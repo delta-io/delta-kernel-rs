@@ -20,7 +20,10 @@ use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
 /// the latest checkpoint without a full directory listing.
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
-/// Per-field cap on a retained hint's `sidecarFiles` / `nonFileActions`.
+/// Per-field count cap on a retained hint's `sidecarFiles` / `nonFileActions`. Matches the
+/// Delta-Spark defaults for `lastCheckpoint.{sidecars,nonFileActions}.threshold` (both 30), which
+/// drop the whole field by count when it exceeds the cap:
+/// <https://github.com/delta-io/delta/blob/83002ef0bfdae90914edbcb0cae23dae5a9b9af5/spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala#L1431-L1461>
 const LAST_CHECKPOINT_SIDECARS_THRESHOLD: usize = 30;
 const LAST_CHECKPOINT_NON_FILE_ACTIONS_THRESHOLD: usize = 30;
 
@@ -75,11 +78,14 @@ pub(crate) struct LastCheckpointV2 {
     pub(crate) modification_time: Option<i64>,
 
     /// The sidecar files this checkpoint references, for a manifest (non-leaf) V2 checkpoint.
-    /// Empty/absent for a leaf checkpoint that inlines its file actions.
+    /// Empty/absent for a leaf checkpoint that inlines its file actions. Also dropped to `None` by
+    /// [`LastCheckpointHint::drop_oversized_fields`] when the count exceeds the threshold, so
+    /// absence is a missing optimization, never a signal that the checkpoint is a leaf.
     pub(crate) sidecar_files: Option<Vec<Sidecar>>,
 
     /// The checkpoint's non-file actions (see [`HintAction`]), letting a reader obtain them
-    /// without reading the checkpoint file.
+    /// without reading the checkpoint file. Dropped to `None` by
+    /// [`LastCheckpointHint::drop_oversized_fields`] when the count exceeds the threshold.
     pub(crate) non_file_actions: Option<Vec<HintAction>>,
 }
 
@@ -101,22 +107,22 @@ pub(crate) enum HintAction {
 
 impl LastCheckpointHint {
     /// Whether this hint describes the checkpoint a log segment selected -- the `checkpoint_parts`
-    /// at `version`. A checkpoint's identity is more than its version (several can share one, e.g.
-    /// concurrent writers), so the rest must also match before the hint's fields can be trusted:
-    ///
-    /// - Part count: a multi-part V1 checkpoint is keyed by `(version, numParts)` and its parts
-    ///   share a deterministic per-version name, so a matching part count pins the identity.
-    ///   `parts` is absent for a single-part / classic checkpoint (hence one part).
-    /// - `v2Checkpoint.path`: a V2 checkpoint's file name carries a UUID, so the name must match
-    ///   the selected part -- `checkpoint_parts.first()`, the file the hint's fields describe.
+    /// at `version`. Multiple checkpoints can share a version (e.g. concurrent writers), so a
+    /// matching version alone is not enough; multi-part checkpoints must have the expected parts
+    /// and V2 checkpoints must have the matching file name.
     pub(crate) fn applies_to(
         &self,
         version: Version,
         checkpoint_parts: &[ParsedLogPath<FileMeta>],
     ) -> bool {
+        // A multi-part V1 checkpoint is keyed by `(version, numParts)` with deterministic
+        // per-version names, so a matching part count pins the identity. `parts` is absent
+        // for a single-part / classic checkpoint.
         self.version == version
             && self.parts.unwrap_or(1) == checkpoint_parts.len()
             && match &self.v2_checkpoint {
+                // A V2 checkpoint's file name carries a UUID, so it must match the selected part
+                // (`checkpoint_parts.first()`), the file the hint's fields describe.
                 Some(v2) => {
                     checkpoint_parts.first().map(|p| p.filename.as_str()) == Some(v2.path.as_str())
                 }
