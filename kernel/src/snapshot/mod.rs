@@ -938,11 +938,13 @@ impl Snapshot {
         if let Some(checkpoint_version) = log_segment.checkpoint_version {
             if checkpoint_version == end {
                 // No tail commits: the checkpoint carries no ICT, so read v_end's ICT from its
-                // commit file (`None` when ICT is disabled).
+                // commit file. A failed read (e.g. the commit file was log-cleaned on an
+                // ICT-enabled table) leaves it absent; the write then fails closed via
+                // `try_write_crc_file`'s ICT guard rather than erroring here.
                 let Some(mut crc) = log_segment.build_crc_from_checkpoint(engine)? else {
                     return Ok(None);
                 };
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine).ok().flatten();
                 return Ok(Some(Arc::new(crc)));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
@@ -962,7 +964,7 @@ impl Snapshot {
             return Ok(Some(Arc::new(base.apply(delta, end))));
         }
 
-        // Case 4: neither CRC nor checkpoint -- reverse-replay the full commit history.
+        // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
         Ok(log_segment
             .build_crc_from_version_zero(engine)?
             .map(Arc::new))
