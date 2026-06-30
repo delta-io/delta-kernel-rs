@@ -8,6 +8,7 @@ mod column_mapping;
 mod commit_info;
 mod domain_metadata;
 mod ict;
+mod interval;
 mod nested_field_ids;
 mod partitioned;
 mod post_commit;

@@ -78,6 +78,10 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
   listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
   carrier type and the SQL literal parser (`parse_sql`).
+- `interval-type-in-dev` -- ANSI interval type write support (experimental, in development). Gates
+  `KernelSupport::Supported` for the `intervalType` reader-writer feature (auto-enabled when a
+  schema has an interval column; writes/reads of tables listing this feature are blocked with the
+  cargo feature off). Reads of legacy featureless interval tables are unaffected.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -241,7 +245,7 @@ is the source of truth. Key concepts:
   `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`,
   `clustering`, `inCommitTimestamp`
 - Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
-  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
+  `deletionVectors`, `intervalType`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
   `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
   `typeWidening`
 

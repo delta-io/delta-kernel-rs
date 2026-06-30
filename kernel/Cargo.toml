@@ -122,6 +122,12 @@ declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc
 # work. TODO(#2630): remove once full column-defaults support ships.
 column-defaults-in-dev = []
 
+# Experimental, temporary feature flag guarding the in-progress ANSI interval-type work.
+# Gates `KernelSupport::Supported` for the `intervalType` reader-writer table feature; with the
+# flag off, writes to tables listing this feature are blocked. TODO(#2840): remove once the
+# interval-type protocol RFC is ratified and interval support fully ships.
+interval-type-in-dev = []
+
 # Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,
 # ensure_data_types, parquet_row_group_skipping). Used by the delta_kernel_default_engine crate
 # and the SyncEngine. Keeps `reqwest` only for the gated `Error::Reqwest` variant.

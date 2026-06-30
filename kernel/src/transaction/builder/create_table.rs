@@ -27,8 +27,9 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     assign_column_mapping_metadata, find_max_column_id_in_schema,
     get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, ColumnMappingMode, EnablementCheck, FeatureType, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    schema_contains_interval_type, schema_contains_timestamp_ntz, ColumnMappingMode,
+    EnablementCheck, FeatureType, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -405,6 +406,19 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `intervalType` reader-writer feature to the protocol when the schema
+/// contains an ANSI interval column. This is the only site that auto-enables the feature; the
+/// blind-append path never auto-enables (it refuses writing intervals to a featureless table).
+fn maybe_enable_interval_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_interval_type(schema) {
+        add_feature_to_lists(
+            TableFeature::IntervalType,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -943,6 +957,7 @@ impl CreateTableTransactionBuilder {
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_interval_type(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
