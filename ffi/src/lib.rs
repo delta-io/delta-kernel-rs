@@ -855,34 +855,6 @@ pub unsafe extern "C" fn snapshot_builder_build(
     snapshot_builder_build_impl(*builder_box).into_extern_result(&engine_ref)
 }
 
-/// Build a snapshot directly from its components, without going through the handle-based
-/// builder API. Shared by [`snapshot`], [`snapshot_with_log_tail`], [`snapshot_at_version`], and
-/// [`snapshot_at_version_with_log_tail`] -- the four convenience entry points that compose the
-/// builder steps internally -- so each one stays a thin wrapper instead of separately matching on
-/// `ExternResult` and manually freeing the builder on every fallible step.
-///
-/// # Safety
-///
-/// The `log_tail`, if present, and its contents must remain valid for the duration of this call.
-unsafe fn build_snapshot(
-    source: FfiSnapshotBuilderSource,
-    engine: Arc<dyn ExternEngine>,
-    version: Option<Version>,
-    log_tail: Option<log_path::LogPathArray>,
-) -> DeltaResult<Handle<SharedSnapshot>> {
-    let log_tail = match log_tail {
-        Some(log_tail) => unsafe { log_tail.log_paths() }?,
-        None => Vec::new(),
-    };
-    snapshot_builder_build_impl(FfiSnapshotBuilder {
-        engine,
-        source,
-        version,
-        log_tail,
-        max_catalog_version: None,
-    })
-}
-
 fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handle<SharedSnapshot>> {
     let engine = builder.engine.engine();
     let mut rust_builder = match builder.source {
@@ -910,104 +882,6 @@ fn snapshot_builder_build_impl(builder: FfiSnapshotBuilder) -> DeltaResult<Handl
 #[no_mangle]
 pub unsafe extern "C" fn free_snapshot_builder(builder: Handle<MutableFfiSnapshotBuilder>) {
     builder.drop_handle();
-}
-
-/// Get the latest snapshot from the specified table.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = unsafe { unwrap_and_parse_path_as_url(path) }.and_then(|url| unsafe {
-        build_snapshot(
-            FfiSnapshotBuilderSource::TableRoot(url),
-            engine_arc,
-            None,
-            None,
-        )
-    });
-    result.into_extern_result(&engine_ref)
-}
-
-/// Get the latest snapshot from the specified table with a log tail for catalog-managed tables.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-/// The log_paths array and its contents must remain valid for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_with_log_tail(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-    log_paths: log_path::LogPathArray,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = unsafe { unwrap_and_parse_path_as_url(path) }.and_then(|url| unsafe {
-        build_snapshot(
-            FfiSnapshotBuilderSource::TableRoot(url),
-            engine_arc,
-            None,
-            Some(log_paths),
-        )
-    });
-    result.into_extern_result(&engine_ref)
-}
-
-/// Get the snapshot from the specified table at a specific version.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_at_version(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-    version: Version,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = unsafe { unwrap_and_parse_path_as_url(path) }.and_then(|url| unsafe {
-        build_snapshot(
-            FfiSnapshotBuilderSource::TableRoot(url),
-            engine_arc,
-            Some(version),
-            None,
-        )
-    });
-    result.into_extern_result(&engine_ref)
-}
-
-/// Get the snapshot from the specified table at a specific version with a log tail.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-/// The log_tail array and its contents must remain valid for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-    version: Version,
-    log_tail: log_path::LogPathArray,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let engine_ref = unsafe { engine.as_ref() };
-    let engine_arc = unsafe { engine.clone_as_arc() };
-    let result = unsafe { unwrap_and_parse_path_as_url(path) }.and_then(|url| unsafe {
-        build_snapshot(
-            FfiSnapshotBuilderSource::TableRoot(url),
-            engine_arc,
-            Some(version),
-            Some(log_tail),
-        )
-    });
-    result.into_extern_result(&engine_ref)
 }
 
 /// # Safety
