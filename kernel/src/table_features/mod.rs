@@ -819,6 +819,56 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
     }
 }
 
+/// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
+pub(crate) fn add_feature_to_lists(
+    feature: TableFeature,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    match feature.feature_type() {
+        FeatureType::ReaderWriter => {
+            if !reader_features.contains(&feature) {
+                reader_features.push(feature.clone());
+            }
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+        FeatureType::WriterOnly | FeatureType::Unknown => {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+    }
+}
+
+/// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
+/// satisfied by `table_properties`, appending it to `reader_features`/`writer_features`
+/// (deduplicated). Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they need
+/// no property-driven enablement. `RowTracking` additionally pulls in its `DomainMetadata`
+/// dependency.
+pub(crate) fn auto_enable_property_driven_features(
+    allowed_table_features: &[TableFeature],
+    table_properties: &TableProperties,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    for table_feature in allowed_table_features {
+        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
+            if check(table_properties) {
+                add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
+                if *table_feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        reader_features,
+                        writer_features,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Enforce that `protocol.min_reader_version()` lies within
 /// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
 /// [`Error::InvalidProtocol`]; above the maximum yields [`Error::Unsupported`].
