@@ -453,9 +453,71 @@ impl CrcReplayAccumulator {
         }
     }
 
+    /// Fold the columns common to commit and checkpoint replay (domain metadata, set
+    /// transactions, protocol, metadata) from row `i`. Each visitor handles its source-specific
+    /// columns (commit: `_file`/commitInfo/add/remove; checkpoint: add) and delegates the rest
+    /// here so the shared leaves live in one place.
+    fn visit_common_columns<'a>(
+        &mut self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+        cols: &CommonColumns,
+    ) -> DeltaResult<()> {
+        if let Some(domain) = getters[cols.dm_domain].get_opt(i, "domainMetadata.domain")? {
+            let configuration: String =
+                getters[cols.dm_config].get(i, "domainMetadata.configuration")?;
+            let removed: bool = getters[cols.dm_removed].get(i, "domainMetadata.removed")?;
+            self.on_domain_metadata(domain, configuration, removed);
+        }
+        if let Some(app_id) = getters[cols.txn_app_id].get_opt(i, "txn.appId")? {
+            let version: i64 = getters[cols.txn_version].get(i, "txn.version")?;
+            let last_updated: Option<i64> =
+                getters[cols.txn_last_updated].get_opt(i, "txn.lastUpdated")?;
+            self.on_set_transaction(app_id, version, last_updated);
+        }
+        let pm = &getters[cols.proto_meta_base..];
+        if self.delta.protocol.is_none() {
+            self.delta.protocol = visit_protocol_at(i, &pm[..cols.n_protocol_leaves])?;
+        }
+        if self.delta.metadata.is_none() {
+            self.delta.metadata = visit_metadata_at(i, &pm[cols.n_protocol_leaves..])?;
+        }
+        Ok(())
+    }
+
     fn into_crc_delta(self) -> CrcDelta {
         self.delta
     }
+}
+
+/// Getter indices for the columns shared by commit and checkpoint replay, plus the count of
+/// protocol leaves so the trailing protocol/metadata leaf slices can be split. Each visitor
+/// fills this from its own column layout and hands it to
+/// [`CrcReplayAccumulator::visit_common_columns`].
+struct CommonColumns {
+    dm_domain: usize,
+    dm_config: usize,
+    dm_removed: usize,
+    txn_app_id: usize,
+    txn_version: usize,
+    txn_last_updated: usize,
+    /// Index of the first protocol leaf; metadata leaves follow the protocol leaves.
+    proto_meta_base: usize,
+    n_protocol_leaves: usize,
+}
+
+/// Append the protocol and metadata leaf columns (in that order) to a visitor's fixed columns,
+/// shared by both replay visitors' `selected_column_names_and_types`.
+fn append_protocol_metadata_leaves(
+    fixed: Vec<(DataType, ColumnName)>,
+) -> (Vec<ColumnName>, Vec<DataType>) {
+    let (mut types, mut names): (Vec<_>, Vec<_>) = fixed.into_iter().unzip();
+    for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
+        let (leaf_names, leaf_types) = leaves.as_ref();
+        names.extend_from_slice(leaf_names);
+        types.extend_from_slice(leaf_types);
+    }
+    (names, types)
 }
 
 // ============================================================================
@@ -504,13 +566,7 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 (LONG, column_name!("txn.version")),
                 (LONG, column_name!("txn.lastUpdated")),
             ];
-            let (mut types, mut names): (Vec<_>, Vec<_>) = fixed.into_iter().unzip();
-            for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
-                let (leaf_names, leaf_types) = leaves.as_ref();
-                names.extend_from_slice(leaf_names);
-                types.extend_from_slice(leaf_types);
-            }
-            (names, types).into()
+            append_protocol_metadata_leaves(fixed).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
@@ -533,6 +589,17 @@ impl RowVisitor for CrcReplayVisitor<'_> {
         let file_url: String = getters[COL_FILE].get(0, "_file")?;
         self.acc.process_batch_start(&file_url);
 
+        let common = CommonColumns {
+            dm_domain: COL_DM_DOMAIN,
+            dm_config: COL_DM_CONFIG,
+            dm_removed: COL_DM_REMOVED,
+            txn_app_id: COL_TXN_APP_ID,
+            txn_version: COL_TXN_VERSION,
+            txn_last_updated: COL_TXN_LAST_UPDATED,
+            proto_meta_base: N_FIXED_COLS,
+            n_protocol_leaves,
+        };
+
         for i in 0..row_count {
             let operation: Option<String> = getters[COL_OP].get_opt(i, "commitInfo.operation")?;
             let ict: Option<i64> = getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
@@ -551,31 +618,7 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 self.acc.on_remove(&path, remove_size)?;
             }
 
-            let dm_domain: Option<String> =
-                getters[COL_DM_DOMAIN].get_opt(i, "domainMetadata.domain")?;
-            if let Some(domain) = dm_domain {
-                let configuration: String =
-                    getters[COL_DM_CONFIG].get(i, "domainMetadata.configuration")?;
-                let removed: bool = getters[COL_DM_REMOVED].get(i, "domainMetadata.removed")?;
-                self.acc.on_domain_metadata(domain, configuration, removed);
-            }
-
-            let txn_app_id: Option<String> = getters[COL_TXN_APP_ID].get_opt(i, "txn.appId")?;
-            if let Some(app_id) = txn_app_id {
-                let version: i64 = getters[COL_TXN_VERSION].get(i, "txn.version")?;
-                let last_updated: Option<i64> =
-                    getters[COL_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
-                self.acc.on_set_transaction(app_id, version, last_updated);
-            }
-
-            if self.acc.delta.protocol.is_none() {
-                self.acc.delta.protocol =
-                    visit_protocol_at(i, &getters[N_FIXED_COLS..N_FIXED_COLS + n_protocol_leaves])?;
-            }
-            if self.acc.delta.metadata.is_none() {
-                self.acc.delta.metadata =
-                    visit_metadata_at(i, &getters[N_FIXED_COLS + n_protocol_leaves..])?;
-            }
+            self.acc.visit_common_columns(i, getters, &common)?;
         }
         Ok(())
     }
@@ -641,13 +684,7 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
                 (LONG, column_name!("txn.version")),
                 (LONG, column_name!("txn.lastUpdated")),
             ];
-            let (mut types, mut names): (Vec<_>, Vec<_>) = fixed.into_iter().unzip();
-            for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
-                let (leaf_names, leaf_types) = leaves.as_ref();
-                names.extend_from_slice(leaf_names);
-                types.extend_from_slice(leaf_types);
-            }
-            (names, types).into()
+            append_protocol_metadata_leaves(fixed).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
@@ -662,6 +699,16 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
                 getters.len()
             ))
         );
+        let common = CommonColumns {
+            dm_domain: COL_CP_DM_DOMAIN,
+            dm_config: COL_CP_DM_CONFIG,
+            dm_removed: COL_CP_DM_REMOVED,
+            txn_app_id: COL_CP_TXN_APP_ID,
+            txn_version: COL_CP_TXN_VERSION,
+            txn_last_updated: COL_CP_TXN_LAST_UPDATED,
+            proto_meta_base: N_CP_FIXED_COLS,
+            n_protocol_leaves,
+        };
         for i in 0..row_count {
             // `add.path` (required) marks an Add row; a present Add with no `size` cannot be
             // accounted for, so file stats degrade to `Indeterminate`.
@@ -673,33 +720,7 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
                 }
             }
 
-            let dm_domain: Option<String> =
-                getters[COL_CP_DM_DOMAIN].get_opt(i, "domainMetadata.domain")?;
-            if let Some(domain) = dm_domain {
-                let configuration: String =
-                    getters[COL_CP_DM_CONFIG].get(i, "domainMetadata.configuration")?;
-                let removed: bool = getters[COL_CP_DM_REMOVED].get(i, "domainMetadata.removed")?;
-                self.acc.on_domain_metadata(domain, configuration, removed);
-            }
-
-            let txn_app_id: Option<String> = getters[COL_CP_TXN_APP_ID].get_opt(i, "txn.appId")?;
-            if let Some(app_id) = txn_app_id {
-                let version: i64 = getters[COL_CP_TXN_VERSION].get(i, "txn.version")?;
-                let last_updated: Option<i64> =
-                    getters[COL_CP_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
-                self.acc.on_set_transaction(app_id, version, last_updated);
-            }
-
-            if self.acc.delta.protocol.is_none() {
-                self.acc.delta.protocol = visit_protocol_at(
-                    i,
-                    &getters[N_CP_FIXED_COLS..N_CP_FIXED_COLS + n_protocol_leaves],
-                )?;
-            }
-            if self.acc.delta.metadata.is_none() {
-                self.acc.delta.metadata =
-                    visit_metadata_at(i, &getters[N_CP_FIXED_COLS + n_protocol_leaves..])?;
-            }
+            self.acc.visit_common_columns(i, getters, &common)?;
         }
         Ok(())
     }

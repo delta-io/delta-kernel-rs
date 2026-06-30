@@ -585,17 +585,27 @@ async fn test_write_checksum_resolves_crc_with_no_in_memory_crc(
     Ok(())
 }
 
+/// Checkpoint at the current version with no tail commits and no CRC: `write_checksum` builds
+/// the CRC from the checkpoint and fills ICT from v_end's commit file. With ICT enabled the
+/// written CRC carries an ICT; with ICT disabled it carries `None` and the write still succeeds.
+#[rstest]
+#[case::ict_enabled(true)]
+#[case::ict_disabled(false)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_from_checkpoint_at_current_version_reads_ict() -> DeltaResult<()> {
+async fn test_write_checksum_from_checkpoint_at_current_version(
+    #[case] ict_enabled: bool,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
-    // ICT-enabled table; insert data, then checkpoint at the latest version (no tail, no CRC).
     let schema = schema_ref! { nullable "id": INTEGER };
-    let snap = create_table(&table_path, schema, "test_engine")
-        .with_table_properties([
+    let mut builder = create_table(&table_path, schema, "test_engine");
+    if ict_enabled {
+        builder = builder.with_table_properties([
             ("delta.feature.inCommitTimestamp", "supported"),
             ("delta.enableInCommitTimestamps", "true"),
-        ])
+        ]);
+    }
+    let snap = builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -621,9 +631,12 @@ async fn test_write_checksum_from_checkpoint_at_current_version_reads_ict() -> D
     let (result, _updated) = fresh.write_checksum(engine.as_ref())?;
     assert_eq!(result, ChecksumWriteResult::Written);
 
-    // The written CRC carries the ICT read from v_end's commit file.
+    // ICT is present iff the table enabled it; either way the CRC round-trips.
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert!(reloaded.crc().unwrap().in_commit_timestamp_opt.is_some());
+    assert_eq!(
+        reloaded.crc().unwrap().in_commit_timestamp_opt.is_some(),
+        ict_enabled
+    );
 
     Ok(())
 }
