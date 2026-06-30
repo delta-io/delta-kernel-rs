@@ -13,7 +13,6 @@ use crate::engine::arrow_utils::{
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
 use crate::object_store::DynObjectStore;
-use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};

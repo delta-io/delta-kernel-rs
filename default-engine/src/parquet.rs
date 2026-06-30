@@ -586,10 +586,9 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::object_store::CopyOptions;
     use delta_kernel::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, Result,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
@@ -613,8 +612,6 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
-
-    use delta_kernel::object_store::ObjectStore;
 
     /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
     /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates

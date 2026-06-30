@@ -343,8 +343,7 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::DynObjectStore;
-    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;
     use delta_kernel_default_engine::DefaultEngineBuilder;

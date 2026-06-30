@@ -24,8 +24,7 @@ use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
-use crate::object_store::DynObjectStore;
-use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,

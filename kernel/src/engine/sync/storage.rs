@@ -6,8 +6,7 @@ use url::Url;
 
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
-use crate::object_store::DynObjectStore;
-use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 pub(crate) struct SyncStorageHandler {
