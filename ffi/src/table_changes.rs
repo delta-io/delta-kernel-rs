@@ -344,7 +344,6 @@ mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
     use delta_kernel::object_store::DynObjectStore;
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     use delta_kernel::object_store::ObjectStoreExt as _;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;

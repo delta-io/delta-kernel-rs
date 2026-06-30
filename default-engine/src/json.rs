@@ -274,7 +274,6 @@ mod tests {
     use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     use delta_kernel::object_store::{CopyOptions, ObjectStore};
     use delta_kernel::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,

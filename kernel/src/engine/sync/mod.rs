@@ -25,10 +25,6 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
 use crate::object_store::DynObjectStore;
-// `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
-// off the `ObjectStore` trait. In arrow-57 mode the compat shim makes the import a no-op, so
-// silence the resulting unused-import warning.
-#[allow(unused_imports)]
 use crate::object_store::ObjectStoreExt as _;
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
