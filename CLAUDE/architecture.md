@@ -35,7 +35,7 @@ Built via `Snapshot::builder_for(url).build(engine)` (latest version) or
 1. **LogSegment** (`kernel/src/log_segment/`) -- discovers commits + checkpoints for the
    requested version, replays Protocol and Metadata (`protocol_metadata_replay.rs`), and
    replays domain metadata (`domain_metadata_replay.rs`)
-2. **Log replay** (`kernel/src/log_replay.rs`) -- file-action deduplication via
+2. **Log replay** (`kernel/src/log_replay/`) -- file-action deduplication via
    `FileActionDeduplicator` and `LogReplayProcessor` trait (distinct from Protocol/Metadata
    replay above)
 
@@ -57,8 +57,8 @@ set), `data_skipping.rs` (rewrite predicates against min/max/nullCount stats and
 - `scan.execute(engine)` -- kernel handles everything end-to-end, returns `EngineData`
 - `scan.scan_metadata(engine)` -- returns file list + transforms; connector reads files and
   calls `transform_to_logical` / `DvInfo::get_selection_vector`
-- `scan.parallel_scan_metadata(engine)` -- two-phase distributed log replay (`pub(crate)`,
-  requires `internal-api` feature)
+- `scan.parallel_scan_metadata(engine)` -- two-phase distributed log replay (the method is
+  `pub`; its supporting types and the `parallel` module are gated behind `internal-api`)
 
 **Incremental read:** `Snapshot::incremental_scan_builder(base_version)` streams the file-action
 diff over `(base_version, target_version]` -- live Adds as a `FilteredEngineData` iterator
@@ -130,7 +130,7 @@ all returned batches -- the engine may split a single file across multiple batch
    encoding, URI encoding for `add.path`
 - `kernel/src/committer/` -- `Committer` trait, `FileSystemCommitter`
 - `kernel/src/log_segment/` -- log file discovery, Protocol/Metadata replay
-- `kernel/src/log_replay.rs` -- file-action deduplication, `LogReplayProcessor` trait
+- `kernel/src/log_replay/` -- file-action deduplication, `LogReplayProcessor` trait
 - `kernel/src/log_reader/` -- I/O layer for reading commit and checkpoint files
 - `kernel/src/actions/` -- Delta action types (Protocol, Metadata, CommitInfo, Add, Remove, Cdc,
    SetTransaction, DomainMetadata, Sidecar, CheckpointMetadata)
