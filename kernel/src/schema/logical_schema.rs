@@ -17,6 +17,7 @@ use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
+use crate::table_properties::TableProperties;
 use crate::{transform_output_type, DeltaResult, Error};
 
 // Private helper for predicate-driven schema traversal.
@@ -82,6 +83,32 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
+/// Row-tracking state derived from [`TableProperties`](crate::table_properties::TableProperties):
+/// whether row tracking is enabled, and the materialized row-ID column name (only present when
+/// row tracking is enabled AND the table metadata configures a column name for it). Kept as two
+/// fields, rather than collapsing to a single `Option<String>`, so that callers needing to
+/// report an error can distinguish "row tracking isn't enabled" from "row tracking is enabled
+/// but the table's metadata is missing the required column-name property" (the latter signals a
+/// malformed table, not an unsupported request).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RowTrackingState {
+    enabled: bool,
+    materialized_row_id_col: Option<String>,
+}
+
+impl RowTrackingState {
+    fn from_table_properties(table_properties: &TableProperties) -> Self {
+        let enabled = table_properties.enable_row_tracking == Some(true);
+        let materialized_row_id_col = enabled
+            .then(|| table_properties.materialized_row_id_column_name.clone())
+            .flatten();
+        Self {
+            enabled,
+            materialized_row_id_col,
+        }
+    }
+}
+
 /// Bundles a logical schema, column mapping mode, partition columns,
 /// and materialized row ID column for read and write schema computation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +116,7 @@ pub struct LogicalSchema {
     schema: SchemaRef,
     column_mapping_mode: ColumnMappingMode,
     partition_columns: Vec<String>,
-    materialized_row_id_col: Option<String>,
+    row_tracking: RowTrackingState,
 }
 
 impl LogicalSchema {
@@ -102,35 +129,23 @@ impl LogicalSchema {
         schema: SchemaRef,
         column_mapping_mode: ColumnMappingMode,
         partition_columns: Vec<String>,
-        materialized_row_id_col: Option<String>,
+        table_properties: &TableProperties,
     ) -> Self {
         Self {
             schema,
             column_mapping_mode,
             partition_columns,
-            materialized_row_id_col,
+            row_tracking: RowTrackingState::from_table_properties(table_properties),
         }
     }
 
     /// Create a new [`LogicalSchema`] from a logical schema and table configuration.
     pub(crate) fn new(schema: SchemaRef, table_config: &TableConfiguration) -> Self {
-        let column_mapping_mode = table_config.column_mapping_mode();
-        let partition_columns = table_config.partition_columns().to_vec();
-        let materialized_row_id_col = table_config
-            .table_properties()
-            .enable_row_tracking
-            .filter(|&b| b)
-            .and_then(|_| {
-                table_config
-                    .table_properties()
-                    .materialized_row_id_column_name
-                    .clone()
-            });
         Self::new_from_parts(
             schema,
-            column_mapping_mode,
-            partition_columns,
-            materialized_row_id_col,
+            table_config.column_mapping_mode(),
+            table_config.partition_columns().to_vec(),
+            table_config.table_properties(),
         )
     }
 
@@ -144,11 +159,18 @@ impl LogicalSchema {
             schema,
             column_mapping_mode,
             partition_columns: vec![],
-            materialized_row_id_col: None,
+            row_tracking: RowTrackingState {
+                enabled: false,
+                materialized_row_id_col: None,
+            },
         })
     }
 
     /// Returns the underlying logical [`SchemaRef`].
+    ///
+    /// This must stay `pub` (rather than `#[internal_api]` or `pub(crate)`) because the
+    /// `delta_kernel_ffi` crate calls it directly across the crate boundary to hand the raw
+    /// schema to engines, independent of the `internal-api` feature flag.
     ///
     /// **Kernel callers should prefer not to use this method.** Instead, add methods to
     /// [`LogicalSchema`] that encapsulate the business logic, so that column-mapping and
@@ -185,7 +207,7 @@ impl LogicalSchema {
     /// Returns the materialized row ID column name. Exposed for tests only.
     #[cfg(test)]
     pub(crate) fn materialized_row_id_col(&self) -> Option<&str> {
-        self.materialized_row_id_col.as_deref()
+        self.row_tracking.materialized_row_id_col.as_deref()
     }
 
     /// Returns the index of the top-level logical column with the given name, or `None` if not
@@ -211,9 +233,8 @@ impl LogicalSchema {
         &self,
         classifier: &C,
     ) -> DeltaResult<(SchemaRef, Option<Arc<TransformSpec>>)> {
-        // Pre-pass: collect metadata column info and validate
+        // Pre-pass: validate metadata columns and collect their names.
         let mut metadata_field_names: HashSet<String> = HashSet::new();
-        let mut selected_row_index_col_name: Option<&String> = None;
         for metadata_column in self.schema.metadata_columns() {
             if self.partition_columns.contains(metadata_column.name()) {
                 return Err(Error::Schema(format!(
@@ -221,14 +242,15 @@ impl LogicalSchema {
                     metadata_column.name()
                 )));
             }
-            if matches!(
-                metadata_column.get_metadata_column_spec(),
-                Some(MetadataColumnSpec::RowIndex)
-            ) {
-                selected_row_index_col_name = Some(metadata_column.name());
-            }
             metadata_field_names.insert(metadata_column.name().clone());
         }
+        let selected_row_index_col_name = self.schema.metadata_columns().find_map(|c| {
+            matches!(
+                c.get_metadata_column_spec(),
+                Some(MetadataColumnSpec::RowIndex)
+            )
+            .then(|| c.name())
+        });
 
         // Main loop: build physical schema and transform spec
         let mut read_fields = Vec::with_capacity(self.schema.num_fields());
@@ -267,10 +289,15 @@ impl LogicalSchema {
                                 index_column_name
                             }
                         };
-                        let Some(row_id_col_name) = &self.materialized_row_id_col else {
-                            return Err(Error::unsupported(
-                                "Row IDs require row tracking to be enabled with a configured materialized column name",
-                            ));
+                        let Some(row_id_col_name) = &self.row_tracking.materialized_row_id_col
+                        else {
+                            return Err(if self.row_tracking.enabled {
+                                Error::generic(
+                                    "No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
+                                )
+                            } else {
+                                Error::unsupported("Row ids are not enabled on this table")
+                            });
                         };
                         read_fields.push(StructField::nullable(row_id_col_name, DataType::LONG));
                         transform_spec.push(FieldTransformSpec::GenerateRowId {
@@ -439,7 +466,7 @@ mod tests {
             schema,
             ColumnMappingMode::None,
             vec!["pcol".to_string()],
-            None,
+            &TableProperties::default(),
         ))
     }
 

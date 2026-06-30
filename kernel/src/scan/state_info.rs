@@ -31,10 +31,6 @@ pub(crate) struct StateInfo {
     /// Fields use physical column names (for column mapping). Only present when the table has
     /// partition columns AND a predicate references those columns.
     pub(crate) physical_partition_schema: Option<SchemaRef>,
-    /// Logical stats schema for the file statistics. When `stats_columns` is requested,
-    /// the engine receives stats with physical column names (for column mapping). This
-    /// logical schema maps those stats back to the table's logical column names.
-    pub(crate) logical_stats_schema: Option<SchemaRef>,
 }
 
 impl StateInfo {
@@ -90,69 +86,57 @@ impl StateInfo {
             _ => None,
         };
 
-        // Build stats schemas based on StatsOutputMode:
+        // Build the physical stats schema based on StatsOutputMode:
         // - AllColumns: output all stats from expected_stats_schema
         // - Columns(non-empty): merge requested + predicate columns for data skipping
         // - Columns(empty): predicate-only internal data skipping (no stats output)
         // - Skip: no stats at all (handled at the Scan level, no schemas needed here)
-        let (physical_stats_schema, logical_stats_schema) =
-            match (&stats_output_mode, &physical_predicate) {
-                // Output all table stats columns in stats_parsed. The DataSkippingFilter
-                // reads stats_parsed from the transformed batch, which uses this schema.
-                (StatsOutputMode::AllColumns, _) => {
-                    let expected_stats_schemas =
-                        table_configuration.build_expected_stats_schemas(None, None)?;
-                    (
-                        Some(expected_stats_schemas.physical),
-                        Some(expected_stats_schemas.logical),
-                    )
-                }
-                // Non-empty requested columns -- include predicate-referenced columns
-                // alongside the user-requested stats columns so that the DataSkippingFilter
-                // has the stats it needs.
-                (StatsOutputMode::Columns(requested_columns), _)
-                    if !requested_columns.is_empty() =>
-                {
-                    let existing: HashSet<&ColumnName> = requested_columns.iter().collect();
-                    let mut all_needed_stats_columns = requested_columns.clone();
-                    for col in &predicate_column_names {
-                        if !existing.contains(col) {
-                            all_needed_stats_columns.push(col.clone());
-                        }
+        let physical_stats_schema = match (&stats_output_mode, &physical_predicate) {
+            // Output all table stats columns in stats_parsed. The DataSkippingFilter
+            // reads stats_parsed from the transformed batch, which uses this schema.
+            (StatsOutputMode::AllColumns, _) => {
+                let expected_stats_schemas =
+                    table_configuration.build_expected_stats_schemas(None, None)?;
+                Some(expected_stats_schemas.physical)
+            }
+            // Non-empty requested columns -- include predicate-referenced columns
+            // alongside the user-requested stats columns so that the DataSkippingFilter
+            // has the stats it needs.
+            (StatsOutputMode::Columns(requested_columns), _) if !requested_columns.is_empty() => {
+                let existing: HashSet<&ColumnName> = requested_columns.iter().collect();
+                let mut all_needed_stats_columns = requested_columns.clone();
+                for col in &predicate_column_names {
+                    if !existing.contains(col) {
+                        all_needed_stats_columns.push(col.clone());
                     }
-                    // Translate logical names to physical for build_expected_stats_schemas,
-                    // which works on the physical data schema.
-                    let physical_columns: Vec<ColumnName> = all_needed_stats_columns
-                        .iter()
-                        .filter_map(|col| logical_schema.get_physical_column_name(col).ok())
-                        .collect();
-                    let expected_stats_schemas = table_configuration
-                        .build_expected_stats_schemas(None, Some(&physical_columns))?;
-                    (
-                        Some(expected_stats_schemas.physical),
-                        Some(expected_stats_schemas.logical),
-                    )
                 }
-                // Columns(empty) or Skip with a physical predicate -- build stats directly
-                // from the physical predicate's referenced schema for internal data skipping
-                // only (no logical schema needed for output).
-                // Predicate-only mode: split referenced columns into data columns (get min/max
-                // stats) and partition columns (get exact values via partition pruning). Exclude
-                // partition columns from data stats to avoid double-handling.
-                (_, PhysicalPredicate::Some(_, ref_schema)) => {
-                    let data_stats = ref_schema
-                        .with_fields_filtered_nonempty(|f| {
-                            physical_partition_schema
-                                .as_ref()
-                                .is_none_or(|ps| ps.field(f.name()).is_none())
-                        })?
+                // Translate logical names to physical for build_expected_stats_schemas,
+                // which works on the physical data schema.
+                let physical_columns: Vec<ColumnName> = all_needed_stats_columns
+                    .iter()
+                    .filter_map(|col| logical_schema.get_physical_column_name(col).ok())
+                    .collect();
+                let expected_stats_schemas = table_configuration
+                    .build_expected_stats_schemas(None, Some(&physical_columns))?;
+                Some(expected_stats_schemas.physical)
+            }
+            // Columns(empty) or Skip with a physical predicate -- build stats directly
+            // from the physical predicate's referenced schema for internal data skipping
+            // only (no logical schema needed for output).
+            // Predicate-only mode: split referenced columns into data columns (get min/max
+            // stats) and partition columns (get exact values via partition pruning). Exclude
+            // partition columns from data stats to avoid double-handling.
+            (_, PhysicalPredicate::Some(_, ref_schema)) => ref_schema
+                .with_fields_filtered_nonempty(|f| {
+                    physical_partition_schema
                         .as_ref()
-                        .and_then(build_stats_schema);
-                    (data_stats, None)
-                }
-                // No stats output and no predicate
-                (_, _) => (None, None),
-            };
+                        .is_none_or(|ps| ps.field(f.name()).is_none())
+                })?
+                .as_ref()
+                .and_then(build_stats_schema),
+            // No stats output and no predicate
+            (_, _) => None,
+        };
 
         Ok(StateInfo {
             logical_schema,
@@ -161,7 +145,6 @@ impl StateInfo {
             transform_spec,
             physical_stats_schema,
             physical_partition_schema,
-            logical_stats_schema,
         })
     }
 }
@@ -611,10 +594,7 @@ pub(crate) mod tests {
             HashMap::new(),
             vec![("row_id", MetadataColumnSpec::RowId)],
         );
-        assert_result_error_with_message(
-            res,
-            "Unsupported: Row IDs require row tracking to be enabled with a configured materialized column name",
-        );
+        assert_result_error_with_message(res, "Unsupported: Row ids are not enabled on this table");
 
         // Row tracking enabled but missing materializedRowIdColumnName → error
         let res = get_state_info(
@@ -627,7 +607,7 @@ pub(crate) mod tests {
         );
         assert_result_error_with_message(
             res,
-            "Unsupported: Row IDs require row tracking to be enabled with a configured materialized column name",
+            "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
         );
     }
 

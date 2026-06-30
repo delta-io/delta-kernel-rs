@@ -39,17 +39,13 @@ use crate::{DeltaResult, Error, Version};
 
 /// Expected schemas for file statistics.
 ///
-/// Contains both logical and physical versions of the stats schema:
-/// - **Logical schema**: Uses original column names (matching table schema)
-/// - **Physical schema**: Uses physical column names (for storage)
+/// Expected schema for file statistics, using physical column names.
 ///
-/// When column mapping is disabled (`ColumnMappingMode::None`), both schemas are identical.
+/// Wrapped in a struct so it can be extended with a logical-name variant if needed.
 #[allow(unused)]
 #[derive(Debug, Clone)]
 #[internal_api]
 pub(crate) struct ExpectedStatsSchemas {
-    /// Stats schema using logical (user-facing) column names.
-    pub logical: SchemaRef,
     /// Stats schema using physical column names (for storage).
     pub physical: SchemaRef,
 }
@@ -191,15 +187,11 @@ impl TableConfiguration {
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
 
         let partition_columns = metadata.partition_columns().to_vec();
-        let materialized_row_id_col = table_properties
-            .enable_row_tracking
-            .filter(|&b| b)
-            .and_then(|_| table_properties.materialized_row_id_column_name.clone());
         let logical_schema_ref = Arc::new(LogicalSchema::new_from_parts(
             logical_schema,
             column_mapping_mode,
             partition_columns,
-            materialized_row_id_col,
+            &table_properties,
         ));
 
         let physical_schema = Arc::new(
@@ -208,15 +200,7 @@ impl TableConfiguration {
                 .make_physical(column_mapping_mode)?,
         );
 
-        // Inline should_materialize_partition_columns: both MaterializePartitionColumns and
-        // IcebergCompatV3 are WriterOnly features with no legacy version, so they require
-        // writer_version >= 7 (table features protocol). MaterializePartitionColumns is
-        // AlwaysIfSupported; IcebergCompatV3 is gated on the enable_iceberg_compat_v3 property.
-        let should_materialize = protocol.writer_features().is_some_and(|wf| {
-            wf.contains(&TableFeature::MaterializePartitionColumns)
-                || (wf.contains(&TableFeature::IcebergCompatV3)
-                    && table_properties.enable_iceberg_compat_v3 == Some(true))
-        });
+        let should_materialize = Self::materialize_partition_columns(&protocol, &table_properties);
         let write_schema = logical_schema_ref.compute_write_physical_schema(should_materialize)?;
 
         let physical_schemas = PhysicalSchemas::new(physical_schema, write_schema);
@@ -338,23 +322,7 @@ impl TableConfiguration {
         )?);
         let physical_stats_schema = strip_metadata(physical_stats_schema);
 
-        // Compute logical stats schema from logical data schema (uses logical column names).
-        // When column mapping is disabled, logical == physical.
-        let logical_stats_schema = if self.column_mapping_mode() == ColumnMappingMode::None {
-            physical_stats_schema.clone()
-        } else {
-            let logical_data_schema = self.logical_data_schema();
-            let logical_stats_schema = Arc::new(expected_stats_schema(
-                &logical_data_schema,
-                &config,
-                required_physical_columns,
-                requested_physical_columns,
-            )?);
-            strip_metadata(logical_stats_schema)
-        };
-
         Ok(ExpectedStatsSchemas {
-            logical: logical_stats_schema,
             physical: physical_stats_schema,
         })
     }
@@ -527,9 +495,23 @@ impl TableConfiguration {
     /// [`MaterializePartitionColumns`]: crate::table_features::TableFeature::MaterializePartitionColumns
     /// [`IcebergCompatV3`]: crate::table_features::TableFeature::IcebergCompatV3
     pub(crate) fn should_materialize_partition_columns(&self) -> bool {
+        Self::materialize_partition_columns(&self.protocol, &self.table_properties)
+    }
+
+    /// Returns true if partition columns should be materialized in data files, given `protocol`
+    /// and `table_properties`. Shared by [`Self::should_materialize_partition_columns`] and
+    /// table-configuration construction (where no `Self` instance exists yet), so the two call
+    /// sites can never diverge.
+    fn materialize_partition_columns(
+        protocol: &Protocol,
+        table_properties: &TableProperties,
+    ) -> bool {
         // TODO(#1125): add IcebergcompatV1/V2 here when they are supported.
-        self.is_feature_enabled(&TableFeature::MaterializePartitionColumns)
-            || self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+        Self::feature_enabled(
+            protocol,
+            table_properties,
+            &TableFeature::MaterializePartitionColumns,
+        ) || Self::feature_enabled(protocol, table_properties, &TableFeature::IcebergCompatV3)
     }
 
     /// The physical schema for writing data files.
@@ -831,15 +813,13 @@ impl TableConfiguration {
     }
 
     /// Returns true if the protocol uses legacy reader version (< 3)
-    #[allow(dead_code)]
-    fn is_legacy_reader_version(&self) -> bool {
-        self.protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION
+    fn is_legacy_reader_version(protocol: &Protocol) -> bool {
+        protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION
     }
 
     /// Returns true if the protocol uses legacy writer version (< 7)
-    #[allow(dead_code)]
-    fn is_legacy_writer_version(&self) -> bool {
-        self.protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION
+    fn is_legacy_writer_version(protocol: &Protocol) -> bool {
+        protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION
     }
 
     /// Helper to check if a feature is present in a feature list.
@@ -849,10 +829,11 @@ impl TableConfiguration {
             .unwrap_or(false)
     }
 
-    /// Helper method to check if a feature is supported.
-    /// This checks protocol versions and feature lists but does NOT check enablement properties.
-    #[internal_api]
-    pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
+    /// Returns true if `feature` is supported by `protocol` (checks protocol versions and
+    /// feature lists, but not enablement properties). Takes `protocol` explicitly, rather than
+    /// `&self`, so it can be shared between [`Self::is_feature_supported`] and table-configuration
+    /// construction (where no `Self` instance exists yet).
+    fn feature_supported(protocol: &Protocol, feature: &TableFeature) -> bool {
         let info = feature.info();
         let min_legacy_version = info.min_legacy_version.as_ref();
         let min_reader_version =
@@ -861,35 +842,60 @@ impl TableConfiguration {
             min_legacy_version.map_or(TABLE_FEATURES_MIN_WRITER_VERSION, |v| v.writer);
         match info.feature_type {
             FeatureType::WriterOnly => {
-                if self.is_legacy_writer_version() {
+                if Self::is_legacy_writer_version(protocol) {
                     // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= min_writer_version
+                    protocol.min_writer_version() >= min_writer_version
                 } else {
                     // Table features writer: feature is in writer_features list
-                    Self::has_feature(self.protocol.writer_features(), feature)
+                    Self::has_feature(protocol.writer_features(), feature)
                 }
             }
             FeatureType::ReaderWriter => {
-                let reader_supported = if self.is_legacy_reader_version() {
+                let reader_supported = if Self::is_legacy_reader_version(protocol) {
                     // Legacy reader: protocol reader version meets minimum requirement
-                    self.protocol.min_reader_version() >= min_reader_version
+                    protocol.min_reader_version() >= min_reader_version
                 } else {
                     // Table features reader: feature is in reader_features list
-                    Self::has_feature(self.protocol.reader_features(), feature)
+                    Self::has_feature(protocol.reader_features(), feature)
                 };
 
-                let writer_supported = if self.is_legacy_writer_version() {
+                let writer_supported = if Self::is_legacy_writer_version(protocol) {
                     // Legacy writer: protocol writer version meets minimum requirement
-                    self.protocol.min_writer_version() >= min_writer_version
+                    protocol.min_writer_version() >= min_writer_version
                 } else {
                     // Table features writer: feature is in writer_features list
-                    Self::has_feature(self.protocol.writer_features(), feature)
+                    Self::has_feature(protocol.writer_features(), feature)
                 };
 
                 reader_supported && writer_supported
             }
-            FeatureType::Unknown => Self::has_feature(self.protocol.writer_features(), feature),
+            FeatureType::Unknown => Self::has_feature(protocol.writer_features(), feature),
         }
+    }
+
+    /// Returns true if `feature` is enabled given `protocol` and `table_properties`: supported
+    /// in the protocol, and its enablement check passes. Shared by [`Self::is_feature_enabled`]
+    /// and table-configuration construction (where no `Self` instance exists yet).
+    fn feature_enabled(
+        protocol: &Protocol,
+        table_properties: &TableProperties,
+        feature: &TableFeature,
+    ) -> bool {
+        if !Self::feature_supported(protocol, feature) {
+            return false;
+        }
+
+        match feature.info().enablement_check {
+            EnablementCheck::AlwaysIfSupported => true,
+            EnablementCheck::EnabledIf(check_fn) => check_fn(table_properties),
+        }
+    }
+
+    /// Helper method to check if a feature is supported.
+    /// This checks protocol versions and feature lists but does NOT check enablement properties.
+    #[internal_api]
+    pub(crate) fn is_feature_supported(&self, feature: &TableFeature) -> bool {
+        Self::feature_supported(&self.protocol, feature)
     }
 
     /// Generic method to check if a feature is enabled.
@@ -899,14 +905,7 @@ impl TableConfiguration {
     /// 2. The enablement check passes
     #[internal_api]
     pub(crate) fn is_feature_enabled(&self, feature: &TableFeature) -> bool {
-        if !self.is_feature_supported(feature) {
-            return false;
-        }
-
-        match feature.info().enablement_check {
-            EnablementCheck::AlwaysIfSupported => true,
-            EnablementCheck::EnabledIf(check_fn) => check_fn(&self.table_properties),
-        }
+        Self::feature_enabled(&self.protocol, &self.table_properties, feature)
     }
 }
 
@@ -2289,15 +2288,33 @@ mod test {
     }
 
     // V3 supported + property set -> partition column materialized into the write schema;
-    // V3 supported but property unset -> partition column stripped from the write schema.
+    // V3 supported but property unset -> partition column stripped from the write schema;
+    // both V3 and MaterializePartitionColumns present -> still materialized (the OR condition
+    // in `should_materialize_partition_columns` doesn't double-materialize or conflict).
     #[rstest]
     #[case::v3_enabled(
+        &[TableFeature::IcebergCompatV3, TableFeature::RowTracking, TableFeature::DomainMetadata],
         &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true")],
         // pcol is included, meaning we expect the partition col to be materialized to disk.
         vec!["value", "pcol"],
     )]
-    #[case::v3_supported_but_property_unset(&[], vec!["value"])]
+    #[case::v3_supported_but_property_unset(
+        &[TableFeature::IcebergCompatV3, TableFeature::RowTracking, TableFeature::DomainMetadata],
+        &[],
+        vec!["value"],
+    )]
+    #[case::v3_and_materialize_partition_columns_both_enabled(
+        &[
+            TableFeature::IcebergCompatV3,
+            TableFeature::MaterializePartitionColumns,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+        ],
+        &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true")],
+        vec!["value", "pcol"],
+    )]
     fn test_physical_write_schema_materializes_pv_when_iceberg_compact_v3_enabled(
+        #[case] writer_features: &[TableFeature],
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_field_names: Vec<&str>,
     ) {
@@ -2319,11 +2336,7 @@ mod test {
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
             Some(Vec::<TableFeature>::new()),
-            Some(vec![
-                TableFeature::IcebergCompatV3,
-                TableFeature::RowTracking,
-                TableFeature::DomainMetadata,
-            ]),
+            Some(writer_features.to_vec()),
         )
         .unwrap();
         let config =
