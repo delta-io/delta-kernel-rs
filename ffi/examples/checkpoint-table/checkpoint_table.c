@@ -101,7 +101,7 @@ int main(int argc, char* argv[]) {
     free_error((Error*)engine_builder_res.err);
     return 1;
   }
-  // Snapshot::checkpoint performs async I/O (read commit JSONs + write parquet checkpoint /
+  // For DefaultEngine, Snapshot::checkpoint performs async I/O (read commit JSONs + write parquet checkpoint /
   // sidecars) and drives it via the engine's task executor with nested `block_on` calls. The
   // default single-threaded background executor would deadlock on that nesting: its one worker
   // thread is parked on the outer `block_on`, so the inner task can never be scheduled. Use a
