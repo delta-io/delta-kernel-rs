@@ -219,6 +219,11 @@ impl TableConfiguration {
         validate_variant_type_feature_support(&table_config)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
+        // TODO(#2630): Validate column-default metadata here so a table that declares a
+        // `CURRENT_DEFAULT` without the `allowColumnDefaults` feature, or with malformed default
+        // metadata, is rejected eagerly as corrupted rather than lazily in
+        // `Transaction::column_defaults`.
+
         Ok(table_config)
     }
 

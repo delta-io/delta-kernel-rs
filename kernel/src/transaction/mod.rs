@@ -1000,8 +1000,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`ColumnDefault::to_scalar`] on each (or fall back to [`ColumnDefault::raw_sql`] when the
     /// kernel cannot parse the default) to materialize the column before writing.
     ///
-    /// Keys are `String` rather than [`ColumnName`] because column defaults are only supported on
-    /// top-level columns, consistent with partition columns.
+    /// Keys are `String` rather than [`ColumnName`] because the kernel currently surfaces defaults
+    /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
+    /// not a protocol one.
     ///
     /// # Errors
     ///
@@ -2111,7 +2112,6 @@ mod tests {
         // NB: `test_utils::schema_with_column_defaults` cannot be used here. In `--lib` unit tests
         // the crate under test and the `delta_kernel` that `test_utils` links are two distinct
         // crate instances, so kernel schema types don't unify across the `test_utils` boundary.
-        // That helper is fine in the integration tests (which link `delta_kernel` exactly once).
 
         /// Builds a transaction whose effective logical schema is `schema`, with the
         /// `allowColumnDefaults` writer feature enabled so any declared defaults are honored.
