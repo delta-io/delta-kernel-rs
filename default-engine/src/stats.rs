@@ -348,6 +348,7 @@ fn compute_column_stats(
     column: &ArrayRef,
     path: &mut Vec<String>,
     filter: &ColumnTrie<'_>,
+    min_max_filter: &ColumnTrie<'_>,
 ) -> DeltaResult<ColumnStats> {
     match column.data_type() {
         // A struct column that the filter marks as a terminal leaf (e.g. Variant, which is a
@@ -377,7 +378,8 @@ fn compute_column_stats(
             for (i, field) in fields.iter().enumerate() {
                 path.push(field.name().to_string());
 
-                let child_stats = compute_column_stats(fixed_struct.column(i), path, filter)?;
+                let child_stats =
+                    compute_column_stats(fixed_struct.column(i), path, filter, min_max_filter)?;
 
                 if let Some(arr) = child_stats.null_count {
                     null_fields.push(Field::new(field.name(), arr.data_type().clone(), true));
@@ -451,6 +453,20 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
+            let null_count: Option<ArrayRef> =
+                Some(Arc::new(Int64Array::from(vec![column.null_count() as i64])));
+
+            // Columns in `filter` but not `min_max_filter` get nullCount only (e.g. interval
+            // columns, which are physically int32/int64: DBR records their nullCount but no
+            // min/max).
+            if !min_max_filter.contains_prefix_of(path) {
+                return Ok(ColumnStats {
+                    null_count,
+                    min_value: None,
+                    max_value: None,
+                });
+            }
+
             // When min/max is None (all nulls or unsupported type), emit a null-valued
             // single-element array to keep the field present in the stats struct. This
             // allows downstream consumers (like StatsColumnVerifier) to find the column and
@@ -458,7 +474,7 @@ fn compute_column_stats(
             // the on-disk format still matches Spark's ignoreNullFields behavior.
             let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
             Ok(ColumnStats {
-                null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
+                null_count,
                 min_value: Some(compute_leaf_agg(column, Agg::Min)?.unwrap_or_else(&null_fallback)),
                 max_value: Some(compute_leaf_agg(column, Agg::Max)?.unwrap_or_else(null_fallback)),
             })
@@ -514,13 +530,17 @@ impl StatsAccumulator {
 ///
 /// # Arguments
 /// * `batch` - The RecordBatch to collect statistics from
-/// * `stats_columns` - Column names that should have statistics collected (allowlist). Only these
-///   columns will appear in nullCount/minValues/maxValues.
+/// * `stats_columns` - Column names that should have `nullCount` collected (allowlist). Only these
+///   columns appear in nullCount/minValues/maxValues.
+/// * `min_max_columns` - Subset of `stats_columns` eligible for min/max. Columns in `stats_columns`
+///   but not here get `nullCount` only (e.g. interval columns, matching DBR).
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
+    min_max_columns: &[ColumnName],
 ) -> DeltaResult<StructArray> {
     let filter = ColumnTrie::from_columns(stats_columns);
+    let min_max_filter = ColumnTrie::from_columns(min_max_columns);
     let schema = batch.schema();
 
     // Collect all stats in a single traversal
@@ -533,7 +553,7 @@ pub(crate) fn collect_stats(
         let column = batch.column(col_idx);
 
         // Single traversal computes all three stats
-        let stats = compute_column_stats(column, &mut path, &filter)?;
+        let stats = compute_column_stats(column, &mut path, &filter, &min_max_filter)?;
 
         if let Some(arr) = stats.null_count {
             null_counts.push(field.name(), arr);
@@ -588,7 +608,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("id")]).unwrap();
+        let stats = collect_stats(&batch, &[column_name!("id")], &[column_name!("id")]).unwrap();
 
         assert_eq!(stats.len(), 1);
         let num_records = stats
@@ -616,7 +636,8 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("value")]).unwrap();
+        let cols = [column_name!("id"), column_name!("value")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         // Check nullCount struct
         let null_count = stats
@@ -662,7 +683,7 @@ mod tests {
         .unwrap();
 
         // Only collect stats for "id", not "value"
-        let stats = collect_stats(&batch, &[column_name!("id")]).unwrap();
+        let stats = collect_stats(&batch, &[column_name!("id")], &[column_name!("id")]).unwrap();
 
         let null_count = stats
             .column_by_name(NULL_COUNT)
@@ -697,7 +718,8 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("number"), column_name!("name")]).unwrap();
+        let cols = [column_name!("number"), column_name!("name")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         // Check minValues
         let min_values = stats
@@ -766,7 +788,8 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("value")]).unwrap();
+        let stats =
+            collect_stats(&batch, &[column_name!("value")], &[column_name!("value")]).unwrap();
 
         // numRecords should be 3
         let num_records = stats
@@ -827,7 +850,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(NullArray::new(length))]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("v")]).unwrap();
+        let stats = collect_stats(&batch, &[column_name!("v")], &[column_name!("v")]).unwrap();
 
         let null_count = stats
             .column_by_name("nullCount")
@@ -874,7 +897,8 @@ mod tests {
         .unwrap();
         let batch = RecordBatch::try_new(schema, vec![Arc::new(inner) as ArrayRef]).unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("s.a"), column_name!("s.v")]).unwrap();
+        let cols = [column_name!("s.a"), column_name!("s.v")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         let s_null_count = stats
             .column_by_name("nullCount")
@@ -920,7 +944,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
 
         // No stats columns requested
-        let stats = collect_stats(&batch, &[]).unwrap();
+        let stats = collect_stats(&batch, &[], &[]).unwrap();
 
         // Should still have numRecords and tightBounds
         assert!(stats.column_by_name(NUM_RECORDS).is_some());
@@ -944,7 +968,8 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+        let stats =
+            collect_stats(&batch, &[column_name!("text")], &[column_name!("text")]).unwrap();
 
         // Check minValues - should be truncated to exactly 32 chars
         let min_values = stats
@@ -997,7 +1022,8 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+        let stats =
+            collect_stats(&batch, &[column_name!("text")], &[column_name!("text")]).unwrap();
 
         // Check maxValues - should use UTF8_MAX_CHAR since 'À' (the truncated char) >= 0x7F
         let max_values = stats
@@ -1031,7 +1057,8 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_stats(&batch, &[column_name!("text")]).unwrap();
+        let stats =
+            collect_stats(&batch, &[column_name!("text")], &[column_name!("text")]).unwrap();
 
         let min_values = stats
             .column_by_name(MIN_VALUES)
@@ -1148,11 +1175,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(nested_struct) as ArrayRef]).unwrap();
 
-        let stats = collect_stats(
-            &batch,
-            &[column_name!("nested.a"), column_name!("nested.b")],
-        )
-        .unwrap();
+        let cols = [column_name!("nested.a"), column_name!("nested.b")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         // Check nullCount.nested.a = 0, nullCount.nested.b = 1
         let null_count = stats
@@ -1280,7 +1304,8 @@ mod tests {
         .unwrap();
 
         // Request stats for both columns
-        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("list_col")]).unwrap();
+        let cols = [column_name!("id"), column_name!("list_col")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         let null_count = stats
             .column_by_name(NULL_COUNT)
@@ -1374,7 +1399,8 @@ mod tests {
         .unwrap();
 
         // === WHEN: collecting stats for both columns ===
-        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("map_col")]).unwrap();
+        let cols = [column_name!("id"), column_name!("map_col")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         // === THEN: map_col has nullCount=1 but no min/max ===
         let null_count = child_struct(&stats, NULL_COUNT);
@@ -1431,7 +1457,8 @@ mod tests {
         .unwrap();
 
         // === WHEN: collecting stats with "v" as a terminal column ===
-        let stats = collect_stats(&batch, &[column_name!("id"), column_name!("v")]).unwrap();
+        let cols = [column_name!("id"), column_name!("v")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         // === THEN: v has nullCount=1 at the struct level, no recursion, no min/max ===
         let null_count = child_struct(&stats, NULL_COUNT);
@@ -1482,11 +1509,8 @@ mod tests {
 
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(struct_array)]).unwrap();
 
-        let stats = collect_stats(
-            &batch,
-            &[column_name!("my_struct.a"), column_name!("my_struct.b")],
-        )
-        .unwrap();
+        let cols = [column_name!("my_struct.a"), column_name!("my_struct.b")];
+        let stats = collect_stats(&batch, &cols, &cols).unwrap();
 
         // Visualizing the data:
         // Row 0: struct=NULL,  (a=1, b=None are "invisible")
@@ -1769,7 +1793,8 @@ mod tests {
 
         // Build stats_columns from all leaf columns in the parquet schema
         let stats_columns = extract_leaf_columns(schema.fields(), &[]);
-        let stats_struct = collect_stats(&record_batch, &stats_columns).expect("collect stats");
+        let stats_struct =
+            collect_stats(&record_batch, &stats_columns, &stats_columns).expect("collect stats");
 
         // Convert kernel stats to JSON
         let json_array = to_json(&stats_struct).expect("convert stats to JSON");

@@ -13,6 +13,9 @@ pub(crate) use column_mapping::{
 use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
+pub(crate) use interval_type::{
+    schema_contains_interval_type, validate_interval_type_feature_support,
+};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -30,6 +33,7 @@ use crate::{DeltaResult, Error};
 
 mod column_mapping;
 mod iceberg_compat;
+mod interval_type;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -146,6 +150,14 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
+    /// ANSI interval types (`interval year to month`, `interval day to second`).
+    ///
+    /// TODO(#2840): intervalType is not fully supported yet. Kernel support is gated by the
+    /// `interval-type-in-dev` cargo feature, and the feature is auto-enabled (like timestampNtz)
+    /// when a schema contains an interval column.
+    #[strum(serialize = "intervalType")]
+    #[serde(rename = "intervalType")]
+    IntervalType,
     /// timestamps without timezone support
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
@@ -557,6 +569,19 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2840): drop the gate (make `kernel_support` unconditionally `Supported`) once the
+// interval-type protocol RFC is ratified in PROTOCOL.md.
+static INTERVAL_TYPE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "interval-type-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "interval-type-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 /// TODO: When type widening is supported on writes, restrict the allowed
 /// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
 /// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
@@ -660,6 +685,7 @@ impl TableFeature {
             | TableFeature::CatalogOwnedPreview
             | TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
+            | TableFeature::IntervalType
             | TableFeature::TimestampWithoutTimezone
             | TableFeature::TypeWidening
             | TableFeature::TypeWideningPreview
@@ -726,6 +752,7 @@ impl TableFeature {
             TableFeature::CatalogOwnedPreview => &CATALOG_OWNED_PREVIEW_INFO,
             TableFeature::ColumnMapping => &COLUMN_MAPPING_INFO,
             TableFeature::DeletionVectors => &DELETION_VECTORS_INFO,
+            TableFeature::IntervalType => &INTERVAL_TYPE_INFO,
             TableFeature::TimestampWithoutTimezone => &TIMESTAMP_WITHOUT_TIMEZONE_INFO,
             TableFeature::TypeWidening => &TYPE_WIDENING_INFO,
             TableFeature::TypeWideningPreview => &TYPE_WIDENING_PREVIEW_INFO,
@@ -987,6 +1014,7 @@ mod tests {
                 TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
                 TableFeature::ColumnMapping => "columnMapping",
                 TableFeature::DeletionVectors => "deletionVectors",
+                TableFeature::IntervalType => "intervalType",
                 TableFeature::TimestampWithoutTimezone => "timestampNtz",
                 TableFeature::TypeWidening => "typeWidening",
                 TableFeature::TypeWideningPreview => "typeWidening-preview",

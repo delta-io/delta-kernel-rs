@@ -171,12 +171,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        min_max_columns: &[ColumnName],
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
         // Collect statistics before writing (includes numRecords)
-        let stats = collect_stats(record_batch, stats_columns)?;
+        let stats = collect_stats(record_batch, stats_columns, min_max_columns)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new_with_options(
@@ -235,6 +236,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
                 &write_context.write_dir(),
                 data,
                 write_context.stats_columns(),
+                write_context.min_max_stats_columns(),
             )
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
@@ -1067,7 +1069,7 @@ mod tests {
         ));
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[], &[])
             .await
             .unwrap();
 
@@ -1147,7 +1149,7 @@ mod tests {
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[], &[])
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
@@ -1674,7 +1676,7 @@ mod tests {
             .unwrap(),
         ));
         let metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[], &[])
             .await
             .unwrap();
 
