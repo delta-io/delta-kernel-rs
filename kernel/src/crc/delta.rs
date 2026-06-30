@@ -39,41 +39,51 @@ pub(crate) struct CrcDelta {
 }
 
 impl CrcDelta {
-    /// Convert this delta into a fresh [`Crc`]. Used when the delta represents the entire table
-    /// state (e.g. CREATE TABLE or the first commit in a forward replay from version zero).
+    /// Convert this delta into a fresh [`Crc`] at `version`. Used when the delta represents the
+    /// entire table state: CREATE TABLE (version 0), or a full-history reverse replay over all
+    /// commits when no CRC or checkpoint is available.
+    ///
+    /// Because the delta covers the whole table, the resulting domain-metadata and
+    /// set-transaction states are [`Complete`](DomainMetadataState::Complete) (authoritative).
+    /// If the file-stats portion is not incremental-safe, file stats are
+    /// [`Indeterminate`](FileStatsState::Indeterminate).
     ///
     /// Returns `None` if protocol or metadata are missing (both are required for a valid CRC).
-    pub(crate) fn into_crc_for_version_zero(self) -> Option<Crc> {
+    pub(crate) fn into_complete_crc(self, version: Version) -> Option<Crc> {
         let protocol = self.protocol?;
         let metadata = self.metadata?;
-        // For CREATE TABLE we know the full domain metadata state: the transaction either
-        // included domain metadata actions or it didn't. Always Complete. Drop tombstones
-        // (a fresh table has no domains to remove).
+        // The delta covers the full table, so the domain metadata state is authoritative.
+        // Drop tombstones (a from-scratch state has no prior domains to remove).
         let domain_metadata_state = DomainMetadataState::Complete(
             self.domain_metadata
                 .into_iter()
                 .filter(|(_, dm)| !dm.is_removed())
                 .collect(),
         );
-        // CREATE TABLE starts with a known-complete set of transactions (possibly empty).
+        // The delta covers the full table, so the set-transaction state is authoritative.
         let set_transaction_state = SetTransactionState::Complete(self.set_transactions);
-        Some(Crc {
-            version: 0,
-            file_stats_state: FileStatsState::Complete(FileStats {
+        let file_stats_state = if self.is_incremental_safe {
+            FileStatsState::Complete(FileStats {
                 num_files: self.file_stats.net_files(),
                 table_size_bytes: self.file_stats.net_bytes(),
-                // For version zero the delta IS the full table histogram. Validate that all bins
-                // are non-negative (a real table can't have negative file counts). If validation
-                // fails, drop the histogram.
+                // The delta IS the full table histogram. Validate that all bins are non-negative
+                // (a real table can't have negative file counts). If validation fails, drop the
+                // histogram.
                 file_size_histogram: self.file_stats.net_histogram.and_then(|delta| {
                     delta
                         .check_non_negative()
                         .inspect_err(|e| {
-                            warn!("Non-negative file count check failed, dropping file size histogram for version zero: {e}");
+                            warn!("Non-negative file count check failed, dropping file size histogram: {e}");
                         })
                         .ok()
                 }),
-            }),
+            })
+        } else {
+            FileStatsState::Indeterminate
+        };
+        Some(Crc {
+            version,
+            file_stats_state,
             protocol,
             metadata,
             domain_metadata_state,
@@ -435,7 +445,7 @@ mod tests {
         assert_eq!(crc.in_commit_timestamp_opt, None);
     }
 
-    // ===== CrcDelta::into_crc_for_version_zero tests =====
+    // ===== CrcDelta::into_complete_crc tests =====
 
     fn test_protocol() -> Protocol {
         Protocol::try_new(
@@ -448,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_into_crc_for_version_zero_with_protocol_and_metadata() {
+    fn test_into_complete_crc_with_protocol_and_metadata() {
         let protocol = test_protocol();
         let metadata = Metadata::default();
         let delta = CrcDelta {
@@ -456,7 +466,7 @@ mod tests {
             metadata: Some(metadata.clone()),
             ..add_files_delta(5, 1000)
         };
-        let crc = delta.into_crc_for_version_zero().unwrap();
+        let crc = delta.into_complete_crc(0).unwrap();
         let stats = crc.file_stats().unwrap();
         assert_eq!(crc.version, 0);
         assert_eq!(crc.protocol, protocol);
@@ -476,25 +486,25 @@ mod tests {
     }
 
     #[test]
-    fn test_into_crc_for_version_zero_returns_none_without_protocol() {
+    fn test_into_complete_crc_returns_none_without_protocol() {
         let delta = CrcDelta {
             metadata: Some(Metadata::default()),
             ..add_files_delta(5, 1000)
         };
-        assert!(delta.into_crc_for_version_zero().is_none());
+        assert!(delta.into_complete_crc(0).is_none());
     }
 
     #[test]
-    fn test_into_crc_for_version_zero_returns_none_without_metadata() {
+    fn test_into_complete_crc_returns_none_without_metadata() {
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             ..add_files_delta(5, 1000)
         };
-        assert!(delta.into_crc_for_version_zero().is_none());
+        assert!(delta.into_complete_crc(0).is_none());
     }
 
     #[test]
-    fn test_into_crc_for_version_zero_with_domain_metadata() {
+    fn test_into_complete_crc_with_domain_metadata() {
         let dm = DomainMetadata::new("my.domain".to_string(), "config1".to_string());
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
@@ -502,22 +512,47 @@ mod tests {
             domain_metadata: HashMap::from([("my.domain".to_string(), dm)]),
             ..add_files_delta(0, 0)
         };
-        let crc = delta.into_crc_for_version_zero().unwrap();
+        let crc = delta.into_complete_crc(0).unwrap();
         let map = crc.domain_metadata_state.expect_complete();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my.domain"].configuration(), "config1");
     }
 
     #[test]
-    fn test_into_crc_for_version_zero_with_in_commit_timestamp() {
+    fn test_into_complete_crc_with_in_commit_timestamp() {
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             in_commit_timestamp: Some(12345),
             ..add_files_delta(0, 0)
         };
-        let crc = delta.into_crc_for_version_zero().unwrap();
+        let crc = delta.into_complete_crc(0).unwrap();
         assert_eq!(crc.in_commit_timestamp_opt, Some(12345));
+    }
+
+    #[test]
+    fn into_complete_crc_at_nonzero_version_keeps_complete_stats() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            ..add_files_delta(5, 1000)
+        };
+        let crc = delta.into_complete_crc(7).unwrap();
+        assert_eq!(crc.version, 7);
+        assert_eq!(crc.file_stats().unwrap().num_files(), 5);
+    }
+
+    #[test]
+    fn into_complete_crc_with_unsafe_delta_is_indeterminate() {
+        let delta = CrcDelta {
+            protocol: Some(test_protocol()),
+            metadata: Some(Metadata::default()),
+            is_incremental_safe: false,
+            ..add_files_delta(5, 1000)
+        };
+        let crc = delta.into_complete_crc(7).unwrap();
+        assert_eq!(crc.version, 7);
+        assert!(crc.file_stats_state.is_indeterminate());
     }
 
     // ===== apply: set transaction tests =====
@@ -558,10 +593,10 @@ mod tests {
         assert_eq!(map["new"].version, 1);
     }
 
-    // ===== into_crc_for_version_zero: set transaction tests =====
+    // ===== into_complete_crc: set transaction tests =====
 
     #[test]
-    fn test_into_crc_for_version_zero_with_set_transactions() {
+    fn test_into_complete_crc_with_set_transactions() {
         let txn = SetTransaction::new("my-app".to_string(), 5, Some(3000));
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
@@ -569,7 +604,7 @@ mod tests {
             set_transactions: HashMap::from([("my-app".to_string(), txn)]),
             ..add_files_delta(0, 0)
         };
-        let crc = delta.into_crc_for_version_zero().unwrap();
+        let crc = delta.into_complete_crc(0).unwrap();
         let map = crc.set_transaction_state.expect_complete();
         assert_eq!(map.len(), 1);
         assert_eq!(map["my-app"].version, 5);
@@ -700,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn into_crc_for_version_zero_includes_histogram() {
+    fn into_complete_crc_includes_histogram() {
         let delta_hist = histogram_from_sizes(&[500, 1000]);
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
@@ -714,7 +749,7 @@ mod tests {
             is_incremental_safe: true,
             ..Default::default()
         };
-        let crc = delta.into_crc_for_version_zero().unwrap();
+        let crc = delta.into_complete_crc(0).unwrap();
         let stats = crc.file_stats().unwrap();
         let hist = stats.file_size_histogram().unwrap();
         assert_eq!(hist.file_counts[0], 2);
@@ -722,15 +757,15 @@ mod tests {
     }
 
     #[test]
-    fn into_crc_for_version_zero_without_histogram() {
+    fn into_complete_crc_without_histogram() {
         // add_files_delta() produces a CrcDelta with no histogram delta, so
-        // into_crc_for_version_zero cannot construct a file size histogram.
+        // into_complete_crc cannot construct a file size histogram.
         let delta = CrcDelta {
             protocol: Some(test_protocol()),
             metadata: Some(Metadata::default()),
             ..add_files_delta(0, 0)
         };
-        let crc = delta.into_crc_for_version_zero().unwrap();
+        let crc = delta.into_complete_crc(0).unwrap();
         let stats = crc.file_stats().unwrap();
         assert!(stats.file_size_histogram().is_none());
     }
