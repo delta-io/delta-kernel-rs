@@ -6,9 +6,9 @@ publish = false
 
 [features]
 default = ["arrow"]
-arrow = ["arrow-58"]
+arrow = ["arrow-59"]
+arrow-59 = ["common/arrow-59"]
 arrow-58 = ["common/arrow-58"]
-arrow-57 = ["common/arrow-57"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

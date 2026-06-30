@@ -31,9 +31,9 @@ uuid = { version = "1.18.0", features = ["v4"] }
 
 [features]
 default = ["arrow", "rustls"]
-arrow = ["arrow-58"]
+arrow = ["arrow-59"]
+arrow-59 = ["delta_kernel/arrow-59"]
 arrow-58 = ["delta_kernel/arrow-58"]
-arrow-57 = ["delta_kernel/arrow-57"]
 native-tls = ["reqwest/native-tls"]
 rustls = ["reqwest/rustls"]
 
