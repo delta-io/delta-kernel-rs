@@ -78,6 +78,15 @@ impl<'a> ColumnDefault<'a> {
             ))),
         }
     }
+
+    /// Returns `true` iff the default parsed to a literal expression.
+    ///
+    /// SQL the kernel could not parse (e.g. arithmetic or function calls) returns `false`, as does
+    /// the defensive case of a parsed-but-non-literal expression. Note that `NULL` parses to a
+    /// literal, so this is `true` for a `NULL` default regardless of the column type.
+    pub(crate) fn is_literal(&self) -> bool {
+        matches!(self.parsed_sql, Some(Expression::Literal(_)))
+    }
 }
 
 #[cfg(test)]
