@@ -231,8 +231,8 @@ pub struct ScanMetadataCompleted {
     pub num_non_file_actions: u64,
     pub num_predicate_filtered: u64,
     pub peak_hash_set_size: u64,
-    pub dedup_visitor_time_ms: u64,
-    pub predicate_eval_time_ms: u64,
+    pub dedup_visitor_time_ns: u64,
+    pub predicate_eval_time_ns: u64,
 }
 
 /// A storage list operation completed.
@@ -478,8 +478,8 @@ impl MetricEvent {
                 num_non_file_actions,
                 num_predicate_filtered,
                 peak_hash_set_size,
-                dedup_visitor_time_ms,
-                predicate_eval_time_ms,
+                dedup_visitor_time,
+                predicate_eval_time,
             }) => Self::ScanMetadataCompleted(ScanMetadataCompleted {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -493,8 +493,8 @@ impl MetricEvent {
                 num_non_file_actions: *num_non_file_actions,
                 num_predicate_filtered: *num_predicate_filtered,
                 peak_hash_set_size: *peak_hash_set_size as u64, // note usize -> u64 cast
-                dedup_visitor_time_ms: *dedup_visitor_time_ms,
-                predicate_eval_time_ms: *predicate_eval_time_ms,
+                dedup_visitor_time_ns: ns(*dedup_visitor_time),
+                predicate_eval_time_ns: ns(*predicate_eval_time),
             }),
             K::StorageListCompleted(kernel::StorageListCompleted {
                 duration,
@@ -650,8 +650,8 @@ mod tests {
             num_non_file_actions: 31,
             num_predicate_filtered: 37,
             peak_hash_set_size: 41,
-            dedup_visitor_time_ms: 43,
-            predicate_eval_time_ms: 47,
+            dedup_visitor_time: Duration::from_nanos(43),
+            predicate_eval_time: Duration::from_nanos(47),
         });
         with_ffi_event(&event, |ffi| {
             let MetricEvent::ScanMetadataCompleted(e) = ffi else {
@@ -674,8 +674,8 @@ mod tests {
             assert_eq!(e.num_non_file_actions, 31);
             assert_eq!(e.num_predicate_filtered, 37);
             assert_eq!(e.peak_hash_set_size, 41);
-            assert_eq!(e.dedup_visitor_time_ms, 43);
-            assert_eq!(e.predicate_eval_time_ms, 47);
+            assert_eq!(e.dedup_visitor_time_ns, 43);
+            assert_eq!(e.predicate_eval_time_ns, 47);
         });
     }
 
