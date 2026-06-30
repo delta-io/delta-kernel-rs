@@ -290,14 +290,6 @@ mod tests {
     use super::*;
     use crate::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
 
-    // A wrapper trait that allows us to work with the ObjectStore trait, without directly importing
-    // it and the ambiguous method errors it would bring.
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    trait ObjectStore: delta_kernel::object_store::ObjectStore {}
-
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    impl<T: delta_kernel::object_store::ObjectStore + ?Sized> ObjectStore for T {}
-
     /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
     /// that since the keys are resolved in order, requests to subsequent keys in the order will
     /// block until the earlier keys are requested.
@@ -444,12 +436,6 @@ mod tests {
             self.inner.get_ranges(location, ranges).await
         }
 
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn delete(&self, location: &Path) -> Result<()> {
-            self.inner.delete(location).await
-        }
-
-        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
         fn delete_stream(
             &self,
             locations: BoxStream<'static, Result<Path>>,
@@ -473,19 +459,8 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
         async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
             self.inner.copy_opts(from, to, options).await
-        }
-
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
         }
     }
 
