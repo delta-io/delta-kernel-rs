@@ -219,6 +219,11 @@ impl TableConfiguration {
         validate_variant_type_feature_support(&table_config)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
+        // TODO(#2630): Validate column-default metadata here so a table that declares a
+        // `CURRENT_DEFAULT` without the `allowColumnDefaults` feature, or with malformed default
+        // metadata, is rejected eagerly as corrupted rather than lazily in
+        // `Transaction::column_defaults`.
+
         Ok(table_config)
     }
 
@@ -449,6 +454,15 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn logical_schema(&self) -> SchemaRef {
         self.logical_schema.clone()
+    }
+
+    /// Borrows this table's logical schema, tied to `&self` (no `Arc` clone).
+    ///
+    /// Use this over [`logical_schema`](Self::logical_schema) when callers need to derive
+    /// `&self`-bound borrows from the schema (e.g. `&DataType` of a field).
+    #[cfg(feature = "column-defaults-in-dev")]
+    pub(crate) fn logical_schema_ref(&self) -> &SchemaRef {
+        &self.logical_schema
     }
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.

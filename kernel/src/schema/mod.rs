@@ -483,6 +483,30 @@ impl StructField {
         }
     }
 
+    /// Returns this field's column default, parsed from its `CURRENT_DEFAULT`
+    /// ([`ColumnMetadataKey::CurrentDefault`]) metadata, if present.
+    ///
+    /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
+    /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
+    /// - `Err(_)` -- present but malformed: either not a [`MetadataValue::String`] (the protocol
+    ///   defines `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected
+    ///   by [`ColumnDefault`] (e.g. a non-NULL default on a non-primitive type).
+    #[cfg(feature = "column-defaults-in-dev")]
+    pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
+        let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
+            None => return Ok(None),
+            Some(MetadataValue::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-string `{}` annotation: {other}",
+                    self.name,
+                    ColumnMetadataKey::CurrentDefault.as_ref(),
+                )))
+            }
+        };
+        ColumnDefault::new(raw_sql, &self.data_type).map(Some)
+    }
+
     /// Validates and extracts pre-existing column-mapping annotations on this field, returning
     /// the parsed `id` and `physical_name` borrowed from the field's metadata. Returning the
     /// parsed values lets the column-mapping assignment dispatch match on
@@ -4121,6 +4145,69 @@ mod tests {
             ColumnMetadataKey::CurrentDefault.as_ref(),
             "CURRENT_DEFAULT"
         );
+    }
+
+    #[cfg(feature = "column-defaults-in-dev")]
+    mod column_default_method {
+        use super::*;
+
+        /// A nullable field named `c` carrying `raw_sql` as its `CURRENT_DEFAULT`.
+        fn field_with_default(data_type: DataType, raw_sql: &str) -> StructField {
+            StructField::nullable("c", data_type).add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::String(raw_sql.to_string()),
+            )])
+        }
+
+        #[test]
+        fn returns_none_when_no_current_default() {
+            let field = StructField::nullable("c", DataType::INTEGER);
+            assert_eq!(field.column_default().unwrap(), None);
+        }
+
+        #[test]
+        fn errors_when_current_default_is_not_a_string() {
+            let field = StructField::nullable("c", DataType::INTEGER).add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::Number(42),
+            )]);
+            let err = field
+                .column_default()
+                .expect_err("a non-string CURRENT_DEFAULT must error")
+                .to_string();
+            assert!(err.contains("non-string"), "got: {err}");
+        }
+
+        #[rstest]
+        #[case::parsable_literal(DataType::INTEGER, "42", true)]
+        #[case::null_primitive(DataType::INTEGER, "NULL", true)]
+        #[case::unparsable_function_call(DataType::TIMESTAMP, "current_timestamp()", false)]
+        #[case::unparsable_type_mismatch(DataType::TIMESTAMP, "0.18", false)]
+        fn exposes_default_for_primitive(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+            #[case] parsable: bool,
+        ) {
+            let field = field_with_default(data_type.clone(), raw_sql);
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            assert_eq!(column_default.raw_sql(), raw_sql);
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap().is_some(), parsable);
+        }
+
+        #[test]
+        fn non_null_default_on_non_primitive_errors() {
+            let data_type = DataType::from(ArrayType::new(DataType::INTEGER, true));
+            let field = field_with_default(data_type, "ARRAY(1)");
+            let err = field
+                .column_default()
+                .expect_err("non-NULL default on a non-primitive type must error")
+                .to_string();
+            assert!(err.contains("not supported"), "got: {err}");
+        }
     }
 
     /// Schema: { a: { b: { c: double } } } — supports walks at depths 1, 2, and 3.

@@ -118,11 +118,11 @@ mod feature_enabled {
 
     use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
-    };
+    use delta_kernel::expressions::Scalar;
+    use delta_kernel::schema::{ArrayType, DataType, StructField, StructType};
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::Snapshot;
     use rstest::rstest;
@@ -215,12 +215,16 @@ mod feature_enabled {
             .expect("c field must exist in loaded schema");
 
         assert_eq!(field.data_type(), &data_type);
-        // TODO(#2630): replace this manual metadata read once StructField::column_default exists.
+        let column_default = field
+            .column_default()
+            .expect("column_default must not error for a valid primitive default")
+            .expect("CURRENT_DEFAULT metadata must be present in the loaded schema");
         assert_eq!(
-            field.get_config_value(&ColumnMetadataKey::CurrentDefault),
-            Some(&MetadataValue::String(default_sql.to_string())),
-            "CURRENT_DEFAULT metadata must round-trip verbatim",
+            column_default.raw_sql(),
+            default_sql,
+            "CURRENT_DEFAULT raw SQL must round-trip verbatim",
         );
+        assert_eq!(column_default.data_type(), &data_type);
 
         Ok(())
     }
@@ -259,5 +263,93 @@ mod feature_enabled {
             &["timestampNtz"],
         )
         .await
+    }
+
+    #[rstest]
+    #[case::all_data_columns(&[])]
+    #[case::default_on_partition_column(&["b"])]
+    #[tokio::test]
+    async fn test_transaction_column_defaults_exposes_all_top_level_defaults(
+        #[case] partition_columns: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // `a`: no default, `b`: kernel-parsable default, `c`: non-kernel-parsable default.
+        let base = StructType::try_new(vec![
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::INTEGER),
+            StructField::nullable("c", DataType::TIMESTAMP),
+        ])?;
+        let schema = schema_with_column_defaults(
+            &base,
+            HashMap::from([("b", "1337"), ("c", "current_timestamp()")]),
+        )?;
+
+        let (store, engine, table_location) = engine_store_setup("test_txn_column_defaults", None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            partition_columns,
+            true,                        /* use_37_protocol */
+            vec![],                      /* reader_features */
+            vec!["allowColumnDefaults"], /* writer_features */
+        )
+        .await?;
+
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+
+        let defaults = txn.column_defaults()?;
+        assert_eq!(defaults.len(), 2, "only b and c declare a default");
+        assert!(!defaults.contains_key("a"), "a has no default");
+
+        let b = &defaults["b"];
+        assert_eq!(b.raw_sql(), "1337");
+        assert_eq!(b.to_scalar()?, Some(Scalar::Integer(1337)));
+
+        let c = &defaults["c"];
+        assert_eq!(c.raw_sql(), "current_timestamp()");
+        assert_eq!(
+            c.to_scalar()?,
+            None,
+            "a non-kernel-parsable default is not parsed by the kernel",
+        );
+
+        Ok(())
+    }
+
+    /// A non-NULL default on a non-primitive column is accepted at create time but surfaces as an
+    /// error when later discovered via `Transaction::column_defaults`.
+    #[tokio::test]
+    async fn test_transaction_column_defaults_errors_on_non_null_non_primitive_default(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable(
+            "arr",
+            ArrayType::new(DataType::INTEGER, true),
+        )])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("arr", "ARRAY(1)")]))?;
+
+        let (store, engine, table_location) =
+            engine_store_setup("test_txn_column_defaults_non_primitive", None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            &[],                         /* partition_columns */
+            true,                        /* use_37_protocol */
+            vec![],                      /* reader_features */
+            vec!["allowColumnDefaults"], /* writer_features */
+        )
+        .await?;
+
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+
+        let err = txn
+            .column_defaults()
+            .expect_err("a non-NULL default on a non-primitive column must error")
+            .to_string();
+        assert!(err.contains("not supported"), "got: {err}");
+
+        Ok(())
     }
 }
