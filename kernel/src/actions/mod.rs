@@ -11,7 +11,9 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
-use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{
+    schema_ref, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::table_features::{
     FeatureType, IntoTableFeature, TableFeature, MIN_VALID_RW_VERSION,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -106,46 +108,26 @@ static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 /// Schema for Add actions in the Delta log.
 /// Wraps the Add action schema in a top-level struct with "add" field name.
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME,
-        Add::to_schema(),
-    )]))
-});
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { nullable ADD_NAME: (Add::to_schema()) });
 
 /// Schema for Remove actions in the Delta log.
 /// Wraps the Remove action schema in a top-level struct with "remove" field name.
-static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        REMOVE_NAME,
-        Remove::to_schema(),
-    )]))
-});
+static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { nullable REMOVE_NAME: (Remove::to_schema()) });
 
 /// Schema for CommitInfo actions in the Delta log.
 /// Wraps the CommitInfo schema in a top-level struct with "commitInfo" field name.
-static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        COMMIT_INFO_NAME,
-        CommitInfo::to_schema(),
-    )]))
-});
+static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { nullable COMMIT_INFO_NAME: (CommitInfo::to_schema()) });
 
 /// Schema for transaction (txn) actions in the Delta log.
 /// Wraps the SetTransaction schema in a top-level struct with "txn" field name.
-static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        SET_TRANSACTION_NAME,
-        SetTransaction::to_schema(),
-    )]))
-});
+static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { nullable SET_TRANSACTION_NAME: (SetTransaction::to_schema()) });
 
-static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        DOMAIN_METADATA_NAME,
-        DomainMetadata::to_schema(),
-    )]))
-});
+static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { nullable DOMAIN_METADATA_NAME: (DomainMetadata::to_schema()) });
 
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits
@@ -193,10 +175,8 @@ pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
 ///
 /// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
 /// schema in a top-level "add" struct.
-pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME, schema,
-    )]))
+pub(crate) fn as_log_add_schema(add_schema: SchemaRef) -> SchemaRef {
+    schema_ref! { nullable ADD_NAME: (add_schema) }
 }
 
 // Serde derives are needed for CRC file deserialization (see `crc::reader`).
@@ -1716,10 +1696,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1744,10 +1721,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1757,10 +1731,7 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1847,10 +1818,7 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1898,10 +1866,7 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),
@@ -2140,7 +2105,7 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_empty_schema() {
-        let schema = Arc::new(StructType::new_unchecked([]));
+        let schema = schema_ref! {};
         assert!(!schema_contains_file_actions(&schema));
     }
 

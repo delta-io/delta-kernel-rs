@@ -11,7 +11,7 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -197,10 +197,7 @@ async fn test_incremental_update_advances_crc_with_real_file_stats(
 async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -260,10 +257,7 @@ async fn test_crc_returns_resolved_crc_at_snapshot_version() -> DeltaResult<()> 
 async fn test_crc_returns_none_when_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -287,10 +281,7 @@ fn create_table_and_commit(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<delta_kernel::transaction::CommittedTransaction> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let txn = create_table(table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine, Box::new(FileSystemCommitter::new()))?
@@ -719,10 +710,7 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     let mut builder = create_table(&table_path, schema, "test_engine");
     if dm_supported {
@@ -1143,10 +1131,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     #[case] expected: Option<i64>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     // v0: create the table with optional retention property
     let mut builder = create_table(&table_path, schema, "test_engine");
@@ -1193,10 +1178,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 #[tokio::test]
 async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     // v0: create the table with zero-second retention so any past lastUpdated expires.
     let committed = create_table(&table_path, schema, "test_engine")
@@ -1255,10 +1237,7 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaR
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: create table with aggressive retention
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     create_table(&table_path, schema, "test_engine")
         .with_table_properties([(
             "delta.setTransactionRetentionDuration",
@@ -1703,10 +1682,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     // === Step 1: Create table with clustering, rowTracking, ICT ===
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(&table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
         .with_table_properties([

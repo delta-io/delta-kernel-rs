@@ -67,11 +67,12 @@ mod sealed {
 ///
 /// Uses a type-state pattern (`S`) to enforce at compile time:
 /// - At least one schema operation must be queued before `build()` is callable.
-/// - Only operations valid for the current state can be chained. This will disallow incompatibel
+/// - Only operations valid for the current state can be chained. This will disallow incompatible
 ///   chaining.
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
+    correlation_id: Option<Arc<str>>,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
@@ -88,8 +89,16 @@ impl<S> AlterTableTransactionBuilder<S> {
         AlterTableTransactionBuilder {
             snapshot: self.snapshot,
             operations: self.operations,
+            correlation_id: self.correlation_id,
             _state: PhantomData,
         }
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining the alter-table commit's metric
+    /// events to the caller's own request or operation id. An empty id is treated as unset.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
     }
 }
 
@@ -99,6 +108,7 @@ impl AlterTableTransactionBuilder<Ready> {
         AlterTableTransactionBuilder {
             snapshot,
             operations: Vec::new(),
+            correlation_id: None,
             _state: PhantomData,
         }
     }
@@ -193,6 +203,11 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_schema,
         )?;
 
-        AlterTableTransaction::try_new_alter_table(self.snapshot, evolved_table_config, committer)
+        AlterTableTransaction::try_new_alter_table(
+            self.snapshot,
+            evolved_table_config,
+            committer,
+            self.correlation_id,
+        )
     }
 }

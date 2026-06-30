@@ -6,6 +6,32 @@ use syn::{
     Type, Visibility,
 };
 
+mod schema_macro;
+
+// Builds a `StructType`; see `delta_kernel::schema::schema` re-export for details.
+#[doc(hidden)]
+#[proc_macro]
+pub fn schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    schema_macro::parse_schema(input, false, |block| block)
+}
+
+// Fallible version of `schema!`; see `delta_kernel::schema::try_schema` re-export for details.
+#[doc(hidden)]
+#[proc_macro]
+pub fn try_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    // Wrap the block in a closure that anchors the block's `?` operators
+    schema_macro::parse_schema(input, true, |block| {
+        quote! { (|| -> delta_kernel::DeltaResult<_> #block)() }
+    })
+}
+
+// `Arc`-wrapped `schema!`; see `delta_kernel::schema::schema_ref` for details.
+#[doc(hidden)]
+#[proc_macro]
+pub fn schema_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    schema_macro::parse_schema(input, false, |block| quote!(::std::sync::Arc::new(#block)))
+}
+
 /// Parses a dot-delimited column name into an array of field names. See
 /// `delta_kernel::expressions::column_name::column_name` macro for details.
 #[proc_macro]

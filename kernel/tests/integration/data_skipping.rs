@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int64Array, RecordBatch};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
     column_expr, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
@@ -23,6 +24,8 @@ use delta_kernel::expressions::{
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Snapshot, SnapshotRef};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
@@ -104,17 +107,17 @@ async fn build_capped_table_with_checkpoint(
     Ok((tmp_dir, table_path, engine))
 }
 
-/// Counts the files surviving data skipping. Exercises the sequential
+/// Returns the paths of files surviving data skipping. Exercises the sequential
 /// `Scan::scan_metadata` path when `use_parallel` is `false`, or the two-phase
 /// `Scan::parallel_scan_metadata` + `ParallelScanMetadata` path when `true`. The parallel
 /// branch dispatches one file per `ParallelScanMetadata` to maximize coverage of the worker
 /// rebuild path.
-fn count_selected_files(
+fn selected_paths(
     snapshot: SnapshotRef,
     engine: Arc<TestEngine>,
     predicate: PredicateRef,
     use_parallel: bool,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
 
     fn push_path(paths: &mut Vec<String>, scan_file: delta_kernel::scan::state::ScanFile) {
@@ -144,7 +147,7 @@ fn count_selected_files(
         }
     }
 
-    Ok(paths.len())
+    Ok(paths)
 }
 
 /// Loads a fresh snapshot off the same on-disk table and returns the surviving file count
@@ -155,9 +158,27 @@ fn surviving_files(
     predicate: PredicateRef,
     use_parallel: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(surviving_paths(table_path, engine, predicate, use_parallel)?.len())
+}
+
+/// Like [`surviving_files`] but returns the surviving file paths, sorted so a test can make an
+/// order-independent exact-set assertion (`scan_metadata`, and especially the parallel path, does
+/// not guarantee a stable file emission order).
+///
+/// Test-only: this never runs in the production scan path. The sort is trivial here because the
+/// test tables yield only a handful of files, but it is O(n log n) in the surviving-file count and
+/// so would not belong on a hot path over a large result set.
+fn surviving_paths(
+    table_path: &str,
+    engine: Arc<TestEngine>,
+    predicate: PredicateRef,
+    use_parallel: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let url = delta_kernel::try_parse_uri(table_path)?;
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
-    count_selected_files(snapshot, engine, predicate, use_parallel)
+    let mut paths = selected_paths(snapshot, engine, predicate, use_parallel)?;
+    paths.sort();
+    Ok(paths)
 }
 
 // === Predicate matrix ===
@@ -561,6 +582,241 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
         2
+    );
+    Ok(())
+}
+
+// === RFC 3339 offset partition values (#2733) ===
+//
+// A foreign writer can emit a timestamp partition value with a non-UTC RFC 3339 offset. The
+// offset must be honored and the value normalized to UTC, e.g. `2024-06-15T14:30:00+05:00`
+// denotes 09:30 UTC, not 14:30 UTC.
+
+/// Builds a Delta commit body containing a `commitInfo` plus one stats-less Add per
+/// `(path, ts_partition_value)`.
+fn commit_with_ts_partitioned_adds(version: u64, adds: &[(&str, &str)]) -> String {
+    let mut lines = vec![format!(
+        r#"{{"commitInfo":{{"timestamp":1700000000000,"operation":"WRITE","version":{version}}}}}"#
+    )];
+    for (path, ts) in adds {
+        lines.push(format!(
+            r#"{{"add":{{"path":"{path}","size":1024,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{{"ts":"{ts}"}}}}}}"#
+        ));
+    }
+    lines.join("\n")
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_pruning_honors_rfc3339_offset_partition_values(
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("ts", DataType::TIMESTAMP),
+        StructField::nullable("v", DataType::LONG),
+    ])?);
+    create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["ts"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // v1: adds in the style of an offset-emitting foreign writer. Pruning never opens data
+    // files, so fake paths are fine. The two partition values denote *different* instants:
+    // file_A is 2024-06-15T09:30:00Z once its +05:00 offset is honored, file_B is 14:30:00Z.
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        commit_with_ts_partitioned_adds(
+            1,
+            &[
+                ("file_A.parquet", "2024-06-15T14:30:00+05:00"),
+                ("file_B.parquet", "2024-06-15T14:30:00Z"),
+            ],
+        ),
+    )
+    .await?;
+
+    let nine_thirty_utc_us: i64 = 1_718_443_800_000_000; // 2024-06-15T09:30:00Z
+    let fourteen_thirty_utc_us: i64 = 1_718_461_800_000_000; // 2024-06-15T14:30:00Z
+
+    // ts == 09:30Z must keep only file_A (its +05:00 value normalized to 09:30 UTC).
+    let predicate = Arc::new(Pred::eq(
+        column_expr!("ts"),
+        Expr::literal(Scalar::Timestamp(nine_thirty_utc_us)),
+    ));
+    assert_eq!(
+        surviving_files(&table_path, engine.clone(), predicate, use_parallel)?,
+        1
+    );
+
+    // ts == 14:30Z must keep only file_B.
+    let predicate = Arc::new(Pred::eq(
+        column_expr!("ts"),
+        Expr::literal(Scalar::Timestamp(fourteen_thirty_utc_us)),
+    ));
+    assert_eq!(
+        surviving_files(&table_path, engine, predicate, use_parallel)?,
+        1
+    );
+    Ok(())
+}
+
+// === All-null file pruning across log-replay sources ===
+//
+// A file whose queried column is entirely NULL can never satisfy a null-intolerant comparison
+// (`=`, `!=`, `<`, `>`, `<=`, `>=`), so data skipping should prune it. `DataSkippingFilter`
+// builds its skipping predicate via `eval_sql_where`, which rewrites the `col IS NOT NULL`
+// guard to `nullCount != numRecords` -- FALSE for an all-null file, forcing the prune. That
+// single guarded predicate is applied to every transformed action batch, so pruning must hold
+// no matter how the all-null file's Add is sourced or how its stats are stored: a JSON commit
+// (`log_transform` parses `add.stats`), a checkpoint with native `stats_parsed`
+// (`writeStatsAsStruct=true`), or a checkpoint with JSON stats (the protocol default, parsed
+// from `add.stats` at read time). One exception is captured at the assertion: the parallel scan
+// path does not yet read `stats_parsed`, so it cannot skip an all-null file sourced from a
+// struct-only checkpoint.
+#[derive(Clone, Copy, Debug)]
+enum AllNullSource {
+    /// All-null file added via a JSON commit, with no checkpoint (the pure delta-log path).
+    CommitOnly,
+    /// All-null file materialized into the checkpoint as a native `stats_parsed` struct
+    /// (`delta.checkpoint.writeStatsAsStruct=true`).
+    CheckpointStructStats,
+    /// All-null file materialized into the checkpoint with JSON stats (the protocol default;
+    /// kernel parses `add.stats` at read time).
+    CheckpointJsonStats,
+    /// One all-null file in the checkpoint and another in a post-checkpoint JSON commit.
+    Both,
+}
+
+/// Builds a stringified Delta `stats` JSON for the single `value: long` column.
+/// `null_count == num_records` with `bounds == None` mimics an all-null file (Delta writers
+/// omit min/max for an all-null column); pass `Some((min, max))` for a normal file.
+fn value_stats_json(num_records: i64, null_count: i64, bounds: Option<(i64, i64)>) -> String {
+    let min_max = match bounds {
+        Some((min, max)) => {
+            format!(r#""minValues":{{"value":{min}}},"maxValues":{{"value":{max}}},"#)
+        }
+        None => r#""minValues":{},"maxValues":{},"#.to_string(),
+    };
+    format!(
+        r#"{{"numRecords":{num_records},{min_max}"nullCount":{{"value":{null_count}}},"tightBounds":true}}"#
+    )
+}
+
+#[rstest]
+// Two representative operators: `=` exercises the direct null-intolerant arm of
+// `eval_sql_where` and `!=` the NOT-wrapped arm. The not-all-null guard is operator-agnostic, and
+// the unit test `test_all_null_pruning_all_comparison_ops` covers all six operators at the rewrite
+// level, so the source/parallel matrix here does not repeat every operator.
+#[case::eq(Pred::eq(column_expr!("value"), Expr::literal(5i64)))]
+#[case::ne(Pred::ne(column_expr!("value"), Expr::literal(5i64)))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_null_files_pruned_regardless_of_source(
+    #[case] predicate: Pred,
+    #[values(
+        AllNullSource::CommitOnly,
+        AllNullSource::CheckpointStructStats,
+        AllNullSource::CheckpointJsonStats,
+        AllNullSource::Both
+    )]
+    source: AllNullSource,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "value",
+        DataType::LONG,
+    )])?);
+    // For the struct-stats cases, also disable `writeStatsAsJson` so the checkpoint carries ONLY
+    // `stats_parsed`. That forces the scan to read the pre-parsed struct (no JSON fallback),
+    // genuinely validating that path. The JSON-stats case keeps the defaults
+    // (`writeStatsAsJson=true`, `writeStatsAsStruct=false`), so its checkpoint carries only JSON
+    // stats. Either way the all-null file's `nullCount` survives into the checkpoint.
+    let table_properties: &[(&str, &str)] = match source {
+        AllNullSource::CheckpointStructStats | AllNullSource::Both => &[
+            ("delta.checkpoint.writeStatsAsStruct", "true"),
+            ("delta.checkpoint.writeStatsAsJson", "false"),
+        ],
+        AllNullSource::CommitOnly | AllNullSource::CheckpointJsonStats => &[],
+    };
+    let _ = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), table_properties)?;
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    let table_url_string = table_url.to_string();
+
+    let use_checkpoint = matches!(
+        source,
+        AllNullSource::CheckpointStructStats
+            | AllNullSource::CheckpointJsonStats
+            | AllNullSource::Both
+    );
+    let add_post_checkpoint_commit =
+        matches!(source, AllNullSource::CommitOnly | AllNullSource::Both);
+
+    // v1: a matching file (`keep.parquet`, value in [1, 10]) is always present. For
+    // checkpoint-sourced scenarios, co-locate an all-null file so it lands in the checkpoint.
+    let mut v1_adds = vec![("keep.parquet", value_stats_json(10, 0, Some((1, 10))))];
+    if use_checkpoint {
+        v1_adds.push(("allnull_ckpt.parquet", value_stats_json(10, 10, None)));
+    }
+    add_commit(
+        &table_url_string,
+        store.as_ref(),
+        1,
+        commit_with_adds(1, &v1_adds),
+    )
+    .await?;
+
+    // Checkpoint so the all-null file (and the kept file) are sourced from the checkpoint parquet.
+    if use_checkpoint {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        snapshot.checkpoint(engine.as_ref(), None)?;
+    }
+
+    // v2: post-checkpoint JSON commit adding an all-null file (the delta-log source).
+    if add_post_checkpoint_commit {
+        add_commit(
+            &table_url_string,
+            store.as_ref(),
+            2,
+            commit_with_adds(
+                2,
+                &[("allnull_commit.parquet", value_stats_json(10, 10, None))],
+            ),
+        )
+        .await?;
+    }
+
+    // `5` can never match an all-null file, but it sits inside the kept file's `[1, 10]` range, so
+    // `keep.parquet` always survives; every all-null file should otherwise be pruned.
+    let survivors = surviving_paths(&table_path, engine, Arc::new(predicate), use_parallel)?;
+    let mut expected = vec!["keep.parquet".to_string()];
+    // TODO(#2832): remove this branch once the parallel scan path reads `stats_parsed`.
+    // `Scan::parallel_scan_metadata` sets `has_stats_parsed = false` and re-parses JSON
+    // `add.stats`, so over a struct-only checkpoint (JSON stats disabled) it has no stats to read
+    // and conservatively keeps the checkpoint-sourced all-null file -- a missed optimization,
+    // never wrong data; the sequential path reads `stats_parsed` and prunes it. When the parallel
+    // checkpoint reader gains `stats_parsed` support, `allnull_ckpt.parquet` will be pruned here
+    // too. The commit-sourced all-null file in `Both` carries JSON stats, so it is pruned on both
+    // paths.
+    let struct_only_checkpoint = matches!(
+        source,
+        AllNullSource::CheckpointStructStats | AllNullSource::Both
+    );
+    if use_parallel && struct_only_checkpoint {
+        expected.push("allnull_ckpt.parquet".to_string());
+    }
+    expected.sort();
+    assert_eq!(
+        survivors, expected,
+        "unexpected survivors for source {source:?} (use_parallel={use_parallel})"
     );
     Ok(())
 }

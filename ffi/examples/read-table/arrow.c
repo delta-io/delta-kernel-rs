@@ -203,6 +203,8 @@ static void visit_read_data(void* vcontext, ExclusiveEngineData* data)
 void c_read_parquet_file(
   struct EngineContext* context,
   const KernelStringSlice path,
+  int64_t size,
+  int64_t mod_time,
   const KernelBoolSlice selection_vector,
   const Expression* transform)
 {
@@ -213,6 +215,8 @@ void c_read_parquet_file(
   KernelStringSlice path_slice = { full_path, full_len };
   FileMeta meta = {
     .path = path_slice,
+    .size = (uintptr_t)size,
+    .last_modified = mod_time,
   };
   ExternResultHandleExclusiveFileReadResultIterator read_res =
     read_parquet_file(context->engine, &meta, context->physical_schema);

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::Transaction;
 use crate::actions::{get_log_commit_info_schema, CommitInfo, COMMIT_INFO_NAME};
 use crate::expressions::{MapData, Scalar};
-use crate::schema::{MapType, StructField, StructType, ToSchema};
+use crate::schema::{schema_ref, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
 
@@ -106,10 +106,7 @@ impl<S> Transaction<S> {
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
                 // with the None branch which uses `get_log_commit_info_schema()`.
                 let wrapped_expr = Expression::struct_from([patch]);
-                let wrapped_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-                    COMMIT_INFO_NAME,
-                    output_schema,
-                )]));
+                let wrapped_schema = schema_ref! { nullable (COMMIT_INFO_NAME): (output_schema) };
                 let evaluator = engine.evaluation_handler().new_expression_evaluator(
                     engine_commit_info_schema.clone(),
                     Arc::new(wrapped_expr),

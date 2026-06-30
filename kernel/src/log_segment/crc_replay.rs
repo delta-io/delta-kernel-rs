@@ -25,8 +25,8 @@ use crate::crc::{
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{
-    column_name, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
+    ToSchema as _,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
@@ -34,37 +34,25 @@ use crate::{DeltaResult, Engine, Error, RowVisitor, Version};
 
 #[allow(clippy::expect_used)]
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
-    // an Add row.
-    let add = StructField::nullable(
-        ADD_NAME,
-        StructType::new_unchecked([StructField::not_null("size", DataType::LONG)]),
-    );
-    // remove.size is optional, so we read remove.path (required) to know a row is a Remove
-    // before reading its size.
-    let remove = StructField::nullable(
-        REMOVE_NAME,
-        StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::nullable("size", DataType::LONG),
-        ]),
-    );
-    let commit_info = StructField::nullable(
-        COMMIT_INFO_NAME,
-        StructType::new_unchecked([
-            StructField::nullable("operation", DataType::STRING),
-            StructField::nullable("inCommitTimestamp", DataType::LONG),
-        ]),
-    );
-    let base = StructType::new_unchecked([
-        add,
-        remove,
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        commit_info,
-    ]);
+    let base = schema! {
+        // size is the only Add leaf the visitor reads, and it is required, so its presence marks
+        // an Add row.
+        nullable ADD_NAME: { not_null "size": LONG },
+        // remove.size is optional, so we read remove.path (required) to know a row is a Remove
+        // before reading its size.
+        nullable REMOVE_NAME: {
+            not_null "path": STRING,
+            nullable "size": LONG,
+        },
+        nullable PROTOCOL_NAME: (Protocol::to_schema()),
+        nullable METADATA_NAME: (Metadata::to_schema()),
+        nullable SET_TRANSACTION_NAME: (SetTransaction::to_schema()),
+        nullable DOMAIN_METADATA_NAME: (DomainMetadata::to_schema()),
+        nullable COMMIT_INFO_NAME: {
+            nullable "operation": STRING,
+            nullable "inCommitTimestamp": LONG,
+        },
+    };
     let with_file = base
         .add_metadata_column("_file", MetadataColumnSpec::FilePath)
         .expect("add _file metadata column");

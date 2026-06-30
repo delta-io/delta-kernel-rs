@@ -25,7 +25,7 @@ use crate::log_replay::HasSelectionVector;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
-use crate::schema::{DataType as KernelDataType, StructField, StructType};
+use crate::schema::{schema_ref, DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
 use crate::utils::test_utils::Action;
@@ -210,10 +210,7 @@ fn create_metadata_action_with_config(configuration: HashMap<String, String>) ->
         Metadata::try_new(
             Some("test-table".into()),
             None,
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                KernelDataType::INTEGER,
-            )])),
+            schema_ref! { nullable "value": INTEGER },
             vec![],
             0,
             configuration,
@@ -928,10 +925,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let table_root = Url::parse("memory:///")?;
     let _ = create_table(
         table_root.as_str(),
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            KernelDataType::INTEGER,
-        )])),
+        schema_ref! { nullable "value": INTEGER },
         "test",
     )
     .build(&engine, Box::new(FileSystemCommitter::new()))?
