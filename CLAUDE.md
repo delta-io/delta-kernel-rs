@@ -134,9 +134,8 @@ directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` ac
 - Reuse helpers from `test_utils` and the integration-test fixtures instead of writing
   custom ones when possible.
 
-For integration-test mechanics -- table setup, the `add_commit` URL rules, commit/read
-helpers, schema fixtures, and the full curated helper catalog -- see
-`kernel/tests/CLAUDE.md`.
+See `kernel/tests/CLAUDE.md` for integration-test mechanics: table setup, the `add_commit` URL
+rules, commit and read helpers, schema fixtures, and where to find the shared test helpers.
 
 ## Protocol TLDR
 

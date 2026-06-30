@@ -1,8 +1,5 @@
 # Workloads guidelines
 
-Scope: `workloads/**`. Cross-cutting conventions live in the root `CLAUDE.md`; this file is the
-workload-spec context.
-
 ## What this crate is
 
 `delta_kernel_workloads` holds the shared description of a benchmark/acceptance workload --
@@ -14,9 +11,8 @@ engine and runs no workload itself.
 ## Invariants to uphold
 
 - **A workload points at a table one way or the other** -- a filesystem/object-store path or UC
-  catalog identity, not both. Today these are two optional fields with the exclusivity checked at
-  parse time (there is a TODO to make it a single enum); preserve the invariant however it is
-  modeled, and don't let both fields be populated.
+  catalog identity, not both. The two are modeled as separate optional fields with the exclusivity
+  checked at parse time; preserve that invariant and never let both fields be populated.
 - **The predicate parser must emit the same expression kernel would evaluate.** It is a thin SQL
   front-end over kernel's expression types; when extending it, mirror kernel's operator and
   literal semantics exactly -- a parser that subtly diverges produces benchmarks that don't

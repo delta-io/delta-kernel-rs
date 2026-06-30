@@ -1,13 +1,12 @@
 # Unity Catalog REST client guidelines
 
-Scope: `unity-catalog-delta-rest-client/**`. Cross-cutting conventions live in the root
-`CLAUDE.md`. The UC crate stack is described in `delta-kernel-unity-catalog/CLAUDE.md`.
-
 ## What this crate is
 
 The concrete HTTP implementation of the traits defined in `unity-catalog-delta-client-api`,
 built on `reqwest`. It provides the commits client (`GetCommitsClient` + `CommitClient`) and a
 higher-level client for table/credential endpoints, configured through a `ClientConfig` builder.
+Where this layer sits in the three-crate UC stack is described in
+`delta-kernel-unity-catalog/CLAUDE.md`.
 
 ## Invariants to uphold
 

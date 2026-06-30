@@ -1,11 +1,8 @@
 # Unity Catalog integration guidelines
 
-Scope: `delta-kernel-unity-catalog/**`. Cross-cutting Rust/comment/protocol conventions live in
-the root `CLAUDE.md`; catalog-managed table background is in `CLAUDE/architecture.md`.
-
 ## Where this sits in the UC stack
 
-Three crates layer cleanly; lower layers know nothing of higher ones:
+Three crates layer, and lower layers know nothing of higher ones:
 
 1. `unity-catalog-delta-client-api` -- transport-agnostic traits (`GetCommitsClient`,
    `CommitClient`) and request/response + credential models. No HTTP.
@@ -15,7 +12,8 @@ Three crates layer cleanly; lower layers know nothing of higher ones:
    catalog-managed tables.
 
 When changing the trait surface, edit `*-client-api` and let the REST client and this crate
-follow; do not duplicate models downstream.
+follow; do not duplicate models downstream. Catalog-managed table background is in
+`CLAUDE/architecture.md`.
 
 ## Invariants to uphold
 

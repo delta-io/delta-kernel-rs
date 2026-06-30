@@ -1,15 +1,13 @@
 # FFI Layer
 
-Scope: `ffi/**`. Cross-cutting Rust/comment/protocol conventions live in the root
-`CLAUDE.md`; this file is the FFI-boundary context.
-
 The `delta_kernel_ffi` crate exposes the kernel to C/C++ via a stable FFI boundary using
 cbindgen-generated headers (`.h` and `.hpp`).
 
 ## Terminology
 
 - **Kernel vs engine** -- "kernel" is the native Rust side; "engine" is the foreign runtime
-  on the other side of the boundary. This is the lens for "which side allocated/owns this".
+  on the other side of the boundary. Use this split to reason about which side allocated and owns
+  a value.
 - **Downcall vs upcall** -- a downcall is the engine invoking an exported Rust function; an
   upcall is Rust invoking an engine-provided function pointer.
 - **Allocator vs owner** -- the allocator initialized the memory and knows *how* to free it;
@@ -25,7 +23,9 @@ ownership semantics:
 
 Declare them with the `#[handle_descriptor]` macro and prefix the type name with `Exclusive`
 or `Shared` so the ownership model is visible at the use site (e.g. `SharedSnapshot`,
-`ExclusiveTransaction`).
+`ExclusiveTransaction`). The public type convention is `Exclusive`/`Shared`, but the
+macro-internal vocabulary is still "mutable" -- the `#[handle_descriptor(mutable = ...)]` argument
+and `HandleDescriptor::Mutable` -- so don't be surprised by the mismatch when editing the macro.
 
 A handle is needed when a value might outlive the function call that passes it across the
 FFI boundary, or when the type is not representable in C/C++ (dyn trait references, slices,

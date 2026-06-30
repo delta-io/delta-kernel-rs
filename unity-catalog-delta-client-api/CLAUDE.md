@@ -1,15 +1,13 @@
 # Unity Catalog client API guidelines
 
-Scope: `unity-catalog-delta-client-api/**`. Cross-cutting conventions live in the root
-`CLAUDE.md`. The UC crate stack and how this layer fits is described in
-`delta-kernel-unity-catalog/CLAUDE.md`.
-
 ## What this crate is
 
 The transport-agnostic contract for talking to Unity Catalog's Delta APIs: the `GetCommitsClient`
 and `CommitClient` traits plus the request/response and credential-vending models they exchange.
 It contains **no HTTP and no concrete client** -- the REST implementation lives in
 `unity-catalog-delta-rest-client`, and an in-memory mock (behind `test-utils`) backs unit tests.
+Where this layer sits in the three-crate UC stack is described in
+`delta-kernel-unity-catalog/CLAUDE.md`.
 
 ## Invariants to uphold
 

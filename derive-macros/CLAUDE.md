@@ -1,8 +1,5 @@
 # Derive macros guidelines
 
-Scope: `derive-macros/**`. Cross-cutting Rust/comment conventions live in the root `CLAUDE.md`;
-this file is the proc-macro context.
-
 ## What this crate is
 
 `delta_kernel_derive` is the proc-macro crate backing kernel ergonomics. It provides the

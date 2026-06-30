@@ -1,21 +1,20 @@
 # Acceptance test guidelines
 
-Scope: `acceptance/**`. Cross-cutting conventions live in the root `CLAUDE.md`. For writing
-kernel's own integration tests (table setup, helpers), see `kernel/tests/CLAUDE.md` -- this crate
-is different: it runs the cross-implementation conformance suite.
+The `acceptance` crate runs the Delta Acceptance Tests (DAT): a cross-implementation conformance
+suite. "Conformance" here means every Delta implementation (kernel, Spark, delta-rs, ...) is held
+to the same externally generated golden cases, so the suite checks kernel against a shared spec
+rather than against itself. Each case is a table plus a JSON description of the expected results;
+the harness loads a case, builds a snapshot, and asserts kernel's reported metadata and data match
+that description.
 
-## What this crate is
-
-The `acceptance` crate runs the Delta Acceptance Tests (DAT): externally generated test cases,
-each a table plus a JSON spec of expected metadata and scan results. It loads a case, builds a
-snapshot, and asserts kernel's snapshot metadata and full scan output match the golden spec. This
-is the suite that proves kernel agrees with the protocol across implementations.
+Kernel's own integration tests (table setup, helpers) are a separate thing under `kernel/tests/`
+-- see `kernel/tests/CLAUDE.md`.
 
 ## Invariants to uphold
 
 - **Golden expectations are the source of truth; don't loosen an assertion to make a case pass.**
   A failing DAT case is signal that kernel diverged from the spec. Fix kernel (or escalate a
-  genuine spec/case bug) -- never weaken the metadata/scan comparison to get green.
+  genuine spec/case bug) -- never weaken the comparison against the golden case to get green.
 - **Cases come from generated DAT resources.** The data is downloaded/generated, not committed.
   If the resource tree is absent the harness has nothing to run; a "passing" empty run is not
   coverage.

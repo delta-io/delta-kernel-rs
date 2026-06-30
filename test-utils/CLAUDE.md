@@ -1,9 +1,7 @@
 # Test utilities guidelines
 
-Scope: `test-utils/**`. Cross-cutting conventions live in the root `CLAUDE.md`; the universal
-testing philosophy is there too, and the curated catalog of what these helpers are and when to
-reach for them lives in `kernel/tests/CLAUDE.md`. This file is about *maintaining* the shared
-helper crate.
+This file is about *maintaining* the shared helper crate. How to *use* these helpers from tests
+is in `kernel/tests/CLAUDE.md`.
 
 ## What this crate is
 
@@ -16,12 +14,13 @@ its public items are effectively an internal API.
 
 - **Add the helper here, not a private copy in a test.** The reason this crate exists is to stop
   every test file from hand-rolling table setup or commit-JSON parsing. Before adding a helper,
-  check whether one already exists (and is catalogued in `kernel/tests/CLAUDE.md`); when you add
-  or rename one, update that catalog so it doesn't drift.
+  check whether one already exists; give every new public helper a doc comment so callers can
+  discover it from the source.
 - **Keep helpers reusable and engine-agnostic where they can be.** A helper baked to one test's
   specifics defeats the purpose; prefer parameters and the existing sweep templates over forking.
 - **Exported sweep templates are a shared macro surface.** Templates are reachable from other
   crates; renaming or repurposing one ripples across consumers -- treat it like an API change.
 - **Honor the multi-thread runtime requirement.** Setup helpers come in single- and multi-thread
-  variants because checkpoint-style operations deadlock on a single-threaded runtime; keep both
-  paths working and point callers at the `_mt` variant when nested blocking is possible.
+  variants because some kernel operations need the multi-thread runtime (see
+  `default-engine/CLAUDE.md` for the nested-`block_on` reason); keep both paths working and point
+  callers at the `_mt` variant when nested blocking is possible.
