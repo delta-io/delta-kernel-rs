@@ -56,43 +56,41 @@ impl From<Error> for unity_catalog_delta_client_api::Error {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+    use unity_catalog_delta_client_api::Error as ApiError;
+
     use super::*;
 
-    #[test]
-    fn from_error_unwraps_api_variant() {
-        let api_err = unity_catalog_delta_client_api::Error::TableNotFound("t1".into());
-        let rest_err = Error::Api(api_err);
-        assert!(matches!(
-            unity_catalog_delta_client_api::Error::from(rest_err),
-            unity_catalog_delta_client_api::Error::TableNotFound(msg) if msg == "t1"
-        ));
-
-        let rest_err = Error::Api(unity_catalog_delta_client_api::Error::AuthenticationFailed);
-        assert!(matches!(
-            unity_catalog_delta_client_api::Error::from(rest_err),
-            unity_catalog_delta_client_api::Error::AuthenticationFailed
-        ));
-
-        let rest_err =
-            Error::Api(unity_catalog_delta_client_api::Error::MaxUnpublishedCommitsExceeded(5));
-        assert!(matches!(
-            unity_catalog_delta_client_api::Error::from(rest_err),
-            unity_catalog_delta_client_api::Error::MaxUnpublishedCommitsExceeded(5)
-        ));
+    /// Each rest client error that wraps a UC delta client API error (Error::API)
+    /// preserves the API error.
+    #[rstest]
+    #[case(ApiError::TableNotFound("t1".into()))]
+    #[case(ApiError::AuthenticationFailed)]
+    #[case(ApiError::MaxUnpublishedCommitsExceeded(5))]
+    #[case(ApiError::CommitConflict)]
+    #[case(ApiError::InvalidCommit("bad".into()))]
+    #[case(ApiError::RateLimited)]
+    fn from_error_unwraps_api_variant(#[case] api_err: ApiError) {
+        let expected = format!("{api_err:?}");
+        let unwrapped = ApiError::from(Error::Api(api_err));
+        assert_eq!(format!("{unwrapped:?}"), expected);
     }
 
-    #[test]
-    fn from_error_maps_rest_only_variants_to_generic() {
-        let api_err = unity_catalog_delta_client_api::Error::from(Error::MaxRetriesExceeded);
+    /// Rest client-only variants have no API counterpart, so they collapse to
+    /// `Generic` carrying the display message.
+    #[rstest]
+    #[case(Error::MaxRetriesExceeded, "Max retries exceeded")]
+    #[case(
+        Error::InvalidConfiguration("bad".into()),
+        "Invalid configuration: bad"
+    )]
+    fn from_error_maps_rest_only_variants_to_generic(
+        #[case] rest_err: Error,
+        #[case] expected_msg: &str,
+    ) {
+        let api_err = ApiError::from(rest_err);
         assert!(
-            matches!(api_err, unity_catalog_delta_client_api::Error::Generic(ref msg) if msg == "Max retries exceeded"),
-            "unexpected: {api_err:?}"
-        );
-
-        let api_err =
-            unity_catalog_delta_client_api::Error::from(Error::InvalidConfiguration("bad".into()));
-        assert!(
-            matches!(api_err, unity_catalog_delta_client_api::Error::Generic(ref msg) if msg == "Invalid configuration: bad"),
+            matches!(api_err, ApiError::Generic(ref msg) if msg == expected_msg),
             "unexpected: {api_err:?}"
         );
     }

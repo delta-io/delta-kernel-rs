@@ -85,18 +85,59 @@ where
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
 
-        match status {
-            StatusCode::UNAUTHORIZED => {
-                Err(unity_catalog_delta_client_api::Error::AuthenticationFailed.into())
-            }
-            StatusCode::NOT_FOUND => Err(Error::HttpStatusError {
-                status: status.as_u16(),
-                message: format!("Resource not found: {error_body}"),
-            }),
-            _ => Err(Error::HttpStatusError {
-                status: status.as_u16(),
-                message: error_body,
-            }),
-        }
+        Err(error_for_errored_status(status, error_body))
+    }
+}
+
+/// Map a non-success HTTP status and response body to a client [`Error`].
+///
+/// Some commit-semantic status codes UC returns become UC delta client API errors
+/// that are preserved as rest client errors. Anything else stays a generic
+/// [`Error::HttpStatusError`].
+fn error_for_errored_status(status: StatusCode, body: String) -> Error {
+    use unity_catalog_delta_client_api::Error as ApiError;
+    match status {
+        StatusCode::UNAUTHORIZED => ApiError::AuthenticationFailed.into(),
+        StatusCode::NOT_FOUND => ApiError::TableNotFound(body).into(),
+        StatusCode::CONFLICT => ApiError::CommitConflict.into(),
+        StatusCode::BAD_REQUEST => ApiError::InvalidCommit(body).into(),
+        StatusCode::TOO_MANY_REQUESTS => ApiError::RateLimited.into(),
+        _ => Error::HttpStatusError {
+            status: status.as_u16(),
+            message: body,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use unity_catalog_delta_client_api::Error as ApiError;
+
+    use super::*;
+
+    /// Each response status maps to its distinct UC delta client API error (the
+    /// trait error implementations see), and response bodies are preserved.
+    #[rstest]
+    #[case(StatusCode::UNAUTHORIZED, ApiError::AuthenticationFailed)]
+    #[case(StatusCode::NOT_FOUND, ApiError::TableNotFound("boom".into()))]
+    #[case(StatusCode::CONFLICT, ApiError::CommitConflict)]
+    #[case(StatusCode::BAD_REQUEST, ApiError::InvalidCommit("boom".into()))]
+    #[case(StatusCode::TOO_MANY_REQUESTS, ApiError::RateLimited)]
+    fn error_for_status_maps_commit_semantic_codes_to_distinct_api_errors(
+        #[case] status: StatusCode,
+        #[case] expected: ApiError,
+    ) {
+        let api_err = ApiError::from(error_for_errored_status(status, "boom".into()));
+        assert_eq!(format!("{api_err:?}"), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn error_for_status_maps_unrecognized_status_to_http_status_error() {
+        let err = error_for_errored_status(StatusCode::IM_A_TEAPOT, "teapot".into());
+        assert!(
+            matches!(err, Error::HttpStatusError { status: 418, ref message } if message == "teapot"),
+            "unexpected: {err:?}"
+        );
     }
 }
