@@ -1336,6 +1336,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "test_utils",
  "tokio",
  "unity-catalog-delta-client-api",
