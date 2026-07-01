@@ -23,7 +23,6 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2.0"
 tracing = "0.1"
 url = "2.5"
-chrono = { version = "0.4", features = ["serde"] }
 
 [features]
 default = []
@@ -32,7 +31,3 @@ test-utils = ["unity-catalog-delta-client-api/test-utils"]
 # `cargo test` never compiles or runs them; the dedicated CI job enables it. See
 # tests/integration_live_server.rs.
 integration-test = []
-
-[dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive", "env"] }
