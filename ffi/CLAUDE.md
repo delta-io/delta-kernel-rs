@@ -87,6 +87,12 @@ dv_unique_id)` pair; `dv_unique_id` is a zero-length slice when absent). Release
 `free_incremental_scan_stream`, `free_incremental_scan_summary`, and each Arrow batch with
 `free_filtered_engine_data_arrow_result`.
 
+To advance a cached listing, evict base entries whose key is in `removes` OR is re-added by the
+range. OPTIMIZE / clustering re-tags a file under the same `(path, dv_unique_id)` key, so it
+lands in `live_adds` but not `removes`; masking with `removes` alone leaves a stale row. The
+full mask is `removes` unioned with the base keys also present in `live_adds`. The Rust API
+computes this via `into_summary_against_base_*`, which the FFI does not yet expose.
+
 ## Write Flow
 
 ```

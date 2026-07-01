@@ -5,7 +5,7 @@
 //! The flow mirrors the Rust API:
 //!
 //! ```text
-//! snapshot_incremental_scan_builder(snapshot, base_version)
+//! snapshot_incremental_scan_builder(snapshot, base_version, engine)
 //!   -> incremental_scan_builder_build(builder)   // -> OptionalValue<stream>; None => full-scan fallback
 //!   -> incremental_scan_stream_next_arrow(stream) // drain filtered Add batches, newest-first
 //!   -> incremental_scan_stream_into_summary(stream) // -> summary; consumes the stream
@@ -202,6 +202,13 @@ fn incremental_scan_stream_next_arrow_impl(
 /// succeeds. Returns an error if a prior [`incremental_scan_stream_next_arrow`] call errored, or
 /// if draining the remaining batches fails.
 ///
+/// To advance a cached listing with the result, evict every base entry whose key is in
+/// `removes` OR is re-added by the range. A file that OPTIMIZE or clustering re-tags keeps its
+/// `(path, dv_unique_id)` key, so it appears in `live_adds` but not `removes`. Masking the base
+/// with `removes` alone leaves that file's stale row pointing at a data file that's no longer
+/// current. The full eviction mask is `removes` unioned with the intersection of your base and
+/// `live_adds` (visit `live_adds` and keep the keys your base already holds).
+///
 /// # Safety
 ///
 /// Caller must pass a valid stream handle and must not use it again after this call.
@@ -271,7 +278,7 @@ pub unsafe extern "C" fn incremental_scan_summary_target_version(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid summary handle and a non-null callback pointer.
+/// Caller must pass a valid summary handle.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
     summary: Handle<SharedIncrementalScanSummary>,
@@ -289,7 +296,7 @@ pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid summary handle and a non-null callback pointer.
+/// Caller must pass a valid summary handle.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_summary_visit_removes(
     summary: Handle<SharedIncrementalScanSummary>,
@@ -352,6 +359,9 @@ pub unsafe extern "C" fn free_incremental_scan_summary(
 /// actions plus a boolean selection vector.
 ///
 /// The engine must free this with [`free_filtered_engine_data_arrow_result`] exactly once.
+///
+/// This mirrors [`crate::scan::ScanMetadataArrowResult`] minus its per-row transforms (the
+/// incremental scan produces none). Keep the release sequence in sync with that type's.
 #[cfg(feature = "default-engine-base")]
 #[repr(C)]
 pub struct FilteredEngineDataArrowResult {
@@ -432,6 +442,45 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let mut builder = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        unsafe { snapshot_builder_set_version(&mut builder, target_version) };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+        (engine, snapshot)
+    }
+
+    // Protocol + metadata commit enabling the deletionVectors feature, so DV-bearing Adds
+    // parse. `TestAction` can't emit a `deletionVector` field, so DV tests write raw JSON.
+    const DV_METADATA: &str = "{\"metaData\":{\"id\":\"test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[]}\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
+
+    fn add_with_dv(path: &str, storage_type: &str, path_or_inline: &str, offset: i32) -> String {
+        format!(
+            "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":null,\"deletionVector\":{{\"storageType\":\"{storage_type}\",\"pathOrInlineDv\":\"{path_or_inline}\",\"offset\":{offset},\"sizeInBytes\":10,\"cardinality\":1}}}}}}"
+        )
+    }
+
+    /// Build an engine + snapshot (pinned to the last version) from raw commit-JSON strings at
+    /// v1.., with a DV-enabling metadata commit at v0.
+    async fn setup_raw(
+        commits: Vec<String>,
+    ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(table_root, storage.as_ref(), 0, DV_METADATA.to_string())
+            .await
+            .unwrap();
+        let target_version = commits.len() as u64;
+        for (idx, body) in commits.into_iter().enumerate() {
+            add_commit(table_root, storage.as_ref(), (idx + 1) as u64, body)
+                .await
+                .unwrap();
         }
         let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
@@ -604,6 +653,129 @@ mod tests {
         };
         unsafe { free_incremental_scan_builder(builder) };
 
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // The whole point of the (path, dv_unique_id) key is that the same path with different DV
+    // ids is a distinct file. Assert the FFI visitor passes the full key through, not just the
+    // path: v1 adds (X, dv=uabc@1), v2 adds (X, dv=uxyz@2) -> two distinct live Adds.
+    #[tokio::test]
+    async fn visit_reports_full_dv_unique_id() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_raw(vec![
+            add_with_dv("X.parquet", "u", "abc", 1),
+            add_with_dv("X.parquet", "u", "xyz", 2),
+        ])
+        .await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
+
+        let mut live_adds = visit_live_adds(&summary);
+        live_adds.sort();
+        assert_eq!(
+            live_adds,
+            vec![
+                ("X.parquet".to_string(), Some("uabc@1".to_string())),
+                ("X.parquet".to_string(), Some("uxyz@2".to_string())),
+            ],
+        );
+
+        unsafe { free_incremental_scan_summary(summary) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // into_summary consumes the stream by taking the inner Option. When a second Arc reference
+    // to the same stream survives (via clone_handle, which bumps the refcount), a further
+    // terminal call hits the taken-Option guard and errors cleanly instead of double-consuming.
+    // (A single-refcount handle reused after into_summary is use-after-free per the # Safety
+    // contract, not this path; this test holds a real second reference.)
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test]
+    async fn terminal_calls_after_into_summary_error() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+
+        // A second owning reference keeps the object alive after into_summary consumes it.
+        let surviving = unsafe { stream.clone_handle() };
+        let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
+
+        let next = unsafe { incremental_scan_stream_next_arrow(surviving.clone_handle()) };
+        assert_extern_result_error_with_message(next, KernelError::GenericError, None);
+        let again = unsafe { incremental_scan_stream_into_summary(surviving) };
+        assert_extern_result_error_with_message(again, KernelError::GenericError, None);
+
+        unsafe { free_incremental_scan_summary(summary) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // Abandoning a never-drained stream must free the retained engine Arc and undrained kernel
+    // stream without leak or panic (the symmetric counterpart to free_builder_without_building).
+    #[tokio::test]
+    async fn free_stream_without_draining() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        unsafe { free_incremental_scan_stream(stream) };
+
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // into_summary must drain the batches the caller didn't read. Read exactly one of two
+    // batches, then assert the summary still reports both commits' Adds.
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test]
+    async fn into_summary_drains_unread_batches() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup(vec![
+            vec![TestAction::Add("A".to_string())],
+            vec![TestAction::Add("B".to_string())],
+        ])
+        .await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+
+        // Read exactly one batch, leaving the other for into_summary to drain.
+        let ptr = unsafe { ok_or_panic(incremental_scan_stream_next_arrow(stream.shallow_copy())) };
+        assert!(!ptr.is_null());
+        unsafe { free_filtered_engine_data_arrow_result(ptr) };
+
+        let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
+        let mut live_adds: Vec<_> = visit_live_adds(&summary)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        live_adds.sort();
+        assert_eq!(live_adds, vec!["A".to_string(), "B".to_string()]);
+
+        unsafe { free_incremental_scan_summary(summary) };
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
         Ok(())

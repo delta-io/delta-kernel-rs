@@ -58,10 +58,12 @@ explains why.
 
 ### Handle `None`: fall back to a full scan
 
-`build()` returns `None` when the target `Snapshot`'s commit list can't cover the range. This
-happens when `base_version` predates the oldest commit the `Snapshot` retains, usually because
-a checkpoint truncated the log history before it. `None` is not an error. It's the signal that
-an incremental advance isn't possible, so you rebuild your cache from a full scan:
+`build()` returns `None` when the target `Snapshot` doesn't retain commit `base_version + 1`,
+the first version in the range. Typically the `Snapshot` loaded from a checkpoint above
+`base_version`, so its retained commit list begins past the first version you need. The commit
+files may still exist on storage; the `Snapshot` just doesn't retain them. `None` is not an
+error. It's the signal that an incremental advance isn't possible, so you rebuild your cache
+from a full scan:
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -84,7 +86,7 @@ match target.clone().incremental_scan_builder(base_version).build(&engine)? {
         consume(stream);
     }
     None => {
-        // History was truncated. Rebuild the listing from a full scan.
+        // The Snapshot no longer retains commits back to the base. Rebuild from a full scan.
         let _scan = target.scan_builder().build()?;
     }
 }
@@ -93,16 +95,17 @@ match target.clone().incremental_scan_builder(base_version).build(&engine)? {
 ```
 
 > [!WARNING]
-> Never unwrap the `Option`. `None` is a normal outcome whenever a checkpoint has truncated
-> the log below your `base_version`. Treating it as an error strands your cache with no way to
-> advance.
+> Never unwrap the `Option`. `None` is a normal outcome whenever the `Snapshot` no longer
+> retains commits back to your `base_version`. Treating it as an error strands your cache with
+> no way to advance.
 
 ## Consuming the stream
 
 `IncrementalScanStream` yields the live added files as `FilteredEngineData` batches, newest
 commit first. A `FilteredEngineData` pairs a data batch with a selection vector, so respect
-the selection vector when reading. Kernel emits one row per Add action and marks inactive the
-rows an Add that later got cancelled within the range.
+the selection vector when reading. Each batch is a raw commit action batch, one row per action.
+Only the rows the selection vector marks active are live Adds. Every other row is present but
+inactive: Removes, Adds that a later commit in the range cancelled, and non-file actions.
 
 Each batch corresponds to a source commit's surviving Adds. A commit whose Adds were all
 cancelled by a later Remove in the range produces no batch at all, and one commit's rows can
@@ -222,8 +225,8 @@ let mask: HashSet<&FileActionKey> =
 
 ## Correctness requirements
 
-A few properties of the stream are easy to violate and produce a silently wrong listing rather
-than an error.
+A few properties of the stream, if violated, produce a silently wrong listing rather than an
+error.
 
 ### Errors are sticky
 
