@@ -5,8 +5,6 @@
 //! Results are discarded for benchmarking purposes.
 //!
 //! Engine and snapshot construction is handled based on `TableInfo`:
-//! - UC tables (`catalog_info`): UC-vended credentials; catalog-managed tables use
-//!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
 //! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
@@ -19,21 +17,16 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Stat
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel_unity_catalog::UCKernelClient;
+use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 use delta_kernel_workloads::models::{
     ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo, TimeTravel,
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
-use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
-use unity_catalog_delta_rest_client::{
-    ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
-};
+use unity_catalog_delta_client_api::Operation;
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 use url::Url;
 
 use crate::registry::{ParallelScan, ReadConfig};
-
-/// Delta table property indicating catalog-managed support.
-const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
@@ -71,11 +64,12 @@ fn build_engine(
 enum SnapshotStrategy {
     /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
     Standard { url: Url },
-    /// Catalog-managed table: snapshot loaded via `UCKernelClient::load_snapshot`.
+    /// Catalog-managed table: snapshot loaded via the UC Delta-Tables API. The three-part table
+    /// name is resolved via `UCClient::load_table`, whose response is turned into a snapshot
+    /// builder by `snapshot_builder_from_load_table`.
     CatalogManaged {
-        table_id: String,
-        table_uri: String,
-        commits_client: Box<UCCommitsRestClient>,
+        table_name: String,
+        client: Box<UCClient>,
     },
 }
 
@@ -95,35 +89,36 @@ impl SnapshotStrategy {
                 }
                 Ok(builder.build(engine)?)
             }
-            SnapshotStrategy::CatalogManaged {
-                table_id,
-                table_uri,
-                commits_client,
-            } => {
-                let catalog = UCKernelClient::new(commits_client.as_ref());
-                let result = match time_travel {
-                    Some(tt) => {
-                        let version = tt.as_version()?;
-                        runtime.block_on(
-                            catalog.load_snapshot_at(table_id, table_uri, version, engine),
-                        )
-                    }
-                    None => runtime.block_on(catalog.load_snapshot(table_id, table_uri, engine)),
-                };
-                result.map_err(|e| format!("Catalog snapshot failed: {e}").into())
+            SnapshotStrategy::CatalogManaged { table_name, client } => {
+                let (catalog, schema, table) = parse_three_part_name(table_name)?;
+                let resp = runtime
+                    .block_on(client.load_table(catalog, schema, table))
+                    .map_err(|e| format!("Catalog load_table failed: {e}"))?;
+                let mut builder = snapshot_builder_from_load_table(&resp)?;
+                if let Some(tt) = time_travel {
+                    builder = builder.at_version(tt.as_version()?);
+                }
+                Ok(builder.build(engine)?)
             }
         }
     }
 }
 
-/// Resolves engine credentials and snapshot strategy from a [`TableInfo`].
+/// Splits a `"catalog.schema.table"` name into its three parts.
+fn parse_three_part_name(name: &str) -> Result<(&str, &str, &str), Box<dyn std::error::Error>> {
+    match name.split('.').collect::<Vec<_>>()[..] {
+        [catalog, schema, table] => Ok((catalog, schema, table)),
+        _ => Err(
+            format!("expected a three-part table name 'catalog.schema.table', got: {name}").into(),
+        ),
+    }
+}
+
+/// Resolves the engine and snapshot strategy from a [`TableInfo`].
 ///
-/// For UC-managed tables (`catalog_info` is present), credentials are vended via
-/// `UCClient`. The `delta.feature.catalogManaged` property then determines whether to use
-/// `UCKernelClient` (catalog-managed) or the standard snapshot builder.
-///
-/// For non-UC tables, the engine is built from env vars (`AWS_*` for S3, local filesystem
-/// otherwise).
+/// For catalog-managed tables (`catalog_info` is present), credentials are vended via `UCClient`
+/// and the snapshot is loaded through the UC Delta-Tables API (`load_table`). For non-UC tables,
+/// the engine is built from env vars (`AWS_*` for S3, local filesystem otherwise).
 fn resolve_snapshot_strategy(
     table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -136,57 +131,52 @@ fn resolve_snapshot_strategy(
 
     let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
     let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
-
     let config = ClientConfig::build(&endpoint, &token).build()?;
-    let client = UCClient::new(config.clone())?;
+    let client = Box::new(UCClient::new(config)?);
 
-    let result: Result<_, UcRestError> = runtime.block_on(async {
-        let table = client.get_table(&cm.table_name).await?;
-        let creds = client
-            .get_credentials(&table.table_id, Operation::Read)
-            .await?;
-        let aws = creds
-            .aws_temp_credentials
-            .ok_or(UcApiError::UnsupportedOperation(
-                // TODO(#2305): support non-AWS credential types
-                "Credential vending returned no AWS credentials".into(),
-            ))?;
-        Ok((
-            table.table_id,
-            table.storage_location,
-            table.properties,
-            aws,
-        ))
-    });
-    let (table_id, table_uri, uc_properties, aws) = result?;
+    let (catalog, schema, table) = parse_three_part_name(&cm.table_name)?;
+    let creds = runtime
+        .block_on(client.get_table_credentials(catalog, schema, table, Operation::Read))
+        .map_err(|e| format!("Credential vending failed: {e}"))?;
 
-    let table_url = Url::parse(&table_uri)?;
-    let region = std::env::var("AWS_REGION").map_err(|_| "AWS_REGION required")?;
-    let options = [
-        ("region", region.as_str()),
-        ("access_key_id", aws.access_key_id.as_str()),
-        ("secret_access_key", aws.secret_access_key.as_str()),
-        ("session_token", aws.session_token.as_str()),
-    ];
-    let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, options)?;
+    let resp = runtime
+        .block_on(client.load_table(catalog, schema, table))
+        .map_err(|e| format!("load_table failed: {e}"))?;
+    let table_url = Url::parse(&resp.metadata.location)?;
+
+    let opts = object_store_options(&creds.storage_credentials);
+    let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, opts)?;
     let engine = build_engine(store.into(), runtime);
 
-    let is_catalog_managed = uc_properties
-        .get(CATALOG_MANAGED_PROPERTY)
-        .is_some_and(|v| v == "supported");
-
-    let strategy = if is_catalog_managed {
-        let commits_client = Box::new(UCCommitsRestClient::new(config)?);
+    Ok((
+        engine,
         SnapshotStrategy::CatalogManaged {
-            table_id,
-            table_uri,
-            commits_client,
-        }
-    } else {
-        SnapshotStrategy::Standard { url: table_url }
-    };
+            table_name: cm.table_name.clone(),
+            client,
+        },
+    ))
+}
 
-    Ok((engine, strategy))
+/// Maps vended UC storage credentials into `object_store` option keys.
+fn object_store_options(
+    creds: &[unity_catalog_delta_client_api::StorageCredential],
+) -> Vec<(String, String)> {
+    let mut opts = Vec::new();
+    for cred in creds {
+        for (key, value) in &cred.config {
+            let mapped = match key.as_str() {
+                "s3.access-key-id" => "access_key_id",
+                "s3.secret-access-key" => "secret_access_key",
+                "s3.session-token" => "session_token",
+                other => other,
+            };
+            opts.push((mapped.to_string(), value.clone()));
+        }
+    }
+    if let Ok(region) = std::env::var("UC_AWS_REGION") {
+        opts.push(("region".to_string(), region));
+    }
+    opts
 }
 
 /// Builds an engine from the table URL scheme and env vars (S3 or local).

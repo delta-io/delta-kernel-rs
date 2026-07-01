@@ -1310,9 +1310,7 @@ version = "0.26.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
- "itertools 0.14.0",
  "rstest",
- "serde",
  "serde_json",
  "tempfile",
  "test_utils",
@@ -1321,7 +1319,6 @@ dependencies = [
  "unity-catalog-delta-client-api",
  "unity-catalog-delta-rest-client",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -4838,7 +4835,6 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 name = "unity-catalog-delta-client-api"
 version = "0.26.0"
 dependencies = [
- "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4849,15 +4845,12 @@ dependencies = [
 name = "unity-catalog-delta-rest-client"
 version = "0.26.0"
 dependencies = [
- "chrono",
- "clap",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "unity-catalog-delta-client-api",
  "url",
 ]

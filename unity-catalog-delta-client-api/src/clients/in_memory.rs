@@ -1,12 +1,12 @@
-//! In-memory implementation of [`CommitClient`] and [`GetCommitsClient`] for testing.
+//! In-memory implementation of [`UpdateTableClient`] for testing.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use super::{CommitClient, GetCommitsClient};
+use super::UpdateTableClient;
 use crate::error::{Error, Result};
-use crate::models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+use crate::models::{Commit, LoadTableResponse, TableMetadata, TableName, UpdateTableRequest};
 
 // ============================================================================
 // TableData
@@ -32,48 +32,28 @@ impl TableData {
         }
     }
 
-    /// Returns commits within the requested version range.
-    fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
-        let start = request.start_version.unwrap_or(0);
-        let end = request.end_version.unwrap_or(i64::MAX);
+    /// Apply the typed `add-commit` and (optional) `set-latest-backfilled-version`
+    /// updates from an `UpdateTableRequest` against this table's state.
+    fn update_table(&mut self, request: &UpdateTableRequest) -> Result<()> {
+        let backfilled = request.latest_backfilled_version();
 
-        Ok(CommitsResponse {
-            commits: Some(
-                self.catalog_commits
-                    .iter()
-                    .filter(|commit| start <= commit.version && commit.version <= end)
-                    .cloned()
-                    .collect(),
-            ),
-            latest_table_version: self.max_ratified_version,
-        })
-    }
-
-    /// Registers a new commit. Returns an error if the version is not the expected next version
-    /// or if the number of unpublished commits exceeds the maximum.
-    fn commit(&mut self, request: CommitRequest) -> Result<()> {
-        let Some(commit) = request.commit_info else {
-            return Err(Error::UnsupportedOperation(
-                "commit_info is required".to_string(),
-            ));
-        };
+        let commit = request.staged_commit().cloned().ok_or_else(|| {
+            Error::UnsupportedOperation("add-commit update is required".to_string())
+        })?;
 
         let expected_version = self.max_ratified_version + 1;
-
         if commit.version != expected_version {
             return Err(Error::UnsupportedOperation(format!(
-                "Expected commit version {} but got {}",
-                expected_version, commit.version
+                "Expected commit version {expected_version} but got {}",
+                commit.version
             )));
         }
-
         if self.catalog_commits.len() >= Self::MAX_UNPUBLISHED_COMMITS {
             return Err(Error::MaxUnpublishedCommitsExceeded(
                 Self::MAX_UNPUBLISHED_COMMITS as u16,
             ));
         }
-
-        if let Some(v) = request.latest_backfilled_version {
+        if let Some(v) = backfilled {
             self.cleanup_published_commits(v);
         }
 
@@ -91,16 +71,16 @@ impl TableData {
 }
 
 // ============================================================================
-// InMemoryCommitsClient
+// InMemoryUpdateTableClient
 // ============================================================================
 
-/// An in-memory implementation of [`CommitClient`] and [`GetCommitsClient`] for testing.
-pub struct InMemoryCommitsClient {
+/// An in-memory implementation of [`UpdateTableClient`] for testing.
+pub struct InMemoryUpdateTableClient {
     // table id -> table data
     tables: RwLock<HashMap<String, TableData>>,
 }
 
-impl InMemoryCommitsClient {
+impl InMemoryUpdateTableClient {
     pub fn new() -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
@@ -128,31 +108,64 @@ impl InMemoryCommitsClient {
             .unwrap()
             .insert(table_id.into(), table_data);
     }
+
+    /// Build a `LoadTableResponse` for the given table id. Lets tests stand in
+    /// for the connector's `load_table` HTTP call.
+    pub fn load_table_response(
+        &self,
+        table_id: &str,
+        storage_location: impl Into<String>,
+    ) -> Result<LoadTableResponse> {
+        let tables = self.tables.read().unwrap();
+        let table = tables
+            .get(table_id)
+            .ok_or_else(|| Error::TableNotFound(table_id.to_string()))?;
+        let metadata = TableMetadata {
+            etag: String::new(),
+            table_type: "MANAGED".to_string(),
+            table_uuid: table_id.to_string(),
+            location: storage_location.into(),
+            created_time: 0,
+            updated_time: 0,
+            columns: serde_json::json!({ "type": "struct", "fields": [] }),
+            partition_columns: vec![],
+            properties: std::collections::HashMap::new(),
+            last_commit_version: Some(table.max_ratified_version),
+            last_commit_timestamp_ms: Some(0),
+        };
+        Ok(LoadTableResponse {
+            metadata,
+            commits: table.catalog_commits.clone(),
+            uniform: None,
+            latest_table_version: Some(table.max_ratified_version),
+        })
+    }
 }
 
-impl Default for InMemoryCommitsClient {
+impl Default for InMemoryUpdateTableClient {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl GetCommitsClient for InMemoryCommitsClient {
-    async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
-        let tables = self.tables.read().unwrap();
-        let table = tables
-            .get(&request.table_id)
-            .ok_or_else(|| Error::TableNotFound(request.table_id.clone()))?;
-        table.get_commits(request)
-    }
-}
+impl UpdateTableClient for InMemoryUpdateTableClient {
+    async fn update_table(&self, _target: &TableName, request: UpdateTableRequest) -> Result<()> {
+        // Identify the target table from the assert-table-uuid requirement.
+        let table_id = request
+            .table_uuid()
+            .ok_or_else(|| {
+                Error::UnsupportedOperation(
+                    "InMemoryUpdateTableClient requires an assert-table-uuid requirement"
+                        .to_string(),
+                )
+            })?
+            .to_string();
 
-impl CommitClient for InMemoryCommitsClient {
-    async fn commit(&self, request: CommitRequest) -> Result<()> {
         let mut tables = self.tables.write().unwrap();
         let table = tables
-            .get_mut(&request.table_id)
-            .ok_or_else(|| Error::TableNotFound(request.table_id.clone()))?;
-        table.commit(request)
+            .get_mut(&table_id)
+            .ok_or_else(|| Error::TableNotFound(table_id.clone()))?;
+        table.update_table(&request)
     }
 }
 
@@ -163,9 +176,9 @@ impl CommitClient for InMemoryCommitsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{DeltaTableRequirement, DeltaTableUpdate};
 
     const TABLE_ID: &str = "test-table-id";
-    const TABLE_URI: &str = "s3://bucket/table";
 
     fn make_commit(version: i64) -> Commit {
         Commit::new(
@@ -177,59 +190,62 @@ mod tests {
         )
     }
 
-    fn commit_request(version: i64, latest_backfilled_version: Option<i64>) -> CommitRequest {
-        CommitRequest::new(
-            TABLE_ID,
-            TABLE_URI,
-            make_commit(version),
-            latest_backfilled_version,
+    fn target() -> TableName {
+        TableName::new("test_catalog", "test_schema", "test_table")
+    }
+
+    fn commit_request(version: i64, latest_backfilled_version: Option<i64>) -> UpdateTableRequest {
+        let mut updates = vec![DeltaTableUpdate::AddCommit {
+            commit: make_commit(version),
+        }];
+        if let Some(v) = latest_backfilled_version {
+            updates.push(DeltaTableUpdate::SetLatestBackfilledVersion {
+                latest_published_version: v,
+            });
+        }
+        UpdateTableRequest::new(
+            vec![DeltaTableRequirement::AssertTableUuid {
+                uuid: TABLE_ID.to_string(),
+            }],
+            updates,
         )
-    }
-
-    fn get_commits_request() -> CommitsRequest {
-        CommitsRequest::new(TABLE_ID, TABLE_URI)
-    }
-
-    fn extract_commit_versions(commits: &[Commit]) -> Vec<i64> {
-        commits.iter().map(|c| c.version).collect()
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn test_commit_and_get_commits() {
-        let client = InMemoryCommitsClient::new();
-
-        // Create table
+    async fn test_commit_and_load_table_response() {
+        let client = InMemoryUpdateTableClient::new();
         client.create_table(TABLE_ID).unwrap();
 
-        // Insert 10 commits (versions 1-10)
         for v in 1..=10 {
-            client.commit(commit_request(v, None)).await.unwrap();
+            client
+                .update_table(&target(), commit_request(v, None))
+                .await
+                .unwrap();
         }
 
-        // Get commits (versions 3-8)
-        let commits_request = get_commits_request()
-            .with_start_version(3)
-            .with_end_version(8);
-        let response = client.get_commits(commits_request).await.unwrap();
-        let commits = response.commits.unwrap();
-        assert_eq!(commits.len(), 6);
-        assert_eq!(extract_commit_versions(&commits), vec![3, 4, 5, 6, 7, 8]);
-        assert_eq!(response.latest_table_version, 10);
+        let resp = client
+            .load_table_response(TABLE_ID, "memory:///tbl/")
+            .unwrap();
+        assert_eq!(resp.latest_table_version, Some(10));
+        assert_eq!(resp.commits.len(), 10);
 
-        // Insert commit 11 with latest_backfilled_version = 5
-        // This should cleanup commits 1-5 (retain versions >= 6)
-        client.commit(commit_request(11, Some(5))).await.unwrap();
-
-        // Get commits again - should return versions 6-11
-        let response = client.get_commits(get_commits_request()).await.unwrap();
-        let commits = response.commits.unwrap();
-        assert_eq!(extract_commit_versions(&commits), vec![6, 7, 8, 9, 10, 11]);
-        assert_eq!(response.latest_table_version, 11);
+        // Backfill cleanup: commit 11 with backfilled=5 keeps versions 6..=11
+        client
+            .update_table(&target(), commit_request(11, Some(5)))
+            .await
+            .unwrap();
+        let resp = client
+            .load_table_response(TABLE_ID, "memory:///tbl/")
+            .unwrap();
+        let versions: Vec<i64> = resp.commits.iter().map(|c| c.version).collect();
+        assert_eq!(versions, vec![6, 7, 8, 9, 10, 11]);
+        assert_eq!(resp.latest_table_version, Some(11));
     }
 
     #[test]
     fn test_create_table_duplicate_throws() {
-        let client = InMemoryCommitsClient::new();
+        let client = InMemoryUpdateTableClient::new();
         client.create_table(TABLE_ID).unwrap();
         assert!(matches!(
             client.create_table(TABLE_ID),
@@ -238,20 +254,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_commits_table_not_found() {
-        assert!(matches!(
-            InMemoryCommitsClient::new()
-                .get_commits(get_commits_request())
-                .await,
-            Err(Error::TableNotFound(_))
-        ));
-    }
-
-    #[tokio::test]
     async fn test_commit_table_not_found() {
         assert!(matches!(
-            InMemoryCommitsClient::new()
-                .commit(commit_request(1, None))
+            InMemoryUpdateTableClient::new()
+                .update_table(&target(), commit_request(1, None))
                 .await,
             Err(Error::TableNotFound(_))
         ));
@@ -259,33 +265,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_wrong_version() {
-        let client = InMemoryCommitsClient::new();
+        let client = InMemoryUpdateTableClient::new();
         client.create_table(TABLE_ID).unwrap();
         assert!(matches!(
-            client.commit(commit_request(5, None)).await,
+            client
+                .update_table(&target(), commit_request(5, None))
+                .await,
             Err(Error::UnsupportedOperation(_))
         ));
     }
 
     #[tokio::test]
-    async fn test_get_commits_empty_table() {
-        let client = InMemoryCommitsClient::new();
-        client.create_table(TABLE_ID).unwrap();
-        let response = client.get_commits(get_commits_request()).await.unwrap();
-        assert!(response.commits.unwrap().is_empty());
-        assert_eq!(response.latest_table_version, 0);
-    }
-
-    #[tokio::test]
     async fn test_commit_max_unpublished_commits_exceeded() {
-        let client = InMemoryCommitsClient::new();
+        let client = InMemoryUpdateTableClient::new();
         client.create_table(TABLE_ID).unwrap();
         for v in 1..=TableData::MAX_UNPUBLISHED_COMMITS as i64 {
-            client.commit(commit_request(v, None)).await.unwrap();
+            client
+                .update_table(&target(), commit_request(v, None))
+                .await
+                .unwrap();
         }
         let next_version = TableData::MAX_UNPUBLISHED_COMMITS as i64 + 1;
         assert!(matches!(
-            client.commit(commit_request(next_version, None)).await,
+            client
+                .update_table(&target(), commit_request(next_version, None))
+                .await,
             Err(Error::MaxUnpublishedCommitsExceeded(_))
         ));
     }
