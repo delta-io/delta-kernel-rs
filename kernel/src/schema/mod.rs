@@ -28,6 +28,8 @@ use crate::{DeltaResult, Error};
 #[cfg(feature = "column-defaults-in-dev")]
 mod column_default;
 #[cfg(feature = "column-defaults-in-dev")]
+pub(crate) use column_default::validate_column_defaults;
+#[cfg(feature = "column-defaults-in-dev")]
 pub use column_default::ColumnDefault;
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]

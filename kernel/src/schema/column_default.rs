@@ -1,7 +1,7 @@
 //! A typed wrapper around Delta's `CURRENT_DEFAULT` column metadata
 
 use crate::expressions::{parse_sql, Expression, Scalar};
-use crate::schema::DataType;
+use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
 
 /// A column-level default parsed from the `CURRENT_DEFAULT` metadata key of a
@@ -89,13 +89,44 @@ impl<'a> ColumnDefault<'a> {
     }
 }
 
+/// Validates the column-default metadata on a table's logical schema, treating an ill-formed
+/// default as table corruption.
+///
+/// Run eagerly at [`TableConfiguration`] construction so a corrupt table is rejected at load.
+/// Inspects top-level columns only, consistent with the rest of kernel's column-default handling.
+///
+/// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
+///
+/// # Errors
+///
+/// - A column declares a `CURRENT_DEFAULT` but `allow_column_defaults` is `false`. The protocol
+///   only honors defaults "when enabled", so such metadata is stray and the table is corrupt.
+/// - Propagates any error from
+///   [`StructField::column_default`](crate::schema::StructField::column_default)
+pub(crate) fn validate_column_defaults(
+    schema: &StructType,
+    allow_column_defaults: bool,
+) -> DeltaResult<()> {
+    for field in schema.fields() {
+        // `column_default` validates the metadata is well-formed; we discard the parsed default.
+        if field.column_default()?.is_some() && !allow_column_defaults {
+            return Err(Error::generic(format!(
+                "Field '{}' declares a `CURRENT_DEFAULT` but the table does not enable the \
+                 `allowColumnDefaults` writer feature",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ArrayType, MapType, StructField};
+    use crate::schema::{ArrayType, ColumnMetadataKey, MapType, MetadataValue, StructField};
 
     fn struct_ty() -> DataType {
         DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
@@ -193,6 +224,68 @@ mod tests {
             (result, expect) => {
                 panic!("unexpected outcome for {raw_sql:?}: {result:?} vs {expect:?}")
             }
+        }
+    }
+
+    /// A field carrying `raw_sql` as its `CURRENT_DEFAULT`.
+    fn field_with_default(
+        name: &str,
+        data_type: impl Into<DataType>,
+        raw_sql: &str,
+    ) -> StructField {
+        StructField::nullable(name, data_type).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+            MetadataValue::String(raw_sql.to_string()),
+        )])
+    }
+
+    /// A field whose `CURRENT_DEFAULT` metadata is a non-string value (malformed).
+    fn field_with_non_string_default(name: &str) -> StructField {
+        StructField::nullable(name, DataType::INTEGER).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+            MetadataValue::Number(7),
+        )])
+    }
+
+    /// `None` expects `Ok`; `Some(needle)` expects an error containing `needle`.
+    #[rstest]
+    #[case::well_formed_default_when_enabled(
+        vec![
+            field_with_default("c", DataType::INTEGER, "42"),
+            StructField::nullable("no_default", DataType::STRING),
+        ],
+        true,
+        None
+    )]
+    #[case::no_defaults_when_disabled(
+        vec![StructField::nullable("c", DataType::INTEGER)],
+        false,
+        None
+    )]
+    #[case::stray_default_when_disabled(
+        vec![field_with_default("c", DataType::INTEGER, "42")],
+        false,
+        Some("allowColumnDefaults")
+    )]
+    #[case::non_string_metadata(vec![field_with_non_string_default("c")], true, Some("non-string"))]
+    #[case::non_null_default_on_non_primitive(
+        vec![field_with_default("arr", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")],
+        true,
+        Some("not supported")
+    )]
+    fn validate_column_defaults_cases(
+        #[case] fields: Vec<StructField>,
+        #[case] allow_column_defaults: bool,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let schema = StructType::try_new(fields).unwrap();
+        match (
+            validate_column_defaults(&schema, allow_column_defaults),
+            expected_error,
+        ) {
+            (Ok(()), None) => {}
+            (Err(e), Some(needle)) => assert!(e.to_string().contains(needle), "got: {e}"),
+            (result, expected) => panic!("unexpected outcome: {result:?} vs {expected:?}"),
         }
     }
 

@@ -347,10 +347,8 @@ mod feature_enabled {
         Ok(())
     }
 
-    /// A non-NULL default on a non-primitive column is accepted at create time but surfaces as an
-    /// error when later discovered via `Transaction::column_defaults`.
     #[tokio::test]
-    async fn test_transaction_column_defaults_errors_on_non_null_non_primitive_default(
+    async fn test_load_rejects_non_null_non_primitive_default(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let base = StructType::try_new(vec![StructField::nullable(
             "arr",
@@ -359,7 +357,7 @@ mod feature_enabled {
         let schema = schema_with_column_defaults(&base, HashMap::from([("arr", "ARRAY(1)")]))?;
 
         let (store, engine, table_location) =
-            engine_store_setup("test_txn_column_defaults_non_primitive", None);
+            engine_store_setup("test_load_non_primitive_default", None);
         let table_url = create_table(
             store,
             table_location,
@@ -371,14 +369,38 @@ mod feature_enabled {
         )
         .await?;
 
-        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-
-        let err = txn
-            .column_defaults()
-            .expect_err("a non-NULL default on a non-primitive column must error")
+        let err = Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect_err("a non-NULL default on a non-primitive column must error at load")
             .to_string();
         assert!(err.contains("not supported"), "got: {err}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_default_without_allow_column_defaults_feature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable("c", DataType::INTEGER)])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42")]))?;
+
+        let (store, engine, table_location) = engine_store_setup("test_load_stray_default", None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            &[],    /* partition_columns */
+            true,   /* use_37_protocol */
+            vec![], /* reader_features */
+            vec![], /* writer_features: no allowColumnDefaults */
+        )
+        .await?;
+
+        let err = Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect_err("a CURRENT_DEFAULT without the allowColumnDefaults feature must error")
+            .to_string();
+        assert!(err.contains("allowColumnDefaults"), "got: {err}");
 
         Ok(())
     }
