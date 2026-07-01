@@ -14,9 +14,7 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{
-    column_expr, column_expr_ref, column_name, ColumnName, Expression, Predicate,
-};
+use crate::expressions::{column_name, ColumnName};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
@@ -59,47 +57,17 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    // Stats-eligible columns for the DataSkippingFilter below. Roughly parallels the scan
-    // path's `StateInfo::physical_stats_columns`. Clustering columns are deliberately not
-    // passed here, for the same reason the scan path leaves them out (see #2588):
-    // loading clustering domain metadata on the table-changes path would add an unbounded
-    // log replay to setup. If #2588 lands a writer-side fix that keeps
-    // `dataSkippingStatsColumns` in sync with clustering, both call sites stay simple.
-    let physical_stats_columns = start_table_configuration.physical_stats_columns_set(None);
-
+    // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
+    // deletion vector pairs before filtering, so unlike the scan path it operates on raw
+    // batches with stats parsed from `add.stats` JSON. `None` metrics: not wired in yet.
     let filter = physical_predicate
         .and_then(|(predicate, _ref_schema)| {
-            // Build the stats schema via the same path the scan side uses
-            // (`build_expected_stats_schemas`), so the read-side shape matches the write-side
-            // exactly. Predicate refs become the `requested_physical_columns` filter; refs
-            // outside `physical_stats_columns` fold to NULL via `DataSkippingFilter`'s gate.
-            let predicate_refs: Vec<ColumnName> =
-                predicate.references().into_iter().cloned().collect();
-            let physical_stats_schema = start_table_configuration
-                .build_expected_stats_schemas(None, Some(&predicate_refs))
-                .ok()?
-                .physical;
-
-            // Parse JSON stats from the raw action batch's `add.stats` column. Unlike the scan
-            // path (which transforms first and reads pre-parsed stats), table_changes must
-            // resolve deletion vector pairs before filtering, so it operates on raw batches.
-            let stats_expr = Arc::new(Expression::parse_json(
-                column_expr!("add.stats"),
-                physical_stats_schema.clone(),
-            ));
-            DataSkippingFilter::new(
+            DataSkippingFilter::for_raw_action_batch(
                 engine.as_ref(),
-                Some(predicate),
-                Some(&physical_stats_schema),
-                stats_expr,
-                None, // no partition columns for table changes (partition_expr unused)
-                column_expr_ref!("partitionValues_parsed"),
-                // Raw action batches keep the nested layout, so Add rows are
-                // `add.path IS NOT NULL`.
-                Arc::new(Predicate::is_not_null(column_expr!("add.path")).into()),
+                predicate,
+                start_table_configuration,
                 get_log_add_schema().clone(),
-                &physical_stats_columns,
-                None, // Table changes doesn't use metrics yet
+                None,
             )
         })
         .map(Arc::new);
