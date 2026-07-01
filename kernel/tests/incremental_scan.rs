@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::num::NonZero;
 use std::sync::Arc;
 
+use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred, PredicateRef};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
     IncrementalScanSummary,
@@ -1162,6 +1163,336 @@ async fn empty_base_keys_produces_no_duplicates() -> Result<(), Box<dyn std::err
     let summary_with = stream.into_summary_against_base_closure(|_| false)?;
     assert!(summary_with.duplicate_adds.is_empty());
     assert_eq!(summary_with.removes, HashSet::from([key("gone.parquet")]));
+
+    Ok(())
+}
+
+// === Predicate pushdown ===
+//
+// `with_predicate` prunes streamed live Adds against file stats using the same
+// `DataSkippingFilter` the read path uses. These tests use raw commit JSON so each Add can
+// carry a distinct `id` min/max range. The metadata (`test_utils::METADATA`) declares an
+// `id: integer` column, so `id`-predicates are eligible for data skipping. Skipping is
+// conservative: an Add is dropped only when its stats prove no row matches; Adds with no
+// stats and all Removes are always kept.
+
+// Build a raw Add action carrying `id` stats over the closed range `[id_min, id_max]`.
+fn add_with_id_stats(path: &str, id_min: i32, id_max: i32) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"id\\\":0}},\
+         \\\"minValues\\\":{{\\\"id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+    )
+}
+
+// Build a raw Add action with no stats (`stats` omitted). Data skipping must always keep it.
+fn add_without_stats(path: &str) -> String {
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true}}}}"
+    )
+}
+
+// Build a raw Remove action.
+fn remove_action(path: &str) -> String {
+    format!(
+        "{{\"remove\":{{\"path\":\"{path}\",\"deletionTimestamp\":1700000000000,\
+         \"dataChange\":true}}}}"
+    )
+}
+
+fn live_add_keys(listing: &IncrementalListing) -> &HashSet<FileActionKey> {
+    &listing.summary.live_adds
+}
+
+// Pushdown drops added files whose stats prove they cannot match, and keeps the rest. Three
+// files span disjoint `id` ranges; `id > 25` keeps only the file whose range extends past 25.
+// Also asserts the emitted selection vector agrees with `live_adds` (no summary/stream drift).
+#[tokio::test]
+async fn pushdown_drops_non_matching_added_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // low: id in [0, 9]; mid: id in [10, 19]; high: id in [20, 30].
+    let v1 = [
+        add_with_id_stats("low.parquet", 0, 9),
+        add_with_id_stats("mid.parquet", 10, 19),
+        add_with_id_stats("high.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // `id > 25` can only match high.parquet ([20, 30]); low and mid are provably excluded.
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        live_add_keys(&listing),
+        &HashSet::from([key("high.parquet")]),
+        "only high.parquet ([20, 30]) can match id > 25"
+    );
+    // The streamed selection vector must agree with the summary's live_adds count.
+    assert_eq!(live_add_count(&listing), 1);
+    assert!(listing.summary.removes.is_empty());
+
+    Ok(())
+}
+
+// The default (no predicate) path is unchanged: every live Add is streamed regardless of
+// stats. Guards against the predicate wiring leaking into the `None` case.
+#[tokio::test]
+async fn no_predicate_streams_every_live_add() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let v1 = [
+        add_with_id_stats("low.parquet", 0, 9),
+        add_with_id_stats("mid.parquet", 10, 19),
+        add_with_id_stats("high.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
+
+    assert_eq!(
+        live_add_keys(&listing),
+        &HashSet::from([key("low.parquet"), key("mid.parquet"), key("high.parquet")]),
+        "no predicate keeps every live Add"
+    );
+    assert_eq!(live_add_count(&listing), 3);
+
+    Ok(())
+}
+
+// A file with no stats is always kept, even under a predicate whose range would exclude it if
+// stats were present. Conservative skipping never drops a stats-less file.
+#[tokio::test]
+async fn added_file_without_stats_is_always_kept() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // no_stats has no stats; in_range has id in [20, 30]. Both must survive `id > 25`:
+    // no_stats because it can't be disproven, in_range because [20, 30] overlaps.
+    let v1 = [
+        add_without_stats("no_stats.parquet"),
+        add_with_id_stats("in_range.parquet", 20, 30),
+        add_with_id_stats("out_of_range.parquet", 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        live_add_keys(&listing),
+        &HashSet::from([key("no_stats.parquet"), key("in_range.parquet")]),
+        "the stats-less file is kept; only the provably-excluded file is dropped"
+    );
+
+    Ok(())
+}
+
+// Removes are never filtered by the predicate. A removed file whose stat range the predicate
+// excludes must still appear in `removes` in full -- the consumer needs every removal to evict
+// stale cached entries.
+#[tokio::test]
+async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // v1 adds gone.parquet (id in [0, 5], which `id > 25` would exclude).
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_id_stats("gone.parquet", 0, 5),
+    )
+    .await?;
+    // v2 removes gone.parquet and adds kept.parquet (id in [20, 30]).
+    let v2 = [
+        remove_action("gone.parquet"),
+        add_with_id_stats("kept.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 2, v2).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    // The Remove is reported in full even though the predicate excludes its stat range.
+    assert_eq!(
+        listing.summary.removes,
+        HashSet::from([key("gone.parquet")]),
+        "removes must never be filtered by the predicate"
+    );
+    // Only kept.parquet ([20, 30]) survives among the live Adds.
+    assert_eq!(
+        live_add_keys(&listing),
+        &HashSet::from([key("kept.parquet")]),
+    );
+
+    Ok(())
+}
+
+// A predicate that statically excludes every file (`id > 25 AND FALSE`) yields an empty live-Add
+// stream, but Removes are still reported. A tautology (`id > 25 OR TRUE`) is useless for
+// skipping and behaves like no predicate.
+#[rstest]
+#[case::static_skip_all(Pred::and(column_expr!("id").gt(Expr::literal(25i32)), Pred::literal(false)), 0)]
+#[case::tautology(Pred::or(column_expr!("id").gt(Expr::literal(25i32)), Pred::literal(true)), 2)]
+#[tokio::test]
+async fn static_skip_all_and_tautology(
+    #[case] predicate: Pred,
+    #[case] expected_live: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // v1 adds two files and removes a third, so removes is non-empty regardless of the predicate.
+    let v1 = [
+        add_with_id_stats("a.parquet", 0, 9),
+        add_with_id_stats("b.parquet", 20, 30),
+        remove_action("removed.parquet"),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(Arc::new(predicate))
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(live_add_count(&listing), expected_live);
+    // Removes are reported regardless of the Add-side skipping strategy.
+    assert_eq!(
+        listing.summary.removes,
+        HashSet::from([key("removed.parquet")]),
+        "removes are reported even when all Adds are statically skipped"
+    );
+
+    Ok(())
+}
+
+// Consumer classification (`into_summary_against_base_*`) composes with the predicate: base
+// intersection runs over the predicate-pruned live Adds, so a base key whose file the
+// predicate dropped is not reported as a duplicate.
+#[tokio::test]
+async fn against_base_classification_composes_with_predicate(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // matches.parquet (id in [20, 30]) survives `id > 25`; dropped.parquet (id in [0, 5]) does not.
+    let v1 = [
+        add_with_id_stats("matches.parquet", 20, 30),
+        add_with_id_stats("dropped.parquet", 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // Both files are in the consumer's base. Only the predicate-surviving one should classify
+    // as a duplicate; the dropped file was pruned before base intersection.
+    let base_keys = [key("matches.parquet"), key("dropped.parquet")];
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let stream = target
+        .incremental_scan_builder(0)
+        .with_predicate(predicate)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let summary = stream.into_summary_against_base_iter(&base_keys)?;
+
+    assert_eq!(
+        summary.duplicate_adds,
+        HashSet::from([key("matches.parquet")]),
+        "the pruned file is not classified as a duplicate"
+    );
+    assert!(summary.removes.is_empty());
 
     Ok(())
 }
