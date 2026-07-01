@@ -1217,6 +1217,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        CheckpointReadIntent::NonFileActions,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1290,6 +1291,9 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: true,
+        },
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1355,6 +1359,9 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: true,
+        },
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1408,6 +1415,9 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: true,
+        },
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1500,6 +1510,9 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: true,
+        },
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1544,6 +1557,188 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     );
 
     assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+/// A `_last_checkpoint` hint whose schema omits `sidecar` must not make a V2 checkpoint read as V1.
+#[tokio::test]
+async fn test_v2_checkpoint_not_read_as_v1_when_hint_omits_sidecar() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let sidecar1_size = add_sidecar_to_store(
+        &store,
+        add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        "sidecarfile1.parquet",
+    )
+    .await?
+    .size;
+    let sidecar2_size = add_sidecar_to_store(
+        &store,
+        add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        "sidecarfile2.parquet",
+    )
+    .await?
+    .size;
+
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
+            get_all_actions_schema().clone(),
+        ),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file_path = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+
+    // Hint at the checkpoint's version whose schema omits `sidecar`. Before the fix this makes the
+    // V2 checkpoint read as V1 and silently drops the sidecar file actions.
+    let sidecar_less_hint = LastCheckpointHintSummary {
+        version: 1,
+        schema: Some(get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+    };
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(
+                &checkpoint_file_path,
+                checkpoint_size,
+            )],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(sidecar_less_hint),
+    )?;
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema.clone(),
+        None,
+        None,
+        None,
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: true,
+        },
+    )?;
+    let mut iter = checkpoint_result.actions;
+
+    // The sidecar files must still be read: V2 is detected from the footer despite the hint.
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert_batch_matches(
+        first_batch,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
+            get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+        ),
+    );
+    let ActionsBatch {
+        actions: second_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert_batch_matches(
+        second_batch,
+        add_batch_simple(v2_checkpoint_read_schema.clone()),
+    );
+    let ActionsBatch {
+        actions: third_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert_batch_matches(
+        third_batch,
+        add_batch_with_remove(v2_checkpoint_read_schema),
+    );
+
+    assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+/// When the table cannot be V2 (`is_v2_supported` false), a classic parquet checkpoint trusts the
+/// `_last_checkpoint` schema hint and does not read the parquet footer. Uses a hint that omits
+/// `sidecar` over a file that does contain sidecar references: trusting the hint yields the V1
+/// path (no sidecars resolved); a stray footer read would instead surface the sidecar column and
+/// resolve sidecars, so the single top-level batch proves the footer was not read.
+#[tokio::test]
+async fn test_v1_checkpoint_trusts_hint_without_footer_read() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_all_actions_schema().clone()),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file_path = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+
+    // Hint schema without a `sidecar` column. With `is_v2_supported: false` the hint is trusted, so
+    // the checkpoint is read as V1 and sidecars are never resolved.
+    let hint_schema = get_commit_schema().project(&[ADD_NAME])?;
+    let read_schema = get_commit_schema().project(&[ADD_NAME])?;
+    let v1_hint = LastCheckpointHintSummary {
+        version: 1,
+        schema: Some(hint_schema),
+    };
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(
+                &checkpoint_file_path,
+                checkpoint_size,
+            )],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(v1_hint),
+    )?;
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        read_schema.clone(),
+        None,
+        None,
+        None,
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: false,
+        },
+    )?;
+    let mut iter = checkpoint_result.actions;
+
+    // Only the top-level checkpoint batch is returned; no sidecar batches, because the hint (which
+    // lacks `sidecar`) was trusted without reading the footer.
+    let ActionsBatch { is_log_batch, .. } = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert!(
+        iter.next().is_none(),
+        "sidecars must not be resolved when the V1 hint is trusted",
+    );
 
     Ok(())
 }
@@ -2702,15 +2897,21 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
 }
 
-/// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
-/// matches [`LogSegment::checkpoint_version`]. Otherwise the parquet footer is read.
+/// `checkpoint_schema()` returns the `_last_checkpoint` hint only when the hint version matches
+/// [`LogSegment::checkpoint_version`]. `get_file_actions_schema_and_sidecars` for a single-file
+/// parquet checkpoint trusts a usable hint only when the table cannot be V2 (`is_v2_supported`
+/// false); when it could be V2, or the hint version does not match, it reads the footer.
+///
+/// Cases: (hint_version, is_v2_supported, expect_hint_schema_used_for_file_actions).
 #[rstest]
-#[case::hint_matches_checkpoint(1, true)]
-#[case::hint_newer_than_checkpoint(99, false)]
-#[case::hint_older_than_checkpoint(0, false)]
+#[case::v1_table_matching_hint(1, false, true)]
+#[case::v2_table_matching_hint(1, true, false)]
+#[case::v1_table_stale_newer_hint(99, false, false)]
+#[case::v1_table_stale_older_hint(0, false, false)]
 #[tokio::test]
 async fn test_get_file_actions_schema_v1_parquet_with_hint(
     #[case] hint_version: u64,
+    #[case] is_v2_supported: bool,
     #[case] expect_hint_schema_used: bool,
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -2729,6 +2930,9 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
+    // A hint schema that differs from the checkpoint footer, so we can tell which one was used.
+    // It has no `sidecar` column, so only a V1 (`is_v2_supported` false) table with a matching hint
+    // version trusts it.
     let hint_schema: SchemaRef = schema_ref! {
         nullable "metadata": {},
     };
@@ -2736,6 +2940,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     // Build a commit that uses v1 checkpoint and a hint that describes a different schema
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
     let commit_v2 = create_log_path(&commit_v2_path);
+    let hint_version_matches = hint_version == 1;
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
             checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
@@ -2751,10 +2956,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         }),
     )?;
 
-    // Verify that checkpoint_schema only returns schema if it is valid
+    // `checkpoint_schema()` returns the hint only when the hint version matches the checkpoint.
     assert_eq!(log_segment.checkpoint_version, Some(1));
     assert_eq!(log_segment.end_version, 2);
-    if expect_hint_schema_used {
+    if hint_version_matches {
         assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
     } else {
         assert!(
@@ -2763,16 +2968,20 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         );
     }
 
-    // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
-    // version
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    // The file-actions schema comes from the hint only when it is trusted (V1 table + matching
+    // hint version); otherwise it comes from the parquet footer.
+    let (schema, sidecars) =
+        log_segment.get_file_actions_schema_and_sidecars(&engine, is_v2_supported)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {
-        assert_eq!(schema, hint_schema, "should use hint when versions match");
+        assert_eq!(
+            schema, hint_schema,
+            "should trust the hint for a V1-only table"
+        );
     } else {
         assert_eq!(
             schema, v1_schema,
-            "should read schema from parquet footer when versions mismatch"
+            "should read the schema from the parquet footer"
         );
     }
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
@@ -2842,7 +3051,8 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    // Multi-part checkpoints are always V1, so `is_v2_supported` is inert here.
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, false)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
 
     // Verify stats_parsed is detectable in the returned schema.
@@ -3566,6 +3776,9 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: true,
+        },
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -3631,6 +3844,9 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
+        CheckpointReadIntent::FileActions {
+            is_v2_supported: true,
+        },
     )?;
 
     // Verify it's false
@@ -4341,7 +4557,13 @@ async fn read_actions_with_null_map_values(
     // Use all_actions_schema to cover sidecar and checkpointMetadata (checkpoint-only actions).
     let action_schema = get_all_actions_schema().clone();
     let action_batches = log_segment
-        .read_actions(&engine, action_schema)
+        .read_actions(
+            &engine,
+            action_schema,
+            CheckpointReadIntent::FileActions {
+                is_v2_supported: true,
+            },
+        )
         .expect("read_actions should succeed");
 
     // Iterate batches and verify the map value field is nullable.

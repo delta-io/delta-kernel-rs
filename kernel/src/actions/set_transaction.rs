@@ -2,7 +2,7 @@ pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::log_replay::ActionsBatch;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{CheckpointReadIntent, LogSegment};
 use crate::{DeltaResult, Engine, RowVisitor as _};
 
 /// Returns `true` if a set transaction is expired according to the given expiration and
@@ -86,7 +86,11 @@ fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
+    log_segment.read_actions(
+        engine,
+        LOG_TXN_SCHEMA.clone(),
+        CheckpointReadIntent::NonFileActions,
+    )
 }
 
 #[cfg(test)]

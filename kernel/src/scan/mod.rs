@@ -22,7 +22,9 @@ use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
+use crate::log_segment::{
+    ActionsWithCheckpointInfo, CheckpointReadInfo, CheckpointReadIntent, LogSegment,
+};
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
@@ -893,6 +895,7 @@ impl Scan {
                 self.build_actions_meta_predicate(),
             )
         };
+        let is_v2_supported = self.snapshot.table_configuration().supports_v2_checkpoint();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
@@ -903,6 +906,7 @@ impl Scan {
                 .as_ref()
                 .map(|s| s.as_ref()),
             None,
+            CheckpointReadIntent::FileActions { is_v2_supported },
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -976,6 +980,7 @@ impl Scan {
                 self.build_actions_meta_predicate(),
             )
         };
+        let is_v2_supported = self.snapshot.table_configuration().supports_v2_checkpoint();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -991,6 +996,7 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                CheckpointReadIntent::FileActions { is_v2_supported },
             )
     }
 

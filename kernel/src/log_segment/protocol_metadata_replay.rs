@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
-use super::LogSegment;
+use super::{CheckpointReadIntent, LogSegment};
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
@@ -128,7 +128,7 @@ impl LogSegment {
             (&PROTOCOL_FIELD),
             (&METADATA_FIELD),
         };
-        self.read_actions(engine, schema)
+        self.read_actions(engine, schema, CheckpointReadIntent::NonFileActions)
     }
 }
 
