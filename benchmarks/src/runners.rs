@@ -5,8 +5,6 @@
 //! Results are discarded for benchmarking purposes.
 //!
 //! Engine and snapshot construction is handled based on `TableInfo`:
-//! - UC tables (`catalog_info`): UC-vended credentials; catalog-managed tables use
-//!   `UCKernelClient::load_snapshot`, others use the standard snapshot builder
 //! - S3 tables (`table_path` with s3://): credentials from `AWS_*` env vars
 //! - Local tables: local filesystem engine
 
@@ -19,20 +17,12 @@ use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, Stat
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel_unity_catalog::UCKernelClient;
 use delta_kernel_workloads::models::{
     ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
     TimeTravel,
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
-use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
-use unity_catalog_delta_rest_client::{
-    ClientConfig, Error as UcRestError, UCClient, UCCommitsRestClient,
-};
 use url::Url;
-
-/// Delta table property indicating catalog-managed support.
-const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
@@ -53,15 +43,13 @@ fn build_engine(
 
 /// Determines how a snapshot is loaded. Built once at setup via [`resolve_snapshot_strategy`],
 /// then used by runners to construct snapshots.
+///
+/// TODO: re-add a `CatalogManaged` variant that loads catalog-managed tables via the new UC API
+/// (`UCClient::load_table` -> `LoadTableResponse` -> `log_tail_from_commits` ->
+/// `Snapshot::builder_for(..).with_log_tail(..)`), restoring the catalog-managed benchmark path.
 enum SnapshotStrategy {
-    /// Standard snapshot builder (local, S3, or UC-managed non-catalog-managed tables).
+    /// Standard snapshot builder (local or S3 tables).
     Standard { url: Url },
-    /// Catalog-managed table: snapshot loaded via `UCKernelClient::load_snapshot`.
-    CatalogManaged {
-        table_id: String,
-        table_uri: String,
-        commits_client: Box<UCCommitsRestClient>,
-    },
 }
 
 impl SnapshotStrategy {
@@ -69,7 +57,6 @@ impl SnapshotStrategy {
     fn load_snapshot(
         &self,
         engine: &dyn Engine,
-        runtime: &tokio::runtime::Runtime,
         time_travel: Option<&TimeTravel>,
     ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
         match self {
@@ -80,98 +67,24 @@ impl SnapshotStrategy {
                 }
                 Ok(builder.build(engine)?)
             }
-            SnapshotStrategy::CatalogManaged {
-                table_id,
-                table_uri,
-                commits_client,
-            } => {
-                let catalog = UCKernelClient::new(commits_client.as_ref());
-                let result = match time_travel {
-                    Some(tt) => {
-                        let version = tt.as_version()?;
-                        runtime.block_on(
-                            catalog.load_snapshot_at(table_id, table_uri, version, engine),
-                        )
-                    }
-                    None => runtime.block_on(catalog.load_snapshot(table_id, table_uri, engine)),
-                };
-                result.map_err(|e| format!("Catalog snapshot failed: {e}").into())
-            }
         }
     }
 }
 
-/// Resolves engine credentials and snapshot strategy from a [`TableInfo`].
+/// Resolves the engine and snapshot strategy from a [`TableInfo`].
 ///
-/// For UC-managed tables (`catalog_info` is present), credentials are vended via
-/// `UCClient`. The `delta.feature.catalogManaged` property then determines whether to use
-/// `UCKernelClient` (catalog-managed) or the standard snapshot builder.
-///
-/// For non-UC tables, the engine is built from env vars (`AWS_*` for S3, local filesystem
+/// The engine is built from the table URL scheme and env vars (`AWS_*` for S3, local filesystem
 /// otherwise).
 fn resolve_snapshot_strategy(
     table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<(Arc<dyn Engine>, SnapshotStrategy), Box<dyn std::error::Error>> {
-    let Some(cm) = &table_info.catalog_info else {
-        let url = table_info.resolved_table_root();
-        let engine = resolve_engine_for_url(&url, runtime)?;
-        return Ok((engine, SnapshotStrategy::Standard { url }));
-    };
-
-    let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
-    let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
-
-    let config = ClientConfig::build(&endpoint, &token).build()?;
-    let client = UCClient::new(config.clone())?;
-
-    let result: Result<_, UcRestError> = runtime.block_on(async {
-        let table = client.get_table(&cm.table_name).await?;
-        let creds = client
-            .get_credentials(&table.table_id, Operation::Read)
-            .await?;
-        let aws = creds
-            .aws_temp_credentials
-            .ok_or(UcApiError::UnsupportedOperation(
-                // TODO(#2305): support non-AWS credential types
-                "Credential vending returned no AWS credentials".into(),
-            ))?;
-        Ok((
-            table.table_id,
-            table.storage_location,
-            table.properties,
-            aws,
-        ))
-    });
-    let (table_id, table_uri, uc_properties, aws) = result?;
-
-    let table_url = Url::parse(&table_uri)?;
-    let region = std::env::var("AWS_REGION").map_err(|_| "AWS_REGION required")?;
-    let options = [
-        ("region", region.as_str()),
-        ("access_key_id", aws.access_key_id.as_str()),
-        ("secret_access_key", aws.secret_access_key.as_str()),
-        ("session_token", aws.session_token.as_str()),
-    ];
-    let (store, _) = delta_kernel::object_store::parse_url_opts(&table_url, options)?;
-    let engine = build_engine(store.into(), runtime);
-
-    let is_catalog_managed = uc_properties
-        .get(CATALOG_MANAGED_PROPERTY)
-        .is_some_and(|v| v == "supported");
-
-    let strategy = if is_catalog_managed {
-        let commits_client = Box::new(UCCommitsRestClient::new(config)?);
-        SnapshotStrategy::CatalogManaged {
-            table_id,
-            table_uri,
-            commits_client,
-        }
-    } else {
-        SnapshotStrategy::Standard { url: table_url }
-    };
-
-    Ok((engine, strategy))
+    if table_info.catalog_info.is_some() {
+        return Err("catalog-managed tables are not supported by this benchmark runner".into());
+    }
+    let url = table_info.resolved_table_root();
+    let engine = resolve_engine_for_url(&url, runtime)?;
+    Ok((engine, SnapshotStrategy::Standard { url }))
 }
 
 /// Builds an engine from the table URL scheme and env vars (S3 or local).
@@ -223,8 +136,7 @@ impl ReadMetadataRunner {
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
-        let snapshot =
-            strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
+        let snapshot = strategy.load_snapshot(engine.as_ref(), read_spec.time_travel.as_ref())?;
 
         let predicate = read_spec
             .predicate
@@ -362,7 +274,6 @@ pub fn create_read_runner(
 
 pub struct SnapshotConstructionRunner {
     engine: Arc<dyn Engine>,
-    runtime: Arc<tokio::runtime::Runtime>,
     snapshot_strategy: SnapshotStrategy,
     time_travel: Option<TimeTravel>,
     name: String,
@@ -377,11 +288,10 @@ impl SnapshotConstructionRunner {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let name = format!("{}/{}", table_info.name, case_name,);
 
-        let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime)?;
 
         Ok(Self {
             engine,
-            runtime,
             snapshot_strategy,
             time_travel: snapshot_spec.time_travel.clone(),
             name,
@@ -391,11 +301,9 @@ impl SnapshotConstructionRunner {
 
 impl WorkloadRunner for SnapshotConstructionRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot = self.snapshot_strategy.load_snapshot(
-            self.engine.as_ref(),
-            &self.runtime,
-            self.time_travel.as_ref(),
-        )?;
+        let snapshot = self
+            .snapshot_strategy
+            .load_snapshot(self.engine.as_ref(), self.time_travel.as_ref())?;
         black_box(snapshot);
         Ok(())
     }

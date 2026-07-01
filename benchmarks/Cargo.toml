@@ -24,14 +24,11 @@ ureq = { version = "3.1", default-features = false, features = ["native-tls", "g
 delta_kernel = { path = "../kernel", features = ["default-engine-base", "internal-api"] }
 delta_kernel_default_engine = { path = "../default-engine", features = ["rustls"] }
 delta_kernel_workloads = { path = "../workloads" }
-delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog" }
 object_store = { version = "0.12.3", features = ["aws"] }
 test_utils = { path = "../test-utils" }
 rayon = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
-unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
-unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client" }
 url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]

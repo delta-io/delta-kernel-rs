@@ -17,6 +17,11 @@ pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         ),
+        // The UC REST API rejects requests without a User-Agent header (HTTP 400).
+        (
+            header::USER_AGENT,
+            header::HeaderValue::from_str(&config.user_agent)?,
+        ),
     ]);
 
     let client = Client::builder()

@@ -1,16 +1,25 @@
-// TODO(https://github.com/delta-io/delta-kernel-rs/issues/2251): Replace UCClient with
-// trait-based clients (GetTableClient, GetCredentialsClient) once those traits are added
-// to unity-catalog-delta-client-api.
+//! Concrete (non-trait) HTTP methods on the UC API surface.
+//!
+//! `UCClient` ships connector-driven endpoints: `load_table`,
+//! `get_table_credentials`, and `get_config`. Trait-abstracted dispatch is
+//! kept narrow and lives in `UCUpdateTableRestClient` (see `update_table.rs`);
+//! see the crate docs for rationale.
+//!
+//! Path prefix: the OpenAPI spec hosts endpoints under
+//! `/api/2.1/unity-catalog/delta/v1/...`. `ClientConfig` stamps
+//! `/api/2.1/unity-catalog/` onto the base URL, so this module joins
+//! `delta/v1/...` paths on top.
+
 use reqwest::StatusCode;
 use tracing::instrument;
-use unity_catalog_delta_client_api::{Operation, TemporaryTableCredentials};
+use unity_catalog_delta_client_api::{
+    CatalogConfig, CredentialsResponse, LoadTableResponse, Operation,
+};
 use url::Url;
 
 use crate::config::ClientConfig;
 use crate::error::Result;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use crate::models::credentials::CredentialsRequest;
-use crate::models::tables::TablesResponse;
 
 /// An HTTP client for interacting with the Unity Catalog API.
 #[derive(Debug, Clone)]
@@ -39,41 +48,71 @@ impl UCClient {
         }
     }
 
-    /// Resolve the table by name.
+    /// `GET /delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`:
+    /// fetch the table's metadata plus inline unpublished commits.
     #[instrument(skip(self))]
-    pub async fn get_table(&self, table_name: &str) -> Result<TablesResponse> {
-        let url = self.base_url.join(&format!("tables/{table_name}"))?;
+    pub async fn load_table(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<LoadTableResponse> {
+        let path = format!("delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}");
+        let url = self.base_url.join(&path)?;
 
         let response =
             execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
-
         match response.status() {
             StatusCode::NOT_FOUND => Err(unity_catalog_delta_client_api::Error::TableNotFound(
-                table_name.to_string(),
+                format!("{catalog}.{schema}.{table}"),
             )
             .into()),
             _ => handle_response(response).await,
         }
     }
 
-    /// Get temporary cloud storage credentials for accessing a table.
+    /// Vend temporary cloud-storage credentials for the table via
+    /// `GET /delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}/credentials?operation=...
+    /// `.
     #[instrument(skip(self))]
-    pub async fn get_credentials(
+    pub async fn get_table_credentials(
         &self,
-        table_id: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
         operation: Operation,
-    ) -> Result<TemporaryTableCredentials> {
-        let url = self.base_url.join("temporary-table-credentials")?;
+    ) -> Result<CredentialsResponse> {
+        let path =
+            format!("delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}/credentials");
+        let mut url = self.base_url.join(&path)?;
+        url.query_pairs_mut()
+            .append_pair("operation", &operation.to_string());
 
-        let request_body = CredentialsRequest::new(table_id, operation);
-        let response = execute_with_retry(&self.config, || {
-            self.http_client
-                .post(url.clone())
-                .json(&request_body)
-                .send()
-        })
-        .await?;
+        let response =
+            execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
+        handle_response(response).await
+    }
 
+    /// `GET /delta/v1/config?catalog={catalog}&protocol-versions={csv}`:
+    /// session-start handshake. The client advertises the protocol versions it
+    /// supports; the server returns endpoint templates the client should use
+    /// for subsequent calls.
+    ///
+    /// `protocol_versions` is a list of version strings such as `["1.1", "2.3"]`
+    /// indicating the highest version per major version the client supports.
+    #[instrument(skip(self))]
+    pub async fn get_config(
+        &self,
+        catalog: &str,
+        protocol_versions: &[&str],
+    ) -> Result<CatalogConfig> {
+        let mut url = self.base_url.join("delta/v1/config")?;
+        url.query_pairs_mut().append_pair("catalog", catalog);
+        url.query_pairs_mut()
+            .append_pair("protocol-versions", &protocol_versions.join(","));
+
+        let response =
+            execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
         handle_response(response).await
     }
 }
