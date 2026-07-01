@@ -71,3 +71,7 @@ declarative-plans = ["delta_kernel/declarative-plans", "arrow", "default-engine-
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
+
+# Experimental, temporary: forwards the kernel column-defaults work to the FFI surface.
+# TODO(#2630): remove once full column-defaults support ships.
+column-defaults-in-dev = ["delta_kernel/column-defaults-in-dev"]

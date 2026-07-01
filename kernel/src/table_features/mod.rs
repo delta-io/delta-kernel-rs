@@ -434,10 +434,13 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// TODO: Implement the write-side requirements for IcebergCompatV3.
 /// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
 ///
+/// Column defaults are enforced (gated by `column-defaults-in-dev`) in `iceberg_compat::v3`'s
+/// `check_column_defaults`: the spec requires literal defaults, and kernel additionally restricts
+/// them to primitive columns.
+///
 /// Attention in the future:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
 ///   tables.
-/// - Column defaults: when supported, only literal expressions are allowed.
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
 ///   always use INT64; INT96 is forbidden.

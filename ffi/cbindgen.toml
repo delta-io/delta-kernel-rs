@@ -13,6 +13,7 @@ cpp_compat = true
 [defines]
 "feature = default-engine-rustls" = "DEFINE_DEFAULT_ENGINE_RUSTLS"
 "feature = default-engine-base" = "DEFINE_DEFAULT_ENGINE_BASE"
+"feature = column-defaults-in-dev" = "DEFINE_COLUMN_DEFAULTS_IN_DEV"
 
 [export.mangle]
 remove_underscores = true
