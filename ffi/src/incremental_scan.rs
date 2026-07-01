@@ -1,0 +1,611 @@
+//! FFI bindings for the incremental scan API.
+//!
+//! An incremental scan streams the file-action diff between a base version and a target
+//! [`SharedSnapshot`], letting an engine advance a cached file listing without a full log replay.
+//! The flow mirrors the Rust API:
+//!
+//! ```text
+//! snapshot_incremental_scan_builder(snapshot, base_version)
+//!   -> incremental_scan_builder_build(builder)   // -> OptionalValue<stream>; None => full-scan fallback
+//!   -> incremental_scan_stream_next_arrow(stream) // drain filtered Add batches, newest-first
+//!   -> incremental_scan_stream_into_summary(stream) // -> summary; consumes the stream
+//! ```
+//!
+//! [`incremental_scan_builder_build`] returns [`OptionalValue::None`] (not an error) when the
+//! target snapshot's commit list can't cover the range, which is the signal to fall back to a
+//! full scan.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
+use delta_kernel::log_replay::FileActionKey;
+use delta_kernel::snapshot::SnapshotRef;
+use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel_ffi_macros::handle_descriptor;
+
+#[cfg(feature = "default-engine-base")]
+use crate::engine_data::ArrowFFIData;
+use crate::handle::Handle;
+#[cfg(feature = "default-engine-base")]
+use crate::KernelBoolSlice;
+use crate::{
+    kernel_string_slice, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
+};
+
+/// Opaque builder for constructing an [`IncrementalScanStream`] from a snapshot.
+///
+/// Create with [`snapshot_incremental_scan_builder`]. Call [`incremental_scan_builder_build`] to
+/// consume the builder and obtain the stream, or [`free_incremental_scan_builder`] to drop it
+/// without building.
+pub struct FfiIncrementalScanBuilder {
+    engine: Arc<dyn ExternEngine>,
+    target_snapshot: SnapshotRef,
+    base_version: Version,
+}
+
+/// An opaque handle with exclusive (Box-like) ownership of a [`FfiIncrementalScanBuilder`].
+#[handle_descriptor(target=FfiIncrementalScanBuilder, mutable=true, sized=true)]
+pub struct MutableFfiIncrementalScanBuilder;
+
+/// An incremental scan stream, guarded by a mutex so it can cross the FFI boundary as a shared
+/// handle. The stream itself is single-consumer; the mutex serializes concurrent `next` calls.
+///
+/// The engine `Arc` is retained so the JSON reader's runtime outlives the stream even if the
+/// caller drops its own engine handle first.
+pub struct FfiIncrementalScanStream {
+    stream: Mutex<Option<IncrementalScanStream>>,
+    engine: Arc<dyn ExternEngine>,
+}
+
+/// An opaque, shared handle owning an [`FfiIncrementalScanStream`]. Release with
+/// [`free_incremental_scan_stream`], or consume it with
+/// [`incremental_scan_stream_into_summary`].
+#[handle_descriptor(target=FfiIncrementalScanStream, mutable=false, sized=true)]
+pub struct SharedIncrementalScanStream;
+
+/// An opaque, shared handle owning an [`IncrementalScanSummary`]. Release with
+/// [`free_incremental_scan_summary`].
+#[handle_descriptor(target=IncrementalScanSummary, mutable=false, sized=true)]
+pub struct SharedIncrementalScanSummary;
+
+/// Get a builder for an incremental scan over the range `(base_version, snapshot.version()]`.
+///
+/// The caller owns the returned handle and must eventually call either
+/// [`incremental_scan_builder_build`] to produce a stream, or [`free_incremental_scan_builder`]
+/// to drop it without building. Does not consume the snapshot handle.
+///
+/// # Safety
+///
+/// Caller must pass a valid snapshot handle and engine handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_incremental_scan_builder(
+    snapshot: Handle<SharedSnapshot>,
+    base_version: Version,
+    engine: Handle<SharedExternEngine>,
+) -> Handle<MutableFfiIncrementalScanBuilder> {
+    let target_snapshot = unsafe { snapshot.clone_as_arc() };
+    let engine = unsafe { engine.clone_as_arc() };
+    Box::new(FfiIncrementalScanBuilder {
+        engine,
+        target_snapshot,
+        base_version,
+    })
+    .into()
+}
+
+/// Consume the builder and return the incremental scan stream, or [`OptionalValue::None`] when
+/// the target snapshot's commit list can't cover `(base_version, target_version]`.
+///
+/// [`OptionalValue::None`] is not an error. It means an incremental advance isn't possible
+/// (typically a checkpoint truncated the log below `base_version`), so the caller should fall
+/// back to a full scan. The builder is always freed by this call, whether or not it succeeds.
+///
+/// Returns an error if `base_version >= target_version`, the target snapshot's protocol has an
+/// unsupported reader feature, or the engine fails to open the commit stream.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and must not use it again after this call.
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_builder_build(
+    builder: Handle<MutableFfiIncrementalScanBuilder>,
+) -> ExternResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+    let builder = unsafe { builder.into_inner() };
+    let engine = builder.engine.clone();
+    incremental_scan_builder_build_impl(*builder).into_extern_result(&engine.as_ref())
+}
+
+fn incremental_scan_builder_build_impl(
+    builder: FfiIncrementalScanBuilder,
+) -> DeltaResult<OptionalValue<Handle<SharedIncrementalScanStream>>> {
+    let engine = builder.engine.engine();
+    let maybe_stream = builder
+        .target_snapshot
+        .incremental_scan_builder(builder.base_version)
+        .build(engine.as_ref())?;
+    let handle = maybe_stream.map(|stream| {
+        Arc::new(FfiIncrementalScanStream {
+            stream: Mutex::new(Some(stream)),
+            engine: builder.engine,
+        })
+        .into()
+    });
+    Ok(handle.into())
+}
+
+/// Free an incremental scan builder without building (e.g. on an error path).
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and must not use it again after this call.
+#[no_mangle]
+pub unsafe extern "C" fn free_incremental_scan_builder(
+    builder: Handle<MutableFfiIncrementalScanBuilder>,
+) {
+    builder.drop_handle();
+}
+
+/// Get the next live-Add batch from the stream as Arrow via the C Data Interface.
+///
+/// Returns `Ok(non-null)` with the next [`FilteredEngineDataArrowResult`] (an Arrow batch paired
+/// with a boolean selection vector), `Ok(null)` when the stream is exhausted, or `Err` on a read
+/// failure. Only rows selected by the vector are live Adds; batches are yielded newest-commit
+/// first. The engine must free each non-null result with
+/// [`free_filtered_engine_data_arrow_result`].
+///
+/// Once this returns an error the stream is dead: later calls return `Ok(null)` and
+/// [`incremental_scan_stream_into_summary`] will error. Rebuild the stream to retry.
+///
+/// # Safety
+///
+/// Caller must pass a valid stream handle.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
+    stream: Handle<SharedIncrementalScanStream>,
+) -> ExternResult<*mut FilteredEngineDataArrowResult> {
+    let stream = unsafe { stream.as_ref() };
+    incremental_scan_stream_next_arrow_impl(stream).into_extern_result(&stream.engine.as_ref())
+}
+
+#[cfg(feature = "default-engine-base")]
+fn incremental_scan_stream_next_arrow_impl(
+    stream: &FfiIncrementalScanStream,
+) -> DeltaResult<*mut FilteredEngineDataArrowResult> {
+    let mut guard = lock_stream(stream)?;
+    let Some(inner) = guard.as_mut() else {
+        // The stream was already consumed by `into_summary`.
+        return Err(Error::generic(
+            "incremental scan stream was already consumed",
+        ));
+    };
+    match inner.next().transpose()? {
+        Some(filtered) => {
+            let (engine_data, selection_vector) = filtered.into_parts();
+            let arrow_data = ArrowFFIData::try_from_engine_data(engine_data)?;
+            let result = Box::new(FilteredEngineDataArrowResult {
+                arrow_data,
+                selection_vector: selection_vector.into(),
+            });
+            Ok(Box::into_raw(result))
+        }
+        None => Ok(std::ptr::null_mut()),
+    }
+}
+
+/// Drain any unread batches, then consume the stream and return its summary of live Add and
+/// Remove file keys for the range.
+///
+/// Consumes the stream handle: the pointer is no longer valid after this call, whether or not it
+/// succeeds. Returns an error if a prior [`incremental_scan_stream_next_arrow`] call errored, or
+/// if draining the remaining batches fails.
+///
+/// # Safety
+///
+/// Caller must pass a valid stream handle and must not use it again after this call.
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_stream_into_summary(
+    stream: Handle<SharedIncrementalScanStream>,
+) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
+    let engine = unsafe { stream.as_ref() }.engine.clone();
+    let result = incremental_scan_stream_into_summary_impl(&stream);
+    stream.drop_handle();
+    result.into_extern_result(&engine.as_ref())
+}
+
+fn incremental_scan_stream_into_summary_impl(
+    stream: &Handle<SharedIncrementalScanStream>,
+) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
+    let stream = unsafe { stream.as_ref() };
+    let inner = lock_stream(stream)?
+        .take()
+        .ok_or_else(|| Error::generic("incremental scan stream was already consumed"))?;
+    let summary = inner.into_summary()?;
+    Ok(Arc::new(summary).into())
+}
+
+fn lock_stream(
+    stream: &FfiIncrementalScanStream,
+) -> DeltaResult<std::sync::MutexGuard<'_, Option<IncrementalScanStream>>> {
+    stream
+        .stream
+        .lock()
+        .map_err(|_| Error::generic("poisoned incremental scan stream mutex"))
+}
+
+/// The base (exclusive lower bound) version of the scanned range.
+///
+/// # Safety
+///
+/// Caller must pass a valid summary handle.
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_summary_base_version(
+    summary: Handle<SharedIncrementalScanSummary>,
+) -> Version {
+    unsafe { summary.as_ref() }.base_version
+}
+
+/// The target (inclusive upper bound) version of the scanned range.
+///
+/// # Safety
+///
+/// Caller must pass a valid summary handle.
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_summary_target_version(
+    summary: Handle<SharedIncrementalScanSummary>,
+) -> Version {
+    unsafe { summary.as_ref() }.target_version
+}
+
+/// Visit each live-Add file key in the summary, invoking `callback` once per key with its path
+/// and (nullable) deletion-vector unique id.
+///
+/// A live Add is a file still present at the target version. Match on the whole `(path,
+/// dv_unique_id)` key, not the path alone: the same path with different DV ids refers to
+/// distinct logical files. `dv_unique_id` is passed as a zero-length slice when the file has no
+/// deletion vector.
+///
+/// The slices passed to the callback are only valid for the duration of the callback.
+///
+/// # Safety
+///
+/// Caller must pass a valid summary handle and a non-null callback pointer.
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
+    summary: Handle<SharedIncrementalScanSummary>,
+    engine_context: NullableCvoid,
+    callback: FileKeyCallback,
+) {
+    let summary = unsafe { summary.as_ref() };
+    visit_file_keys(&summary.live_adds, engine_context, callback);
+}
+
+/// Visit each Remove file key in the summary, invoking `callback` once per key with its path and
+/// (nullable) deletion-vector unique id.
+///
+/// See [`incremental_scan_summary_visit_live_adds`] for the callback contract.
+///
+/// # Safety
+///
+/// Caller must pass a valid summary handle and a non-null callback pointer.
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_summary_visit_removes(
+    summary: Handle<SharedIncrementalScanSummary>,
+    engine_context: NullableCvoid,
+    callback: FileKeyCallback,
+) {
+    let summary = unsafe { summary.as_ref() };
+    visit_file_keys(&summary.removes, engine_context, callback);
+}
+
+/// Callback invoked once per file key by the summary visitors. `dv_unique_id` is a zero-length
+/// slice when the file carries no deletion vector. Both slices are only valid for the duration
+/// of the call.
+pub type FileKeyCallback = extern "C" fn(
+    engine_context: NullableCvoid,
+    path: KernelStringSlice,
+    dv_unique_id: KernelStringSlice,
+);
+
+fn visit_file_keys(
+    keys: &HashSet<FileActionKey>,
+    engine_context: NullableCvoid,
+    callback: FileKeyCallback,
+) {
+    for key in keys {
+        let path = key.path();
+        let dv = key.dv_unique_id().unwrap_or("");
+        callback(
+            engine_context,
+            kernel_string_slice!(path),
+            kernel_string_slice!(dv),
+        );
+    }
+}
+
+/// Free an incremental scan stream. Use this when abandoning a stream without draining it to a
+/// summary. After [`incremental_scan_stream_into_summary`] consumes the stream, do not call this.
+///
+/// # Safety
+///
+/// Caller must pass a valid stream handle and must not use it again after this call.
+#[no_mangle]
+pub unsafe extern "C" fn free_incremental_scan_stream(stream: Handle<SharedIncrementalScanStream>) {
+    stream.drop_handle();
+}
+
+/// Free an incremental scan summary.
+///
+/// # Safety
+///
+/// Caller must pass a valid summary handle and must not use it again after this call.
+#[no_mangle]
+pub unsafe extern "C" fn free_incremental_scan_summary(
+    summary: Handle<SharedIncrementalScanSummary>,
+) {
+    summary.drop_handle();
+}
+
+/// Result of [`incremental_scan_stream_next_arrow`]: an Arrow C Data Interface batch of live Add
+/// actions plus a boolean selection vector.
+///
+/// The engine must free this with [`free_filtered_engine_data_arrow_result`] exactly once.
+#[cfg(feature = "default-engine-base")]
+#[repr(C)]
+pub struct FilteredEngineDataArrowResult {
+    /// Arrow C Data Interface batch of Add actions for one source commit.
+    pub arrow_data: ArrowFFIData,
+    /// Boolean selection vector; `true` at index `i` means row `i` is a live Add. Length equals
+    /// the batch row count.
+    pub selection_vector: KernelBoolSlice,
+}
+
+/// Free a [`FilteredEngineDataArrowResult`] returned by [`incremental_scan_stream_next_arrow`].
+///
+/// # Safety
+///
+/// `result` must be a pointer returned by [`incremental_scan_stream_next_arrow`], or null. Must
+/// be called at most once per result.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn free_filtered_engine_data_arrow_result(
+    result: *mut FilteredEngineDataArrowResult,
+) {
+    if result.is_null() {
+        return;
+    }
+    let FilteredEngineDataArrowResult {
+        arrow_data,
+        selection_vector,
+    } = unsafe { *Box::from_raw(result) };
+    // KernelBoolSlice is a leaked Vec<bool>; reconstitute and drop to free.
+    let _ = unsafe { selection_vector.into_vec() };
+    // ArrowFFIData's FFI structs release themselves on drop; a no-op if the consumer already
+    // imported the data.
+    drop(arrow_data);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
+    use test_utils::{actions_to_string, add_commit, TestAction};
+
+    use super::*;
+    use crate::error::KernelError;
+    use crate::ffi_test_utils::{
+        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+    };
+    use crate::{
+        engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, kernel_string_slice,
+        snapshot_builder_build, snapshot_builder_set_version, NullableCvoid, TryFromStringSlice,
+    };
+
+    /// Build an in-memory engine handle and a snapshot pinned to `target_version`, pre-loaded
+    /// with a metadata commit at v0 and the given `commits` at v1.. Returns
+    /// `(engine_handle, snapshot_handle)`; the caller frees both.
+    async fn setup(
+        commits: Vec<Vec<TestAction>>,
+    ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await
+        .unwrap();
+        let target_version = commits.len() as u64;
+        for (idx, body) in commits.into_iter().enumerate() {
+            add_commit(
+                table_root,
+                storage.as_ref(),
+                (idx + 1) as u64,
+                actions_to_string(body),
+            )
+            .await
+            .unwrap();
+        }
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let mut builder = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        unsafe { snapshot_builder_set_version(&mut builder, target_version) };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+        (engine, snapshot)
+    }
+
+    // Collect the (path, dv_unique_id) pairs a summary visitor reports. `RefCell` because the
+    // C callback takes `&self` context; the visit is single-threaded.
+    extern "C" fn collect_key(
+        engine_context: NullableCvoid,
+        path: KernelStringSlice,
+        dv_unique_id: KernelStringSlice,
+    ) {
+        let keys =
+            engine_context.unwrap().as_ptr() as *const RefCell<Vec<(String, Option<String>)>>;
+        let path = unsafe { String::try_from_slice(&path) }.unwrap();
+        let dv = unsafe { String::try_from_slice(&dv_unique_id) }.unwrap();
+        let dv = if dv.is_empty() { None } else { Some(dv) };
+        unsafe { &*keys }.borrow_mut().push((path, dv));
+    }
+
+    fn visit_live_adds(
+        summary: &Handle<SharedIncrementalScanSummary>,
+    ) -> Vec<(String, Option<String>)> {
+        let keys = RefCell::new(Vec::new());
+        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        unsafe {
+            incremental_scan_summary_visit_live_adds(summary.shallow_copy(), ctx, collect_key)
+        };
+        keys.into_inner()
+    }
+
+    fn visit_removes(
+        summary: &Handle<SharedIncrementalScanSummary>,
+    ) -> Vec<(String, Option<String>)> {
+        let keys = RefCell::new(Vec::new());
+        let ctx = std::ptr::NonNull::new(&keys as *const _ as *mut std::ffi::c_void);
+        unsafe { incremental_scan_summary_visit_removes(summary.shallow_copy(), ctx, collect_key) };
+        keys.into_inner()
+    }
+
+    #[tokio::test]
+    async fn build_and_summary_reports_live_adds_and_removes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Range (0, 3]: A added at v1, removed at v3; B added at v2 stays live; C added at v3.
+        let (engine, snapshot) = setup(vec![
+            vec![TestAction::Add("A".to_string())],
+            vec![TestAction::Add("B".to_string())],
+            vec![
+                TestAction::Add("C".to_string()),
+                TestAction::Remove("A".to_string()),
+            ],
+        ])
+        .await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+
+        let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
+
+        assert_eq!(
+            unsafe { incremental_scan_summary_base_version(summary.shallow_copy()) },
+            0
+        );
+        assert_eq!(
+            unsafe { incremental_scan_summary_target_version(summary.shallow_copy()) },
+            3
+        );
+
+        let mut live_adds: Vec<_> = visit_live_adds(&summary)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        live_adds.sort();
+        assert_eq!(live_adds, vec!["B".to_string(), "C".to_string()]);
+
+        let removes: Vec<_> = visit_removes(&summary)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(removes, vec!["A".to_string()]);
+
+        unsafe { free_incremental_scan_summary(summary) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test]
+    async fn next_arrow_drains_then_null_then_summary() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup(vec![
+            vec![TestAction::Add("A".to_string())],
+            vec![TestAction::Add("B".to_string())],
+        ])
+        .await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+
+        let mut batches = 0;
+        loop {
+            let ptr =
+                unsafe { ok_or_panic(incremental_scan_stream_next_arrow(stream.shallow_copy())) };
+            if ptr.is_null() {
+                break;
+            }
+            batches += 1;
+            unsafe { free_filtered_engine_data_arrow_result(ptr) };
+        }
+        assert_eq!(batches, 2, "one live-Add batch per commit");
+
+        // The stream is drained; into_summary still recovers the key sets.
+        let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
+        let mut live_adds: Vec<_> = visit_live_adds(&summary)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        live_adds.sort();
+        assert_eq!(live_adds, vec!["A".to_string(), "B".to_string()]);
+
+        unsafe { free_incremental_scan_summary(summary) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_errors_when_base_not_below_target() -> Result<(), Box<dyn std::error::Error>> {
+        // Target snapshot is v2; base_version 2 makes the range empty.
+        let (engine, snapshot) = setup(vec![
+            vec![TestAction::Add("A".to_string())],
+            vec![TestAction::Add("B".to_string())],
+        ])
+        .await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 2, engine.shallow_copy())
+        };
+        let result = unsafe { incremental_scan_builder_build(builder) };
+        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn free_builder_without_building() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        unsafe { free_incremental_scan_builder(builder) };
+
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+}
