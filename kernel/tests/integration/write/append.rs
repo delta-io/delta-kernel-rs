@@ -405,7 +405,7 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
 
         let batch = into_record_batch(meta);
         let index = batch.schema().index_of(field)?;
-        
+
         // The add-metadata schema declares these fields non-nullable, so rebuild the schema with
         // the target field made nullable before inserting a null column.
         let mut fields: Vec<ArrowField> = batch
