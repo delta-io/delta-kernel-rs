@@ -4,7 +4,7 @@ use delta_kernel::committer::{
     CommitMetadata, CommitResponse, CommitType, Committer, PublishMetadata,
 };
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FilteredEngineData,
+    DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
@@ -30,7 +30,7 @@ macro_rules! require {
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
-/// Version 0 (table creation) is not yet supported and returns an error (#2826).
+/// Version 0 (table creation) writes the published commit directly to the delta log.
 ///
 /// For version >= 1, the committer writes a staged commit and calls the UC `update_table` API
 /// to ratify it.
@@ -127,8 +127,6 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 
     /// Commit version 0 (table creation). Validates that all required UC properties are present,
     /// then writes the version 0 commit file directly to the published commit path.
-    // TODO(#2826): wire into `commit` dispatch once CREATE is exposed by this committer.
-    #[allow(dead_code)]
     fn commit_version_0(
         &self,
         engine: &dyn Engine,
@@ -149,7 +147,11 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         ) {
             Ok(()) => {
                 info!("wrote version 0 commit file for UC table creation");
-                let file_meta = engine.storage_handler().head(&published_commit_path)?;
+                let file_meta = FileMeta::new(
+                    published_commit_path,
+                    commit_metadata.in_commit_timestamp(),
+                    0,
+                );
                 Ok(CommitResponse::Committed { file_meta })
             }
             Err(DeltaError::FileAlreadyExists(_)) => {
@@ -230,6 +232,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
+        // `block_in_place` panics if the current runtime isn't multi-threaded. We can't check for
+        // that up front: `runtime_flavor()` can't tell a real single-threaded runtime (where this
+        // panics) apart from the FFI case (single-threaded on top of multi-threaded, where it's
+        // fine). So we let it run and catch the panic.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::task::block_in_place(|| {
                 handle.block_on(async move {
@@ -254,22 +260,17 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// Commit the given `actions` to the delta table in UC.
     ///
-    /// Version 0 (table creation) is not yet supported and returns an error (#2826).
-    ///
-    /// For version >= 1, writes a staged commit then calls the UC update_table API to ratify it.
-    /// Connectors should publish staged commits to the delta log immediately after writing.
-    /// UC expects to be informed of the last known published version during commit.
+    /// For version 0, the caller finalizes the table in UC separately. For version >= 1, connectors
+    /// should publish staged commits to the delta log immediately after writing; UC expects to be
+    /// informed of the last known published version during commit.
     fn commit(
         &self,
         engine: &dyn Engine,
         actions: DeltaResultIterator<'_, FilteredEngineData>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
-        // TODO(#2826): dispatch v0 to `commit_version_0` once CREATE is wired end-to-end.
         if commit_metadata.version() == 0 {
-            return Err(DeltaError::unsupported(
-                "CREATE (version 0) is not yet supported by UCCommitter",
-            ));
+            return self.commit_version_0(engine, actions, &commit_metadata);
         }
         self.commit_version_non_zero(engine, actions, commit_metadata)
     }
@@ -347,26 +348,7 @@ mod tests {
         .unwrap()
     }
 
-    // TODO(#2826): remove once CREATE is wired; the ignored v0 tests below take over.
     #[test]
-    fn commit_rejects_version_0() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
-        let commit_metadata = catalog_managed_commit_metadata(table_root, 0);
-        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
-
-        let err = test_committer()
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("version 0"),
-            "expected a version-0-unsupported error, got: {err}"
-        );
-    }
-
-    // TODO(#2826): un-ignore once CREATE is wired into `commit` dispatch.
-    #[test]
-    #[ignore = "v0 CREATE not yet wired into commit dispatch"]
     fn commit_version_0_writes_published_commit() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
@@ -390,6 +372,7 @@ mod tests {
                     "expected published path for version 0, got: {}",
                     file_meta.location
                 );
+                assert_eq!(file_meta.size, 0);
                 // Verify the file was written to disk
                 let commit_path = tmp_dir.path().join("_delta_log/00000000000000000000.json");
                 assert!(commit_path.exists(), "000.json should exist on disk");
@@ -401,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "v0 CREATE not yet wired into commit dispatch"]
     fn commit_version_0_conflict_when_file_exists() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
@@ -424,7 +406,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "v0 CREATE not yet wired into commit dispatch"]
     fn commit_version_0_rejects_missing_catalog_managed_feature() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
@@ -443,7 +424,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "v0 CREATE not yet wired into commit dispatch"]
     fn commit_version_0_rejects_missing_table_id() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
@@ -473,7 +453,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "v0 CREATE not yet wired into commit dispatch"]
     fn commit_version_0_rejects_missing_ict_enablement() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();

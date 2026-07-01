@@ -82,19 +82,21 @@ This crate connects the UC client layer to Kernel's APIs. It depends on both
   response into a `Vec<LogPath>` log tail. Use it directly when you need to assemble
   the `SnapshotBuilder` yourself.
 - **`UCCommitter<C: UpdateTableClient>`**: implements Kernel's `Committer` trait
-  for UC tables. Version 0 (table creation) is not yet supported (#2826). For
-  version >= 1, it writes a staged commit to `_delta_log/_staged_commits/`, then
-  calls the UC `update_table` API to ratify it. The `publish()` method copies
-  ratified staged commits to `_delta_log/` as published commits.
+  for UC tables. Version 0 (table creation) writes `00000000000000000000.json`
+  directly and skips `update_table`. For version >= 1, it writes a staged commit
+  to `_delta_log/_staged_commits/`, then calls the UC `update_table` API to ratify
+  it. The `publish()` method copies ratified staged commits to `_delta_log/` as
+  published commits.
 - **`get_required_properties_for_disk()`**: returns the table properties you
   must include when creating a UC-managed table (the `catalogManaged` and
   `vacuumProtocolCheck` feature signals, plus the `io.unitycatalog.tableId`).
   Kernel's `create_table()` consumes these as table properties on the version 0
   commit.
-- **`get_final_required_properties_for_uc()`**: extracts the full set of
-  properties from the post-creation Snapshot (feature signals, protocol
-  versions, in-commit timestamp, optional clustering columns) that you send to
-  your UC server's table-registration endpoint to finalize the table.
+- **`build_uc_create_table_request()`**: reads the post-creation version 0
+  Snapshot and produces a typed `CreateTableRequest` whose schema, partition
+  columns, protocol, domain metadata, and metadata-config properties are separate
+  typed fields. You send it to your UC server's table-registration endpoint to
+  finalize the table.
 
 See [Creating UC Tables](./creating_tables.md) for the end-to-end creation
 flow and how these two utilities fit together.
@@ -163,8 +165,9 @@ connector reads or writes a UC-managed table.
 ```
 
 The diagram shows the steady-state commit flow for an existing table. Version 0
-(table creation) is not yet supported by `UCCommitter` (#2826). See
-[Creating UC Tables](./creating_tables.md) for the intended creation flow.
+(table creation) takes a different path: `UCCommitter` writes the published commit
+directly and skips `update_table`. See [Creating UC Tables](./creating_tables.md)
+for the creation flow.
 
 ## Dependencies and feature flags
 
@@ -249,7 +252,7 @@ extension points.
 
 - [Creating UC Tables](./creating_tables.md): how to create a new UC-managed
   table using `get_required_properties_for_disk` and
-  `get_final_required_properties_for_uc`.
+  `build_uc_create_table_request`.
 - [Reading UC Tables](./reading.md): how to load a Snapshot and read data from
   a UC-managed table.
 - [Writing to UC Tables](./writing.md): how to commit and publish writes through

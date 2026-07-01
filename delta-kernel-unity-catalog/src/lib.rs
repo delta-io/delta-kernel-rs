@@ -10,7 +10,7 @@ use delta_kernel::snapshot::SnapshotBuilder;
 use delta_kernel::{DeltaResult, Error, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};
 use url::Url;
-pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
+pub use utils::{build_uc_create_table_request, get_required_properties_for_disk};
 
 /// Convert the inline `Commit`s returned by a UC `load_table` response into
 /// kernel `LogPath`s suitable for `Snapshot::builder_for(...).with_log_tail(...)`.

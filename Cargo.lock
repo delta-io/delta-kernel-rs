@@ -1310,6 +1310,7 @@ version = "0.26.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
+ "reqwest 0.13.2",
  "rstest",
  "serde_json",
  "tempfile",
@@ -1319,6 +1320,7 @@ dependencies = [
  "unity-catalog-delta-client-api",
  "unity-catalog-delta-rest-client",
  "url",
+ "uuid",
 ]
 
 [[package]]

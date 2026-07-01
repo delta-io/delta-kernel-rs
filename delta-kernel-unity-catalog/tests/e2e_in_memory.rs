@@ -1,12 +1,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
-use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
-use test_utils::read_scan;
+use delta_kernel_unity_catalog::{
+    get_required_properties_for_disk, snapshot_builder_from_load_table, UCCommitter,
+};
+use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{Commit, InMemoryUpdateTableClient, TableData, TableName};
 
 // ============================================================================
@@ -121,6 +126,16 @@ fn commit(
         .unwrap_post_commit_snapshot())
 }
 
+/// Loads a snapshot via the connector read path: `load_table` response -> snapshot builder.
+fn build_snapshot(
+    client: &Arc<InMemoryUpdateTableClient>,
+    engine: &DefaultEngine<TokioMultiThreadExecutor>,
+    table_uri: &url::Url,
+) -> Result<Arc<Snapshot>, TestError> {
+    let resp = client.load_table_response(TABLE_ID, table_uri.as_str())?;
+    Ok(snapshot_builder_from_load_table(&resp)?.build(engine)?)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -218,5 +233,116 @@ async fn test_cannot_checkpoint_unpublished_snapshot() -> Result<(), TestError> 
     let snapshot = commit(&snapshot, &update_table_client, &engine)?;
     let err = snapshot.checkpoint(&engine, None).unwrap_err();
     assert!(matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("not published")));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
+    let tmp = tempfile::tempdir()?;
+    let table_uri = url::Url::from_directory_path(tmp.path()).map_err(|_| "invalid path")?;
+
+    let store = Arc::new(LocalFileSystem::new());
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = Arc::new(
+        delta_kernel_default_engine::DefaultEngineBuilder::new(store)
+            .with_task_executor(executor)
+            .build(),
+    );
+
+    let client = Arc::new(InMemoryUpdateTableClient::new());
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("val", DataType::STRING),
+    ])?);
+
+    // v0 create: writes 000.json directly to storage, does not call the catalog.
+    create_table(table_uri.as_str(), schema, "delta-kernel-uc-test")
+        .with_table_properties(get_required_properties_for_disk(TABLE_ID))
+        .build(engine.as_ref(), Box::new(uc_committer(&client)))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+    client.create_table(TABLE_ID)?;
+
+    let snap_v0 = build_snapshot(&client, &engine, &table_uri)?;
+    assert_eq!(snap_v0.version(), 0);
+    let scan = snap_v0.clone().scan_builder().build()?;
+    let v0_rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(v0_rows, 0);
+
+    // v1 append: 3 rows.
+    let id_col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let val_col: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+    insert_data_with(
+        snap_v0,
+        &engine,
+        vec![id_col, val_col],
+        Box::new(uc_committer(&client)),
+        "WRITE",
+        true,
+        false,
+    )
+    .await?
+    .unwrap_committed();
+
+    let snap_v1 = build_snapshot(&client, &engine, &table_uri)?;
+    assert_eq!(snap_v1.version(), 1);
+    let scan = snap_v1.clone().scan_builder().build()?;
+    let v1_batches = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?;
+    let v1_rows: usize = v1_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(v1_rows, 3);
+    let mut ids: Vec<i32> = v1_batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id is int32");
+            col.values().to_vec()
+        })
+        .collect();
+    // Scan row order is not guaranteed, so sort before comparing.
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+
+    // v2 append: 2 more rows -> incremental read sees v1 + v2.
+    let id_col: ArrayRef = Arc::new(Int32Array::from(vec![4, 5]));
+    let val_col: ArrayRef = Arc::new(StringArray::from(vec!["d", "e"]));
+    insert_data_with(
+        snap_v1,
+        &engine,
+        vec![id_col, val_col],
+        Box::new(uc_committer(&client)),
+        "WRITE",
+        true,
+        false,
+    )
+    .await?
+    .unwrap_committed();
+
+    let snap_v2 = build_snapshot(&client, &engine, &table_uri)?;
+    assert_eq!(snap_v2.version(), 2);
+    let scan = snap_v2.clone().scan_builder().build()?;
+    let v2_rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(v2_rows, 5);
+
+    // Publish, then confirm reads still return all rows.
+    let published = snap_v2.publish(engine.as_ref(), &uc_committer(&client))?;
+    let scan = published.scan_builder().build()?;
+    let pub_rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(pub_rows, 5);
     Ok(())
 }
