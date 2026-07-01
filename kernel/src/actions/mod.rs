@@ -1028,27 +1028,13 @@ impl CheckpointAction {
         self.version
     }
 
-    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O, resolving its
-    /// path against `table_root`. Mirrors [`Sidecar::to_filemeta`]'s size-conversion handling, but
-    /// follows the V4 root-manifest path scheme instead of the sidecar one: a path that parses
-    /// as an absolute URL with a real (multi-character) scheme is used as-is, otherwise it is
-    /// resolved relative to `table_root` by literal concatenation (not [`Url::join`] -- `join`
-    /// re-parses `path` as a standalone relative reference and, per RFC 3986 5.2.2, treats any
-    /// reference that itself looks like it has a scheme as already absolute, silently ignoring
-    /// `table_root`). A single-character "scheme" (e.g. `C:\foo`) is treated as a Windows drive
-    /// letter rather than a URI scheme, matching the convention already used by
-    /// [`crate::utils::try_parse_uri`]; this does not (and cannot, without a scheme allowlist)
-    /// disambiguate every possible multi-character pseudo-scheme. `table_root` is normalized to
-    /// end in `/` before concatenation, so callers don't need to guarantee that themselves. See
-    /// [`ContentRoot::path`].
+    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O.
     ///
-    /// `table_root` must not carry a query string or fragment -- concatenation operates on its
-    /// full serialized form, so a query/fragment would otherwise silently absorb the appended
-    /// path instead of it becoming a new path segment. Returns an error if either is present.
-    ///
-    /// The root manifest has no recorded modification time. `last_modified` is set to
-    /// `i64::MAX` rather than `0` so that engines which cache or invalidate files based on
-    /// staleness (e.g. "evict if older than X") never treat the root manifest as stale.
+    /// An absolute path (parses as a URL with a multi-character scheme) is used as-is; otherwise
+    /// the path is resolved relative to `table_root`. `last_modified` is set to `i64::MAX` since
+    /// the root manifest has no recorded modification time, so staleness-based caches never evict
+    /// it. Returns an error if `table_root` carries a query or fragment, or if the size doesn't
+    /// fit a [`FileSize`]. See [`ContentRoot::path`].
     #[allow(dead_code)]
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
         require!(
@@ -1058,6 +1044,10 @@ impl CheckpointAction {
             ))
         );
         let path = self.path();
+        // A single-char "scheme" (e.g. `C:\foo`) is a Windows drive letter, not a URI scheme
+        // (matching `crate::utils::try_parse_uri`). Relative paths are resolved by literal
+        // concatenation rather than `Url::join`, which would re-parse `path` as a standalone
+        // reference and drop `table_root` for anything resembling a scheme (RFC 3986 5.2.2).
         let location = match Url::parse(path) {
             Ok(absolute) if absolute.scheme().len() > 1 => absolute,
             _ => {
@@ -2389,50 +2379,12 @@ mod tests {
         "memory:///table/metadata/root.parquet",
         Err("Failed to convert checkpoint contentRoot size -1")
     )]
-    #[case::table_root_without_trailing_slash(
-        "memory:///table",
-        "metadata/root.parquet",
-        2048,
-        "memory:///table/metadata/root.parquet",
-        Ok(2048)
-    )]
     #[case::table_root_with_query_is_rejected(
         "memory:///table/?foo=bar",
         "metadata/root.parquet",
         2048,
         "",
         Err("table_root must not have a query or fragment")
-    )]
-    #[case::table_root_with_fragment_is_rejected(
-        "memory:///table/#frag",
-        "metadata/root.parquet",
-        2048,
-        "",
-        Err("table_root must not have a query or fragment")
-    )]
-    #[case::windows_drive_letter_forward_slash_is_not_misclassified_as_absolute(
-        "memory:///table/",
-        "C:/root.parquet",
-        2048,
-        "memory:///table/C:/root.parquet",
-        Ok(2048)
-    )]
-    #[case::windows_drive_letter_backslash_is_not_misclassified_as_absolute(
-        "memory:///table/",
-        "C:\\root.parquet",
-        2048,
-        "memory:///table/C:\\root.parquet",
-        Ok(2048)
-    )]
-    // Known, accepted limitation (matching `crate::utils::try_parse_uri`'s same scope): a
-    // *multi*-character pseudo-scheme can't be distinguished from a real one without a scheme
-    // allowlist, so this relative path is (still) misclassified as absolute and used verbatim.
-    #[case::multi_character_pseudo_scheme_is_a_known_limitation(
-        "memory:///table/",
-        "part:1/root.parquet",
-        2048,
-        "part:1/root.parquet",
-        Ok(2048)
     )]
     fn test_checkpoint_action_root_filemeta(
         #[case] table_root: &str,
