@@ -63,6 +63,36 @@ commit_range_builder_for(path, start_version, engine)
 The caller owns the builder and must call either `commit_range_builder_build` or
 `free_commit_range_builder`. Release the range with `free_commit_range`.
 
+## Incremental Scan Flow
+
+An incremental scan streams the file-action diff between a base version and a target snapshot,
+letting an engine advance a cached file listing without a full log replay
+(`ffi/src/incremental_scan.rs`):
+
+```
+snapshot_incremental_scan_builder(snapshot, base_version, engine)
+  -> incremental_scan_builder_build(builder)      // -> OptionalValue<stream>; None => full-scan fallback
+  -> incremental_scan_stream_next_arrow(stream)    // drain live-Add batches (Arrow), newest-first
+  -> incremental_scan_stream_into_summary(stream)  // -> summary; consumes the stream
+```
+
+`incremental_scan_builder_build` returns `OptionalValue::None` (not an error) when the target
+snapshot's commit list can't cover `(base_version, target_version]`, which is the signal to fall
+back to a full scan. The builder is always consumed by `build`; discard it early with
+`free_incremental_scan_builder`.
+
+Read the diff via `incremental_scan_summary_base_version` / `_target_version` and the
+`incremental_scan_summary_visit_live_adds` / `_visit_removes` callbacks (each key is a `(path,
+dv_unique_id)` pair; `dv_unique_id` is a zero-length slice when absent). Release handles with
+`free_incremental_scan_stream`, `free_incremental_scan_summary`, and each Arrow batch with
+`free_filtered_engine_data_arrow_result`.
+
+To advance a cached listing, evict base entries whose key is in `removes` OR is re-added by the
+range. OPTIMIZE / clustering re-tags a file under the same `(path, dv_unique_id)` key, so it
+lands in `live_adds` but not `removes`; masking with `removes` alone leaves a stale row. The
+full mask is `removes` unioned with the base keys also present in `live_adds`. The Rust API
+computes this via `into_summary_against_base_*`, which the FFI does not yet expose.
+
 ## Write Flow
 
 ```
