@@ -1,5 +1,6 @@
 //! This module holds functionality for managing transactions.
 mod deletion_vector;
+mod partition_value;
 mod transaction_id;
 mod write_context;
 
@@ -15,8 +16,19 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
+pub use partition_value::{
+    free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
+    partition_value_map_insert_byte, partition_value_map_insert_date,
+    partition_value_map_insert_decimal, partition_value_map_insert_double,
+    partition_value_map_insert_float, partition_value_map_insert_int,
+    partition_value_map_insert_long, partition_value_map_insert_null,
+    partition_value_map_insert_short, partition_value_map_insert_string,
+    partition_value_map_insert_timestamp, partition_value_map_insert_timestamp_ntz,
+    partition_value_map_new, ExclusivePartitionValueMap,
+};
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -476,10 +488,101 @@ pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
 #[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableBuilder;
 
-// TODO: Add `create_table_builder_with_data_layout` FFI function to support partitioned and
-// clustered table creation. The kernel's
-// `CreateTableTransactionBuilder::with_data_layout(DataLayout)` supports this but is not yet
-// exposed through FFI.
+/// Collect `num_columns` column-name string slices into owned `String`s.
+///
+/// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
+/// pointer is sound in the empty case. Returns `Err` if any slice is not valid UTF-8.
+///
+/// # Safety
+///
+/// When `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid
+/// [`KernelStringSlice`] values whose backing bytes are readable for the duration of the call.
+unsafe fn collect_create_table_columns(
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+) -> DeltaResult<Vec<String>> {
+    if num_columns == 0 {
+        return Ok(Vec::new());
+    }
+    let slices = unsafe { std::slice::from_raw_parts(columns, num_columns) };
+    slices
+        .iter()
+        .map(|slice| {
+            unsafe { TryFromStringSlice::try_from_slice(slice) }.map(|s: &str| s.to_string())
+        })
+        .collect()
+}
+
+/// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// clustering column names (in order). Clustering and partitioning are mutually exclusive; the
+/// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
+/// happens later at [`create_table_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// Only top-level columns are supported through this entry point (each slice is one column name);
+/// nested clustering columns must be set on the Rust builder directly.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_with_clustering_columns(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
+        .into_extern_result(&engine)
+}
+
+/// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// partition column names (in order). Clustering and partitioning are mutually exclusive; the last
+/// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
+/// later at [`create_table_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_with_partition_columns(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::partitioned))
+        .into_extern_result(&engine)
+}
+
+/// Shared lowering for the data-layout FFI entry points, extracted from the `unsafe extern`
+/// wrappers so it can be unit-tested. `layout` is a `DeltaResult` so a column-parse failure
+/// short-circuits here, dropping the already-consumed builder rather than producing a layout.
+fn create_table_builder_with_data_layout_impl(
+    builder: CreateTableTransactionBuilder,
+    layout: DeltaResult<DataLayout>,
+) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    Ok(Box::new(builder.with_data_layout(layout?)).into())
+}
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
@@ -706,8 +809,9 @@ mod tests {
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
         create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
-        get_physical_write_schema, get_unpartitioned_write_context, get_write_path,
-        get_write_schema, SharedWriteContext,
+        get_partitioned_write_context, get_physical_write_schema, get_unpartitioned_write_context,
+        get_write_dir, get_write_path, get_write_schema, resolve_file_path, visit_partition_values,
+        SharedWriteContext,
     };
 
     use super::*;
@@ -718,6 +822,7 @@ mod tests {
     };
     use crate::{
         free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
+        KernelStringSlice, NullableCvoid,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -967,6 +1072,403 @@ mod tests {
             test_read(&test_batch, &table_url, unsafe { engine.as_ref().engine() })?;
 
             unsafe { free_schema(write_schema) };
+            unsafe { free_write_context(write_context) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    /// Callback for [`visit_partition_values`] that collects each entry into a
+    /// `Vec<(key, value, is_null)>` passed via the engine context pointer.
+    extern "C" fn collect_partition_value(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+        is_null: bool,
+    ) {
+        let collected =
+            unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut Vec<(String, String, bool)>) };
+        let key = unsafe { String::try_from_slice(&key) }.unwrap();
+        let value = unsafe { String::try_from_slice(&value) }.unwrap();
+        collected.push((key, value, is_null));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    async fn test_partitioned_append() -> Result<(), Box<dyn std::error::Error>> {
+        // Partition column `part` is listed last in the schema; the physical write schema must
+        // exclude it (CM=none, partition columns are not materialized).
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("string", DataType::STRING),
+            StructField::nullable("part", DataType::INTEGER),
+        ])?);
+
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+        for (table_url, _engine, store, _table_name) in setup_test_tables(
+            schema,
+            &["part"],
+            Some(&tmp_dir_local_url),
+            "test_partitioned_table",
+        )
+        .await?
+        {
+            let table_path = table_url.to_file_path().unwrap();
+            let table_path_str = table_path.to_str().unwrap();
+            let engine = get_default_engine(table_path_str);
+
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            });
+            unsafe { set_data_change(txn.shallow_copy(), true) };
+            let engine_info = "default_engine";
+            let txn = unsafe {
+                ok_or_panic(with_engine_info(
+                    txn,
+                    kernel_string_slice!(engine_info),
+                    engine.shallow_copy(),
+                ))
+            };
+            let operation = "WRITE";
+            let txn = unsafe {
+                ok_or_panic(with_operation(
+                    txn,
+                    kernel_string_slice!(operation),
+                    engine.shallow_copy(),
+                ))
+            };
+
+            // Build the partition values map: part = 100.
+            let part_name = "part";
+            let partition_values = partition_value_map_new();
+            let inserted = ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(part_name),
+                    100,
+                    engine.shallow_copy(),
+                )
+            });
+            assert!(inserted);
+
+            let write_context = ok_or_panic(unsafe {
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
+            });
+
+            // Physical write schema excludes the partition column.
+            let write_schema = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
+            let write_schema_ref = unsafe { write_schema.as_ref() };
+            assert_eq!(write_schema_ref.num_fields(), 2);
+            assert_eq!(write_schema_ref.field_at_index(0).unwrap().name, "number");
+            assert_eq!(write_schema_ref.field_at_index(1).unwrap().name, "string");
+
+            // The write directory carries the Hive-style partition prefix.
+            let write_dir_str = recover_string(
+                unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
+            );
+            let write_dir_url = Url::parse(&write_dir_str)?;
+            assert!(
+                write_dir_url.path().ends_with("part=100/"),
+                "unexpected write dir: {write_dir_str}"
+            );
+
+            // The serialized partition values surface the physical name and value.
+            let mut collected: Vec<(String, String, bool)> = Vec::new();
+            let ctx = std::ptr::NonNull::new(
+                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
+            );
+            unsafe {
+                visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
+            };
+            assert_eq!(
+                collected,
+                vec![("part".to_string(), "100".to_string(), false)]
+            );
+
+            // Write the parquet data (partition column excluded) into the partition directory.
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "number",
+                    Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                ),
+                (
+                    "string",
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let dir_path = write_dir_url.to_file_path().unwrap();
+            std::fs::create_dir_all(&dir_path)?;
+            let file_name = "my_file.parquet";
+            let file_fs_path = dir_path.join(file_name);
+            let parquet_file = std::fs::File::create(&file_fs_path)?;
+            let mut writer = ArrowWriter::try_new(
+                parquet_file,
+                batch.schema(),
+                Some(WriterProperties::builder().build()),
+            )?;
+            writer.write(&batch)?;
+            let parquet_meta = writer.close()?;
+            let num_rows = parquet_meta.file_metadata().num_rows();
+            let size = std::fs::metadata(&file_fs_path)?.len();
+
+            // Resolve the relative add.path from the absolute file URL.
+            let file_url = write_dir_url.join(file_name)?;
+            let file_url_str = file_url.as_str();
+            let add_path = recover_string(
+                ok_or_panic(unsafe {
+                    resolve_file_path(
+                        write_context.shallow_copy(),
+                        kernel_string_slice!(file_url_str),
+                        allocate_str,
+                        engine.shallow_copy(),
+                    )
+                })
+                .unwrap(),
+            );
+            assert_eq!(add_path, "part=100/my_file.parquet");
+
+            // Build the add metadata with the populated partitionValues.
+            let metadata_json = format!(
+                r#"{{"path":"{add_path}", "partitionValues": {{"part":"100"}}, "size": {size}, "modificationTime": 0, "stats": {{"numRecords": {num_rows}}}}}"#,
+            );
+            let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+                .as_ref()
+                .try_into_arrow()?;
+            let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
+            let file_info_engine_data = ok_or_panic(unsafe {
+                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            });
+            unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+
+            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            unsafe { free_committed_transaction(committed) };
+
+            // The commit's add action records the partition values and Hive-style path.
+            let commit1_url = table_url
+                .join("_delta_log/00000000000000000001.json")
+                .unwrap();
+            let commit1 = store
+                .get(&Path::from_url_path(commit1_url.path()).unwrap())
+                .await?;
+            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+            let add = &parsed_commits[1]["add"];
+            assert_eq!(add["path"], json!("part=100/my_file.parquet"));
+            assert_eq!(add["partitionValues"], json!({ "part": "100" }));
+
+            // The read reconstructs the partition column for every row.
+            let expected = RecordBatch::try_from_iter(vec![
+                (
+                    "number",
+                    Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                ),
+                (
+                    "string",
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                ),
+                (
+                    "part",
+                    Arc::new(Int32Array::from(vec![100, 100, 100])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let expected_engine_data = ArrowEngineData::from(expected);
+            test_read(&expected_engine_data, &table_url, unsafe {
+                engine.as_ref().engine()
+            })?;
+
+            unsafe { free_schema(write_schema) };
+            unsafe { free_write_context(write_context) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    async fn test_partitioned_write_context_rejects_unpartitioned_table(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "number",
+            DataType::INTEGER,
+        )])?);
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+        for (table_url, _engine, _store, _table_name) in
+            setup_test_tables(schema, &[], Some(&tmp_dir_local_url), "test_unpartitioned").await?
+        {
+            let table_path = table_url.to_file_path().unwrap();
+            let table_path_str = table_path.to_str().unwrap();
+            let engine = get_default_engine(table_path_str);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            });
+
+            // Supplying partition values for a non-partitioned table is an error, and the call
+            // still consumes the map handle.
+            let partition_values = partition_value_map_new();
+            let name = "nope";
+            let _ = ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(name),
+                    1,
+                    engine.shallow_copy(),
+                )
+            });
+            let result = unsafe {
+                get_partitioned_write_context(txn, partition_values, engine.shallow_copy())
+            };
+            let err = match result {
+                ExternResult::Err(e) => unsafe { recover_error(e) },
+                ExternResult::Ok(_) => panic!("expected error for unpartitioned table"),
+            };
+            assert!(
+                err.message.contains("not partitioned"),
+                "unexpected error: {}",
+                err.message
+            );
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    async fn test_visit_partition_values_surfaces_null() -> Result<(), Box<dyn std::error::Error>> {
+        // A null partition value must surface across the visitor as `is_null = true` with an
+        // empty value slice (the documented C contract).
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("part", DataType::INTEGER),
+        ])?);
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+        for (table_url, _engine, _store, _table_name) in setup_test_tables(
+            schema,
+            &["part"],
+            Some(&tmp_dir_local_url),
+            "test_null_partition",
+        )
+        .await?
+        {
+            let table_path = table_url.to_file_path().unwrap();
+            let table_path_str = table_path.to_str().unwrap();
+            let engine = get_default_engine(table_path_str);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            });
+
+            let partition_values = partition_value_map_new();
+            let part_name = "part";
+            // NullTypeTag::Integer == 3.
+            let _ = ok_or_panic(unsafe {
+                partition_value::partition_value_map_insert_null(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(part_name),
+                    crate::expressions::kernel_visitor::NullTypeTag::Integer as u8,
+                    0,
+                    0,
+                    engine.shallow_copy(),
+                )
+            });
+            let write_context = ok_or_panic(unsafe {
+                get_partitioned_write_context(txn, partition_values, engine.shallow_copy())
+            });
+
+            let mut collected: Vec<(String, String, bool)> = Vec::new();
+            let ctx = std::ptr::NonNull::new(
+                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
+            );
+            unsafe {
+                visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
+            };
+            assert_eq!(collected, vec![("part".to_string(), String::new(), true)]);
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    async fn test_visit_partition_values_is_sorted_by_key() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Multiple partition columns must be visited in deterministic (sorted) key order,
+        // regardless of insertion order or the underlying HashMap layout.
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("region", DataType::STRING),
+            StructField::nullable("year", DataType::INTEGER),
+        ])?);
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+        for (table_url, _engine, _store, _table_name) in setup_test_tables(
+            schema,
+            &["year", "region"],
+            Some(&tmp_dir_local_url),
+            "test_multi_partition",
+        )
+        .await?
+        {
+            let table_path = table_url.to_file_path().unwrap();
+            let table_path_str = table_path.to_str().unwrap();
+            let engine = get_default_engine(table_path_str);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            });
+
+            let partition_values = partition_value_map_new();
+            // Insert in a different order than the expected sorted output.
+            let year = "year";
+            let _ = ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(year),
+                    2024,
+                    engine.shallow_copy(),
+                )
+            });
+            let region = "region";
+            let region_val = "US";
+            let _ = ok_or_panic(unsafe {
+                partition_value_map_insert_string(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(region),
+                    kernel_string_slice!(region_val),
+                    engine.shallow_copy(),
+                )
+            });
+            let write_context = ok_or_panic(unsafe {
+                get_partitioned_write_context(txn, partition_values, engine.shallow_copy())
+            });
+
+            let mut collected: Vec<(String, String, bool)> = Vec::new();
+            let ctx = std::ptr::NonNull::new(
+                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
+            );
+            unsafe {
+                visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
+            };
+            let keys: Vec<&str> = collected.iter().map(|(k, _, _)| k.as_str()).collect();
+            assert_eq!(keys, vec!["region", "year"]);
+
             unsafe { free_write_context(write_context) };
             unsafe { free_engine(engine) };
         }
@@ -1570,6 +2072,208 @@ mod tests {
         unsafe { free_snapshot(snap) };
         unsafe { free_engine(engine) };
         Ok(())
+    }
+
+    /// Reads the v0 commit file (`_delta_log/00..00.json`) of a freshly created table.
+    fn read_v0_commit(tmp_dir: &tempfile::TempDir) -> String {
+        let path = tmp_dir
+            .path()
+            .join("_delta_log")
+            .join("00000000000000000000.json");
+        std::fs::read_to_string(path).expect("v0 commit file should exist")
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_clustering_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        let col = "id";
+        let columns = [kernel_string_slice!(col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        // A clustered create records the `delta.clustering` domain metadata (listing the
+        // clustering columns, JSON-escaped inside the configuration string) and adds the
+        // `clustering` writer feature to the protocol.
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains("delta.clustering"),
+            "missing clustering domain metadata: {log}"
+        );
+        assert!(
+            log.contains("clusteringColumns") && log.contains(r#"[[\"id\"]]"#),
+            "missing clustering columns: {log}"
+        );
+        assert!(
+            log.contains(r#""clustering""#),
+            "missing clustering writer feature: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        // Partitioning requires at least one non-partition column, so partition on `date`
+        // while keeping `id` as data.
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("date", DataType::STRING),
+            ],
+        );
+
+        let col = "date";
+        let columns = [kernel_string_slice!(col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_partition_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        // A partitioned create records the partition columns in the table metadata.
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains(r#""partitionColumns":["date"]"#),
+            "missing partitionColumns in metadata: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_with_multiple_clustering_columns(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp_dir = tempdir()?;
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        // Two columns: order must be preserved in the serialized clustering domain metadata.
+        let c0 = "id";
+        let c1 = "name";
+        let columns = [kernel_string_slice!(c0), kernel_string_slice!(c1)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains(r#"[[\"id\"],[\"name\"]]"#),
+            "clustering column order not preserved: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_create_table_data_layout_last_call_wins() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp_dir = tempdir()?;
+        let (_table_path, engine, builder) = create_table_builder(
+            &tmp_dir,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("date", DataType::STRING),
+            ],
+        );
+
+        // Set clustering, then partition: the layouts are mutually exclusive and the last call
+        // wins, so the committed table must be partitioned with no clustering domain metadata.
+        let c_col = "id";
+        let c_cols = [kernel_string_slice!(c_col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                c_cols.as_ptr(),
+                c_cols.len(),
+                engine.shallow_copy(),
+            )
+        });
+        let p_col = "date";
+        let p_cols = [kernel_string_slice!(p_col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_partition_columns(
+                builder,
+                p_cols.as_ptr(),
+                p_cols.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let log = read_v0_commit(&tmp_dir);
+        assert!(
+            log.contains(r#""partitionColumns":["date"]"#),
+            "partition layout should win: {log}"
+        );
+        assert!(
+            !log.contains("delta.clustering"),
+            "stale clustering layout leaked: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_create_table_columns_empty_is_null_safe() {
+        // num_columns == 0 must short-circuit before from_raw_parts, so a null pointer is sound.
+        let columns = unsafe { collect_create_table_columns(std::ptr::null(), 0) };
+        assert_eq!(columns.unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_with_data_layout_impl_propagates_column_error() {
+        // A column-collection error must short-circuit the shared lowering and drop the consumed
+        // builder, never producing a layout or a dangling handle.
+        let tmp_dir = tempdir().unwrap();
+        let (_table_path, engine, builder_handle) = create_table_builder(
+            &tmp_dir,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let builder = unsafe { *builder_handle.into_inner() };
+        let layout: DeltaResult<DataLayout> = Err(delta_kernel::Error::generic("bad column"));
+        let result = create_table_builder_with_data_layout_impl(builder, layout);
+        assert!(result.is_err());
+        unsafe { free_engine(engine) };
     }
 
     /// CREATE TABLE: the committed transaction must expose a post-commit snapshot at version 0
