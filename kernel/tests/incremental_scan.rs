@@ -18,15 +18,16 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::{
-    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
+    Engine, Error, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
-    compacted_log_path_for_versions, create_log_path, delta_path_for_version, TestAction,
+    actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
+    add_commit, add_staged_commit, compacted_log_path_for_versions, create_log_path,
+    delta_path_for_version, TestAction,
 };
 use url::Url;
 
@@ -1204,15 +1205,44 @@ fn remove_action(path: &str) -> String {
     )
 }
 
-fn live_add_keys(listing: &IncrementalListing) -> &HashSet<FileActionKey> {
-    &listing.summary.live_adds
+// Build a raw Add action with a partition value for the `val` partition column and no stats.
+fn add_partitioned(path: &str, val: &str) -> String {
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{\"val\":\"{val}\"}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true}}}}"
+    )
 }
 
-// Pushdown drops added files whose stats prove they cannot match, and keeps the rest. Three
-// files span disjoint `id` ranges; `id > 25` keeps only the file whose range extends past 25.
-// Also asserts the emitted selection vector agrees with `live_adds` (no summary/stream drift).
+// Column-mapping (name mode) metadata whose `id` column maps to the physical name `col-id`.
+const COLUMN_MAPPING_METADATA: &str = "{\"metaData\":{\"id\":\"cm-test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"integer\\\",\\\"nullable\\\":true,\\\"metadata\\\":{\\\"delta.columnMapping.id\\\":1,\\\"delta.columnMapping.physicalName\\\":\\\"col-id\\\"}}]}\",\"partitionColumns\":[],\"configuration\":{\"delta.columnMapping.mode\":\"name\",\"delta.columnMapping.maxColumnId\":\"1\"},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\"]}}";
+
+// Build a raw Add whose stats are keyed by the physical column name `col-id` (column mapping).
+fn add_with_physical_id_stats(path: &str, id_min: i32, id_max: i32) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"col-id\\\":0}},\
+         \\\"minValues\\\":{{\\\"col-id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"col-id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+    )
+}
+
+// Pushdown drops added files whose stats prove they cannot match and keeps the rest; the
+// `None` predicate keeps every live Add unchanged. Three files span disjoint `id` ranges over
+// a single commit. Each case asserts the surviving key set and that the emitted selection
+// vector agrees with `live_adds` (no summary/stream drift).
+#[rstest]
+#[case::pushdown(
+    Some(Arc::new(column_expr!("id").gt(Expr::literal(25i32))) as PredicateRef),
+    vec!["high.parquet"],
+)]
+#[case::no_predicate(None, vec!["low.parquet", "mid.parquet", "high.parquet"])]
 #[tokio::test]
-async fn pushdown_drops_non_matching_added_files() -> Result<(), Box<dyn std::error::Error>> {
+async fn pushdown_keeps_only_matching_added_files(
+    #[case] predicate: Option<PredicateRef>,
+    #[case] expected_live: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -1223,7 +1253,8 @@ async fn pushdown_drops_non_matching_added_files() -> Result<(), Box<dyn std::er
         actions_to_string(vec![TestAction::Metadata]),
     )
     .await?;
-    // low: id in [0, 9]; mid: id in [10, 19]; high: id in [20, 30].
+    // low: id in [0, 9]; mid: id in [10, 19]; high: id in [20, 30]. `id > 25` can only match
+    // high; low and mid are provably excluded. No predicate keeps all three.
     let v1 = [
         add_with_id_stats("low.parquet", 0, 9),
         add_with_id_stats("mid.parquet", 10, 19),
@@ -1235,9 +1266,6 @@ async fn pushdown_drops_non_matching_added_files() -> Result<(), Box<dyn std::er
     let target = Snapshot::builder_for(table_url)
         .at_version(1)
         .build(engine.as_ref())?;
-
-    // `id > 25` can only match high.parquet ([20, 30]); low and mid are provably excluded.
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1245,51 +1273,11 @@ async fn pushdown_drops_non_matching_added_files() -> Result<(), Box<dyn std::er
             .build(engine.as_ref())?,
     );
 
-    assert_eq!(
-        live_add_keys(&listing),
-        &HashSet::from([key("high.parquet")]),
-        "only high.parquet ([20, 30]) can match id > 25"
-    );
+    let expected: HashSet<FileActionKey> = expected_live.iter().map(|p| key(p)).collect();
+    assert_eq!(listing.summary.live_adds, expected);
     // The streamed selection vector must agree with the summary's live_adds count.
-    assert_eq!(live_add_count(&listing), 1);
+    assert_eq!(live_add_count(&listing), expected.len());
     assert!(listing.summary.removes.is_empty());
-
-    Ok(())
-}
-
-// The default (no predicate) path is unchanged: every live Add is streamed regardless of
-// stats. Guards against the predicate wiring leaking into the `None` case.
-#[tokio::test]
-async fn no_predicate_streams_every_live_add() -> Result<(), Box<dyn std::error::Error>> {
-    let (storage, engine, table_url) = setup_test();
-    let table_root = table_url.as_str();
-
-    add_commit(
-        table_root,
-        storage.as_ref(),
-        0,
-        actions_to_string(vec![TestAction::Metadata]),
-    )
-    .await?;
-    let v1 = [
-        add_with_id_stats("low.parquet", 0, 9),
-        add_with_id_stats("mid.parquet", 10, 19),
-        add_with_id_stats("high.parquet", 20, 30),
-    ]
-    .join("\n");
-    add_commit(table_root, storage.as_ref(), 1, v1).await?;
-
-    let target = Snapshot::builder_for(table_url)
-        .at_version(1)
-        .build(engine.as_ref())?;
-    let listing = unwrap_listing(target.incremental_scan_builder(0).build(engine.as_ref())?);
-
-    assert_eq!(
-        live_add_keys(&listing),
-        &HashSet::from([key("low.parquet"), key("mid.parquet"), key("high.parquet")]),
-        "no predicate keeps every live Add"
-    );
-    assert_eq!(live_add_count(&listing), 3);
 
     Ok(())
 }
@@ -1331,8 +1319,8 @@ async fn added_file_without_stats_is_always_kept() -> Result<(), Box<dyn std::er
     );
 
     assert_eq!(
-        live_add_keys(&listing),
-        &HashSet::from([key("no_stats.parquet"), key("in_range.parquet")]),
+        listing.summary.live_adds,
+        HashSet::from([key("no_stats.parquet"), key("in_range.parquet")]),
         "the stats-less file is kept; only the provably-excluded file is dropped"
     );
 
@@ -1390,8 +1378,8 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
     );
     // Only kept.parquet ([20, 30]) survives among the live Adds.
     assert_eq!(
-        live_add_keys(&listing),
-        &HashSet::from([key("kept.parquet")]),
+        listing.summary.live_adds,
+        HashSet::from([key("kept.parquet")])
     );
 
     Ok(())
@@ -1493,6 +1481,195 @@ async fn against_base_classification_composes_with_predicate(
         "the pruned file is not classified as a duplicate"
     );
     assert!(summary.removes.is_empty());
+
+    Ok(())
+}
+
+// Newest-wins holds when the newest Add of a key is pruned but an older Add of the same key
+// (with a matching range) exists earlier in the range. The pruned newest Add still records the
+// key as `seen`, so the older duplicate must not leak into `live_adds`. The file's live (newest)
+// metadata does not match the predicate, so a cold scan at the target would exclude it too --
+// net zero live Adds. Guards the "record seen regardless of the mask" invariant.
+#[tokio::test]
+async fn pruned_newest_add_suppresses_older_matching_duplicate(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // v1: dupe.parquet with a range that WOULD match `id > 25`.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_id_stats("dupe.parquet", 20, 30),
+    )
+    .await?;
+    // v2: dupe.parquet re-added with a range the predicate provably excludes ([0, 5]).
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        add_with_id_stats("dupe.parquet", 0, 5),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert!(
+        listing.summary.live_adds.is_empty(),
+        "the pruned newest Add records `seen`, so the older matching duplicate must not leak"
+    );
+    assert_eq!(live_add_count(&listing), 0);
+
+    Ok(())
+}
+
+// A predicate referencing a column absent from the table schema fails at `build` (fail-fast),
+// not lazily mid-stream, matching the documented `# Errors` contract.
+#[tokio::test]
+async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_id_stats("a.parquet", 0, 9),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("nonexistent").gt(Expr::literal(1i32)));
+    let result = target
+        .incremental_scan_builder(0)
+        .with_predicate(predicate)
+        .build(engine.as_ref());
+
+    assert!(
+        matches!(result, Err(Error::MissingColumn(_))),
+        "build must fail fast with MissingColumn on an unknown-column predicate, got {result:?}"
+    );
+
+    Ok(())
+}
+
+// Predicate over a partition column folds to keep-all: partition-value pruning is not wired in
+// on this path, so every live Add survives regardless of the partition predicate. Locks in the
+// documented conservative behavior (and doubles as the regression guard once partition pruning
+// lands).
+#[tokio::test]
+async fn partition_column_predicate_keeps_all_added_files() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    // METADATA_WITH_PARTITION_COLS partitions by `val`.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_partitioned(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let v1 = [
+        add_partitioned("a.parquet", "x"),
+        add_partitioned("b.parquet", "y"),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // `val = 'x'` is a partition predicate; it must not prune either file.
+    let predicate: PredicateRef = Arc::new(column_expr!("val").eq(Expr::literal("x")));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("a.parquet"), key("b.parquet")]),
+        "a partition-column predicate folds to keep-all"
+    );
+
+    Ok(())
+}
+
+// Under column mapping, `with_predicate` lowers the logical predicate column to its physical
+// name before reading stats keyed by that physical name. A logical `id > 25` skips against the
+// physical-name stats, so only the in-range file survives -- proving the physical-vs-logical
+// lowering on this path.
+#[tokio::test]
+async fn pushdown_resolves_column_mapping_physical_names() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        COLUMN_MAPPING_METADATA.to_string(),
+    )
+    .await?;
+    // Stats are keyed by the physical name `col-id`, while the predicate references logical `id`.
+    let v1 = [
+        add_with_physical_id_stats("low.parquet", 0, 5),
+        add_with_physical_id_stats("high.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("high.parquet")]),
+        "predicate on logical `id` resolves to physical `col-id` stats and drops the low file"
+    );
 
     Ok(())
 }
