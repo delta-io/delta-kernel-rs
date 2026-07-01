@@ -644,8 +644,8 @@ mod tests {
         );
 
         // Verify timing metrics are present and parseable (values may be 0 for fast operations)
-        let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ms");
-        let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ms");
+        let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ns");
+        let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ns");
 
         // Verify Parallel metrics if expected
         if let Some(expected) = parallel_expected {
@@ -669,8 +669,8 @@ mod tests {
                 total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
 
                 // Verify timing metrics are present and parseable in parallel phase
-                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ms");
-                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ms");
+                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ns");
+                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ns");
 
                 search_start = absolute_pos + 1;
             }
