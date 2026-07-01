@@ -151,8 +151,9 @@ Under the hood, `UCCommitter::commit` does two things for versions >= 1:
 2. Submits the staged commit to the UC `update_table` API, where Unity Catalog
    ratifies it
 
-Version 0 (table creation) is not yet supported by `UCCommitter` (#2826).
-See [Creating UC Tables](./creating_tables.md) for the intended creation flow and
+Version 0 (table creation) takes a different path: `UCCommitter` writes
+`_delta_log/00000000000000000000.json` directly and skips the `update_table` API.
+See [Creating UC Tables](./creating_tables.md) for the creation flow and
 [the catalog-managed write lifecycle](../catalog_managed/writing.md) for the
 generic ratification flow.
 

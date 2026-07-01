@@ -10,10 +10,6 @@ pub(crate) const FEATURE_SUPPORTED: &str = "supported";
 pub(crate) const CATALOG_MANAGED_FEATURE_KEY: &str = "delta.feature.catalogManaged";
 /// Feature signal key for vacuum protocol check.
 pub(crate) const VACUUM_PROTOCOL_CHECK_FEATURE_KEY: &str = "delta.feature.vacuumProtocolCheck";
-/// UC property for the last committed version.
-pub(crate) const METASTORE_LAST_UPDATE_VERSION: &str = "delta.lastUpdateVersion";
-/// UC property for the last commit timestamp.
-pub(crate) const METASTORE_LAST_COMMIT_TIMESTAMP: &str = "delta.lastCommitTimestamp";
 /// Feature name for catalog-managed tables (wire format).
 pub(crate) const CATALOG_MANAGED_FEATURE: &str = "catalogManaged";
 /// Feature name for vacuum protocol check (wire format).
@@ -22,3 +18,5 @@ pub(crate) const VACUUM_PROTOCOL_CHECK_FEATURE: &str = "vacuumProtocolCheck";
 pub(crate) const IN_COMMIT_TIMESTAMP_FEATURE: &str = "inCommitTimestamp";
 /// Domain name for clustering metadata.
 pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
+/// Domain name for row-tracking metadata.
+pub(crate) const ROW_TRACKING_DOMAIN_NAME: &str = "delta.rowTracking";
