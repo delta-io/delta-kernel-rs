@@ -1,357 +1,92 @@
-//! UCKernelClient implements a high-level interface for interacting with Delta Tables in Unity
-//! Catalog.
+//! Kernel-side helpers for catalog-managed Delta tables under the
+//! Unity Catalog API surface.
+//!
+//! This crate exposes:
+//!
+//! - [`UCCommitter`]: a `delta-kernel` `Committer` impl that, on v >= 1, dispatches a typed
+//!   `requirements + updates` payload through an [`UpdateTableClient`] to the catalog.
+//! - [`log_tail_from_commits`]: converts the inline `Commit`s returned by `load_table` into kernel
+//!   `LogPath`s. The connector then drives `Snapshot::builder_for(...).with_log_tail(...)`
+//!   directly.
+//! - [`normalize_table_root`]: normalizes a UC table location to a root URL ending in `/`.
+//!
+//! [`UpdateTableClient`]: unity_catalog_delta_client_api::UpdateTableClient
 
 mod committer;
 mod constants;
 mod errors;
 mod utils;
-use std::sync::Arc;
 
 pub use committer::UCCommitter;
-use delta_kernel::{Engine, LogPath, Snapshot, Version};
-use itertools::Itertools;
-use tracing::debug;
-use unity_catalog_delta_client_api::{CommitsRequest, GetCommitsClient};
+use delta_kernel::LogPath;
+use unity_catalog_delta_client_api::Commit;
 use url::Url;
 pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
 
-/// The [UCKernelClient] provides a high-level interface to interact with Delta Tables stored in
-/// Unity Catalog. It is a lightweight wrapper around a [GetCommitsClient].
-pub struct UCKernelClient<'a, C: GetCommitsClient> {
-    get_commits_client: &'a C,
+/// Boxed dynamic error type used by this crate's free functions. Chosen so
+/// callers don't need to depend on a specific error enum; this code path
+/// composes failures from kernel, the api crate, and `url::ParseError`.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Normalize a UC table location to a root URL ending in `/`. `load_table` returns the location
+/// without a trailing slash, but staged-commit/log-path resolution and snapshot building require
+/// the table root to end in `/`.
+pub fn normalize_table_root(table_url: &Url) -> Url {
+    let mut root = table_url.clone();
+    if !root.path().ends_with('/') {
+        root.set_path(&format!("{}/", root.path()));
+    }
+    root
 }
 
-impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
-    /// Create a new [UCKernelClient] instance with the provided client.
-    pub fn new(get_commits_client: &'a C) -> Self {
-        UCKernelClient { get_commits_client }
-    }
-
-    /// Load the latest snapshot of a Delta Table identified by `table_id` and `table_uri` in Unity
-    /// Catalog. Generally, a separate `get_table` call can be used to resolve the table id/uri from
-    /// the table name.
-    pub async fn load_snapshot(
-        &self,
-        table_id: &str,
-        table_uri: &str,
-        engine: &dyn Engine,
-    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        self.load_snapshot_inner(table_id, table_uri, None, engine)
-            .await
-    }
-
-    /// Load a snapshot of a Delta Table identified by `table_id` and `table_uri` for a specific
-    /// version. Generally, a separate `get_table` call can be used to resolve the table id/uri from
-    /// the table name.
-    pub async fn load_snapshot_at(
-        &self,
-        table_id: &str,
-        table_uri: &str,
-        version: Version,
-        engine: &dyn Engine,
-    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        self.load_snapshot_inner(table_id, table_uri, Some(version), engine)
-            .await
-    }
-
-    pub(crate) async fn load_snapshot_inner(
-        &self,
-        table_id: &str,
-        table_uri: &str,
-        version: Option<Version>,
-        engine: &dyn Engine,
-    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_uri = table_uri.to_string();
-        let req = CommitsRequest {
-            table_id: table_id.to_string(),
-            table_uri: table_uri.clone(),
-            start_version: Some(0),
-            end_version: version.and_then(|v| v.try_into().ok()),
-        };
-        let mut commits = self.get_commits_client.get_commits(req).await?;
-        if let Some(commits) = commits.commits.as_mut() {
-            commits.sort_by_key(|c| c.version)
-        }
-
-        // The catalog always returns the latest ratified version. Use it as the
-        // max_catalog_version for snapshot building, and as the effective version when no
-        // explicit time-travel version is requested.
-        let max_catalog_version: Version = commits.latest_table_version.try_into()?;
-
-        // consume the UC Commit and hand back a delta_kernel LogPath
-        let mut table_url = Url::parse(&table_uri)?;
-        // add trailing slash
-        if !table_url.path().ends_with('/') {
-            // NB: we push an empty segment which effectively adds a trailing slash
-            table_url
-                .path_segments_mut()
-                .map_err(|_| "Cannot modify URL path segments")?
-                .push("");
-        }
-        let commits: Vec<_> = commits
-            .commits
-            .unwrap_or_default()
-            .into_iter()
-            .map(
-                |c| -> Result<LogPath, Box<dyn std::error::Error + Send + Sync>> {
-                    LogPath::staged_commit(
-                        table_url.clone(),
-                        &c.file_name,
-                        c.file_modification_timestamp,
-                        c.file_size.try_into()?,
-                    )
-                    .map_err(|e| e.into())
-                },
+/// Convert the inline `Commit`s returned by a UC `load_table` response into
+/// kernel `LogPath`s suitable for `Snapshot::builder_for(...).with_log_tail(...)`.
+///
+/// The UC `load_table` endpoint returns unpublished commits inline, so
+/// no separate `get_commits` RPC is needed. Connectors pass the
+/// resulting `LogPath`s along with `with_max_catalog_version` to build a
+/// snapshot directly.
+///
+/// # Errors
+///
+/// Returns a boxed error if any commit's `file_size` does not fit in `usize`
+/// or if `LogPath::staged_commit` rejects the inputs.
+pub fn log_tail_from_commits(
+    commits: &[Commit],
+    table_url: &Url,
+) -> Result<Vec<LogPath>, BoxError> {
+    let table_root = normalize_table_root(table_url);
+    let mut sorted: Vec<&Commit> = commits.iter().collect();
+    sorted.sort_by_key(|c| c.version);
+    sorted
+        .into_iter()
+        .map(|c| {
+            LogPath::staged_commit(
+                table_root.clone(),
+                &c.file_name,
+                c.file_modification_timestamp,
+                c.file_size.try_into()?,
             )
-            .try_collect()?;
-
-        debug!("commits for kernel: {:?}\n", commits);
-
-        let mut builder = Snapshot::builder_for(table_url)
-            .with_max_catalog_version(max_catalog_version)
-            .with_log_tail(commits);
-
-        if let Some(v) = version {
-            builder = builder.at_version(v);
-        }
-
-        builder.build(engine).map_err(Into::into)
-    }
+            .map_err(Into::into)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::env;
     use std::sync::Arc;
 
-    use delta_kernel::committer::{Committer, FileSystemCommitter};
-    use delta_kernel::object_store;
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::table_features::{
-        SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
-    };
-    use delta_kernel::transaction::CommitResult;
+    use delta_kernel::Snapshot;
     use delta_kernel_default_engine::DefaultEngineBuilder;
-    use tracing::info;
-    use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
-    use unity_catalog_delta_rest_client::models::TablesResponse;
-    use unity_catalog_delta_rest_client::{UCClient, UCCommitsRestClient};
+    use unity_catalog_delta_client_api::{Commit, InMemoryUpdateTableClient, TableData};
 
     use super::*;
 
-    /// Returns `true` when the UC `get_table` response indicates the table uses the
-    /// `catalogManaged` protocol feature.
-    ///
-    /// We key off the UC `properties` map because the snapshot has not been loaded yet and we
-    /// need the answer to decide *how* to load it (catalog round-trip vs. direct object-store
-    /// read). Once a snapshot is in hand, protocol inspection is the authoritative source.
-    fn is_catalog_managed(table: &TablesResponse) -> bool {
-        let key = format!("{SET_TABLE_FEATURE_SUPPORTED_PREFIX}catalogManaged");
-        table.properties.get(&key).map(String::as_str) == Some(SET_TABLE_FEATURE_SUPPORTED_VALUE)
-    }
-
-    /// Load a snapshot of the given UC Delta table, picking the correct strategy based on whether
-    /// the table uses the `catalogManaged` protocol feature. Catalog-managed tables are loaded via
-    /// [`UCKernelClient`] (which queries UC for the authoritative log tail); other UC Delta tables
-    /// are loaded directly from object storage via [`Snapshot::builder_for`].
-    ///
-    /// When `version` is `None`, loads the latest snapshot; otherwise loads the snapshot at the
-    /// given version.
-    async fn load_uc_table_snapshot(
-        table: &TablesResponse,
-        commits_client: &UCCommitsRestClient,
-        version: Option<Version>,
-        engine: &dyn Engine,
-    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        if is_catalog_managed(table) {
-            UCKernelClient::new(commits_client)
-                .load_snapshot_inner(&table.table_id, &table.storage_location, version, engine)
-                .await
-        } else {
-            let mut builder = Snapshot::builder_for(&table.storage_location);
-            if let Some(v) = version {
-                builder = builder.at_version(v);
-            }
-            Ok(builder.build(engine)?)
-        }
-    }
-
-    // We could just re-export UCClient's get_table to not require consumers to directly import
-    // unity_catalog_delta_rest_client themselves.
-    async fn get_table(
-        client: &UCClient,
-        table_name: &str,
-    ) -> Result<TablesResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let res = client.get_table(table_name).await?;
-        info!(
-            "[GET TABLE] got table_id: {}, table_uri: {}, catalog_managed: {}\n",
-            res.table_id,
-            res.storage_location,
-            is_catalog_managed(&res),
-        );
-        Ok(res)
-    }
-
-    // ignored test which you can run manually to play around with reading a UC table. run with:
-    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t read_uc_table --nocapture -- --ignored`
-    //
-    // Supports both catalog-managed Delta tables (via UCKernelClient, which queries UC for the
-    // log tail) and non-catalog-managed UC tables (via Snapshot::builder_for).
-    #[ignore]
     #[tokio::test]
-    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
-        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
-        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
-
-        // build shared config
-        let config =
-            unity_catalog_delta_rest_client::ClientConfig::build(&endpoint, &token).build()?;
-
-        // build clients
-        let uc_client = UCClient::new(config.clone())?;
-        let uc_commits_client = UCCommitsRestClient::new(config)?;
-
-        let table = get_table(&uc_client, &table_name).await?;
-        let creds = uc_client
-            .get_credentials(&table.table_id, Operation::Read)
-            .await
-            .map_err(|e| format!("Failed to get credentials: {e}"))?;
-
-        // TODO: support non-AWS
-        let creds = creds
-            .aws_temp_credentials
-            .ok_or("No AWS temporary credentials found")?;
-
-        let options = [
-            ("region", "us-west-2"),
-            ("access_key_id", &creds.access_key_id),
-            ("secret_access_key", &creds.secret_access_key),
-            ("session_token", &creds.session_token),
-        ];
-
-        let table_url = Url::parse(&table.storage_location)?;
-        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
-
-        info!("created object store: {:?}\npath: {:?}\n", store, path);
-
-        let engine = DefaultEngineBuilder::new(store.into()).build();
-
-        let snapshot = load_uc_table_snapshot(&table, &uc_commits_client, None, &engine).await?;
-        // or time travel, e.g.
-        // load_uc_table_snapshot(&table, &uc_commits_client, Some(2), &engine).await?;
-
-        println!("loaded snapshot: {snapshot:?}");
-
-        Ok(())
-    }
-
-    // ignored test which you can run manually to play around with writing to a UC table. run with:
-    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
-    //
-    // Supports both catalog-managed Delta tables (via UCKernelClient + UCCommitter) and
-    // non-catalog-managed UC tables (via Snapshot::builder_for + FileSystemCommitter).
-    #[ignore]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
-        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
-        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
-
-        // build shared config
-        let config =
-            unity_catalog_delta_rest_client::ClientConfig::build(&endpoint, &token).build()?;
-
-        // build clients
-        let client = UCClient::new(config.clone())?;
-        let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
-
-        let table = get_table(&client, &table_name).await?;
-        let creds = client
-            .get_credentials(&table.table_id, Operation::ReadWrite)
-            .await
-            .map_err(|e| format!("Failed to get credentials: {e}"))?;
-
-        // TODO: support non-AWS
-        let creds = creds
-            .aws_temp_credentials
-            .ok_or("No AWS temporary credentials found")?;
-
-        let options = [
-            ("region", "us-west-2"),
-            ("access_key_id", &creds.access_key_id),
-            ("secret_access_key", &creds.secret_access_key),
-            ("session_token", &creds.session_token),
-        ];
-
-        let table_url = Url::parse(&table.storage_location)?;
-        let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
-        let store = Arc::new(store);
-
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
-
-        let snapshot = load_uc_table_snapshot(&table, &commits_client, None, &engine).await?;
-        println!("latest snapshot version: {:?}", snapshot.version());
-
-        // UC catalogManaged tables must commit through UC; UC non-catalogManaged commit through
-        // the filesystem.
-        let committer: Box<dyn Committer> = if is_catalog_managed(&table) {
-            Box::new(UCCommitter::new(
-                commits_client.clone(),
-                table.table_id.clone(),
-            ))
-        } else {
-            Box::new(FileSystemCommitter::new())
-        };
-        let txn = snapshot.clone().transaction(committer, &engine)?;
-        let _write_context = txn.unpartitioned_write_context()?;
-
-        match txn.commit(&engine)? {
-            CommitResult::CommittedTransaction(t) => {
-                println!("committed version {}", t.commit_version());
-                let _snapshot = t
-                    .post_commit_snapshot()
-                    .ok_or("no post commit snapshot")?
-                    .clone();
-                // then do publish (catalog-managed only)
-            }
-            CommitResult::ConflictedTransaction(t) => {
-                println!("commit conflicted at version {}", t.conflict_version());
-            }
-            CommitResult::RetryableTransaction(_) => {
-                println!("we should retry...");
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_snapshot_at_errors_when_version_exceeds_catalog() {
-        let client = InMemoryCommitsClient::new();
-        client.insert_table(
-            "test_table",
-            TableData {
-                max_ratified_version: 3,
-                catalog_commits: vec![],
-            },
-        );
-        let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store).build();
-        let catalog = UCKernelClient::new(&client);
-
-        // Request version 5 but catalog only reports version 3
-        let result = catalog
-            .load_snapshot_at("test_table", "memory:///", 5, &engine)
-            .await;
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Time-travel version 5 exceeds max_catalog_version 3"));
-    }
-
-    #[tokio::test]
-    async fn load_snapshot_errors_on_non_contiguous_commits() {
-        let client = InMemoryCommitsClient::new();
+    async fn snapshot_build_errors_on_non_contiguous_commits() {
+        // Catalog state has a gap at v2 (commits for v1 and v3 only).
+        let client = InMemoryUpdateTableClient::new();
         client.insert_table(
             "test_table",
             TableData {
@@ -370,20 +105,56 @@ mod tests {
                         "00000000000000000003.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
                         100,
                         0,
-                    ), // gap: version 2 missing
+                    ),
                 ],
             },
         );
+        let resp = client
+            .load_table_response("test_table", "memory:///")
+            .unwrap();
+
+        let table_url = Url::parse(&resp.metadata.location).unwrap();
+        let log_tail = log_tail_from_commits(&resp.commits, &table_url).unwrap();
+
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(store).build();
-        let catalog = UCKernelClient::new(&client);
+        let max_catalog_version: u64 = resp.latest_table_version.unwrap_or(0).try_into().unwrap();
+        let result = Snapshot::builder_for(table_url)
+            .with_log_tail(log_tail)
+            .with_max_catalog_version(max_catalog_version)
+            .build(&engine);
 
-        let result = catalog
-            .load_snapshot("test_table", "memory:///", &engine)
-            .await;
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("log_tail must be sorted and contiguous"));
+    }
+
+    #[test]
+    fn normalize_table_root_adds_and_preserves_trailing_slash() {
+        let no_slash = Url::parse("s3://bucket/a/b").unwrap();
+        assert_eq!(normalize_table_root(&no_slash).as_str(), "s3://bucket/a/b/");
+
+        let with_slash = Url::parse("s3://bucket/a/b/").unwrap();
+        assert_eq!(
+            normalize_table_root(&with_slash).as_str(),
+            "s3://bucket/a/b/"
+        );
+    }
+
+    #[test]
+    fn log_tail_from_commits_resolves_staged_commit_without_trailing_slash() {
+        let commits = vec![Commit::new(
+            1,
+            0,
+            "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+            10,
+            0,
+        )];
+        // Table URL lacks a trailing slash; normalization inside the helper must still resolve the
+        // staged-commit URL.
+        let table_url = Url::parse("s3://bucket/a/b").unwrap();
+        let log_tail = log_tail_from_commits(&commits, &table_url).unwrap();
+        assert_eq!(log_tail.len(), 1);
     }
 }

@@ -4,15 +4,42 @@ use url::Url;
 
 use crate::error::Result;
 
-#[derive(Debug, Clone)]
+/// Default `User-Agent` identifying this client. Some catalogs require a specific `User-Agent`
+/// value and reject others; override via [`ClientConfigBuilder::with_user_agent`] when your
+/// catalog expects a particular value.
+fn default_user_agent() -> String {
+    format!(
+        "Delta/{v} delta-kernel-rs/{v}",
+        v = env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[derive(Clone)]
 pub struct ClientConfig {
     pub workspace_url: Url,
     pub token: String,
+    pub user_agent: String,
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub max_retries: u32,
     pub retry_base_delay: Duration,
     pub retry_max_delay: Duration,
+}
+
+// Manual Debug to avoid leaking the bearer token.
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("workspace_url", &self.workspace_url)
+            .field("token", &"***")
+            .field("user_agent", &self.user_agent)
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_retries", &self.max_retries)
+            .field("retry_base_delay", &self.retry_base_delay)
+            .field("retry_max_delay", &self.retry_max_delay)
+            .finish()
+    }
 }
 
 impl ClientConfig {
@@ -36,6 +63,7 @@ impl ClientConfig {
         Ok(Self {
             workspace_url,
             token: token.into(),
+            user_agent: default_user_agent(),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             max_retries: 3,
@@ -52,6 +80,7 @@ impl ClientConfig {
 pub struct ClientConfigBuilder {
     workspace: String,
     token: String,
+    user_agent: String,
     timeout: Duration,
     connect_timeout: Duration,
     max_retries: u32,
@@ -64,12 +93,19 @@ impl ClientConfigBuilder {
         Self {
             workspace: workspace.into(),
             token: token.into(),
+            user_agent: default_user_agent(),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             max_retries: 3,
             retry_base_delay: Duration::from_millis(500),
             retry_max_delay: Duration::from_secs(10),
         }
+    }
+
+    /// Override the `User-Agent` header with the value the catalog expects for your connector.
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -95,6 +131,7 @@ impl ClientConfigBuilder {
 
     pub fn build(self) -> Result<ClientConfig> {
         let mut config = ClientConfig::new(self.workspace, self.token)?;
+        config.user_agent = self.user_agent;
         config.timeout = self.timeout;
         config.connect_timeout = self.connect_timeout;
         config.max_retries = self.max_retries;
@@ -138,5 +175,18 @@ mod tests {
             .as_str()
             .contains("api/2.1/unity-catalog"));
         assert_eq!(config.token, "token");
+    }
+
+    #[test]
+    fn debug_redacts_bearer_token() {
+        let config = ClientConfig::build("example.com", "super-secret-token")
+            .build()
+            .unwrap();
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("super-secret-token"),
+            "token leaked: {debug}"
+        );
+        assert!(debug.contains("***"), "redaction marker missing: {debug}");
     }
 }

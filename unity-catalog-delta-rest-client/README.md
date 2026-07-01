@@ -1,37 +1,13 @@
 # unity-catalog-delta-rest-client
 
-An experimental/under-construction rust client for Unity Catalog. This crate is not intended for
-production use.
+An experimental/under-construction Rust client for the Unity Catalog Delta APIs. This crate is not
+intended for production use.
 
-## Example CLI
-This crate provides a command-line interface (CLI) to interact with Unity Catalog APIs, see
-`unity-catalog-delta-rest-client/examples/uc-cli.rs`.
+It provides two REST structs:
 
-```bash
-# set environment variables for UC url/token
-UC_WORKSPACE_URL=https://some.uc.org
-UC_TOKEN=your-token
+- `UCClient`: concrete HTTP methods for the connector-driven read endpoints (`load_table`,
+  credential vending, `/config`).
+- `UCUpdateTableRestClient`: an implementation of the `UpdateTableClient` trait (from
+  `unity-catalog-delta-client-api`) against the `update_table` commit endpoint.
 
-# or set them in each command like
-cargo run --example uc-cli -- --workspace-url <url> --token <token> table catalog.schema.table
-
-# there are 3 operations:
-# 1. get table metadata
-cargo run --example uc-cli -- table catalog.schema.table
-
-# 2. get commits for a table (automatically resolves table id and storage location)
-cargo run --example uc-cli -- commits catalog.schema.table
-
-# or get commits with version range
-cargo run --example uc-cli -- commits catalog.schema.table \
-  --start-version 0 \
-  --end-version 10
-
-# 3. get temporary credentials
-cargo run --example uc-cli -- credentials \
-  --table-id "table-uuid" \
-  --operation READ
-
-# also can enable verbose logging
-cargo run --example uc-cli -- --verbose table catalog.schema.table
-```
+See the crate-level documentation for usage examples.
