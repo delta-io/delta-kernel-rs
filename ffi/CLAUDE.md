@@ -127,7 +127,7 @@ cargo build -p delta_kernel_ffi --release
 Feature flags:
 - `default-engine-rustls` (default)
 - `default-engine-native-tls`
-- `arrow` (default; currently maps to `arrow-58`)
-- `arrow-58`, `arrow-57`
+- `arrow` (default; currently maps to `arrow-59`)
+- `arrow-59`, `arrow-58`
 - `delta-kernel-unity-catalog`
 - `tracing`

@@ -25,9 +25,9 @@ cargo build -p delta_kernel_ffi --release
 |---------|---------|-------------|
 | `default-engine-rustls` | yes | Includes the `DefaultEngine` with rustls TLS |
 | `default-engine-native-tls` | no | Includes the `DefaultEngine` with native TLS (instead of rustls) |
-| `arrow` | yes | Enables Arrow integration (selects `arrow-58` by default) |
-| `arrow-58` | yes | Pin to Arrow 58 explicitly (enabled transitively by `arrow`) |
-| `arrow-57` | no | Pin to Arrow 57 explicitly |
+| `arrow` | yes | Enables Arrow integration (selects `arrow-59` by default) |
+| `arrow-59` | yes | Pin to Arrow 59 explicitly (enabled transitively by `arrow`) |
+| `arrow-58` | no | Pin to Arrow 58 explicitly |
 | `delta-kernel-unity-catalog` | no | Enables Unity Catalog integration for catalog-managed tables |
 | `tracing` | no | Enables tracing/logging support via `tracing-subscriber` |
 

@@ -128,7 +128,7 @@ pub(crate) mod row_tracking;
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
 pub use arrow_compat::*;
 
 #[cfg(feature = "internal-api")]
