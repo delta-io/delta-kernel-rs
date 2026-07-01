@@ -78,6 +78,7 @@ pub mod stats_verifier;
 mod stats_verifier;
 mod update;
 mod write_context;
+mod write_validation;
 
 use stats_verifier::StatsColumnVerifier;
 use write_context::SharedWriteState;
@@ -421,6 +422,15 @@ impl<S> Transaction<S> {
 
         // Validate clustering column stats if ClusteredTable feature is enabled
         self.validate_add_files_stats(&self.add_files_metadata)?;
+
+        // Validate required fields for addFile.
+        if !self.add_files_metadata.is_empty() {
+            write_validation::ActionValidator::new(
+                &write_validation::ADD_REQUIRED_COLUMNS_TYPES,
+                vec![Box::new(write_validation::AddFileRequiredFields)],
+            )?
+            .validate(&self.add_files_metadata)?;
+        }
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
