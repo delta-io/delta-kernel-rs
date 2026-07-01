@@ -354,9 +354,8 @@ impl TableConfiguration {
     }
 
     /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
-    /// every column reference in the rewritten predicate against this set, so the two
-    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
-    /// point to keep their gate input in lockstep.
+    /// every column reference in the rewritten predicate against this set; every data-skipping
+    /// call site shares this entry point so their gate input stays in lockstep.
     pub(crate) fn physical_stats_columns_set(
         &self,
         required_columns: Option<&[ColumnName]>,

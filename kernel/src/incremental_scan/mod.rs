@@ -9,12 +9,15 @@ use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
+use crate::scan::data_skipping::DataSkippingFilter;
+use crate::scan::PhysicalPredicate;
 use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, Version,
+    DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, PredicateRef,
+    Version,
 };
 
 /// Schema projected from each commit JSON: `add` and `remove` only.
@@ -32,6 +35,7 @@ static INCREMENTAL_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 pub struct IncrementalScanBuilder {
     target_snapshot: SnapshotRef,
     base_version: Version,
+    predicate: Option<PredicateRef>,
 }
 
 impl IncrementalScanBuilder {
@@ -40,7 +44,28 @@ impl IncrementalScanBuilder {
         Self {
             target_snapshot: target_snapshot.into(),
             base_version,
+            predicate: None,
         }
+    }
+
+    /// Restrict the streamed live `Add` actions to those whose file stats do not provably
+    /// exclude `predicate`. `None` (the default) preserves the current behavior: every live
+    /// Add is streamed.
+    ///
+    /// Removes are unaffected (they carry no stats and must all be reported so consumers can
+    /// drop stale cached entries). Skipping is best-effort and conservative: a file is dropped
+    /// only when its stats prove no row can match, and files without stats are always kept.
+    ///
+    /// For predicates over data columns, skipping reuses the same stats-based filter the read
+    /// path uses, so the surviving Add set matches what a full scan at the target version with
+    /// the same predicate would keep among these added files. Partition-value pruning is not
+    /// yet wired in on this path: predicates over partition columns fold to keep-all, so a
+    /// predicate touching partition columns yields a superset of what a cold scan would keep.
+    /// Skipping never drops a file a cold scan would keep, so consumers must re-apply the
+    /// predicate at read time regardless.
+    pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
+        self.predicate = predicate.into();
+        self
     }
 
     /// Build the incremental scan stream, or `None` if the target snapshot's commit list
@@ -63,6 +88,8 @@ impl IncrementalScanBuilder {
     ///
     /// # Errors
     /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
+    /// - [`Error::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
+    ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<Option<IncrementalScanStream>> {
@@ -78,6 +105,10 @@ impl IncrementalScanBuilder {
                 self.base_version, target_version
             ))
         );
+        // Resolve the predicate into an Add-side skipping strategy up front so `build` can
+        // fail fast on a malformed predicate (e.g. references to unknown columns), rather
+        // than surfacing the error lazily from the stream.
+        let add_skipping = self.resolve_add_skipping(engine)?;
         // `base_version < target_version` above guarantees `base_version < u64::MAX`, but use
         // `checked_add` to make the dependency explicit and panic-free.
         let start_version = self.base_version.checked_add(1).ok_or_else(|| {
@@ -132,12 +163,60 @@ impl IncrementalScanBuilder {
             base_version: self.base_version,
             target_version,
             actions,
+            add_skipping,
             seen_file_keys: HashSet::new(),
             live_adds: HashSet::new(),
             removes: HashSet::new(),
             errored: false,
         }))
     }
+
+    /// Lowers `self.predicate` into the per-batch skipping strategy applied to live Adds.
+    ///
+    /// Returns [`AddSkipping::KeepAll`] when there is no predicate, when the predicate is
+    /// useless for data skipping ([`PhysicalPredicate::None`]), or when the filter cannot be
+    /// constructed. [`AddSkipping::SkipAll`] when the predicate statically excludes every file
+    /// ([`PhysicalPredicate::StaticSkipAll`]); the stream still reports Removes but yields no
+    /// live Adds. [`AddSkipping::Filter`] carries the reusable [`DataSkippingFilter`].
+    fn resolve_add_skipping(&self, engine: &dyn Engine) -> DeltaResult<AddSkipping> {
+        let Some(predicate) = self.predicate.as_ref() else {
+            return Ok(AddSkipping::KeepAll);
+        };
+
+        let table_configuration = self.target_snapshot.table_configuration();
+        let logical_schema = table_configuration.logical_schema();
+        let column_mapping_mode = table_configuration.column_mapping_mode();
+        match PhysicalPredicate::try_new(predicate, &logical_schema, column_mapping_mode)? {
+            PhysicalPredicate::StaticSkipAll => Ok(AddSkipping::SkipAll),
+            PhysicalPredicate::None => Ok(AddSkipping::KeepAll),
+            PhysicalPredicate::Some(physical_predicate, _referenced_schema) => {
+                // Reuse the same raw-action-batch filter the change-data-feed path builds:
+                // parse stats from `add.stats` JSON and skip against the shared
+                // `DataSkippingFilter`. `None` (predicate ineligible for skipping, or stats
+                // schema unbuildable) degrades to keep-all.
+                let filter = DataSkippingFilter::for_raw_action_batch(
+                    engine,
+                    physical_predicate,
+                    table_configuration,
+                    INCREMENTAL_READ_SCHEMA.clone(),
+                    None,
+                );
+                Ok(filter.map_or(AddSkipping::KeepAll, |f| AddSkipping::Filter(Arc::new(f))))
+            }
+        }
+    }
+}
+
+/// How the streamed live `Add` actions are pruned against the builder's predicate.
+enum AddSkipping {
+    /// No predicate, or a predicate useless for data skipping: every live Add is streamed.
+    KeepAll,
+    /// The predicate statically excludes every file: no live Add is streamed (Removes are
+    /// still reported).
+    SkipAll,
+    /// Prune each Add batch through the stats-based filter, keeping only Adds the predicate
+    /// cannot provably exclude.
+    Filter(Arc<DataSkippingFilter>),
 }
 
 /// Streaming output of an incremental scan over `(base_version, target_version]`.
@@ -160,6 +239,7 @@ pub struct IncrementalScanStream {
     base_version: Version,
     target_version: Version,
     actions: FileDataReadResultIterator,
+    add_skipping: AddSkipping,
     seen_file_keys: HashSet<FileActionKey>,
     live_adds: HashSet<FileActionKey>,
     removes: HashSet<FileActionKey>,
@@ -181,6 +261,7 @@ impl Iterator for IncrementalScanStream {
                 }
                 Ok(batch) => match process_batch(
                     batch,
+                    &self.add_skipping,
                     &mut self.seen_file_keys,
                     &mut self.live_adds,
                     &mut self.removes,
@@ -476,15 +557,34 @@ impl std::fmt::Debug for IncrementalListingAgainstBase {
 }
 
 /// Visit one commit-batch, updating dedup state and accumulators. Returns the filtered Add
-/// rows for this batch, or `None` if no Adds survived dedup in this batch.
+/// rows for this batch, or `None` if no Adds survived dedup (and skipping) in this batch.
+///
+/// When `add_skipping` carries a [`DataSkippingFilter`], a per-row stats mask is computed
+/// once for the batch and AND-ed into the live-Add selection: an Add whose stats prove it
+/// cannot match the predicate is dropped from both the emitted selection vector and the
+/// `live_adds` set, keeping the streamed batches and the summary consistent. A skipped Add
+/// still advances dedup state (its `(path, dv_unique_id)` key is recorded as seen) so an
+/// older duplicate of the same file cannot leak through, matching newest-wins semantics.
+/// Removes are never skipped.
 fn process_batch(
     batch: Box<dyn EngineData>,
+    add_skipping: &AddSkipping,
     seen_file_keys: &mut HashSet<FileActionKey>,
     live_adds: &mut HashSet<FileActionKey>,
     removes: &mut HashSet<FileActionKey>,
 ) -> DeltaResult<Option<FilteredEngineData>> {
     let row_count = batch.len();
     let mut adds_sel = vec![false; row_count];
+
+    // Per-row "keep this Add" mask derived from the predicate. `true` (the default) keeps the
+    // Add; `false` drops it. `SkipAll` drops every Add; `KeepAll` keeps every Add; `Filter`
+    // consults the stats-based skipper (which conservatively keeps rows it cannot disprove,
+    // including Removes and stats-less files).
+    let keep_add: Vec<bool> = match add_skipping {
+        AddSkipping::KeepAll => vec![true; row_count],
+        AddSkipping::SkipAll => vec![false; row_count],
+        AddSkipping::Filter(filter) => filter.apply(batch.as_ref())?,
+    };
 
     let deduplicator = FileActionDeduplicator::new(
         seen_file_keys,
@@ -497,15 +597,17 @@ fn process_batch(
     );
     let mut visitor = IncrementalDedupVisitor {
         deduplicator,
+        keep_add: &keep_add,
         adds_sel: &mut adds_sel,
         live_adds,
         removes,
     };
     visitor.visit_rows_of(batch.as_ref())?;
 
-    // No Adds in the batch survived dedup, e.g. a Removes-only commit or a commit whose
-    // Adds were all cancelled by later commits in the range. Skip yielding an empty
-    // batch; dedup state has still been advanced by the visit above.
+    // No Adds in the batch survived dedup and skipping, e.g. a Removes-only commit, a commit
+    // whose Adds were all cancelled by later commits in the range, or one whose Adds were all
+    // pruned by the predicate. Skip yielding an empty batch; dedup state has still been
+    // advanced by the visit above.
     if !adds_sel.iter().any(|s| *s) {
         return Ok(None);
     }
@@ -529,6 +631,9 @@ const NUM_GETTERS: usize = 9; // 5 add + 4 remove columns
 // slimmer visitor is the right shape here.
 struct IncrementalDedupVisitor<'a, 'seen> {
     deduplicator: FileActionDeduplicator<'seen>,
+    /// Per-row predicate mask (`true` = keep the Add). Same length as the batch; indexed by
+    /// the visitor's row index. Removes ignore this mask.
+    keep_add: &'a [bool],
     adds_sel: &'a mut [bool],
     live_adds: &'a mut HashSet<FileActionKey>,
     removes: &'a mut HashSet<FileActionKey>,
@@ -586,8 +691,13 @@ impl RowVisitor for IncrementalDedupVisitor<'_, '_> {
             }
 
             if is_add {
-                self.adds_sel[i] = true;
-                self.live_adds.insert(key);
+                // Record `seen` above regardless of the predicate so an older duplicate of a
+                // pruned file stays suppressed (newest-wins). Only inclusion in the output
+                // and `live_adds` is gated by the stats mask.
+                if self.keep_add[i] {
+                    self.adds_sel[i] = true;
+                    self.live_adds.insert(key);
+                }
             } else {
                 self.removes.insert(key);
             }
