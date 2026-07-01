@@ -630,7 +630,8 @@ pub trait StorageHandler: AsAny {
 
     /// Delete the file at the given path.
     ///
-    /// This operation is idempotent: deleting a path that does not exist returns `Ok(())`.
+    /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
+    /// For any other error, this must propagate the corresponding error.
     fn delete(&self, path: &Url) -> DeltaResult<()>;
 }
 
@@ -890,7 +891,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// **Non-compliance produces files with incorrect `field_id`s**, which may lead to
     /// read failures when column mapping mode is `id` and to failures when converting
-    /// the table to Iceberg.   
+    /// the table to Iceberg.
     ///
     /// # Parameters
     ///
