@@ -19,6 +19,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 bytes = "1.10"
+prost = { version = "0.13", optional = true }
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
@@ -37,7 +38,6 @@ libc = "0.2.175"
 
 [dev-dependencies]
 paste = "1.0"
-prost = "0.13"
 rand = "0.9.2"
 serde = "1.0.219"
 serde_json = "1.0.142"
@@ -66,7 +66,7 @@ default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_def
 # Requires `arrow` because iterators returned from plan execution use Arrow to pass along data
 # batches, and requires `default-engine-base` because the `PlanBasedEngine` FFI constructor pairs
 # the plan executor with `ArrowEvaluationHandler`
-declarative-plans = ["delta_kernel/declarative-plans", "arrow", "default-engine-base"]
+declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "default-engine-base"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []

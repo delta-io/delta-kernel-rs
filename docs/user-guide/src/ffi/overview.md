@@ -353,6 +353,7 @@ calls return `false`.
 | Function | Purpose |
 |----------|---------|
 | `allocate_kernel_string` | Create a Kernel-owned string from a `KernelStringSlice` |
+| `allocate_kernel_bytes` | Create a Kernel-owned byte buffer from a `KernelBytesSlice` |
 
 ## Visitor callbacks
 

@@ -2,13 +2,15 @@
 //! execution to happen outside of Rust).
 use std::sync::Arc;
 
+use delta_kernel::plans::proto::schema as proto_schema;
+use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
+use prost::Message as _;
 
 use crate::error::EngineExecResult;
 use crate::plans::iter::{FfiBytesIter, FfiEngineDataIter, FfiFileMetaIter};
 use crate::plans::result::{CParquetFooter, CPlanResult};
-use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{kernel_bytes_slice, KernelBytesSlice, NullableCvoid};
 
 /// A shared (`Arc`-like) handle to an [`PlanExecutor`].
@@ -83,46 +85,43 @@ impl PlanExecutor for FfiPlanExecutor {
     }
 }
 
-/// Convert a [`CParquetFooter`] into a kernel [`ParquetFooter`]
+/// Convert a [`CParquetFooter`] into a kernel [`ParquetFooter`].
 ///
-/// Returns an error if schema visiting produces an invalid schema.
+/// Consumes the embedded [`ExclusiveRustBytes`](crate::ExclusiveRustBytes) handle carrying
+/// the proto-serialized schema, returning an error if the bytes are not a valid schema proto
+/// message.
 fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
-    let CParquetFooter { schema } = footer;
-    let mut visitor_state = KernelSchemaVisitorState::default();
-    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-
-    // TODO: we currently use the existing visitor pattern for sending schema, but
-    // to be consistent with how we send the input plan (which includes schema), we could just use
-    // proto to serialize the schema here too.
-    let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
-    Ok(ParquetFooter {
-        schema: Arc::new(schema),
-    })
+    let CParquetFooter { schema_proto } = footer;
+    // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
+    let bytes = *unsafe { schema_proto.into_inner() };
+    let proto = proto_schema::StructType::decode(bytes.as_slice()).map_err(Error::generic_err)?;
+    let schema = Arc::new(StructType::try_from(proto)?);
+    Ok(ParquetFooter { schema })
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
     use std::ptr::NonNull;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
-    use delta_kernel::plans::proto::operation as proto;
-    use delta_kernel::schema::DataType as KernelDataType;
+    use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
+    use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
     use delta_kernel::Error;
     use prost::Message;
     use url::Url;
 
     use super::*;
     use crate::error::{EngineExecError, KernelError};
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
     use crate::handle::Handle;
     use crate::plans::get_plan_executor;
     use crate::plans::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
     use crate::plans::result::CParquetFooter;
-    use crate::scan::EngineSchema;
-    use crate::schema_visitor::{visit_field_integer, visit_field_struct};
-    use crate::{kernel_string_slice, ExclusiveEngineData, ExclusiveRustString, OptionalValue};
+    use crate::{
+        allocate_kernel_bytes, kernel_bytes_slice, ExclusiveEngineData, ExclusiveRustString,
+        OptionalValue,
+    };
 
     extern "C" fn noop_free(_state: NullableCvoid) {}
 
@@ -284,42 +283,14 @@ mod tests {
         assert!(bytes_iter.next().is_none(), "empty bytes iterator");
     }
 
-    /// Schema visitor that produces `{id: integer (nullable)}`.
-    extern "C" fn visit_id_only_schema(
-        _schema_ptr: *mut c_void,
-        state: &mut KernelSchemaVisitorState,
-    ) -> usize {
-        let id = "id";
-        let id_field_id = unsafe {
-            ok_or_panic(visit_field_integer(
-                state,
-                kernel_string_slice!(id),
-                true,
-                allocate_err,
-            ))
-        };
-        let field_ids = [id_field_id];
-        let schema = "schema";
-        unsafe {
-            ok_or_panic(visit_field_struct(
-                state,
-                kernel_string_slice!(schema),
-                field_ids.as_ptr(),
-                1,
-                false,
-                allocate_err,
-            ))
-        }
-    }
-
     #[test]
     fn execute_op_parquet_footer_variant() {
-        let footer = CParquetFooter {
-            schema: EngineSchema {
-                schema: std::ptr::null_mut(),
-                visitor: visit_id_only_schema,
-            },
-        };
+        let schema =
+            StructType::try_new(vec![StructField::nullable("id", KernelDataType::INTEGER)])
+                .unwrap();
+        let bytes = proto_schema::StructType::from(&schema).encode_to_vec();
+        let schema_proto = unsafe { allocate_kernel_bytes(kernel_bytes_slice!(bytes)) };
+        let footer = CParquetFooter { schema_proto };
         let footer = execute_dummy_op(CPlanResult::ParquetFooter(footer))
             .into_parquet_footer()
             .expect("ParquetFooter variant");
