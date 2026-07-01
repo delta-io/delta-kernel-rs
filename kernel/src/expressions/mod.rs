@@ -410,8 +410,8 @@ pub enum Expression {
     Unknown(String),
     /// Parse a JSON string expression into a struct with the given schema.
     ParseJson(ParseJsonExpression),
-    /// Extract keys from a `Map<String, String>` and parse values into a typed struct using
-    /// Delta's partition value serialization rules.
+    /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
+    /// [`MapToStructExpression`] for how values are parsed.
     MapToStruct(MapToStructExpression),
 }
 
@@ -539,8 +539,8 @@ impl ParseJsonExpression {
 /// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
 /// the output struct column: a `key` -> `value` mapping in the map means the struct field named
 /// `key` receives `value`, parsed into the field's target type via [`PrimitiveType::parse_scalar`].
-/// An empty-string value mirrors DBR's non-ANSI `Cast`: it casts to itself for string, to empty
-/// bytes for binary, and to null for every other type.
+/// An empty-string value is the exception: it casts to itself for string, to empty bytes for
+/// binary, and to null for every other type.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -740,7 +740,8 @@ impl Expression {
 
     /// Extracts keys from a `Map<String, String>` and parses values into a typed struct. The output
     /// struct schema is determined by the evaluator's `result_type`. An empty-string value casts to
-    /// itself for string, to empty bytes for binary, and to null for every other type.
+    /// itself for string, to empty bytes for binary, and to null for every other type. See
+    /// [`MapToStructExpression`] for the full contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
     }

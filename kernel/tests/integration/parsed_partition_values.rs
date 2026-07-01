@@ -148,8 +148,9 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
 // === Foreign-writer literal empty-string partition values ===
 //
 // The kernel never persists a literal "" partition value (it collapses empties to an absent map
-// entry on write), so these tests stand in a raw-JSON foreign writer (Spark) that did, then assert
-// the kernel reconstructs `partitionValues_parsed` with DBR's non-ANSI `Cast` semantics.
+// entry on write), so these tests stand in a raw-JSON foreign writer that did, then assert the
+// kernel reconstructs `partitionValues_parsed` with the empty-string cast: "" stays "" for string,
+// becomes empty bytes for binary, and becomes null for every other type.
 
 /// Writes a foreign-writer table under `table_path`: protocol + metadata declaring string, binary,
 /// and integer partition columns (with `writeStatsAsStruct` enabled so a checkpoint writes its own
@@ -217,13 +218,13 @@ fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
 }
 
 /// A foreign writer can persist a literal "" in the `partitionValues` map. On read, kernel
-/// reconstructs `partitionValues_parsed` with DBR's non-ANSI `Cast` semantics: "" stays "" for
-/// string, becomes empty bytes for binary, and becomes null for every other type.
+/// reconstructs `partitionValues_parsed` with the empty-string cast: "" stays "" for string,
+/// becomes empty bytes for binary, and becomes null for every other type.
 ///
 /// The result is identical whether the value is reconstructed from the `partitionValues` map (JSON
 /// commit) or read from a kernel-written checkpoint's native `partitionValues_parsed` column: the
 /// checkpoint reconstructs that column with the same cast, so a checkpoint never changes the value
-/// a scan surfaces. `native_checkpoint` pins that equivalence.
+/// a scan surfaces. The `native_checkpoint` axis exercises both sources.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_partition_values_read_foreign_empty_string(
@@ -295,19 +296,19 @@ fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
     paths.push(scan_file.path);
 }
 
-/// A file whose string partition value is a foreign literal "" is KEPT under a `p_str = ''`
-/// predicate (the reconstructed value is "", matching DBR) and PRUNED under `p_str = 'other'`.
-/// This locks in the DBR-consistent partition skipping the cast change enables: before the change
-/// "" collapsed to null and `p_str = 'other'` kept the file conservatively, diverging from DBR.
+/// A file whose partition value is a foreign literal "" is a real empty value, not null, so
+/// partition skipping treats it accordingly:
+/// - `p_str = ''` keeps it, `p_str = 'other'` prunes it (before the cast change "" collapsed to
+///   null, so `p_str = 'other'` kept the file conservatively).
+/// - `p_str IS NULL` prunes it and `p_str IS NOT NULL` keeps it (the value is "", not null).
+/// - the same holds for the binary column (`p_bin`), whose "" reconstructs as empty bytes.
 ///
-/// `native_checkpoint` pins that pruning is identical before and after a kernel checkpoint: the
-/// checkpoint reconstructs the same "" into its native `partitionValues_parsed` column, so skipping
-/// keeps and prunes the same files a scan of the JSON commit would.
+/// The `native_checkpoint` axis exercises that pruning is identical before and after a kernel
+/// checkpoint: the checkpoint reconstructs the same "" into its native `partitionValues_parsed`
+/// column, so skipping keeps and prunes the same files a scan of the JSON commit would.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_string_partition_pruning_matches_dbr(
-    #[values(false, true)] native_checkpoint: bool,
-) {
+async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint: bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("empty-string-pruning");
     let url = write_foreign_partition_table(
@@ -347,14 +348,38 @@ async fn empty_string_partition_pruning_matches_dbr(
         paths
     };
 
+    let empty = "p_str=/empty.parquet".to_string();
+    let other = "p_str=other/other.parquet".to_string();
+    let both = vec![empty.clone(), other.clone()];
+
+    // The empty-string value is a real "", so equality and null predicates treat it as such.
     assert_eq!(
         surviving(Predicate::eq(col!("p_str"), lit(""))),
-        vec!["p_str=/empty.parquet".to_string()],
+        vec![empty.clone()],
         "empty-string file must be kept under p_str = ''"
     );
     assert_eq!(
         surviving(Predicate::eq(col!("p_str"), lit("other"))),
-        vec!["p_str=other/other.parquet".to_string()],
-        "empty-string file must be pruned under p_str = 'other' (matches DBR)"
+        vec![other.clone()],
+        "empty-string file must be pruned under p_str = 'other'"
+    );
+    // Both partition values are non-null ("" and "other"), so IS NULL prunes both and IS NOT NULL
+    // keeps both. The empty file surviving IS NOT NULL is the fix: before the cast change "" was
+    // null, so it would have been kept under IS NULL and pruned under IS NOT NULL.
+    assert!(
+        surviving(Predicate::is_null(col!("p_str"))).is_empty(),
+        "no file has a null p_str, so IS NULL prunes both (the empty file's value is \"\", not null)"
+    );
+    assert_eq!(
+        surviving(Predicate::is_not_null(col!("p_str"))),
+        both,
+        "both files must be kept under p_str IS NOT NULL"
+    );
+
+    // The binary column reconstructs "" as empty bytes, pruned the same way.
+    assert_eq!(
+        surviving(Predicate::eq(col!("p_bin"), lit(b"other".as_slice()))),
+        vec![other.clone()],
+        "empty-bytes file must be pruned under p_bin = X'6f74686572'"
     );
 }

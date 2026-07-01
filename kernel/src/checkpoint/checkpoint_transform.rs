@@ -200,10 +200,9 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// itself carries no schema, so the expression evaluator uses the expected output type to
 /// parse each string value into the correct native type.
 ///
-/// `MAP_TO_STRUCT` reconstructs the same typed struct the scan reads, so a checkpoint and its
-/// source commits surface identical partition values (the read and this fallback never disagree).
-/// Kernel never writes a literal empty-string partition value, so the only rows this affects hold
-/// a foreign `""`, which reconstructs identically here and on read.
+/// The fallback uses the same `MAP_TO_STRUCT` the scan applies, so an empty-string partition value
+/// (only ever a foreign `""`, since the kernel collapses empties to an absent map entry on write)
+/// reconstructs into the checkpoint identically to how the scan reconstructs it from a commit.
 ///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {

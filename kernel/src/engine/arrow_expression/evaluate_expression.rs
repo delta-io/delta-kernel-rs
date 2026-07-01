@@ -897,10 +897,7 @@ pub fn coalesce_arrays(
 
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
-/// An empty string mirrors DBR's non-ANSI `Cast` of the partition-value map: it casts to itself for
-/// string, to empty bytes for binary, and to null for every other type. A literal empty string only
-/// reaches this path from a foreign writer, since the kernel collapses empties to an absent map
-/// entry on write.
+/// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
 ///
 /// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
 /// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
@@ -910,11 +907,7 @@ pub fn coalesce_arrays(
 /// harmless on the read path. All other types go through `parse_scalar`.
 fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
-        return Ok(match prim {
-            PrimitiveType::String => Some(Scalar::String(String::new())),
-            PrimitiveType::Binary => Some(Scalar::Binary(Vec::new())),
-            _ => None,
-        });
+        return Ok(prim.empty_string_partition_cast());
     }
     match prim {
         PrimitiveType::Date => {
@@ -943,7 +936,7 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
-/// casts to itself for string, to empty bytes for binary, and to null for every other type.
+/// casts via [`PrimitiveType::empty_string_partition_cast`].
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -2487,11 +2480,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// An empty-string map value mirrors DBR's non-ANSI Cast: `""` for string, empty bytes for
-    /// binary, and null for every other type. A literal empty string only reaches this path from a
-    /// foreign writer; the kernel collapses empties to an absent map entry on write.
+    /// An empty-string map value casts via `empty_string_partition_cast`: `""` for string, empty
+    /// bytes for binary, and null for every other type.
     #[test]
-    fn test_map_to_struct_empty_string_casts_like_dbr() {
+    fn test_map_to_struct_empty_string_cast_semantics() {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("region");
         builder.values().append_value("");
