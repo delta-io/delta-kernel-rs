@@ -200,6 +200,11 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// itself carries no schema, so the expression evaluator uses the expected output type to
 /// parse each string value into the correct native type.
 ///
+/// `MAP_TO_STRUCT` reconstructs the same typed struct the scan reads, so a checkpoint and its
+/// source commits surface identical partition values (the read and this fallback never disagree).
+/// Kernel never writes a literal empty-string partition value, so the only rows this affects hold
+/// a foreign `""`, which reconstructs identically here and on read.
+///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([
@@ -425,6 +430,25 @@ mod tests {
         assert!(
             is_replacement(inner, PARTITION_VALUES_PARSED_FIELD),
             "partitionValues_parsed should be replaced"
+        );
+    }
+
+    /// The checkpoint falls back to `MAP_TO_STRUCT` over `partitionValues` when no native
+    /// `partitionValues_parsed` column is present, so a checkpoint reconstructs the same typed
+    /// struct the scan reads and the two can never disagree on a value.
+    #[test]
+    fn build_partition_values_parsed_expr_falls_back_to_map_to_struct() {
+        let expr = build_partition_values_parsed_expr();
+        let Expression::Variadic(coalesce) = expr.as_ref() else {
+            panic!("expected a COALESCE expression");
+        };
+        let has_map_to_struct_fallback = coalesce
+            .exprs
+            .iter()
+            .any(|e| matches!(e, Expression::MapToStruct(_)));
+        assert!(
+            has_map_to_struct_fallback,
+            "checkpoint partitionValues_parsed must reconstruct via MAP_TO_STRUCT"
         );
     }
 

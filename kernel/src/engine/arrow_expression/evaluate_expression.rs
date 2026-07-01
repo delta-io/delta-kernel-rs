@@ -897,16 +897,24 @@ pub fn coalesce_arrays(
 
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
+/// An empty string mirrors DBR's non-ANSI `Cast` of the partition-value map: it casts to itself for
+/// string, to empty bytes for binary, and to null for every other type. A literal empty string only
+/// reaches this path from a foreign writer, since the kernel collapses empties to an absent map
+/// entry on write.
+///
 /// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
 /// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
 /// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
 /// timestamp carrying an explicit offset) and interpret no-offset timestamps as UTC, matching
 /// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
-/// harmless on the read path. All other types go through `parse_scalar`, including its handling of
-/// the empty string as a null value.
+/// harmless on the read path. All other types go through `parse_scalar`.
 fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
-        return Ok(None);
+        return Ok(match prim {
+            PrimitiveType::String => Some(Scalar::String(String::new())),
+            PrimitiveType::Binary => Some(Scalar::Binary(Vec::new())),
+            _ => None,
+        });
     }
     match prim {
         PrimitiveType::Date => {
@@ -934,8 +942,8 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 }
 
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
-/// and parses each value into its target type using Delta's partition value serialization rules,
-/// producing a `StructArray`.
+/// and parses each value into its target type, producing a `StructArray`. An empty-string value
+/// casts to itself for string, to empty bytes for binary, and to null for every other type.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -2479,14 +2487,17 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// An empty-string map value mirrors DBR's non-ANSI Cast: `""` for string, empty bytes for
+    /// binary, and null for every other type. A literal empty string only reaches this path from a
+    /// foreign writer; the kernel collapses empties to an absent map entry on write.
     #[test]
-    fn test_map_to_struct_empty_string_is_null() {
-        // An empty string maps to null, matching `parse_scalar`. MapToStruct must agree with the
-        // canonical partition-value parser used elsewhere in the kernel.
+    fn test_map_to_struct_empty_string_casts_like_dbr() {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("region");
         builder.values().append_value("");
         builder.keys().append_value("blob");
+        builder.values().append_value("");
+        builder.keys().append_value("count");
         builder.values().append_value("");
         builder.append(true).unwrap();
 
@@ -2501,6 +2512,7 @@ mod tests {
         let output_schema = StructType::new_unchecked(vec![
             StructField::nullable("region", DataType::STRING),
             StructField::nullable("blob", DataType::BINARY),
+            StructField::nullable("count", DataType::INTEGER),
         ]);
         let result_type = DataType::from(output_schema);
         let expr = Expr::map_to_struct(column_expr!("pv"));
@@ -2512,14 +2524,23 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert!(regions.is_null(0));
+        assert!(!regions.is_null(0));
+        assert_eq!(regions.value(0), "");
 
         let blobs = structs
             .column(1)
             .as_any()
             .downcast_ref::<crate::arrow::array::BinaryArray>()
             .unwrap();
-        assert!(blobs.is_null(0));
+        assert!(!blobs.is_null(0));
+        assert_eq!(blobs.value(0), b"");
+
+        let counts = structs
+            .column(2)
+            .as_any()
+            .downcast_ref::<crate::arrow::array::Int32Array>()
+            .unwrap();
+        assert!(counts.is_null(0));
     }
 
     #[test]

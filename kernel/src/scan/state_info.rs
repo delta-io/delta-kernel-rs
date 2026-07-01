@@ -426,7 +426,8 @@ impl StateInfo {
         // the predicate-narrowed subset. The data skipping filter only references the columns
         // its predicate needs, so the superset is safe for pruning too. All fields are forced
         // nullable: MapToStruct can yield null even for a non-nullable column (a missing key, or
-        // the protocol's empty-string-is-null rule), and a non-nullable field would then error.
+        // an empty string cast to a non-string/binary type), and a non-nullable field would then
+        // error.
         let physical_partition_schema = if partition_values.parsed_struct {
             table_partition_schema.map(|tps| {
                 let nullable_fields = tps

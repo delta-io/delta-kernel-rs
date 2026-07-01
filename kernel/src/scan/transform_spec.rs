@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::expressions::{
     col, lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar,
 };
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
@@ -208,12 +208,22 @@ fn apply_insert_after(
     }
 }
 
-/// Parse a partition value from the raw string representation
+/// Parse a partition value from the raw string representation.
+///
+/// An empty string mirrors DBR's non-ANSI `Cast` of the partition-value map: it casts to itself
+/// for string, to empty bytes for binary, and to null for every other type. A literal empty string
+/// only reaches this path from a foreign writer, since the kernel collapses empties to an absent
+/// map entry on write.
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
     match (raw, data_type.as_primitive_opt()) {
+        (Some(v), Some(primitive)) if v.is_empty() => Ok(match primitive {
+            PrimitiveType::String => Scalar::String(String::new()),
+            PrimitiveType::Binary => Scalar::Binary(Vec::new()),
+            _ => Scalar::Null(data_type.clone()),
+        }),
         (Some(v), Some(primitive)) => primitive.parse_scalar(v),
         (Some(_), None) => Err(Error::generic(format!(
             "Unexpected partition column type: {data_type:?}"
@@ -333,6 +343,26 @@ mod tests {
     fn test_parse_partition_value_raw_null() {
         let result = parse_partition_value_raw(None, &DataType::STRING).unwrap();
         assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_parse_partition_value_raw_empty_string_cast_semantics() {
+        // Mirror DBR's non-ANSI Cast of the partition-value map: an empty string casts to itself
+        // for string and to empty bytes for binary, and to null for every other type. A literal
+        // empty string only reaches this path from a foreign writer, since the kernel collapses
+        // empties to an absent map entry on write.
+        let empty = String::new();
+
+        let string_value = parse_partition_value_raw(Some(&empty), &DataType::STRING).unwrap();
+        assert_eq!(string_value, Scalar::String(String::new()));
+
+        let binary_value = parse_partition_value_raw(Some(&empty), &DataType::BINARY).unwrap();
+        assert_eq!(binary_value, Scalar::Binary(Vec::new()));
+
+        let int_value =
+            parse_partition_value_raw(Some(&empty), &DataType::Primitive(PrimitiveType::Integer))
+                .unwrap();
+        assert!(int_value.is_null());
     }
 
     #[test]

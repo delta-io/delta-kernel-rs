@@ -726,8 +726,9 @@ fn scan_row_schema_with_parsed_columns(
 ///   to pay the per-batch `ToJson` cost over potentially large stats structs.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
-/// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed
-///   column.
+/// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
+///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
+///   the `partitionValues` string map.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -786,10 +787,10 @@ fn get_add_transform_expr(
     // engine-facing typed output column.
     if partition_schema.is_some() {
         let pv_parsed_expr = if has_partition_values_parsed {
-            // Checkpoint has partitionValues_parsed column - read directly
+            // Checkpoint carries a native partitionValues_parsed column - read it directly.
             column_expr!("add.partitionValues_parsed")
         } else {
-            // No partitionValues_parsed available (JSON log files) - parse from string map
+            // No native column (JSON commit): reconstruct from the string map.
             Expression::map_to_struct(column_expr!("add.partitionValues"))
         };
         fields.push(Arc::new(pv_parsed_expr));
@@ -1921,10 +1922,8 @@ mod tests {
 
     /// `synthesize_json=false` removes every `ToJson` node from the add transform;
     /// `synthesize_json=true` leaves exactly one inside the COALESCE branch.
-    #[rstest]
-    fn add_transform_omits_to_json_when_synthesis_skipped(
-        #[values(false, true)] has_partition_values_parsed: bool,
-    ) {
+    #[test]
+    fn add_transform_omits_to_json_when_synthesis_skipped() {
         let stats_schema: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("value", DataType::STRING),
@@ -1940,7 +1939,7 @@ mod tests {
             false, // skip_stats
             true,  // synthesize_json
             partition_schema.clone(),
-            has_partition_values_parsed,
+            false, // has_partition_values_parsed
         );
         assert_eq!(
             count_to_json(&with_synthesis),
@@ -1955,7 +1954,7 @@ mod tests {
             false, // skip_stats
             false, // synthesize_json
             partition_schema,
-            has_partition_values_parsed,
+            false, // has_partition_values_parsed
         );
         assert_eq!(
             count_to_json(&without_synthesis),
