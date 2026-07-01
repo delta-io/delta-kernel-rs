@@ -28,6 +28,7 @@ use crate::crc::{
     FileSizeHistogram, FileStatsDelta,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::path::ParsedLogPath;
 use crate::schema::{
     column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
 };
@@ -173,8 +174,7 @@ impl LogSegment {
             ))
         );
 
-        let locations = deltas.iter().rev().map(|c| c.location.clone()).collect();
-        self.replay_commits_into_crc_delta(engine, locations, seed_histogram)
+        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
     }
 
     /// Build a Complete [`Crc`] at `checkpoint_version` by reading this segment's checkpoint
@@ -228,45 +228,46 @@ impl LogSegment {
         let Some(first) = self.listed.ascending_commit_files.first() else {
             return Ok(None);
         };
+        // A log with no checkpoint must start at version 0; a higher first version means the log
+        // was truncated without a checkpoint. That is a corrupt table, not a kernel-invariant
+        // breach, so it is a generic error rather than an internal one.
         require!(
             first.version == 0,
-            Error::internal_error(format!(
-                "build_crc_from_version_zero expects commits from version 0, but the first commit \
-                 is at version {}",
+            Error::generic(format!(
+                "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
+                 (expected 0); the log appears truncated without a checkpoint",
                 first.version
             ))
         );
-        let locations = self
-            .listed
-            .ascending_commit_files
-            .iter()
-            .rev()
-            .map(|c| c.location.clone())
-            .collect();
         let delta = self.replay_commits_into_crc_delta(
             engine,
-            locations,
+            self.listed.ascending_commit_files.iter(),
             Some(FileSizeHistogram::create_default()),
         )?;
         Ok(delta.into_complete_crc(self.end_version))
     }
 
-    /// Reverse-replay the given commit files (passed newest-first) into a [`CrcDelta`]. The shared
-    /// core of [`Self::build_incremental_crc_delta_from_base`] and
-    /// [`Self::build_crc_from_version_zero`]. `seed_histogram` is an empty histogram with the
-    /// downstream base's bin boundaries, or `None` to skip histogram tracking.
-    fn replay_commits_into_crc_delta(
+    /// Reverse-replay the given commits into a [`CrcDelta`]. The shared core of
+    /// [`Self::build_incremental_crc_delta_from_base`] and
+    /// [`Self::build_crc_from_version_zero`]. Takes the commits in ascending order and reverses
+    /// them internally, since reverse replay (newest-first) is load-bearing for ICT capture.
+    /// `seed_histogram` is an empty histogram with the downstream base's bin boundaries, or
+    /// `None` to skip histogram tracking.
+    fn replay_commits_into_crc_delta<'a>(
         &self,
         engine: &dyn Engine,
-        locations_newest_first: Vec<FileMeta>,
+        ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> DeltaResult<CrcDelta> {
+        let locations: Vec<FileMeta> = ascending_commits
+            .rev()
+            .map(|c| c.location.clone())
+            .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let batches = engine.json_handler().read_json_files(
-            &locations_newest_first,
-            REPLAY_SCHEMA.clone(),
-            None,
-        )?;
+        let batches =
+            engine
+                .json_handler()
+                .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
 
         for batch_result in batches {
             // Transient visitor borrows the shared accumulator for the duration of the
@@ -520,6 +521,27 @@ fn append_protocol_metadata_leaves(
     (names, types)
 }
 
+/// Validate that `getters` carries exactly the columns a replay visitor projects: `n_fixed`
+/// fixed columns plus the protocol and metadata leaves. Returns the protocol-leaf count, which
+/// the caller needs to split the trailing protocol/metadata leaf slices. `visitor_name` names
+/// the visitor in the error.
+fn check_visitor_getters(
+    getters: &[&dyn GetData<'_>],
+    n_fixed: usize,
+    visitor_name: &str,
+) -> DeltaResult<usize> {
+    let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
+    let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
+    require!(
+        getters.len() == n_fixed + n_protocol_leaves + n_metadata_leaves,
+        Error::internal_error(format!(
+            "Wrong number of {visitor_name} getters: {}",
+            getters.len()
+        ))
+    );
+    Ok(n_protocol_leaves)
+}
+
 // ============================================================================
 // Visitor
 // ============================================================================
@@ -572,15 +594,7 @@ impl RowVisitor for CrcReplayVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
-        let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
-        require!(
-            getters.len() == N_FIXED_COLS + n_protocol_leaves + n_metadata_leaves,
-            Error::internal_error(format!(
-                "Wrong number of CrcReplayVisitor getters: {}",
-                getters.len()
-            ))
-        );
+        let n_protocol_leaves = check_visitor_getters(getters, N_FIXED_COLS, "CrcReplayVisitor")?;
         if row_count == 0 {
             return Ok(());
         }
@@ -690,15 +704,8 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
-        let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
-        require!(
-            getters.len() == N_CP_FIXED_COLS + n_protocol_leaves + n_metadata_leaves,
-            Error::internal_error(format!(
-                "Wrong number of CheckpointCrcVisitor getters: {}",
-                getters.len()
-            ))
-        );
+        let n_protocol_leaves =
+            check_visitor_getters(getters, N_CP_FIXED_COLS, "CheckpointCrcVisitor")?;
         let common = CommonColumns {
             dm_domain: COL_CP_DM_DOMAIN,
             dm_config: COL_CP_DM_CONFIG,

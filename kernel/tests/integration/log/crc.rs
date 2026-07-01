@@ -1935,6 +1935,32 @@ async fn test_stale_crc_fresh_build_advance_matrix(
         ChecksumWriteResult::Written
     );
 
+    // For the Absent case, the CRC just written was rooted at the checkpoint (no prior CRC).
+    // Reload and read domain metadata and set transactions back through `FailingEngine`: every
+    // value must come from the written CRC's `Complete` state, so a mis-wired checkpoint visitor
+    // (e.g. a swapped `CommonColumns` index) surfaces as a wrong value or a panic, not a silent
+    // fallthrough to log replay.
+    if crc_staleness == CrcStaleness::Absent {
+        let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert!(reloaded.crc().is_some());
+        // Carried from the checkpoint base.
+        assert!(reloaded
+            .get_domain_metadata_internal("domain_at_create", &FailingEngine)?
+            .is_some());
+        assert_eq!(
+            reloaded.get_app_id_version("app_at_create", &FailingEngine)?,
+            Some(0)
+        );
+        // Carried from the advanced tail.
+        assert!(reloaded
+            .get_domain_metadata_internal("domain", &FailingEngine)?
+            .is_some());
+        assert_eq!(
+            reloaded.get_app_id_version("app", &FailingEngine)?,
+            Some(LATEST_VERSION)
+        );
+    }
+
     Ok(())
 }
 
