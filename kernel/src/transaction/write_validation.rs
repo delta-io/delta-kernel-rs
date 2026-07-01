@@ -52,11 +52,11 @@ impl Validation for AddFileRequiredFields {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[0]
             .get_opt(row, "path")?
-            .ok_or_else(|| Error::generic("Add action is missing required field 'path'"))?;
+            .ok_or_else(|| Error::missing_data("Add action is missing required field 'path'"))?;
 
         require!(
             getters[1].get_map(row, "partitionValues")?.is_some(),
-            Error::generic(format!(
+            Error::missing_data(format!(
                 "Add action for '{path}' is missing required field 'partitionValues'"
             ))
         );
@@ -64,7 +64,7 @@ impl Validation for AddFileRequiredFields {
         let size: Option<i64> = getters[2].get_opt(row, "size")?;
         require!(
             size.is_some(),
-            Error::generic(format!(
+            Error::missing_data(format!(
                 "Add action for '{path}' is missing required field 'size'"
             ))
         );
@@ -72,7 +72,7 @@ impl Validation for AddFileRequiredFields {
         let modification_time: Option<i64> = getters[3].get_opt(row, "modificationTime")?;
         require!(
             modification_time.is_some(),
-            Error::generic(format!(
+            Error::missing_data(format!(
                 "Add action for '{path}' is missing required field 'modificationTime'"
             ))
         );
@@ -89,28 +89,30 @@ pub(crate) struct ActionValidator {
     /// # Example
     ///
     /// With `columns_types` = `[path, partitionValues, size, modificationTime]`, the
-    /// [`AddFileRequiredFields`] check declares those same columns in that order, so
-    /// `validation_column_indices == [[0, 1, 2, 3]]`. A check declaring only `[size, path]` would
-    /// instead map to `[[2, 0]]`.
+    /// [`AddFileRequiredFields`] validation declares those same columns in that order, so
+    /// `validation_column_indices == [[0, 1, 2, 3]]`. A validation declaring only `[size, path]`
+    /// would instead map to `[[2, 0]]`.
     validation_column_indices: Vec<Vec<usize>>,
 }
 
 impl ActionValidator {
-    /// Build a validator that runs `checks` against the columns in `columns_types`.
+    /// Build a validator that runs `validations` against the columns in `columns_types`.
     pub(crate) fn new(
         columns_types: &'static ColumnNamesAndTypes,
-        checks: Vec<Box<dyn Validation>>,
+        validations: Vec<Box<dyn Validation>>,
     ) -> DeltaResult<Self> {
         let (names, _) = columns_types.as_ref();
+        // Use BTreeMap instead of HashMap, because ColumnName doesn't implement hash, and the
+        // mapping is light part(one-time effort) for the validation.
         let name_to_index: BTreeMap<&ColumnName, usize> = names
             .iter()
             .enumerate()
             .map(|(i, name)| (name, i))
             .collect();
-        let indices: Vec<Vec<usize>> = checks
+        let indices: Vec<Vec<usize>> = validations
             .iter()
-            .map(|check| {
-                check
+            .map(|validation| {
+                validation
                     .columns()
                     .iter()
                     .map(|column| {
@@ -125,7 +127,7 @@ impl ActionValidator {
             .try_collect()?;
         Ok(Self {
             columns_types,
-            validations: checks,
+            validations,
             validation_column_indices: indices,
         })
     }
