@@ -75,15 +75,15 @@ pub struct PlanBuilder(PlanBuilderRoot);
 
 impl PlanBuilder {
     fn node(op: impl Into<Operator>, inputs: Vec<BuilderNodeRef>, schema: SchemaRef) -> Self {
-        PlanBuilder(PlanBuilderRoot::Present(Arc::new(BuilderNode {
+        PlanBuilder::present(BuilderNode {
             op: op.into(),
             inputs,
             schema,
-        })))
+        })
     }
 
     /// Rewrap an existing node -- used where a combinator forwards an input unchanged.
-    fn from_node(node: BuilderNodeRef) -> Self {
+    fn present(node: impl Into<BuilderNodeRef>) -> Self {
         PlanBuilder(PlanBuilderRoot::Present(node))
     }
 
@@ -102,8 +102,8 @@ impl PlanBuilder {
 
     /// Apply a single-input transform: wrap `op` (output `schema`) over a present input, or stay
     /// absent. Callers validate against [`Self::schema`] first.
-    fn apply_op(self, op: impl Into<Operator>, schema: SchemaRef) -> Self {
-        match self.0 {
+    fn unary_op_or_absent(self, schema: SchemaRef, op: impl Into<BuilderNodeRef>) -> Self {
+        match self {
             PlanBuilderRoot::Present(node) => Self::node(op, vec![node], schema),
             PlanBuilderRoot::Absent(_) => Self::absent(schema),
         }
@@ -198,9 +198,8 @@ impl PlanBuilder {
         for (i, row) in rows.iter().enumerate() {
             if row.len() != width {
                 return Err(Error::generic(format!(
-                    "values: row {i} has {} value(s) {:?} but schema has {width} field(s) {:?}",
+                    "values: row {i} has {} value(s) {row:?} but schema has {width} field(s) {:?}",
                     row.len(),
-                    row,
                     Vec::from_iter(schema.fields().map(|f| f.name())),
                 )));
             }
@@ -337,24 +336,18 @@ impl PlanBuilder {
     pub fn aggregate(self, aggregate: impl TryInto<Aggregate, Error = Error>) -> DeltaResult<Self> {
         let aggregate = aggregate.try_into()?;
         let schema = Arc::clone(&aggregate.schema);
-        match self.0 {
-            PlanBuilderRoot::Present(node) => Ok(Self::node(aggregate, vec![node], schema)),
+        let schema = aggregate.schema.clone();
+        let node = match self {
+            PlanBuilder::Present(node) => node,
+            PlanBuilderRoot::Absent(schema) if aggregate.group_by.is_empty() => {
+                // Ungrouped aggs always produce a single row of output, even if input is
+                // empty. Just materialize the empty input relation and let engine deal with it.
+                Self::node(schema.clone(), Values::new(schema, vec![]), vec![])
+            }
             // Grouped aggregate over the empty relation: zero groups, hence absent.
-            PlanBuilderRoot::Absent(_) if !aggregate.group_by.is_empty() => {
-                Ok(Self::absent(schema))
-            }
-            // Global aggregate: one row, NULL per output column (the empty-multiset value of every
-            // aggregate function), materialized as a one-row Values source.
-            PlanBuilderRoot::Absent(_) => {
-                let row =
-                    Vec::from_iter(schema.fields().map(|f| Scalar::null(f.data_type().clone())));
-                let node = Values {
-                    schema: Arc::clone(&schema),
-                    rows: vec![row],
-                };
-                Ok(Self::node(node, vec![], schema))
-            }
-        }
+            PlanBuilderRoot::Absent(_) => return Ok(Self::Absent(schema)),
+        };
+        Ok(Self::node(schema, aggregate, vec![node]))
     }
 
     /// Aggregate `self`, grouped by `keys`. `aggs` receives an [`AggregateBuilder`] rooted at
@@ -451,25 +444,22 @@ impl PlanBuilder {
         }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
         check_columns_resolve(build.schema(), &build_keys, "join build")?;
-        // Uninhabited probe always produces an uninhabited result.
-        let probe = match self.0 {
-            PlanBuilderRoot::Present(probe) => probe,
-            PlanBuilderRoot::Absent(schema) => return Ok(Self::absent(schema)),
+        let Planbuilder::Present(probe) = self else {
+            return Ok(self); // just forward the (uninhabited) probe side
         };
         let build = match build.0 {
             PlanBuilderRoot::Present(build) => build,
-            // An absent build matches nothing: a semi join is then absent; an anti join, which
-            // subtracts nothing, forwards the probe.
+            // An absent build side matches nothing, so an anti-join forwards an unfiltered 
+            // probe side while a semi-join is uninhabited.
             PlanBuilderRoot::Absent(_) if inverted => return Ok(Self::from_node(probe)),
-            PlanBuilderRoot::Absent(_) => return Ok(Self::absent(Arc::clone(&probe.schema))),
+            PlanBuilder::Absent(_) => return Ok(Self::absent(probe.schema)),
         };
         let node = SemiJoin {
             inverted,
             probe_keys,
             build_keys,
         };
-        let schema = Arc::clone(&probe.schema);
-        Ok(Self::node(node, vec![probe, build], schema))
+        Ok(Self::node(probe.schema.clone(), node, vec![probe, build]))
     }
 
     /// Unordered bag union of `inputs`. All inputs must share the same schema; absent inputs are
@@ -518,11 +508,7 @@ impl PlanBuilder {
             PlanBuilderRoot::Present(root) => Self::build_plan(root),
             PlanBuilderRoot::Absent(schema) => Plan {
                 nodes: vec![PlanNode {
-                    op: Values {
-                        schema: Arc::clone(schema),
-                        rows: Vec::new(),
-                    }
-                    .into(),
+                    op: Values::new(Arc::clone(schema), vec![]).into(),
                     inputs: Vec::new(),
                 }],
             },
@@ -537,31 +523,22 @@ impl PlanBuilder {
         })
     }
 
-    /// Linearize the DAG rooted at `root` into a [`Plan`]. A post-order walk emits each node after
-    /// its inputs (topological order), so `root` -- the terminal -- is the last node. A node is
-    /// identified by its index in [`Plan::nodes`]; shared subgraphs are emitted once (a node
-    /// reached again reuses its first-assigned index), and nodes unreachable from `root` are
-    /// dropped.
+    /// Linearize the DAG rooted at `root` into a topologically sorted [`Plan`] with `root` as
+    /// the last (terminal) node. A node's inputs always precede it and are identified by
+    /// their index in [`Plan::nodes`]. Multiple nodes can reference the same (shared) input.
     fn build_plan(root: &BuilderNodeRef) -> Plan {
-        // `emitted` maps a node's address to its index, deduping shared subgraphs. The address is a
-        // stable identity while the DAG holds the `Arc` alive.
+        // Maps a node's Arc pointer to its index, deduping shared subgraphs. Node pointers are
+        // stable because the root "pins" all reachable nodes for the lifetime of `build_plan`.
         fn emit(
             node: &BuilderNodeRef,
             nodes: &mut Vec<PlanNode>,
             emitted: &mut HashMap<*const BuilderNode, usize>,
         ) -> usize {
-            let key = Arc::as_ptr(node);
-            if let Some(&index) = emitted.get(&key) {
-                return index;
-            }
-            let inputs = Vec::from_iter(node.inputs.iter().map(|i| emit(i, nodes, emitted)));
-            let index = nodes.len();
-            nodes.push(PlanNode {
-                op: node.op.clone(),
-                inputs,
-            });
-            emitted.insert(key, index);
-            index
+            *emitted.entry(Arc::as_ptr(node)).or_insert_with(|| {
+                let inputs = node.inputs.iter().map(|i| emit(i, nodes, emitted));
+                nodes.push(PlanNode::new(node.op.clone(), inputs.collect()));
+                nodes.len() - 1
+            })
         }
         let mut nodes = Vec::new();
         emit(root, &mut nodes, &mut HashMap::new());
