@@ -14,6 +14,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
+use crate::expressions::scalars::{format_day_time_interval, format_year_month_interval};
 use crate::expressions::{DecimalData, Scalar};
 use crate::{DeltaResult, Error};
 
@@ -92,6 +93,11 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
+        // Intervals serialize as Spark ANSI interval literal strings (e.g.
+        // `INTERVAL '1-0' YEAR TO MONTH`), matching how DBR stores interval partition values.
+        // Inverse of `PrimitiveType::parse_scalar`.
+        Scalar::IntervalYearMonth(months) => Ok(Some(format_year_month_interval(*months))),
+        Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
         Scalar::Binary(b) if b.is_empty() => Ok(None),
         Scalar::Binary(b) => Ok(Some(format_binary(b)?)),
@@ -519,10 +525,34 @@ mod tests {
         Scalar::decimal(1_230_000_000_000_000_000i128, 38, 18).unwrap(),
         PrimitiveType::decimal(38, 18).unwrap()
     )]
+    #[case::interval_ym(Scalar::IntervalYearMonth(30), PrimitiveType::IntervalYearMonth)]
+    #[case::interval_ym_neg(Scalar::IntervalYearMonth(-18), PrimitiveType::IntervalYearMonth)]
+    #[case::interval_ym_zero(Scalar::IntervalYearMonth(0), PrimitiveType::IntervalYearMonth)]
+    #[case::interval_dt(
+        Scalar::IntervalDayTime(131_445_000_000),
+        PrimitiveType::IntervalDayTime
+    )]
+    #[case::interval_dt_neg(Scalar::IntervalDayTime(-5), PrimitiveType::IntervalDayTime)]
     fn test_roundtrip(#[case] input: Scalar, #[case] ptype: PrimitiveType) {
         let serialized = serialize_partition_value(&input).unwrap().unwrap();
         let parsed = ptype.parse_scalar(&serialized).unwrap();
         assert_eq!(parsed, input);
+    }
+
+    /// Interval partition values serialize to Spark ANSI interval literal strings. The
+    /// year-month spelling is verified against the DAT `intv_003` workload.
+    #[rstest]
+    #[case(Scalar::IntervalYearMonth(12), "INTERVAL '1-0' YEAR TO MONTH")]
+    #[case(Scalar::IntervalYearMonth(30), "INTERVAL '2-6' YEAR TO MONTH")]
+    #[case(
+        Scalar::IntervalDayTime(131_445_000_000),
+        "INTERVAL '1 12:30:45.000000' DAY TO SECOND"
+    )]
+    fn test_spark_ref_interval(#[case] input: Scalar, #[case] expected: &str) {
+        assert_eq!(
+            serialize_partition_value(&input).unwrap(),
+            Some(expected.to_string())
+        );
     }
 
     /// Kernel formats the smallest subnormal double as "5.0E-324" while Delta-Spark

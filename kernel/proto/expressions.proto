@@ -104,6 +104,8 @@ message Scalar {
     int64 timestamp = 9;        // micros since epoch, UTC
     int64 timestamp_ntz = 10;   // micros since epoch, no tz
     int32 date = 11;            // days since epoch
+    int32 interval_year_month = 18; // year-month interval: signed month count
+    int64 interval_day_time = 19;   // day-time interval: signed microsecond count
     bytes binary = 12;
     DecimalData decimal = 13;
     delta.kernel.schema.DataType null = 14;

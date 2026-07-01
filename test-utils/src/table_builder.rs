@@ -1834,6 +1834,10 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 Scalar::decimal(bits, dt.precision(), dt.scale())
                     .expect("test seed produced invalid decimal")
             }
+            PrimitiveType::Void => panic!("void type is not a valid partition column"),
+            // Intervals are physical integers: months (year-month) / microseconds (day-time).
+            PrimitiveType::IntervalYearMonth => Scalar::IntervalYearMonth((seed % 100) as i32),
+            PrimitiveType::IntervalDayTime => Scalar::IntervalDayTime((seed * 1000) as i64),
             other => panic!("{other:?} is not a valid partition column type"),
         },
         other => panic!("partition columns must be primitive types, got: {other:?}"),
