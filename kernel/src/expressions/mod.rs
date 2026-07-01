@@ -27,7 +27,7 @@ use crate::{DataType, DeltaResult, DynPartialEq, Error};
 mod column_names;
 pub(crate) mod literal_expression_transform;
 pub(crate) use literal_expression_transform::literal_expression_transform;
-mod scalars;
+pub(crate) mod scalars;
 mod sql;
 pub(crate) use self::sql::parse_sql;
 

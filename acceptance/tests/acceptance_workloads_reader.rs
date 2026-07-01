@@ -164,11 +164,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "var_null_top_level/specs/var_null_top_level_filter_null",
         ],
     ),
-    // partition values need Scalar::Interval; not yet supported
-    (
-        "Interval partition values not supported (needs Scalar::Interval)",
-        &["intv_003_interval_partitioned/specs/intv_003_interval_partitioned_read_all"],
-    ),
     (
         "Cannot fall back to log replay when checkpoint files are missing or incomplete",
         &[
