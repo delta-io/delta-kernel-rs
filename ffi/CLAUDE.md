@@ -68,7 +68,8 @@ commit_range_builder_for(path, start_version, engine)
 
 The caller owns the builder and must call either `commit_range_builder_build` or
 `free_commit_range_builder`. Release the range with `free_commit_range` and the commits iterator
-with `free_commit_actions_iter`. Release the commit action iterator via `free_commit_action`.
+with `free_commit_actions_iter`. Each `SharedCommitAction` handed to the visitor must be released
+with `free_commit_action`.
 
 ## Write Flow
 

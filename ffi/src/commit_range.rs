@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction};
+use delta_kernel::commit_range::{CommitAction, CommitRange, DeltaAction as KernelDeltaAction};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -137,11 +137,11 @@ pub unsafe extern "C" fn free_commit_range(commit_range: Handle<SharedCommitRang
     commit_range.drop_handle();
 }
 
-/// FFI-safe mirror of [`DeltaAction`]: the Delta log action kinds a caller can request from
-/// [`commit_range_commits`].
+/// FFI-safe mirror of the kernel's [`KernelDeltaAction`]: the Delta log action kinds a caller can
+/// request from [`commit_range_commits`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelDeltaAction {
+pub enum DeltaAction {
     AddAction = 0,
     RemoveAction = 1,
     MetadataAction = 2,
@@ -154,30 +154,47 @@ pub enum KernelDeltaAction {
     SidecarAction = 9,
 }
 
-impl From<KernelDeltaAction> for DeltaAction {
-    fn from(value: KernelDeltaAction) -> Self {
+impl From<DeltaAction> for KernelDeltaAction {
+    fn from(value: DeltaAction) -> Self {
         match value {
-            KernelDeltaAction::AddAction => DeltaAction::Add,
-            KernelDeltaAction::RemoveAction => DeltaAction::Remove,
-            KernelDeltaAction::MetadataAction => DeltaAction::Metadata,
-            KernelDeltaAction::ProtocolAction => DeltaAction::Protocol,
-            KernelDeltaAction::CommitInfoAction => DeltaAction::CommitInfo,
-            KernelDeltaAction::CdcAction => DeltaAction::Cdc,
-            KernelDeltaAction::DomainMetadataAction => DeltaAction::DomainMetadata,
-            KernelDeltaAction::SetTxnAction => DeltaAction::SetTxn,
-            KernelDeltaAction::CheckpointMetadataAction => DeltaAction::CheckpointMetadata,
-            KernelDeltaAction::SidecarAction => DeltaAction::Sidecar,
+            DeltaAction::AddAction => KernelDeltaAction::Add,
+            DeltaAction::RemoveAction => KernelDeltaAction::Remove,
+            DeltaAction::MetadataAction => KernelDeltaAction::Metadata,
+            DeltaAction::ProtocolAction => KernelDeltaAction::Protocol,
+            DeltaAction::CommitInfoAction => KernelDeltaAction::CommitInfo,
+            DeltaAction::CdcAction => KernelDeltaAction::Cdc,
+            DeltaAction::DomainMetadataAction => KernelDeltaAction::DomainMetadata,
+            DeltaAction::SetTxnAction => KernelDeltaAction::SetTxn,
+            DeltaAction::CheckpointMetadataAction => KernelDeltaAction::CheckpointMetadata,
+            DeltaAction::SidecarAction => KernelDeltaAction::Sidecar,
         }
     }
 }
 
-/// Copy a C array of [`KernelDeltaAction`] into a `Vec<DeltaAction>`. A null pointer or zero
+impl From<KernelDeltaAction> for DeltaAction {
+    fn from(value: KernelDeltaAction) -> Self {
+        match value {
+            KernelDeltaAction::Add => DeltaAction::AddAction,
+            KernelDeltaAction::Remove => DeltaAction::RemoveAction,
+            KernelDeltaAction::Metadata => DeltaAction::MetadataAction,
+            KernelDeltaAction::Protocol => DeltaAction::ProtocolAction,
+            KernelDeltaAction::CommitInfo => DeltaAction::CommitInfoAction,
+            KernelDeltaAction::Cdc => DeltaAction::CdcAction,
+            KernelDeltaAction::DomainMetadata => DeltaAction::DomainMetadataAction,
+            KernelDeltaAction::SetTxn => DeltaAction::SetTxnAction,
+            KernelDeltaAction::CheckpointMetadata => DeltaAction::CheckpointMetadataAction,
+            KernelDeltaAction::Sidecar => DeltaAction::SidecarAction,
+        }
+    }
+}
+
+/// Copy a C array of [`DeltaAction`] into a `Vec<KernelDeltaAction>`. A null pointer or zero
 /// length yields an empty vector.
 ///
 /// # Safety
 ///
-/// `ptr` must point to `len` valid [`KernelDeltaAction`] values that remain valid for this call.
-unsafe fn parse_actions(ptr: *const KernelDeltaAction, len: usize) -> Vec<DeltaAction> {
+/// `ptr` must point to `len` valid [`DeltaAction`] values that remain valid for this call.
+unsafe fn parse_actions(ptr: *const DeltaAction, len: usize) -> Vec<KernelDeltaAction> {
     if ptr.is_null() || len == 0 {
         return Vec::new();
     }
@@ -287,12 +304,12 @@ pub struct SharedCommitActionsIterator;
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles, and an `actions` pointer to `actions_len`
-/// valid [`KernelDeltaAction`] values.
+/// valid [`DeltaAction`] values.
 #[no_mangle]
 pub unsafe extern "C" fn commit_range_commits(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
-    actions: *const KernelDeltaAction,
+    actions: *const DeltaAction,
     actions_len: usize,
 ) -> ExternResult<Handle<SharedCommitActionsIterator>> {
     let engine_ref = unsafe { engine.as_ref() };
@@ -316,13 +333,13 @@ pub unsafe extern "C" fn commit_range_commits(
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles, and an `actions` pointer to `actions_len`
-/// valid [`KernelDeltaAction`] values.
+/// valid [`DeltaAction`] values.
 #[no_mangle]
 pub unsafe extern "C" fn commit_range_commits_with_snapshot(
     commit_range: Handle<SharedCommitRange>,
     engine: Handle<SharedExternEngine>,
     start_snapshot: Handle<SharedSnapshot>,
-    actions: *const KernelDeltaAction,
+    actions: *const DeltaAction,
     actions_len: usize,
 ) -> ExternResult<Handle<SharedCommitActionsIterator>> {
     let engine_ref = unsafe { engine.as_ref() };
@@ -338,7 +355,7 @@ fn commit_range_commits_impl(
     commit_range: &CommitRange,
     engine: Arc<dyn ExternEngine>,
     start_snapshot: Option<SnapshotRef>,
-    actions: Vec<DeltaAction>,
+    actions: Vec<KernelDeltaAction>,
 ) -> DeltaResult<Handle<SharedCommitActionsIterator>> {
     let inner = commit_range.commits(engine.engine(), start_snapshot, &actions)?;
     let boxed: CommitActionIter = Box::new(inner);
@@ -580,23 +597,44 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_snapshot_yields_each_commit(false, 0, 1, Some(vec![0, 1]))]
-    #[case::snapshot_matched_anchor_yields_commit(true, 1, 1, Some(vec![1]))]
-    #[case::snapshot_mismatched_anchor_errors(true, 0, 0, None)]
+    #[case(DeltaAction::AddAction, KernelDeltaAction::Add)]
+    #[case(DeltaAction::RemoveAction, KernelDeltaAction::Remove)]
+    #[case(DeltaAction::MetadataAction, KernelDeltaAction::Metadata)]
+    #[case(DeltaAction::ProtocolAction, KernelDeltaAction::Protocol)]
+    #[case(DeltaAction::CommitInfoAction, KernelDeltaAction::CommitInfo)]
+    #[case(DeltaAction::CdcAction, KernelDeltaAction::Cdc)]
+    #[case(DeltaAction::DomainMetadataAction, KernelDeltaAction::DomainMetadata)]
+    #[case(DeltaAction::SetTxnAction, KernelDeltaAction::SetTxn)]
+    #[case(
+        DeltaAction::CheckpointMetadataAction,
+        KernelDeltaAction::CheckpointMetadata
+    )]
+    #[case(DeltaAction::SidecarAction, KernelDeltaAction::Sidecar)]
+    fn test_delta_action_conversion_round_trips(
+        #[case] ffi_action: DeltaAction,
+        #[case] kernel_action: KernelDeltaAction,
+    ) {
+        assert_eq!(KernelDeltaAction::from(ffi_action), kernel_action);
+        assert_eq!(DeltaAction::from(kernel_action), ffi_action);
+    }
+
+    #[rstest]
+    #[case::no_snapshot_yields_each_commit(1, false, 0, 1, Some(vec![0, 1]))]
+    #[case::no_snapshot_multi_commit_yields_each_commit(3, false, 0, 3, Some(vec![0, 1, 2, 3]))]
+    #[case::snapshot_matched_anchor_yields_commit(1, true, 1, 1, Some(vec![1]))]
+    #[case::snapshot_mismatched_anchor_errors(1, true, 0, 0, None)]
     #[tokio::test]
     async fn test_commit_range_commits(
+        #[case] last_version: u64,
         #[case] with_snapshot: bool,
         #[case] range_start: u64,
         #[case] range_end: u64,
         #[case] expected: Option<Vec<u64>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, table_root) = setup_engine_with_commits(1).await;
+        let (engine, table_root) = setup_engine_with_commits(last_version).await;
         let range =
             unsafe { build_range(table_root, range_start, range_end, engine.shallow_copy()) };
-        let actions = [
-            KernelDeltaAction::MetadataAction,
-            KernelDeltaAction::ProtocolAction,
-        ];
+        let actions = [DeltaAction::MetadataAction, DeltaAction::ProtocolAction];
 
         let snapshot = with_snapshot.then(|| unsafe {
             build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy())
@@ -698,7 +736,7 @@ mod tests {
         let (engine, table_root) = setup_engine_with_commits(1).await;
         let range = unsafe { build_range(table_root, 0, 1, engine.shallow_copy()) };
 
-        let actions = [KernelDeltaAction::MetadataAction];
+        let actions = [DeltaAction::MetadataAction];
         let iter = unsafe {
             ok_or_panic(commit_range_commits(
                 range.shallow_copy(),
