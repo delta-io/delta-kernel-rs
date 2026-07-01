@@ -22,7 +22,7 @@ use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
 #[cfg(feature = "column-defaults-in-dev")]
-use crate::schema::validate_column_defaults;
+use crate::schema::validate_column_defaults_metadata_respects_protocol;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
@@ -222,7 +222,7 @@ impl TableConfiguration {
         // Reject stray/malformed column-default metadata as table corruption before the
         // IcebergCompatV3 check applies its narrower (literal, primitive-column) rules.
         #[cfg(feature = "column-defaults-in-dev")]
-        validate_column_defaults(
+        validate_column_defaults_metadata_respects_protocol(
             &table_config.logical_schema,
             table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults),
         )?;

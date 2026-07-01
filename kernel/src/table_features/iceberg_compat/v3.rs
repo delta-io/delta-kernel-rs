@@ -18,11 +18,11 @@ pub(crate) const V3_VALIDATOR: IcebergCompatValidator = IcebergCompatValidator {
     checks: V3_CHECKS,
 };
 
-// `check_column_defaults` only exists under `column-defaults-in-dev`, so it is gated as an
-// individual slice element rather than duplicating the whole list per cfg.
 const V3_CHECKS: &[IcebergCompatCheck] = &[
     check_v3_supported_types,
     check_no_legacy_nested_ids,
+    // `check_column_defaults` only exists under `column-defaults-in-dev`, so it is gated as an
+    // individual slice element rather than duplicating the whole list per cfg.
     #[cfg(feature = "column-defaults-in-dev")]
     check_column_defaults,
 ];

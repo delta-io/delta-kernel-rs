@@ -81,9 +81,9 @@ impl<'a> ColumnDefault<'a> {
 
     /// Returns `true` iff the default parsed to a literal expression.
     ///
-    /// SQL the kernel could not parse (e.g. arithmetic or function calls) returns `false`, as does
-    /// the defensive case of a parsed-but-non-literal expression. Note that `NULL` parses to a
-    /// literal, so this is `true` for a `NULL` default regardless of the column type.
+    /// SQL the kernel could not parse (e.g. arithmetic or function calls) returns `false`. Note
+    /// that `NULL` parses to a literal, so this is `true` for a `NULL` default regardless of the
+    /// column type.
     pub(crate) fn is_literal(&self) -> bool {
         matches!(self.parsed_sql, Some(Expression::Literal(_)))
     }
@@ -103,7 +103,7 @@ impl<'a> ColumnDefault<'a> {
 ///   only honors defaults "when enabled", so such metadata is stray and the table is corrupt.
 /// - Propagates any error from
 ///   [`StructField::column_default`](crate::schema::StructField::column_default)
-pub(crate) fn validate_column_defaults(
+pub(crate) fn validate_column_defaults_metadata_respects_protocol(
     schema: &StructType,
     allow_column_defaults: bool,
 ) -> DeltaResult<()> {
@@ -239,8 +239,8 @@ mod tests {
         )])
     }
 
-    /// A field whose `CURRENT_DEFAULT` metadata is a non-string value (malformed).
-    fn field_with_non_string_default(name: &str) -> StructField {
+    /// A field with an invalid `CURRENT_DEFAULT`: the metadata is a non-string value (malformed).
+    fn field_with_invalid_default(name: &str) -> StructField {
         StructField::nullable(name, DataType::INTEGER).add_metadata([(
             ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
             MetadataValue::Number(7),
@@ -267,7 +267,7 @@ mod tests {
         false,
         Some("allowColumnDefaults")
     )]
-    #[case::non_string_metadata(vec![field_with_non_string_default("c")], true, Some("non-string"))]
+    #[case::non_string_metadata(vec![field_with_invalid_default("c")], true, Some("non-string"))]
     #[case::non_null_default_on_non_primitive(
         vec![field_with_default("arr", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")],
         true,
@@ -280,7 +280,7 @@ mod tests {
     ) {
         let schema = StructType::try_new(fields).unwrap();
         match (
-            validate_column_defaults(&schema, allow_column_defaults),
+            validate_column_defaults_metadata_respects_protocol(&schema, allow_column_defaults),
             expected_error,
         ) {
             (Ok(()), None) => {}

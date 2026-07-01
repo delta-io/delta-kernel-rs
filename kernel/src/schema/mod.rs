@@ -28,7 +28,7 @@ use crate::{DeltaResult, Error};
 #[cfg(feature = "column-defaults-in-dev")]
 mod column_default;
 #[cfg(feature = "column-defaults-in-dev")]
-pub(crate) use column_default::validate_column_defaults;
+pub(crate) use column_default::validate_column_defaults_metadata_respects_protocol;
 #[cfg(feature = "column-defaults-in-dev")]
 pub use column_default::ColumnDefault;
 pub(crate) mod compare;
