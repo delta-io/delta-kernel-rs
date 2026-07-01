@@ -54,13 +54,15 @@ impl IncrementalScanBuilder {
     ///
     /// Removes are unaffected (they carry no stats and must all be reported so consumers can
     /// drop stale cached entries). Skipping is best-effort and conservative: a file is dropped
-    /// only when its stats prove no row can match, and files without stats are always kept. The
-    /// surviving Add set is therefore identical to what a full scan at the target version with
-    /// the same predicate would keep among these added files.
+    /// only when its stats prove no row can match, and files without stats are always kept.
     ///
-    /// Skipping reuses the same stats-based filter the read path uses, so incremental skipping
-    /// is semantically identical to a cold scan. Partition-value pruning is not yet wired in on
-    /// this path; predicates over partition columns fold to keep-all.
+    /// For predicates over data columns, skipping reuses the same stats-based filter the read
+    /// path uses, so the surviving Add set matches what a full scan at the target version with
+    /// the same predicate would keep among these added files. Partition-value pruning is not
+    /// yet wired in on this path: predicates over partition columns fold to keep-all, so a
+    /// predicate touching partition columns yields a superset of what a cold scan would keep.
+    /// Skipping never drops a file a cold scan would keep, so consumers must re-apply the
+    /// predicate at read time regardless.
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
@@ -86,6 +88,8 @@ impl IncrementalScanBuilder {
     ///
     /// # Errors
     /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
+    /// - [`Error::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
+    ///   references a column absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<Option<IncrementalScanStream>> {
