@@ -96,10 +96,6 @@ where
 /// [`Error::HttpStatusError`].
 fn error_for_errored_status(status: StatusCode, body: String) -> Error {
     use unity_catalog_delta_client_api::Error as ApiError;
-    assert!(
-        !status.is_success(),
-        "passed in status shouldn't be successful"
-    );
     match status {
         StatusCode::UNAUTHORIZED => ApiError::AuthenticationFailed.into(),
         StatusCode::NOT_FOUND => ApiError::TableNotFound(body).into(),
