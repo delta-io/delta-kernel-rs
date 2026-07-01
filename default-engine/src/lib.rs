@@ -7,6 +7,7 @@
 //! the [executor] module.
 
 use std::future::Future;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
@@ -121,6 +122,21 @@ pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
     task_executor: E,
+    /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
+    /// fall back to the handlers' defaults.
+    io_config: ReadIoConfig,
+}
+
+/// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
+///
+/// Both knobs default to the handlers' built-in defaults when left unset.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReadIoConfig {
+    /// Maximum number of files read concurrently (file-level readahead depth). See
+    /// [`DefaultEngineBuilder::with_buffer_size`].
+    buffer_size: Option<NonZero<usize>>,
+    /// Maximum number of rows per yielded batch. See [`DefaultEngineBuilder::with_batch_size`].
+    batch_size: Option<NonZero<usize>>,
 }
 
 /// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
@@ -133,13 +149,14 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
         Self {
             object_store,
             task_executor: DefaultTaskExecutor,
+            io_config: ReadIoConfig::default(),
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor)
+        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
     }
 }
 
@@ -154,14 +171,36 @@ impl<E> DefaultEngineBuilder<E> {
         DefaultEngineBuilder {
             object_store: self.object_store,
             task_executor,
+            io_config: self.io_config,
         }
+    }
+
+    /// Set the maximum number of files read concurrently by the JSON and Parquet handlers in their
+    /// `read_*_files` paths. This is the file-level I/O readahead depth: higher values overlap more
+    /// object-store requests to hide latency, at the cost of more in-flight memory.
+    ///
+    /// Defaults to the handlers' built-in value when unset. Ordering of returned data is preserved
+    /// regardless of this value.
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
+        self.io_config.buffer_size = Some(buffer_size);
+        self
+    }
+
+    /// Set the maximum number of rows per batch yielded by the JSON and Parquet handlers in their
+    /// `read_*_files` paths.
+    ///
+    /// Defaults to the handlers' built-in value when unset. Overall read memory usage is roughly
+    /// proportional to `buffer_size * batch_size`.
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
+        self.io_config.batch_size = Some(batch_size);
+        self
     }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor)
+        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
     }
 }
 
@@ -177,19 +216,28 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    fn new_with_opts(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    fn new_with_opts(
+        object_store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        io_config: ReadIoConfig,
+    ) -> Self {
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
             task_executor.clone(),
         ));
-        let raw_json: Arc<dyn JsonHandler> = Arc::new(DefaultJsonHandler::new(
-            object_store.clone(),
-            task_executor.clone(),
-        ));
-        let raw_parquet = Arc::new(DefaultParquetHandler::new(
-            object_store.clone(),
-            task_executor.clone(),
-        ));
+
+        let mut json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone());
+        let mut parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone());
+        if let Some(buffer_size) = io_config.buffer_size {
+            json = json.with_buffer_size(buffer_size.get());
+            parquet = parquet.with_buffer_size(buffer_size.get());
+        }
+        if let Some(batch_size) = io_config.batch_size {
+            json = json.with_batch_size(batch_size.get());
+            parquet = parquet.with_batch_size(batch_size.get());
+        }
+        let raw_json: Arc<dyn JsonHandler> = Arc::new(json);
+        let raw_parquet = Arc::new(parquet);
         Self {
             storage: Arc::new(MeteredStorageHandler::new(raw_storage)),
             json: Arc::new(MeteredJsonHandler::new(raw_json)),
@@ -386,6 +434,8 @@ mod tests {
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
         let engine = DefaultEngineBuilder::new(object_store)
             .with_task_executor(executor)
+            .with_buffer_size(NonZero::new(4).unwrap())
+            .with_batch_size(NonZero::new(8).unwrap())
             .build();
         test_arrow_engine(&engine, &url);
     }
