@@ -17,7 +17,7 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::{
-    Engine, Error, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
+    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
 };
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -25,8 +25,8 @@ use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
-    add_commit, add_staged_commit, compacted_log_path_for_versions, create_log_path,
-    delta_path_for_version, TestAction,
+    add_commit, add_staged_commit, assert_result_error_with_message,
+    compacted_log_path_for_versions, create_log_path, delta_path_for_version, TestAction,
 };
 use url::Url;
 
@@ -1572,10 +1572,10 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
         .with_predicate(predicate)
         .build(engine.as_ref());
 
-    assert!(
-        matches!(result, Err(Error::MissingColumn(_))),
-        "build must fail fast with MissingColumn on an unknown-column predicate, got {result:?}"
-    );
+    // Fail-fast at build, surfacing the unresolved column. The concrete error is
+    // `Error::MissingColumn`, but a captured backtrace wraps it in `Error::Backtraced`, so match
+    // on the message rather than the variant.
+    assert_result_error_with_message(result, "unknown column: nonexistent");
 
     Ok(())
 }
