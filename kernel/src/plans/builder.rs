@@ -15,22 +15,20 @@
 //! ```
 //! use std::sync::Arc;
 //! use delta_kernel::PlanBuilder;
-//! use delta_kernel::FileMeta;
 //! use delta_kernel::expressions::col;
 //! use delta_kernel::plans::ir::nodes::Operator;
 //! use delta_kernel::schema::{DataType, StructField, StructType};
 //!
 //! let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
 //!
-//! // A scan over no files is the *absent* relation: it produces no rows, so the builder
+//! // A source with no rows is the *absent* relation: it produces no rows, so the builder
 //! // eliminates it as dead code, collapsing the plan to its minimal correct shape. Downstream
 //! // transforms still validate and chain exactly as they would over a populated source.
-//! let scan = PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], schema)?;
-//!
-//! assert!(scan.clone().filter(col!("id").is_not_null())?.build_opt()?.is_none());
+//! let scan = PlanBuilder::values(schema, vec![])?
+//!     .filter(col!("id").is_not_null())?;
 //!
 //! // `build_opt` reports the eliminated plan as `None` ...
-//! assert!(scan.build_opt()?.is_none());
+//! assert!(scan.clone().build_opt()?.is_none());
 //! // ... while `build` keeps the plan runnable, replacing the absent relation with a single
 //! // empty `Values` node.
 //! let plan = scan.build()?;
