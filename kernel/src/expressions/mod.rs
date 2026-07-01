@@ -25,7 +25,7 @@ use crate::{DataType, DeltaResult, DynPartialEq, Error};
 mod column_names;
 pub(crate) mod literal_expression_transform;
 pub(crate) use literal_expression_transform::literal_expression_transform;
-mod scalars;
+pub(crate) mod scalars;
 #[cfg(feature = "column-defaults-in-dev")]
 mod sql;
 #[cfg(feature = "column-defaults-in-dev")]

@@ -99,6 +99,9 @@ impl Scalar {
                 // timezone was already set at builder construction time
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
+            // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
+            IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, *val),
+            IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
             // precision and scale were already set at builder construction time
@@ -213,11 +216,9 @@ impl Scalar {
                     "Variant is not supported as scalar yet.",
                 ));
             }
-            DataType::INTERVAL_YEAR_MONTH | DataType::INTERVAL_DAY_TIME => {
-                return Err(Error::unsupported(
-                    "Interval is not supported as scalar yet.",
-                ));
-            }
+            // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
+            DataType::INTERVAL_YEAR_MONTH => append_nulls_as!(array::Int32Builder),
+            DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
         }
         Ok(())
     }

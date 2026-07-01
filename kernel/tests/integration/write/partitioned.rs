@@ -125,6 +125,63 @@ async fn test_write_partitioned_normal_values_roundtrip(
     Ok(())
 }
 
+/// Writes a year-month interval partition column, asserts the partitionValues entry is the Spark
+/// ANSI interval literal (CM=None), and verifies the value round-trips through a scan. Gated on
+/// `interval-type-in-dev` because writing an interval table requires the `intervalType` feature.
+#[cfg(feature = "interval-type-in-dev")]
+#[rstest]
+#[case::cm_none(ColumnMappingMode::None)]
+#[case::cm_name(ColumnMappingMode::Name)]
+#[case::cm_id(ColumnMappingMode::Id)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_partitioned_interval_year_month_roundtrip(
+    #[case] cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::nullable("period", DataType::INTERVAL_YEAR_MONTH),
+    ])?);
+    // Full logical-schema columns; the partition column's data is dropped by the logical->physical
+    // transform, and its value comes from `partition_values`.
+    let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
+        schema,
+        &["period"],
+        cm_mode,
+        true, // write_partition_values_parsed
+        vec![
+            Arc::new(Int32Array::from(vec![7])),
+            Arc::new(Int32Array::from(vec![30])),
+        ],
+        HashMap::from([("period".to_string(), Scalar::IntervalYearMonth(30))]),
+    )
+    .await?;
+
+    // CM=None: the raw partitionValues entry is the Spark ANSI interval literal (2y6m).
+    if cm_mode == ColumnMappingMode::None {
+        let (add, _rel) = read_single_add(&table_path, 1)?;
+        assert_eq!(
+            add["partitionValues"]["period"].as_str(),
+            Some("INTERVAL '2-6' YEAR TO MONTH"),
+            "interval partition value should serialize to the ANSI literal"
+        );
+    }
+
+    // The partition value round-trips: scan materializes `period` back as its physical int32.
+    let sorted = read_sorted(&snapshot, engine)?;
+    let int_col = |i: usize| {
+        sorted
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(int_col(0), 7, "value column");
+    assert_eq!(int_col(1), 30, "period column (months)");
+
+    Ok(())
+}
+
 /// Writes one row with all null partition values, reads it back, checkpoints, reloads
 /// from checkpoint, and verifies every partition column is null in both reads.
 #[rstest]
