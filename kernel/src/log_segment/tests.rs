@@ -1547,6 +1547,116 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     Ok(())
 }
 
+/// A `_last_checkpoint` hint whose schema omits `sidecar` must not make a V2 checkpoint read as V1.
+#[tokio::test]
+async fn test_v2_checkpoint_not_read_as_v1_when_hint_omits_sidecar() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let sidecar1_size = add_sidecar_to_store(
+        &store,
+        add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        "sidecarfile1.parquet",
+    )
+    .await?
+    .size;
+    let sidecar2_size = add_sidecar_to_store(
+        &store,
+        add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        "sidecarfile2.parquet",
+    )
+    .await?
+    .size;
+
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
+            get_all_actions_schema().clone(),
+        ),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file_path = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+
+    // Hint at the checkpoint's version whose schema omits `sidecar`. Before the fix this makes the
+    // V2 checkpoint read as V1 and silently drops the sidecar file actions.
+    let sidecar_less_hint = LastCheckpointHintSummary {
+        version: 1,
+        schema: Some(get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+    };
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(
+                &checkpoint_file_path,
+                checkpoint_size,
+            )],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(sidecar_less_hint),
+    )?;
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        v2_checkpoint_read_schema.clone(),
+        None,
+        None,
+        None,
+    )?;
+    let mut iter = checkpoint_result.actions;
+
+    // The sidecar files must still be read: V2 is detected from the footer despite the hint.
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert_batch_matches(
+        first_batch,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
+            get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+        ),
+    );
+    let ActionsBatch {
+        actions: second_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert_batch_matches(
+        second_batch,
+        add_batch_simple(v2_checkpoint_read_schema.clone()),
+    );
+    let ActionsBatch {
+        actions: third_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert_batch_matches(
+        third_batch,
+        add_batch_with_remove(v2_checkpoint_read_schema),
+    );
+
+    assert!(iter.next().is_none());
+
+    Ok(())
+}
+
 #[derive(Default)]
 struct LogSegmentConfig<'a> {
     published_commit_versions: &'a [u64],
@@ -2701,8 +2811,10 @@ async fn test_checkpoint_schema_propagation_from_hint() {
     assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
 }
 
-/// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
-/// matches [`LogSegment::checkpoint_version`]. Otherwise the parquet footer is read.
+/// `checkpoint_schema()` returns the `_last_checkpoint` hint only when the hint version matches
+/// [`LogSegment::checkpoint_version`]. `get_file_actions_schema_and_sidecars` for a single-file
+/// parquet checkpoint always reads the footer, since a hint without a `sidecar` column can't rule
+/// out a V2 checkpoint.
 #[rstest]
 #[case::hint_matches_checkpoint(1, true)]
 #[case::hint_newer_than_checkpoint(99, false)]
@@ -2762,18 +2874,15 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         );
     }
 
-    // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
-    // version
+    // A single-file parquet checkpoint always reads the footer to decide V1 vs V2: the hint has no
+    // `sidecar` column, so it can't rule out a V2 checkpoint. The returned schema is the footer's,
+    // regardless of whether the hint version matched.
     let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
-    if expect_hint_schema_used {
-        assert_eq!(schema, hint_schema, "should use hint when versions match");
-    } else {
-        assert_eq!(
-            schema, v1_schema,
-            "should read schema from parquet footer when versions mismatch"
-        );
-    }
+    assert_eq!(
+        schema, v1_schema,
+        "single-file parquet reads schema from the footer"
+    );
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
     Ok(())
