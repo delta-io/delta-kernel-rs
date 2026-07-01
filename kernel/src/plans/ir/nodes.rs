@@ -271,6 +271,16 @@ pub struct Values {
     pub rows: Vec<Vec<Scalar>>,
 }
 
+impl Values {
+    /// Literal `rows` matching `schema`. Empty `rows` is the uninhabited relation over `schema`.
+    pub fn new(schema: impl Into<SchemaRef>, rows: Vec<Vec<Scalar>>) -> Self {
+        Self {
+            schema: schema.into(),
+            rows,
+        }
+    }
+}
+
 /// Projects the input through `expr` into rows of `schema`.
 ///
 /// `expr` must be a struct constructor or struct patch whose fields match `schema`. It is

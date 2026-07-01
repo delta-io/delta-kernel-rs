@@ -3,10 +3,11 @@
 //! a new builder; clone a builder (cheap) to feed it into more than one transform. Validating
 //! methods return [`DeltaResult`] and surface errors at the call site.
 //!
-//! A source with no rows (e.g. a scan over no files) is the *absent* relation. The builder treats
-//! it as dead code: transforms validate as usual but propagate absence, eliminating the parts of
-//! the plan that cannot contribute rows (a union drops absent arms, an anti-join with an absent
-//! build forwards its probe, etc.). [`build`](PlanBuilder::build) collapses the plan to its
+//! A source with no rows (e.g. a scan over no files) is the *absent* relation. Absence is
+//! transitive: a transform over an absent input is itself absent. The builder treats it as dead
+//! code: transforms validate as usual but propagate absence, eliminating the parts of the plan
+//! that cannot contribute rows (a union drops absent arms, an anti-join with an absent build
+//! forwards its probe, etc.). [`build`](PlanBuilder::build) collapses the plan to its
 //! minimal correct shape, emitting a single empty [`Values`] node when the whole relation is
 //! absent, so it always yields a runnable plan; [`build_opt`](PlanBuilder::build_opt) yields
 //! `None` for it.
@@ -15,6 +16,7 @@
 //! use std::sync::Arc;
 //! use delta_kernel::PlanBuilder;
 //! use delta_kernel::FileMeta;
+//! use delta_kernel::expressions::col;
 //! use delta_kernel::plans::ir::nodes::Operator;
 //! use delta_kernel::schema::{DataType, StructField, StructType};
 //!
@@ -24,6 +26,8 @@
 //! // eliminates it as dead code, collapsing the plan to its minimal correct shape. Downstream
 //! // transforms still validate and chain exactly as they would over a populated source.
 //! let scan = PlanBuilder::scan_parquet(Vec::<FileMeta>::new(), &[], schema)?;
+//!
+//! assert!(scan.clone().filter(col!("id").is_not_null())?.build_opt()?.is_none());
 //!
 //! // `build_opt` reports the eliminated plan as `None` ...
 //! assert!(scan.build_opt()?.is_none());
@@ -74,17 +78,13 @@ enum PlanBuilderRoot {
 pub struct PlanBuilder(PlanBuilderRoot);
 
 impl PlanBuilder {
-    fn node(op: impl Into<Operator>, inputs: Vec<BuilderNodeRef>, schema: SchemaRef) -> Self {
-        PlanBuilder::present(BuilderNode {
+    /// A present relation applying `op` (output `schema`) over `inputs`.
+    fn present(schema: SchemaRef, op: impl Into<Operator>, inputs: Vec<BuilderNodeRef>) -> Self {
+        PlanBuilder(PlanBuilderRoot::Present(Arc::new(BuilderNode {
             op: op.into(),
             inputs,
             schema,
-        })
-    }
-
-    /// Rewrap an existing node -- used where a combinator forwards an input unchanged.
-    fn present(node: impl Into<BuilderNodeRef>) -> Self {
-        PlanBuilder(PlanBuilderRoot::Present(node))
+        })))
     }
 
     /// The uninhabited relation over `schema`.
@@ -102,9 +102,9 @@ impl PlanBuilder {
 
     /// Apply a single-input transform: wrap `op` (output `schema`) over a present input, or stay
     /// absent. Callers validate against [`Self::schema`] first.
-    fn unary_op_or_absent(self, schema: SchemaRef, op: impl Into<BuilderNodeRef>) -> Self {
-        match self {
-            PlanBuilderRoot::Present(node) => Self::node(op, vec![node], schema),
+    fn unary_op_or_absent(self, schema: SchemaRef, op: impl Into<Operator>) -> Self {
+        match self.0 {
+            PlanBuilderRoot::Present(node) => Self::present(schema, op, vec![node]),
             PlanBuilderRoot::Absent(_) => Self::absent(schema),
         }
     }
@@ -161,21 +161,20 @@ impl PlanBuilder {
         if files.is_empty() {
             return Ok(Self::absent(schema));
         }
-        let op: Operator = match file_type {
-            FileType::Parquet => ScanParquet {
+        let file_constant_columns = cols;
+        let op = match file_type {
+            FileType::Parquet => Operator::from(ScanParquet {
                 files,
-                file_constant_columns: cols,
+                file_constant_columns,
                 schema: Arc::clone(&schema),
-            }
-            .into(),
-            FileType::Json => ScanJson {
+            }),
+            FileType::Json => Operator::from(ScanJson {
                 files,
-                file_constant_columns: cols,
+                file_constant_columns,
                 schema: Arc::clone(&schema),
-            }
-            .into(),
+            }),
         };
-        Ok(Self::node(op, vec![], schema))
+        Ok(Self::present(schema, op, vec![]))
     }
 
     /// Inline literal rows. See [`Values`] for the row encoding. Empty `rows` yields the absent
@@ -207,11 +206,8 @@ impl PlanBuilder {
         if rows.is_empty() {
             return Ok(Self::absent(schema));
         }
-        let node = Values {
-            schema: Arc::clone(&schema),
-            rows,
-        };
-        Ok(Self::node(node, vec![], schema))
+        let op = Values::new(schema, rows);
+        Ok(Self::present(op.schema.clone(), op, vec![]))
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -221,13 +217,11 @@ impl PlanBuilder {
     /// # Example
     /// ```
     /// # use std::sync::Arc;
-    /// # use url::Url;
-    /// # use delta_kernel::{FileMeta, PlanBuilder};
+    /// # use delta_kernel::PlanBuilder;
     /// # use delta_kernel::expressions::col;
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
     /// let schema = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
-    /// let file = FileMeta::new(Url::parse("file:///table/part-0.parquet")?, 0, 1024);
-    /// let plan = PlanBuilder::scan_parquet([file], &[], schema)?
+    /// let plan = PlanBuilder::values(schema, vec![vec![1.into()], vec![2.into()]])?
     ///     .filter(col!("id").is_not_null())?
     ///     .build()?;
     /// # Ok::<(), delta_kernel::Error>(())
@@ -236,7 +230,7 @@ impl PlanBuilder {
         let predicate = predicate.into();
         check_columns_resolve(self.schema(), predicate.references(), "filter")?;
         let schema = Arc::clone(self.schema());
-        Ok(self.apply_op(Filter { predicate }, schema))
+        Ok(self.unary_op_or_absent(schema, Filter { predicate }))
     }
 
     /// Project `self` through `expr` into rows of the caller-declared `schema`. `expr` must be a
@@ -250,8 +244,7 @@ impl PlanBuilder {
     /// # Example
     /// ```
     /// # use std::sync::Arc;
-    /// # use url::Url;
-    /// # use delta_kernel::{FileMeta, PlanBuilder};
+    /// # use delta_kernel::PlanBuilder;
     /// # use delta_kernel::expressions::{col, Expression};
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
     /// let input = Arc::new(StructType::try_new([
@@ -259,9 +252,8 @@ impl PlanBuilder {
     ///     StructField::nullable("name", DataType::STRING),
     /// ])?);
     /// let out = Arc::new(StructType::try_new([StructField::not_null("id", DataType::INTEGER)])?);
-    /// let file = FileMeta::new(Url::parse("file:///table/part-0.parquet")?, 0, 1024);
     /// // Keep only `id`.
-    /// let plan = PlanBuilder::scan_parquet([file], &[], input)?
+    /// let plan = PlanBuilder::values(input, vec![vec![1.into(), "a".into()]])?
     ///     .project(Expression::struct_from([col!("id")]), out)?
     ///     .build()?;
     /// # Ok::<(), delta_kernel::Error>(())
@@ -271,14 +263,10 @@ impl PlanBuilder {
         expr: impl Into<ExpressionRef>,
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        let out = schema.into();
+        let schema = schema.into();
         let expr = expr.into();
         check_columns_resolve(self.schema(), expr.references(), "project")?;
-        let project = Project {
-            expr,
-            schema: Arc::clone(&out),
-        };
-        Ok(self.apply_op(project, out))
+        Ok(self.unary_op_or_absent(Arc::clone(&schema), Project { expr, schema }))
     }
 
     /// Project `self` by editing its columns. `edit` receives a [`ProjectionStructPatchBuilder`]
@@ -319,35 +307,38 @@ impl PlanBuilder {
             &load.file_constant_columns,
             "load file_constant",
         )?;
-        let out = Arc::clone(&load.schema);
-        Ok(self.apply_op(load, out))
+        Ok(self.unary_op_or_absent(Arc::clone(&load.schema), load))
     }
 
     /// Aggregate `self` into `aggregate` (build one with [`Aggregate::group_by`]). The output
     /// schema is the group keys followed by the aggregate columns. See [`Aggregate`].
     ///
     /// Over an absent input the result is group-arity dependent: a **grouped** aggregate yields
-    /// zero groups and so is absent; a **global** aggregate (no group keys) still yields one
-    /// row -- each aggregate's value over the empty multiset, which is NULL for every aggregate
-    /// function -- materialized as a one-row [`Values`] source.
+    /// zero groups and so is absent; a **global** aggregate (no group keys) still yields one row,
+    /// so it aggregates an empty [`Values`] input and lets the engine produce that row.
     ///
     /// Produces an error when building `aggregate` fails: a group key or an aggregate's operand
     /// column is absent from its input schema, or two output columns would share a name.
     pub fn aggregate(self, aggregate: impl TryInto<Aggregate, Error = Error>) -> DeltaResult<Self> {
         let aggregate = aggregate.try_into()?;
         let schema = Arc::clone(&aggregate.schema);
-        let schema = aggregate.schema.clone();
-        let node = match self {
-            PlanBuilder::Present(node) => node,
-            PlanBuilderRoot::Absent(schema) if aggregate.group_by.is_empty() => {
-                // Ungrouped aggs always produce a single row of output, even if input is
-                // empty. Just materialize the empty input relation and let engine deal with it.
-                Self::node(schema.clone(), Values::new(schema, vec![]), vec![])
+        match self.0 {
+            PlanBuilderRoot::Present(node) => Ok(Self::present(schema, aggregate, vec![node])),
+            // A grouped aggregate over the empty relation has zero groups, hence absent.
+            PlanBuilderRoot::Absent(_) if !aggregate.group_by.is_empty() => {
+                Ok(Self::absent(schema))
             }
-            // Grouped aggregate over the empty relation: zero groups, hence absent.
-            PlanBuilderRoot::Absent(_) => return Ok(Self::Absent(schema)),
-        };
-        Ok(Self::node(schema, aggregate, vec![node]))
+            // A global aggregate always emits one row, even over no input: aggregate an empty
+            // Values relation and let the engine produce that row.
+            PlanBuilderRoot::Absent(input_schema) => {
+                let input = Self::present(
+                    Arc::clone(&input_schema),
+                    Values::new(input_schema, vec![]),
+                    vec![],
+                );
+                Ok(input.unary_op_or_absent(schema, aggregate))
+            }
+        }
     }
 
     /// Aggregate `self`, grouped by `keys`. `aggs` receives an [`AggregateBuilder`] rooted at
@@ -360,17 +351,15 @@ impl PlanBuilder {
     /// # Example
     /// ```
     /// # use std::sync::Arc;
-    /// # use url::Url;
-    /// # use delta_kernel::{FileMeta, PlanBuilder};
+    /// # use delta_kernel::PlanBuilder;
     /// # use delta_kernel::expressions::column_name;
     /// # use delta_kernel::schema::{DataType, StructField, StructType};
     /// let schema = Arc::new(StructType::try_new([
     ///     StructField::not_null("id", DataType::INTEGER),
     ///     StructField::nullable("version", DataType::LONG),
     /// ])?);
-    /// let file = FileMeta::new(Url::parse("file:///table/part-0.parquet")?, 0, 1024);
     /// // Latest `version` per `id`.
-    /// let plan = PlanBuilder::scan_parquet([file], &[], schema)?
+    /// let plan = PlanBuilder::values(schema, vec![vec![1.into(), 7i64.into()]])?
     ///     .aggregate_by([column_name!("id")], |a| a.max(column_name!("version")))?
     ///     .build()?;
     /// # Ok::<(), delta_kernel::Error>(())
@@ -411,21 +400,21 @@ impl PlanBuilder {
         probe_keys: impl IntoIterator<Item = ColumnName>,
         build_keys: impl IntoIterator<Item = ColumnName>,
     ) -> DeltaResult<Self> {
-        self.join(build, false, probe_keys, build_keys)
+        self.semi_join_impl(build, false, probe_keys, build_keys)
     }
 
     /// Anti join: emit the `self` (probe) rows that have *no* match in `build` on the join keys.
-    /// Otherwise as [`Self::semi_join`].
+    /// An inverted [`SemiJoin`]; otherwise as [`Self::semi_join`].
     pub fn anti_join(
         self,
         build: PlanBuilder,
         probe_keys: impl IntoIterator<Item = ColumnName>,
         build_keys: impl IntoIterator<Item = ColumnName>,
     ) -> DeltaResult<Self> {
-        self.join(build, true, probe_keys, build_keys)
+        self.semi_join_impl(build, true, probe_keys, build_keys)
     }
 
-    fn join(
+    fn semi_join_impl(
         self,
         build: PlanBuilder,
         inverted: bool,
@@ -444,26 +433,30 @@ impl PlanBuilder {
         }
         check_columns_resolve(self.schema(), &probe_keys, "join probe")?;
         check_columns_resolve(build.schema(), &build_keys, "join build")?;
-        let Planbuilder::Present(probe) = self else {
-            return Ok(self); // just forward the (uninhabited) probe side
+        // An uninhabited probe always produces an uninhabited result; forward it unchanged.
+        let PlanBuilderRoot::Present(probe) = self.0 else {
+            return Ok(self);
         };
         let build = match build.0 {
             PlanBuilderRoot::Present(build) => build,
-            // An absent build side matches nothing, so an anti-join forwards an unfiltered 
+            // An absent build side matches nothing, so an anti-join forwards an unfiltered
             // probe side while a semi-join is uninhabited.
-            PlanBuilderRoot::Absent(_) if inverted => return Ok(Self::from_node(probe)),
-            PlanBuilder::Absent(_) => return Ok(Self::absent(probe.schema)),
+            PlanBuilderRoot::Absent(_) if inverted => {
+                return Ok(PlanBuilder(PlanBuilderRoot::Present(probe)))
+            }
+            PlanBuilderRoot::Absent(_) => return Ok(Self::absent(Arc::clone(&probe.schema))),
         };
         let node = SemiJoin {
             inverted,
             probe_keys,
             build_keys,
         };
-        Ok(Self::node(probe.schema.clone(), node, vec![probe, build]))
+        let schema = Arc::clone(&probe.schema);
+        Ok(Self::present(schema, node, vec![probe, build]))
     }
 
-    /// Unordered bag union of `inputs`. All inputs must share the same schema; absent inputs are
-    /// dropped, and a lone present input is forwarded unchanged.
+    /// Unordered bag union of `inputs` into a [`UnionAll`]. All inputs must share the same schema;
+    /// absent inputs are dropped, and a lone present input is forwarded unchanged.
     ///
     /// Produces an error when `inputs` is empty, or two inputs have differing schemas.
     ///
@@ -496,8 +489,8 @@ impl PlanBuilder {
         }));
         Ok(match present.len() {
             0 => Self::absent(schema),
-            1 => Self::from_node(present.swap_remove(0)),
-            _ => Self::node(UnionAll, present, schema),
+            1 => PlanBuilder(PlanBuilderRoot::Present(present.swap_remove(0))),
+            _ => Self::present(schema, UnionAll, present),
         })
     }
 
@@ -507,10 +500,10 @@ impl PlanBuilder {
         Ok(match &self.0 {
             PlanBuilderRoot::Present(root) => Self::build_plan(root),
             PlanBuilderRoot::Absent(schema) => Plan {
-                nodes: vec![PlanNode {
-                    op: Values::new(Arc::clone(schema), vec![]).into(),
-                    inputs: Vec::new(),
-                }],
+                nodes: vec![PlanNode::new(
+                    Values::new(Arc::clone(schema), vec![]),
+                    vec![],
+                )],
             },
         })
     }
@@ -523,22 +516,26 @@ impl PlanBuilder {
         })
     }
 
-    /// Linearize the DAG rooted at `root` into a topologically sorted [`Plan`] with `root` as
-    /// the last (terminal) node. A node's inputs always precede it and are identified by
-    /// their index in [`Plan::nodes`]. Multiple nodes can reference the same (shared) input.
+    /// Linearize the DAG rooted at `root` into a topologically sorted [`Plan`] with `root` as the
+    /// last (terminal) node. A node's inputs always precede it, referenced by their index in
+    /// [`Plan::nodes`]. Shared subgraphs are emitted once; multiple nodes can reference them.
     fn build_plan(root: &BuilderNodeRef) -> Plan {
-        // Maps a node's Arc pointer to its index, deduping shared subgraphs. Node pointers are
-        // stable because the root "pins" all reachable nodes for the lifetime of `build_plan`.
+        // Maps a node's Arc pointer to its index, deduping shared subgraphs. Pointers are stable
+        // because `root` pins all reachable nodes for the lifetime of `build_plan`.
         fn emit(
             node: &BuilderNodeRef,
             nodes: &mut Vec<PlanNode>,
             emitted: &mut HashMap<*const BuilderNode, usize>,
         ) -> usize {
-            *emitted.entry(Arc::as_ptr(node)).or_insert_with(|| {
-                let inputs = node.inputs.iter().map(|i| emit(i, nodes, emitted));
-                nodes.push(PlanNode::new(node.op.clone(), inputs.collect()));
-                nodes.len() - 1
-            })
+            let key = Arc::as_ptr(node);
+            if let Some(&index) = emitted.get(&key) {
+                return index;
+            }
+            let inputs = Vec::from_iter(node.inputs.iter().map(|i| emit(i, nodes, emitted)));
+            nodes.push(PlanNode::new(node.op.clone(), inputs));
+            let index = nodes.len() - 1;
+            emitted.insert(key, index);
+            index
         }
         let mut nodes = Vec::new();
         emit(root, &mut nodes, &mut HashMap::new());
@@ -572,19 +569,16 @@ fn check_file_constant_columns<'a>(
     ctx: &str,
 ) -> DeltaResult<()> {
     for name in names {
-        match schema.field(name.as_str()) {
-            Some(field) if field.is_metadata_column() => {
-                return Err(Error::generic(format!(
-                    "{ctx}: column `{name}` is a metadata column"
-                )));
-            }
-            Some(_) => {}
-            None => {
-                return Err(Error::generic(format!(
-                    "{ctx}: column `{name}` not found; schema has {:?}",
-                    Vec::from_iter(schema.fields().map(|f| f.name())),
-                )));
-            }
+        let Some(field) = schema.field(name.as_str()) else {
+            return Err(Error::generic(format!(
+                "{ctx}: column `{name}` not found; schema has {:?}",
+                Vec::from_iter(schema.fields().map(|f| f.name())),
+            )));
+        };
+        if field.is_metadata_column() {
+            return Err(Error::generic(format!(
+                "{ctx}: column `{name}` is a metadata column"
+            )));
         }
     }
     Ok(())
@@ -915,19 +909,18 @@ mod tests {
         Ok(())
     }
 
-    /// A global (no group keys) aggregate over an absent input materializes one all-NULL row, using
-    /// the output schema the aggregate carries.
+    /// A global (no group keys) aggregate over an absent input aggregates an empty `Values`
+    /// relation, so the engine produces the single output row.
     #[test]
-    fn aggregate_global_over_absent_materializes_null_row() -> DeltaResult<()> {
+    fn aggregate_global_over_absent_aggregates_empty_values() -> DeltaResult<()> {
         let agg = absent_src().aggregate(
             Aggregate::group_by(id_schema(), Vec::<ColumnName>::new()).max(column_name!("id")),
         )?;
-        let plan = assert_plan(agg, &[(&[], "values")]);
+        let plan = assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
         let Operator::Values(values) = &plan.nodes[0].op else {
-            panic!("expected Values");
+            panic!("expected Values input");
         };
-        assert_eq!(values.rows.len(), 1);
-        assert!(values.rows[0].iter().all(|s| matches!(s, Scalar::Null(_))));
+        assert!(values.rows.is_empty());
         Ok(())
     }
 
