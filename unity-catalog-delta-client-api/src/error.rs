@@ -7,7 +7,7 @@ use thiserror::Error;
 /// implementation-specific dependencies.
 #[derive(Error, Debug)]
 pub enum Error {
-    /// The requested table was not found.
+    /// The requested table was not found (HTTP 404).
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
@@ -19,9 +19,22 @@ pub enum Error {
     #[error("Operation not supported: {0}")]
     UnsupportedOperation(String),
 
-    /// Authentication with Unity Catalog failed.
+    /// Authentication with Unity Catalog failed (HTTP 401).
     #[error("Authentication failed")]
     AuthenticationFailed,
+
+    /// Another writer already ratified this version, so the commit was rejected
+    /// (HTTP 409).
+    #[error("Commit conflict: version already ratified")]
+    CommitConflict,
+
+    /// Unity Catalog rejected the commit as invalid (HTTP 400).
+    #[error("Invalid commit: {0}")]
+    InvalidCommit(String),
+
+    /// Unity Catalog rate-limited the request (HTTP 429).
+    #[error("Rate limited")]
+    RateLimited,
 
     /// A generic error with a descriptive message.
     #[error("{0}")]
