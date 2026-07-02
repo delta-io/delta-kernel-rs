@@ -170,65 +170,16 @@ impl RowVisitor for ActionValidator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use rstest::rstest;
 
     use super::*;
-    use crate::actions::Add;
-    use crate::arrow::array::{
-        new_empty_array, new_null_array, Array as _, ArrayRef, Int64Array, MapArray, StringArray,
-        StructArray,
-    };
-    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+    use crate::arrow::array::new_null_array;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::engine::arrow_conversion::TryIntoArrow as _;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::{StructField, StructType, ToSchema as _};
+    use crate::utils::test_utils::valid_add_file_batch;
 
-    /// The real `add` action schema with every field made nullable.
-    fn nullable_add_schema() -> StructType {
-        let schema = Add::to_schema();
-        let fields = schema
-            .fields()
-            .map(|f| StructField::nullable(f.name().clone(), f.data_type().clone()));
-        StructType::try_new(fields).expect("nullable add schema")
-    }
-
-    /// A valid `add` batch.
-    fn valid_add_file() -> RecordBatch {
-        let arrow_schema: ArrowSchema = (&nullable_add_schema())
-            .try_into_arrow()
-            .expect("arrow schema");
-        let columns = arrow_schema
-            .fields()
-            .iter()
-            .map(|field| match field.name().as_str() {
-                "path" => Arc::new(StringArray::from(vec!["f"])) as ArrayRef,
-                "size" | "modificationTime" => Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
-                "partitionValues" => {
-                    let (entries_field, sorted) = match field.data_type() {
-                        ArrowDataType::Map(entries_field, sorted) => (entries_field, sorted),
-                        other => panic!("expected a map type, got {other:?}"),
-                    };
-                    let entries = new_empty_array(entries_field.data_type());
-                    let entries = entries
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .expect("map entries struct")
-                        .clone();
-                    // One row, empty map.
-                    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0]));
-                    Arc::new(
-                        MapArray::try_new(entries_field.clone(), offsets, entries, None, *sorted)
-                            .expect("empty map array"),
-                    )
-                }
-                _ => new_null_array(field.data_type(), 1),
-            })
-            .collect();
-        RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid record batch")
+    fn nullable_add_file() -> RecordBatch {
+        valid_add_file_batch(true /* all_nullable */)
     }
 
     /// Return `batch` with `field`'s column replaced by an all-null array of the same type.
@@ -258,7 +209,7 @@ mod tests {
 
     #[test]
     fn present_required_fields_ok() {
-        let adds = [Box::new(ArrowEngineData::new(valid_add_file())) as Box<dyn EngineData>];
+        let adds = [Box::new(ArrowEngineData::new(nullable_add_file())) as Box<dyn EngineData>];
         add_validator().validate(&adds).unwrap();
     }
 
@@ -268,7 +219,7 @@ mod tests {
     #[case::size("size")]
     #[case::modification_time("modificationTime")]
     fn null_required_field_rejected(#[case] field: &str) {
-        let batch = set_field_as_null(&valid_add_file(), field);
+        let batch = set_field_as_null(&nullable_add_file(), field);
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
         assert_err_contains(
             add_validator().validate(&adds),
