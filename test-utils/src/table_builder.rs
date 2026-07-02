@@ -325,7 +325,7 @@ impl LogState {
     }
 
     /// Versions at which CRC files are written, in ascending order.
-    pub(crate) fn crcs_at(&self) -> &[u64] {
+    pub fn crcs_at(&self) -> &[u64] {
         &self.crcs_at
     }
 
