@@ -85,7 +85,7 @@ impl LogSegment {
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
-        let advanced = self.build_incremental_crc_from_base(engine, base)?;
+        let advanced = self.build_crc_from_base(engine, base)?;
         Ok(Some(Arc::new(advanced)))
     }
 
@@ -117,8 +117,8 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
-    #[instrument(name = "log_seg.build_incremental_crc_from_base", skip_all, err)]
-    pub(crate) fn build_incremental_crc_from_base(
+    #[instrument(name = "log_seg.build_crc_from_base", skip_all, err)]
+    pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,
         base_crc: &Crc,
@@ -130,63 +130,20 @@ impl LogSegment {
                 FileSizeHistogram::create_empty_with_boundaries(h.sorted_bin_boundaries().to_vec())
             })
             .transpose()?;
-        let delta =
-            self.build_incremental_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
+        let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
         Ok(base_crc.clone().apply(delta, self.end_version))
     }
 
-    /// Build a `CrcDelta` covering commits `(base_version, self.end_version]` via reverse
-    /// log replay. `seed_histogram` is an empty histogram with the same bin boundaries as
-    /// the downstream base CRC, or `None` to skip histogram tracking on the delta.
+    /// Build a Complete base [`Crc`] at `checkpoint_version` from this segment's checkpoint files.
+    /// The tail commits are folded in separately by the caller as a [`CrcDelta`], so this reads
+    /// only the checkpoint. Returns `None` when the segment has no checkpoint, or if protocol or
+    /// metadata could not be recovered from it.
     ///
-    /// Errors if `base_version >= self.end_version` or if the segment is missing the
-    /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
-    pub(crate) fn build_incremental_crc_delta_from_base(
-        &self,
-        engine: &dyn Engine,
-        base_version: Version,
-        seed_histogram: Option<FileSizeHistogram>,
-    ) -> DeltaResult<CrcDelta> {
-        require!(
-            base_version < self.end_version,
-            Error::internal_error(format!(
-                "build_incremental_crc_delta_from_base: base_version ({}) must be strictly less \
-                 than end_version ({})",
-                base_version, self.end_version,
-            ))
-        );
-
-        let deltas: Vec<_> = self
-            .listed
-            .ascending_commit_files
-            .iter()
-            .filter(|c| c.version > base_version)
-            .collect();
-
-        let first_above = deltas.first().map(|c| c.version);
-        require!(
-            first_above == Some(base_version + 1),
-            Error::internal_error(format!(
-                "build_incremental_crc_delta_from_base: segment is missing commit {} \
-                 (lowest commit above base_version is {:?})",
-                base_version + 1,
-                first_above,
-            ))
-        );
-
-        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
-    }
-
-    /// Build a Complete [`Crc`] at `checkpoint_version` by reading this segment's checkpoint
-    /// files only (not the tail commits). Returns `None` when the segment has no checkpoint, or
-    /// if protocol or metadata could not be recovered from it.
-    ///
-    /// File stats sum live [`Add`](crate::actions::Add) actions (remove tombstones are skipped);
-    /// a missing Add `size` yields [`FileStatsState::Indeterminate`]. Domain metadata and set
-    /// transactions are [`Complete`](DomainMetadataState::Complete) since a checkpoint is
-    /// authoritative. `in_commit_timestamp_opt` is left `None`: a checkpoint carries no
-    /// `commitInfo`, so the caller supplies the ICT (from a tail commit, or read directly when
-    /// the checkpoint is at the target version).
+    /// File stats sum the checkpoint's AddFile actions (a reconciled checkpoint holds only live
+    /// files). Domain metadata and set transactions are
+    /// [`Complete`](DomainMetadataState::Complete) since a checkpoint is authoritative.
+    /// `in_commit_timestamp_opt` is left `None`: a checkpoint carries no `commitInfo`, so the
+    /// caller sets the ICT on the returned CRC afterward.
     pub(crate) fn build_crc_from_checkpoint(
         &self,
         engine: &dyn Engine,
@@ -194,11 +151,10 @@ impl LogSegment {
         let Some(version) = self.checkpoint_version else {
             return Ok(None);
         };
-        // No commit boundaries here, so the delta stays incremental-safe unless an Add is missing
-        // its size. It covers the full table, which `into_complete_crc` turns into a Complete CRC.
+        // No commit boundaries here, so the delta stays incremental-safe. It covers the full
+        // table, which `into_complete_crc` turns into a Complete CRC.
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
-        // Read the checkpoint files only (parquet plus any V2 sidecars), skipping the commit
-        // files: `create_checkpoint_stream` without the commit chain that `read_actions` adds.
+        // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
             .create_checkpoint_stream(engine, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)?
             .actions;
@@ -210,9 +166,9 @@ impl LogSegment {
         Ok(acc.into_crc_delta().into_complete_crc(version))
     }
 
-    /// Build a Complete [`Crc`] at `end_version` by reverse-replaying every commit in the
-    /// segment, for the case where there is neither a CRC nor a checkpoint to root at. Only
-    /// valid when the segment has no checkpoint, so its commits run contiguously from version 0.
+    /// Build a Complete [`Crc`] at `end_version` by reverse-replaying every commit in the segment,
+    /// for a segment with no CRC and no checkpoint to root at. The commits must run contiguously
+    /// from version 0.
     ///
     /// Returns `None` if protocol or metadata could not be recovered. File stats degrade to
     /// [`Indeterminate`](FileStatsState::Indeterminate) if the replay is not incremental-safe.
@@ -227,9 +183,8 @@ impl LogSegment {
         let Some(first) = self.listed.ascending_commit_files.first() else {
             return Ok(None);
         };
-        // A log with no checkpoint must start at version 0; a higher first version means the log
-        // was truncated without a checkpoint. That is a corrupt table, not a kernel-invariant
-        // breach, so it is a generic error rather than an internal one.
+        // A log with no checkpoint must start at version 0; a higher first version means a table
+        // truncated without a checkpoint.
         require!(
             first.version == 0,
             Error::generic(format!(
@@ -246,18 +201,59 @@ impl LogSegment {
         Ok(delta.into_complete_crc(self.end_version))
     }
 
-    /// Reverse-replay the given commits into a [`CrcDelta`]. The shared core of
-    /// [`Self::build_incremental_crc_delta_from_base`] and
-    /// [`Self::build_crc_from_version_zero`]. Takes the commits in ascending order and reverses
-    /// them internally, since reverse replay (newest-first) is load-bearing for ICT capture.
-    /// `seed_histogram` is an empty histogram with the downstream base's bin boundaries, or
-    /// `None` to skip histogram tracking.
+    /// Build a `CrcDelta` covering commits `(base_version, self.end_version]` via reverse
+    /// log replay. `seed_histogram` is an empty histogram with the same bin boundaries as
+    /// the downstream base CRC, or `None` to skip histogram tracking on the delta.
+    ///
+    /// Errors if `base_version >= self.end_version` or if the segment is missing the
+    /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
+    pub(crate) fn build_crc_delta_from_base(
+        &self,
+        engine: &dyn Engine,
+        base_version: Version,
+        seed_histogram: Option<FileSizeHistogram>,
+    ) -> DeltaResult<CrcDelta> {
+        require!(
+            base_version < self.end_version,
+            Error::internal_error(format!(
+                "build_crc_delta_from_base: base_version ({}) must be strictly less \
+                 than end_version ({})",
+                base_version, self.end_version,
+            ))
+        );
+
+        let deltas: Vec<_> = self
+            .listed
+            .ascending_commit_files
+            .iter()
+            .filter(|c| c.version > base_version)
+            .collect();
+
+        let first_above = deltas.first().map(|c| c.version);
+        require!(
+            first_above == Some(base_version + 1),
+            Error::internal_error(format!(
+                "build_crc_delta_from_base: segment is missing commit {} \
+                 (lowest commit above base_version is {:?})",
+                base_version + 1,
+                first_above,
+            ))
+        );
+
+        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
+    }
+
+    /// Replay the given commits into a [`CrcDelta`]. The shared core of
+    /// [`Self::build_crc_delta_from_base`] and [`Self::build_crc_from_version_zero`].
+    /// `ascending_commits` are taken oldest-first; `seed_histogram` is an empty histogram with the
+    /// downstream base's bin boundaries, or `None` to skip histogram tracking.
     fn replay_commits_into_crc_delta<'a>(
         &self,
         engine: &dyn Engine,
         ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
         seed_histogram: Option<FileSizeHistogram>,
     ) -> DeltaResult<CrcDelta> {
+        // Replay newest-first: ICT capture reads from the newest commit only.
         let locations: Vec<FileMeta> = ascending_commits
             .rev()
             .map(|c| c.location.clone())
@@ -365,12 +361,6 @@ impl CrcReplayAccumulator {
 
     // ===== Row-level updates (also the seams used by `on_*` unit tests) =====
 
-    /// Mark file stats as non-incremental-safe so they degrade to `Indeterminate`. Used when a
-    /// size needed for accounting is absent (e.g. a checkpoint Add with no `size`).
-    fn mark_file_stats_unsafe(&mut self) {
-        self.delta.is_incremental_safe = false;
-    }
-
     /// Called by the visitor once per commitInfo row (gated on operation or ict being
     /// present). Handles both pieces: `operation` drives per-commit safety classification,
     /// `ict` is captured into the delta from the newest commit only.
@@ -453,10 +443,10 @@ impl CrcReplayAccumulator {
         }
     }
 
-    /// Fold the columns common to commit and checkpoint replay (domain metadata, set
-    /// transactions, protocol, metadata) from row `i`. Each visitor handles its source-specific
-    /// columns (commit: `_file`/commitInfo/add/remove; checkpoint: add) and delegates the rest
-    /// here so the shared leaves live in one place.
+    /// Apply the columns common to commit and checkpoint replay (domain metadata, set
+    /// transactions, protocol, metadata) from row `i` to the delta. Each visitor handles its
+    /// source-specific columns (commit: `_file`/commitInfo/add/remove; checkpoint: add) and
+    /// delegates the rest here so the shared leaves live in one place.
     fn visit_common_columns<'a>(
         &mut self,
         i: usize,
@@ -490,9 +480,11 @@ impl CrcReplayAccumulator {
     }
 }
 
-/// Number of columns shared by both replay visitors: domain metadata (domain, configuration,
-/// removed) then set transaction (appId, version, lastUpdated). They sit contiguously at the end
-/// of each visitor's fixed columns, immediately before the protocol and metadata leaves.
+/// Number of columns shared by [`CrcReplayVisitor`] and [`CheckpointCrcVisitor`]: domain metadata
+/// (domain, configuration, removed) then set transaction (appId, version, lastUpdated). Each
+/// visitor's column list is {source-specific} then {shared} then {protocol leaves, metadata
+/// leaves}. Protocol and metadata are appended last because each expands to many leaf columns,
+/// while every column before them is a single leaf.
 const N_SHARED_COLS: usize = 6;
 
 /// Getter indices for the columns shared by commit and checkpoint replay, plus the count of
@@ -657,19 +649,14 @@ impl RowVisitor for CrcReplayVisitor<'_> {
 // Checkpoint base construction
 // ============================================================================
 
-/// Action schema for reading a checkpoint into a base [`Crc`]. Mirrors the on-disk action
-/// layout but projects only the leaves the accumulator needs. `add.path` (required) marks an
-/// Add row; `add.size` is read as optional so a malformed Add with no size degrades file stats
-/// rather than erroring. Unlike [`REPLAY_SCHEMA`], there is no `_file`, `remove`, or
-/// `commitInfo`: a checkpoint is a single reconciled view with no commit boundaries, removes
-/// are tombstones excluded from live file stats, and ICT is supplied by the caller.
+/// Action schema for reading a checkpoint into a base [`Crc`], projecting only the leaves the
+/// accumulator needs. `add.size` is the only Add leaf read, and it is required, so its presence
+/// marks an Add row (a checkpoint Add missing `size` errors at read time). A checkpoint has no
+/// `remove` or `commitInfo` to project.
 #[allow(clippy::expect_used)]
 static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(schema! {
-        nullable ADD_NAME: {
-            not_null "path": STRING,
-            nullable "size": LONG,
-        },
+        nullable ADD_NAME: { not_null "size": LONG },
         nullable PROTOCOL_NAME: (Protocol::to_schema()),
         nullable METADATA_NAME: (Metadata::to_schema()),
         nullable SET_TRANSACTION_NAME: (SetTransaction::to_schema()),
@@ -678,14 +665,12 @@ static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 // ===== Checkpoint visitor column indices =====
-const COL_CP_ADD_PATH: usize = 0;
-const COL_CP_ADD_SIZE: usize = 1;
+const COL_CP_ADD_SIZE: usize = 0;
 /// Source-specific columns end here; the shared columns follow.
 const N_CP_SPECIFIC_COLS: usize = COL_CP_ADD_SIZE + 1;
 const N_CP_FIXED_COLS: usize = N_CP_SPECIFIC_COLS + N_SHARED_COLS;
 
-/// Pulls leaf values from a checkpoint batch into the shared [`CrcReplayAccumulator`]. An Add
-/// with no `size` degrades file stats to `Indeterminate`.
+/// Pulls leaf values from a checkpoint batch into the shared [`CrcReplayAccumulator`].
 struct CheckpointCrcVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
 }
@@ -693,10 +678,7 @@ struct CheckpointCrcVisitor<'a> {
 impl RowVisitor for CheckpointCrcVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let mut fixed = vec![
-                (DataType::STRING, column_name!("add.path")),
-                (DataType::LONG, column_name!("add.size")),
-            ];
+            let mut fixed = vec![(DataType::LONG, column_name!("add.size"))];
             fixed.extend(shared_dm_txn_columns());
             append_protocol_metadata_leaves(fixed).into()
         });
@@ -708,14 +690,9 @@ impl RowVisitor for CheckpointCrcVisitor<'_> {
             check_visitor_getters(getters, N_CP_FIXED_COLS, "CheckpointCrcVisitor")?;
         let common = CommonColumns::new(N_CP_SPECIFIC_COLS, n_protocol_leaves);
         for i in 0..row_count {
-            // `add.path` (required) marks an Add row; a present Add with no `size` cannot be
-            // accounted for, so file stats degrade to `Indeterminate`.
-            let add_path: Option<String> = getters[COL_CP_ADD_PATH].get_opt(i, "add.path")?;
-            if add_path.is_some() {
-                match getters[COL_CP_ADD_SIZE].get_opt(i, "add.size")? {
-                    Some(size) => self.acc.on_add(size)?,
-                    None => self.acc.mark_file_stats_unsafe(),
-                }
+            // `add.size` (required) marks an Add row.
+            if let Some(size) = getters[COL_CP_ADD_SIZE].get_opt(i, "add.size")? {
+                self.acc.on_add(size)?;
             }
 
             self.acc.visit_common_columns(i, getters, &common)?;
@@ -1009,9 +986,7 @@ mod tests {
             set_transaction_state: SetTransactionState::Complete(HashMap::new()),
             ..Default::default()
         };
-        let crc = segment
-            .build_incremental_crc_from_base(&engine, &base)
-            .unwrap();
+        let crc = segment.build_crc_from_base(&engine, &base).unwrap();
 
         // Newest-wins: v2's upgraded protocol (now carries `rowTracking` on top of v0's
         // features), v2's metadata, v2's ICT.
@@ -1055,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_incremental_crc_delta_from_base_errors_when_base_version_geq_end_version() {
+    async fn build_crc_delta_from_base_errors_when_base_version_geq_end_version() {
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let root = "memory:///t/";
@@ -1078,7 +1053,7 @@ mod tests {
         .unwrap();
         for base in [0, 5] {
             assert_result_error_with_message(
-                segment.build_incremental_crc_delta_from_base(&engine, base, None),
+                segment.build_crc_delta_from_base(&engine, base, None),
                 "must be strictly less than end_version",
             );
         }

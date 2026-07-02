@@ -390,13 +390,13 @@ struct BuiltCrcTest {
 
 impl BuiltCrcTest {
     /// Construct a `LogSegment` directly from the store state (no `Snapshot`) and run
-    /// `build_incremental_crc_from_base` against `base`.
+    /// `build_crc_from_base` against `base`.
     fn incrementally_build_crc(&self, base: &Crc) -> DeltaResult<Crc> {
         let storage = self.engine.storage_handler();
         let log_root = self.url.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
-        log_segment.build_incremental_crc_from_base(&self.engine, base)
+        log_segment.build_crc_from_base(&self.engine, base)
     }
 
     /// Read the on-disk CRC at `version` from this test's log.

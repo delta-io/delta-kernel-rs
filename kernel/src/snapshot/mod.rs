@@ -915,9 +915,6 @@ impl Snapshot {
     /// 2. A stale on-disk CRC, advanced over the tail commits via reverse replay.
     /// 3. A checkpoint, advanced over the tail commits via reverse replay.
     /// 4. A full reverse replay of the commit history.
-    ///
-    /// An on-disk CRC always sits at or after the checkpoint (a log-segment invariant) and is
-    /// cheap to read, so 2 is preferred over 3 whenever a CRC exists.
     fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Option<Arc<Crc>>> {
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = &self.crc {
@@ -929,18 +926,19 @@ impl Snapshot {
 
         // Case 2: a stale on-disk CRC (older than this version, since an equal one would have
         // short-circuited to `AlreadyExists`). Advance it over the tail commits.
+        // TODO: `read_latest_crc` re-reads the CRC from disk. `LazyCrc` was deleted in the pivot
+        //       to incremental CRC being optional; reintroduce something like it so a CRC already
+        //       read during snapshot load is reused here instead of re-read.
         if let Some(base) = log_segment.read_latest_crc(engine) {
-            let crc = log_segment.build_incremental_crc_from_base(engine, &base)?;
+            let crc = log_segment.build_crc_from_base(engine, &base)?;
             return Ok(Some(Arc::new(crc)));
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
         if let Some(checkpoint_version) = log_segment.checkpoint_version {
             if checkpoint_version == end {
-                // No tail commits: the checkpoint carries no ICT, so read v_end's ICT from its
-                // commit file. A failed read (e.g. the commit file was log-cleaned on an
-                // ICT-enabled table) leaves it absent; the write then fails closed via
-                // `try_write_crc_file`'s ICT guard rather than erroring here.
+                // No tail commits, so read v_end's ICT from its commit file. A failed read leaves
+                // it absent, and `try_write_crc_file`'s ICT guard fails the write closed.
                 let Some(mut crc) = log_segment.build_crc_from_checkpoint(engine)? else {
                     return Ok(None);
                 };
@@ -949,7 +947,7 @@ impl Snapshot {
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
-            let delta = log_segment.build_incremental_crc_delta_from_base(
+            let delta = log_segment.build_crc_delta_from_base(
                 engine,
                 checkpoint_version,
                 Some(FileSizeHistogram::create_default()),
