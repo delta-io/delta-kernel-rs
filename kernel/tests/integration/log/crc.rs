@@ -544,96 +544,162 @@ async fn test_write_checksum_double_write_returns_already_exists(
     Ok(())
 }
 
-/// No checkpoint: `write_checksum` resolves from a stale on-disk CRC or from version zero.
-#[rstest]
-#[case::stale_on_disk_crc(true)]
-#[case::version_zero(false)]
-#[tokio::test]
-async fn test_write_checksum_resolves_crc_with_no_in_memory_crc(
-    #[case] write_crc_at_v0: bool,
-) -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let snap = create_table_and_commit(&table_path, engine.as_ref())?
-        .post_commit_snapshot()
-        .unwrap()
-        .clone();
-    if write_crc_at_v0 {
-        snap.write_checksum(engine.as_ref())?;
-    }
-    let snap = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
-        .await?
-        .unwrap_post_commit_snapshot();
-    insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))])
-        .await?
-        .unwrap_committed();
-
-    // Default load (no incremental replay), so no in-memory CRC.
-    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(fresh.version(), 2);
-    assert!(fresh.crc().is_none());
-
-    let (result, _updated) = fresh.write_checksum(engine.as_ref())?;
-    assert_eq!(result, ChecksumWriteResult::Written);
-
-    // The written CRC round-trips with file stats covering both inserted files.
-    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let stats = reloaded.get_file_stats_if_present().unwrap();
-    assert_eq!(stats.num_files(), 2);
-
-    Ok(())
+/// The root that `resolve_crc_for_write` resolves the CRC from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteRoot {
+    /// No checkpoint and no CRC.
+    VersionZero,
+    /// A checkpoint at the snapshot's version with no tail commits.
+    CheckpointNoTail,
+    /// A checkpoint below the snapshot's version with tail commits.
+    CheckpointWithTail,
+    /// A stale on-disk CRC, loaded with [`IncrementalReplay::Unlimited`].
+    StaleCrcIncrementalBuild,
+    /// A stale on-disk CRC, loaded with [`IncrementalReplay::Disabled`].
+    StaleCrcNonIncrementalBuild,
 }
 
-/// Checkpoint at the current version, no tail commits, no CRC: `write_checksum` builds the CRC
-/// from the checkpoint and fills ICT (present iff enabled) from v_end's commit file.
+/// For each resolution root: build a table, load a snapshot, write the CRC, and validate its
+/// contents (file stats, active domains, set transactions).
 #[rstest]
-#[case::ict_enabled(true)]
-#[case::ict_disabled(false)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_from_checkpoint_at_current_version(
-    #[case] ict_enabled: bool,
+async fn test_write_checksum_resolves_correct_crc_from_each_root(
+    #[values(
+        WriteRoot::VersionZero,
+        WriteRoot::CheckpointNoTail,
+        WriteRoot::CheckpointWithTail,
+        WriteRoot::StaleCrcIncrementalBuild,
+        WriteRoot::StaleCrcNonIncrementalBuild
+    )]
+    root: WriteRoot,
+    #[values(false, true)] ict_enabled: bool,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
+    // === Create the table with domain metadata (and optionally ICT) enabled ===
     let schema = schema_ref! { nullable "id": INTEGER };
-    let mut builder = create_table(&table_path, schema, "test_engine");
+    let mut builder = create_table(&table_path, schema, "test_engine")
+        .with_table_properties([("delta.feature.domainMetadata", "supported")]);
     if ict_enabled {
-        builder = builder.with_table_properties([
-            ("delta.feature.inCommitTimestamp", "supported"),
-            ("delta.enableInCommitTimestamps", "true"),
-        ]);
+        builder = builder.with_table_properties([("delta.enableInCommitTimestamps", "true")]);
     }
-    let snap = builder
+    let mut snap = builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
-    let snap = insert_data(
-        snap,
-        &engine,
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-    )
-    .await?
-    .unwrap_post_commit_snapshot();
-    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
-    let checkpoint_version = snap.version();
 
-    // Default load: checkpoint at the current version, no tail commits, no CRC.
-    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(fresh.version(), checkpoint_version);
-    assert!(fresh.crc().is_none());
+    const CHECKPOINT_OR_CRC_VERSION: i64 = 4;
+    let (checkpoint_or_crc_version, latest): (Option<i64>, i64) = match root {
+        WriteRoot::VersionZero => (None, CHECKPOINT_OR_CRC_VERSION),
+        WriteRoot::CheckpointNoTail => (Some(CHECKPOINT_OR_CRC_VERSION), CHECKPOINT_OR_CRC_VERSION),
+        WriteRoot::CheckpointWithTail
+        | WriteRoot::StaleCrcIncrementalBuild
+        | WriteRoot::StaleCrcNonIncrementalBuild => (
+            Some(CHECKPOINT_OR_CRC_VERSION),
+            CHECKPOINT_OR_CRC_VERSION + 2,
+        ),
+    };
+    let removed_domain = "d1";
+
+    // === Commit loop: accumulate domain metadata and set transactions ===
+    // Each commit v adds one file, sets domain "d{v}"->"cfg{v}" and set-txn "app{v}"->v. At v=3 we
+    // also remove "d1", so the final CRC must reflect the removal.
+    for v in 1..=latest {
+        let arrow_schema = TryFromKernel::try_from_kernel(snap.schema().as_ref())?;
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(Int32Array::from(vec![v as i32]))],
+        )
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        let mut txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_operation("WRITE".to_string())
+            .with_data_change(true)
+            .with_domain_metadata(format!("d{v}"), format!("cfg{v}"))
+            .with_transaction_id(format!("app{v}"), v);
+        if v == 3 {
+            txn = txn.with_domain_metadata_removed(removed_domain.to_string());
+        }
+        let write_context = txn.unpartitioned_write_context()?;
+        let adds = engine
+            .write_parquet(&ArrowEngineData::new(batch), &write_context)
+            .await?;
+        txn.add_files(adds);
+        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+        if checkpoint_or_crc_version == Some(v) {
+            match root {
+                WriteRoot::CheckpointNoTail | WriteRoot::CheckpointWithTail => {
+                    snap = snap.checkpoint(engine.as_ref(), None)?.1;
+                }
+                WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
+                    snap.write_checksum(engine.as_ref())?;
+                }
+                WriteRoot::VersionZero => unreachable!("VersionZero has no seed version"),
+            }
+        }
+    }
+
+    // === Load from disk, write the checksum, reload, assert the persisted CRC ===
+    let incremental_build = root == WriteRoot::StaleCrcIncrementalBuild;
+    let replay = if incremental_build {
+        IncrementalReplay::Unlimited
+    } else {
+        IncrementalReplay::Disabled
+    };
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(replay)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.crc().is_some(), incremental_build);
+
+    // Confirm the load actually reached the intended resolution root, so a mis-resolution that
+    // still produced correct contents cannot pass silently.
+    match root {
+        WriteRoot::CheckpointNoTail | WriteRoot::CheckpointWithTail => assert_eq!(
+            fresh.log_segment().checkpoint_version,
+            Some(CHECKPOINT_OR_CRC_VERSION as u64)
+        ),
+        WriteRoot::VersionZero => assert!(fresh.log_segment().checkpoint_version.is_none()),
+        WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
+            assert!(crc_file_path(&table_path, CHECKPOINT_OR_CRC_VERSION as u64).exists())
+        }
+    }
+
     assert_eq!(
-        fresh.log_segment().checkpoint_version,
-        Some(checkpoint_version)
+        fresh.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
     );
 
-    let (result, _updated) = fresh.write_checksum(engine.as_ref())?;
-    assert_eq!(result, ChecksumWriteResult::Written);
-
-    // ICT is present iff the table enabled it; either way the CRC round-trips.
+    // Reload from disk so the assertions below run against the persisted CRC.
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(
-        reloaded.crc().unwrap().in_commit_timestamp_opt.is_some(),
-        ict_enabled
-    );
+    let crc = reloaded.crc().unwrap();
+
+    assert_eq!(crc.version as i64, latest);
+    assert_eq!(crc.in_commit_timestamp_opt.is_some(), ict_enabled);
+
+    // File stats cover every live file (one per commit), checked against disk ground truth.
+    let disk = parquet_file_sizes_on_disk(&table_path);
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files() as usize, disk.len());
+    assert_eq!(stats.table_size_bytes(), disk.iter().sum::<i64>());
+
+    // Domain metadata: every set domain is present with its config, except the removed one.
+    let dms = crc.domain_metadata_state.expect_complete();
+    assert!(!dms.contains_key(removed_domain));
+    for v in 1..=latest {
+        let domain = format!("d{v}");
+        if domain == removed_domain {
+            continue;
+        }
+        assert_eq!(dms[&domain].configuration(), format!("cfg{v}"));
+    }
+
+    // Set transactions: every committed app id is present.
+    let txns = crc.set_transaction_state.expect_complete();
+    assert_eq!(txns.len() as i64, latest);
+    for v in 1..=latest {
+        assert!(txns.contains_key(&format!("app{v}")));
+    }
 
     Ok(())
 }
@@ -1966,43 +2032,6 @@ async fn test_stale_crc_fresh_build_advance_matrix(
         fresh.get_app_id_version("app", real_engine_iff_crc_missing)?,
         Some(LATEST_VERSION)
     );
-
-    // === Check: write_checksum ===
-    // Succeeds whether or not an in-memory CRC was present: with no CRC, write_checksum resolves
-    // one from the checkpoint root and advances it over the tail commits.
-    assert_eq!(
-        fresh.write_checksum(engine.as_ref())?.0,
-        ChecksumWriteResult::Written
-    );
-
-    // For the Absent case the CRC was rooted at the checkpoint. Reload and read domain metadata,
-    // set transactions, and file stats through `FailingEngine`: with I/O impossible, every value
-    // must come from the written CRC's `Complete` state.
-    if crc_staleness == CrcStaleness::Absent {
-        let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-        assert!(reloaded.crc().is_some());
-        // File stats: checkpoint base summed with the advanced tail, checked against disk.
-        let stats = reloaded.get_file_stats_if_present().unwrap();
-        let disk = parquet_file_sizes_on_disk(&table_path);
-        assert_eq!(stats.num_files() as usize, disk.len());
-        assert_eq!(stats.table_size_bytes(), disk.iter().sum::<i64>());
-        // Carried from the checkpoint base.
-        assert!(reloaded
-            .get_domain_metadata_internal("domain_at_create", &FailingEngine)?
-            .is_some());
-        assert_eq!(
-            reloaded.get_app_id_version("app_at_create", &FailingEngine)?,
-            Some(0)
-        );
-        // Carried from the advanced tail.
-        assert!(reloaded
-            .get_domain_metadata_internal("domain", &FailingEngine)?
-            .is_some());
-        assert_eq!(
-            reloaded.get_app_id_version("app", &FailingEngine)?,
-            Some(LATEST_VERSION)
-        );
-    }
 
     Ok(())
 }
