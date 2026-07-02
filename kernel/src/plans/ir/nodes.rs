@@ -48,6 +48,30 @@ pub enum Operator {
     UnionAll(UnionAll),
 }
 
+/// Generate `From<Payload> for Operator` for each listed variant, wrapping the payload in the
+/// same-named [`Operator`] variant. Example: `Filter { .. }.into()` yields `Operator::Filter`).
+macro_rules! impl_from_payload_for_operator {
+    ($($variant:ident),+ $(,)?) => {
+        $(impl From<$variant> for Operator {
+            fn from(payload: $variant) -> Self {
+                Operator::$variant(payload)
+            }
+        })+
+    };
+}
+
+impl_from_payload_for_operator!(
+    ScanParquet,
+    ScanJson,
+    Values,
+    Project,
+    Filter,
+    Load,
+    Aggregate,
+    SemiJoin,
+    UnionAll,
+);
+
 /// One file to scan plus literal values broadcast to every row read from that file.
 ///
 /// `file_constants` holds one [`Scalar`] per entry in the parent scan node's
@@ -159,7 +183,7 @@ impl From<FileMeta> for ScanFile {
 #[derive(Debug, Clone)]
 pub struct ScanParquet {
     pub files: Vec<ScanFile>,
-    pub file_constant_columns: Vec<ColumnName>,
+    pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
 }
 
@@ -184,7 +208,7 @@ pub struct ScanParquet {
 #[derive(Debug, Clone)]
 pub struct ScanJson {
     pub files: Vec<ScanFile>,
-    pub file_constant_columns: Vec<ColumnName>,
+    pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
 }
 
@@ -245,6 +269,16 @@ pub struct ScanJson {
 pub struct Values {
     pub schema: SchemaRef,
     pub rows: Vec<Vec<Scalar>>,
+}
+
+impl Values {
+    /// Literal `rows` matching `schema`. Empty `rows` is the uninhabited relation over `schema`.
+    pub fn new(schema: impl Into<SchemaRef>, rows: Vec<Vec<Scalar>>) -> Self {
+        Self {
+            schema: schema.into(),
+            rows,
+        }
+    }
 }
 
 /// Projects the input through `expr` into rows of `schema`.
@@ -315,6 +349,21 @@ pub struct LoadColumnFileMeta {
     pub num_records_column: ColumnName,
 }
 
+impl LoadColumnFileMeta {
+    /// The columns naming each file's path, size, and row-count.
+    pub fn new(
+        path_column: ColumnName,
+        file_size_column: ColumnName,
+        num_records_column: ColumnName,
+    ) -> Self {
+        Self {
+            path_column,
+            file_size_column,
+            num_records_column,
+        }
+    }
+}
+
 /// Reads data files from an upstream stream of file-metadata tuples, one input row per file.
 /// For each row, `file_meta` locates and sizes the file, the engine resolves its path against
 /// `base_url` (see below), opens it as `file_type`, and reads columns matching `schema`.
@@ -355,7 +404,7 @@ pub struct LoadColumnFileMeta {
 /// ```
 /// ```text
 /// Load {
-///     schema: { id: int, name: string },
+///     schema: { id: int, name: string, version: long },
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
 ///     file_constant_columns: ["version"],
@@ -384,9 +433,45 @@ pub struct Load {
     pub schema: SchemaRef,
     pub file_type: FileType,
     pub base_url: Option<Url>,
-    pub file_constant_columns: Vec<ColumnName>,
+    pub file_constant_columns: Vec<String>,
     pub file_meta: LoadColumnFileMeta,
     pub dv_column: ColumnName,
+}
+
+impl Load {
+    /// A [`Load`] over `schema` reading `file_type` files, with no base URL and no file-constant
+    /// columns. Add those with [`Self::with_base_url`] / [`Self::with_file_constant_columns`].
+    pub fn new(
+        schema: impl Into<SchemaRef>,
+        file_type: FileType,
+        file_meta: LoadColumnFileMeta,
+        dv_column: ColumnName,
+    ) -> Self {
+        Self {
+            schema: schema.into(),
+            file_type,
+            base_url: None,
+            file_constant_columns: Vec::new(),
+            file_meta,
+            dv_column,
+        }
+    }
+
+    /// Set the base URL that per-row file paths resolve against.
+    pub fn with_base_url(mut self, base_url: Url) -> Self {
+        self.base_url = Some(base_url);
+        self
+    }
+
+    /// Set the output columns broadcast from the upstream row (see
+    /// [`Self::file_constant_columns`]).
+    pub fn with_file_constant_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.file_constant_columns = columns.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// Groups input rows by `group_by` (a global aggregation over all rows when `group_by` is

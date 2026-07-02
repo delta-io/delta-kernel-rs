@@ -586,11 +586,9 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-    use delta_kernel::object_store::CopyOptions;
     use delta_kernel::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, Result,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
@@ -614,15 +612,6 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
-
-    // A wrapper trait that lets us bound on `ObjectStore` without directly importing it under
-    // arrow-57, which would bring in ambiguous-method errors.
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    trait ObjectStore: delta_kernel::object_store::ObjectStore {}
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    impl<T: delta_kernel::object_store::ObjectStore + ?Sized> ObjectStore for T {}
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-    use delta_kernel::object_store::ObjectStore;
 
     /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
     /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates
@@ -692,8 +681,6 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        // ===== Required only by object_store 0.13 (arrow-58) =====
-        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
         fn delete_stream(
             &self,
             locations: BoxStream<'static, Result<Path>>,
@@ -701,25 +688,8 @@ mod tests {
             self.inner.delete_stream(locations)
         }
 
-        #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
         async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
             self.inner.copy_opts(from, to, options).await
-        }
-
-        // ===== Required only by object_store 0.12 (arrow-57) =====
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn delete(&self, location: &Path) -> Result<()> {
-            self.inner.delete(location).await
-        }
-
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
         }
     }
 
