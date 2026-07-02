@@ -376,9 +376,6 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // Cap what the segment retains so a huge `_last_checkpoint` can't bloat memory.
-        let checkpoint_hint = checkpoint_hint.map(LastCheckpointHint::drop_oversized_fields);
-
         // The end_version is the time_travel_version, if present
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present

@@ -241,7 +241,6 @@ impl Snapshot {
         // below the existing snapshot version, trim existing commits and compaction files
         // already covered by it; otherwise keep all existing files.
         let new_checkpoint_version = new_log_segment.checkpoint_version;
-        let new_checkpoint_hint = new_log_segment.last_checkpoint_metadata.clone();
         let mut ascending_commit_files = Self::files_after_checkpoint(
             &existing_log_segment.listed.ascending_commit_files,
             new_checkpoint_version,
@@ -259,12 +258,11 @@ impl Snapshot {
         // Note: the incremental listing never uses a _last_checkpoint hint, so
         // new_log_segment.last_checkpoint_metadata is always None when a new checkpoint
         // is found here. The combined segment will read the new checkpoint's parquet footer at
-        // scan time. When no new checkpoint was found, preserve the existing schema hint if
-        // available.
-        let (new_checkpoint_parts, new_checkpoint_schema) = if new_checkpoint_version.is_some() {
+        // scan time. When no new checkpoint was found, preserve the existing hint if available.
+        let (new_checkpoint_parts, new_checkpoint_hint) = if new_checkpoint_version.is_some() {
             (
                 new_log_segment.listed.checkpoint_parts.clone(),
-                new_checkpoint_hint,
+                new_log_segment.last_checkpoint_metadata.clone(),
             )
         } else {
             (
@@ -289,7 +287,7 @@ impl Snapshot {
             },
             log_root,
             requested_version,
-            new_checkpoint_schema,
+            new_checkpoint_hint,
         )?;
 
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer

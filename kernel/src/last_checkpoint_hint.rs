@@ -38,7 +38,8 @@ pub(crate) struct LastCheckpointHint {
     pub version: Version,
     /// The number of actions that are stored in the checkpoint.
     pub(crate) size: i64,
-    /// The number of fragments if the last checkpoint was written in multiple parts.
+    /// The number of fragments if the last checkpoint was written in multiple parts. `None` means
+    /// a single-part or classic checkpoint (i.e. `numParts == 1`).
     pub(crate) parts: Option<usize>,
     /// The number of bytes of the checkpoint.
     pub(crate) size_in_bytes: Option<i64>,
@@ -130,9 +131,17 @@ impl LastCheckpointHint {
             }
     }
 
+    /// Parses a hint from raw `_last_checkpoint` bytes, dropping oversized fields so the retained
+    /// hint is always bounded. This is the only way to construct a hint from disk, so callers can
+    /// never hold an untrimmed one.
+    fn from_bytes_with_oversized_fields_dropped(bytes: &[u8]) -> serde_json::Result<Self> {
+        let hint: Self = serde_json::from_slice(bytes)?;
+        Ok(hint.drop_oversized_fields())
+    }
+
     /// Drops `sidecarFiles` / `nonFileActions` over the threshold. Drops the whole field, never
     /// truncates. Absent means info missing, so this only loses an optimization.
-    pub(crate) fn drop_oversized_fields(mut self) -> Self {
+    fn drop_oversized_fields(mut self) -> Self {
         if let Some(v2) = &mut self.v2_checkpoint {
             let version = self.version;
             if let Some(count) = v2
@@ -185,9 +194,10 @@ impl LastCheckpointHint {
         let file_path = Self::path(log_root)?;
         match storage.read_files(vec![(file_path, None)])?.next() {
             Some(Ok(data)) => {
-                let result: Option<LastCheckpointHint> = serde_json::from_slice(&data)
-                    .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-                    .ok();
+                let result: Option<LastCheckpointHint> =
+                    Self::from_bytes_with_oversized_fields_dropped(&data)
+                        .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+                        .ok();
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
