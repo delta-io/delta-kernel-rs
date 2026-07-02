@@ -8,7 +8,7 @@ use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROT
 use crate::commit_range::with_version_context;
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
-use crate::schema::{schema_ref, SchemaRef};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
 use crate::{DeltaResult, Engine, Error, FileDataReadResultIterator, Version};
@@ -33,13 +33,11 @@ pub enum DeltaAction {
 
 /// Read schema for the per-commit header: protocol + metadata (for validation and the effective
 /// table configuration) plus commitInfo (for the in-commit timestamp).
-static HEADER_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        (&PROTOCOL_FIELD),
-        (&METADATA_FIELD),
-        (&COMMIT_INFO_FIELD),
-    }
-});
+static HEADER_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&COMMIT_INFO_FIELD),
+};
 
 /// Per-commit handle returned by [`super::CommitRange::commits`].
 ///

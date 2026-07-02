@@ -34,7 +34,7 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
+    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
     StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
@@ -56,17 +56,13 @@ pub(crate) mod test_utils;
 #[cfg(test)]
 mod tests;
 
-pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        (&ADD_FIELD),
-        (&REMOVE_FIELD),
-    }
-});
-pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        (&ADD_FIELD),
-    }
-});
+pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+};
+pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+};
 
 /// Checkpoint schema WITHOUT stats for column projection pushdown.
 /// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.

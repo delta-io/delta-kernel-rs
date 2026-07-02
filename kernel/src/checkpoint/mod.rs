@@ -121,7 +121,7 @@ use crate::expressions::{
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
@@ -323,7 +323,7 @@ fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
 
 /// Schema for V1 checkpoints (without checkpointMetadata action)
 static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { ..(base_checkpoint_action_fields()) });
+    lazy_schema_ref! { ..(base_checkpoint_action_fields()) };
 
 /// Schema for the checkpointMetadata field in V2 checkpoints.
 /// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
@@ -336,12 +336,10 @@ fn checkpoint_metadata_field() -> StructField {
 }
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action)
-static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        ..(base_checkpoint_action_fields()),
-        (checkpoint_metadata_field()),
-    }
-});
+static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(base_checkpoint_action_fields()),
+    (checkpoint_metadata_field()),
+};
 
 /// Orchestrates the process of creating a checkpoint for a table.
 ///

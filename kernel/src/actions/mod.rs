@@ -12,7 +12,8 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{
-    schema_ref, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+    lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef, StructField, StructType,
+    ToSchema as _,
 };
 use crate::table_features::{
     FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
@@ -106,69 +107,61 @@ pub(crate) static CHECKPOINT_METADATA_FIELD: LazyLock<StructField> = LazyLock::n
 pub(crate) static SIDECAR_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
 
-static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        (&ADD_FIELD),
-        (&REMOVE_FIELD),
-        (&METADATA_FIELD),
-        (&PROTOCOL_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&COMMIT_INFO_FIELD),
-        (&CDC_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-    }
-});
+static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+};
 
-static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        (&ADD_FIELD),
-        (&REMOVE_FIELD),
-        (&METADATA_FIELD),
-        (&PROTOCOL_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&COMMIT_INFO_FIELD),
-        (&CDC_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-        (&CHECKPOINT_METADATA_FIELD),
-        (&SIDECAR_FIELD),
-    }
-});
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&CHECKPOINT_METADATA_FIELD),
+    (&SIDECAR_FIELD),
+};
 
 /// Schema for Add actions in the Delta log.
 /// Wraps the Add action schema in a top-level struct with "add" field name.
 #[internal_api]
-pub(crate) static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { (&ADD_FIELD) });
+pub(crate) static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&ADD_FIELD) };
 
 /// Schema for Remove actions in the Delta log.
 /// Wraps the Remove action schema in a top-level struct with "remove" field name.
 #[internal_api]
-pub(crate) static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { (&REMOVE_FIELD) });
+pub(crate) static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&REMOVE_FIELD) };
 
 #[internal_api]
-pub(crate) static LOG_METADATA_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { (&METADATA_FIELD) });
+pub(crate) static LOG_METADATA_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&METADATA_FIELD) };
 
 #[internal_api]
-pub(crate) static LOG_PROTOCOL_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { (&PROTOCOL_FIELD) });
+pub(crate) static LOG_PROTOCOL_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&PROTOCOL_FIELD) };
 
 /// Schema for CommitInfo actions in the Delta log.
 /// Wraps the CommitInfo schema in a top-level struct with "commitInfo" field name.
 #[internal_api]
 pub(crate) static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { (&COMMIT_INFO_FIELD) });
+    lazy_schema_ref! { (&COMMIT_INFO_FIELD) };
 
 /// Schema for transaction (txn) actions in the Delta log.
 /// Wraps the SetTransaction schema in a top-level struct with "txn" field name.
 #[internal_api]
 pub(crate) static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { (&SET_TRANSACTION_FIELD) });
+    lazy_schema_ref! { (&SET_TRANSACTION_FIELD) };
 
 #[internal_api]
 pub(crate) static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { (&DOMAIN_METADATA_FIELD) });
+    lazy_schema_ref! { (&DOMAIN_METADATA_FIELD) };
 
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits

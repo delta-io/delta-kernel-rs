@@ -83,7 +83,7 @@ use crate::actions::{
     ADD_FIELD, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD,
     SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
-use crate::schema::{schema_ref, SchemaRef};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 
 mod writer;
 
@@ -94,14 +94,12 @@ mod tests;
 
 /// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
-static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        (&ADD_FIELD),
-        (&REMOVE_FIELD),
-        (&METADATA_FIELD),
-        (&PROTOCOL_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-        (&SIDECAR_FIELD),
-    }
-});
+static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&SIDECAR_FIELD),
+};

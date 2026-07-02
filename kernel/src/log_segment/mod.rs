@@ -25,7 +25,7 @@ use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::compare::SchemaComparison;
-use crate::schema::{schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
@@ -1199,7 +1199,7 @@ impl LogSegment {
     /// Schema to read just the sidecar column from a checkpoint file.
     fn sidecar_read_schema() -> SchemaRef {
         static SIDECAR_SCHEMA: LazyLock<SchemaRef> =
-            LazyLock::new(|| schema_ref! { nullable SIDECAR_NAME: (Sidecar::to_schema()) });
+            lazy_schema_ref! { nullable SIDECAR_NAME: (Sidecar::to_schema()) };
         SIDECAR_SCHEMA.clone()
     }
 

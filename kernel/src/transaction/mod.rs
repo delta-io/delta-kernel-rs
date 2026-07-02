@@ -40,7 +40,7 @@ use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 #[cfg(feature = "column-defaults-in-dev")]
 use crate::schema::ColumnDefault;
 use crate::schema::{
-    schema_ref, ArrayType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, ArrayType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -89,14 +89,12 @@ pub(crate) type EngineDataResultIterator<'a> =
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange
 /// column.
-pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        not_null "path": STRING,
-        not_null "partitionValues": { STRING => nullable STRING },
-        not_null "size": LONG,
-        not_null "modificationTime": LONG,
-    }
-});
+pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    not_null "path": STRING,
+    not_null "partitionValues": { STRING => nullable STRING },
+    not_null "size": LONG,
+    not_null "modificationTime": LONG,
+};
 
 /// Returns a reference to the mandatory fields in an add action.
 ///
@@ -118,21 +116,19 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 /// The nested structures within nullCount/minValues/maxValues depend on the table's data schema
 /// and which columns have statistics enabled. Use [`Transaction::stats_schema`] to get the
 /// expected stats schema for a specific table.
-pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    schema_ref! {
-        ..(mandatory_add_file_schema().fields().cloned()),
-        nullable "stats": {
-            nullable NUM_RECORDS: LONG,
-            // nullCount, minValues, maxValues are dynamic based on data schema. Empty struct
-            // placeholders indicate these fields exist but their inner structure depends on the
-            // table schema and stats column configuration.
-            nullable NULL_COUNT: {},
-            nullable MIN_VALUES: {},
-            nullable MAX_VALUES: {},
-            nullable TIGHT_BOUNDS: BOOLEAN,
-        },
-    }
-});
+pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(mandatory_add_file_schema().fields().cloned()),
+    nullable "stats": {
+        nullable NUM_RECORDS: LONG,
+        // nullCount, minValues, maxValues are dynamic based on data schema. Empty struct
+        // placeholders indicate these fields exist but their inner structure depends on the
+        // table schema and stats column configuration.
+        nullable NULL_COUNT: {},
+        nullable MIN_VALUES: {},
+        nullable MAX_VALUES: {},
+        nullable TIGHT_BOUNDS: BOOLEAN,
+    },
+};
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
@@ -1762,7 +1758,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
-    use crate::schema::MapType;
+    use crate::schema::{schema_ref, MapType};
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;

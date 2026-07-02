@@ -43,6 +43,11 @@ pub(crate) mod void_utils;
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
+/// Sugar for `LazyLock::new(|| `[`schema_ref!`](schema_ref)` { ... })`, yielding a lazy
+/// [`SchemaRef`].
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::lazy_schema_ref;
 /// Builds a [`StructType`] from a JSON-shaped description that freely mixes literal structure
 /// with interpolated runtime values, in the spirit of [`serde_json::json!`].
 ///

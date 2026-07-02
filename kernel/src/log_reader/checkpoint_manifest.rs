@@ -9,7 +9,7 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{schema_ref, SchemaRef};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
 
@@ -40,13 +40,11 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            schema_ref! {
-                (&ADD_FIELD),
-                (&REMOVE_FIELD),
-                (&SIDECAR_FIELD),
-            }
-        });
+        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+            (&SIDECAR_FIELD),
+        };
 
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
