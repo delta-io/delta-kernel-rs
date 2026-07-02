@@ -161,7 +161,7 @@ impl From<&ScanParquet> for proto_plan::ScanParquetNode {
     fn from(node: &ScanParquet) -> Self {
         proto_plan::ScanParquetNode {
             files: convert_vec(&node.files),
-            file_constant_columns: convert_vec(&node.file_constant_columns),
+            file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
         }
     }
@@ -171,7 +171,7 @@ impl From<&ScanJson> for proto_plan::ScanJsonNode {
     fn from(node: &ScanJson) -> Self {
         proto_plan::ScanJsonNode {
             files: convert_vec(&node.files),
-            file_constant_columns: convert_vec(&node.file_constant_columns),
+            file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
         }
     }
@@ -216,7 +216,7 @@ impl From<&Load> for proto_plan::LoadNode {
             schema: Some(node.schema.as_ref().into()),
             file_type: proto_plan::FileType::from(node.file_type) as i32,
             base_url: node.base_url.as_ref().map(ToString::to_string),
-            file_constant_columns: convert_vec(&node.file_constant_columns),
+            file_constant_columns: node.file_constant_columns.clone(),
             file_meta: Some((&node.file_meta).into()),
             dv_column: Some((&node.dv_column).into()),
         }
@@ -1101,7 +1101,7 @@ mod tests {
     fn from_scan_parquet() {
         let node = ScanParquet {
             files: vec![ScanFile::new(sample_file_meta())],
-            file_constant_columns: vec![ColumnName::new(["c"])],
+            file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
         };
         let proto = proto_plan::ScanParquetNode::from(&node);
@@ -1114,7 +1114,7 @@ mod tests {
     fn from_scan_json() {
         let node = ScanJson {
             files: vec![ScanFile::new(sample_file_meta())],
-            file_constant_columns: vec![ColumnName::new(["c"])],
+            file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
         };
         let proto = proto_plan::ScanJsonNode::from(&node);
@@ -1179,7 +1179,7 @@ mod tests {
             schema: sample_schema(),
             file_type,
             base_url,
-            file_constant_columns: vec![ColumnName::new(["c"])],
+            file_constant_columns: vec!["c".to_string()],
             file_meta: sample_load_column_file_meta(),
             dv_column: ColumnName::new(["dv"]),
         };

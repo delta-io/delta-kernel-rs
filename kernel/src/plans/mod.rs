@@ -1,13 +1,13 @@
 //! This module defines the concept of a PlanExecutor and its associated input + output types.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
+mod builder;
 pub mod ir;
 pub mod proto;
-mod query_builder;
 
+pub use builder::PlanBuilder;
 use bytes::Bytes;
 pub use ir::{IoOperation, Operation};
-pub use query_builder::QueryPlanBuilder;
 
 use crate::{
     AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,

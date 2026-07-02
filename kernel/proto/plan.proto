@@ -32,13 +32,13 @@ message ScanFile {
 
 message ScanParquetNode {
   repeated ScanFile files = 1;
-  repeated delta.kernel.expressions.ColumnName file_constant_columns = 2;
+  repeated string file_constant_columns = 2;
   delta.kernel.schema.StructType schema = 3;
 }
 
 message ScanJsonNode {
   repeated ScanFile files = 1;
-  repeated delta.kernel.expressions.ColumnName file_constant_columns = 2;
+  repeated string file_constant_columns = 2;
   delta.kernel.schema.StructType schema = 3;
 }
 
@@ -81,7 +81,7 @@ message LoadNode {
   delta.kernel.schema.StructType schema = 1;
   FileType file_type = 2;
   optional string base_url = 3;
-  repeated delta.kernel.expressions.ColumnName file_constant_columns = 4;
+  repeated string file_constant_columns = 4;
   LoadColumnFileMeta file_meta = 5;
   delta.kernel.expressions.ColumnName dv_column = 6;
 }
