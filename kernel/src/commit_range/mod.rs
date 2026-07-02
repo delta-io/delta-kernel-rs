@@ -54,9 +54,9 @@ pub use builder::{CommitOrdering, CommitRangeBuilder};
 use url::Url;
 
 use crate::actions::{
-    ADD_FIELD, CDC_FIELD, CHECKPOINT_METADATA_FIELD, COMMIT_INFO_FIELD, DOMAIN_METADATA_FIELD,
-    METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD, Metadata,
-    Protocol,
+    Metadata, Protocol, ADD_FIELD, CDC_FIELD, CHECKPOINT_METADATA_FIELD, COMMIT_INFO_FIELD,
+    DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
+    SIDECAR_FIELD,
 };
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType};

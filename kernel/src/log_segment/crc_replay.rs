@@ -16,8 +16,8 @@ use crate::actions::visitors::{
     visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
 };
 use crate::actions::{
-    DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, SET_TRANSACTION_FIELD,
-    DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, REMOVE_NAME,
+    DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
+    METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,

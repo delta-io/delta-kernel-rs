@@ -11,7 +11,9 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
-use crate::schema::{schema_ref, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{
+    schema_ref, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::table_features::{
     FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -90,44 +92,46 @@ pub(crate) static METADATA_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(METADATA_NAME, Metadata::to_schema()));
 pub(crate) static PROTOCOL_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()));
-pub(crate) static SET_TRANSACTION_FIELD: LazyLock<StructField> = LazyLock::new(|| {
-    StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema())
-});
+pub(crate) static SET_TRANSACTION_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()));
 pub(crate) static COMMIT_INFO_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()));
 pub(crate) static CDC_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(CDC_NAME, Cdc::to_schema()));
-pub(crate) static DOMAIN_METADATA_FIELD: LazyLock<StructField> = LazyLock::new(|| {
-    StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema())
-});
+pub(crate) static DOMAIN_METADATA_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()));
 pub(crate) static CHECKPOINT_METADATA_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
 });
 pub(crate) static SIDECAR_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
 
-static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
-    (&ADD_FIELD),
-    (&REMOVE_FIELD),
-    (&METADATA_FIELD),
-    (&PROTOCOL_FIELD),
-    (&SET_TRANSACTION_FIELD),
-    (&COMMIT_INFO_FIELD),
-    (&CDC_FIELD),
-    (&DOMAIN_METADATA_FIELD),
+static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    schema_ref! {
+        (&ADD_FIELD),
+        (&REMOVE_FIELD),
+        (&METADATA_FIELD),
+        (&PROTOCOL_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&COMMIT_INFO_FIELD),
+        (&CDC_FIELD),
+        (&DOMAIN_METADATA_FIELD),
+    }
 });
 
-static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
-    (&ADD_FIELD),
-    (&REMOVE_FIELD),
-    (&METADATA_FIELD),
-    (&PROTOCOL_FIELD),
-    (&SET_TRANSACTION_FIELD),
-    (&COMMIT_INFO_FIELD),
-    (&CDC_FIELD),
-    (&DOMAIN_METADATA_FIELD),
-    (&CHECKPOINT_METADATA_FIELD),
-    (&SIDECAR_FIELD),
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    schema_ref! {
+        (&ADD_FIELD),
+        (&REMOVE_FIELD),
+        (&METADATA_FIELD),
+        (&PROTOCOL_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&COMMIT_INFO_FIELD),
+        (&CDC_FIELD),
+        (&DOMAIN_METADATA_FIELD),
+        (&CHECKPOINT_METADATA_FIELD),
+        (&SIDECAR_FIELD),
+    }
 });
 
 /// Schema for Add actions in the Delta log.

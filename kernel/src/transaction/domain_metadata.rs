@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::{EngineDataResultIterator, Transaction};
-use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::error::Error;
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;

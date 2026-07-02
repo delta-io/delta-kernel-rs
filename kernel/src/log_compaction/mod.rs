@@ -94,12 +94,14 @@ mod tests;
 
 /// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
-static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
-    (&ADD_FIELD),
-    (&REMOVE_FIELD),
-    (&METADATA_FIELD),
-    (&PROTOCOL_FIELD),
-    (&SET_TRANSACTION_FIELD),
-    (&DOMAIN_METADATA_FIELD),
-    (&SIDECAR_FIELD),
+static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    schema_ref! {
+        (&ADD_FIELD),
+        (&REMOVE_FIELD),
+        (&METADATA_FIELD),
+        (&PROTOCOL_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&DOMAIN_METADATA_FIELD),
+        (&SIDECAR_FIELD),
+    }
 });

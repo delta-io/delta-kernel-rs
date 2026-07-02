@@ -3,13 +3,12 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
-
 use std::sync::Arc;
 
 use tracing::{info, instrument};
 
 use super::LogSegment;
-use crate::actions::{METADATA_FIELD, PROTOCOL_FIELD, Metadata, Protocol};
+use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;

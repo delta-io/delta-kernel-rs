@@ -40,10 +40,12 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
-            (&ADD_FIELD),
-            (&REMOVE_FIELD),
-            (&SIDECAR_FIELD),
+        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            schema_ref! {
+                (&ADD_FIELD),
+                (&REMOVE_FIELD),
+                (&SIDECAR_FIELD),
+            }
         });
 
         let actions = match manifest.extension.as_str() {

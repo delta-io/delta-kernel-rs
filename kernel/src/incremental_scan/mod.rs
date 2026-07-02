@@ -4,25 +4,18 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use crate::actions::{ADD_FIELD, REMOVE_FIELD};
-use crate::schema::schema_ref;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
-use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef};
+use crate::scan::COMMIT_READ_SCHEMA;
+use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, Version,
 };
-
-/// Schema projected from each commit JSON: `add` and `remove` only.
-static INCREMENTAL_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
-    (&ADD_FIELD),
-    (&REMOVE_FIELD),
-});
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via
 /// [`crate::Snapshot::incremental_scan_builder`] and drive with
@@ -123,7 +116,7 @@ impl IncrementalScanBuilder {
 
         let actions = engine.json_handler().read_json_files(
             &commit_locations,
-            INCREMENTAL_READ_SCHEMA.clone(),
+            COMMIT_READ_SCHEMA.clone(),
             None,
         )?;
 

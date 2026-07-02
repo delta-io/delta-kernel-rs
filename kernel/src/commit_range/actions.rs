@@ -4,9 +4,7 @@ use std::sync::LazyLock;
 use url::Url;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
-use crate::actions::{
-    COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD, Metadata, Protocol,
-};
+use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
@@ -35,10 +33,12 @@ pub enum DeltaAction {
 
 /// Read schema for the per-commit header: protocol + metadata (for validation and the effective
 /// table configuration) plus commitInfo (for the in-commit timestamp).
-static HEADER_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
-    (&PROTOCOL_FIELD),
-    (&METADATA_FIELD),
-    (&COMMIT_INFO_FIELD),
+static HEADER_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    schema_ref! {
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+        (&COMMIT_INFO_FIELD),
+    }
 });
 
 /// Per-commit handle returned by [`super::CommitRange::commits`].

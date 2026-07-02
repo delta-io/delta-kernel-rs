@@ -10,8 +10,8 @@ use tracing::info;
 
 use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
 use crate::actions::{
-    Metadata, Protocol, ADD_FIELD, CDC_FIELD, LOG_ADD_SCHEMA, METADATA_FIELD, PROTOCOL_FIELD,
-    REMOVE_FIELD, COMMIT_INFO_NAME,
+    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, LOG_ADD_SCHEMA, METADATA_FIELD,
+    PROTOCOL_FIELD, REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{

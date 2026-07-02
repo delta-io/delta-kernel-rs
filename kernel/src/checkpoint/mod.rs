@@ -336,9 +336,11 @@ fn checkpoint_metadata_field() -> StructField {
 }
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action)
-static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
-    ..(base_checkpoint_action_fields()),
-    (checkpoint_metadata_field()),
+static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
+    schema_ref! {
+        ..(base_checkpoint_action_fields()),
+        (checkpoint_metadata_field()),
+    }
 });
 
 /// Orchestrates the process of creating a checkpoint for a table.

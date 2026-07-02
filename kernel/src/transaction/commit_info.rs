@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::Transaction;
-use crate::actions::{CommitInfo, LOG_COMMIT_INFO_SCHEMA, COMMIT_INFO_NAME};
+use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
 use crate::expressions::{MapData, Scalar};
 use crate::schema::{schema_ref, MapType, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -114,9 +114,7 @@ impl<S> Transaction<S> {
                 )?;
                 evaluator.evaluate(engine_commit_info.as_ref())
             }
-            None => {
-                kernel_commit_info.into_engine_data(LOG_COMMIT_INFO_SCHEMA.clone(), engine)
-            }
+            None => kernel_commit_info.into_engine_data(LOG_COMMIT_INFO_SCHEMA.clone(), engine),
         }
     }
 }
