@@ -382,7 +382,6 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
     let schema = get_simple_int_schema();
 
     for field in ["path", "partitionValues", "size", "modificationTime"] {
-        // A fresh table per field, since committing consumes the transaction.
         let (table_url, engine, _store, _table_name) =
             setup_test_tables(schema.clone(), &[], None, "required_field_table")
                 .await?

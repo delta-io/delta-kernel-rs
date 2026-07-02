@@ -426,7 +426,7 @@ impl<S> Transaction<S> {
         // Validate required fields for addFile.
         if !self.add_files_metadata.is_empty() {
             write_validation::ActionValidator::new(
-                &write_validation::ADD_REQUIRED_COLUMNS_TYPES,
+                &write_validation::ADDFILE_REQUIRED_COLUMNS_TYPES,
                 vec![Box::new(write_validation::AddFileRequiredFields)],
             )?
             .validate(&self.add_files_metadata)?;
@@ -1779,7 +1779,7 @@ mod tests {
     use crate::utils::test_utils::{
         install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
         test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
-        CapturingReporter,
+        valid_add_file_batch, CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -2683,7 +2683,7 @@ mod tests {
     // validate_blind_append tests
     // ============================================================================
     fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
-        let batch = crate::utils::test_utils::valid_add_file_batch(false /* all_nullable */);
+        let batch = valid_add_file_batch(false /* all_nullable */);
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 

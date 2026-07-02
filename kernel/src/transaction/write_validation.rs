@@ -11,21 +11,22 @@ use crate::schema::{ColumnNamesAndTypes, DataType, MapType};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error};
 
-pub(crate) static ADD_REQUIRED_COLUMNS_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-    let names = vec![
-        column_name!("path"),
-        column_name!("partitionValues"),
-        column_name!("size"),
-        column_name!("modificationTime"),
-    ];
-    let types = vec![
-        DataType::STRING,
-        MapType::new(DataType::STRING, DataType::STRING, true).into(),
-        DataType::LONG,
-        DataType::LONG,
-    ];
-    (names, types).into()
-});
+pub(crate) static ADDFILE_REQUIRED_COLUMNS_TYPES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| {
+        let names = vec![
+            column_name!("path"),
+            column_name!("partitionValues"),
+            column_name!("size"),
+            column_name!("modificationTime"),
+        ];
+        let types = vec![
+            DataType::STRING,
+            MapType::new(DataType::STRING, DataType::STRING, true).into(),
+            DataType::LONG,
+            DataType::LONG,
+        ];
+        (names, types).into()
+    });
 
 pub(crate) trait Validation {
     /// The leaf columns this validation reads, in the order [`Validation::validate_row`] expects
@@ -118,7 +119,9 @@ impl ActionValidator {
                     .map(|column| {
                         name_to_index.get(column).copied().ok_or_else(|| {
                             Error::internal_error(format!(
-                                "write-validation column '{column}' is not in the provided union"
+                                "to-be-validated column '{column}' is not in the validator's \
+                                 column list: [{}]",
+                                names.iter().join(", ")
                             ))
                         })
                     })
@@ -193,7 +196,7 @@ mod tests {
 
     fn add_validator() -> ActionValidator {
         ActionValidator::new(
-            &ADD_REQUIRED_COLUMNS_TYPES,
+            &ADDFILE_REQUIRED_COLUMNS_TYPES,
             vec![Box::new(AddFileRequiredFields)],
         )
         .unwrap()
