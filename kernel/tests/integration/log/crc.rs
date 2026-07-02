@@ -544,16 +544,173 @@ async fn test_write_checksum_double_write_returns_already_exists(
     Ok(())
 }
 
+/// No checkpoint: `write_checksum` resolves from a stale on-disk CRC or from version zero.
+#[rstest]
+#[case::stale_on_disk_crc(true)]
+#[case::version_zero(false)]
 #[tokio::test]
-async fn test_write_checksum_with_no_in_memory_crc_returns_error() -> DeltaResult<()> {
+async fn test_write_checksum_resolves_crc_with_no_in_memory_crc(
+    #[case] write_crc_at_v0: bool,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let _ = create_table_and_commit(&table_path, engine.as_ref())?;
+    let snap = create_table_and_commit(&table_path, engine.as_ref())?
+        .post_commit_snapshot()
+        .unwrap()
+        .clone();
+    if write_crc_at_v0 {
+        snap.write_checksum(engine.as_ref())?;
+    }
+    let snap = insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![1]))])
+        .await?
+        .unwrap_post_commit_snapshot();
+    insert_data(snap, &engine, vec![Arc::new(Int32Array::from(vec![2]))])
+        .await?
+        .unwrap_committed();
 
-    // Load from disk -- no CRC file on disk, so no in-memory CRC
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    // Default load (no incremental replay), so no in-memory CRC.
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 2);
+    assert!(fresh.crc().is_none());
 
-    let result = snapshot.write_checksum(engine.as_ref());
-    assert!(result.is_err());
+    let (result, _updated) = fresh.write_checksum(engine.as_ref())?;
+    assert_eq!(result, ChecksumWriteResult::Written);
+
+    // The written CRC round-trips with file stats covering both inserted files.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let stats = reloaded.get_file_stats_if_present().unwrap();
+    assert_eq!(stats.num_files(), 2);
+
+    Ok(())
+}
+
+/// Checkpoint at the current version, no tail commits, no CRC: `write_checksum` builds the CRC
+/// from the checkpoint and fills ICT (present iff enabled) from v_end's commit file.
+#[rstest]
+#[case::ict_enabled(true)]
+#[case::ict_disabled(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_checksum_from_checkpoint_at_current_version(
+    #[case] ict_enabled: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let mut builder = create_table(&table_path, schema, "test_engine");
+    if ict_enabled {
+        builder = builder.with_table_properties([
+            ("delta.feature.inCommitTimestamp", "supported"),
+            ("delta.enableInCommitTimestamps", "true"),
+        ]);
+    }
+    let snap = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_version = snap.version();
+
+    // Default load: checkpoint at the current version, no tail commits, no CRC.
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), checkpoint_version);
+    assert!(fresh.crc().is_none());
+    assert_eq!(
+        fresh.log_segment().checkpoint_version,
+        Some(checkpoint_version)
+    );
+
+    let (result, _updated) = fresh.write_checksum(engine.as_ref())?;
+    assert_eq!(result, ChecksumWriteResult::Written);
+
+    // ICT is present iff the table enabled it; either way the CRC round-trips.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(
+        reloaded.crc().unwrap().in_commit_timestamp_opt.is_some(),
+        ict_enabled
+    );
+
+    Ok(())
+}
+
+/// ICT enabled, checkpoint at the current version, but v_end's commit file is unreadable: the
+/// ICT read fails, and rather than persist a CRC with a missing ICT the write fails closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_returns_unsupported(
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let snap = create_table(&table_path, schema, "test_engine")
+        .with_table_properties([
+            ("delta.feature.inCommitTimestamp", "supported"),
+            ("delta.enableInCommitTimestamps", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_version = snap.version();
+
+    // Corrupt v_end's commit file so its ICT can't be read (the snapshot still loads from the
+    // checkpoint at the same version).
+    let commit = _temp_dir
+        .path()
+        .join(format!("_delta_log/{checkpoint_version:020}.json"));
+    std::fs::write(&commit, b"}}} not valid commit json").unwrap();
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh.crc().is_none());
+    assert!(matches!(
+        fresh.write_checksum(engine.as_ref()),
+        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+    ));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported(
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let snap = create_table(&table_path, schema, "test_engine")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
+    // Non-incremental operation in the tail dooms file stats regardless of the checkpoint.
+    begin_transaction(snap, engine.as_ref())?
+        .with_operation("ANALYZE STATS".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh.crc().is_none());
+    assert!(matches!(
+        fresh.write_checksum(engine.as_ref()),
+        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+    ));
 
     Ok(())
 }
@@ -1811,16 +1968,40 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     );
 
     // === Check: write_checksum ===
-    if expect_crc_present {
+    // Succeeds whether or not an in-memory CRC was present: with no CRC, write_checksum resolves
+    // one from the checkpoint root and advances it over the tail commits.
+    assert_eq!(
+        fresh.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+
+    // For the Absent case the CRC was rooted at the checkpoint. Reload and read domain metadata,
+    // set transactions, and file stats through `FailingEngine`: with I/O impossible, every value
+    // must come from the written CRC's `Complete` state.
+    if crc_staleness == CrcStaleness::Absent {
+        let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        assert!(reloaded.crc().is_some());
+        // File stats: checkpoint base summed with the advanced tail, checked against disk.
+        let stats = reloaded.get_file_stats_if_present().unwrap();
+        let disk = parquet_file_sizes_on_disk(&table_path);
+        assert_eq!(stats.num_files() as usize, disk.len());
+        assert_eq!(stats.table_size_bytes(), disk.iter().sum::<i64>());
+        // Carried from the checkpoint base.
+        assert!(reloaded
+            .get_domain_metadata_internal("domain_at_create", &FailingEngine)?
+            .is_some());
         assert_eq!(
-            fresh.write_checksum(engine.as_ref())?.0,
-            ChecksumWriteResult::Written
+            reloaded.get_app_id_version("app_at_create", &FailingEngine)?,
+            Some(0)
         );
-    } else {
-        assert!(matches!(
-            fresh.write_checksum(engine.as_ref()),
-            Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
-        ));
+        // Carried from the advanced tail.
+        assert!(reloaded
+            .get_domain_metadata_internal("domain", &FailingEngine)?
+            .is_some());
+        assert_eq!(
+            reloaded.get_app_id_version("app", &FailingEngine)?,
+            Some(LATEST_VERSION)
+        );
     }
 
     Ok(())
