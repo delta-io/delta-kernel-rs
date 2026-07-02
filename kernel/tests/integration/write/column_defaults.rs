@@ -70,12 +70,13 @@ fn test_schema_with_column_defaults_overwrites_existing_default() {
 
 #[cfg(not(feature = "column-defaults-in-dev"))]
 mod feature_disabled {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Snapshot;
-    use test_utils::{create_table, engine_store_setup};
+    use test_utils::{create_table, engine_store_setup, schema_with_column_defaults};
 
     #[tokio::test]
     async fn test_col_defaults_blocked_when_cargo_feature_off(
@@ -109,6 +110,35 @@ mod feature_disabled {
 
         Ok(())
     }
+
+    /// With the cargo feature off, `V3_CHECKS` omits `check_column_defaults`, so a V3 table whose
+    /// default would be rejected with the feature on (here a non-literal primitive default) still
+    /// loads. `allowColumnDefaults` is a writer feature, so it does not block snapshot load.
+    #[tokio::test]
+    async fn test_v3_column_default_check_absent_when_cargo_feature_off(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable("c", DataType::TIMESTAMP)])?;
+        let schema =
+            schema_with_column_defaults(&base, HashMap::from([("c", "current_timestamp()")]))?;
+
+        let (store, engine, table_location) = engine_store_setup("test_v3_default_off", None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            &[],    /* partition_columns */
+            true,   /* use_37_protocol */
+            vec![], /* reader_features */
+            vec!["allowColumnDefaults", "icebergCompatV3"],
+        )
+        .await?;
+
+        Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect("V3 table must load when the column-defaults check is not compiled in");
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "column-defaults-in-dev")]
@@ -116,7 +146,7 @@ mod feature_enabled {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use delta_kernel::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
@@ -317,10 +347,8 @@ mod feature_enabled {
         Ok(())
     }
 
-    /// A non-NULL default on a non-primitive column is accepted at create time but surfaces as an
-    /// error when later discovered via `Transaction::column_defaults`.
     #[tokio::test]
-    async fn test_transaction_column_defaults_errors_on_non_null_non_primitive_default(
+    async fn test_load_rejects_non_null_non_primitive_default(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let base = StructType::try_new(vec![StructField::nullable(
             "arr",
@@ -329,7 +357,7 @@ mod feature_enabled {
         let schema = schema_with_column_defaults(&base, HashMap::from([("arr", "ARRAY(1)")]))?;
 
         let (store, engine, table_location) =
-            engine_store_setup("test_txn_column_defaults_non_primitive", None);
+            engine_store_setup("test_load_non_primitive_default", None);
         let table_url = create_table(
             store,
             table_location,
@@ -341,14 +369,140 @@ mod feature_enabled {
         )
         .await?;
 
-        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-
-        let err = txn
-            .column_defaults()
-            .expect_err("a non-NULL default on a non-primitive column must error")
+        let err = Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect_err("a non-NULL default on a non-primitive column must error at load")
             .to_string();
         assert!(err.contains("not supported"), "got: {err}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_default_without_allow_column_defaults_feature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable("c", DataType::INTEGER)])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42")]))?;
+
+        let (store, engine, table_location) = engine_store_setup("test_load_stray_default", None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            &[],    /* partition_columns */
+            true,   /* use_37_protocol */
+            vec![], /* reader_features */
+            vec![], /* writer_features: no allowColumnDefaults */
+        )
+        .await?;
+
+        let err = Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect_err("a CURRENT_DEFAULT without the allowColumnDefaults feature must error")
+            .to_string();
+        assert!(err.contains("allowColumnDefaults"), "got: {err}");
+
+        Ok(())
+    }
+
+    /// End-to-end: a literal column default composes with `icebergCompatV3`. The default survives
+    /// the column-mapping transform (so it is still discoverable by its logical name), and a write
+    /// that materializes the default round-trips on read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_column_default_with_iceberg_compat_v3_e2e(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("c", DataType::INTEGER),
+        ])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42")]))?;
+
+        let (store, engine, table_location) = engine_store_setup("test_v3_col_default_e2e", None);
+        // The helper auto-enables V3's dependencies (columnMapping, rowTracking, domainMetadata)
+        // and assigns the per-field column-mapping metadata a valid V3 table requires.
+        let table_url = create_table(
+            store,
+            table_location,
+            schema.clone(),
+            &[],    /* partition_columns */
+            true,   /* use_37_protocol */
+            vec![], /* reader_features */
+            vec!["allowColumnDefaults", "icebergCompatV3"],
+        )
+        .await?;
+        let engine = Arc::new(engine);
+
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let writer_features = snapshot
+            .table_configuration()
+            .protocol()
+            .writer_features()
+            .expect("writer_features must be present on a writer v7 table");
+        for feature in [
+            TableFeature::IcebergCompatV3,
+            TableFeature::RowTracking,
+            TableFeature::ColumnMapping,
+            TableFeature::AllowColumnDefaults,
+        ] {
+            assert!(
+                writer_features.contains(&feature),
+                "writer_features must include {feature:?}; got {writer_features:?}",
+            );
+        }
+
+        // The default is still keyed by the logical name `c` and parses to its literal.
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        let defaults = txn.column_defaults()?;
+        assert_eq!(defaults["c"].to_scalar()?, Some(Scalar::Integer(42)));
+        drop(defaults);
+        drop(txn);
+
+        // The connector materializes the default (42) into the batch, then writes.
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![42, 42, 42])),
+        ];
+        assert!(insert_data(snapshot, &engine, columns.clone())
+            .await?
+            .is_committed());
+
+        let data = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), columns)?;
+        test_read(&ArrowEngineData::new(data), &table_url, engine)?;
+
+        Ok(())
+    }
+
+    /// `icebergCompatV3` requires column defaults to be literals, so a non-literal primitive
+    /// default fails snapshot load. This asserts the check is wired into snapshot load; the
+    /// full reject/accept matrix (including the NULL-on-non-primitive kernel limitation) lives
+    /// in the `validate_v3_column_default` unit test in `iceberg_compat::v3`.
+    #[tokio::test]
+    async fn test_iceberg_compat_v3_rejects_non_literal_column_default(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable("c", DataType::TIMESTAMP)])?;
+        let schema =
+            schema_with_column_defaults(&base, HashMap::from([("c", "current_timestamp()")]))?;
+
+        let (store, engine, table_location) =
+            engine_store_setup("test_v3_invalid_col_default", None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            &[],    /* partition_columns */
+            true,   /* use_37_protocol */
+            vec![], /* reader_features */
+            vec!["allowColumnDefaults", "icebergCompatV3"],
+        )
+        .await?;
+
+        let err = Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect_err("icebergCompatV3 must reject a non-literal column default")
+            .to_string();
+        assert!(err.contains("literal"), "got: {err}");
 
         Ok(())
     }
