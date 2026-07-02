@@ -76,3 +76,46 @@ fn test_cross_product_read_write(
 
     Ok(())
 }
+
+/// A trailing remove commit (`LogState::with_removed_file`) drops one data file's rows from
+/// reads at the resulting latest version, while time travel to the last data version still
+/// sees them. Exercises Remove-action reconciliation across delta-only, checkpointed, and
+/// post-cleanup log states. Removes are feature-independent, so an unpartitioned, no-feature
+/// table is sufficient.
+#[rstest]
+#[case::commits_only(commits_only())]
+#[case::checkpoint_at_end(checkpoint_at_end())]
+#[case::checkpoint_mid_post_cleanup(checkpoint_mid_post_cleanup())]
+fn test_removed_file_excluded_from_scan(#[case] base: LogState) -> DeltaResult<()> {
+    let data_version = base.latest_version();
+    let table = test_table(
+        base.with_removed_file(),
+        no_features(),
+        unpartitioned(),
+        no_checkpoint_stats(),
+    );
+    let engine: Arc<dyn Engine> =
+        Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+
+    // Latest sees one fewer file than the data versions added.
+    let latest = build_snapshot!(VersionTarget::Latest, table.table_root(), engine.as_ref());
+    let latest_rows: usize = read_scan(&latest.scan_builder().build()?, engine.clone())?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(latest_rows, (data_version as usize - 1) * ROWS_PER_COMMIT);
+
+    // Time travel to the last data version still sees every file.
+    let before = build_snapshot!(
+        VersionTarget::AtVersion(data_version),
+        table.table_root(),
+        engine.as_ref()
+    );
+    let before_rows: usize = read_scan(&before.scan_builder().build()?, engine.clone())?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(before_rows, data_version as usize * ROWS_PER_COMMIT);
+
+    Ok(())
+}
