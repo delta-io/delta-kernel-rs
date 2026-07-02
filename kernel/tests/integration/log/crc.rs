@@ -544,9 +544,7 @@ async fn test_write_checksum_double_write_returns_already_exists(
     Ok(())
 }
 
-/// With no in-memory CRC at load, `write_checksum` resolves one from disk: a stale on-disk CRC
-/// at v0 is advanced (case 2), and with no CRC at all the full history from version zero is
-/// replayed (case 4). Neither table has a checkpoint.
+/// No checkpoint: `write_checksum` resolves from a stale on-disk CRC or from version zero.
 #[rstest]
 #[case::stale_on_disk_crc(true)]
 #[case::version_zero(false)]
@@ -585,9 +583,8 @@ async fn test_write_checksum_resolves_crc_with_no_in_memory_crc(
     Ok(())
 }
 
-/// Checkpoint at the current version with no tail commits and no CRC: `write_checksum` builds
-/// the CRC from the checkpoint and fills ICT from v_end's commit file. With ICT enabled the
-/// written CRC carries an ICT; with ICT disabled it carries `None` and the write still succeeds.
+/// Checkpoint at the current version, no tail commits, no CRC: `write_checksum` builds the CRC
+/// from the checkpoint and fills ICT (present iff enabled) from v_end's commit file.
 #[rstest]
 #[case::ict_enabled(true)]
 #[case::ict_disabled(false)]
@@ -637,6 +634,49 @@ async fn test_write_checksum_from_checkpoint_at_current_version(
         reloaded.crc().unwrap().in_commit_timestamp_opt.is_some(),
         ict_enabled
     );
+
+    Ok(())
+}
+
+/// ICT enabled, checkpoint at the current version, but v_end's commit file is unreadable: the
+/// ICT read fails, and rather than persist a CRC with a missing ICT the write fails closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_returns_unsupported(
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let snap = create_table(&table_path, schema, "test_engine")
+        .with_table_properties([
+            ("delta.feature.inCommitTimestamp", "supported"),
+            ("delta.enableInCommitTimestamps", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_version = snap.version();
+
+    // Corrupt v_end's commit file so its ICT can't be read (the snapshot still loads from the
+    // checkpoint at the same version).
+    let commit = _temp_dir
+        .path()
+        .join(format!("_delta_log/{checkpoint_version:020}.json"));
+    std::fs::write(&commit, b"}}} not valid commit json").unwrap();
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh.crc().is_none());
+    assert!(matches!(
+        fresh.write_checksum(engine.as_ref()),
+        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+    ));
 
     Ok(())
 }
@@ -1935,14 +1975,17 @@ async fn test_stale_crc_fresh_build_advance_matrix(
         ChecksumWriteResult::Written
     );
 
-    // For the Absent case, the CRC just written was rooted at the checkpoint (no prior CRC).
-    // Reload and read domain metadata and set transactions back through `FailingEngine`: every
-    // value must come from the written CRC's `Complete` state, so a mis-wired checkpoint visitor
-    // (e.g. a swapped `CommonColumns` index) surfaces as a wrong value or a panic, not a silent
-    // fallthrough to log replay.
+    // For the Absent case the CRC was rooted at the checkpoint. Reload and read domain metadata,
+    // set transactions, and file stats through `FailingEngine`: with I/O impossible, every value
+    // must come from the written CRC's `Complete` state.
     if crc_staleness == CrcStaleness::Absent {
         let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
         assert!(reloaded.crc().is_some());
+        // File stats: checkpoint base summed with the advanced tail, checked against disk.
+        let stats = reloaded.get_file_stats_if_present().unwrap();
+        let disk = parquet_file_sizes_on_disk(&table_path);
+        assert_eq!(stats.num_files() as usize, disk.len());
+        assert_eq!(stats.table_size_bytes(), disk.iter().sum::<i64>());
         // Carried from the checkpoint base.
         assert!(reloaded
             .get_domain_metadata_internal("domain_at_create", &FailingEngine)?
