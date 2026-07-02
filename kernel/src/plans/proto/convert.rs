@@ -1,6 +1,6 @@
 //! Conversions from the kernel plan IR into the prost-generated proto wire types.
 
-use super::plan::agg_fn as proto_agg_fn;
+use super::plan::agg as proto_agg;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -12,7 +12,7 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, AggFn, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Max, MaxNonNullBy, Min,
+    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Max, MaxNonNullBy, Min,
     MinNonNullBy, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
@@ -245,36 +245,27 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
-        proto_plan::Agg {
-            func: Some((&agg.func).into()),
-            alias: agg.alias.clone(),
-        }
-    }
-}
-
-impl From<&AggFn> for proto_plan::AggFn {
-    fn from(func: &AggFn) -> Self {
-        let func = match func {
-            AggFn::Min(Min { value }) => proto_agg_fn::Func::Min(proto_plan::MinAgg {
+        let func = match agg {
+            Agg::Min(Min { value }) => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            AggFn::Max(Max { value }) => proto_agg_fn::Func::Max(proto_plan::MaxAgg {
+            Agg::Max(Max { value }) => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            AggFn::MinNonNullBy(MinNonNullBy { value, key }) => {
-                proto_agg_fn::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
+            Agg::MinNonNullBy(MinNonNullBy { value, key }) => {
+                proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),
                 })
             }
-            AggFn::MaxNonNullBy(MaxNonNullBy { value, key }) => {
-                proto_agg_fn::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
+            Agg::MaxNonNullBy(MaxNonNullBy { value, key }) => {
+                proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),
                 })
             }
         };
-        proto_plan::AggFn { func: Some(func) }
+        proto_plan::Agg { func: Some(func) }
     }
 }
 
@@ -1203,13 +1194,12 @@ mod tests {
     fn from_aggregate() {
         let node = Aggregate {
             group_by: vec![ColumnName::new(["g"])],
-            aggs: vec![Agg::max(ColumnName::new(["a"])).with_alias("a_max")],
+            aggs: vec![Agg::max(ColumnName::new(["a"]))],
             schema: sample_schema(),
         };
         let proto = proto_plan::AggregateNode::from(&node);
         assert_eq!(proto.group_by.len(), 1);
         assert_eq!(proto.aggs.len(), 1);
-        assert_eq!(proto.aggs[0].alias.as_deref(), Some("a_max"));
         assert!(proto.aggs[0].func.is_some());
         assert!(proto.schema.is_some());
     }
@@ -1219,17 +1209,16 @@ mod tests {
     #[case(Agg::max(ColumnName::new(["a"])), "max")]
     #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
     #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
-    fn from_agg_fn(#[case] agg: Agg, #[case] expected: &str) {
-        use proto_plan::agg_fn::Func;
+    fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
+        use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
-        let kind = match proto.func.unwrap().func.unwrap() {
+        let kind = match proto.func.unwrap() {
             Func::Min(_) => "min",
             Func::Max(_) => "max",
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
         assert_eq!(kind, expected);
-        assert_eq!(proto.alias, None);
     }
 
     #[rstest]
