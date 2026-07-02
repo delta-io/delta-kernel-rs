@@ -52,7 +52,6 @@ impl CrcDelta {
     pub(crate) fn into_complete_crc(self, version: Version) -> Option<Crc> {
         let protocol = self.protocol?;
         let metadata = self.metadata?;
-        // The delta covers the full table, so the domain metadata state is authoritative.
         // Drop tombstones (a from-scratch state has no prior domains to remove).
         let domain_metadata_state = DomainMetadataState::Complete(
             self.domain_metadata
@@ -60,7 +59,6 @@ impl CrcDelta {
                 .filter(|(_, dm)| !dm.is_removed())
                 .collect(),
         );
-        // The delta covers the full table, so the set-transaction state is authoritative.
         let set_transaction_state = SetTransactionState::Complete(self.set_transactions);
         let file_stats_state = if self.is_incremental_safe {
             FileStatsState::Complete(FileStats {
