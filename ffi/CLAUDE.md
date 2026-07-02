@@ -51,17 +51,25 @@ The caller owns the returned builder handle and must call either `snapshot_build
 
 ## Commit Range Flow
 
-A `CommitRange` describes a contiguous commits of table. Build one
-via the commit range builder (`ffi/src/commit_range.rs`):
+A `CommitRange` describes a contiguous range of a table's commits. Build one via the commit range
+builder (`ffi/src/commit_range.rs`):
 
 ```
 commit_range_builder_for(path, start_version, engine)
   -> commit_range_builder_set_end_version(builder, end_version)  // optional; else latest version
   -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
+  -> commit_range_commits(range, engine, actions, actions_len)   // -> SharedCommitActionsIterator
+       // or commit_range_commits_with_snapshot(range, engine, start_snapshot, actions, actions_len)
+  -> commit_range_commits_next(iter, ctx, visitor)               // visitor receives a SharedCommitAction
+       // in the visitor: commit_action_version / commit_action_timestamp
+       //                  commit_action_get_actions(action, engine) -> ExclusiveFileReadResultIterator
+       //                    -> read_result_next(...) -> free_read_result_iter(...)
 ```
 
 The caller owns the builder and must call either `commit_range_builder_build` or
-`free_commit_range_builder`. Release the range with `free_commit_range`.
+`free_commit_range_builder`. Release the range with `free_commit_range` and the commits iterator
+with `free_commit_actions_iter`. Each `SharedCommitAction` handed to the visitor must be released
+with `free_commit_action`.
 
 ## Write Flow
 
