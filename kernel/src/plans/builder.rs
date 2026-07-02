@@ -3,11 +3,10 @@
 //! a new builder; clone a builder (cheap) to feed it into more than one transform. Validating
 //! methods return [`DeltaResult`] and surface errors at the call site.
 //!
-//! A source with no rows (e.g. a scan over no files) is the *absent* relation. Absence is
-//! transitive: a transform over an absent input is itself absent. The builder treats it as dead
-//! code: transforms validate as usual but propagate absence, eliminating the parts of the plan
-//! that cannot contribute rows (a union drops absent arms, an anti-join with an absent build
-//! forwards its probe, etc.). [`build`](PlanBuilder::build) collapses the plan to its
+//! A source with no rows (e.g. a scan over no files) is the *absent* relation. The builder treats
+//! it as dead code: transforms validate as usual but propagate absence, eliminating the parts of
+//! the plan that cannot contribute rows (a union drops absent arms, an anti-join with an absent
+//! build forwards its probe, etc.). [`build`](PlanBuilder::build) collapses the plan to its
 //! minimal correct shape, emitting a single empty [`Values`] node when the whole relation is
 //! absent, so it always yields a runnable plan; [`build_opt`](PlanBuilder::build_opt) yields
 //! `None` for it.
@@ -529,11 +528,12 @@ impl PlanBuilder {
             if let Some(&index) = emitted.get(&key) {
                 return index;
             }
+            // Recurse before `entry` so the closure borrows only `nodes`, not `emitted`.
             let inputs = Vec::from_iter(node.inputs.iter().map(|i| emit(i, nodes, emitted)));
-            nodes.push(PlanNode::new(node.op.clone(), inputs));
-            let index = nodes.len() - 1;
-            emitted.insert(key, index);
-            index
+            *emitted.entry(key).or_insert_with(|| {
+                nodes.push(PlanNode::new(node.op.clone(), inputs));
+                nodes.len() - 1
+            })
         }
         let mut nodes = Vec::new();
         emit(root, &mut nodes, &mut HashMap::new());

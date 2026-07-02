@@ -159,8 +159,8 @@ fn values_to_engine_data(values: Values) -> DeltaResult<Box<dyn EngineData>> {
         .map(|(col, field)| -> DeltaResult<ArrayRef> {
             let element_type = ArrayType::new(field.data_type().clone(), true);
             let column = ArrayData::try_new(element_type, rows.iter().map(|row| row[col].clone()))?;
-            //This produces a single array row. The array contains n elements, one for each
-            //attribute of the column.
+            // This produces a single array row. The array contains n elements, one for each
+            // attribute of the column.
             let list = Scalar::Array(column).to_array(1)?;
             let list = list.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
                 Error::generic("Values: Scalar::Array did not lower to a ListArray")
