@@ -59,6 +59,11 @@ impl StorageHandler for PlanBasedStorageHandler {
             .exactly_one()
             .map_err(|e| Error::generic(format!("Expected exactly one file meta: {e}")))?
     }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        // TODO(#2820): implement here once supported as IoOperation.
+        unimplemented!("PlanBasedStorageHandler does not yet implement delete")
+    }
 }
 
 #[cfg(test)]

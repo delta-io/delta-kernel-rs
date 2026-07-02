@@ -79,6 +79,9 @@ pub enum IoOperation {
     /// [`PlanResult::ParquetFooter`]: crate::plans::PlanResult::ParquetFooter
     /// [`ParquetHandler::read_parquet_footer`]: crate::ParquetHandler::read_parquet_footer
     ParquetFooter { file: FileMeta },
+    // TODO(#2820): add a `Delete { url: Url }` variant (plus an `IoOperation::delete`
+    // constructor) so `PlanBasedStorageHandler::delete` can route through the plan path
+    // instead of `unimplemented!()`.
 }
 
 impl IoOperation {
