@@ -2,14 +2,15 @@
 //! [`IncrementalScanBuilder`] for the entry point.
 
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
-use crate::actions::{Add, Remove, ADD_NAME, REMOVE_NAME};
+use crate::actions::{ADD_FIELD, REMOVE_FIELD};
+use crate::schema::schema_ref;
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor};
 use crate::expressions::{column_name, ColumnName};
 use crate::log_replay::deduplicator::{Deduplicator, FileActionInfo};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey};
-use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::utils::require;
@@ -18,11 +19,9 @@ use crate::{
 };
 
 /// Schema projected from each commit JSON: `add` and `remove` only.
-static INCREMENTAL_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-    ]))
+static INCREMENTAL_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
 });
 
 /// Builder for an incremental scan over `(base_version, target_version]`. Construct via

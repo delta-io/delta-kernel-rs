@@ -130,7 +130,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;

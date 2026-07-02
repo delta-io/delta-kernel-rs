@@ -2,7 +2,7 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use serde::{Deserialize, Serialize};
@@ -11,9 +11,7 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
-use crate::schema::{
-    schema_ref, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
-};
+use crate::schema::{schema_ref, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
     FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -84,50 +82,89 @@ pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
 #[internal_api]
 pub(crate) const STATS_PARSED: &str = "stats_parsed";
 
-static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
-        StructField::nullable(CDC_NAME, Cdc::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-    ]))
+pub(crate) static ADD_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(ADD_NAME, Add::to_schema()));
+pub(crate) static REMOVE_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(REMOVE_NAME, Remove::to_schema()));
+pub(crate) static METADATA_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(METADATA_NAME, Metadata::to_schema()));
+pub(crate) static PROTOCOL_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()));
+pub(crate) static SET_TRANSACTION_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema())
+});
+pub(crate) static COMMIT_INFO_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()));
+pub(crate) static CDC_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(CDC_NAME, Cdc::to_schema()));
+pub(crate) static DOMAIN_METADATA_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema())
+});
+pub(crate) static CHECKPOINT_METADATA_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
+});
+pub(crate) static SIDECAR_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+
+static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
 });
 
-static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(
-        get_commit_schema().fields().cloned().chain([
-            StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
-            StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-        ]),
-    ))
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&CHECKPOINT_METADATA_FIELD),
+    (&SIDECAR_FIELD),
 });
 
 /// Schema for Add actions in the Delta log.
 /// Wraps the Add action schema in a top-level struct with "add" field name.
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { nullable ADD_NAME: (Add::to_schema()) });
+#[internal_api]
+pub(crate) static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { (&ADD_FIELD) });
 
 /// Schema for Remove actions in the Delta log.
 /// Wraps the Remove action schema in a top-level struct with "remove" field name.
-static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { nullable REMOVE_NAME: (Remove::to_schema()) });
+#[internal_api]
+pub(crate) static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { (&REMOVE_FIELD) });
+
+#[internal_api]
+pub(crate) static LOG_METADATA_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { (&METADATA_FIELD) });
+
+#[internal_api]
+pub(crate) static LOG_PROTOCOL_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { (&PROTOCOL_FIELD) });
 
 /// Schema for CommitInfo actions in the Delta log.
 /// Wraps the CommitInfo schema in a top-level struct with "commitInfo" field name.
-static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { nullable COMMIT_INFO_NAME: (CommitInfo::to_schema()) });
+#[internal_api]
+pub(crate) static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { (&COMMIT_INFO_FIELD) });
 
 /// Schema for transaction (txn) actions in the Delta log.
 /// Wraps the SetTransaction schema in a top-level struct with "txn" field name.
-static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { nullable SET_TRANSACTION_NAME: (SetTransaction::to_schema()) });
+#[internal_api]
+pub(crate) static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { (&SET_TRANSACTION_FIELD) });
 
-static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_ref! { nullable DOMAIN_METADATA_NAME: (DomainMetadata::to_schema()) });
+#[internal_api]
+pub(crate) static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| schema_ref! { (&DOMAIN_METADATA_FIELD) });
 
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits
@@ -141,27 +178,6 @@ pub(crate) fn get_commit_schema() -> &'static SchemaRef {
 /// Gets a schema for all actions defined by the delta spec.
 pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
     &ALL_ACTIONS_SCHEMA
-}
-
-#[internal_api]
-pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
-    &LOG_ADD_SCHEMA
-}
-
-pub(crate) fn get_log_remove_schema() -> &'static SchemaRef {
-    &LOG_REMOVE_SCHEMA
-}
-
-pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
-    &LOG_COMMIT_INFO_SCHEMA
-}
-
-pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
-    &LOG_TXN_SCHEMA
-}
-
-pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
-    &LOG_DOMAIN_METADATA_SCHEMA
 }
 
 /// Returns true if the schema contains file actions (add or remove)
@@ -1053,6 +1069,8 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rstest::rstest;
     use serde_json::json;
 
@@ -1066,7 +1084,7 @@ mod tests {
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::schema::{schema_ref, ArrayType, DataType, MapType, StructField};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
@@ -1881,7 +1899,7 @@ mod tests {
         let metadata_id = metadata.id.clone();
 
         // test with the full log schema that wraps metadata in a "metaData" field
-        let commit_schema = get_commit_schema().project(&[METADATA_NAME]).unwrap();
+        let commit_schema = LOG_METADATA_SCHEMA.clone();
         let actual = metadata
             .into_engine_data(commit_schema, &engine)
             .unwrap()
@@ -1971,7 +1989,7 @@ mod tests {
         assert_eq!(record_batch, expected);
 
         // test with the full log schema that wraps protocol in a "protocol" field
-        let commit_schema = get_commit_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let commit_schema = LOG_PROTOCOL_SCHEMA.clone();
         let engine_data = protocol.into_engine_data(commit_schema, &engine);
 
         let schema = Arc::new(Schema::new(vec![Field::new(

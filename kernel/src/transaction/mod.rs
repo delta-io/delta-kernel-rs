@@ -9,9 +9,9 @@ use delta_kernel_derive::internal_api;
 use tracing::{info, instrument};
 
 use crate::actions::{
-    as_log_add_schema, get_commit_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, Metadata, Protocol, SetTransaction, MAX_VALUES, METADATA_NAME, MIN_VALUES,
-    NULL_COUNT, NUM_RECORDS, PROTOCOL_NAME, TIGHT_BOUNDS,
+    as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
+    LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA, LOG_REMOVE_SCHEMA, LOG_TXN_SCHEMA, MAX_VALUES,
+    MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use crate::committer::{
     CommitMetadata, CommitProtocolMetadata, CommitResponse, CommitType, Committer,
@@ -427,7 +427,7 @@ impl<S> Transaction<S> {
             .set_transactions
             .clone()
             .into_iter()
-            .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
+            .map(|txn| txn.into_engine_data(LOG_TXN_SCHEMA.clone(), engine));
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
@@ -443,7 +443,7 @@ impl<S> Transaction<S> {
         // Step 3: Generate Protocol and Metadata actions based on emit flags
         let (protocol_action, protocol) = if self.should_emit_protocol {
             let protocol = self.effective_table_config.protocol().clone();
-            let schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
+            let schema = LOG_PROTOCOL_SCHEMA.clone();
             let action = protocol.clone().into_engine_data(schema, engine)?;
             (Some(action), Some(protocol))
         } else {
@@ -451,7 +451,7 @@ impl<S> Transaction<S> {
         };
         let (metadata_action, metadata) = if self.should_emit_metadata {
             let metadata = self.effective_table_config.metadata().clone();
-            let schema = get_commit_schema().project(&[METADATA_NAME])?;
+            let schema = LOG_METADATA_SCHEMA.clone();
             let action = metadata.clone().into_engine_data(schema, engine)?;
             (Some(action), Some(metadata))
         } else {
@@ -1492,7 +1492,7 @@ impl<S> Transaction<S> {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = schema_with_all_fields_nullable(get_log_remove_schema());
+        let target_schema = schema_with_all_fields_nullable(&LOG_REMOVE_SCHEMA);
         let evaluation_handler = engine.evaluation_handler();
 
         let make_eval = |coalesce_stats_with_parsed: bool| -> DeltaResult<_> {

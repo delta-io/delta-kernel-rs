@@ -16,8 +16,8 @@ use crate::actions::visitors::{
     visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
 };
 use crate::actions::{
-    DomainMetadata, Metadata, Protocol, SetTransaction, ADD_NAME, COMMIT_INFO_NAME,
-    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, SET_TRANSACTION_FIELD,
+    DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, REMOVE_NAME,
 };
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
@@ -26,7 +26,6 @@ use crate::crc::{
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{
     column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
-    ToSchema as _,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
@@ -44,10 +43,10 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             not_null "path": STRING,
             nullable "size": LONG,
         },
-        nullable PROTOCOL_NAME: (Protocol::to_schema()),
-        nullable METADATA_NAME: (Metadata::to_schema()),
-        nullable SET_TRANSACTION_NAME: (SetTransaction::to_schema()),
-        nullable DOMAIN_METADATA_NAME: (DomainMetadata::to_schema()),
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&DOMAIN_METADATA_FIELD),
         nullable COMMIT_INFO_NAME: {
             nullable "operation": STRING,
             nullable "inCommitTimestamp": LONG,

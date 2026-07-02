@@ -10,9 +10,9 @@ use url::Url;
 use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
-    MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_all_actions_schema, get_commit_schema, ADD_FIELD, METADATA_FIELD, REMOVE_FIELD, Add, Sidecar,
+    ADD_NAME, DOMAIN_METADATA_NAME, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME,
+    REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -1198,7 +1198,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_commit_schema().project(&[METADATA_NAME])?;
+    let v2_checkpoint_read_schema = schema_ref! { (&METADATA_FIELD) };
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -1268,7 +1268,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
-    let v2_checkpoint_read_schema = get_commit_schema().project(&[ADD_NAME])?;
+    let v2_checkpoint_read_schema = schema_ref! { (&ADD_FIELD) };
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -1441,7 +1441,10 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     // Write sidecars first so we can get their actual sizes
     let sidecar1_size = add_sidecar_to_store(
         &store,
-        add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_simple(schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+        }),
         "sidecarfile1.parquet",
     )
     .await?
@@ -1449,7 +1452,10 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
     let sidecar2_size = add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_with_remove(schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+        }),
         "sidecarfile2.parquet",
     )
     .await?
@@ -2716,7 +2722,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     let engine = SyncEngine::new_with_store(store.clone());
 
     // Build a checkpoint with an initial v1 schema
-    let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    let v1_schema = schema_ref! {
+        (&ADD_FIELD),
+        (&REMOVE_FIELD),
+    };
     add_checkpoint_to_store(
         &store,
         add_batch_simple(v1_schema.clone()),

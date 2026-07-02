@@ -10,8 +10,8 @@ use tracing::info;
 
 use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    Metadata, Protocol, ADD_FIELD, CDC_FIELD, LOG_ADD_SCHEMA, METADATA_FIELD, PROTOCOL_FIELD,
+    REMOVE_FIELD, COMMIT_INFO_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{
@@ -20,9 +20,7 @@ use crate::expressions::{
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{
-    ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema as _,
-};
+use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
@@ -97,7 +95,7 @@ pub(crate) fn table_changes_action_iter(
                 // Raw action batches keep the nested layout, so Add rows are
                 // `add.path IS NOT NULL`.
                 Arc::new(Predicate::is_not_null(column_expr!("add.path")).into()),
-                get_log_add_schema().clone(),
+                LOG_ADD_SCHEMA.clone(),
                 &physical_stats_columns,
                 None, // Table changes doesn't use metrics yet
             )
@@ -372,7 +370,7 @@ impl LogReplayScanner {
             .try_into()
             .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            get_log_add_schema().clone(),
+            LOG_ADD_SCHEMA.clone(),
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
             cdf_scan_row_schema().into(),
         )?;
@@ -410,22 +408,17 @@ struct PreparePhaseVisitor<'a> {
     remove_dvs: &'a mut HashMap<String, DvInfo>,
 }
 impl PreparePhaseVisitor<'_> {
-    fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable(ADD_NAME, Add::to_schema()),
-            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-            StructField::nullable(CDC_NAME, Cdc::to_schema()),
-            StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-            StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-            StructField::nullable(
-                COMMIT_INFO_NAME,
-                StructType::new_unchecked([StructField::new(
-                    "inCommitTimestamp",
-                    DataType::LONG,
-                    true,
-                )]),
-            ),
-        ]))
+    fn schema() -> SchemaRef {
+        schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+            (&CDC_FIELD),
+            (&METADATA_FIELD),
+            (&PROTOCOL_FIELD),
+            nullable COMMIT_INFO_NAME: {
+                nullable "inCommitTimestamp": LONG,
+            },
+        }
     }
 }
 
@@ -505,12 +498,12 @@ impl<'a> FileActionSelectionVisitor<'a> {
             remove_dvs,
         }
     }
-    fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable(CDC_NAME, Cdc::to_schema()),
-            StructField::nullable(ADD_NAME, Add::to_schema()),
-            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        ]))
+    fn schema() -> SchemaRef {
+        schema_ref! {
+            (&CDC_FIELD),
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+        }
     }
 }
 
