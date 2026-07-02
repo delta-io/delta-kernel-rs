@@ -153,6 +153,16 @@ fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> 
     Some(Arc::new(predicates.fold(first, Predicate::or)))
 }
 
+/// Whether a checkpoint could be V2 (and thus reference sidecars). Governs how far the
+/// `_last_checkpoint` hint schema can be trusted when deciding V1 vs V2.
+enum CheckpointKind {
+    /// Always V1, never has sidecars (e.g. multi-part). The hint is trusted whenever present.
+    AlwaysV1,
+    /// May be V1 or V2 (single-file or UUID parquet). The hint is trusted only if it already has
+    /// a `sidecar` column; otherwise the parquet footer is read to decide.
+    MaybeV2,
+}
+
 impl LogSegment {
     /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
     ///
@@ -833,8 +843,12 @@ impl LogSegment {
         match &checkpoint.file_type {
             MultiPartCheckpoint { .. } => {
                 // Multi-part checkpoints are always V1 and never have sidecars.
-                let schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                let schema = Self::read_checkpoint_schema(
+                    engine,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                    CheckpointKind::AlwaysV1,
+                )?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
@@ -844,9 +858,14 @@ impl LogSegment {
             }
             SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
-                // Check for sidecar column to distinguish.
-                let checkpoint_schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                // Distinguish by the sidecar column; the hint is trusted only if it proves V2
+                // (see `read_checkpoint_schema`).
+                let checkpoint_schema = Self::read_checkpoint_schema(
+                    engine,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                    CheckpointKind::MaybeV2,
+                )?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
                     self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
                 } else {
@@ -857,16 +876,27 @@ impl LogSegment {
         }
     }
 
-    /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
-    /// available or reading the parquet footer otherwise.
+    /// Returns the checkpoint's parquet schema, from the `_last_checkpoint` hint when it is safe to
+    /// trust or from the parquet footer otherwise. For a possibly-V2 checkpoint the hint is trusted
+    /// only when it already has a `sidecar` column, since a hint that omits `sidecar` cannot rule
+    /// out a V2 checkpoint whose `checkpointSchema` was written without it.
     fn read_checkpoint_schema(
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
+        kind: CheckpointKind,
     ) -> DeltaResult<SchemaRef> {
         match hint_schema {
-            Some(schema) => Ok(schema.clone()),
-            None => Ok(engine
+            // Trust the hint: always for V1-only checkpoints, or for possibly-V2 ones that already
+            // show a `sidecar` column.
+            Some(hint)
+                if matches!(kind, CheckpointKind::AlwaysV1)
+                    || hint.field(SIDECAR_NAME).is_some() =>
+            {
+                Ok(hint.clone())
+            }
+            // No hint, or a possibly-V2 hint without `sidecar`: read the footer to decide.
+            _ => Ok(engine
                 .parquet_handler()
                 .read_parquet_footer(&checkpoint.location)?
                 .schema),
