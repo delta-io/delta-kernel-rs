@@ -177,14 +177,14 @@ impl EnsureDataTypes {
                         }
                     }
                     ValidationMode::TypesAndNames | ValidationMode::Full => {
-                        // Name-based matching: look up kernel fields by arrow field name.
-                        // Full mode additionally checks nullability and metadata.
-                        let mapped_fields = arrow_fields
-                            .iter()
-                            .filter_map(|f| kernel_fields.field(f.name()));
-
+                        // Name-based matching: look up the kernel field for each arrow field by
+                        // name. Arrow fields with no kernel counterpart are ignored. Full mode
+                        // additionally checks nullability and metadata.
                         let mut found_fields = 0;
-                        for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
+                        for arrow_field in arrow_fields {
+                            let Some(kernel_field) = kernel_fields.field(arrow_field.name()) else {
+                                continue;
+                            };
                             self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
                             self.ensure_data_types(
                                 &kernel_field.data_type,
@@ -710,6 +710,43 @@ mod tests {
                 ValidationMode::Full,
             ),
             "Generic delta kernel error: w has nullability true in kernel and false in arrow",
+        );
+    }
+
+    #[test]
+    fn name_based_matching_pairs_fields_by_name_with_interleaved_extra() {
+        // The arrow struct has an unselected `extra` field between the matched ones. `x` must be
+        // paired with the arrow `x`, not positionally with `extra`.
+        let kernel = DataType::struct_type_unchecked([
+            StructField::nullable("w", DataType::LONG),
+            StructField::nullable("x", DataType::STRING),
+        ]);
+        let arrow = ArrowDataType::Struct(Fields::from(vec![
+            ArrowField::new("w", ArrowDataType::Int64, true),
+            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("x", ArrowDataType::Utf8, true),
+        ]));
+        assert_eq!(
+            ensure_data_types(&kernel, &arrow, ValidationMode::Full).unwrap(),
+            DataTypeCompat::Nested
+        );
+    }
+
+    #[test]
+    fn name_based_matching_rejects_wrong_type_behind_interleaved_extra() {
+        // An unselected `extra` field must not mask a type mismatch on the real `x` field.
+        let kernel = DataType::struct_type_unchecked([
+            StructField::nullable("w", DataType::LONG),
+            StructField::nullable("x", DataType::LONG),
+        ]);
+        let arrow = ArrowDataType::Struct(Fields::from(vec![
+            ArrowField::new("w", ArrowDataType::Int64, true),
+            ArrowField::new("extra", ArrowDataType::Int64, true),
+            ArrowField::new("x", ArrowDataType::Utf8, true),
+        ]));
+        assert_result_error_with_message(
+            ensure_data_types(&kernel, &arrow, ValidationMode::Full),
+            "Incorrect datatype",
         );
     }
 
