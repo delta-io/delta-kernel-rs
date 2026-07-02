@@ -4296,13 +4296,24 @@ fn test_schema_to_is_not_null_predicate(
     "tags",
     r#"{"checkpointMetadata":{"version":0,"tags":{"key1":"val1","key2":null}}}"#
 )]
-// Known issues: these map fields don't yet have #[allow_null_container_values].
-// commitInfo.operationParameters.description: null
-#[should_panic(expected = "StructArray re-validation failed")]
-#[case::commit_info_operation_parameters_known_issue(
+// commitInfo.operationParameters: null values are dropped (allow_null_container_values).
+#[case::commit_info_operation_parameters_null_value(
     "commitInfo",
     "operationParameters",
     r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#
+)]
+// commitInfo.operationParameters: boolean values are coerced to strings by coerce_primitive.
+#[case::commit_info_operation_parameters_boolean_value(
+    "commitInfo",
+    "operationParameters",
+    r#"{"commitInfo":{"timestamp":1000,"operation":"MERGE","operationParameters":{"mode":"Overwrite","statsOnLoad":false}}}"#
+)]
+// commitInfo.operationParameters: integer values are coerced to strings by coerce_primitive.
+// This is the exact case from issue #501: {"version":10,"timestamp":null}
+#[case::commit_info_operation_parameters_integer_value(
+    "commitInfo",
+    "operationParameters",
+    r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"version":10,"timestamp":null}}}"#
 )]
 // metaData.configuration.key2: null
 #[should_panic(expected = "StructArray re-validation failed")]
