@@ -545,6 +545,40 @@ mod tests {
         assert_eq!(&expected, &stats_schema);
     }
 
+    // A UDT is excluded from min/max even when its sql_type is an orderable primitive (Spark writes
+    // no stats for UDT columns), but still appears as a nullCount leaf like Array/Map/Variant.
+    #[test]
+    fn test_stats_schema_excludes_udt_from_min_max() {
+        let properties: TableProperties = [("key", "value")].into();
+        let udt = DataType::UserDefined(UserDefinedType {
+            sql_type: Box::new(DataType::INTEGER),
+            raw: serde_json::json!({"type": "udt", "class": "X", "sqlType": "integer"}),
+        });
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("features", udt),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // nullCount includes the UDT as a leaf; min/max excludes it.
+        let expected_null = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("features", DataType::LONG),
+        ]);
+        let expected_min_max =
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+        let expected = expected_stats(expected_null, expected_min_max);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
     #[test]
     fn test_stats_schema_col_names() {
         let properties: TableProperties = [(

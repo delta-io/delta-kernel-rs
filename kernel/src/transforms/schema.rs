@@ -129,6 +129,10 @@ pub trait SchemaTransform<'a> {
 
     /// Called for each user-defined type encountered. The provided implementation recurses into
     /// the physical `sql_type` and rebuilds the [`UserDefinedType`], preserving its `raw` JSON.
+    ///
+    /// A transform that rewrites `sql_type` desyncs it from `raw` (which still embeds the original
+    /// `sqlType`); such transforms must override this to treat the UDT as an opaque leaf, as the
+    /// column-mapping and stats transforms do.
     fn transform_user_defined(
         &mut self,
         udt: &'a UserDefinedType,

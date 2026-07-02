@@ -208,7 +208,6 @@ impl Scalar {
                 }
             }
             DataType::VOID => append_nulls_as!(array::NullBuilder),
-            // A UDT's physical layout is its sql_type; append nulls for that.
             DataType::UserDefined(ref udt) => Self::append_null(builder, &udt.sql_type, num_rows)?,
             DataType::Variant(_) => {
                 return Err(Error::unsupported(

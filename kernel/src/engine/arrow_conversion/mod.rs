@@ -301,7 +301,6 @@ fn kernel_field_into_arrow(
                 false, /* keys_sorted */
             ))
         }
-        // A UDT converts via its physical sql_type (delegated through `try_into_arrow`).
         DataType::Struct(_)
         | DataType::Primitive(_)
         | DataType::Variant(_)
@@ -392,7 +391,6 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     )))
                 }
             }
-            // A UDT is physically its sql_type; convert that.
             DataType::UserDefined(udt) => udt.sql_type.as_ref().try_into_arrow(),
         }
     }

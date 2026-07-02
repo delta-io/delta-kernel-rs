@@ -213,6 +213,12 @@ pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
+    // A UDT partition column is physically stored as its `sql_type`, so parse against that -- just
+    // as every other read-path site resolves a UDT through `sql_type`.
+    let data_type = match data_type {
+        DataType::UserDefined(udt) => udt.sql_type.as_ref(),
+        dt => dt,
+    };
     match (raw, data_type.as_primitive_opt()) {
         (Some(v), Some(primitive)) => primitive.parse_scalar(v),
         (Some(_), None) => Err(Error::generic(format!(
@@ -228,7 +234,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::BinaryExpressionOp;
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{DataType, PrimitiveType, StructField, StructType, UserDefinedType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     // Tests for parse_partition_value function
@@ -351,6 +357,22 @@ mod tests {
             &DataType::Primitive(PrimitiveType::Integer),
         );
         assert_result_error_with_message(result, "Failed to parse value");
+    }
+
+    // A UDT-over-primitive partition column parses against its physical `sql_type`, not the
+    // opaque UDT wrapper (which is not primitive and would otherwise error).
+    #[test]
+    fn test_parse_partition_value_raw_user_defined() {
+        let udt = DataType::UserDefined(UserDefinedType {
+            sql_type: Box::new(DataType::INTEGER),
+            raw: serde_json::json!({"type": "udt", "class": "X", "sqlType": "integer"}),
+        });
+        let result = parse_partition_value_raw(Some(&"42".to_string()), &udt).unwrap();
+        assert_eq!(result, Scalar::Integer(42));
+
+        // A missing value still yields a physical-typed null, not a UDT-typed one.
+        let null = parse_partition_value_raw(None, &udt).unwrap();
+        assert_eq!(null, Scalar::Null(DataType::INTEGER));
     }
 
     // Tests for get_transform_expr function

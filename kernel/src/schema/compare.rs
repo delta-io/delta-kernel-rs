@@ -191,7 +191,7 @@ mod tests {
         let udt = |raw: &str| {
             DataType::UserDefined(UserDefinedType {
                 sql_type: Box::new(DataType::INTEGER),
-                raw: raw.to_string(),
+                raw: serde_json::from_str(raw).unwrap(),
             })
         };
         let a = udt(r#"{"type":"udt","class":"X","sqlType":"integer"}"#);
