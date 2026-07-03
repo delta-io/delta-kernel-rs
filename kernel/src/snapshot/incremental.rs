@@ -1323,6 +1323,46 @@ mod tests {
         Ok(())
     }
 
+    // A fresh build that finds a CRC already at the target version serves P&M straight from it,
+    // with no replay. Before this work that branch emitted no ProtocolMetadataLoad at all
+    // (#2677); now it emits one classified as crc_at_target with zero replay denominators.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_build_with_crc_at_target_emits_crc_at_target_source() -> DeltaResult<()> {
+        use crate::metrics::{MetricEvent, ProtocolMetadataSource};
+        use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+        // Plant a CRC at the latest version (2) so a default (Disabled) fresh build serves P&M
+        // from it without any replay.
+        ctx.store
+            .put(
+                &delta_path_for_version(2, "crc"),
+                make_test_crc_json(300, 3).to_string().into(),
+            )
+            .await?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let snapshot = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot.version(), 2);
+        assert_eq!(snapshot.crc().map(|c| c.version), Some(2));
+
+        let pm = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("expected ProtocolMetadataLoadSuccess even on the CRC-served branch");
+        assert_eq!(pm.source, ProtocolMetadataSource::CrcAtTarget);
+        assert_eq!(pm.num_commits_replayed_for_pm, 0);
+        assert_eq!(pm.bytes_read_for_pm, 0);
+        Ok(())
+    }
+
     // Stronger regression for the `resolve_crc_file` invariant filter: set up a metadata change
     // at the checkpoint version so that a stale inherited CRC would produce wrong
     // Metadata, not just wrong bookkeeping. Without the filter, the incremental update
