@@ -794,12 +794,13 @@ impl PrimitiveType {
     /// Casts an empty partition-value string to its target [`Scalar`], or `None` for a null value.
     ///
     /// An empty string is a value for a string or binary column (the empty string / empty bytes)
-    /// but has no representation for any other type, so it casts to null there. This mirrors a
-    /// non-ANSI SQL cast of the partition-value map and is the empty-string rule the scan read path
-    /// applies, in place of [`parse_scalar`]'s null-for-every-type handling.
+    /// but has no representation for any other type, so it casts to null there. This aligns with
+    /// Spark, which reads the partition-value map as a non-ANSI SQL cast, and is the empty-string
+    /// rule the scan read path applies, in place of [`parse_scalar`]'s null-for-every-type
+    /// handling.
     ///
-    /// A literal empty string only reaches this path from a foreign writer, since the kernel
-    /// collapses empty partition values to an absent map entry on write.
+    /// A literal empty string only reaches this path from a foreign writer, since kernel
+    /// serializes its own empty and null partition values to JSON null on write.
     ///
     /// [`parse_scalar`]: PrimitiveType::parse_scalar
     pub(crate) fn empty_string_partition_cast(&self) -> Option<Scalar> {

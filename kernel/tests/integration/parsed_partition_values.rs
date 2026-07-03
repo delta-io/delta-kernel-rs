@@ -17,7 +17,10 @@ use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::table_builder::{partitioned, version_latest, FeatureSet, LogState, TableConfig};
-use test_utils::{add_commit, create_default_engine_mt_executor, get_column, test_context};
+use test_utils::{
+    add_commit, create_default_engine_mt_executor, get_column,
+    install_thread_local_metrics_reporter, test_context, CountingReporter,
+};
 use url::Url;
 
 /// Requesting the typed struct via `with_struct()` on a partitioned table must emit a
@@ -147,10 +150,10 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
 
 // === Foreign-writer literal empty-string partition values ===
 //
-// The kernel never persists a literal "" partition value (it collapses empties to an absent map
-// entry on write), so these tests stand in a raw-JSON foreign writer that did, then assert the
-// kernel reconstructs `partitionValues_parsed` with the empty-string cast: "" stays "" for string,
-// becomes empty bytes for binary, and becomes null for every other type.
+// The kernel never persists a literal "" partition value (it serializes its own empty and null
+// partition values to JSON null on write), so these tests stand in a raw-JSON foreign writer that
+// did, then assert the kernel reconstructs `partitionValues_parsed` with the empty-string cast: ""
+// stays "" for string, becomes empty bytes for binary, and becomes null for every other type.
 
 /// Writes a foreign-writer table under `table_path`: protocol + metadata declaring string, binary,
 /// and integer partition columns (with `writeStatsAsStruct` enabled so a checkpoint writes its own
@@ -251,9 +254,19 @@ async fn parsed_partition_values_read_foreign_empty_string(
         snapshot.checkpoint(engine.as_ref(), None).unwrap();
     }
 
+    // Confirm the scan reads from the intended source: the checkpoint axis must actually place a
+    // checkpoint in the snapshot's log segment (and the non-checkpoint axis must not), otherwise a
+    // silently-skipped checkpoint would re-test the JSON-commit path twice.
+    let reporter = Arc::new(CountingReporter::new());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
     let snapshot = Snapshot::builder_for(url.clone())
         .build(engine.as_ref())
         .unwrap();
+    assert_eq!(
+        reporter.checkpoint_files.get(),
+        u64::from(native_checkpoint),
+        "log segment checkpoint parts must match native_checkpoint={native_checkpoint}"
+    );
     let scan = snapshot
         .scan_builder()
         .with_partition_values(PartitionValuesOptions::with_struct())
@@ -265,9 +278,6 @@ async fn parsed_partition_values_read_foreign_empty_string(
         let (data, selection) = scan_metadata.unwrap().scan_files.into_parts();
         let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
         let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
-        if batch.num_rows() == 0 {
-            continue;
-        }
         let pv = get_column!(batch, "partitionValues_parsed", StructArray);
 
         let p_str = pv.column_by_name("p_str").unwrap();
@@ -298,8 +308,7 @@ fn collect_path(paths: &mut Vec<String>, scan_file: ScanFile) {
 
 /// A file whose partition value is a foreign literal "" is a real empty value, not null, so
 /// partition skipping treats it accordingly:
-/// - `p_str = ''` keeps it, `p_str = 'other'` prunes it (before the cast change "" collapsed to
-///   null, so `p_str = 'other'` kept the file conservatively).
+/// - `p_str = ''` keeps it and `p_str = 'other'` prunes it.
 /// - `p_str IS NULL` prunes it and `p_str IS NOT NULL` keeps it (the value is "", not null).
 /// - the same holds for the binary column (`p_bin`), whose "" reconstructs as empty bytes.
 ///
@@ -364,8 +373,7 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         "empty-string file must be pruned under p_str = 'other'"
     );
     // Both partition values are non-null ("" and "other"), so IS NULL prunes both and IS NOT NULL
-    // keeps both. The empty file surviving IS NOT NULL is the fix: before the cast change "" was
-    // null, so it would have been kept under IS NULL and pruned under IS NOT NULL.
+    // keeps both.
     assert!(
         surviving(Predicate::is_null(col!("p_str"))).is_empty(),
         "no file has a null p_str, so IS NULL prunes both (the empty file's value is \"\", not null)"

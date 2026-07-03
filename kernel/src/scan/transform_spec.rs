@@ -346,7 +346,7 @@ mod tests {
     fn test_parse_partition_value_raw_empty_string_cast_semantics() {
         // An empty string casts to itself for string and to empty bytes for binary, and to null
         // for every other type. A literal empty string only reaches this path from a foreign
-        // writer, since the kernel collapses empties to an absent map entry on write.
+        // writer, since kernel serializes its own empty and null partition values to JSON null.
         let empty = String::new();
 
         let string_value = parse_partition_value_raw(Some(&empty), &DataType::STRING).unwrap();
