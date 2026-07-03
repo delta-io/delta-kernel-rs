@@ -5,6 +5,7 @@
 //! compaction interactions, catalog-managed staged commits, and vacuum races.
 
 use std::collections::HashSet;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use delta_kernel::incremental_scan::{
@@ -793,7 +794,7 @@ impl CustomBatchSizeEngine {
         let task_executor = Arc::new(TokioBackgroundExecutor::new());
         let json = Arc::new(
             DefaultJsonHandler::new(storage.clone(), task_executor.clone())
-                .with_batch_size(batch_size),
+                .with_batch_size(NonZero::new(batch_size).expect("batch_size is non-zero")),
         );
         let inner = Arc::new(
             DefaultEngineBuilder::new(storage)

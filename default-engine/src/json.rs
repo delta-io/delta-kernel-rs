@@ -1,6 +1,7 @@
 //! Default Json handler implementation
 
 use std::io::BufReader;
+use std::num::NonZero;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -37,10 +38,10 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The maximum number of read requests to buffer in memory at once. Note that this actually
     /// controls two things: the number of concurrent requests (done by `buffered`) and the size of
     /// the buffer (via our `sync_channel`).
-    buffer_size: usize,
+    buffer_size: NonZero<usize>,
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
-    batch_size: usize,
+    batch_size: NonZero<usize>,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -48,21 +49,21 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: super::DEFAULT_BUFFER_SIZE,
-            batch_size: super::DEFAULT_BATCH_SIZE,
+            buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
+            batch_size: super::DEFAULT_READ_BATCH_SIZE,
         }
     }
 
     /// Set the maximum number read requests to buffer in memory at once in
     /// [Self::read_json_files()].
     ///
-    /// Defaults to 1000.
+    /// Defaults to `super::DEFAULT_READ_BUFFER_SIZE`.
     ///
     /// Memory constraints can be imposed by constraining the buffer size and batch size. Note that
     /// overall memory usage is proportional to the product of these two values.
     /// 1. Batch size governs the size of RecordBatches yielded in each iteration of the stream
     /// 2. Buffer size governs the number of concurrent tasks (which equals the size of the buffer
-    pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
         self.buffer_size = buffer_size;
         self
     }
@@ -70,13 +71,13 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
     /// yielded by the stream will have at most N rows.
     ///
-    /// Defaults to 1000 rows (json objects).
+    /// Defaults to `super::DEFAULT_READ_BATCH_SIZE` rows (json objects).
     ///
     /// See [Decoder::with_buffer_size] for details on constraining memory usage with buffer size
     /// and batch size.
     ///
     /// [Decoder::with_buffer_size]: delta_kernel::arrow::json::reader::Decoder
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.batch_size = batch_size;
         self
     }
@@ -169,8 +170,8 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
-            self.batch_size,
-            self.buffer_size,
+            self.batch_size.get(),
+            self.buffer_size.get(),
         );
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
@@ -586,7 +587,7 @@ mod tests {
         assert_eq!(data[0].num_rows(), 4);
 
         // limit batch size
-        let handler = handler.with_batch_size(2);
+        let handler = handler.with_batch_size(NonZero::new(2).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
@@ -796,7 +797,8 @@ mod tests {
                     tokio::runtime::Handle::current(),
                 )),
             );
-            let handler = handler.with_buffer_size(*buffer_size);
+            let handler = handler
+                .with_buffer_size(NonZero::new(*buffer_size).expect("buffer_size is non-zero"));
             let physical_schema = schema_ref! { nullable "val": INTEGER };
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
