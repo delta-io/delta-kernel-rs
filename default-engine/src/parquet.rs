@@ -1,6 +1,7 @@
 //! Default Parquet handler implementation
 
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -47,9 +48,9 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     task_executor: Arc<E>,
     /// The maximum number of files to read concurrently in [`Self::read_parquet_files()`]. This is
     /// the number of futures buffered by `buffered`, i.e. the file-level I/O readahead depth.
-    buffer_size: usize,
+    buffer_size: NonZero<usize>,
     /// The maximum number of rows per RecordBatch yielded by the read stream.
-    batch_size: usize,
+    batch_size: NonZero<usize>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -153,29 +154,33 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: super::DEFAULT_BUFFER_SIZE,
-            batch_size: super::DEFAULT_BATCH_SIZE,
+            buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
+            batch_size: super::DEFAULT_READ_BATCH_SIZE,
         }
     }
 
     /// Set the maximum number of files to read concurrently in [Self::read_parquet_files()].
     ///
-    /// Defaults to `super::DEFAULT_BUFFER_SIZE`.
+    /// Defaults to `super::DEFAULT_READ_BUFFER_SIZE`.
+    ///
+    /// This setting applies only to object-store reads. When every file in the batch uses a
+    /// presigned URL (`https://...`), reads bypass the object store and this value has no effect;
+    /// use [`Self::with_batch_size`] to tune RecordBatch chunking in that path.
     ///
     /// Memory constraints can be imposed by constraining the buffer size and batch size. Note that
     /// overall memory usage is proportional to the product of these two values.
     /// 1. Batch size governs the size of RecordBatches yielded in each iteration of the stream.
     /// 2. Buffer size governs the number of concurrent file reads (which equals the size of the
     ///    readahead buffer).
-    pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
         self.buffer_size = buffer_size;
         self
     }
 
     /// Set the maximum number of rows per RecordBatch yielded by [Self::read_parquet_files()].
     ///
-    /// Defaults to `super::DEFAULT_BATCH_SIZE` rows.
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+    /// Defaults to `super::DEFAULT_READ_BATCH_SIZE` rows.
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
         self.batch_size = batch_size;
         self
     }
@@ -325,8 +330,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
-            self.buffer_size,
-            self.batch_size,
+            self.buffer_size.get(),
+            self.batch_size.get(),
         );
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
@@ -1237,7 +1242,7 @@ mod tests {
         // With a batch size of 4, the 10-row file should be split into batches of 4, 4, 2.
         let handler =
             DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()))
-                .with_batch_size(4);
+                .with_batch_size(NonZero::new(4).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
                 slice::from_ref(&file_meta),

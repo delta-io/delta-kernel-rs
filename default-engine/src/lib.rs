@@ -85,6 +85,13 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
+/// Default file-level readahead depth for JSON and Parquet handlers.
+pub(crate) const DEFAULT_READ_BUFFER_SIZE: NonZero<usize> =
+    NonZero::new(DEFAULT_BUFFER_SIZE).unwrap();
+/// Default row batch size for JSON and Parquet read streams.
+pub(crate) const DEFAULT_READ_BATCH_SIZE: NonZero<usize> =
+    NonZero::new(DEFAULT_BATCH_SIZE).unwrap();
+
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
@@ -226,16 +233,14 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             task_executor.clone(),
         ));
 
-        let mut json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone());
-        let mut parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone());
-        if let Some(buffer_size) = io_config.buffer_size {
-            json = json.with_buffer_size(buffer_size.get());
-            parquet = parquet.with_buffer_size(buffer_size.get());
-        }
-        if let Some(batch_size) = io_config.batch_size {
-            json = json.with_batch_size(batch_size.get());
-            parquet = parquet.with_batch_size(batch_size.get());
-        }
+        let buffer_size = io_config.buffer_size.unwrap_or(DEFAULT_READ_BUFFER_SIZE);
+        let batch_size = io_config.batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
+        let json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
+            .with_buffer_size(buffer_size)
+            .with_batch_size(batch_size);
+        let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
+            .with_buffer_size(buffer_size)
+            .with_batch_size(batch_size);
         let raw_json: Arc<dyn JsonHandler> = Arc::new(json);
         let raw_parquet = Arc::new(parquet);
         Self {

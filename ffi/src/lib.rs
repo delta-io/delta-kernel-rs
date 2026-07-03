@@ -2544,10 +2544,15 @@ mod tests {
     }
 
     // Test building an engine via the FFI builder with custom read-path I/O concurrency, then
-    // exercising the read path (snapshot + checkpoint) to confirm the configured engine works.
+    // exercising the read path (snapshot) to confirm the configured engine works.
     #[cfg(feature = "default-engine-base")]
-    #[test]
-    fn test_setting_io_concurrency() -> Result<(), Box<dyn std::error::Error>> {
+    #[rstest]
+    #[case(4, 8)]
+    #[case(0, 0)]
+    fn test_setting_io_concurrency(
+        #[case] buffer_size: usize,
+        #[case] batch_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel::object_store::local::LocalFileSystem;
         use tempfile::tempdir;
 
@@ -2588,8 +2593,9 @@ mod tests {
                 allocate_err,
             ))
         };
-        // Non-zero values configure the JSON and Parquet handlers; 0 would mean "use default".
-        unsafe { set_builder_with_io_concurrency(builder.as_mut().unwrap(), 4, 8) };
+        unsafe {
+            set_builder_with_io_concurrency(builder.as_mut().unwrap(), buffer_size, batch_size)
+        };
         let engine = unsafe { ok_or_panic(builder_build(builder)) };
 
         let snapshot =
