@@ -112,17 +112,16 @@ directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` ac
 - **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.
-- **STRONGLY prefer `TestTableBuilder` (`test_utils::table_builder`) to build the table under
-  test.** Whenever a test needs a Delta table in a specific state -- a given set of features,
-  a partitioned or clustered layout, checkpoints, CRC files, a stale/missing `_last_checkpoint`
-  hint, or post-cleanup logs -- reach for the builder before hand-rolling commits. It composes
-  these axes (`LogState x FeatureSet x DataLayoutConfig x TableConfig`) through the real kernel
-  write path, so the table is protocol-correct by construction. Load a snapshot at any
-  `VersionTarget` with the `build_snapshot!` macro. For coverage across many table states, apply
-  the `default_sweep` cross-product template (or a per-axis template with your own `#[values]`);
-  see `kernel/tests/integration/cross_product/mod.rs`. Drop to hand-rolled `add_commit` /
-  `LocalMockTable` only for states the builder cannot yet express (e.g. corrupt or malformed
-  logs) -- and prefer extending the builder over duplicating setup.
+- **Consider `TestTableBuilder` (`test_utils::table_builder`) to build the table under test.**
+  When a test needs a Delta table in a specific state -- a given set of features, a partitioned
+  or clustered layout, checkpoints, CRC files, a stale/missing `_last_checkpoint` hint, or
+  post-cleanup logs -- the builder is often a good fit, composing these axes (`LogState x
+  FeatureSet x DataLayoutConfig x TableConfig`) through the real kernel write path so the table
+  is protocol-correct by construction. Load a snapshot at any `VersionTarget` with the
+  `build_snapshot!` macro. For coverage across many table states, the `default_sweep`
+  cross-product template (or a per-axis template with your own `#[values]`) can help; see
+  `kernel/tests/integration/cross_product/mod.rs`. For states the builder cannot express (e.g.
+  corrupt or malformed logs), hand-rolled `add_commit` / `LocalMockTable` remain available.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
@@ -192,8 +191,8 @@ This list is non-exhaustive -- when in doubt, browse the source files directly
 
 **Table creation in tests**
 
-- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand) -- the
-  default choice for a table in a specific state: composes `LogState x FeatureSet x
+- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand) -- worth
+  considering for a table in a specific state: composes `LogState x FeatureSet x
   DataLayoutConfig x TableConfig` through the real write path. Pair with the `build_snapshot!`
   macro and, for broad coverage, the `default_sweep` template. See the Testing section above.
 - Prefer the kernel `create_table` builder
