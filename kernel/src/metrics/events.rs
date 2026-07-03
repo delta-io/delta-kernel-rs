@@ -1780,10 +1780,12 @@ pub(crate) fn emit_protocol_metadata_load(
 
 /// Emit a [`MetricEvent::ProtocolMetadataLoadFailure`] via a tracing span.
 ///
-/// The `error` field flips the span-close event to its failure counterpart, matching how
-/// `#[instrument(err)]` records failures on the instrument-based paths.
+/// Mirrors how `#[instrument(err)]` records failures: enter the span and emit an event carrying a
+/// debug-valued `error` field. The layer's `on_event` routes that field through the visitor's
+/// `record_debug`, flipping the stashed success event to its failure counterpart before the span
+/// closes.
 pub(crate) fn emit_protocol_metadata_load_failure(metric_context: &SnapshotLoadMetricContext) {
-    let _span = tracing::span!(
+    let span = tracing::span!(
         tracing::Level::INFO,
         ProtocolMetadataLoadSuccess::SPAN_NAME,
         report = tracing::field::Empty,
@@ -1794,7 +1796,11 @@ pub(crate) fn emit_protocol_metadata_load_failure(metric_context: &SnapshotLoadM
         num_commits_replayed_for_pm = tracing::field::Empty,
         bytes_read_for_pm = tracing::field::Empty,
         duration_ns = tracing::field::Empty,
-        error = "protocol/metadata load failed",
+    );
+    let _enter = span.enter();
+    tracing::info!(
+        error = tracing::field::debug("protocol/metadata load failed"),
+        "P&M load failed"
     );
 }
 

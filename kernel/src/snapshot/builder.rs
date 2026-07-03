@@ -7,7 +7,7 @@ use tracing::{info, instrument};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-use crate::metrics::{MetricId, SnapshotLoadMetricContext};
+use crate::metrics::{MetricId, SnapshotLoadMetricContext, SnapshotLoadType};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
@@ -214,7 +214,7 @@ impl SnapshotBuilder {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or("")),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type_label()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
@@ -415,6 +415,17 @@ impl SnapshotBuilder {
                     .map(|s| s.table_root().as_str())
             })
             .unwrap_or("unknown")
+    }
+
+    /// The `load_type` label for the snapshot-build metric span: `incremental` when built from an
+    /// existing snapshot, else `fresh`. Determined at span-creation time.
+    fn load_type_label(&self) -> &'static str {
+        let load_type = if self.existing_snapshot.is_some() {
+            SnapshotLoadType::Incremental
+        } else {
+            SnapshotLoadType::Fresh
+        };
+        load_type.into()
     }
 
     fn target_version_str(&self) -> String {
@@ -753,6 +764,58 @@ mod tests {
             snap_duration >= segment_duration,
             "SnapshotBuildSuccess.duration ({snap_duration:?}) should be >= LogSegmentLoadSuccess.duration ({segment_duration:?})"
         );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn incremental_build_emits_log_segment_and_protocol_metadata_loads(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::metrics::{LogSegmentLoadPurpose, ProtocolMetadataSource, SnapshotLoadType};
+
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        // Build v0 before installing the reporter so only the incremental update is measured.
+        let snap_v0 = SnapshotBuilder::new_for(table_root)
+            .at_version(0)
+            .build(engine.as_ref())?;
+
+        let (reporter, _guard) = measuring_reporter();
+        let snap_v1 = SnapshotBuilder::new_from(snap_v0).build(engine.as_ref())?;
+        assert_eq!(snap_v1.version(), 1);
+
+        let events = reporter.events();
+
+        // (a) The incremental path emits a LogSegmentLoad labelled incremental_snapshot.
+        let seg = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoadSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("incremental build must emit LogSegmentLoadSuccess");
+        assert_eq!(seg.load_purpose, LogSegmentLoadPurpose::IncrementalSnapshot);
+
+        // (b) It also emits a ProtocolMetadataLoad. With no CRC and no P&M change in the new
+        // commit, P&M is inherited from the existing snapshot.
+        let pm = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("incremental build must emit ProtocolMetadataLoadSuccess");
+        assert_eq!(pm.source, ProtocolMetadataSource::InheritedFromExisting);
+
+        // (c) The build event is labelled incremental.
+        let build = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::SnapshotBuildSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("expected SnapshotBuildSuccess");
+        assert_eq!(build.load_type, SnapshotLoadType::Incremental);
         Ok(())
     }
 

@@ -8,9 +8,12 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogSegment, PmReplayWork};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::{
+    emit_log_segment_load, emit_protocol_metadata_load, LogSegmentLoadPurpose,
+    ProtocolMetadataSource, SnapshotLoadMetricContext,
+};
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -117,6 +120,11 @@ impl Snapshot {
         // Start listing just after the previous segment's checkpoint, if any.
         let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
+        // The incremental path lists and assembles the segment inline (not via
+        // `LogSegment::for_snapshot`), so it emits its own `LogSegmentLoad` metric at the
+        // productive exits (cases D.1 and F) with `load_purpose = incremental_snapshot`.
+        let segment_load_start = std::time::Instant::now();
+
         // Check for new commits (and CRC)
         let new_listed_files = LogSegmentFiles::list(
             storage.as_ref(),
@@ -177,6 +185,14 @@ impl Snapshot {
                 // of the listing, so a full rebuild is required. The existing snapshot's CRC
                 // is older than the new checkpoint and cannot apply, but a fresh on-disk CRC
                 // at or above the new checkpoint still advances per `incremental_replay`.
+                //
+                // Emit the segment-load metric for the incremental listing; the delegated
+                // `try_new_from_log_segment` emits the `ProtocolMetadataLoad` metric.
+                Self::emit_incremental_segment_load(
+                    &metric_context,
+                    &new_log_segment,
+                    segment_load_start.elapsed(),
+                );
                 let snapshot = Self::try_new_from_log_segment(
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
@@ -292,6 +308,14 @@ impl Snapshot {
             new_checkpoint_schema,
         )?;
 
+        // Emit the segment-load metric for the incremental listing now that the combined segment
+        // is assembled.
+        Self::emit_incremental_segment_load(
+            &metric_context,
+            &combined_log_segment,
+            segment_load_start.elapsed(),
+        );
+
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
         // `incremental_replay`.
@@ -302,16 +326,24 @@ impl Snapshot {
             incremental_replay,
         )?;
 
+        // Resolve P&M, classifying where it came from for the `ProtocolMetadataLoad` metric.
+        let pm_load_start = std::time::Instant::now();
         let existing_table_config = existing_snapshot.table_configuration();
-        let (new_metadata, new_protocol) = match &crc_at_version {
+        let (new_metadata, new_protocol, pm_source, pm_work) = match &crc_at_version {
             Some(crc) => {
-                // If we were able to build a new CRC, then re-use it for TableConfiguration
-                // creation.
+                // A CRC resolved at the target version supplied P&M. Distinguish already-at-target
+                // from advanced-by-replay via the base CRC version.
+                let source = match base_crc.as_deref() {
+                    Some(base) if base.version == new_end_version => {
+                        ProtocolMetadataSource::CrcAtTarget
+                    }
+                    _ => ProtocolMetadataSource::CrcAdvancedByReplay,
+                };
                 let new_metadata = (crc.metadata != *existing_table_config.metadata())
                     .then(|| crc.metadata.clone());
                 let new_protocol = (crc.protocol != *existing_table_config.protocol())
                     .then(|| crc.protocol.clone());
-                (new_metadata, new_protocol)
+                (new_metadata, new_protocol, source, PmReplayWork::default())
             }
             None => {
                 // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
@@ -321,11 +353,34 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
-                combined_log_segment
-                    .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine, newer_base)?
+                let pruned = combined_log_segment.segment_after_version(existing_snapshot_version);
+                let work = pruned.pm_replay_work(None, /* include_checkpoint */ false);
+                let (new_metadata, new_protocol) =
+                    match pruned.read_protocol_metadata_opt(engine, newer_base) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            crate::metrics::emit_protocol_metadata_load_failure(&metric_context);
+                            return Err(e);
+                        }
+                    };
+                // A newer base CRC seeds the pruned replay; otherwise the existing snapshot's P&M
+                // is the baseline and the new commits are only checked for P&M changes.
+                let source = if newer_base.is_some() {
+                    ProtocolMetadataSource::CrcSeededPmOnlyReplay
+                } else {
+                    ProtocolMetadataSource::InheritedFromExisting
+                };
+                (new_metadata, new_protocol, source, work)
             }
         };
+        emit_protocol_metadata_load(
+            &metric_context,
+            pm_source,
+            pm_work.num_commits,
+            pm_work.bytes,
+            pm_load_start.elapsed(),
+        );
+
         let table_configuration = TableConfiguration::try_new_from(
             existing_table_config,
             new_metadata,
@@ -339,6 +394,24 @@ impl Snapshot {
             table_configuration,
             crc_at_version,
         )?))
+    }
+
+    /// Emit a `LogSegmentLoad` metric for the incremental snapshot path, which assembles its
+    /// segment inline rather than via the instrumented `LogSegment::for_snapshot`.
+    fn emit_incremental_segment_load(
+        metric_context: &SnapshotLoadMetricContext,
+        segment: &LogSegment,
+        duration: std::time::Duration,
+    ) {
+        emit_log_segment_load(
+            metric_context,
+            LogSegmentLoadPurpose::IncrementalSnapshot,
+            segment.listed.ascending_commit_files.len() as u64,
+            segment.listed.checkpoint_parts.len() as u64,
+            segment.listed.ascending_compaction_files.len() as u64,
+            segment.listed.latest_crc_file.is_some(),
+            duration,
+        );
     }
 
     // ============================================================================
