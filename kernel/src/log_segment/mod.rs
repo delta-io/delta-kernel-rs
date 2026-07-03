@@ -835,10 +835,21 @@ impl LogSegment {
         Self::version_tagged_scan_files(&self.find_commit_cover_paths())
     }
 
-    /// Returns checkpoint-part files tagged with file-constant `version`.
+    /// Returns checkpoint-part files tagged with file-constant `version`, split by format into
+    /// `(json_parts, parquet_parts)`. V2 checkpoints may be UUID-named JSON, so callers must route
+    /// each part to the matching scan operator rather than assuming parquet.
     #[cfg(feature = "declarative-plans")]
-    pub(crate) fn checkpoint_version_tagged_scan_files(&self) -> DeltaResult<Vec<ScanFile>> {
-        Self::version_tagged_scan_files(&self.listed.checkpoint_parts)
+    pub(crate) fn checkpoint_version_tagged_scan_files(
+        &self,
+    ) -> DeltaResult<(Vec<ScanFile>, Vec<ScanFile>)> {
+        let (json, parquet): (Vec<_>, Vec<_>) = self
+            .listed
+            .checkpoint_parts
+            .iter()
+            .partition(|part| part.extension == "json");
+        let json = Self::version_tagged_scan_files(json)?;
+        let parquet = Self::version_tagged_scan_files(parquet)?;
+        Ok((json, parquet))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.

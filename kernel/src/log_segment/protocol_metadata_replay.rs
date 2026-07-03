@@ -149,10 +149,11 @@ impl LogSegment {
         };
 
         let commit_files = self.commit_cover_version_tagged_scan_files()?;
-        let checkpoint_files = self.checkpoint_version_tagged_scan_files()?;
+        let (json_checkpoint, parquet_checkpoint) = self.checkpoint_version_tagged_scan_files()?;
         let plan = PlanBuilder::union_all([
             PlanBuilder::scan_json(commit_files, &["version"], Arc::clone(&versioned_schema))?,
-            PlanBuilder::scan_parquet(checkpoint_files, &["version"], versioned_schema)?,
+            PlanBuilder::scan_json(json_checkpoint, &["version"], Arc::clone(&versioned_schema))?,
+            PlanBuilder::scan_parquet(parquet_checkpoint, &["version"], versioned_schema)?,
         ])?
         .aggregate_ungrouped(|a| {
             a.max_non_null_by(ColumnName::new([PROTOCOL_NAME]), column_name!("version"))
