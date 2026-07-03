@@ -12,8 +12,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Max, MaxNonNullBy, Min,
-    MinNonNullBy, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -246,19 +246,19 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
         let func = match agg {
-            Agg::Min(Min { value }) => proto_agg::Func::Min(proto_plan::MinAgg {
+            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            Agg::Max(Max { value }) => proto_agg::Func::Max(proto_plan::MaxAgg {
+            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            Agg::MinNonNullBy(MinNonNullBy { value, key }) => {
+            Agg::MinNonNullBy { value, key } => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),
                 })
             }
-            Agg::MaxNonNullBy(MaxNonNullBy { value, key }) => {
+            Agg::MaxNonNullBy { value, key } => {
                 proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),

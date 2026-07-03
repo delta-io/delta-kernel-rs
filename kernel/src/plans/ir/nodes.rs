@@ -568,10 +568,14 @@ impl Aggregate {
 /// An aggregate function and its operand column(s) within an [`Aggregate`] operator.
 #[derive(Debug, Clone)]
 pub enum Agg {
-    Min(Min),
-    Max(Max),
-    MinNonNullBy(MinNonNullBy),
-    MaxNonNullBy(MaxNonNullBy),
+    /// Operands for [`Agg::min`].
+    Min { value: ColumnName },
+    /// Operands for [`Agg::max`].
+    Max { value: ColumnName },
+    /// Operands for [`Agg::min_non_null_by`].
+    MinNonNullBy { value: ColumnName, key: ColumnName },
+    /// Operands for [`Agg::max_non_null_by`].
+    MaxNonNullBy { value: ColumnName, key: ColumnName },
 }
 
 impl Agg {
@@ -583,9 +587,9 @@ impl Agg {
     /// []              -> NULL
     /// ```
     pub fn min(value: impl Into<ColumnName>) -> Self {
-        Self::Min(Min {
+        Self::Min {
             value: value.into(),
-        })
+        }
     }
 
     /// The greatest non-NULL value in each group, or NULL if the group has no non-NULL value.
@@ -597,18 +601,18 @@ impl Agg {
     /// []              -> NULL
     /// ```
     pub fn max(value: impl Into<ColumnName>) -> Self {
-        Self::Max(Max {
+        Self::Max {
             value: value.into(),
-        })
+        }
     }
 
     /// Like [`max_non_null_by`](Self::max_non_null_by), but selects the `value` from the row with
     /// the *least* `key`.
     pub fn min_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        Self::MinNonNullBy(MinNonNullBy {
+        Self::MinNonNullBy {
             value: value.into(),
             key: key.into(),
-        })
+        }
     }
 
     /// The `value` from the row with the greatest `key`, considering only rows where *both* `value`
@@ -649,10 +653,10 @@ impl Agg {
     /// ) WHERE rn = 1
     /// ```
     pub fn max_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        Self::MaxNonNullBy(MaxNonNullBy {
+        Self::MaxNonNullBy {
             value: value.into(),
             key: key.into(),
-        })
+        }
     }
 
     /// Derives this aggregate's output [`StructField`] over `input_schema`, validating that every
@@ -664,9 +668,8 @@ impl Agg {
         alias: Option<String>,
     ) -> DeltaResult<StructField> {
         let value = match self {
-            Agg::Min(Min { value }) | Agg::Max(Max { value }) => value,
-            Agg::MinNonNullBy(MinNonNullBy { value, key })
-            | Agg::MaxNonNullBy(MaxNonNullBy { value, key }) => {
+            Agg::Min { value } | Agg::Max { value } => value,
+            Agg::MinNonNullBy { value, key } | Agg::MaxNonNullBy { value, key } => {
                 input_schema.field_at(key)?;
                 value
             }
@@ -681,36 +684,6 @@ impl Agg {
             .into_owned();
         Ok(StructField::nullable(name, data_type))
     }
-}
-
-/// Operands for [`Agg::min`].
-#[derive(Debug, Clone)]
-pub struct Min {
-    pub value: ColumnName,
-}
-
-/// Operands for [`Agg::max`].
-#[derive(Debug, Clone)]
-pub struct Max {
-    pub value: ColumnName,
-}
-
-/// Operands for [`Agg::min_non_null_by`].
-#[derive(Debug, Clone)]
-pub struct MinNonNullBy {
-    /// Column whose value the aggregate emits.
-    pub value: ColumnName,
-    /// Column compared across rows to pick the winning (least-key) row.
-    pub key: ColumnName,
-}
-
-/// Operands for [`Agg::max_non_null_by`].
-#[derive(Debug, Clone)]
-pub struct MaxNonNullBy {
-    /// Column whose value the aggregate emits.
-    pub value: ColumnName,
-    /// Column compared across rows to pick the winning (greatest-key) row.
-    pub key: ColumnName,
 }
 
 /// Builds an [`Aggregate`] over an input schema, deriving the output schema from the group keys
