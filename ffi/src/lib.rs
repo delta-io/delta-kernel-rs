@@ -27,7 +27,7 @@ use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
     delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
-    std::collections::HashMap,
+    std::collections::HashMap, std::num::NonZero,
 };
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -551,6 +551,19 @@ pub struct EngineBuilder {
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
+    /// Read-path I/O concurrency config for the JSON and Parquet handlers. `None` fields fall back
+    /// to the engine's defaults.
+    io_config: IoConcurrencyConfig,
+}
+
+#[cfg(feature = "default-engine-base")]
+#[derive(Default)]
+struct IoConcurrencyConfig {
+    /// Maximum number of files read concurrently (file-level readahead depth). `None` uses the
+    /// engine default.
+    buffer_size: Option<NonZero<usize>>,
+    /// Maximum number of rows per yielded batch. `None` uses the engine default.
+    batch_size: Option<NonZero<usize>>,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -594,6 +607,7 @@ fn get_engine_builder_impl(
         allocate_fn,
         options: HashMap::default(),
         multithreaded_executor_config: None,
+        io_config: IoConcurrencyConfig::default(),
     });
     Ok(Box::into_raw(builder))
 }
@@ -651,6 +665,36 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
     });
 }
 
+/// Configure read-path I/O concurrency for the engine's JSON and Parquet handlers.
+///
+/// These control the `read_*_files` paths used during log replay and scans. Returned data ordering
+/// is preserved regardless of these values.
+///
+/// # Parameters
+/// - `builder`: The engine builder to configure.
+/// - `buffer_size`: Maximum number of files read concurrently (file-level readahead depth). Higher
+///   values overlap more object-store requests to hide latency, at the cost of more in-flight
+///   memory. Pass 0 to use the engine default.
+/// - `batch_size`: Maximum number of rows per yielded batch. Pass 0 to use the engine default.
+///   Overall read memory usage is roughly proportional to `buffer_size * batch_size`.
+///
+/// # Safety
+///
+/// Caller must pass a valid EngineBuilder pointer.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_with_io_concurrency(
+    builder: &mut EngineBuilder,
+    buffer_size: usize,
+    batch_size: usize,
+) {
+    // `NonZero::new` maps 0 -> `None`, which the engine reads as "use the default".
+    builder.io_config = IoConcurrencyConfig {
+        buffer_size: NonZero::new(buffer_size),
+        batch_size: NonZero::new(batch_size),
+    };
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -669,6 +713,7 @@ pub unsafe extern "C" fn builder_build(
         builder_box.url,
         builder_box.options,
         builder_box.multithreaded_executor_config,
+        builder_box.io_config,
         builder_box.allocate_fn,
     )
     .into_extern_result(&builder_box.allocate_fn)
@@ -693,7 +738,13 @@ fn get_default_default_engine_impl(
     url: DeltaResult<Url>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(url?, Default::default(), None, allocate_error)
+    get_default_engine_impl(
+        url?,
+        Default::default(),
+        None,
+        IoConcurrencyConfig::default(),
+        allocate_error,
+    )
 }
 
 /// Safety
@@ -720,6 +771,7 @@ fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
     executor_config: Option<MultithreadedExecutorConfig>,
+    io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
@@ -727,18 +779,32 @@ fn get_default_engine_impl(
 
     let store = store_from_url_opts(&url, options)?;
 
+    // The builder is generic over the executor type, so apply the shared I/O config via a generic
+    // helper to both branches without naming the concrete builder type.
+    fn apply_io_config<E>(
+        builder: DefaultEngineBuilder<E>,
+        io_config: &IoConcurrencyConfig,
+    ) -> DefaultEngineBuilder<E> {
+        let builder = match io_config.buffer_size {
+            Some(buffer_size) => builder.with_buffer_size(buffer_size),
+            None => builder,
+        };
+        match io_config.batch_size {
+            Some(batch_size) => builder.with_batch_size(batch_size),
+            None => builder,
+        }
+    }
+
     let engine: Arc<dyn Engine> = if let Some(config) = executor_config {
         let executor = TokioMultiThreadExecutor::new_owned_runtime(
             config.worker_threads,
             config.max_blocking_threads,
         )?;
-        Arc::new(
-            DefaultEngineBuilder::new(store)
-                .with_task_executor(Arc::new(executor))
-                .build(),
-        )
+        let builder = DefaultEngineBuilder::new(store).with_task_executor(Arc::new(executor));
+        Arc::new(apply_io_config(builder, &io_config).build())
     } else {
-        Arc::new(DefaultEngineBuilder::new(store).build())
+        let builder = apply_io_config(DefaultEngineBuilder::new(store), &io_config);
+        Arc::new(builder.build())
     };
 
     Ok(engine_to_handle(engine, allocate_error))
@@ -2471,6 +2537,71 @@ mod tests {
             }
         };
         assert!(did_checkpoint);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test building an engine via the FFI builder with custom read-path I/O concurrency, then
+    // exercising the read path (snapshot) to confirm the configured engine works.
+    #[cfg(feature = "default-engine-base")]
+    #[rstest]
+    #[case(4, 8)]
+    #[case(0, 0)]
+    fn test_setting_io_concurrency(
+        #[case] buffer_size: usize,
+        #[case] batch_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use delta_kernel::object_store::local::LocalFileSystem;
+        use tempfile::tempdir;
+
+        let tmp_dir = tempdir()?;
+        let tmp_path = tmp_dir.path();
+        let table_root = tmp_path
+            .to_str()
+            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+        let storage = Arc::new(LocalFileSystem::new());
+
+        let protocol_and_metadata = METADATA
+            .lines()
+            .skip(1) // skip commitInfo
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
+                add_commit(
+                    &table_root,
+                    storage.as_ref(),
+                    1,
+                    actions_to_string(vec![
+                        TestAction::Add("file1.parquet".into()),
+                        TestAction::Add("file2.parquet".into()),
+                    ]),
+                )
+                .await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
+
+        let builder = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
+        unsafe {
+            set_builder_with_io_concurrency(builder.as_mut().unwrap(), buffer_size, batch_size)
+        };
+        let engine = unsafe { ok_or_panic(builder_build(builder)) };
+
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let version = unsafe { version(snapshot.shallow_copy()) };
+        assert_eq!(version, 1);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }

@@ -101,18 +101,13 @@ message MaxNonNullByAgg {
   delta.kernel.expressions.ColumnName key = 2;
 }
 
-message AggFn {
+message Agg {
   oneof func {
     MinAgg min = 1;
     MaxAgg max = 2;
     MinNonNullByAgg min_non_null_by = 3;
     MaxNonNullByAgg max_non_null_by = 4;
   }
-}
-
-message Agg {
-  AggFn func = 1;
-  optional string alias = 2;
 }
 
 message AggregateNode {

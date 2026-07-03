@@ -168,6 +168,15 @@ async fn put_impl(
     Ok(())
 }
 
+/// Native async implementation for delete.
+async fn delete_impl(store: Arc<DynObjectStore>, path: Path) -> DeltaResult<()> {
+    match store.delete(&path).await {
+        Ok(()) => Ok(()),
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Native async implementation for head
 async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta> {
     let meta = store.head(&Path::from_url_path(url.path())?).await?;
@@ -219,6 +228,12 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
         let future = head_impl(self.inner.clone(), path.clone());
         self.task_executor.block_on(future)
+    }
+
+    fn delete(&self, path: &Url) -> DeltaResult<()> {
+        let path = Path::from_url_path(path.path())?;
+        self.task_executor
+            .block_on(delete_impl(self.inner.clone(), path))
     }
 }
 
@@ -513,5 +528,33 @@ mod tests {
             .collect();
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0], new_data);
+    }
+
+    #[test]
+    fn test_delete() {
+        let (tmp, _store, handler) = setup_test();
+
+        let data = Bytes::from("delete-test-data");
+        let file_url = Url::from_file_path(tmp.path().join("delete.txt")).unwrap();
+        handler.put(&file_url, data, false).unwrap();
+
+        handler.delete(&file_url).unwrap();
+
+        assert!(matches!(
+            handler.head(&file_url),
+            Err(Error::FileNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_delete_nonexistent_is_ok() {
+        let (tmp, _store, handler) = setup_test();
+
+        let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
+        assert!(matches!(
+            handler.head(&missing_url),
+            Err(Error::FileNotFound(_))
+        ));
+        handler.delete(&missing_url).unwrap();
     }
 }

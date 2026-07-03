@@ -1,6 +1,7 @@
 //! Default Parquet handler implementation
 
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -45,7 +46,11 @@ use crate::UrlExt;
 pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    readahead: usize,
+    /// The maximum number of files to read concurrently in [`Self::read_parquet_files()`]. This is
+    /// the number of futures buffered by `buffered`, i.e. the file-level I/O readahead depth.
+    buffer_size: NonZero<usize>,
+    /// The maximum number of rows per RecordBatch yielded by the read stream.
+    batch_size: NonZero<usize>,
 }
 
 /// Metadata of a data file (typically a parquet file).
@@ -149,15 +154,34 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Self {
             store,
             task_executor,
-            readahead: 10,
+            buffer_size: super::DEFAULT_READ_BUFFER_SIZE,
+            batch_size: super::DEFAULT_READ_BATCH_SIZE,
         }
     }
 
-    /// Max number of batches to read ahead while executing [Self::read_parquet_files()].
+    /// Set the maximum number of files to read concurrently in [Self::read_parquet_files()].
     ///
-    /// Defaults to 10.
-    pub fn with_readahead(mut self, readahead: usize) -> Self {
-        self.readahead = readahead;
+    /// Defaults to `super::DEFAULT_READ_BUFFER_SIZE`.
+    ///
+    /// This setting applies only to object-store reads. When every file in the batch uses a
+    /// presigned URL (`https://...`), reads bypass the object store and this value has no effect;
+    /// use [`Self::with_batch_size`] to tune RecordBatch chunking in that path.
+    ///
+    /// Memory constraints can be imposed by constraining the buffer size and batch size. Note that
+    /// overall memory usage is proportional to the product of these two values.
+    /// 1. Batch size governs the size of RecordBatches yielded in each iteration of the stream.
+    /// 2. Buffer size governs the number of concurrent file reads (which equals the size of the
+    ///    readahead buffer).
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
+        self.buffer_size = buffer_size;
+        self
+    }
+
+    /// Set the maximum number of rows per RecordBatch yielded by [Self::read_parquet_files()].
+    ///
+    /// Defaults to `super::DEFAULT_READ_BATCH_SIZE` rows.
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
+        self.batch_size = batch_size;
         self
     }
 
@@ -247,6 +271,8 @@ async fn read_parquet_files_impl(
     files: Vec<FileMeta>,
     physical_schema: SchemaRef,
     predicate: Option<PredicateRef>,
+    buffer_size: usize,
+    batch_size: usize,
 ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
     if files.is_empty() {
         return Ok(Box::pin(stream::empty()));
@@ -264,7 +290,7 @@ async fn read_parquet_files_impl(
     // SAFETY: we did is_empty check above, this is ok.
     if files[0].location.is_presigned() {
         let file_opener = Box::new(PresignedUrlOpener::new(
-            1024,
+            batch_size,
             physical_schema.clone(),
             predicate,
         ));
@@ -279,21 +305,11 @@ async fn read_parquet_files_impl(
         let store = store.clone();
         let schema = physical_schema.clone();
         let predicate = predicate.clone();
-        async move {
-            open_parquet_file(
-                store,
-                schema,
-                predicate,
-                None,
-                super::DEFAULT_BATCH_SIZE,
-                file,
-            )
-            .await
-        }
+        async move { open_parquet_file(store, schema, predicate, None, batch_size, file).await }
     });
     // create a stream from that iterator which buffers up to `buffer_size` futures at a time
     let result_stream = stream::iter(file_futures)
-        .buffered(super::DEFAULT_BUFFER_SIZE)
+        .buffered(buffer_size)
         .try_flatten()
         .map_ok(|record_batch| -> Box<dyn EngineData> {
             Box::new(ArrowEngineData::new(record_batch))
@@ -314,6 +330,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files.to_vec(),
             physical_schema,
             predicate,
+            self.buffer_size.get(),
+            self.batch_size.get(),
         );
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
@@ -1185,6 +1203,59 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 3);
         assert_eq!(data[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_files_respects_batch_size() {
+        let store = Arc::new(InMemory::new());
+        let writer: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "x",
+                Arc::new(Int64Array::from((0..10).collect::<Vec<_>>())) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let file_url = Url::parse("memory:///test/batch_size.parquet").unwrap();
+        writer
+            .write_parquet_file(file_url.clone(), Box::new(std::iter::once(Ok(engine_data))))
+            .unwrap();
+
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let metadata = store.head(&path).await.unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: metadata.size,
+        };
+
+        // With a batch size of 4, the 10-row file should be split into batches of 4, 4, 2.
+        let handler =
+            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()))
+                .with_batch_size(NonZero::new(4).unwrap());
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        let row_counts: Vec<usize> = data.iter().map(|b| b.num_rows()).collect();
+        assert_eq!(row_counts, vec![4, 4, 2]);
     }
 
     #[tokio::test]
