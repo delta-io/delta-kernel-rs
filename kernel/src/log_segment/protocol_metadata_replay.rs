@@ -8,11 +8,19 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use super::LogSegment;
-use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
+use crate::actions::{
+    Metadata, Protocol, METADATA_FIELD, METADATA_NAME, PROTOCOL_FIELD, PROTOCOL_NAME,
+};
 use crate::crc::Crc;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::ColumnName;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
 use crate::metrics::SnapshotLoadMetricContext;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::{Operation, PlanBuilder};
+#[cfg(feature = "declarative-plans")]
+use crate::schema::column_name;
 use crate::schema::schema_ref;
 use crate::{DeltaResult, Engine, Error};
 
@@ -102,9 +110,19 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        #[cfg(feature = "declarative-plans")]
+        let actions_batches = self.read_pm_batches_via_plan(engine).or_else(|err| {
+            info!("declarative P&M plan unavailable, using legacy replay: {err}");
+            self.read_pm_batches(engine)
+                .map(|batches| Box::new(batches) as _)
+        })?;
+
+        #[cfg(not(feature = "declarative-plans"))]
+        let actions_batches = self.read_pm_batches(engine)?;
+
         let mut metadata_opt = None;
         let mut protocol_opt = None;
-        for actions_batch in self.read_pm_batches(engine)? {
+        for actions_batch in actions_batches {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
@@ -117,6 +135,38 @@ impl LogSegment {
             }
         }
         Ok((metadata_opt, protocol_opt))
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn read_pm_batches_via_plan(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        let versioned_schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+            not_null "version": LONG,
+        };
+
+        let commit_files = self.commit_cover_version_tagged_scan_files()?;
+        let checkpoint_files = self.checkpoint_version_tagged_scan_files()?;
+        let plan = PlanBuilder::union_all([
+            PlanBuilder::scan_json(commit_files, &["version"], Arc::clone(&versioned_schema))?,
+            PlanBuilder::scan_parquet(checkpoint_files, &["version"], versioned_schema)?,
+        ])?
+        .aggregate_ungrouped(|a| {
+            a.max_non_null_by(ColumnName::new([PROTOCOL_NAME]), column_name!("version"))
+                .max_non_null_by(ColumnName::new([METADATA_NAME]), column_name!("version"))
+        })?
+        .build()?;
+
+        // NOTE: The plan dedupes all actions, so mark all results as coming from checkpoint
+        let batches = engine
+            .plan_executor()
+            .execute_op(Operation::QueryPlan(plan))?
+            .into_data()?
+            .map(|batch| Ok(ActionsBatch::new(batch?, true)));
+        Ok(Box::new(batches))
     }
 
     // Replay the commit log, projecting rows to only contain Protocol and Metadata action columns.
