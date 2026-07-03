@@ -134,14 +134,19 @@ fn emit_field_entry(
         input.parse::<Token![..]>()?;
         let expr: Expr = parse_paren_to_end(input, "splice expression")?;
         return Ok(quote_spanned! { expr.span() =>
-            __fields.extend(::core::iter::IntoIterator::into_iter(#expr));
+            __fields.extend(
+                ::core::iter::IntoIterator::into_iter(#expr)
+                    .map(delta_kernel::schema::ToSchemaField::to_schema_field)
+            );
         });
     }
     // `(field)` -- interpolate one `StructField`. A named field always starts with a nullability
     // keyword, so a leading `(` is unambiguous.
     if input.peek(Paren) {
         let expr: Expr = parse_paren_to_end(input, "field expression")?;
-        return Ok(quote_spanned! { expr.span() => __fields.push(#expr); });
+        return Ok(quote_spanned! { expr.span() =>
+            __fields.push(delta_kernel::schema::ToSchemaField::to_schema_field(#expr));
+        });
     }
     // `nullability NAME : type`
     let nullable = parse_nullability(input)?;

@@ -32,6 +32,17 @@ pub fn schema_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     schema_macro::parse_schema(input, false, |block| quote!(::std::sync::Arc::new(#block)))
 }
 
+// `LazyLock<SchemaRef>`-wrapped `schema!`; see `delta_kernel::schema::lazy_schema_ref`.
+#[doc(hidden)]
+#[proc_macro]
+pub fn lazy_schema_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    schema_macro::parse_schema(
+        input,
+        false,
+        |block| quote!(::std::sync::LazyLock::new(|| ::std::sync::Arc::new(#block))),
+    )
+}
+
 /// Parses a dot-delimited column name into an array of field names. See
 /// `delta_kernel::expressions::column_name::column_name` macro for details.
 #[proc_macro]

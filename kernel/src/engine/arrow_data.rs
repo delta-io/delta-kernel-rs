@@ -537,7 +537,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{extract_record_batch, ArrowEngineData};
-    use crate::actions::{get_commit_schema, Metadata, Protocol};
+    use crate::actions::{get_commit_schema, Metadata, Protocol, LOG_PROTOCOL_SCHEMA};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
@@ -583,7 +583,7 @@ mod tests {
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]
         .into();
-        let output_schema = get_commit_schema().project(&["protocol"])?;
+        let output_schema = LOG_PROTOCOL_SCHEMA.clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
