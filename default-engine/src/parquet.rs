@@ -412,9 +412,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
-            let schema = StructType::try_from_arrow(metadata.schema().as_ref())
-                .map(Arc::new)
-                .map_err(Error::Arrow)?;
+            let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
             Ok(ParquetFooter { schema })
         })
     }

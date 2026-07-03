@@ -26,8 +26,8 @@ use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler,
+    PredicateRef, SchemaRef, StorageHandler,
 };
 
 pub(crate) mod json;
@@ -37,6 +37,9 @@ mod storage;
 #[cfg(feature = "declarative-plans")]
 pub(crate) mod plan;
 
+#[cfg(feature = "declarative-plans")]
+use plan::SyncPlanExecutor;
+
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
 pub(crate) struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
@@ -44,7 +47,7 @@ pub(crate) struct SyncEngine {
     parquet_handler: Arc<parquet::SyncParquetHandler>,
     evaluation_handler: Arc<ArrowEvaluationHandler>,
     #[cfg(feature = "declarative-plans")]
-    plan_executor: Arc<plan::SyncPlanExecutor>,
+    plan_executor: Arc<SyncPlanExecutor>,
 }
 
 impl SyncEngine {
@@ -61,18 +64,13 @@ impl SyncEngine {
     }
 
     fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
-        #[cfg(feature = "declarative-plans")]
-        let plan_executor = Arc::new(match &store {
-            Some(store) => plan::SyncPlanExecutor::new_with_store(store.clone()),
-            None => plan::SyncPlanExecutor::new(),
-        });
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler::new(store.clone())),
+            #[cfg(feature = "declarative-plans")]
+            plan_executor: Arc::new(plan::SyncPlanExecutor::new(store.clone())),
             json_handler: Arc::new(json::SyncJsonHandler::new(store.clone())),
             parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store)),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
-            #[cfg(feature = "declarative-plans")]
-            plan_executor,
         }
     }
 }
@@ -216,24 +214,21 @@ pub(super) fn put_bytes(
 }
 
 /// Read each file as bytes and feed it to `try_create_from_bytes` to produce data batches.
-fn read_files<F, I>(
+fn read_files_arrow<F, I>(
     store: Option<&Arc<DynObjectStore>>,
     files: &[FileMeta],
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_bytes: F,
-) -> DeltaResult<FileDataReadResultIterator>
+) -> impl Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
     F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
-    if files.is_empty() {
-        return Ok(Box::new(std::iter::empty()));
-    }
-    let files = files.to_vec();
+    let files = files.to_vec(); // Clone for static iterator (clippy hates chained to_vec+into_iter)
     let store = store.cloned();
-    let result = files
+    files
         .into_iter()
         .map(move |file| {
             let location_string = file.location.to_string();
@@ -241,8 +236,7 @@ where
             try_create_from_bytes(bytes, schema.clone(), predicate.clone(), location_string)
         })
         .flatten_ok()
-        .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
-    Ok(Box::new(result))
+        .map(|data| data?)
 }
 
 // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
