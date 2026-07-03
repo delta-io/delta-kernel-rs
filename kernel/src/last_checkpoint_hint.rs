@@ -451,77 +451,90 @@ mod tests {
     /// txn, no domainMetadata). Also checks the identity gate exposes a matched hint's sidecars
     /// but suppresses a mismatched one (`v2-classic-checkpoint-parquet`, whose hint names a
     /// UUID checkpoint while the segment selects the classic-named one).
+    /// A table's expected `_last_checkpoint` identity and metadata for the case below.
+    struct ExpectedHint {
+        table: &'static str,
+        version: u64,
+        path: &'static str,
+        sidecars: &'static [&'static str],
+        metadata_id: &'static str,
+        created_time: i64,
+        config: &'static [(&'static str, &'static str)],
+    }
+
     #[rstest]
-    #[case::parquet_sidecars(
-    "v2-checkpoints-parquet-with-sidecars",
-    6,
-    "00000000000000000006.checkpoint.f15b9025-707a-4c73-aac0-31dfcbd29aa6.parquet",
-    &[
-    "00000000000000000006.checkpoint.0000000001.0000000002.76931b15-ead3-480d-b86c-afe55a577fc3.parquet",
-    "00000000000000000006.checkpoint.0000000002.0000000002.4367b29c-0e87-447f-8e81-9814cc01ad1f.parquet",
-    ],
-    "5a5afdfe-7d40-4109-bb92-29b051257e4c",
-    1739329708855,
-    &[("delta.checkpointInterval", "1"), ("delta.checkpointPolicy", "v2")]
-    )]
-    #[case::json_sidecars(
-    "v2-checkpoints-json-with-sidecars",
-    6,
-    "00000000000000000006.checkpoint.2a15d0c6-8b11-4a98-bab4-957905d62f7f.json",
-    &[
-    "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet",
-    "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet",
-    ],
-    "f571bf08-452e-4155-9f52-f793e630c55c",
-    1739329697356,
-    &[("delta.checkpointInterval", "1"), ("delta.checkpointPolicy", "v2")]
-    )]
-    #[case::parquet_last_checkpoint(
-    "v2-checkpoints-parquet-with-last-checkpoint",
-    0,
-    "00000000000000000000.checkpoint.8516aa94-7099-4e71-92a0-d6d7e7bb3b2c.parquet",
-    &["00000000000000000000.checkpoint.0000000001.0000000001.c561300b-ad5f-49d4-a28d-9b3f4bb0331c.parquet"],
-    "d3b78022-27fc-470d-a4ea-1b8b47fcc143",
-    1739329764309,
-    &[("delta.checkpointPolicy", "v2")]
-    )]
-    #[case::json_last_checkpoint(
-    "v2-checkpoints-json-with-last-checkpoint",
-    0,
-    "00000000000000000000.checkpoint.0e42c15b-17cc-4918-990d-2ff76e918e4d.json",
-    &["00000000000000000000.checkpoint.0000000001.0000000001.9167a758-dd93-4e52-8636-7cf5776eb10f.parquet"],
-    "f03ce383-0d09-4e1c-9446-8d80e1a59daa",
-    1739329763101,
-    &[("delta.checkpointPolicy", "v2")]
-    )]
-    #[case::classic_parquet(
-    "v2-classic-checkpoint-parquet",
-    1,
-    "00000000000000000001.checkpoint.bfe7499d-715e-4d64-82a4-e6cdd2fc37af.parquet",
-    &["00000000000000000001.checkpoint.0000000001.0000000001.e2eb56f9-1c54-4a82-b122-de108e317c20.parquet"],
-    "541a194a-df83-4f46-9adf-032a1275e82b",
-    1739329759409,
-    &[("delta.checkpointPolicy", "v2")]
-    )]
-    #[case::classic_json(
-    "v2-classic-checkpoint-json",
-    1,
-    "00000000000000000001.checkpoint.6c750e24-bbc4-4618-8feb-7cd7d5b9e084.json",
-    &["00000000000000000001.checkpoint.0000000001.0000000001.c1bacf45-f3a9-4846-bd44-87cdacd4620f.parquet"],
-    "29ef2045-59c5-4cf7-9d5d-2ba47e971d32",
-    1739313200623,
-    &[("delta.checkpointPolicy", "v2")]
-    )]
-    fn v2_last_checkpoint_hint_contents(
-        #[case] table: &str,
-        #[case] expected_version: u64,
-        #[case] expected_path: &str,
-        #[case] expected_sidecars: &[&str],
-        #[case] expected_metadata_id: &str,
-        #[case] expected_created_time: i64,
-        #[case] expected_config: &[(&str, &str)],
-    ) -> DeltaResult<()> {
+    #[case::parquet_sidecars(ExpectedHint {
+        table: "v2-checkpoints-parquet-with-sidecars",
+        version: 6,
+        path: "00000000000000000006.checkpoint.f15b9025-707a-4c73-aac0-31dfcbd29aa6.parquet",
+        sidecars: &[
+            "00000000000000000006.checkpoint.0000000001.0000000002.76931b15-ead3-480d-b86c-afe55a577fc3.parquet",
+            "00000000000000000006.checkpoint.0000000002.0000000002.4367b29c-0e87-447f-8e81-9814cc01ad1f.parquet",
+        ],
+        metadata_id: "5a5afdfe-7d40-4109-bb92-29b051257e4c",
+        created_time: 1739329708855,
+        config: &[("delta.checkpointInterval", "1"), ("delta.checkpointPolicy", "v2")],
+    })]
+    #[case::json_sidecars(ExpectedHint {
+        table: "v2-checkpoints-json-with-sidecars",
+        version: 6,
+        path: "00000000000000000006.checkpoint.2a15d0c6-8b11-4a98-bab4-957905d62f7f.json",
+        sidecars: &[
+            "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet",
+            "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet",
+        ],
+        metadata_id: "f571bf08-452e-4155-9f52-f793e630c55c",
+        created_time: 1739329697356,
+        config: &[("delta.checkpointInterval", "1"), ("delta.checkpointPolicy", "v2")],
+    })]
+    #[case::parquet_last_checkpoint(ExpectedHint {
+        table: "v2-checkpoints-parquet-with-last-checkpoint",
+        version: 0,
+        path: "00000000000000000000.checkpoint.8516aa94-7099-4e71-92a0-d6d7e7bb3b2c.parquet",
+        sidecars: &["00000000000000000000.checkpoint.0000000001.0000000001.c561300b-ad5f-49d4-a28d-9b3f4bb0331c.parquet"],
+        metadata_id: "d3b78022-27fc-470d-a4ea-1b8b47fcc143",
+        created_time: 1739329764309,
+        config: &[("delta.checkpointPolicy", "v2")],
+    })]
+    #[case::json_last_checkpoint(ExpectedHint {
+        table: "v2-checkpoints-json-with-last-checkpoint",
+        version: 0,
+        path: "00000000000000000000.checkpoint.0e42c15b-17cc-4918-990d-2ff76e918e4d.json",
+        sidecars: &["00000000000000000000.checkpoint.0000000001.0000000001.9167a758-dd93-4e52-8636-7cf5776eb10f.parquet"],
+        metadata_id: "f03ce383-0d09-4e1c-9446-8d80e1a59daa",
+        created_time: 1739329763101,
+        config: &[("delta.checkpointPolicy", "v2")],
+    })]
+    #[case::classic_parquet(ExpectedHint {
+        table: "v2-classic-checkpoint-parquet",
+        version: 1,
+        path: "00000000000000000001.checkpoint.bfe7499d-715e-4d64-82a4-e6cdd2fc37af.parquet",
+        sidecars: &["00000000000000000001.checkpoint.0000000001.0000000001.e2eb56f9-1c54-4a82-b122-de108e317c20.parquet"],
+        metadata_id: "541a194a-df83-4f46-9adf-032a1275e82b",
+        created_time: 1739329759409,
+        config: &[("delta.checkpointPolicy", "v2")],
+    })]
+    #[case::classic_json(ExpectedHint {
+        table: "v2-classic-checkpoint-json",
+        version: 1,
+        path: "00000000000000000001.checkpoint.6c750e24-bbc4-4618-8feb-7cd7d5b9e084.json",
+        sidecars: &["00000000000000000001.checkpoint.0000000001.0000000001.c1bacf45-f3a9-4846-bd44-87cdacd4620f.parquet"],
+        metadata_id: "29ef2045-59c5-4cf7-9d5d-2ba47e971d32",
+        created_time: 1739313200623,
+        config: &[("delta.checkpointPolicy", "v2")],
+    })]
+    fn v2_last_checkpoint_hint_contents(#[case] expected: ExpectedHint) -> DeltaResult<()> {
         use crate::utils::test_utils::load_test_table;
+
+        let ExpectedHint {
+            table,
+            version: expected_version,
+            path: expected_path,
+            sidecars: expected_sidecars,
+            metadata_id: expected_metadata_id,
+            created_time: expected_created_time,
+            config: expected_config,
+        } = expected;
 
         let (engine, snapshot, _tempdir) = load_test_table(table)?;
         let seg = snapshot.log_segment();

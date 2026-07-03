@@ -33,8 +33,6 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
-use crate::snapshot::Snapshot;
-use crate::table_features::TableFeature;
 use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, string_array_to_engine_data, Action,
