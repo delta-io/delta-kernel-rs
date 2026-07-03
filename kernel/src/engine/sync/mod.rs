@@ -43,6 +43,8 @@ pub(crate) struct SyncEngine {
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
     evaluation_handler: Arc<ArrowEvaluationHandler>,
+    #[cfg(feature = "declarative-plans")]
+    plan_executor: Arc<plan::SyncPlanExecutor>,
 }
 
 impl SyncEngine {
@@ -59,11 +61,18 @@ impl SyncEngine {
     }
 
     fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
+        #[cfg(feature = "declarative-plans")]
+        let plan_executor = Arc::new(match &store {
+            Some(store) => plan::SyncPlanExecutor::new_with_store(store.clone()),
+            None => plan::SyncPlanExecutor::new(),
+        });
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler::new(store.clone())),
             json_handler: Arc::new(json::SyncJsonHandler::new(store.clone())),
             parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store)),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
+            #[cfg(feature = "declarative-plans")]
+            plan_executor,
         }
     }
 }
@@ -83,6 +92,11 @@ impl Engine for SyncEngine {
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json_handler.clone()
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Arc<dyn crate::plans::PlanExecutor> {
+        self.plan_executor.clone()
     }
 }
 

@@ -83,7 +83,7 @@ mod tests {
     use crate::{Error, StorageHandler as _};
 
     fn make_handler() -> PlanBasedStorageHandler {
-        PlanBasedStorageHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedStorageHandler::new(Arc::new(SyncPlanExecutor::default()))
     }
 
     #[test]

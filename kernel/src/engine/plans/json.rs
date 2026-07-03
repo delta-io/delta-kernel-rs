@@ -83,11 +83,11 @@ mod tests {
     };
 
     fn make_handler() -> PlanBasedJsonHandler {
-        PlanBasedJsonHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedJsonHandler::new(Arc::new(SyncPlanExecutor::default()))
     }
 
     fn make_parquet_handler() -> PlanBasedParquetHandler {
-        PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::default()))
     }
 
     fn temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {

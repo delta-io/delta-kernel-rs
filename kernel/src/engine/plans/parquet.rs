@@ -77,7 +77,7 @@ mod tests {
     use crate::{FileMeta, ParquetHandler as _};
 
     fn make_handler() -> PlanBasedParquetHandler {
-        PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::default()))
     }
 
     fn file_meta_for(path: &Path) -> FileMeta {

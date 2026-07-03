@@ -40,22 +40,25 @@ pub(crate) struct SyncPlanExecutor {
 }
 
 impl SyncPlanExecutor {
-    /// Create a `SyncPlanExecutor` that resolves URLs against LocalFileSystem
-    pub(crate) fn new() -> Self {
-        Self::new_inner(None)
-    }
-
-    /// Create a `SyncPlanExecutor` backed by an explicit object store.
-    pub(crate) fn new_with_store(store: Arc<DynObjectStore>) -> Self {
-        Self::new_inner(Some(store))
-    }
-
-    fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
+    /// Create a `SyncPlanExecutor` over `store`, or over a per-URL [`LocalFileSystem`] when `None`
+    /// (matching the handlers it delegates to).
+    ///
+    /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
+    pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
         Self {
             storage: SyncStorageHandler::new(store.clone()),
             json: SyncJsonHandler::new(store.clone()),
             parquet: SyncParquetHandler::new(store),
         }
+    }
+}
+
+impl Default for SyncPlanExecutor {
+    /// A `SyncPlanExecutor` over a per-URL [`LocalFileSystem`].
+    ///
+    /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 
