@@ -1989,6 +1989,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: Some("snap-req-3".into()),
+            load_type: SnapshotLoadType::Fresh,
             version: 0,
             duration: Duration::default(),
         };

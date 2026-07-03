@@ -756,6 +756,35 @@ mod tests {
         Ok(())
     }
 
+    #[test_log::test(tokio::test)]
+    async fn fresh_build_no_crc_emits_full_replay_protocol_metadata_load(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::metrics::ProtocolMetadataSource;
+
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?; // no CRC on disk
+
+        let (reporter, _guard) = measuring_reporter();
+        let _snap = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
+
+        let pm = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("expected ProtocolMetadataLoadSuccess on a fresh no-CRC build");
+        assert_eq!(pm.source, ProtocolMetadataSource::FullReplay);
+        // A full replay reads commit files, so it covers a nonzero commit count and byte volume.
+        assert!(
+            pm.num_commits_replayed_for_pm > 0,
+            "expected commits replayed"
+        );
+        assert!(pm.bytes_read_for_pm > 0, "expected nonzero replay bytes");
+        Ok(())
+    }
+
     #[rstest::rstest]
     #[case::with_id(Some("req-abc-123"))]
     #[case::without_id(None)]
