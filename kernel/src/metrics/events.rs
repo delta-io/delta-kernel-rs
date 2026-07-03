@@ -568,9 +568,9 @@ impl ProtocolMetadataSource {
 /// Protocol and metadata actions were resolved for a snapshot, from a CRC and/or log replay.
 ///
 /// Emit-based (like [`ScanMetadataCompleted`]): the snapshot layer classifies the `source`,
-/// measures the `duration`, and sums the replay denominators, then fires the event via
-/// [`emit_protocol_metadata_load`]. `num_commits_replayed_for_pm` and `bytes_read_for_pm` are the
-/// work denominators; both are zero when P&M is served from a cache (`CrcAtTarget`,
+/// measures the `duration`, and sums the replay denominators, then fires the event via an
+/// internal emit helper. `num_commits_replayed_for_pm` and `bytes_read_for_pm` are the work
+/// denominators; both are zero when P&M is served from a cache (`CrcAtTarget`,
 /// `InheritedFromExisting`).
 ///
 /// `bytes_read_for_pm` is the on-disk size of the files the replay covered (commits, plus

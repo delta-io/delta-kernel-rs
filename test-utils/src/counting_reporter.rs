@@ -397,10 +397,11 @@ mod tests {
     use std::time::Duration;
 
     use delta_kernel::metrics::{
-        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
-        ProtocolMetadataLoadSuccess, SetTransactionLoadSuccess, SnapshotBuildFailure,
-        SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
-        TableType, TransactionCommitFailure, TransactionCommitSuccess,
+        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadPurpose, LogSegmentLoadSuccess,
+        MetricId, ProtocolMetadataLoadSuccess, ProtocolMetadataSource, SetTransactionLoadSuccess,
+        SnapshotBuildFailure, SnapshotBuildSuccess, SnapshotLoadType, StorageCopyCompleted,
+        StorageListCompleted, StorageReadCompleted, TableType, TransactionCommitFailure,
+        TransactionCommitSuccess,
     };
 
     use super::*;
@@ -453,6 +454,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
+            load_type: SnapshotLoadType::Fresh,
             version: 0,
             duration: dur(),
         }));
@@ -471,6 +473,7 @@ mod tests {
             num_checkpoint_files: 2,
             num_compaction_files: 1,
             has_latest_crc_file: true,
+            load_purpose: LogSegmentLoadPurpose::Snapshot,
         }));
         assert_eq!(reporter.log_segment_loads.get(), 1);
         assert_eq!(reporter.commit_files.get(), 7);
@@ -491,6 +494,7 @@ mod tests {
             num_checkpoint_files: 1,
             num_compaction_files: 0,
             has_latest_crc_file: false,
+            load_purpose: LogSegmentLoadPurpose::IncrementalSnapshot,
         }));
         assert_eq!(reporter.log_segment_loads.get(), 1);
         assert_eq!(reporter.latest_crc_files_found.get(), 0);
@@ -615,6 +619,9 @@ mod tests {
                 operation_id: MetricId::new(),
                 table_type: TableType::PathBased,
                 correlation_id: None,
+                source: ProtocolMetadataSource::FullReplay,
+                num_commits_replayed_for_pm: 0,
+                bytes_read_for_pm: 0,
                 duration: dur(),
             },
         ));
@@ -622,6 +629,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
+            load_type: SnapshotLoadType::Fresh,
         }));
         assert_eq!(reporter.snapshot_completions.get(), 0);
     }
@@ -650,6 +658,7 @@ mod tests {
             num_checkpoint_files: 2,
             num_compaction_files: 1,
             has_latest_crc_file: true,
+            load_purpose: LogSegmentLoadPurpose::Snapshot,
         }));
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
