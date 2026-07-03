@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(bytes.as_ref(), b"third");
     }
 
+    // TODO(#2872): add a double-delete test to exercise idempotency on the in-memory store.
     #[tokio::test]
     async fn delete_store_removes_file() {
         let store = std::sync::Arc::new(InMemory::new());
