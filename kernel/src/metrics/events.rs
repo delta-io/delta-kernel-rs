@@ -320,8 +320,7 @@ impl fmt::Display for MetricEvent {
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
 /// Which caller loaded the log segment. A single `LogSegmentLoad` metric slices by this label so
-/// fresh and incremental snapshot loads (and, in the future, other segment loaders) share one
-/// metric definition instead of re-declaring file-count denominators per caller.
+/// fresh and incremental snapshot loads share one metric definition.
 ///
 /// Serializes to its `snake_case` name for the `load_purpose` span field.
 #[derive(
@@ -524,13 +523,10 @@ pub(crate) const PROTOCOL_METADATA_LOADED_SPAN: &str = "segment.read_metadata";
 
 /// Where a snapshot's Protocol and Metadata came from during load.
 ///
-/// Note: on the CRC branches the load resolves more than P&M (file stats, domain metadata, set
-/// transactions, ICT are carried by the CRC); the event is named for the always-present P&M part.
-///
 /// The `Crc*` split reflects that a stale base CRC produces two different outcomes depending on the
 /// [`IncrementalReplay`] budget: `CrcAdvancedByReplay` reverse-replays commits to advance the CRC
 /// (yielding a warm, full-state snapshot), while `CrcSeededPmOnlyReplay` forward-replays only P&M
-/// columns (a cold snapshot with no cached stats/DM/txn). We record the outcome, not the budget.
+/// columns (a cold snapshot with no cached stats/DM/txn).
 ///
 /// Serializes to its `snake_case` name for the `pm_source` span field.
 ///
@@ -557,7 +553,12 @@ pub enum ProtocolMetadataSource {
 }
 
 impl ProtocolMetadataSource {
+    /// Empty means the field was not set (the failure-emit path leaves it `Empty`, since the event
+    /// is flipped to its failure counterpart which drops the source); a non-empty unknown warns.
     fn parse_lenient(s: &str) -> Self {
+        if s.is_empty() {
+            return Self::FullReplay;
+        }
         Self::from_str(s).unwrap_or_else(|e| {
             warn!("Invalid pm_source '{s}' on span: {e}. Using FullReplay.");
             Self::FullReplay

@@ -252,8 +252,7 @@ impl Snapshot {
                 }
                 _ => ProtocolMetadataSource::CrcAdvancedByReplay,
             };
-            // CRC-served P&M does no P&M-specific replay work (the reverse replay that advanced the
-            // CRC is accounted under CRC construction, not the P&M denominator).
+            // CRC-served P&M does no P&M-specific replay work.
             let work = crate::log_segment::PmReplayWork::default();
             return Ok((
                 crc.metadata.clone(),
