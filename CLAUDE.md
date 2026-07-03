@@ -120,8 +120,9 @@ directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` ac
   is protocol-correct by construction. Load a snapshot at any `VersionTarget` with the
   `build_snapshot!` macro. For coverage across many table states, the `default_sweep`
   cross-product template (or a per-axis template with your own `#[values]`) can help; see
-  `kernel/tests/integration/cross_product/mod.rs`. For states the builder cannot express (e.g.
-  corrupt or malformed logs), hand-rolled `add_commit` / `LocalMockTable` remain available.
+  `kernel/tests/integration/cross_product/mod.rs`. Drop to lower-level setup like
+  `test_table_setup` (or hand-rolled `add_commit` / `LocalMockTable`) only when necessary --
+  e.g. for states the builder cannot express, such as corrupt or malformed logs.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
