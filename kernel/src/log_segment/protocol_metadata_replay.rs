@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use super::LogSegment;
-use crate::actions::{
-    Metadata, Protocol, METADATA_FIELD, METADATA_NAME, PROTOCOL_FIELD, PROTOCOL_NAME,
-};
+use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
+#[cfg(feature = "declarative-plans")]
+use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::ColumnName;

@@ -279,6 +279,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     }
 
     /// Convenience wrapper around [`version_as_i64`] for this parsed path's `version`.
+    #[cfg(feature = "declarative-plans")]
     pub(crate) fn version_as_i64(&self) -> DeltaResult<i64> {
         crate::version_as_i64(self.version)
     }
