@@ -2,9 +2,9 @@
 //!
 //! # Supported types
 //!
-//! All Delta primitive types are supported: Integer, Long, Short, Byte, Float, Double,
-//! Boolean, String, Date, Timestamp, TimestampNtz, Decimal, Binary (including `LargeUtf8`
-//! and `LargeBinary` Arrow variants).
+//! All Delta primitive types are supported: Integer, Long, Short, Byte, Uint8, Uint16,
+//! Uint32, Uint64, Float, Double, Boolean, String, Date, Timestamp, TimestampNtz, Decimal,
+//! Binary (including `LargeUtf8` and `LargeBinary` Arrow variants).
 //!
 //! Complex types (Struct, Array, Map) are not supported and return an error.
 //!
@@ -16,7 +16,7 @@
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
     Date32Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    Int8Type, TimestampMicrosecondType,
+    Int8Type, TimestampMicrosecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use crate::arrow::array::Array;
 use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
@@ -62,6 +62,18 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
         )),
         ArrowDataType::Int64 => Ok(Scalar::Long(
             array.as_primitive::<Int64Type>().value(row_idx),
+        )),
+        ArrowDataType::UInt8 => Ok(Scalar::Uint8(
+            array.as_primitive::<UInt8Type>().value(row_idx),
+        )),
+        ArrowDataType::UInt16 => Ok(Scalar::Uint16(
+            array.as_primitive::<UInt16Type>().value(row_idx),
+        )),
+        ArrowDataType::UInt32 => Ok(Scalar::Uint32(
+            array.as_primitive::<UInt32Type>().value(row_idx),
+        )),
+        ArrowDataType::UInt64 => Ok(Scalar::Uint64(
+            array.as_primitive::<UInt64Type>().value(row_idx),
         )),
         ArrowDataType::Float32 => Ok(Scalar::Float(
             array.as_primitive::<Float32Type>().value(row_idx),
@@ -129,14 +141,18 @@ pub fn extract_primitive_scalar(array: &dyn Array, row_idx: usize) -> DeltaResul
 ///
 /// This intentionally does not delegate to `TryFromArrow<&ArrowDataType>` from
 /// `arrow_conversion` because this function has different requirements: we accept any
-/// timezone annotation (not just UTC) and reject types like UInt*, Utf8View, Date64
-/// that `TryFromArrow` supports but are not valid for direct scalar extraction.
+/// timezone annotation (not just UTC) and reject types like Utf8View, Date64 that
+/// `TryFromArrow` supports but are not valid for direct scalar extraction.
 fn arrow_primitive_to_kernel_type(arrow_type: &ArrowDataType) -> DeltaResult<DataType> {
     match arrow_type {
         ArrowDataType::Int8 => Ok(DataType::BYTE),
         ArrowDataType::Int16 => Ok(DataType::SHORT),
         ArrowDataType::Int32 => Ok(DataType::INTEGER),
         ArrowDataType::Int64 => Ok(DataType::LONG),
+        ArrowDataType::UInt8 => Ok(DataType::UINT8),
+        ArrowDataType::UInt16 => Ok(DataType::UINT16),
+        ArrowDataType::UInt32 => Ok(DataType::UINT32),
+        ArrowDataType::UInt64 => Ok(DataType::UINT64),
         ArrowDataType::Float32 => Ok(DataType::FLOAT),
         ArrowDataType::Float64 => Ok(DataType::DOUBLE),
         ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
@@ -174,6 +190,7 @@ mod tests {
         new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
         Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
         LargeBinaryArray, LargeStringArray, StringArray, StructArray, TimestampMicrosecondArray,
+        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use crate::arrow::datatypes::{Field, Fields};
     use crate::engine::arrow_conversion::TryFromArrow as _;
@@ -224,6 +241,16 @@ mod tests {
     #[case::int_max(Arc::new(Int32Array::from(vec![i32::MAX])) as ArrayRef, Scalar::Integer(i32::MAX))]
     #[case::long_min(Arc::new(Int64Array::from(vec![i64::MIN])) as ArrayRef, Scalar::Long(i64::MIN))]
     #[case::long_max(Arc::new(Int64Array::from(vec![i64::MAX])) as ArrayRef, Scalar::Long(i64::MAX))]
+    #[case::uint8(Arc::new(UInt8Array::from(vec![200u8])) as ArrayRef, Scalar::Uint8(200))]
+    #[case::uint8_max(Arc::new(UInt8Array::from(vec![u8::MAX])) as ArrayRef, Scalar::Uint8(u8::MAX))]
+    #[case::uint16(Arc::new(UInt16Array::from(vec![60000u16])) as ArrayRef, Scalar::Uint16(60000))]
+    #[case::uint16_max(Arc::new(UInt16Array::from(vec![u16::MAX])) as ArrayRef, Scalar::Uint16(u16::MAX))]
+    #[case::uint32(Arc::new(UInt32Array::from(vec![4_000_000_000u32])) as ArrayRef, Scalar::Uint32(4_000_000_000))]
+    #[case::uint32_max(Arc::new(UInt32Array::from(vec![u32::MAX])) as ArrayRef, Scalar::Uint32(u32::MAX))]
+    #[case::uint64_max(
+        Arc::new(UInt64Array::from(vec![18446744073709551615u64])) as ArrayRef,
+        Scalar::Uint64(18446744073709551615)
+    )]
     fn test_extract_primitive_scalar_non_null_returns_typed_value(
         #[case] array: ArrayRef,
         #[case] expected: Scalar,
@@ -380,6 +407,10 @@ mod tests {
     #[case::int16(ArrowDataType::Int16, DataType::SHORT)]
     #[case::int32(ArrowDataType::Int32, DataType::INTEGER)]
     #[case::int64(ArrowDataType::Int64, DataType::LONG)]
+    #[case::uint8(ArrowDataType::UInt8, DataType::UINT8)]
+    #[case::uint16(ArrowDataType::UInt16, DataType::UINT16)]
+    #[case::uint32(ArrowDataType::UInt32, DataType::UINT32)]
+    #[case::uint64(ArrowDataType::UInt64, DataType::UINT64)]
     #[case::float32(ArrowDataType::Float32, DataType::FLOAT)]
     #[case::float64(ArrowDataType::Float64, DataType::DOUBLE)]
     #[case::boolean(ArrowDataType::Boolean, DataType::BOOLEAN)]
@@ -543,6 +574,10 @@ mod tests {
     #[case::integer_min(Arc::new(Int32Array::from(vec![i32::MIN])) as ArrayRef)]
     #[case::long(Arc::new(Int64Array::from(vec![9_876_543_210i64])) as ArrayRef)]
     #[case::long_max(Arc::new(Int64Array::from(vec![i64::MAX])) as ArrayRef)]
+    #[case::uint8_max(Arc::new(UInt8Array::from(vec![u8::MAX])) as ArrayRef)]
+    #[case::uint16_max(Arc::new(UInt16Array::from(vec![u16::MAX])) as ArrayRef)]
+    #[case::uint32_max(Arc::new(UInt32Array::from(vec![u32::MAX])) as ArrayRef)]
+    #[case::uint64_max(Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef)]
     #[case::boolean_true(Arc::new(BooleanArray::from(vec![true])) as ArrayRef)]
     #[case::boolean_false(Arc::new(BooleanArray::from(vec![false])) as ArrayRef)]
     #[case::string(Arc::new(StringArray::from(vec!["hello world"])) as ArrayRef)]

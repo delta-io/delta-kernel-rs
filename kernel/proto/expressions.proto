@@ -110,6 +110,10 @@ message Scalar {
     StructData struct = 15;
     ArrayData array = 16;
     MapData map = 17;
+    uint32 uint8 = 18;          // u8 widened at decode (proto has no u8)
+    uint32 uint16 = 19;         // u16 widened at decode (proto has no u16)
+    uint32 uint32 = 20;
+    uint64 uint64 = 21;
   }
 }
 

@@ -530,6 +530,10 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Long(v) => Value::Long(*v),
             Scalar::Short(v) => Value::Short(*v as i32),
             Scalar::Byte(v) => Value::Byte(*v as i32),
+            Scalar::Uint8(v) => Value::Uint8(*v as u32),
+            Scalar::Uint16(v) => Value::Uint16(*v as u32),
+            Scalar::Uint32(v) => Value::Uint32(*v),
+            Scalar::Uint64(v) => Value::Uint64(*v),
             Scalar::Float(v) => Value::Float(*v),
             Scalar::Double(v) => Value::Double(*v),
             Scalar::String(v) => Value::String(v.clone()),
@@ -619,6 +623,10 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Integer => Kind::Simple(Simple::Integer as i32),
             PrimitiveType::Short => Kind::Simple(Simple::Short as i32),
             PrimitiveType::Byte => Kind::Simple(Simple::Byte as i32),
+            PrimitiveType::Uint8 => Kind::Simple(Simple::Uint8 as i32),
+            PrimitiveType::Uint16 => Kind::Simple(Simple::Uint16 as i32),
+            PrimitiveType::Uint32 => Kind::Simple(Simple::Uint32 as i32),
+            PrimitiveType::Uint64 => Kind::Simple(Simple::Uint64 as i32),
             PrimitiveType::Float => Kind::Simple(Simple::Float as i32),
             PrimitiveType::Double => Kind::Simple(Simple::Double as i32),
             PrimitiveType::Boolean => Kind::Simple(Simple::Boolean as i32),
@@ -1570,6 +1578,10 @@ mod tests {
     #[case(Scalar::Long(7), "long")]
     #[case(Scalar::Short(7), "short")]
     #[case(Scalar::Byte(7), "byte")]
+    #[case(Scalar::Uint8(7), "uint8")]
+    #[case(Scalar::Uint16(7), "uint16")]
+    #[case(Scalar::Uint32(7), "uint32")]
+    #[case(Scalar::Uint64(7), "uint64")]
     #[case(Scalar::Float(1.5), "float")]
     #[case(Scalar::Double(1.5), "double")]
     #[case(Scalar::String("hi".into()), "string")]
@@ -1615,6 +1627,10 @@ mod tests {
             Value::Long(_) => "long",
             Value::Short(_) => "short",
             Value::Byte(_) => "byte",
+            Value::Uint8(_) => "uint8",
+            Value::Uint16(_) => "uint16",
+            Value::Uint32(_) => "uint32",
+            Value::Uint64(_) => "uint64",
             Value::Float(_) => "float",
             Value::Double(_) => "double",
             Value::String(_) => "string",
@@ -1722,6 +1738,10 @@ mod tests {
     #[case(PrimitiveType::Integer, proto_schema::SimplePrimitiveType::Integer)]
     #[case(PrimitiveType::Short, proto_schema::SimplePrimitiveType::Short)]
     #[case(PrimitiveType::Byte, proto_schema::SimplePrimitiveType::Byte)]
+    #[case(PrimitiveType::Uint8, proto_schema::SimplePrimitiveType::Uint8)]
+    #[case(PrimitiveType::Uint16, proto_schema::SimplePrimitiveType::Uint16)]
+    #[case(PrimitiveType::Uint32, proto_schema::SimplePrimitiveType::Uint32)]
+    #[case(PrimitiveType::Uint64, proto_schema::SimplePrimitiveType::Uint64)]
     #[case(PrimitiveType::Float, proto_schema::SimplePrimitiveType::Float)]
     #[case(PrimitiveType::Double, proto_schema::SimplePrimitiveType::Double)]
     #[case(PrimitiveType::Boolean, proto_schema::SimplePrimitiveType::Boolean)]

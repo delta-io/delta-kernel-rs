@@ -543,6 +543,13 @@ fn visit_expression_scalar(
         Scalar::Long(val) => call!(visitor, visit_literal_long, sibling_list_id, *val),
         Scalar::Short(val) => call!(visitor, visit_literal_short, sibling_list_id, *val),
         Scalar::Byte(val) => call!(visitor, visit_literal_byte, sibling_list_id, *val),
+        // Unsigned integers have no dedicated FFI literal callback yet (adding one is a C ABI
+        // change to EngineExpressionVisitor). Route them through visit_unknown rather than
+        // coercing to a narrower/signed callback, which would silently corrupt the value.
+        Scalar::Uint8(_) => visit_unknown(visitor, sibling_list_id, "uint8"),
+        Scalar::Uint16(_) => visit_unknown(visitor, sibling_list_id, "uint16"),
+        Scalar::Uint32(_) => visit_unknown(visitor, sibling_list_id, "uint32"),
+        Scalar::Uint64(_) => visit_unknown(visitor, sibling_list_id, "uint64"),
         Scalar::Float(val) => call!(visitor, visit_literal_float, sibling_list_id, *val),
         Scalar::Double(val) => {
             call!(visitor, visit_literal_double, sibling_list_id, *val)

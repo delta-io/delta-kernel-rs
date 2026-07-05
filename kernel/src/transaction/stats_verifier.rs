@@ -142,6 +142,10 @@ define_column_types!(COL_TYPES_STRING, DataType::STRING);
 define_column_types!(COL_TYPES_BINARY, DataType::BINARY);
 define_column_types!(COL_TYPES_FLOAT, DataType::FLOAT);
 define_column_types!(COL_TYPES_DOUBLE, DataType::DOUBLE);
+define_column_types!(COL_TYPES_UINT8, DataType::UINT8);
+define_column_types!(COL_TYPES_UINT16, DataType::UINT16);
+define_column_types!(COL_TYPES_UINT32, DataType::UINT32);
+define_column_types!(COL_TYPES_UINT64, DataType::UINT64);
 define_column_types!(COL_TYPES_DATE, DataType::DATE);
 define_column_types!(COL_TYPES_TIMESTAMP, DataType::TIMESTAMP);
 define_column_types!(COL_TYPES_TIMESTAMP_NTZ, DataType::TIMESTAMP_NTZ);
@@ -187,6 +191,10 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::TIMESTAMP => Ok(&COL_TYPES_TIMESTAMP),
         &DataType::TIMESTAMP_NTZ => Ok(&COL_TYPES_TIMESTAMP_NTZ),
         DataType::Primitive(PrimitiveType::Decimal(_)) => Ok(&COL_TYPES_DECIMAL),
+        &DataType::UINT8 => Ok(&COL_TYPES_UINT8),
+        &DataType::UINT16 => Ok(&COL_TYPES_UINT16),
+        &DataType::UINT32 => Ok(&COL_TYPES_UINT32),
+        &DataType::UINT64 => Ok(&COL_TYPES_UINT64),
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
             format!("Interval types are not supported for stats validation: {dt}"),
         )),
@@ -224,6 +232,10 @@ fn is_stat_present<'b>(
         DataType::Primitive(PrimitiveType::Decimal(_)) => {
             Ok(getter.get_decimal(row_idx, field_name)?.is_some())
         }
+        &DataType::UINT8 => Ok(getter.get_uint8(row_idx, field_name)?.is_some()),
+        &DataType::UINT16 => Ok(getter.get_uint16(row_idx, field_name)?.is_some()),
+        &DataType::UINT32 => Ok(getter.get_uint32(row_idx, field_name)?.is_some()),
+        &DataType::UINT64 => Ok(getter.get_uint64(row_idx, field_name)?.is_some()),
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
             format!("Interval types are not supported for stats presence check: {data_type}"),
         )),
