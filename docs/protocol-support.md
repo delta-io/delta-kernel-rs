@@ -26,7 +26,7 @@ Statuses: **yes** = fully implemented; **partial** = implemented under a conditi
 | `icebergCompatV1` | writer | n/a | n/a | unimplemented | unimplemented | unimplemented | unimplemented | unimplemented |
 | `icebergCompatV2` | writer | n/a | n/a | unimplemented | unimplemented | unimplemented | unimplemented | unimplemented |
 | `icebergCompatV3` | writer | n/a | n/a | yes | partial | partial | partial | yes |
-| `clustering` | writer | yes | yes | yes | yes | yes | yes | unimplemented |
+| `clustering` | writer | yes | yes | yes | yes | yes | yes | partial |
 | `materializePartitionColumns` | writer | yes | yes | yes | yes | yes | yes | yes |
 | `allowColumnDefaults` | writer | n/a | n/a | unimplemented | unimplemented | unimplemented | unimplemented | unimplemented |
 | `catalogManaged` | reader+writer | yes | unimplemented | yes | yes | yes | yes | yes |
@@ -57,6 +57,7 @@ Unknown / unrecognized features are forbidden for every operation.
 - `icebergCompatV3` / dmlRemove: Remove actions are not yet supported on icebergCompatV3-enabled tables
 - `icebergCompatV3` / maintenance: Remove actions are not yet supported on icebergCompatV3-enabled tables
 - `icebergCompatV3` / alter: ALTER TABLE not yet supported on icebergCompatV3-enabled tables
+- `clustering` / create: is enabled by with_data_layout(clustered(...)); do not set delta.feature.clustering at create time
 - `timestampNtz` / create: is enabled by schema column type; do not set the corresponding delta.feature.* signal at create time
 - `variantType` / create: is enabled by schema column type; do not set the corresponding delta.feature.* signal at create time
 - `variantType-preview` / create: is enabled by schema column type; do not set the corresponding delta.feature.* signal at create time

@@ -887,10 +887,14 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     operation_support: OperationSupport {
         ddl: DdlSupport {
             alter: AlterSupport::ALL_ALLOWED,
-            create_table: ProtocolImplement::NotImplemented {
-                blocks: true,
-                msg: msg::CREATE_KERNEL_INFERENCE_ONLY_CLUSTERING,
-            },
+            // Create IS supported -- but only via kernel inference (`with_data_layout`), which never
+            // flows through the create gate. An explicit `delta.feature.*` signal is rejected, so
+            // the check is constant-false. `Partial` (not `NotImplemented`) because the capability
+            // exists; it is just not reachable through an explicit opt-in.
+            create_table: ProtocolImplement::Partial(
+                |_ctx| false,
+                msg::CREATE_KERNEL_INFERENCE_ONLY_CLUSTERING,
+            ),
         },
         ..OperationSupport::ALL_ALLOWED
     },
@@ -1558,6 +1562,7 @@ mod tests {
             TableFeature::VariantTypePreview,
             TableFeature::VariantShredding,
             TableFeature::VariantShreddingPreview,
+            TableFeature::ClusteredTable,
         ];
 
         for feature in TableFeature::iter() {
