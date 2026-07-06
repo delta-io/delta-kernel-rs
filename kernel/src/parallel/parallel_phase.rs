@@ -147,7 +147,7 @@ mod tests {
     };
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
-    use crate::scan::StatsOptions;
+    use crate::scan::{ScanBuilder, StatsOptions};
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
@@ -389,7 +389,7 @@ mod tests {
         let scan = snapshot
             .clone()
             .scan_builder()
-            .fold_with(predicate, crate::scan::ScanBuilder::with_predicate)
+            .fold_with(predicate, ScanBuilder::with_predicate)
             .build()?;
         let mut scan_metadata_iter = scan.scan_metadata(engine)?;
 
@@ -416,7 +416,7 @@ mod tests {
         let scan = snapshot
             .clone()
             .scan_builder()
-            .fold_with(predicate, crate::scan::ScanBuilder::with_predicate)
+            .fold_with(predicate, ScanBuilder::with_predicate)
             .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 

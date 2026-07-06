@@ -909,7 +909,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
-    use crate::snapshot::Snapshot;
+    use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::utils::FoldWithOption as _;
@@ -1030,7 +1030,7 @@ mod tests {
         let engine = SyncEngine::new();
         let path = Url::from_directory_path(table.table_root()).unwrap();
         let snapshot = Snapshot::builder_for(path)
-            .fold_with(at_version, crate::snapshot::SnapshotBuilder::at_version)
+            .fold_with(at_version, SnapshotBuilder::at_version)
             .build(&engine)
             .unwrap();
         let log_segment = LogSegment::for_timestamp_conversion(
