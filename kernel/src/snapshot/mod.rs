@@ -1325,6 +1325,7 @@ mod tests {
 
     fn valid_last_checkpoint() -> (Vec<u8>, LastCheckpointHint) {
         let checkpoint = LastCheckpointHint {
+            v2_checkpoint: None,
             version: 1,
             size: 8,
             parts: None,

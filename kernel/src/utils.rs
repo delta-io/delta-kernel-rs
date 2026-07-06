@@ -247,10 +247,28 @@ pub(crate) mod test_utils {
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::path::ParsedLogPath;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
-    use crate::{DeltaResult, Engine, EngineData, Error, Snapshot, SnapshotRef};
+    use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef};
+
+    /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
+    /// synthetic log-file listings in tests.
+    pub(crate) fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+        create_log_path_with_size(path, 0)
+    }
+
+    /// [`create_log_path`] with an explicit file size.
+    pub(crate) fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
+        ParsedLogPath::try_from(FileMeta {
+            location: Url::parse(path).expect("Invalid file URL"),
+            last_modified: 0,
+            size,
+        })
+        .unwrap()
+        .unwrap()
+    }
 
     /// A metrics reporter that captures all events for test assertions.
     #[derive(Debug, Default)]
