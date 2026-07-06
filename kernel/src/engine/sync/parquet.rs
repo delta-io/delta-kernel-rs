@@ -7,8 +7,7 @@ use super::{get_bytes, put_bytes, read_files};
 use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::{reader_options, writer_options};
@@ -16,6 +15,7 @@ use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
+use crate::utils::FoldWithOption as _;
 use crate::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
     FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
@@ -38,19 +38,16 @@ fn try_create_from_parquet(
     file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
-    let parquet_schema = metadata.schema();
-    let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(data, metadata.clone());
-    let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
-    if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
-        builder = builder.with_projection(mask);
-    }
+    let (requested_ordering, mask) = parquet_read_plan(&schema, &metadata)?;
 
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+        .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-    if let Some(predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut());
-    }
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(data, metadata)
+        .fold_with(mask, ParquetRecordBatchReaderBuilder::with_projection)
+        .fold_with(predicate, |builder, predicate| {
+            builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+        });
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
