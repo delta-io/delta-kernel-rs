@@ -441,7 +441,8 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///
 /// Column defaults are enforced (gated by `column-defaults-in-dev`) in `iceberg_compat::v3`'s
 /// `check_column_defaults`: the spec requires literal defaults, and kernel additionally restricts
-/// them to primitive columns.
+/// them to primitive columns for parity with Spark, which does not emit non-primitive defaults on
+/// IcebergCompatV3 tables.
 ///
 /// Attention in the future:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3

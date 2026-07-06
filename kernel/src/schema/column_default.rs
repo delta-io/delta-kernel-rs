@@ -3,12 +3,13 @@
 //! # Invariants
 //!
 //! The rules kernel enforces on column defaults, and where each comes from. Each is enforced in
-//! code below (see [`ColumnDefault::new`] and
-//! [`validate_column_defaults_metadata_respects_protocol`], plus the IcebergCompatV3 check in
-//! [`crate::table_features`]).
+//! code below (see [`ColumnDefault`]'s constructor and [`validate_column_defaults_metadata`],
+//! plus the IcebergCompatV3 check in [`crate::table_features`]).
 //!
-//! - A `CURRENT_DEFAULT` is honored only when the `allowColumnDefaults` writer feature is enabled;
-//!   metadata present without it is stray and the table is treated as corrupt. (Protocol.)
+//! - `CURRENT_DEFAULT` metadata present without the `allowColumnDefaults` writer feature is
+//!   orphaned metadata, which kernel tolerates on both read and write. Most Delta features tolerate
+//!   metadata whose owning feature is absent, and this matches DBR, which reads and writes such
+//!   tables. (Protocol.)
 //! - `CURRENT_DEFAULT` metadata must be a SQL string. (Protocol.)
 //! - A Variant column may default only to `NULL`. (Protocol: the Default Columns section requires
 //!   that all columns of `variant` type default to null.)
@@ -60,13 +61,19 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `data_type` is non-primitive (Array, Map, Struct, or Variant) and
-    /// `raw_sql` is not `NULL` (case-insensitive).
+    /// Returns an [`Error::unsupported`] when `data_type` is non-primitive (Array, Map, Struct, or
+    /// Variant) and `raw_sql` is not `NULL` (case-insensitive). The protocol permits such a
+    /// default, but kernel does not materialize it (matching Spark), so it is unsupported
+    /// rather than corrupt.
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
         // Enforces the "non-primitive columns default only to NULL" invariant (see module docs).
+        // This is a kernel limitation, not table corruption: the protocol permits a non-`NULL`
+        // default on an Array/Map/Struct column, but kernel does not materialize one (matching
+        // Spark), so it reports the value as unsupported rather than rejecting the table as
+        // corrupt.
         if data_type.as_primitive_opt().is_none() && !is_null {
-            return Err(Error::generic(format!(
+            return Err(Error::unsupported(format!(
                 "non-null column default for non-primitive type {data_type:?} is not \
                  supported, got {raw_sql:?}"
             )));
@@ -195,33 +202,50 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
     }
 }
 
-/// Validates the column-default metadata on a table's logical schema, treating metadata the
-/// protocol forbids as table corruption (see [Errors](#errors)).
+/// Validates the column-default metadata on a table's logical schema (see [Errors](#errors)).
 ///
-/// Run eagerly at [`TableConfiguration`] construction so a corrupt table is rejected at load.
+/// Run eagerly at [`TableConfiguration`] construction so an invalid table is rejected at load.
 /// Inspects nested fields as well as top-level columns; see [`collect_column_defaults`].
+///
+/// This does not couple defaults to the `allowColumnDefaults` feature: a `CURRENT_DEFAULT`
+/// present without the feature is orphaned metadata, which kernel tolerates (see the module docs).
 ///
 /// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
 ///
 /// # Errors
 ///
-/// - A column declares a `CURRENT_DEFAULT` but `allow_column_defaults` is `false`. The protocol
-///   only honors defaults "when enabled", so such metadata is stray and the table is corrupt.
-/// - Propagates any error from [`collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is not
-///   a SQL string, or a non-`NULL` default on a non-primitive column.
-pub(crate) fn validate_column_defaults_metadata_respects_protocol(
-    schema: &StructType,
-    allow_column_defaults: bool,
-) -> DeltaResult<()> {
-    for (path, _) in collect_column_defaults(schema)? {
-        if !allow_column_defaults {
-            return Err(Error::generic(format!(
-                "Field '{path}' declares a `CURRENT_DEFAULT` but the table does not enable the \
-                 `allowColumnDefaults` writer feature"
-            )));
-        }
-    }
+/// Propagates any error from [`collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is not
+/// a SQL string (corrupt, since the protocol defines it as a SQL string), or a non-`NULL` default
+/// on a non-primitive column (unsupported by kernel, though the protocol permits it).
+pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<()> {
+    collect_column_defaults(schema)?;
     Ok(())
+}
+
+/// A nullable field named `name` carrying `raw_sql` as its `CURRENT_DEFAULT` metadata.
+///
+/// Shared across the crate's column-default unit tests (here, `schema`, and `transaction`).
+#[cfg(test)]
+pub(crate) fn field_with_default(
+    name: &str,
+    data_type: impl Into<DataType>,
+    raw_sql: &str,
+) -> StructField {
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    StructField::nullable(name, data_type).add_metadata([(
+        ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+        MetadataValue::String(raw_sql.to_string()),
+    )])
+}
+
+/// A nullable field named `name` whose `CURRENT_DEFAULT` metadata is a non-string value (corrupt).
+#[cfg(test)]
+pub(crate) fn field_with_invalid_default(name: &str) -> StructField {
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    StructField::nullable(name, DataType::INTEGER).add_metadata([(
+        ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+        MetadataValue::Number(7),
+    )])
 }
 
 #[cfg(test)]
@@ -230,7 +254,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ArrayType, ColumnMetadataKey, MapType, MetadataValue, StructField};
+    use crate::schema::{ArrayType, MapType, StructField};
 
     fn struct_ty() -> DataType {
         DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
@@ -331,101 +355,36 @@ mod tests {
         }
     }
 
-    /// A field carrying `raw_sql` as its `CURRENT_DEFAULT`.
-    fn field_with_default(
-        name: &str,
-        data_type: impl Into<DataType>,
-        raw_sql: &str,
-    ) -> StructField {
-        StructField::nullable(name, data_type).add_metadata([(
-            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-            MetadataValue::String(raw_sql.to_string()),
-        )])
-    }
-
-    /// A field with an invalid `CURRENT_DEFAULT`: the metadata is a non-string value (malformed).
-    fn field_with_invalid_default(name: &str) -> StructField {
-        StructField::nullable(name, DataType::INTEGER).add_metadata([(
-            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-            MetadataValue::Number(7),
-        )])
-    }
-
-    /// `None` expects `Ok`; `Some(needle)` expects an error containing `needle`.
+    /// Validation is independent of the `allowColumnDefaults` feature: it checks only that the
+    /// metadata is well-formed (string-typed, primitive-or-NULL), never whether the feature is
+    /// enabled. `None` expects `Ok`; `Some(needle)` expects an error containing `needle`.
     #[rstest]
-    #[case::well_formed_default_when_enabled(
+    #[case::well_formed_default(
         vec![
             field_with_default("c", DataType::INTEGER, "42"),
             StructField::nullable("no_default", DataType::STRING),
         ],
-        true,
         None
     )]
-    #[case::no_defaults_when_disabled(
-        vec![StructField::nullable("c", DataType::INTEGER)],
-        false,
-        None
-    )]
-    #[case::stray_default_when_disabled(
-        vec![field_with_default("c", DataType::INTEGER, "42")],
-        false,
-        Some("allowColumnDefaults")
-    )]
-    #[case::non_string_metadata(vec![field_with_invalid_default("c")], true, Some("non-string"))]
+    #[case::no_defaults(vec![StructField::nullable("c", DataType::INTEGER)], None)]
+    #[case::non_string_metadata(vec![field_with_invalid_default("c")], Some("non-string"))]
     #[case::non_null_default_on_non_primitive(
         vec![field_with_default("arr", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")],
-        true,
         Some("not supported")
     )]
-    #[case::nested_default_when_enabled(
+    #[case::nested_default(
         vec![StructField::nullable(
             "s",
             DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap(),
         )],
-        true,
         None
-    )]
-    #[case::nested_stray_default_when_disabled(
-        vec![StructField::nullable(
-            "s",
-            DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap(),
-        )],
-        false,
-        Some("s.inner")
-    )]
-    #[case::array_nested_stray_default_when_disabled(
-        vec![StructField::nullable(
-            "arr",
-            ArrayType::new(
-                DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap(),
-                true,
-            ),
-        )],
-        false,
-        Some("arr.element.inner")
-    )]
-    #[case::map_value_nested_stray_default_when_disabled(
-        vec![StructField::nullable(
-            "m",
-            MapType::new(
-                DataType::STRING,
-                DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap(),
-                true,
-            ),
-        )],
-        false,
-        Some("m.value.inner")
     )]
     fn validate_column_defaults_cases(
         #[case] fields: Vec<StructField>,
-        #[case] allow_column_defaults: bool,
         #[case] expected_error: Option<&str>,
     ) {
         let schema = StructType::try_new(fields).unwrap();
-        match (
-            validate_column_defaults_metadata_respects_protocol(&schema, allow_column_defaults),
-            expected_error,
-        ) {
+        match (validate_column_defaults_metadata(&schema), expected_error) {
             (Ok(()), None) => {}
             (Err(e), Some(needle)) => assert!(e.to_string().contains(needle), "got: {e}"),
             (result, expected) => panic!("unexpected outcome: {result:?} vs {expected:?}"),

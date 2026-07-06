@@ -1001,9 +1001,11 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
     /// not a protocol one.
     ///
-    /// Stray column-default metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults` writer
-    /// feature) and malformed defaults are rejected eagerly at snapshot load (when constructing the
+    /// Malformed defaults (a non-string `CURRENT_DEFAULT`, or a non-`NULL` default on a
+    /// non-primitive column) are rejected eagerly at snapshot load (when constructing the
     /// [`TableConfiguration`]), so by the time this runs the metadata is already validated.
+    /// Orphaned metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults` writer feature)
+    /// is tolerated and surfaced here like any other default.
     ///
     /// # Errors
     ///
@@ -2094,11 +2096,12 @@ mod tests {
     #[cfg(feature = "column-defaults-in-dev")]
     mod column_defaults {
         use super::*;
-        use crate::schema::{ColumnMetadataKey, MetadataValue};
+        use crate::schema::column_default::{field_with_default, field_with_invalid_default};
 
         // NB: `test_utils::schema_with_column_defaults` cannot be used here. In `--lib` unit tests
         // the crate under test and the `delta_kernel` that `test_utils` links are two distinct
         // crate instances, so kernel schema types don't unify across the `test_utils` boundary.
+        // The `field_with_*` helpers live in-crate (`schema::column_default`) for the same reason.
 
         /// Builds a transaction whose effective logical schema is `schema`, with the
         /// `allowColumnDefaults` writer feature enabled so any declared defaults are honored.
@@ -2123,7 +2126,7 @@ mod tests {
 
         /// Builds the [`TableConfiguration`] a transaction would carry for `schema` and
         /// `writer_features`, swapping a synthetic schema/protocol onto a real snapshot's config so
-        /// column-default validation (run at construction) can be exercised without `create_table`.
+        /// the validation `try_new` runs at construction can be exercised without `create_table`.
         /// Returns the construction result so a test can assert eager-validation errors.
         fn try_table_config(
             base: &Transaction,
@@ -2154,14 +2157,6 @@ mod tests {
             snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)
                 .unwrap()
-        }
-
-        /// A nullable field carrying `raw_sql` as its `CURRENT_DEFAULT`.
-        fn field_with_default(name: &str, data_type: DataType, raw_sql: &str) -> StructField {
-            StructField::nullable(name, data_type).add_metadata([(
-                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-                MetadataValue::String(raw_sql.to_string()),
-            )])
         }
 
         #[test]
@@ -2204,11 +2199,7 @@ mod tests {
 
         #[test]
         fn load_rejects_malformed_default() {
-            let field = StructField::nullable("c", DataType::INTEGER).add_metadata([(
-                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-                MetadataValue::Number(7),
-            )]);
-            let schema = StructType::try_new(vec![field]).unwrap();
+            let schema = StructType::try_new(vec![field_with_invalid_default("c")]).unwrap();
 
             let err = try_table_config(&base_txn(), schema, [TableFeature::AllowColumnDefaults])
                 .expect_err("non-string CURRENT_DEFAULT must error at load")
@@ -2217,15 +2208,14 @@ mod tests {
         }
 
         #[test]
-        fn load_rejects_default_present_but_feature_not_enabled() {
+        fn load_tolerates_default_present_but_feature_not_enabled() {
             let schema =
                 StructType::try_new(vec![field_with_default("c", DataType::INTEGER, "42")])
                     .unwrap();
 
-            let err = try_table_config(&base_txn(), schema, [])
-                .expect_err("a column default without the allowColumnDefaults feature must error")
-                .to_string();
-            assert!(err.contains("allowColumnDefaults"), "got: {err}");
+            // Orphaned column-default metadata (no `allowColumnDefaults` feature) is tolerated.
+            try_table_config(&base_txn(), schema, [])
+                .expect("orphaned column-default metadata must be tolerated at load");
         }
     }
 

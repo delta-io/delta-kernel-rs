@@ -60,18 +60,19 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 
 /// Validates column defaults on an IcebergCompatV3 table.
 ///
-/// The IcebergCompatV3 spec requires only that a column default be a literal, so non-literal
-/// defaults (e.g. `current_timestamp()`) are rejected. The kernel additionally restricts defaults
-/// to primitive columns: a `NULL` default on a non-primitive column is allowed on a normal table
-/// but rejected here.
+/// The IcebergCompatV3 spec requires only that a column default be a literal. Kernel imposes two
+/// tighter limitations here:
+/// - The default must be a *kernel-parsable* literal. A literal kernel's SQL parser cannot parse
+///   (so [`ColumnDefault::is_literal`] is `false`, e.g. `current_timestamp()`) is rejected, since
+///   kernel cannot materialize it into the Iceberg metadata.
+/// - The column must be primitive. A `NULL` default on a non-primitive column is allowed on a
+///   normal table but rejected here, matching Spark, which does not emit non-primitive defaults for
+///   IcebergCompatV3.
+///
+/// [`ColumnDefault::is_literal`]: crate::schema::ColumnDefault::is_literal
 #[cfg(feature = "column-defaults-in-dev")]
 fn check_column_defaults(tc: &TableConfiguration) -> DeltaResult<()> {
-    validate_v3_column_defaults(tc.logical_schema_ref())
-}
-
-#[cfg(feature = "column-defaults-in-dev")]
-fn validate_v3_column_defaults(schema: &crate::schema::StructType) -> DeltaResult<()> {
-    for (path, column_default) in crate::schema::collect_column_defaults(schema)? {
+    for (path, column_default) in crate::schema::collect_column_defaults(tc.logical_schema_ref())? {
         if column_default.data_type().as_primitive_opt().is_none() {
             return Err(Error::generic(format!(
                 "kernel does not support a column default on non-primitive column '{path}' on \
@@ -80,7 +81,8 @@ fn validate_v3_column_defaults(schema: &crate::schema::StructType) -> DeltaResul
         }
         if !column_default.is_literal() {
             return Err(Error::generic(format!(
-                "icebergCompatV3 requires the column default for '{path}' to be a literal, got: {}",
+                "icebergCompatV3 requires the column default for '{path}' to be a literal kernel \
+                 can parse, got: {}",
                 column_default.raw_sql()
             )));
         }
@@ -140,12 +142,41 @@ mod tests {
 
 #[cfg(all(test, feature = "column-defaults-in-dev"))]
 mod column_default_tests {
-    use rstest::rstest;
+    use std::collections::HashMap;
 
-    use super::validate_v3_column_defaults;
+    use rstest::rstest;
+    use url::Url;
+
+    use super::check_column_defaults;
+    use crate::actions::{Metadata, Protocol};
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
+    use crate::table_configuration::TableConfiguration;
+    use crate::table_features::TableFeature;
+
+    /// Builds a `TableConfiguration` carrying `schema` with `allowColumnDefaults` enabled, so
+    /// `check_column_defaults` can be driven directly. The config does not enable IcebergCompatV3
+    /// itself (whose required dependencies are heavy to assemble here); the V3 check is invoked
+    /// directly instead, and the end-to-end V3 path is covered by the integration tests.
+    fn table_config_with_schema(schema: StructType) -> TableConfiguration {
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            std::sync::Arc::new(schema),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            [TableFeature::AllowColumnDefaults],
+        )
+        .unwrap();
+        TableConfiguration::try_new(metadata, protocol, Url::parse("file:///t/").unwrap(), 0)
+            .unwrap()
+    }
 
     #[rstest]
     #[case::primitive_literal(DataType::INTEGER, "42", None)]
@@ -156,7 +187,7 @@ mod column_default_tests {
         "NULL",
         Some("non-primitive")
     )]
-    fn validate_v3_column_default(
+    fn check_v3_column_default(
         #[case] data_type: DataType,
         #[case] default_sql: &str,
         #[case] expected_error: Option<&str>,
@@ -165,9 +196,9 @@ mod column_default_tests {
             ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
             MetadataValue::String(default_sql.to_string()),
         )]);
-        let schema = StructType::try_new([field]).unwrap();
+        let tc = table_config_with_schema(StructType::try_new([field]).unwrap());
 
-        match (validate_v3_column_defaults(&schema), expected_error) {
+        match (check_column_defaults(&tc), expected_error) {
             (Ok(()), None) => {}
             (Err(e), Some(needle)) => assert!(e.to_string().contains(needle), "got: {e}"),
             (result, expected) => {
@@ -177,7 +208,7 @@ mod column_default_tests {
     }
 
     #[test]
-    fn validate_v3_column_default_rejects_nested_non_literal() {
+    fn check_v3_column_default_rejects_nested_non_literal() {
         let inner = StructField::nullable("inner", DataType::TIMESTAMP).add_metadata([(
             ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
             MetadataValue::String("current_timestamp()".to_string()),
@@ -187,8 +218,9 @@ mod column_default_tests {
             DataType::try_struct_type([inner]).unwrap(),
         )])
         .unwrap();
+        let tc = table_config_with_schema(schema);
 
-        let err = validate_v3_column_defaults(&schema)
+        let err = check_column_defaults(&tc)
             .expect_err("non-literal default on a nested field must be rejected")
             .to_string();
         assert!(
