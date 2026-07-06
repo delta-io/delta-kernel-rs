@@ -321,18 +321,22 @@ fn allocate_kernel_string_impl(
 pub struct ExclusiveRustBytes;
 
 /// Allow engines to create an opaque pointer to [`ExclusiveRustBytes`] by copying the provided
-/// `bytes`` into kernel-owned memory.
+/// `bytes` into kernel-owned memory.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid [`KernelBytesSlice`] whose pointer references at least
-/// `len` readable bytes. The slice only needs to remain until after this call returns.
+/// `len` readable bytes. The slice only needs to remain valid until after this call returns.
 #[cfg(feature = "declarative-plans")]
 #[no_mangle]
 pub unsafe extern "C" fn allocate_kernel_bytes(
     bytes: KernelBytesSlice,
 ) -> Handle<ExclusiveRustBytes> {
-    let copied = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec();
+    let copied = if bytes.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec()
+    };
     Box::new(copied).into()
 }
 

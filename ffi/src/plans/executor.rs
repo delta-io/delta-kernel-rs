@@ -142,8 +142,8 @@ mod tests {
     }
 
     /// Executes a dummy plan operation against a `PlanExecutor` whose callback returns the given
-    /// `expected_plan_result`. Returns the resulting `PlanResult` for furhter validation.
-    fn execute_dummy_op(expected_plan_result: CPlanResult) -> PlanResult {
+    /// `expected_plan_result`, returning the raw result of `execute_op`.
+    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> DeltaResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
         let executor = unsafe { get_plan_executor(context, mock_execute_op) };
@@ -153,7 +153,13 @@ mod tests {
         let url = Url::parse("memory:///table/").unwrap();
         let op = Operation::IoOperation(delta_kernel::IoOperation::file_listing(url));
 
-        plan_executor.execute_op(op).expect("execute_op succeeds")
+        plan_executor.execute_op(op)
+    }
+
+    /// Like [`try_execute_dummy_op`], but asserts the operation succeeds and returns the
+    /// resulting `PlanResult` for further validation.
+    fn execute_dummy_op(expected_plan_result: CPlanResult) -> PlanResult {
+        try_execute_dummy_op(expected_plan_result).expect("execute_op succeeds")
     }
 
     #[test]
@@ -298,6 +304,22 @@ mod tests {
         let id_field = footer.schema.field("id").expect("id field");
         assert_eq!(id_field.data_type(), &KernelDataType::INTEGER);
         assert!(id_field.is_nullable());
+    }
+
+    #[test]
+    fn execute_op_parquet_footer_rejects_invalid_schema_bytes() {
+        // Bytes that are not a valid proto-encoded `StructType` message.
+        let bytes = vec![0xffu8; 8];
+        let schema_proto = unsafe { allocate_kernel_bytes(kernel_bytes_slice!(bytes)) };
+        let footer = CParquetFooter { schema_proto };
+
+        let Err(err) = try_execute_dummy_op(CPlanResult::ParquetFooter(footer)) else {
+            panic!("invalid schema proto bytes should fail to decode");
+        };
+        assert!(
+            matches!(err, Error::GenericError { .. }),
+            "expected a proto decode error, got {err:?}"
+        );
     }
 
     #[test]
