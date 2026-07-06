@@ -145,6 +145,14 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
+    /// ANSI interval types (`interval year to month`, `interval day to second`).
+    ///
+    /// TODO(#2840): intervalType is not fully supported yet. Kernel support is gated by the
+    /// `interval-type-in-dev` cargo feature. Registering the feature lets kernel read tables that
+    /// declare it; writing interval data lands in a later change.
+    #[strum(serialize = "intervalType")]
+    #[serde(rename = "intervalType")]
+    IntervalType,
     /// timestamps without timezone support
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
@@ -558,6 +566,19 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2840): drop the gate (make `kernel_support` unconditionally `Supported`) once the
+// interval-type protocol RFC is ratified in PROTOCOL.md.
+static INTERVAL_TYPE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "interval-type-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "interval-type-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 /// TODO: When type widening is supported on writes, restrict the allowed
 /// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
 /// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
@@ -690,6 +711,7 @@ impl TableFeature {
             | TableFeature::CatalogOwnedPreview
             | TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
+            | TableFeature::IntervalType
             | TableFeature::TimestampWithoutTimezone
             | TableFeature::TypeWidening
             | TableFeature::TypeWideningPreview
@@ -757,6 +779,7 @@ impl TableFeature {
             TableFeature::CatalogOwnedPreview => &CATALOG_OWNED_PREVIEW_INFO,
             TableFeature::ColumnMapping => &COLUMN_MAPPING_INFO,
             TableFeature::DeletionVectors => &DELETION_VECTORS_INFO,
+            TableFeature::IntervalType => &INTERVAL_TYPE_INFO,
             TableFeature::TimestampWithoutTimezone => &TIMESTAMP_WITHOUT_TIMEZONE_INFO,
             TableFeature::TypeWidening => &TYPE_WIDENING_INFO,
             TableFeature::TypeWideningPreview => &TYPE_WIDENING_PREVIEW_INFO,
@@ -1046,6 +1069,24 @@ mod tests {
         }
     }
 
+    /// A table that declares `intervalType` in its reader features is readable exactly when kernel
+    /// support is compiled in (the `interval-type-in-dev` gate); otherwise the read is refused.
+    #[test]
+    fn test_read_protocol_with_interval_type_feature() {
+        let protocol =
+            Protocol::try_new_modern([TableFeature::IntervalType], [TableFeature::IntervalType])
+                .unwrap();
+        let result = ensure_table_can_be_read(&protocol);
+        if cfg!(feature = "interval-type-in-dev") {
+            result.expect("intervalType table must be readable when the feature is enabled");
+        } else {
+            assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "intervalType read must be Unsupported when the feature is off, got: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_roundtrip_table_features() {
         use strum::IntoEnumIterator as _;
@@ -1070,6 +1111,7 @@ mod tests {
                 TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
                 TableFeature::ColumnMapping => "columnMapping",
                 TableFeature::DeletionVectors => "deletionVectors",
+                TableFeature::IntervalType => "intervalType",
                 TableFeature::TimestampWithoutTimezone => "timestampNtz",
                 TableFeature::TypeWidening => "typeWidening",
                 TableFeature::TypeWideningPreview => "typeWidening-preview",
