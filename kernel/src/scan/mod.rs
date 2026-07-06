@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
@@ -34,8 +34,8 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
+    StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
@@ -56,17 +56,13 @@ pub(crate) mod test_utils;
 #[cfg(test)]
 mod tests;
 
-// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
-#[allow(clippy::unwrap_used)]
-pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    get_commit_schema()
-        .project(&[ADD_NAME, REMOVE_NAME])
-        .unwrap()
-});
-// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
-#[allow(clippy::unwrap_used)]
-pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+};
+pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+};
 
 /// Checkpoint schema WITHOUT stats for column projection pushdown.
 /// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.

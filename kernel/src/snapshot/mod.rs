@@ -1154,7 +1154,7 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructField, StructType};
     use crate::table_features::{
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
@@ -1888,11 +1888,7 @@ mod tests {
             .to_string();
         let engine = SyncEngine::new();
 
-        let schema = Arc::new(StructType::try_new(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )])?);
+        let schema = schema_ref! { nullable "id": INTEGER };
 
         let mut create_table_builder = create_table(&table_path, schema, "Test/1.0");
         if ict_enabled {

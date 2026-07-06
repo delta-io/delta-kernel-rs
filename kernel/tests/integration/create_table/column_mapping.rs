@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+    StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
@@ -68,7 +69,7 @@ pub(super) fn strip_column_mapping_metadata(schema: &StructType) -> StructType {
 /// For `Name` / `Id`: feature supported & enabled, mode matches, `maxColumnId` equals
 /// the maximum `delta.columnMapping.id` reachable in the schema. Callers can pre-populate
 /// CM annotations on the input schema, in which case the persisted `maxColumnId` reflects
-/// any preserved IDs (matching Spark/DBR's `assignColumnIdAndPhysicalName`).
+/// any preserved IDs (matching Spark's `assignColumnIdAndPhysicalName`).
 ///
 /// For `None`: mode is `None`, no `maxColumnId`, and no column mapping metadata (IDs or
 /// physical names) on any field. Note: whether `ColumnMapping` appears in the protocol
@@ -174,11 +175,7 @@ fn test_create_table_with_column_mapping_name_mode() -> DeltaResult<()> {
 fn test_create_table_with_column_mapping_id_mode() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::new(
-        "id",
-        DataType::INTEGER,
-        true,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     // Create table and load snapshot (validates column mapping on read)
     let snapshot = create_table_and_load_snapshot(
@@ -411,32 +408,14 @@ fn test_column_mapping_schema_with_maps_and_arrays() -> DeltaResult<()> {
     //   metadata: struct<
     //     labels: map<string, array<int>>
     //   >
-    let labels_type = MapType::new(
-        DataType::STRING,
-        ArrayType::new(DataType::INTEGER, true),
-        true,
-    );
-
-    let metadata_type = StructType::try_new(vec![StructField::new(
-        "labels",
-        DataType::from(labels_type),
-        true,
-    )])?;
-
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new(
-            "tags",
-            DataType::from(MapType::new(DataType::STRING, DataType::STRING, true)),
-            true,
-        ),
-        StructField::new(
-            "scores",
-            DataType::from(ArrayType::new(DataType::INTEGER, true)),
-            true,
-        ),
-        StructField::new("metadata", metadata_type, true),
-    ])?);
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "tags": { STRING => nullable STRING },
+        nullable "scores": [nullable INTEGER],
+        nullable "metadata": {
+            nullable "labels": { STRING => nullable [nullable INTEGER] },
+        },
+    };
 
     // Create table with column mapping and read back the snapshot.
     // The snapshot read exercises validate_schema_column_mapping, which verifies
@@ -462,21 +441,16 @@ fn test_column_mapping_schema_with_maps_and_arrays() -> DeltaResult<()> {
 /// Builds a schema that supports clustering at depths 1, 2, and 5:
 ///   { id: int, name: string, address: { city: string, zip: string },
 ///     l1: { l2: { l3: { l4: { value: double } } } } }
-fn clustering_cm_test_schema() -> DeltaResult<Arc<StructType>> {
-    let address = StructType::try_new(vec![
-        StructField::new("city", DataType::STRING, true),
-        StructField::new("zip", DataType::STRING, true),
-    ])?;
-    let l4 = StructType::try_new(vec![StructField::new("value", DataType::DOUBLE, true)])?;
-    let l3 = StructType::try_new(vec![StructField::new("l4", l4, true)])?;
-    let l2 = StructType::try_new(vec![StructField::new("l3", l3, true)])?;
-    let l1 = StructType::try_new(vec![StructField::new("l2", l2, true)])?;
-    Ok(Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("name", DataType::STRING, true),
-        StructField::new("address", address, true),
-        StructField::new("l1", l1, true),
-    ])?))
+fn clustering_cm_test_schema() -> Arc<StructType> {
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "name": STRING,
+        nullable "address": {
+            nullable "city": STRING,
+            nullable "zip": STRING,
+        },
+        nullable "l1": { nullable "l2": { nullable "l3": { nullable "l4": { nullable "value": DOUBLE } } } },
+    }
 }
 
 #[rstest::rstest]
@@ -497,7 +471,7 @@ fn test_create_clustered_table_nested_with_column_mapping(
     use delta_kernel::expressions::ColumnName;
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = clustering_cm_test_schema()?;
+    let schema = clustering_cm_test_schema();
     let expected_cols: Vec<ColumnName> = col_paths
         .iter()
         .map(|p| ColumnName::new(p.iter().copied()))
@@ -653,7 +627,7 @@ fn test_create_table_dup_physical_name(
 }
 
 // ============================================================================
-// CREATE TABLE accepts pre-populated column mapping metadata (DBR/Spark parity).
+// CREATE TABLE accepts pre-populated column mapping metadata (Spark parity).
 // See https://github.com/delta-io/delta-kernel-rs/issues/2377.
 // ============================================================================
 

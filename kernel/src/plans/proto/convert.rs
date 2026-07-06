@@ -1,6 +1,6 @@
 //! Conversions from the kernel plan IR into the prost-generated proto wire types.
 
-use super::plan::agg_fn as proto_agg_fn;
+use super::plan::agg as proto_agg;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -12,8 +12,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, AggFn, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Max, MaxNonNullBy, Min,
-    MinNonNullBy, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -161,7 +161,7 @@ impl From<&ScanParquet> for proto_plan::ScanParquetNode {
     fn from(node: &ScanParquet) -> Self {
         proto_plan::ScanParquetNode {
             files: convert_vec(&node.files),
-            file_constant_columns: convert_vec(&node.file_constant_columns),
+            file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
         }
     }
@@ -171,7 +171,7 @@ impl From<&ScanJson> for proto_plan::ScanJsonNode {
     fn from(node: &ScanJson) -> Self {
         proto_plan::ScanJsonNode {
             files: convert_vec(&node.files),
-            file_constant_columns: convert_vec(&node.file_constant_columns),
+            file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
         }
     }
@@ -216,7 +216,7 @@ impl From<&Load> for proto_plan::LoadNode {
             schema: Some(node.schema.as_ref().into()),
             file_type: proto_plan::FileType::from(node.file_type) as i32,
             base_url: node.base_url.as_ref().map(ToString::to_string),
-            file_constant_columns: convert_vec(&node.file_constant_columns),
+            file_constant_columns: node.file_constant_columns.clone(),
             file_meta: Some((&node.file_meta).into()),
             dv_column: Some((&node.dv_column).into()),
         }
@@ -245,36 +245,27 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
-        proto_plan::Agg {
-            func: Some((&agg.func).into()),
-            alias: agg.alias.clone(),
-        }
-    }
-}
-
-impl From<&AggFn> for proto_plan::AggFn {
-    fn from(func: &AggFn) -> Self {
-        let func = match func {
-            AggFn::Min(Min { value }) => proto_agg_fn::Func::Min(proto_plan::MinAgg {
+        let func = match agg {
+            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            AggFn::Max(Max { value }) => proto_agg_fn::Func::Max(proto_plan::MaxAgg {
+            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            AggFn::MinNonNullBy(MinNonNullBy { value, key }) => {
-                proto_agg_fn::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
+            Agg::MinNonNullBy { value, key } => {
+                proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),
                 })
             }
-            AggFn::MaxNonNullBy(MaxNonNullBy { value, key }) => {
-                proto_agg_fn::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
+            Agg::MaxNonNullBy { value, key } => {
+                proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),
                 })
             }
         };
-        proto_plan::AggFn { func: Some(func) }
+        proto_plan::Agg { func: Some(func) }
     }
 }
 
@@ -1101,7 +1092,7 @@ mod tests {
     fn from_scan_parquet() {
         let node = ScanParquet {
             files: vec![ScanFile::new(sample_file_meta())],
-            file_constant_columns: vec![ColumnName::new(["c"])],
+            file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
         };
         let proto = proto_plan::ScanParquetNode::from(&node);
@@ -1114,7 +1105,7 @@ mod tests {
     fn from_scan_json() {
         let node = ScanJson {
             files: vec![ScanFile::new(sample_file_meta())],
-            file_constant_columns: vec![ColumnName::new(["c"])],
+            file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
         };
         let proto = proto_plan::ScanJsonNode::from(&node);
@@ -1179,7 +1170,7 @@ mod tests {
             schema: sample_schema(),
             file_type,
             base_url,
-            file_constant_columns: vec![ColumnName::new(["c"])],
+            file_constant_columns: vec!["c".to_string()],
             file_meta: sample_load_column_file_meta(),
             dv_column: ColumnName::new(["dv"]),
         };
@@ -1203,13 +1194,12 @@ mod tests {
     fn from_aggregate() {
         let node = Aggregate {
             group_by: vec![ColumnName::new(["g"])],
-            aggs: vec![Agg::max(ColumnName::new(["a"])).with_alias("a_max")],
+            aggs: vec![Agg::max(ColumnName::new(["a"]))],
             schema: sample_schema(),
         };
         let proto = proto_plan::AggregateNode::from(&node);
         assert_eq!(proto.group_by.len(), 1);
         assert_eq!(proto.aggs.len(), 1);
-        assert_eq!(proto.aggs[0].alias.as_deref(), Some("a_max"));
         assert!(proto.aggs[0].func.is_some());
         assert!(proto.schema.is_some());
     }
@@ -1219,17 +1209,16 @@ mod tests {
     #[case(Agg::max(ColumnName::new(["a"])), "max")]
     #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
     #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
-    fn from_agg_fn(#[case] agg: Agg, #[case] expected: &str) {
-        use proto_plan::agg_fn::Func;
+    fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
+        use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
-        let kind = match proto.func.unwrap().func.unwrap() {
+        let kind = match proto.func.unwrap() {
             Func::Min(_) => "min",
             Func::Max(_) => "max",
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
         assert_eq!(kind, expected);
-        assert_eq!(proto.alias, None);
     }
 
     #[rstest]

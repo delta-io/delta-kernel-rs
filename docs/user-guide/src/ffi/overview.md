@@ -25,9 +25,9 @@ cargo build -p delta_kernel_ffi --release
 |---------|---------|-------------|
 | `default-engine-rustls` | yes | Includes the `DefaultEngine` with rustls TLS |
 | `default-engine-native-tls` | no | Includes the `DefaultEngine` with native TLS (instead of rustls) |
-| `arrow` | yes | Enables Arrow integration (selects `arrow-58` by default) |
-| `arrow-58` | yes | Pin to Arrow 58 explicitly (enabled transitively by `arrow`) |
-| `arrow-57` | no | Pin to Arrow 57 explicitly |
+| `arrow` | yes | Enables Arrow integration (selects `arrow-59` by default) |
+| `arrow-59` | yes | Pin to Arrow 59 explicitly (enabled transitively by `arrow`) |
+| `arrow-58` | no | Pin to Arrow 58 explicitly |
 | `delta-kernel-unity-catalog` | no | Enables Unity Catalog integration for catalog-managed tables |
 | `tracing` | no | Enables tracing/logging support via `tracing-subscriber` |
 
@@ -112,6 +112,7 @@ authoritative list and signatures, consult the generated
 | `get_default_engine` | Create an engine from a table path with default options |
 | `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
 | `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
+| `set_builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
 | `free_engine` | Release the engine handle |
 
 **Snapshots**

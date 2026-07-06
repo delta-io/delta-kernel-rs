@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_add_schema, schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, MAX_VALUES,
+    schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, MAX_VALUES,
     METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
@@ -25,7 +25,7 @@ use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::compare::SchemaComparison;
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
@@ -72,7 +72,7 @@ impl CheckpointReadInfo {
         Self {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
-            checkpoint_read_schema: get_log_add_schema().clone(),
+            checkpoint_read_schema: LOG_ADD_SCHEMA.clone(),
         }
     }
 }
@@ -1198,12 +1198,8 @@ impl LogSegment {
 
     /// Schema to read just the sidecar column from a checkpoint file.
     fn sidecar_read_schema() -> SchemaRef {
-        static SIDECAR_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                SIDECAR_NAME,
-                Sidecar::to_schema(),
-            )]))
-        });
+        static SIDECAR_SCHEMA: LazyLock<SchemaRef> =
+            lazy_schema_ref! { nullable SIDECAR_NAME: (Sidecar::to_schema()) };
         SIDECAR_SCHEMA.clone()
     }
 

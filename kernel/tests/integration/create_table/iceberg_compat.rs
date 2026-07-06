@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, StructField, StructType,
+    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
@@ -98,14 +98,9 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
 #[test]
 fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "data",
-        MapType::new(
-            DataType::INTEGER,
-            ArrayType::new(DataType::INTEGER, true),
-            true,
-        ),
-    )])?);
+    let schema = schema_ref! {
+        nullable "data": { INTEGER => nullable [nullable INTEGER] },
+    };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.icebergCompatV3", "supported")])

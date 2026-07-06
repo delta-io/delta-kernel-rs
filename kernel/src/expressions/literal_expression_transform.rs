@@ -157,7 +157,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{ArrayData, MapData};
-    use crate::schema::{SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, SchemaRef, StructField, StructType};
     use crate::DataType as DeltaDataTypes;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
@@ -177,17 +177,11 @@ mod tests {
     fn test_create_one_top_level_null() {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "col_1": INTEGER };
         let expected = Expr::null_literal(schema.clone().into());
         assert_single_row_transform(values, schema, Ok(expected));
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "col_1": INTEGER };
         let expected = Expr::struct_from(vec![Expr::null_literal(DeltaDataTypes::INTEGER)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -226,22 +220,16 @@ mod tests {
     #[test]
     fn test_many_structs() {
         let values: &[Scalar] = &[1.into(), 2.into(), 3.into(), 4.into()];
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable(
-                "x",
-                DeltaDataTypes::struct_type_unchecked([
-                    StructField::not_null("a", DeltaDataTypes::INTEGER),
-                    StructField::nullable("b", DeltaDataTypes::INTEGER),
-                ]),
-            ),
-            StructField::nullable(
-                "y",
-                DeltaDataTypes::struct_type_unchecked([
-                    StructField::not_null("c", DeltaDataTypes::INTEGER),
-                    StructField::nullable("d", DeltaDataTypes::INTEGER),
-                ]),
-            ),
-        ]));
+        let schema = schema_ref! {
+            nullable "x": {
+                not_null "a": INTEGER,
+                nullable "b": INTEGER,
+            },
+            nullable "y": {
+                not_null "c": INTEGER,
+                nullable "d": INTEGER,
+            },
+        };
         let expected = Expr::struct_from(vec![
             Expr::struct_from(vec![Expr::literal(1), Expr::literal(2)]),
             Expr::struct_from(vec![Expr::literal(3), Expr::literal(4)]),

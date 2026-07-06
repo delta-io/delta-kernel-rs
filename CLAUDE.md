@@ -295,6 +295,13 @@ Keep this list updated when new protocol features are added to kernel.
   string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
   same as `column_expr!`); one or more comma-separated args build a column with each segment taken
   verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
+- Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
+  `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
+  interpolated fields might collide. For Delta log action schemas, reuse the canonical
+  `*_FIELD` and `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
+  `StructField::nullable(ACTION_NAME, Action::to_schema())` or projecting from
+  `get_commit_schema()`. Prefer `StructType::try_new` or schema builder/patch APIs for complex
+  data-dependent schema manipulation.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
 

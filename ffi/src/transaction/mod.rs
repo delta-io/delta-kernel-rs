@@ -689,7 +689,7 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
@@ -1004,10 +1004,7 @@ mod tests {
         name: &str,
     ) -> Result<(Url, Arc<DynObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
     {
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
+        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup(name, Some(dir_url));
         let table_url = test_utils::create_table(
@@ -1180,10 +1177,7 @@ mod tests {
         let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
 
         // Create a table WITHOUT the domainMetadata writer feature (v1/v1 protocol)
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
+        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup("test_dm_no_feature", Some(&tmp_dir_url));
         let table_url = test_utils::create_table(
@@ -1872,9 +1866,7 @@ mod tests {
 
     #[test]
     fn test_free_create_table_builder() {
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "id": INTEGER };
         let builder =
             delta_kernel::transaction::create_table::create_table("memory:///test", schema, "test");
         let handle: Handle<ExclusiveCreateTableBuilder> = Box::new(builder).into();
@@ -2156,10 +2148,7 @@ mod tests {
 
         // Build a DV-enabled table; create_table sets delta.enableDeletionVectors for the
         // writer feature.
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
+        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup("test_dv_ffi", Some(&tmp_dir_url));
         let table_url = test_utils::create_table(

@@ -120,7 +120,7 @@ mod tests {
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::schema_ref;
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::transaction::create_table::create_table;
     use delta_kernel::transaction::data_layout::DataLayout;
@@ -143,13 +143,10 @@ mod tests {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_table/";
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, true),
-                StructField::new("region", DataType::STRING, true),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "region": STRING,
+        };
 
         // Create a UC catalog-managed table with clustering
         let disk_props = get_required_properties_for_disk("test-table-id-456");
@@ -200,18 +197,14 @@ mod tests {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_clustering_ser/";
-        let address_struct = StructType::new_unchecked(vec![
-            StructField::new("city", DataType::STRING, true),
-            StructField::new("zip", DataType::STRING, true),
-        ]);
-        let schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("id", DataType::INTEGER, true),
-                StructField::new("region", DataType::STRING, true),
-                StructField::new("address", address_struct, true),
-            ])
-            .unwrap(),
-        );
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "region": STRING,
+            nullable "address": {
+                nullable "city": STRING,
+                nullable "zip": STRING,
+            },
+        };
 
         use delta_kernel::expressions::ColumnName;
 
@@ -251,9 +244,7 @@ mod tests {
         let storage = Arc::new(InMemory::new());
         let engine = DefaultEngineBuilder::new(storage).build();
         let table_path = "memory:///test_version_check/";
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "id": INTEGER };
 
         // Create a table (version 0) and append (version 1)
         let disk_props = get_required_properties_for_disk("test-table-id");

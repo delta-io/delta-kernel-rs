@@ -16,8 +16,8 @@ use crate::actions::visitors::{
     visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
 };
 use crate::actions::{
-    DomainMetadata, Metadata, Protocol, SetTransaction, ADD_NAME, COMMIT_INFO_NAME,
-    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
+    METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
@@ -25,8 +25,7 @@ use crate::crc::{
 };
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::{
-    column_name, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
@@ -34,37 +33,25 @@ use crate::{DeltaResult, Engine, Error, RowVisitor, Version};
 
 #[allow(clippy::expect_used)]
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
-    // an Add row.
-    let add = StructField::nullable(
-        ADD_NAME,
-        StructType::new_unchecked([StructField::not_null("size", DataType::LONG)]),
-    );
-    // remove.size is optional, so we read remove.path (required) to know a row is a Remove
-    // before reading its size.
-    let remove = StructField::nullable(
-        REMOVE_NAME,
-        StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::nullable("size", DataType::LONG),
-        ]),
-    );
-    let commit_info = StructField::nullable(
-        COMMIT_INFO_NAME,
-        StructType::new_unchecked([
-            StructField::nullable("operation", DataType::STRING),
-            StructField::nullable("inCommitTimestamp", DataType::LONG),
-        ]),
-    );
-    let base = StructType::new_unchecked([
-        add,
-        remove,
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        commit_info,
-    ]);
+    let base = schema! {
+        // size is the only Add leaf the visitor reads, and it is required, so its presence marks
+        // an Add row.
+        nullable ADD_NAME: { not_null "size": LONG },
+        // remove.size is optional, so we read remove.path (required) to know a row is a Remove
+        // before reading its size.
+        nullable REMOVE_NAME: {
+            not_null "path": STRING,
+            nullable "size": LONG,
+        },
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&DOMAIN_METADATA_FIELD),
+        nullable COMMIT_INFO_NAME: {
+            nullable "operation": STRING,
+            nullable "inCommitTimestamp": LONG,
+        },
+    };
     let with_file = base
         .add_metadata_column("_file", MetadataColumnSpec::FilePath)
         .expect("add _file metadata column");

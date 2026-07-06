@@ -48,6 +48,30 @@ pub enum Operator {
     UnionAll(UnionAll),
 }
 
+/// Generate `From<Payload> for Operator` for each listed variant, wrapping the payload in the
+/// same-named [`Operator`] variant. Example: `Filter { .. }.into()` yields `Operator::Filter`).
+macro_rules! impl_from_payload_for_operator {
+    ($($variant:ident),+ $(,)?) => {
+        $(impl From<$variant> for Operator {
+            fn from(payload: $variant) -> Self {
+                Operator::$variant(payload)
+            }
+        })+
+    };
+}
+
+impl_from_payload_for_operator!(
+    ScanParquet,
+    ScanJson,
+    Values,
+    Project,
+    Filter,
+    Load,
+    Aggregate,
+    SemiJoin,
+    UnionAll,
+);
+
 /// One file to scan plus literal values broadcast to every row read from that file.
 ///
 /// `file_constants` holds one [`Scalar`] per entry in the parent scan node's
@@ -159,7 +183,7 @@ impl From<FileMeta> for ScanFile {
 #[derive(Debug, Clone)]
 pub struct ScanParquet {
     pub files: Vec<ScanFile>,
-    pub file_constant_columns: Vec<ColumnName>,
+    pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
 }
 
@@ -184,7 +208,7 @@ pub struct ScanParquet {
 #[derive(Debug, Clone)]
 pub struct ScanJson {
     pub files: Vec<ScanFile>,
-    pub file_constant_columns: Vec<ColumnName>,
+    pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
 }
 
@@ -245,6 +269,16 @@ pub struct ScanJson {
 pub struct Values {
     pub schema: SchemaRef,
     pub rows: Vec<Vec<Scalar>>,
+}
+
+impl Values {
+    /// Literal `rows` matching `schema`. Empty `rows` is the uninhabited relation over `schema`.
+    pub fn new(schema: impl Into<SchemaRef>, rows: Vec<Vec<Scalar>>) -> Self {
+        Self {
+            schema: schema.into(),
+            rows,
+        }
+    }
 }
 
 /// Projects the input through `expr` into rows of `schema`.
@@ -315,6 +349,21 @@ pub struct LoadColumnFileMeta {
     pub num_records_column: ColumnName,
 }
 
+impl LoadColumnFileMeta {
+    /// The columns naming each file's path, size, and row-count.
+    pub fn new(
+        path_column: ColumnName,
+        file_size_column: ColumnName,
+        num_records_column: ColumnName,
+    ) -> Self {
+        Self {
+            path_column,
+            file_size_column,
+            num_records_column,
+        }
+    }
+}
+
 /// Reads data files from an upstream stream of file-metadata tuples, one input row per file.
 /// For each row, `file_meta` locates and sizes the file, the engine resolves its path against
 /// `base_url` (see below), opens it as `file_type`, and reads columns matching `schema`.
@@ -355,7 +404,7 @@ pub struct LoadColumnFileMeta {
 /// ```
 /// ```text
 /// Load {
-///     schema: { id: int, name: string },
+///     schema: { id: int, name: string, version: long },
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
 ///     file_constant_columns: ["version"],
@@ -384,9 +433,45 @@ pub struct Load {
     pub schema: SchemaRef,
     pub file_type: FileType,
     pub base_url: Option<Url>,
-    pub file_constant_columns: Vec<ColumnName>,
+    pub file_constant_columns: Vec<String>,
     pub file_meta: LoadColumnFileMeta,
     pub dv_column: ColumnName,
+}
+
+impl Load {
+    /// A [`Load`] over `schema` reading `file_type` files, with no base URL and no file-constant
+    /// columns. Add those with [`Self::with_base_url`] / [`Self::with_file_constant_columns`].
+    pub fn new(
+        schema: impl Into<SchemaRef>,
+        file_type: FileType,
+        file_meta: LoadColumnFileMeta,
+        dv_column: ColumnName,
+    ) -> Self {
+        Self {
+            schema: schema.into(),
+            file_type,
+            base_url: None,
+            file_constant_columns: Vec::new(),
+            file_meta,
+            dv_column,
+        }
+    }
+
+    /// Set the base URL that per-row file paths resolve against.
+    pub fn with_base_url(mut self, base_url: Url) -> Self {
+        self.base_url = Some(base_url);
+        self
+    }
+
+    /// Set the output columns broadcast from the upstream row (see
+    /// [`Self::file_constant_columns`]).
+    pub fn with_file_constant_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.file_constant_columns = columns.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// Groups input rows by `group_by` (a global aggregation over all rows when `group_by` is
@@ -394,14 +479,14 @@ pub struct Load {
 /// group-by key columns first (in order), then the aggregate columns (in order).
 ///
 /// Build an `Aggregate` with [`Aggregate::group_by`], which derives `schema` from the input
-/// schema -- including each output column's type and nullability -- so callers never restate it.
+/// schema -- including each output column's name, type, and nullability.
 ///
 /// # Output schema
 ///
 /// - **Group keys** pass through verbatim: each key column keeps its input type, nullability, and
 ///   metadata.
-/// - **Aggregate columns** take the type of their value column; nullability comes from the function
-///   (see [`Agg`]).
+/// - **Aggregate columns**: name, type, and nullability come from each [`Agg`] (see per-function
+///   docs); use [`AggregateBuilder::aggregate_as`] to override the name.
 ///
 /// # SQL equivalent
 ///
@@ -480,37 +565,21 @@ impl Aggregate {
     }
 }
 
-/// One aggregate function application within an [`Aggregate`] operator.
-///
-/// An `Agg` is a function ([`AggFn`]) applied to input column(s), optionally renamed via
-/// [`with_alias`](Self::with_alias). When no alias is set, the output column takes the name of the
-/// value column.
-///
-/// Construct with [`min`](Self::min) / [`max`](Self::max) /
-/// [`min_non_null_by`](Self::min_non_null_by) / [`max_non_null_by`](Self::max_non_null_by), then
-/// chain [`with_alias`](Self::with_alias):
-///
-/// ```
-/// # use delta_kernel::expressions::column_name;
-/// # use delta_kernel::plans::ir::nodes::Agg;
-/// let agg = Agg::max_non_null_by(column_name!("protocol"), column_name!("version"))
-///     .with_alias("latest_protocol");
-/// ```
-///
-/// # Nullability
-///
-/// Output nullability is a property of the function (see [`AggFn`]), not the input column. Every
-/// current function is nullable.
+/// An aggregate function and its operand column(s) within an [`Aggregate`] operator.
 #[derive(Debug, Clone)]
-pub struct Agg {
-    /// The aggregate function and its operand column(s).
-    pub func: AggFn,
-    /// Optional output column name. Defaults to the value column's name when unset.
-    pub alias: Option<String>,
+pub enum Agg {
+    /// Operands for [`Agg::min`].
+    Min { value: ColumnName },
+    /// Operands for [`Agg::max`].
+    Max { value: ColumnName },
+    /// Operands for [`Agg::min_non_null_by`].
+    MinNonNullBy { value: ColumnName, key: ColumnName },
+    /// Operands for [`Agg::max_non_null_by`].
+    MaxNonNullBy { value: ColumnName, key: ColumnName },
 }
 
 impl Agg {
-    /// The least non-NULL value in each group, or NULL if the group has no non-NULL value.
+    /// Like [`max`](Self::max), but selects the least non-NULL value in each group.
     ///
     /// ```text
     /// [3, NULL, 5, 1] -> 1
@@ -518,12 +587,13 @@ impl Agg {
     /// []              -> NULL
     /// ```
     pub fn min(value: impl Into<ColumnName>) -> Self {
-        Self::new(AggFn::Min(Min {
+        Self::Min {
             value: value.into(),
-        }))
+        }
     }
 
     /// The greatest non-NULL value in each group, or NULL if the group has no non-NULL value.
+    /// The output is always nullable, with name and type matching `value`.
     ///
     /// ```text
     /// [3, NULL, 5, 1] -> 5
@@ -531,23 +601,24 @@ impl Agg {
     /// []              -> NULL
     /// ```
     pub fn max(value: impl Into<ColumnName>) -> Self {
-        Self::new(AggFn::Max(Max {
+        Self::Max {
             value: value.into(),
-        }))
+        }
     }
 
     /// Like [`max_non_null_by`](Self::max_non_null_by), but selects the `value` from the row with
     /// the *least* `key`.
     pub fn min_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        Self::new(AggFn::MinNonNullBy(MinNonNullBy {
+        Self::MinNonNullBy {
             value: value.into(),
             key: key.into(),
-        }))
+        }
     }
 
     /// The `value` from the row with the greatest `key`, considering only rows where *both* `value`
     /// and `key` are non-null. NULL if no such row exists. If multiple rows tie for the greatest
-    /// `key`, which one's `value` is returned is unspecified.
+    /// `key`, which one's `value` is returned is unspecified. The output is always nullable, with
+    /// name and type matching `value`.
     ///
     /// ```text
     ///  key | value     ->  c
@@ -582,117 +653,36 @@ impl Agg {
     /// ) WHERE rn = 1
     /// ```
     pub fn max_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        Self::new(AggFn::MaxNonNullBy(MaxNonNullBy {
+        Self::MaxNonNullBy {
             value: value.into(),
             key: key.into(),
-        }))
-    }
-
-    /// Sets the output column name, overriding the default (the value column's name).
-    pub fn with_alias(mut self, name: impl Into<String>) -> Self {
-        self.alias = Some(name.into());
-        self
-    }
-
-    fn new(func: AggFn) -> Self {
-        Self { func, alias: None }
-    }
-
-    /// The output column name: the alias if set, else the value column's leaf name.
-    fn output_name(&self) -> DeltaResult<&str> {
-        self.alias
-            .as_ref()
-            .or_else(|| self.func.value().path().last())
-            .map(String::as_str)
-            .ok_or_else(|| Error::generic("Aggregate value column has an empty path"))
+        }
     }
 
     /// Derives this aggregate's output [`StructField`] over `input_schema`, validating that every
     /// operand column resolves. The output takes the value column's type (with field metadata
-    /// stripped); nullability comes from the function (see [`AggFn::nullable`]).
-    fn output_field(&self, input_schema: &StructType) -> DeltaResult<StructField> {
+    /// stripped).
+    fn output_field(
+        &self,
+        input_schema: &StructType,
+        alias: Option<String>,
+    ) -> DeltaResult<StructField> {
+        let value = match self {
+            Agg::Min { value } | Agg::Max { value } => value,
+            Agg::MinNonNullBy { value, key } | Agg::MaxNonNullBy { value, key } => {
+                input_schema.field_at(key)?;
+                value
+            }
+        };
+        let name = alias
+            .or_else(|| value.path().last().cloned())
+            .ok_or_else(|| {
+                Error::generic("Cannot derive default output name from empty column path")
+            })?;
         let data_type = StripFieldMetadataTransform
-            .transform(input_schema.field_at(self.func.value())?.data_type())
+            .transform(input_schema.field_at(value)?.data_type())
             .into_owned();
-        // Validate the key column (for the `*_non_null_by` functions) resolves, even though it
-        // does not appear in the output.
-        if let Some(key) = self.func.key() {
-            input_schema.field_at(key)?;
-        }
-        Ok(StructField::new(
-            self.output_name()?,
-            data_type,
-            self.func.nullable(),
-        ))
-    }
-}
-
-/// An aggregate function and its operand column(s).
-#[derive(Debug, Clone)]
-pub enum AggFn {
-    Min(Min),
-    Max(Max),
-    MinNonNullBy(MinNonNullBy),
-    MaxNonNullBy(MaxNonNullBy),
-}
-
-/// Operands for [`Agg::min`].
-#[derive(Debug, Clone)]
-pub struct Min {
-    pub value: ColumnName,
-}
-
-/// Operands for [`Agg::max`].
-#[derive(Debug, Clone)]
-pub struct Max {
-    pub value: ColumnName,
-}
-
-/// Operands for [`Agg::min_non_null_by`].
-#[derive(Debug, Clone)]
-pub struct MinNonNullBy {
-    /// Column whose value the aggregate emits.
-    pub value: ColumnName,
-    /// Column compared across rows to pick the winning (least-key) row.
-    pub key: ColumnName,
-}
-
-/// Operands for [`Agg::max_non_null_by`].
-#[derive(Debug, Clone)]
-pub struct MaxNonNullBy {
-    /// Column whose value the aggregate emits.
-    pub value: ColumnName,
-    /// Column compared across rows to pick the winning (greatest-key) row.
-    pub key: ColumnName,
-}
-
-impl AggFn {
-    /// The column whose value this aggregate emits (and whose type the output column takes).
-    pub fn value(&self) -> &ColumnName {
-        match self {
-            AggFn::Min(Min { value })
-            | AggFn::Max(Max { value })
-            | AggFn::MinNonNullBy(MinNonNullBy { value, .. })
-            | AggFn::MaxNonNullBy(MaxNonNullBy { value, .. }) => value,
-        }
-    }
-
-    /// The key column this aggregate compares rows on, or `None` for functions that take only a
-    /// value column.
-    fn key(&self) -> Option<&ColumnName> {
-        match self {
-            AggFn::MinNonNullBy(MinNonNullBy { key, .. })
-            | AggFn::MaxNonNullBy(MaxNonNullBy { key, .. }) => Some(key),
-            AggFn::Min(_) | AggFn::Max(_) => None,
-        }
-    }
-
-    /// Whether this function's output can be NULL. True for every current function (each yields
-    /// NULL over an empty or fully-excluded group); a count-style function would be `false`.
-    fn nullable(&self) -> bool {
-        match self {
-            AggFn::Min(_) | AggFn::Max(_) | AggFn::MinNonNullBy(_) | AggFn::MaxNonNullBy(_) => true,
-        }
+        Ok(StructField::nullable(name, data_type))
     }
 }
 
@@ -701,22 +691,28 @@ impl AggFn {
 ///
 /// Created by [`Aggregate::group_by`], which fixes the group keys. Aggregators are then collected
 /// by the named helpers or [`aggregate`](Self::aggregate); [`build`](Self::build) resolves keys and
-/// aggregators against the input schema, derives each output column's type and nullability, and
-/// validates that all output column names are unique.
+/// aggregators against the input schema; derives each output column's name, type and nullability
+/// from its [`Agg`] or group-by column; and validates that all output column names are unique.
 #[derive(Debug)]
 pub struct AggregateBuilder {
     input_schema: SchemaRef,
     group_by: Vec<ColumnName>,
-    aggs: Vec<Agg>,
+    aggs: Vec<(Agg, Option<String>)>,
 }
 
 impl AggregateBuilder {
-    /// Adds an aggregate column, emitted after the group keys in call order. Prefer the named
-    /// helpers ([`min`](Self::min), [`max`](Self::max), [`min_non_null_by`](Self::min_non_null_by),
-    /// [`max_non_null_by`](Self::max_non_null_by)) for the common, unaliased case; use this
-    /// directly to attach an alias via [`Agg::with_alias`].
+    /// Adds an aggregate column, emitted after the group keys in call order, using each [`Agg`]'s
+    /// default output name (see the per-function docs). Prefer the named helpers for the common
+    /// case (e.g. [`max`](Self::max); use [`aggregate_as`](Self::aggregate_as) to override the
+    /// output name.
     pub fn aggregate(mut self, agg: Agg) -> Self {
-        self.aggs.push(agg);
+        self.aggs.push((agg, None));
+        self
+    }
+
+    /// Like [`aggregate`](Self::aggregate), but with the specified output name.
+    pub fn aggregate_as(mut self, agg: Agg, name: impl Into<String>) -> Self {
+        self.aggs.push((agg, Some(name.into())));
         self
     }
 
@@ -751,13 +747,15 @@ impl AggregateBuilder {
         for key in &self.group_by {
             fields.push(self.input_schema.field_at(key)?.clone());
         }
-        for agg in &self.aggs {
-            fields.push(agg.output_field(&self.input_schema)?);
+        let mut aggs = Vec::with_capacity(self.aggs.len());
+        for (agg, alias) in self.aggs {
+            fields.push(agg.output_field(&self.input_schema, alias)?);
+            aggs.push(agg);
         }
         // NOTE: `StructType::try_new` rejects duplicate (case-insensitive) output column names.
         Ok(Aggregate {
             group_by: self.group_by,
-            aggs: self.aggs,
+            aggs,
             schema: Arc::new(StructType::try_new(fields)?),
         })
     }
@@ -914,7 +912,7 @@ mod tests {
     fn alias_overrides_default_output_name() {
         let input = schema(&[("a", true)]);
         let agg = Aggregate::group_by(input, [])
-            .aggregate(Agg::max(column_name!("a")).with_alias("a_max"))
+            .aggregate_as(Agg::max(column_name!("a")), "a_max")
             .build()
             .unwrap();
         assert!(agg.schema.field("a_max").is_some());
@@ -936,8 +934,8 @@ mod tests {
     fn distinct_aliases_resolve_min_max_collision() {
         let input = schema(&[("a", true)]);
         let agg = Aggregate::group_by(input, [])
-            .aggregate(Agg::min(column_name!("a")).with_alias("a_min"))
-            .aggregate(Agg::max(column_name!("a")).with_alias("a_max"))
+            .aggregate_as(Agg::min(column_name!("a")), "a_min")
+            .aggregate_as(Agg::max(column_name!("a")), "a_max")
             .build()
             .unwrap();
         let names: Vec<&str> = agg.schema.fields().map(|f| f.name().as_str()).collect();

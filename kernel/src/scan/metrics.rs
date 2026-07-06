@@ -129,8 +129,12 @@ impl ScanMetrics {
             num_non_file_actions: self.num_non_file_actions.load(Ordering::Relaxed),
             num_predicate_filtered: self.num_predicate_filtered.load(Ordering::Relaxed),
             peak_hash_set_size: self.peak_hash_set_size.load(Ordering::Relaxed),
-            dedup_visitor_time_ms: self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000,
-            predicate_eval_time_ms: self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            dedup_visitor_time: Duration::from_nanos(
+                self.dedup_visitor_time_ns.load(Ordering::Relaxed),
+            ),
+            predicate_eval_time: Duration::from_nanos(
+                self.predicate_eval_time_ns.load(Ordering::Relaxed),
+            ),
         }
     }
 
@@ -143,9 +147,8 @@ impl ScanMetrics {
         let non_file_actions = self.num_non_file_actions.load(Ordering::Relaxed);
         let predicate_filtered = self.num_predicate_filtered.load(Ordering::Relaxed);
         let peak_hash_set_size = self.peak_hash_set_size.load(Ordering::Relaxed);
-        let dedup_visitor_time_ms = self.dedup_visitor_time_ns.load(Ordering::Relaxed) / 1_000_000;
-        let predicate_eval_time_ms =
-            self.predicate_eval_time_ns.load(Ordering::Relaxed) / 1_000_000;
+        let dedup_visitor_time_ns = self.dedup_visitor_time_ns.load(Ordering::Relaxed);
+        let predicate_eval_time_ns = self.predicate_eval_time_ns.load(Ordering::Relaxed);
         info!(
             add_files_seen,
             active_add_files,
@@ -154,8 +157,8 @@ impl ScanMetrics {
             non_file_actions,
             predicate_filtered,
             peak_hash_set_size,
-            dedup_visitor_time_ms,
-            predicate_eval_time_ms,
+            dedup_visitor_time_ns,
+            predicate_eval_time_ns,
             "{}",
             message.as_ref()
         );

@@ -25,10 +25,10 @@ use crate::schema::{
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    assign_column_mapping_metadata, find_max_column_id_in_schema,
-    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, ColumnMappingMode, EnablementCheck, FeatureType, TableFeature,
-    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
+    find_max_column_id_in_schema, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
+    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -191,34 +191,6 @@ impl ValidatedTableProperties {
     /// Returns `true` iff `properties[key] == "true"`.
     fn is_property_true(&self, key: &str) -> bool {
         self.properties.get(key).map(String::as_str) == Some("true")
-    }
-}
-
-/// Adds a feature to the appropriate reader/writer feature lists based on its type.
-///
-/// - ReaderWriter features are added to both reader and writer lists
-/// - Writer and Unknown features are added only to the writer list
-///
-/// This function is idempotent - it won't add duplicate features.
-fn add_feature_to_lists(
-    feature: TableFeature,
-    reader_features: &mut Vec<TableFeature>,
-    writer_features: &mut Vec<TableFeature>,
-) {
-    match feature.feature_type() {
-        FeatureType::ReaderWriter => {
-            if !reader_features.contains(&feature) {
-                reader_features.push(feature.clone());
-            }
-            if !writer_features.contains(&feature) {
-                writer_features.push(feature);
-            }
-        }
-        FeatureType::WriterOnly | FeatureType::Unknown => {
-            if !writer_features.contains(&feature) {
-                writer_features.push(feature);
-            }
-        }
     }
 }
 
@@ -436,30 +408,16 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
     }
 }
 
-/// Auto-enables allowed features whose [`EnablementCheck::EnabledIf`] check is satisfied by the
-/// table properties. Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they
-/// don't require property-driven enablement.
+/// Auto-enables allowed property-driven features from the table properties (see
+/// [`auto_enable_property_driven_features`]).
 fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
     let table_properties = TableProperties::from(validated.properties.iter());
-    for feature in ALLOWED_DELTA_FEATURES {
-        if let EnablementCheck::EnabledIf(check) = feature.info().enablement_check {
-            if check(&table_properties) {
-                add_feature_to_lists(
-                    feature.clone(),
-                    &mut validated.reader_features,
-                    &mut validated.writer_features,
-                );
-                // RowTracking requires DomainMetadata as a dependency
-                if *feature == TableFeature::RowTracking {
-                    add_feature_to_lists(
-                        TableFeature::DomainMetadata,
-                        &mut validated.reader_features,
-                        &mut validated.writer_features,
-                    );
-                }
-            }
-        }
-    }
+    auto_enable_property_driven_features(
+        ALLOWED_DELTA_FEATURES,
+        &table_properties,
+        &mut validated.reader_features,
+        &mut validated.writer_features,
+    );
 }
 
 /// Sets materialized column name properties when row tracking is enabled.
@@ -766,6 +724,7 @@ pub struct CreateTableTransactionBuilder {
     engine_info: String,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
+    correlation_id: Option<Arc<str>>,
 }
 
 impl CreateTableTransactionBuilder {
@@ -780,6 +739,7 @@ impl CreateTableTransactionBuilder {
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
+            correlation_id: None,
         }
     }
 
@@ -864,6 +824,13 @@ impl CreateTableTransactionBuilder {
     /// ```
     pub fn with_data_layout(mut self, layout: DataLayout) -> Self {
         self.data_layout = layout;
+        self
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
+    /// metric events to the caller's own request or operation id. An empty id is treated as unset.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
 
@@ -985,6 +952,7 @@ impl CreateTableTransactionBuilder {
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
+            self.correlation_id,
         )
     }
 }
@@ -998,7 +966,9 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{
+        schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
         COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
@@ -1010,11 +980,7 @@ mod tests {
     };
 
     fn test_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]))
+        schema_ref! { not_null "id": INTEGER }
     }
 
     #[test]
@@ -1265,11 +1231,7 @@ mod tests {
     fn test_clustering_column_not_in_schema() {
         use crate::expressions::ColumnName;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1338,47 +1300,25 @@ mod tests {
 
     #[rstest::rstest]
     #[case::variant_top_level(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "v": (DataType::unshredded_variant()) },
         &[TableFeature::VariantType],
     )]
     #[case::variant_nested(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked(vec![StructField::new(
-                    "inner_v",
-                    DataType::unshredded_variant(),
-                    true,
-                )]),
-                true,
-            ),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_v": (DataType::unshredded_variant()) },
+        },
         &[TableFeature::VariantType],
     )]
     #[case::ntz_top_level(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "ts": TIMESTAMP_NTZ },
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::ntz_nested(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked(vec![StructField::new(
-                    "inner_ts",
-                    DataType::TIMESTAMP_NTZ,
-                    true,
-                )]),
-                true,
-            ),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_ts": TIMESTAMP_NTZ },
+        },
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::both_variant_and_ntz(
@@ -1432,32 +1372,19 @@ mod tests {
 
     #[rstest::rstest]
     #[case::all_nullable(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("name", DataType::STRING, true),
-        ])),
+        schema_ref! { nullable "id": INTEGER, nullable "name": STRING },
         false,
     )]
     #[case::top_level_non_null(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "name": STRING },
         true,
     )]
     #[case::nested_non_null(
-        Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]),
-            true,
-        )])),
+        schema_ref! { nullable "parent": { not_null "child": INTEGER } },
         true,
     )]
     #[case::variant_only(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ])),
+        schema_ref! { nullable "id": INTEGER, nullable "v": (DataType::unshredded_variant()) },
         false,
     )]
     fn test_maybe_enable_invariants(#[case] schema: SchemaRef, #[case] expect_invariants: bool) {

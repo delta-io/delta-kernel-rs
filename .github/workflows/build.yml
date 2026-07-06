@@ -372,6 +372,14 @@ jobs:
           cmake ..
           make
           make test
+      - name: build and run checkpoint-table test
+        run: |
+          pushd ffi/examples/checkpoint-table
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
   miri:
     name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest

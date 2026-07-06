@@ -285,8 +285,8 @@ pub(crate) mod test_utils {
     }
 
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue,
-        SchemaRef, StructField, StructType,
+        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType,
+        MetadataValue, SchemaRef, StructField, StructType,
     };
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
@@ -448,9 +448,14 @@ pub(crate) mod test_utils {
     // Reusable test schemas
     // Each variant exists with and without column mapping metadata.
 
-    /// Helper to add column mapping metadata to a [`StructField`].
-    fn with_column_mapping(field: StructField, id: i64, physical_name: &str) -> StructField {
-        field.with_metadata([
+    /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
+    fn cm_field(
+        name: &str,
+        id: i64,
+        physical_name: &str,
+        ty: impl Into<KernelDataType>,
+    ) -> StructField {
+        StructField::nullable(name, ty).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(id),
@@ -809,195 +814,97 @@ pub(crate) mod test_utils {
 
     /// Flat schema: `[id: long, name: string]`
     pub(crate) fn test_schema_flat() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable("name", KernelDataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "name": STRING,
+        }
     }
 
     /// Flat schema with column mapping metadata.
     pub(crate) fn test_schema_flat_with_column_mapping() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable("name", KernelDataType::STRING),
-                2,
-                "phys_name",
-            ),
-        ]))
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("name", 2, "phys_name", KernelDataType::STRING)),
+        }
     }
 
     /// Nested struct schema with array and map inside the struct
     pub(crate) fn test_schema_nested() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable(
-                "info",
-                StructType::new_unchecked([
-                    StructField::nullable("name", KernelDataType::STRING),
-                    StructField::nullable("age", KernelDataType::INTEGER),
-                    StructField::nullable(
-                        "tags",
-                        MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
-                    ),
-                    StructField::nullable("scores", ArrayType::new(KernelDataType::INTEGER, true)),
-                ]),
-            ),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "info": {
+                nullable "name": STRING,
+                nullable "age": INTEGER,
+                nullable "tags": { STRING => nullable STRING },
+                nullable "scores": [ nullable INTEGER ],
+            },
+        }
     }
 
     /// Nested struct schema with column mapping metadata.
     pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable(
-                    "info",
-                    StructType::new_unchecked([
-                        with_column_mapping(
-                            StructField::nullable("name", KernelDataType::STRING),
-                            3,
-                            "phys_name",
-                        ),
-                        with_column_mapping(
-                            StructField::nullable("age", KernelDataType::INTEGER),
-                            4,
-                            "phys_age",
-                        ),
-                        with_column_mapping(
-                            StructField::nullable(
-                                "tags",
-                                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
-                            ),
-                            5,
-                            "phys_tags",
-                        ),
-                        with_column_mapping(
-                            StructField::nullable(
-                                "scores",
-                                ArrayType::new(KernelDataType::INTEGER, true),
-                            ),
-                            6,
-                            "phys_scores",
-                        ),
-                    ]),
-                ),
-                2,
-                "phys_info",
-            ),
-        ]))
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("info", 2, "phys_info", schema! {
+                (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
+                (cm_field("age", 4, "phys_age", KernelDataType::INTEGER)),
+                (cm_field("tags", 5, "phys_tags",
+                    MapType::new(KernelDataType::STRING, KernelDataType::STRING, true))),
+                (cm_field("scores", 6, "phys_scores",
+                    ArrayType::new(KernelDataType::INTEGER, true))),
+            })),
+        }
     }
 
     /// Schema with a map
     pub(crate) fn test_schema_with_map() -> SchemaRef {
-        let value_struct = StructType::new_unchecked([
-            StructField::nullable("key", KernelDataType::STRING),
-            StructField::nullable("value", KernelDataType::INTEGER),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable(
-                "entries",
-                MapType::new(KernelDataType::STRING, value_struct, true),
-            ),
-            StructField::nullable("name", KernelDataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "entries": { STRING => nullable {
+                nullable "key": STRING,
+                nullable "value": INTEGER,
+            } },
+            nullable "name": STRING,
+        }
     }
 
     /// Schema with a map and column mapping metadata.
     pub(crate) fn test_schema_with_map_and_column_mapping() -> SchemaRef {
-        let value_struct = StructType::new_unchecked([
-            with_column_mapping(
-                StructField::nullable("key", KernelDataType::STRING),
-                4,
-                "phys_key",
-            ),
-            with_column_mapping(
-                StructField::nullable("value", KernelDataType::INTEGER),
-                5,
-                "phys_value",
-            ),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable(
-                    "entries",
-                    MapType::new(KernelDataType::STRING, value_struct, true),
-                ),
-                2,
-                "phys_entries",
-            ),
-            with_column_mapping(
-                StructField::nullable("name", KernelDataType::STRING),
-                3,
-                "phys_name",
-            ),
-        ]))
+        let value_struct = schema! {
+            (cm_field("key", 4, "phys_key", KernelDataType::STRING)),
+            (cm_field("value", 5, "phys_value", KernelDataType::INTEGER)),
+        };
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("entries", 2, "phys_entries",
+                MapType::new(KernelDataType::STRING, value_struct, true))),
+            (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
+        }
     }
 
     /// Schema with an array
     pub(crate) fn test_schema_with_array() -> SchemaRef {
-        let item_struct = StructType::new_unchecked([
-            StructField::nullable("label", KernelDataType::STRING),
-            StructField::nullable("count", KernelDataType::INTEGER),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable(
-                "items",
-                ArrayType::new(KernelDataType::from(item_struct), true),
-            ),
-            StructField::nullable("name", KernelDataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "items": [ nullable {
+                nullable "label": STRING,
+                nullable "count": INTEGER,
+            } ],
+            nullable "name": STRING,
+        }
     }
 
     /// Schema with an array and column mapping metadata.
     pub(crate) fn test_schema_with_array_and_column_mapping() -> SchemaRef {
-        let item_struct = StructType::new_unchecked([
-            with_column_mapping(
-                StructField::nullable("label", KernelDataType::STRING),
-                4,
-                "phys_label",
-            ),
-            with_column_mapping(
-                StructField::nullable("count", KernelDataType::INTEGER),
-                5,
-                "phys_count",
-            ),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable(
-                    "items",
-                    ArrayType::new(KernelDataType::from(item_struct), true),
-                ),
-                2,
-                "phys_items",
-            ),
-            with_column_mapping(
-                StructField::nullable("name", KernelDataType::STRING),
-                3,
-                "phys_name",
-            ),
-        ]))
+        let item_struct = schema! {
+            (cm_field("label", 4, "phys_label", KernelDataType::STRING)),
+            (cm_field("count", 5, "phys_count", KernelDataType::INTEGER)),
+        };
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("items", 2, "phys_items", ArrayType::new(item_struct, true))),
+            (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
+        }
     }
 
     /// Deeply nested schema: struct -> array -> struct -> map(value) -> struct.
@@ -1005,20 +912,18 @@ pub(crate) mod test_utils {
     /// The leaf struct field is intentionally **not** annotated with column mapping metadata,
     /// so this schema can be used to test error paths when column mapping is enabled.
     pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
-        let leaf_struct =
-            StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
-        let map_type = MapType::new(KernelDataType::STRING, leaf_struct, true);
-        let mid_struct = StructType::new_unchecked([with_column_mapping(
-            StructField::nullable("mid_field", map_type),
-            2,
-            "phys_mid_field",
-        )]);
-        let array_type = ArrayType::new(KernelDataType::from(mid_struct), true);
-        StructType::new_unchecked([with_column_mapping(
-            StructField::nullable("top", array_type),
-            1,
-            "phys_top",
-        )])
+        let map_type = MapType::new(
+            KernelDataType::STRING,
+            schema! { not_null "leaf": INTEGER },
+            true,
+        );
+        let array_type = ArrayType::new(
+            schema! { (cm_field("mid_field", 2, "phys_mid_field", map_type)) },
+            true,
+        );
+        schema! {
+            (cm_field("top", 1, "phys_top", array_type)),
+        }
     }
 
     /// Build a create-table transaction with the given schema and column mapping mode.
@@ -1149,7 +1054,8 @@ pub(crate) mod test_utils {
 
     pub(crate) mod column_mapping_physical_name_dedup_fixtures {
         use crate::schema::{
-            ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+            schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+            StructType,
         };
 
         /// Two fields with the same physical name at different physical paths should be accepted.
@@ -1189,17 +1095,14 @@ pub(crate) mod test_utils {
         ///
         /// Dedup must error at the shallower site and never report the deeper one.
         pub(crate) fn multiple_physical_name_collisions() -> StructType {
-            let a_struct = StructType::new_unchecked([cm_field("aa", 6, "aa", DataType::INTEGER)]);
-            let b_struct = StructType::new_unchecked([cm_field("bb", 7, "bb", DataType::INTEGER)]);
-            let nested = StructType::new_unchecked([
-                cm_field("x", 4, "q", DataType::INTEGER),
-                cm_field("y", 5, "q", DataType::INTEGER),
-            ]);
-            StructType::new_unchecked([
-                cm_field("a", 1, "p", a_struct),
-                cm_field("b", 2, "p", b_struct),
-                cm_field("nested", 3, "nested", nested),
-            ])
+            schema! {
+                (cm_field("a", 1, "p", schema! { (cm_field("aa", 6, "aa", DataType::INTEGER)) })),
+                (cm_field("b", 2, "p", schema! { (cm_field("bb", 7, "bb", DataType::INTEGER)) })),
+                (cm_field("nested", 3, "nested", schema! {
+                    (cm_field("x", 4, "q", DataType::INTEGER)),
+                    (cm_field("y", 5, "q", DataType::INTEGER)),
+                })),
+            }
         }
 
         fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> StructField {
