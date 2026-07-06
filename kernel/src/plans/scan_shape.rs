@@ -1,6 +1,7 @@
-//! Resolves a snapshot's checkpoint shape for scanning: no checkpoint, leaf (file actions inline,
-//! including multi-part), or manifest (sidecar references). When stats are requested, also reports
-//! whether the checkpoint has compatible parsed stats. Driven through a [`PlanExecutor`].
+//! Resolves a snapshot's checkpoint shape for scanning. This falls into the following cases: no
+//! checkpoint, leaf (file actions inline, including multi-part), or manifest (which references
+//! sidecar files) . When stats are requested, also reports whether the checkpoint has compatible
+//! parsed stats. Driven through a [`PlanExecutor`].
 
 // Public surface for the FSR scan builder; no other in-crate caller.
 #![allow(unused)]
@@ -69,63 +70,64 @@ impl ScanShape {
         let Some(first) = parts.first() else {
             return Ok(make_info(CheckpointShape::None, false));
         };
-        // Fast path: a hint listing sidecars means a manifest. Probe stats from a sidecar footer,
-        // skipping the checkpoint read. Positive signal only; an absent/empty list falls through.
-        if let Some(sidecar) = seg
-            .checkpoint_sidecars()
-            .and_then(|sidecars| sidecars.first())
-        {
-            let has_parsed_stats =
-                sidecar_has_parsed_stats(exec, sidecar.to_filemeta(&seg.log_root)?, stats_schema)?;
-            return Ok(make_info(CheckpointShape::Manifest, has_parsed_stats));
-        }
-
         let file_format = checkpoint_file_type(first);
-
-        // Otherwise classify by the `sidecar` column. Parquet without it is a leaf (that schema is
-        // probed for stats); with it, drain: empty is inline leaf, non-empty manifest. JSON always
-        // drains (no footer schema).
-        let mut leaf_parsed_stats = false;
-        let sidecar = match file_format {
-            FileType::Parquet => {
+        let hint_sidecar = seg
+            .checkpoint_sidecars()
+            .and_then(|sidecars| sidecars.first());
+        // Classify by locating a sidecar reference: a checkpoint with sidecars is a manifest, one
+        // without is a leaf. Prefer the `_last_checkpoint` hint to avoid reading the checkpoint;
+        // otherwise inspect the checkpoint file itself. Alongside the sidecar, capture the schema
+        // for a leaf checkpiont, since that schema carries the parsed stats.
+        let (sidecar, leaf_checkpoint_schema) = match (file_format, hint_sidecar) {
+            // The `_last_checkpoint` hint lists a sidecar: a manifest, no checkpoint read needed.
+            (_, Some(sidecar)) => (Some(sidecar.to_filemeta(&seg.log_root)?), None),
+            (FileType::Parquet, None) => {
                 // Prefer the `_last_checkpoint` schema hint to avoid a footer read.
                 let cp_schema = match seg.checkpoint_schema() {
                     Some(schema) => schema,
                     None => read_footer_schema(exec, first.location.clone())?,
                 };
-                let sidecar = if cp_schema.contains(SIDECAR_NAME) {
-                    // A chekpoint may have sidecar present in its schema without being a manifest.
-                    // To ensure it really is a manifest checkpoint, scan it for sidecars.
-                    collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
-                } else {
-                    None
+                // A checkpoint may list the `sidecar` column without being a manifest, so scan it
+                // to confirm a sidecar is actually present.
+                let sidecar = match cp_schema.contains(SIDECAR_NAME) {
+                    true => {
+                        collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
+                    }
+                    false => None,
                 };
-                // No sidecar: `cp_schema` is the leaf schema, probe it for stats.
-                if sidecar.is_none() {
-                    leaf_parsed_stats = stats_schema.is_some_and(|reqd| {
-                        LogSegment::schema_has_compatible_stats_parsed(
-                            cp_schema.as_ref(),
-                            reqd.as_ref(),
-                        )
-                    });
-                }
-                sidecar
+                // A leaf holds its file actions inline, so `cp_schema` carries their stats.
+                let leaf_checkpoint_schema = sidecar.is_none().then_some(cp_schema);
+                (sidecar, leaf_checkpoint_schema)
             }
-            FileType::Json => {
-                // It is not possible to know ahead of time if a json checkpoint is a manifets or
-                // leaf-level. Thus, we try to pull out sidecar files.
-                collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?
-            }
+            // A JSON checkpoint has no footer schema to inspect, so drain it for sidecars.
+            (FileType::Json, None) => (
+                collect_sidecar(exec, first.location.clone(), file_format, &seg.log_root)?,
+                None,
+            ),
         };
 
-        let Some(sidecar) = sidecar else {
-            // No sidecar was found in the checkpoint, so it can be treated as a leaf.
-            return Ok(make_info(CheckpointShape::Leaf, leaf_parsed_stats));
+        let checkpoint_shape = match sidecar.is_some() {
+            true => CheckpointShape::Manifest,
+            false => CheckpointShape::Leaf,
         };
 
-        // Probe the sidecar footer if stats were requested.
-        let has_parsed_stats = sidecar_has_parsed_stats(exec, sidecar, stats_schema)?;
-        Ok(make_info(CheckpointShape::Manifest, has_parsed_stats))
+        // Parsed stats come from the schema of the file holding the add actions: the sidecar footer
+        // for a manifest, or the leaf checkpoint schema for a parquet leaf. Probe it once, and only
+        // when a stats schema was requested. A JSON leaf has no such schema (its stats are unparsed
+        // strings), so `leaf_schema` is `None` and it never reports parsed stats.
+        let has_parsed_stats = match stats_schema {
+            Some(reqd) => {
+                let data_schema = match sidecar {
+                    Some(sidecar) => Some(read_footer_schema(exec, sidecar)?),
+                    None => leaf_checkpoint_schema,
+                };
+                data_schema.is_some_and(|schema| {
+                    LogSegment::schema_has_compatible_stats_parsed(schema.as_ref(), reqd.as_ref())
+                })
+            }
+            None => false,
+        };
+        Ok(make_info(checkpoint_shape, has_parsed_stats))
     }
 }
 
@@ -137,25 +139,7 @@ fn read_footer_schema(exec: &dyn PlanExecutor, file: FileMeta) -> DeltaResult<Sc
     Ok(footer.schema)
 }
 
-/// Whether a manifest's `sidecar` footer has parsed stats compatible with `stats_schema`. All
-/// sidecars share one schema, so callers pass the first. `false` when stats were not requested.
-fn sidecar_has_parsed_stats(
-    exec: &dyn PlanExecutor,
-    sidecar: FileMeta,
-    stats_schema: Option<&SchemaRef>,
-) -> DeltaResult<bool> {
-    let Some(reqd) = stats_schema else {
-        return Ok(false);
-    };
-    let side_schema = read_footer_schema(exec, sidecar)?;
-    Ok(LogSegment::schema_has_compatible_stats_parsed(
-        side_schema.as_ref(),
-        reqd.as_ref(),
-    ))
-}
-
-/// Drain the checkpoint `file`'s `sidecar` column, resolving the first reference to a [`FileMeta`]
-/// (enough to classify and probe; not a full enumeration).
+/// Read the checkpoint `file`'s `sidecar` column, returning the first reference to a sidecar's [`FileMeta`]
 fn collect_sidecar(
     exec: &dyn PlanExecutor,
     file: FileMeta,
