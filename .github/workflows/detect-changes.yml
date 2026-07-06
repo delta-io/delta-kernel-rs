@@ -1,18 +1,14 @@
 name: detect-changes
 
 # Reusable detector shared by the CI workflows. A caller adds a `detect_changes` job that
-# `uses:` this file, then gates its expensive jobs with
-# `needs: detect_changes` + `if: needs.detect_changes.outputs.docs_only == 'false'`.
-#
-# Gating at the job level (not via `paths-ignore`) keeps each job reporting a status: a job
-# skipped by its own `if:` reports "skipped", whereas a skipped *workflow* leaves its required
-# checks pending and blocks the merge. Callers pair this with an aggregator gate job so the
-# skipped jobs still resolve to a single green required check. See .github/CLAUDE.md.
+# `uses:` this file, then gates its jobs on the `docs_only` output. See .github/CLAUDE.md for
+# how callers gate (job-level `if:` + aggregator) and why job-level skips are used over
+# `paths-ignore`.
 #
 # docs_only is meaningful only for pull_request events. On a pull_request it is 'true' when
-# paths-filter confirms every changed file is docs/markdown, so callers skip. On push,
-# merge_group, or any other event the filter does not run, so docs_only is 'false' and callers
-# always run their full work. (Fail-safe: we skip only on a confirmed docs-only PR.)
+# every changed file is docs/markdown. On push, merge_group, or any other event the filter
+# does not run, so docs_only is 'false' and callers run their full work. (Fail-safe: we skip
+# only on a confirmed docs-only PR.)
 on:
   workflow_call:
     outputs:

@@ -44,22 +44,22 @@ GitHub treats two kinds of "skip" differently for required status checks:
   check of the same name. This is the mechanism we use.
 
 The shared `detect-changes.yml` reusable workflow emits `docs_only`. Callers gate on
-`needs: detect_changes` + `if: needs.detect_changes.outputs.docs_only == 'false'`. How to
-gate depends on the job shape:
+`needs: detect_changes` + a `docs_only` `if:`. How to gate depends on the job shape:
 
-- **Single (non-matrix) jobs** (`format`, `docs`, `run-examples`, ...): the job-level `if:`
-  is enough. A skipped job reports its own name as "skipped", satisfying its required check.
 - **Matrix jobs** (`build`, `test`, `ffi_test`, `miri`): a job-level `if:` skip never expands
   the matrix, so its per-leg checks (`build (ubuntu-latest)`, ...) never report and the PR
-  blocks. These CANNOT be individually required. Instead, `build.yml` funnels every job into
-  one `all-required-checks-pass` aggregator (`if: always()`, `needs:` every job) whose step
-  fails only when a needed job is `failure`/`cancelled` (`success`/`skipped` pass). Branch
-  protection requires ONLY that aggregator, so matrix jobs skip cleanly as a unit with a
-  single job-level `if:` and no per-step gating.
-
-The aggregator's `name:` is load-bearing: renaming it silently disables branch protection.
-When adding a job to `build.yml`, add it to the aggregator's `needs:` unless it is
-intentionally non-required (e.g. `invalid-handle-code`).
+  blocks. These CANNOT be individually required. `build.yml` funnels every job into one
+  `all-required-checks-pass` aggregator (`if: always()`, `needs:` every job) whose step fails
+  only when a needed job is `failure`/`cancelled` (`success`/`skipped` pass). Branch protection
+  requires ONLY that aggregator, so each job (matrix included) carries a single job-level
+  `if: docs_only == 'false'` and skips as a unit. The aggregator's `name:` is load-bearing:
+  renaming it silently disables branch protection. Add every new job to its `needs:` unless
+  intentionally non-required (e.g. `invalid-handle-code`).
+- **Single directly-required jobs** (`run-examples`): with no aggregator to catch a `failure`,
+  gate on `if: always() && docs_only != 'true'`, NOT `== 'false'`. A failed `detect_changes`
+  yields an empty output; `== 'false'` plus the implicit `success()` would skip the job, and a
+  skipped required check counts as passing, so the work would silently never run. `!= 'true'`
+  under `always()` runs the job unless docs-only is positively confirmed (fail-safe).
 
 ## Supply chain security: `--locked`
 
