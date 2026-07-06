@@ -164,16 +164,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "var_null_top_level/specs/var_null_top_level_filter_null",
         ],
     ),
-    (
-        "Arrow parquet reader cannot annotate Unknown logical type from BOOLEAN physical type",
-        &[
-            "void_001_void_top_level/specs/void_001_void_top_level_read_all",
-            "void_002_void_nested_struct/specs/void_002_void_nested_struct_read_all",
-            "void_005_void_schema_evolution/specs/void_005_void_schema_evolution_read_all",
-            "void_006_void_multiple_columns/specs/void_006_void_multiple_columns_read_all",
-            "void_007_void_with_backticks/specs/void_007_void_with_backticks_read_all",
-        ],
-    ),
     // partition values need Scalar::Interval; not yet supported
     (
         "Interval partition values not supported (needs Scalar::Interval)",
