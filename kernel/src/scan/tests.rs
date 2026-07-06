@@ -1766,14 +1766,13 @@ mod scan_metadata_completed_tests {
 
     use rstest::rstest;
 
+    use super::ScanBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
-
-    use super::ScanBuilder;
 
     fn run_scan(
         table: &str,

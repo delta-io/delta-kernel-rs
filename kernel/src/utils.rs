@@ -145,11 +145,13 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
 }
 
 /// Extension trait for folding zero or one value from an [`Option`] into a base value.
+#[internal_api]
 pub(crate) trait FoldWithOption: Sized {
-    /// Folds `opt` into `self`: if `opt` is [`Some`], returns `f(self, value)`; otherwise
-    /// returns `self`.
+    /// Applies an optional fold operation `f` to `self` if `opt` is [`Some`]; otherwise returns
+    /// `self`.
     ///
-    /// Equivalent to `opt.iter().fold(self, |acc, value| f(acc, value))`.
+    /// Similar to `opt.iter().fold(self, |acc, value| f(acc, value))`, but accepting `FnOnce`
+    /// instead of requiring `FnMut`, and with the base value as receiver instead of the option.
     fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self;
 }
 
