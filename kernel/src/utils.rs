@@ -144,6 +144,26 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
+/// Extension trait for folding zero or one value from an [`Option`] into a base value.
+#[internal_api]
+pub(crate) trait FoldWithOption: Sized {
+    /// Applies an optional fold operation `f` to `self` if `opt` is [`Some`]; otherwise returns
+    /// `self`.
+    ///
+    /// Similar to `opt.iter().fold(self, |acc, value| f(acc, value))`, but accepting `FnOnce`
+    /// instead of requiring `FnMut`, and with the base value as receiver instead of the option.
+    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self;
+}
+
+impl<T: Sized> FoldWithOption for T {
+    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self {
+        match opt {
+            Some(value) => f(self, value),
+            None => self,
+        }
+    }
+}
+
 /// Extension trait for adding completion callbacks to iterators.
 pub(crate) trait IteratorExt: Iterator + Sized {
     /// Wraps this iterator to call a closure when fully exhausted.

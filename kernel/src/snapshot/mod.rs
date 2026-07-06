@@ -1161,6 +1161,7 @@ mod tests {
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::utils::FoldWithOption as _;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -2122,14 +2123,13 @@ mod tests {
             ])
             .unwrap(),
         );
-        let mut builder = create_table("memory:///", schema, "test");
-        if let Some(cols) = &clustering_cols {
-            builder = builder.with_data_layout(DataLayout::clustered(cols.clone()));
-        }
-        if let Some(mode) = column_mapping_mode {
-            builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
-        }
-        let _ = builder
+        let _ = create_table("memory:///", schema, "test")
+            .fold_with(clustering_cols.as_ref(), |builder, cols| {
+                builder.with_data_layout(DataLayout::clustered(cols.clone()))
+            })
+            .fold_with(column_mapping_mode, |builder, mode| {
+                builder.with_table_properties([("delta.columnMapping.mode", mode)])
+            })
             .build(
                 &engine,
                 Box::new(crate::committer::FileSystemCommitter::new()),

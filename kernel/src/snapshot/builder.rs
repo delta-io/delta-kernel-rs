@@ -447,6 +447,7 @@ mod tests {
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::utils::FoldWithOption as _;
 
     fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
@@ -767,11 +768,9 @@ mod tests {
         create_table(&store, &table_root).await?;
 
         let (reporter, _guard) = measuring_reporter();
-        let mut builder = SnapshotBuilder::new_for(table_root);
-        if let Some(id) = correlation_id {
-            builder = builder.with_correlation_id(id);
-        }
-        builder.build(engine.as_ref())?;
+        let _ = SnapshotBuilder::new_for(table_root)
+            .fold_with(correlation_id, SnapshotBuilder::with_correlation_id)
+            .build(engine.as_ref())?;
 
         // The build event and its snapshot-load child events must all carry the id, since they
         // ride the same SnapshotLoadMetricContext.

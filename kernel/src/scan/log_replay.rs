@@ -28,7 +28,7 @@ use crate::schema::{
     StructField, StructType, ToSchema as _,
 };
 use crate::table_features::ColumnMappingMode;
-use crate::utils::require;
+use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
 /// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
@@ -685,19 +685,16 @@ fn scan_row_schema_with_parsed_columns(
     if !needs_extra {
         return Ok(SCAN_ROW_SCHEMA.clone());
     }
-    let mut patch = SchemaStructPatchBuilder::new();
-    if let Some(schema) = stats_schema {
-        patch = patch.append(StructField::nullable(
-            STATS_PARSED_NAME,
-            schema.as_ref().clone(),
-        ));
-    }
-    if let Some(schema) = partition_schema {
-        patch = patch.append(StructField::nullable(
-            PARTITION_VALUES_PARSED_NAME,
-            schema.as_ref().clone(),
-        ));
-    }
+    let patch = SchemaStructPatchBuilder::new()
+        .fold_with(stats_schema.as_ref(), |patch, schema| {
+            patch.append(StructField::nullable(STATS_PARSED_NAME, schema.clone()))
+        })
+        .fold_with(partition_schema.as_ref(), |patch, schema| {
+            patch.append(StructField::nullable(
+                PARTITION_VALUES_PARSED_NAME,
+                schema.clone(),
+            ))
+        });
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
