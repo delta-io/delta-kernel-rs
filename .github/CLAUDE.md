@@ -33,12 +33,33 @@ on:
   merge_group:
 ```
 
-## Never `paths`/`paths-ignore` a workflow whose jobs are required checks
+## Skipping docs-only PRs without wedging required checks
 
-Do NOT add `paths` or `paths-ignore` filters to a workflow whose jobs are required
-status checks (most of `build.yml`). When a path filter skips the whole workflow,
-the required checks never report, and the PR stays blocked on "Expected, waiting
-for status" indefinitely. A skipped workflow is not the same as a passing one.
+GitHub treats two kinds of "skip" differently for required status checks:
+
+- A **workflow** skipped by `paths`/`paths-ignore` never reports its checks, so any
+  required check stays "Expected, waiting for status" and blocks the merge forever.
+  NEVER add `paths`/`paths-ignore` to a workflow whose jobs are required.
+- A **job** skipped by its own `if:` reports "skipped", which satisfies a required
+  check of the same name. This is the mechanism we use.
+
+The shared `detect-changes.yml` reusable workflow emits `docs_only`. Callers gate on
+`needs: detect_changes` + `if: needs.detect_changes.outputs.docs_only == 'false'`. How to
+gate depends on the job shape:
+
+- **Single (non-matrix) jobs** (`format`, `docs`, `run-examples`, ...): the job-level `if:`
+  is enough. A skipped job reports its own name as "skipped", satisfying its required check.
+- **Matrix jobs** (`build`, `test`, `ffi_test`, `miri`): a job-level `if:` skip never expands
+  the matrix, so its per-leg checks (`build (ubuntu-latest)`, ...) never report and the PR
+  blocks. These CANNOT be individually required. Instead, `build.yml` funnels every job into
+  one `all-required-checks-pass` aggregator (`if: always()`, `needs:` every job) whose step
+  fails only when a needed job is `failure`/`cancelled` (`success`/`skipped` pass). Branch
+  protection requires ONLY that aggregator, so matrix jobs skip cleanly as a unit with a
+  single job-level `if:` and no per-step gating.
+
+The aggregator's `name:` is load-bearing: renaming it silently disables branch protection.
+When adding a job to `build.yml`, add it to the aggregator's `needs:` unless it is
+intentionally non-required (e.g. `invalid-handle-code`).
 
 ## Supply chain security: `--locked`
 

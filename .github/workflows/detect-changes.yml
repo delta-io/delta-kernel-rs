@@ -1,0 +1,41 @@
+name: detect-changes
+
+# Reusable detector shared by the CI workflows. A caller adds a `detect_changes` job that
+# `uses:` this file, then gates its expensive jobs with
+# `needs: detect_changes` + `if: needs.detect_changes.outputs.docs_only == 'false'`.
+#
+# Gating at the job level (not via `paths-ignore`) keeps each job reporting a status: a job
+# skipped by its own `if:` reports "skipped", whereas a skipped *workflow* leaves its required
+# checks pending and blocks the merge. Callers pair this with an aggregator gate job so the
+# skipped jobs still resolve to a single green required check. See .github/CLAUDE.md.
+#
+# docs_only is meaningful only for pull_request events. On a pull_request it is 'true' when
+# paths-filter confirms every changed file is docs/markdown, so callers skip. On push,
+# merge_group, or any other event the filter does not run, so docs_only is 'false' and callers
+# always run their full work. (Fail-safe: we skip only on a confirmed docs-only PR.)
+on:
+  workflow_call:
+    outputs:
+      docs_only:
+        description: "'true' when a pull_request changed only docs/markdown; 'false' otherwise."
+        value: ${{ jobs.detect.outputs.docs_only }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.code == 'false' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # 'every' means a file matches only if it satisfies ALL the negations below, so
+          # `code` is true when any changed file falls outside those docs paths.
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**.md'
+              - '!docs/**'
+              - '!.github/ISSUE_TEMPLATE/**'
