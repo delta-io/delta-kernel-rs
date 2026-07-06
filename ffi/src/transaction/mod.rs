@@ -792,7 +792,8 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
+        StructType,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
@@ -806,6 +807,8 @@ mod tests {
     use rstest::rstest;
     use serde_json::{json, Deserializer};
     use tempfile::tempdir;
+    use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+    use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
         create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
@@ -826,6 +829,33 @@ mod tests {
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    type LocalTestTables = Vec<(
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<DynObjectStore>,
+        &'static str,
+    )>;
+
+    /// Create v1.1 and v3.7 test tables on the local filesystem under a fresh temp directory.
+    ///
+    /// Keep the returned [`tempfile::TempDir`] alive for the duration of the test.
+    async fn setup_local_test_tables(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+        table_base_name: &str,
+    ) -> Result<(tempfile::TempDir, LocalTestTables), Box<dyn std::error::Error>> {
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let tables = setup_test_tables(
+            schema,
+            partition_columns,
+            Some(&tmp_dir_url),
+            table_base_name,
+        )
+        .await?;
+        Ok((tmp_test_dir, tables))
+    }
 
     /// Reads the committed version from a [`Handle<ExclusiveCommittedTransaction>`] and
     /// frees the handle.
@@ -915,21 +945,9 @@ mod tests {
             StructField::nullable("string", DataType::STRING),
         ])?);
 
-        // Create a temporary local directory for use during this test
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-
         // TODO: test with partitions
-        let partition_columns = vec![];
-
-        for (table_url, _engine, store, _table_name) in setup_test_tables(
-            schema,
-            &partition_columns,
-            Some(&tmp_dir_local_url),
-            "test_table",
-        )
-        .await?
-        {
+        let (_tmp_test_dir, tables) = setup_local_test_tables(schema, &[], "test_table").await?;
+        for (table_url, _engine, store, _table_name) in tables {
             let table_path = table_url.to_file_path().unwrap();
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
@@ -1105,17 +1123,9 @@ mod tests {
             StructField::nullable("part", DataType::INTEGER),
         ])?);
 
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-
-        for (table_url, _engine, store, _table_name) in setup_test_tables(
-            schema,
-            &["part"],
-            Some(&tmp_dir_local_url),
-            "test_partitioned_table",
-        )
-        .await?
-        {
+        let (_tmp_test_dir, tables) =
+            setup_local_test_tables(schema, &["part"], "test_partitioned_table").await?;
+        for (table_url, _engine, store, _table_name) in tables {
             let table_path = table_url.to_file_path().unwrap();
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
@@ -1302,12 +1312,10 @@ mod tests {
             "number",
             DataType::INTEGER,
         )])?);
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let (_tmp_test_dir, tables) =
+            setup_local_test_tables(schema, &[], "test_unpartitioned").await?;
 
-        for (table_url, _engine, _store, _table_name) in
-            setup_test_tables(schema, &[], Some(&tmp_dir_local_url), "test_unpartitioned").await?
-        {
+        for (table_url, _engine, _store, _table_name) in tables {
             let table_path = table_url.to_file_path().unwrap();
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
@@ -1354,17 +1362,10 @@ mod tests {
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("part", DataType::INTEGER),
         ])?);
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let (_tmp_test_dir, tables) =
+            setup_local_test_tables(schema, &["part"], "test_null_partition").await?;
 
-        for (table_url, _engine, _store, _table_name) in setup_test_tables(
-            schema,
-            &["part"],
-            Some(&tmp_dir_local_url),
-            "test_null_partition",
-        )
-        .await?
-        {
+        for (table_url, _engine, _store, _table_name) in tables {
             let table_path = table_url.to_file_path().unwrap();
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
@@ -1416,17 +1417,10 @@ mod tests {
             StructField::nullable("region", DataType::STRING),
             StructField::nullable("year", DataType::INTEGER),
         ])?);
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let (_tmp_test_dir, tables) =
+            setup_local_test_tables(schema, &["year", "region"], "test_multi_partition").await?;
 
-        for (table_url, _engine, _store, _table_name) in setup_test_tables(
-            schema,
-            &["year", "region"],
-            Some(&tmp_dir_local_url),
-            "test_multi_partition",
-        )
-        .await?
-        {
+        for (table_url, _engine, _store, _table_name) in tables {
             let table_path = table_url.to_file_path().unwrap();
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
