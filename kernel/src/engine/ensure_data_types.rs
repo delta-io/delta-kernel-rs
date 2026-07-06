@@ -898,6 +898,23 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn interval_rejects_incompatible_arrow_types(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+        #[values(
+            ArrowDataType::Utf8,
+            ArrowDataType::Boolean,
+            ArrowDataType::Date32,
+            ArrowDataType::Float64
+        )]
+        arrow_type: ArrowDataType,
+    ) {
+        assert_result_error_with_message(
+            ensure_data_types(&interval, &arrow_type, ValidationMode::TypesAndNames),
+            "Incorrect datatype",
+        );
+    }
+
     /// Ensures that every kernel-level checkpoint reinterpretation rule in
     /// `PrimitiveType::is_checkpoint_cast_compatible` has a corresponding Arrow cast
     /// in `check_cast_compat`. If one side is updated without the other, this test fails.

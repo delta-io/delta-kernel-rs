@@ -1492,7 +1492,7 @@ fn test_void_scalar_to_array() {
     assert_eq!(*array.data_type(), DataType::Null);
 }
 
-// Unit test to ensure `Scalar::validate` rejects interval types
+// Unit test to ensure scalars reject interval types
 #[rstest]
 #[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH)]
 #[case::day_time(KernelDataType::INTERVAL_DAY_TIME)]
