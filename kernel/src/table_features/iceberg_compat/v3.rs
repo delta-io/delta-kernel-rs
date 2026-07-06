@@ -71,21 +71,16 @@ fn check_column_defaults(tc: &TableConfiguration) -> DeltaResult<()> {
 
 #[cfg(feature = "column-defaults-in-dev")]
 fn validate_v3_column_defaults(schema: &crate::schema::StructType) -> DeltaResult<()> {
-    for field in schema.fields() {
-        let Some(column_default) = field.column_default()? else {
-            continue;
-        };
+    for (path, column_default) in crate::schema::collect_column_defaults(schema)? {
         if column_default.data_type().as_primitive_opt().is_none() {
             return Err(Error::generic(format!(
-                "kernel does not support a column default on non-primitive column '{}' on \
-                 icebergCompatV3 tables",
-                field.name()
+                "kernel does not support a column default on non-primitive column '{path}' on \
+                 icebergCompatV3 tables"
             )));
         }
         if !column_default.is_literal() {
             return Err(Error::generic(format!(
-                "icebergCompatV3 requires the column default for '{}' to be a literal, got: {}",
-                field.name(),
+                "icebergCompatV3 requires the column default for '{path}' to be a literal, got: {}",
                 column_default.raw_sql()
             )));
         }
@@ -179,5 +174,26 @@ mod column_default_tests {
                 panic!("unexpected outcome for {default_sql:?}: {result:?} vs {expected:?}")
             }
         }
+    }
+
+    #[test]
+    fn validate_v3_column_default_rejects_nested_non_literal() {
+        let inner = StructField::nullable("inner", DataType::TIMESTAMP).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+            MetadataValue::String("current_timestamp()".to_string()),
+        )]);
+        let schema = StructType::try_new([StructField::nullable(
+            "s",
+            DataType::try_struct_type([inner]).unwrap(),
+        )])
+        .unwrap();
+
+        let err = validate_v3_column_defaults(&schema)
+            .expect_err("non-literal default on a nested field must be rejected")
+            .to_string();
+        assert!(
+            err.contains("s.inner"),
+            "expected nested path in error: {err}"
+        );
     }
 }
