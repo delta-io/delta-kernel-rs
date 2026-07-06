@@ -21,6 +21,7 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotRef};
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Snapshot};
 
 // ============================================================================
@@ -413,11 +414,11 @@ impl BuiltCrcTest {
         version: Option<u64>,
         mode: IncrementalReplay,
     ) -> (SnapshotRef, String) {
-        let mut builder = Snapshot::builder_for(self.url.clone()).with_incremental_crc_replay(mode);
-        if let Some(v) = version {
-            builder = builder.at_version(v);
-        }
-        let snapshot = builder.build(&self.engine).unwrap();
+        let snapshot = Snapshot::builder_for(self.url.clone())
+            .with_incremental_crc_replay(mode)
+            .fold_with(version, crate::snapshot::SnapshotBuilder::at_version)
+            .build(&self.engine)
+            .unwrap();
         let label = version.map_or("latest".to_string(), |v| format!("v{v}"));
         (snapshot, label)
     }

@@ -1770,7 +1770,10 @@ mod scan_metadata_completed_tests {
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
+
+    use super::ScanBuilder;
 
     fn run_scan(
         table: &str,
@@ -1787,14 +1790,12 @@ mod scan_metadata_completed_tests {
         let engine = Arc::new(SyncEngine::new());
         let guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-        let mut builder = snapshot.scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        if let Some(id) = correlation_id {
-            builder = builder.with_correlation_id(id);
-        }
-        let scan = builder.build().unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .fold_with(correlation_id, ScanBuilder::with_correlation_id)
+            .build()
+            .unwrap();
         let results: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()

@@ -15,6 +15,7 @@ use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::SchemaRef;
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
@@ -321,10 +322,9 @@ fn read_scan_file(
         // because the selection vector is `None`.
         let extend = Some(!is_dv_resolved_pair);
         let rest = split_vector(sv.as_mut(), len, extend);
-        let result = match sv {
-            Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
-            None => logical,
-        };
+        let result = logical.fold_with(sv, |logical, sv| {
+            logical.and_then(|data| data.apply_selection_vector(sv))
+        });
         selection_vector = rest;
         result
     });

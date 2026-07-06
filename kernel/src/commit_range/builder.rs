@@ -183,6 +183,7 @@ mod tests {
     use super::*;
     use crate::commit_range::DeltaAction;
     use crate::engine::sync::SyncEngine;
+    use crate::utils::FoldWithOption as _;
     use crate::{Engine, Snapshot};
 
     /// `table-with-dv-small` has versions 0 and 1 (snapshot version = 1).
@@ -248,11 +249,10 @@ mod tests {
         let snapshot = Snapshot::builder_for(table_root.as_str())
             .build(&engine)
             .unwrap();
-        let mut builder = CommitRange::builder_from(snapshot, start);
-        if let Some(end) = end {
-            builder = builder.with_end_version(end);
-        }
-        let err = builder.build(&engine).expect_err("must error");
+        let err = CommitRange::builder_from(snapshot, start)
+            .fold_with(end, CommitRangeBuilder::with_end_version)
+            .build(&engine)
+            .expect_err("must error");
         let msg = format!("{err}");
         for needle in expected_substrings {
             assert!(
