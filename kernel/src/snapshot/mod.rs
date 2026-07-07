@@ -923,9 +923,14 @@ impl Snapshot {
     /// Returns [`Error::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
     /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
     /// stats).
+    ///
+    /// The `root` span field records which root resolved the CRC.
+    #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
     fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
+        let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = &self.crc {
+            span.record("root", "in_memory");
             return Ok(crc.clone());
         }
 
@@ -935,16 +940,18 @@ impl Snapshot {
         // Case 2: a stale on-disk CRC, older than this version. An on-disk CRC at exactly this
         // version would have short-circuited to `AlreadyExists` in `write_checksum`. Advance it
         // over the tail commits.
-        // TODO: `read_latest_crc` re-reads the CRC from disk. `LazyCrc` was deleted in the pivot
-        //       to incremental CRC being optional; reintroduce something like it so a CRC already
-        //       read during snapshot load is reused here instead of re-read.
+        // TODO(#2889): `read_latest_crc` re-reads the CRC from disk. `LazyCrc` was deleted in the
+        //              pivot to incremental CRC being optional; reintroduce something like it so a
+        //              CRC already read during snapshot load is reused here instead of re-read.
         if let Some(base) = log_segment.read_latest_crc(engine) {
+            span.record("root", "stale_crc");
             let crc = log_segment.build_crc_from_base(engine, &base)?;
             return Ok(Arc::new(crc));
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
         if let Some(checkpoint_version) = log_segment.checkpoint_version {
+            span.record("root", "checkpoint");
             if checkpoint_version == end {
                 // A checkpoint carries no ICT (it has no commitInfo). Since there's no tail delta
                 // to carry it either, we defer to `get_in_commit_timestamp`, which reads the commit
@@ -975,6 +982,7 @@ impl Snapshot {
         }
 
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
+        span.record("root", "version_zero");
         let crc = log_segment
             .build_crc_from_version_zero(engine)?
             .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
