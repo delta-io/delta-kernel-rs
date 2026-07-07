@@ -443,11 +443,10 @@ impl CrcReplayAccumulator {
         }
     }
 
-    /// Apply the columns every source carries (add file, domain metadata, set transactions,
-    /// protocol, metadata) from row `i` to the delta. Each visitor handles its source-specific
-    /// columns (commit: `_file`/commitInfo/remove) and passes the trailing shared slice here so
-    /// the shared leaves live in one place. `shared` starts at the first shared column, laid out
-    /// as [`shared_columns`] then the protocol and metadata leaves.
+    /// Apply the shared columns (`shared`, laid out by [`shared_columns`] then the protocol and
+    /// metadata leaves) from row `i` to the delta. Each visitor reads its source-specific columns
+    /// (commit: `_file`/commitInfo/remove) and passes the trailing shared slice here so the shared
+    /// leaves live in one place.
     fn apply_shared_columns<'a>(
         &mut self,
         i: usize,
@@ -488,7 +487,7 @@ impl CrcReplayAccumulator {
 // ===== Shared column indices =====
 // Indices into the shared slice each visitor passes to
 // [`CrcReplayAccumulator::apply_shared_columns`], laid out by [`shared_columns`].
-// Zero-based: the slice starts at the first shared column.
+// The slice starts at the first shared column.
 const SHARED_COL_ADD_SIZE: usize = 0;
 const SHARED_COL_DM_DOMAIN: usize = 1;
 const SHARED_COL_DM_CONFIG: usize = 2;
@@ -639,9 +638,7 @@ static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     })
 });
 
-// A checkpoint carries no `_file`, `commitInfo`, or `remove`, so its entire projection is the
-// shared columns: the visitor has no source-specific columns and hands the full getter slice to
-// [`CrcReplayAccumulator::apply_shared_columns`].
+// A checkpoint has no source-specific columns, so its projection is the shared columns.
 
 /// Pulls leaf values from a checkpoint batch into the shared [`CrcReplayAccumulator`].
 struct CheckpointCrcVisitor<'a> {
@@ -821,6 +818,18 @@ mod tests {
         let (names, types) = visitor.selected_column_names_and_types();
         let expected =
             N_FIXED_COLS + PROTOCOL_LEAVES.as_ref().0.len() + METADATA_LEAVES.as_ref().0.len();
+        assert_eq!(names.len(), expected);
+        assert_eq!(types.len(), expected);
+    }
+
+    #[test]
+    fn checkpoint_visitor_schema_length_matches_column_indices() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        let visitor = CheckpointCrcVisitor { acc: &mut acc };
+        let (names, types) = visitor.selected_column_names_and_types();
+        let expected = N_SHARED_SINGLE_LEAF_COLS
+            + PROTOCOL_LEAVES.as_ref().0.len()
+            + METADATA_LEAVES.as_ref().0.len();
         assert_eq!(names.len(), expected);
         assert_eq!(types.len(), expected);
     }

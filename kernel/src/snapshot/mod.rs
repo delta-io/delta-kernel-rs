@@ -861,8 +861,8 @@ impl Snapshot {
     ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent.
-    /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot
-    ///   be read from the commit file.
+    /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
+    ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
     #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
     pub fn write_checksum(
