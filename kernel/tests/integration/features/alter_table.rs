@@ -18,8 +18,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
-    test_table_setup_mt, write_batch_to_table,
+    add_commit, column_mapping_fixtures as fixtures, create_table_and_load_snapshot,
+    engine_store_setup, test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -1092,6 +1092,55 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
     assert!(
         err.contains("Duplicate column mapping ID") && err.contains(&existing_id.to_string()),
         "expected duplicate-id error naming id {existing_id}, got: {err}"
+    );
+    Ok(())
+}
+
+/// A mapping-disabled table carrying residual `delta.columnMapping.*` annotations reads fine
+/// (see the read-side tolerance), but ALTER is still rejected: the write path validates the whole
+/// evolved schema, so a stale annotation on an untouched column fails even when the ALTER only adds
+/// a clean column. delta-spark tolerates this; closing the gap is tracked in
+/// https://github.com/delta-io/delta-kernel-rs/issues/2885. This test pins the current strict
+/// behavior until then.
+#[tokio::test]
+async fn add_column_rejected_when_table_has_stale_column_mapping() -> DeltaResult<()> {
+    let (store, engine, table_url) = engine_store_setup("alter_stale_cm", None);
+
+    // `value` carries a stale physicalName + id; protocol omits columnMapping and no mode is set
+    // (resolves to None) -- the enable-then-disable artifact.
+    let stale_schema = StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::INTEGER).add_metadata([
+            ("delta.columnMapping.id", MetadataValue::Number(2)),
+            (
+                "delta.columnMapping.physicalName",
+                MetadataValue::String("col-2f8a".to_string()),
+            ),
+        ]),
+    ])?;
+    let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
+    // v0 written directly to bypass create_table validation (which rejects stale annotations).
+    let v0 = format!(
+        r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}
+{{"metaData":{{"id":"alter-stale-cm","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}
+"#
+    );
+    add_commit(table_url.as_str(), store.as_ref(), 0, v0)
+        .await
+        .unwrap();
+
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+    // Adding a brand-new clean column still fails, and the error names the untouched stale field.
+    let err = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("region", DataType::STRING))
+        .build(&engine, committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Column mapping is not enabled but field 'value'"),
+        "expected the ALTER to be rejected naming the untouched stale field, got: {err}"
     );
     Ok(())
 }

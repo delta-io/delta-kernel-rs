@@ -32,7 +32,7 @@ use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{validate_schema_column_mapping_strict, Operation, TableFeature};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
@@ -187,6 +187,11 @@ impl AlterTableTransactionBuilder<Modifying> {
             column_mapping_mode,
             current_max_column_id,
         )?;
+
+        // Reject stale column-mapping annotations on a mapping-disabled table. `make_physical`
+        // (run when building the evolved `TableConfiguration` below) tolerates these on the read
+        // path, so this explicit check keeps ALTER from persisting a table in that shape.
+        validate_schema_column_mapping_strict(&evolved_schema, column_mapping_mode)?;
 
         let evolved_metadata = table_config
             .metadata()

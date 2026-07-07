@@ -16,7 +16,7 @@ use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::schema_ref;
+use delta_kernel::schema::{schema_ref, MetadataValue, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{Engine, FileMeta, Snapshot};
@@ -477,5 +477,86 @@ async fn test_duplicated_phy_path_rejected(
             && msg.contains(".b'"),
         "expected path-aware dedup error naming colliding leaves, got: {msg}"
     );
+    Ok(())
+}
+
+/// A table left with `delta.columnMapping.*` annotations after mapping was enabled and then
+/// disabled must still be readable: mapping is off, so the annotations are inert and columns
+/// resolve by logical name. Kernel matches delta-spark, which ignores residual annotations when
+/// mapping is disabled.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_tolerates_stale_column_mapping_when_disabled(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = tempfile::tempdir()?;
+    let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let engine = Arc::new(
+        DefaultEngineBuilder::new(store.clone())
+            .with_task_executor(Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            )))
+            .build(),
+    );
+
+    // A `value` column carrying a stale physicalName + id, with no columnMapping feature in the
+    // protocol and mode absent (so it resolves to None) -- the enable-then-disable artifact.
+    let stale_schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": INTEGER
+    };
+    let stale_schema = StructType::try_new([
+        stale_schema.field("id").unwrap().clone(),
+        stale_schema.field("value").unwrap().clone().add_metadata([
+            ("delta.columnMapping.id", MetadataValue::Number(2)),
+            (
+                "delta.columnMapping.physicalName",
+                MetadataValue::String("col-2f8a".to_string()),
+            ),
+        ]),
+    ])?;
+    let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?)?;
+    // Create a v0 commit directly to bypass create_table validation (which would reject the
+    // stale annotations on the write path).
+    let v0 = format!(
+        r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}
+{{"metaData":{{"id":"stale-cm-id","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}
+"#
+    );
+    add_commit(table_url.as_str(), store.as_ref(), 0, v0).await?;
+
+    // Snapshot load succeeds and reports column mapping disabled.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot
+            .table_properties()
+            .column_mapping_mode
+            .unwrap_or(ColumnMappingMode::None),
+        ColumnMappingMode::None
+    );
+    // The `value` column resolves by its logical name, not the stale physical name.
+    let physical_name = get_any_level_column_physical_name(
+        snapshot.schema().as_ref(),
+        &ColumnName::new(["value"]),
+        ColumnMappingMode::None,
+    )?
+    .into_inner()
+    .remove(0);
+    assert_eq!(physical_name, "value");
+
+    // Write data through the tolerated snapshot and read it back to confirm the full path works.
+    let batch = RecordBatch::try_new(
+        Arc::new(snapshot.schema().as_ref().try_into_arrow()?),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+        ],
+    )?;
+    let post_write =
+        write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
+
+    let scan = post_write.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2, "expected the two written rows back");
     Ok(())
 }

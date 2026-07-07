@@ -180,11 +180,10 @@ pub(crate) fn apply_schema_operations(
                     // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
-                    // No upfront reject for stray CM metadata: the recursive walk in
-                    // `StructType::make_physical` (called from
-                    // `TableConfiguration::try_new_with_schema`
-                    // by the AlterTable builder) catches any CM annotation anywhere in the tree.
-                    // CREATE TABLE's non-CM path relies on the same mechanism.
+                    // No upfront reject for stray CM metadata here: the AlterTable builder runs an
+                    // explicit `validate_schema_column_mapping` over the evolved schema, which
+                    // rejects any CM annotation while mapping is disabled. CREATE TABLE runs the
+                    // same check on its non-CM path.
                     field
                 };
                 schema.field_map_mut().insert(field.name().clone(), field);
