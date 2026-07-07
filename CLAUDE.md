@@ -240,14 +240,13 @@ is the source of truth. Key concepts:
 
 **Table features**:
 
-- Writer: `appendOnly`, `invariants`, `checkConstraints`, `generatedColumns`,
-  `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
-  `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`,
-  `clustering`, `inCommitTimestamp`
-- Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
-  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
-  `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
-  `adaptiveMetadata-preview`, `typeWidening`
+- Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
+  `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
+  `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`, `rowTracking`
+- Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
+  `columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
+  `vacuumProtocolCheck`, `variantShredding`, `variantShredding-preview`, `variantType`,
+  `variantType-preview`
 
 Keep this list updated when new protocol features are added to kernel.
 
