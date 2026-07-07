@@ -267,7 +267,7 @@ impl LogSegment {
         for batch_result in batches {
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
-            let mut visitor = CrcReplayVisitor { acc: &mut acc };
+            let mut visitor = CommitCrcVisitor { acc: &mut acc };
             visitor.visit_rows_of(batch_result?.as_ref())?;
         }
 
@@ -443,34 +443,39 @@ impl CrcReplayAccumulator {
         }
     }
 
-    /// Apply the columns common to commit and checkpoint replay (domain metadata, set
-    /// transactions, protocol, metadata) from row `i` to the delta. Each visitor handles its
-    /// source-specific columns (commit: `_file`/commitInfo/add/remove; checkpoint: add) and
-    /// delegates the rest here so the shared leaves live in one place.
-    fn visit_common_columns<'a>(
+    /// Apply the columns every source carries (add file, domain metadata, set transactions,
+    /// protocol, metadata) from row `i` to the delta. Each visitor handles its source-specific
+    /// columns (commit: `_file`/commitInfo/remove) and passes the trailing shared slice here so
+    /// the shared leaves live in one place. `shared` starts at the first shared column, laid out
+    /// as [`shared_columns`] then the protocol and metadata leaves.
+    fn apply_shared_columns<'a>(
         &mut self,
         i: usize,
-        getters: &[&'a dyn GetData<'a>],
-        cols: &CommonColumns,
+        shared: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<()> {
-        if let Some(domain) = getters[cols.dm_domain].get_opt(i, "domainMetadata.domain")? {
+        // `add.size` (required) marks an Add row.
+        if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
+            self.on_add(size)?;
+        }
+        if let Some(domain) = shared[SHARED_COL_DM_DOMAIN].get_opt(i, "domainMetadata.domain")? {
             let configuration: String =
-                getters[cols.dm_config].get(i, "domainMetadata.configuration")?;
-            let removed: bool = getters[cols.dm_removed].get(i, "domainMetadata.removed")?;
+                shared[SHARED_COL_DM_CONFIG].get(i, "domainMetadata.configuration")?;
+            let removed: bool = shared[SHARED_COL_DM_REMOVED].get(i, "domainMetadata.removed")?;
             self.on_domain_metadata(domain, configuration, removed);
         }
-        if let Some(app_id) = getters[cols.txn_app_id].get_opt(i, "txn.appId")? {
-            let version: i64 = getters[cols.txn_version].get(i, "txn.version")?;
+        if let Some(app_id) = shared[SHARED_COL_TXN_APP_ID].get_opt(i, "txn.appId")? {
+            let version: i64 = shared[SHARED_COL_TXN_VERSION].get(i, "txn.version")?;
             let last_updated: Option<i64> =
-                getters[cols.txn_last_updated].get_opt(i, "txn.lastUpdated")?;
+                shared[SHARED_COL_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
             self.on_set_transaction(app_id, version, last_updated);
         }
-        let pm = &getters[cols.proto_meta_base..];
+        let leaves = &shared[N_SHARED_SINGLE_LEAF_COLS..];
+        let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
         if self.delta.protocol.is_none() {
-            self.delta.protocol = visit_protocol_at(i, &pm[..cols.n_protocol_leaves])?;
+            self.delta.protocol = visit_protocol_at(i, &leaves[..n_protocol_leaves])?;
         }
         if self.delta.metadata.is_none() {
-            self.delta.metadata = visit_metadata_at(i, &pm[cols.n_protocol_leaves..])?;
+            self.delta.metadata = visit_metadata_at(i, &leaves[n_protocol_leaves..])?;
         }
         Ok(())
     }
@@ -480,49 +485,27 @@ impl CrcReplayAccumulator {
     }
 }
 
-/// Number of columns shared by [`CrcReplayVisitor`] and [`CheckpointCrcVisitor`]: domain metadata
-/// (domain, configuration, removed) then set transaction (appId, version, lastUpdated). Each
-/// visitor's column list is {source-specific} then {shared} then {protocol leaves, metadata
-/// leaves}. Protocol and metadata are appended last because each expands to many leaf columns,
-/// while every column before them is a single leaf.
-const N_SHARED_COLS: usize = 6;
+// ===== Shared column indices =====
+// Indices into the shared slice each visitor passes to
+// [`CrcReplayAccumulator::apply_shared_columns`], laid out by [`shared_columns`].
+// Zero-based: the slice starts at the first shared column.
+const SHARED_COL_ADD_SIZE: usize = 0;
+const SHARED_COL_DM_DOMAIN: usize = 1;
+const SHARED_COL_DM_CONFIG: usize = 2;
+const SHARED_COL_DM_REMOVED: usize = 3;
+const SHARED_COL_TXN_APP_ID: usize = 4;
+const SHARED_COL_TXN_VERSION: usize = 5;
+const SHARED_COL_TXN_LAST_UPDATED: usize = 6;
+/// The single-leaf shared columns end here; the protocol and metadata leaves follow them in the
+/// shared slice.
+const N_SHARED_SINGLE_LEAF_COLS: usize = SHARED_COL_TXN_LAST_UPDATED + 1;
 
-/// Getter indices for the columns shared by commit and checkpoint replay, plus the count of
-/// protocol leaves so the trailing protocol/metadata leaf slices can be split. Built via
-/// [`CommonColumns::new`] and handed to [`CrcReplayAccumulator::visit_common_columns`].
-struct CommonColumns {
-    dm_domain: usize,
-    dm_config: usize,
-    dm_removed: usize,
-    txn_app_id: usize,
-    txn_version: usize,
-    txn_last_updated: usize,
-    /// Index of the first protocol leaf; metadata leaves follow the protocol leaves.
-    proto_meta_base: usize,
-    n_protocol_leaves: usize,
-}
-
-impl CommonColumns {
-    /// The shared columns are contiguous starting at `base`, in the order laid out by
-    /// [`shared_dm_txn_columns`], followed by the protocol leaves and then the metadata leaves.
-    fn new(base: usize, n_protocol_leaves: usize) -> Self {
-        Self {
-            dm_domain: base,
-            dm_config: base + 1,
-            dm_removed: base + 2,
-            txn_app_id: base + 3,
-            txn_version: base + 4,
-            txn_last_updated: base + 5,
-            proto_meta_base: base + N_SHARED_COLS,
-            n_protocol_leaves,
-        }
-    }
-}
-
-/// The domain-metadata and set-transaction columns shared by both replay visitors, in the order
-/// [`CommonColumns::new`] assumes. Each visitor appends these to its source-specific columns.
-fn shared_dm_txn_columns() -> Vec<(DataType, ColumnName)> {
+/// The columns every source carries (add file, domain metadata, set transaction), in the order
+/// [`CrcReplayAccumulator::apply_shared_columns`] assumes. Each visitor appends these to its
+/// source-specific columns.
+fn shared_columns() -> Vec<(DataType, ColumnName)> {
     vec![
+        (DataType::LONG, column_name!("add.size")),
         (DataType::STRING, column_name!("domainMetadata.domain")),
         (
             DataType::STRING,
@@ -550,14 +533,13 @@ fn append_protocol_metadata_leaves(
 }
 
 /// Validate that `getters` carries exactly the columns a replay visitor projects: `n_fixed`
-/// fixed columns plus the protocol and metadata leaves. Returns the protocol-leaf count, which
-/// the caller needs to split the trailing protocol/metadata leaf slices. `visitor_name` names
-/// the visitor in the error.
+/// fixed columns plus the protocol and metadata leaves. `visitor_name` names the visitor in the
+/// error.
 fn check_visitor_getters(
     getters: &[&dyn GetData<'_>],
     n_fixed: usize,
     visitor_name: &str,
-) -> DeltaResult<usize> {
+) -> DeltaResult<()> {
     let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
     let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
     require!(
@@ -567,7 +549,7 @@ fn check_visitor_getters(
             getters.len()
         ))
     );
-    Ok(n_protocol_leaves)
+    Ok(())
 }
 
 // ============================================================================
@@ -575,42 +557,40 @@ fn check_visitor_getters(
 // ============================================================================
 
 // ===== Visitor column indices =====
-// Indices into the column list returned by [`CrcReplayVisitor::selected_column_names_and_types`].
+// Indices into the column list returned by [`CommitCrcVisitor::selected_column_names_and_types`].
 const COL_FILE: usize = 0;
 const COL_OP: usize = 1;
 const COL_ICT: usize = 2;
-const COL_ADD_SIZE: usize = 3;
-const COL_REMOVE_PATH: usize = 4;
-const COL_REMOVE_SIZE: usize = 5;
+const COL_REMOVE_PATH: usize = 3;
+const COL_REMOVE_SIZE: usize = 4;
 /// Source-specific columns end here; the shared columns follow.
 const N_CRC_SPECIFIC_COLS: usize = COL_REMOVE_SIZE + 1;
-const N_FIXED_COLS: usize = N_CRC_SPECIFIC_COLS + N_SHARED_COLS;
+const N_FIXED_COLS: usize = N_CRC_SPECIFIC_COLS + N_SHARED_SINGLE_LEAF_COLS;
 
 /// Thin shim that pulls leaf values from `getters` and forwards them to the accumulator's
 /// `on_*` methods. All behavior lives in [`CrcReplayAccumulator`].
-struct CrcReplayVisitor<'a> {
+struct CommitCrcVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
 }
 
-impl RowVisitor for CrcReplayVisitor<'_> {
+impl RowVisitor for CommitCrcVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             let mut fixed = vec![
                 (DataType::STRING, column_name!("_file")),
                 (DataType::STRING, column_name!("commitInfo.operation")),
                 (DataType::LONG, column_name!("commitInfo.inCommitTimestamp")),
-                (DataType::LONG, column_name!("add.size")),
                 (DataType::STRING, column_name!("remove.path")),
                 (DataType::LONG, column_name!("remove.size")),
             ];
-            fixed.extend(shared_dm_txn_columns());
+            fixed.extend(shared_columns());
             append_protocol_metadata_leaves(fixed).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let n_protocol_leaves = check_visitor_getters(getters, N_FIXED_COLS, "CrcReplayVisitor")?;
+        check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")?;
         if row_count == 0 {
             return Ok(());
         }
@@ -619,17 +599,11 @@ impl RowVisitor for CrcReplayVisitor<'_> {
         let file_url: String = getters[COL_FILE].get(0, "_file")?;
         self.acc.process_batch_start(&file_url);
 
-        let common = CommonColumns::new(N_CRC_SPECIFIC_COLS, n_protocol_leaves);
-
         for i in 0..row_count {
             let operation: Option<String> = getters[COL_OP].get_opt(i, "commitInfo.operation")?;
             let ict: Option<i64> = getters[COL_ICT].get_opt(i, "commitInfo.inCommitTimestamp")?;
             if operation.is_some() || ict.is_some() {
                 self.acc.on_commit_info(operation.as_deref(), ict);
-            }
-
-            if let Some(size) = getters[COL_ADD_SIZE].get_opt(i, "add.size")? {
-                self.acc.on_add(size)?;
             }
 
             let remove_path: Option<String> = getters[COL_REMOVE_PATH].get_opt(i, "remove.path")?;
@@ -639,7 +613,8 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 self.acc.on_remove(&path, remove_size)?;
             }
 
-            self.acc.visit_common_columns(i, getters, &common)?;
+            self.acc
+                .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])?;
         }
         Ok(())
     }
@@ -664,11 +639,9 @@ static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     })
 });
 
-// ===== Checkpoint visitor column indices =====
-const COL_CP_ADD_SIZE: usize = 0;
-/// Source-specific columns end here; the shared columns follow.
-const N_CP_SPECIFIC_COLS: usize = COL_CP_ADD_SIZE + 1;
-const N_CP_FIXED_COLS: usize = N_CP_SPECIFIC_COLS + N_SHARED_COLS;
+// A checkpoint carries no `_file`, `commitInfo`, or `remove`, so its entire projection is the
+// shared columns: the visitor has no source-specific columns and hands the full getter slice to
+// [`CrcReplayAccumulator::apply_shared_columns`].
 
 /// Pulls leaf values from a checkpoint batch into the shared [`CrcReplayAccumulator`].
 struct CheckpointCrcVisitor<'a> {
@@ -677,25 +650,15 @@ struct CheckpointCrcVisitor<'a> {
 
 impl RowVisitor for CheckpointCrcVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            let mut fixed = vec![(DataType::LONG, column_name!("add.size"))];
-            fixed.extend(shared_dm_txn_columns());
-            append_protocol_metadata_leaves(fixed).into()
-        });
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| append_protocol_metadata_leaves(shared_columns()).into());
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let n_protocol_leaves =
-            check_visitor_getters(getters, N_CP_FIXED_COLS, "CheckpointCrcVisitor")?;
-        let common = CommonColumns::new(N_CP_SPECIFIC_COLS, n_protocol_leaves);
+        check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
         for i in 0..row_count {
-            // `add.size` (required) marks an Add row.
-            if let Some(size) = getters[COL_CP_ADD_SIZE].get_opt(i, "add.size")? {
-                self.acc.on_add(size)?;
-            }
-
-            self.acc.visit_common_columns(i, getters, &common)?;
+            self.acc.apply_shared_columns(i, getters)?;
         }
         Ok(())
     }
@@ -854,7 +817,7 @@ mod tests {
     #[test]
     fn visitor_schema_length_matches_column_indices() {
         let mut acc = CrcReplayAccumulator::new(None);
-        let visitor = CrcReplayVisitor { acc: &mut acc };
+        let visitor = CommitCrcVisitor { acc: &mut acc };
         let (names, types) = visitor.selected_column_names_and_types();
         let expected =
             N_FIXED_COLS + PROTOCOL_LEAVES.as_ref().0.len() + METADATA_LEAVES.as_ref().0.len();
