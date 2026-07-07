@@ -145,11 +145,8 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
-    /// ANSI interval types (`interval year to month`, `interval day to second`).
-    ///
-    /// TODO(#2840): intervalType is not fully supported yet. Kernel support is gated by the
-    /// `interval-type-in-dev` cargo feature. Registering the feature lets kernel read tables that
-    /// declare it; writing interval data lands in a later change.
+    /// TODO(#2840): intervalType is not yet fully supported, gated on `interval-type-in-dev`
+    /// feature. Registering the feature now lets kernel read tables that declare the feature.
     #[strum(serialize = "intervalType")]
     #[serde(rename = "intervalType")]
     IntervalType,
@@ -566,8 +563,7 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#2840): drop the gate (make `kernel_support` unconditionally `Supported`) once the
-// interval-type protocol RFC is ratified in PROTOCOL.md.
+// TODO(#2840): drop the gate once RFC is ratified and interval support is merged.
 static INTERVAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
