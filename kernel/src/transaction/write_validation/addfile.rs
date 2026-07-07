@@ -28,7 +28,7 @@ impl StagedDataValidator {
 }
 
 /// Validates that every staged add-file row has its protocol-required fields (`path`,
-/// `partitionValues`, `size`, `modificationTime`) present and non-null.
+/// `partitionValues`, `size`, `modificationTime`) present.
 pub(crate) struct AddFileRequiredFields;
 
 impl Validation for AddFileRequiredFields {
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn present_required_fields_ok() {
+    fn required_fields_present_ok() {
         let adds = [Box::new(ArrowEngineData::new(nullable_add_file())) as Box<dyn EngineData>];
         add_validator().validate(&adds).unwrap();
     }
@@ -124,7 +124,7 @@ mod tests {
     #[case::partition_values("partitionValues")]
     #[case::size("size")]
     #[case::modification_time("modificationTime")]
-    fn null_required_field_rejected(#[case] field: &str) {
+    fn required_field_missing_rejected(#[case] field: &str) {
         let batch = set_field_as_null(&nullable_add_file(), field);
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
         assert_result_error_with_message(
