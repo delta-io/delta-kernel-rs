@@ -31,7 +31,7 @@
 // later phase). Allow dead code until then so the unwired prototype builds under `-D warnings`.
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
@@ -40,7 +40,10 @@ use super::state_info::StateInfo;
 use super::transform_spec::FieldTransformSpec;
 use super::{PhysicalPredicate, PrefixColumns};
 use crate::actions::{ADD_FIELD, ADD_NAME, REMOVE_FIELD};
-use crate::expressions::{col, ColumnName, Expression, ExpressionStructPatchBuilder, Predicate};
+use crate::expressions::{
+    col, column_name, joined_column_expr, ColumnName, Expression as Expr,
+    ExpressionStructPatchBuilder, Predicate,
+};
 use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
@@ -52,9 +55,10 @@ use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Error, PlanBuilder};
 
 // === Internal column names ===
-// File identity mirrors `FileActionKey`: path + deletion-vector (storageType, pathOrInlineDv,
-// offset). Materialized as top-level scaffolding columns so the aggregate can group on them and
-// the anti-join can match on them.
+
+// Both add and remove provide path + DV (storageType, pathOrInlineDv, offset) columns. We coalesce
+// and materialize them as top-level scaffolding columns so the plan's aggregate and anti-join
+// operators can correclty pair up adds with removes.
 const KEY_PATH: &str = "key_path";
 const KEY_DV_STORAGE: &str = "key_dv_storage";
 const KEY_DV_PATH: &str = "key_dv_path";
@@ -94,62 +98,56 @@ fn read_schema(include_remove: bool) -> SchemaRef {
 /// path shared by the `add`/`remove` actions)`. Single source of truth for the group-by/join key
 /// columns ([`key_columns`]), their schema fields ([`key_fields`]), and the projection that
 /// materializes them ([`append_identity_keys`]).
-fn identity_keys() -> [(&'static str, DataType, &'static [&'static str]); 4] {
+static IDENTITY_KEYS: LazyLock<[(&str, DataType, ColumnName); 4]> = LazyLock::new(|| {
     [
-        (KEY_PATH, DataType::STRING, &["path"]),
+        (KEY_PATH, DataType::STRING, column_name!("path")),
         (
             KEY_DV_STORAGE,
             DataType::STRING,
-            &["deletionVector", "storageType"],
+            column_name!("deletionVector.storageType"),
         ),
         (
             KEY_DV_PATH,
             DataType::STRING,
-            &["deletionVector", "pathOrInlineDv"],
+            column_name!("deletionVector.pathOrInlineDv"),
         ),
         (
             KEY_DV_OFFSET,
             DataType::INTEGER,
-            &["deletionVector", "offset"],
+            column_name!("deletionVector.offset"),
         ),
     ]
-}
+});
 
 /// The identity (`key_*`) scaffolding fields, all nullable.
 fn key_fields() -> Vec<StructField> {
-    identity_keys()
-        .into_iter()
-        .map(|(name, dtype, _)| StructField::nullable(name, dtype))
+    IDENTITY_KEYS
+        .iter()
+        .map(|(name, dtype, _)| StructField::nullable(*name, dtype.clone()))
         .collect()
 }
 
 /// The `key_*` group-by / join keys as [`ColumnName`]s.
 fn key_columns() -> Vec<ColumnName> {
-    identity_keys()
+    IDENTITY_KEYS
         .iter()
         .map(|(name, ..)| ColumnName::new([*name]))
         .collect()
 }
 
-/// `coalesce(add.<a.b>, remove.<a.b>)` where `segments` is the shared trailing path (e.g.
-/// `["deletionVector", "offset"]`) -- the identity component that survives whichever side (add or
-/// remove) populated the row.
-fn coalesced_key(segments: &[&str]) -> Expression {
-    let with =
-        |root: &str| Expression::column(std::iter::once(root).chain(segments.iter().copied()));
-    Expression::coalesce([with("add"), with("remove")])
-}
-
-/// Append the identity keys to a projection patch, each produced by `key_expr(segments)` -- which
+/// Append the identity keys to a projection patch, each produced by `key_expr(trailing)` -- which
 /// differs per arm: coalesced across add/remove for commits, add-only for checkpoints.
 fn append_identity_keys<'a>(
     patch: ProjectionStructPatchBuilder<'a>,
-    key_expr: impl Fn(&[&str]) -> Expression,
+    key_expr: impl Fn(&ColumnName) -> Expr,
 ) -> ProjectionStructPatchBuilder<'a> {
-    identity_keys()
-        .into_iter()
-        .fold(patch, |patch, (name, dtype, segments)| {
-            patch.append(StructField::nullable(name, dtype), key_expr(segments))
+    IDENTITY_KEYS
+        .iter()
+        .fold(patch, |patch, (name, dtype, trailing)| {
+            patch.append(
+                StructField::nullable(*name, dtype.clone()),
+                key_expr(trailing),
+            )
         })
 }
 
@@ -172,21 +170,21 @@ fn reparse_add<'a>(
             add,
             STATS,
             StructField::nullable(STATS, ss.as_ref().clone()),
-            Expression::parse_json(col!("add.stats"), Arc::clone(ss)),
+            Expr::parse_json(col!("add.stats"), Arc::clone(ss)),
         ),
-        None => patch.replace_expr_at(add, STATS, Expression::null_literal(DataType::STRING)),
+        None => patch.replace_expr_at(add, STATS, Expr::null_literal(DataType::STRING)),
     };
     match partition_schema {
         Some(ps) => patch.replace_at(
             add,
             PARTITION_VALUES,
             StructField::nullable(PARTITION_VALUES, ps.as_ref().clone()),
-            Expression::map_to_struct(col!("add.partitionValues")),
+            Expr::map_to_struct(col!("add.partitionValues")),
         ),
         None => patch.replace_expr_at(
             add,
             PARTITION_VALUES,
-            Expression::null_literal(partition_values_map_type()),
+            Expr::null_literal(partition_values_map_type()),
         ),
     }
 }
@@ -251,21 +249,24 @@ fn commit_arm(
         col!(KEY_DV_STORAGE),
         col!(KEY_DV_PATH),
         col!(KEY_DV_OFFSET),
-        Expression::struct_from([col!("add"), col!("remove")]),
+        Expr::struct_from([col!("add"), col!("remove")]),
     ];
 
-    // Normalize: reparse `add.stats`/`add.partitionValues` in place, pass remove/version through,
-    // and append the identity keys (coalesced across add/remove) that pruning and dedup key on.
     PlanBuilder::scan_json(commit_files, &[VERSION], read_schema(true))?
         .project_patch(|patch| {
             reparse_add(
-                append_identity_keys(patch, coalesced_key),
+                append_identity_keys(patch, |trailing| {
+                    Expr::coalesce([
+                        joined_column_expr!("add", trailing),
+                        joined_column_expr!("remove", trailing),
+                    ])
+                }),
                 stats_schema,
                 partition_schema,
             )
         })?
         .filter(filter)?
-        .project(Expression::struct_from(wrap_exprs), wrapped_schema)
+        .project(Expr::struct_from(wrap_exprs), wrapped_schema)
 }
 
 /// Build the checkpoint arm: scan the checkpoint parts, normalize + prune (no guard -- adds always
@@ -288,19 +289,13 @@ fn checkpoint_arm(
         Predicate::and(add_present, prune.clone())
     });
 
-    // Normalize: reparse `add.stats`/`add.partitionValues` in place, pass `version` through, and
-    // append the identity keys (from `add` only -- checkpoint rows are all adds).
-    let add_key = |segments: &[&str]| {
-        Expression::column(std::iter::once("add").chain(segments.iter().copied()))
-    };
-
     PlanBuilder::union_all([
         PlanBuilder::scan_json(json_parts, &[VERSION], read_schema(false))?,
         PlanBuilder::scan_parquet(parquet_parts, &[VERSION], read_schema(false))?,
     ])?
     .project_patch(|patch| {
         reparse_add(
-            append_identity_keys(patch, add_key),
+            append_identity_keys(patch, |trailing| joined_column_expr!("add", trailing)),
             stats_schema,
             partition_schema,
         )
@@ -390,8 +385,8 @@ pub(crate) fn build_metadata_scan_plan(
         a.max_non_null_by(ColumnName::new([PAIR]), ColumnName::new([VERSION]))
     })?;
 
-    // Live checkpoint adds: commits are newer than the checkpoint, so anti-join away every
-    // checkpoint file whose identity a commit re-touched, then project the surviving `{ add }`.
+    // Live checkpoint adds: Commit content supersedes checkpoint content, so anti-join away every
+    // checkpoint identity a commit also touched, then project out the `{ add }`.
     let checkpoint_live = checkpoint_arm(
         json_checkpoint_files,
         parquet_checkpoint_files,
@@ -400,15 +395,12 @@ pub(crate) fn build_metadata_scan_plan(
         prune,
     )?
     .anti_join(deduped_commit.clone(), key_columns(), key_columns())?
-    .project(
-        Expression::struct_from([col!("add")]),
-        output_schema.clone(),
-    )?;
+    .project(Expr::struct_from([col!("add")]), output_schema.clone())?;
 
     // Live commit adds: keep the identities whose newest action is an add, projected to `{ add }`.
     let commit_live = deduped_commit
         .filter(col!(PAIR, "add").is_not_null())?
-        .project(Expression::struct_from([col!("pair.add")]), output_schema)?;
+        .project(Expr::struct_from([col!("pair.add")]), output_schema)?;
 
     PlanBuilder::union_all([commit_live, checkpoint_live])?.build_opt()
 }
@@ -452,7 +444,7 @@ impl<'a> DataReadShapeBuilder<'a> {
                     )));
                 };
                 let name = field.physical_name(self.state.column_mapping_mode);
-                let load_field = StructField::nullable(name, field.data_type().clone());
+                let load_field = StructField::new(name, field.data_type().clone(), field.nullable);
                 schema_patch = match insert_after {
                     Some(predecessor) => schema_patch.insert_after(predecessor.clone(), load_field),
                     None => schema_patch.prepend(load_field),
@@ -470,7 +462,7 @@ impl<'a> DataReadShapeBuilder<'a> {
                         schema_patch.append(StructField::nullable(BASE_ROW_ID, DataType::LONG));
                 }
                 self.file_constant_columns.push(BASE_ROW_ID.to_string());
-                let expr = Expression::coalesce([
+                let expr = Expr::coalesce([
                     col!(field_name),
                     col!(BASE_ROW_ID) + col!(row_index_field_name),
                 ]);
@@ -486,7 +478,7 @@ impl<'a> DataReadShapeBuilder<'a> {
         Ok(patch)
     }
 
-    fn build(self, reshape: Option<(Expression, SchemaRef)>) -> DeltaResult<DataReadShape> {
+    fn build(self, reshape: Option<(Expr, SchemaRef)>) -> DeltaResult<DataReadShape> {
         Ok(DataReadShape {
             load_schema: Arc::new(self.load_schema_patch.build(&self.state.physical_schema)?),
             file_constant_columns: self.file_constant_columns,
@@ -500,7 +492,7 @@ impl<'a> DataReadShapeBuilder<'a> {
 struct DataReadShape {
     load_schema: SchemaRef,
     file_constant_columns: Vec<String>,
-    reshape: Option<(Expression, SchemaRef)>,
+    reshape: Option<(Expr, SchemaRef)>,
 }
 
 impl DataReadShape {
@@ -520,7 +512,7 @@ impl DataReadShape {
             reshape_patch = builder.apply_field_transform(field_transform, reshape_patch)?;
         }
         builder.build(Some((
-            Expression::struct_patch(reshape_patch)?,
+            Expr::struct_patch(reshape_patch)?,
             state.logical_schema.clone(),
         )))
     }
@@ -896,7 +888,7 @@ mod tests {
             panic!("expected project");
         };
         assert_eq!(project.schema, read_schema);
-        let Expression::StructPatch(patch) = project.expr.as_ref() else {
+        let Expr::StructPatch(patch) = project.expr.as_ref() else {
             panic!("expected struct patch");
         };
         assert!(patch.is_empty());
@@ -936,7 +928,7 @@ mod tests {
             panic!("expected project");
         };
         assert_eq!(project.schema, read_schema);
-        let Expression::StructPatch(patch) = project.expr.as_ref() else {
+        let Expr::StructPatch(patch) = project.expr.as_ref() else {
             panic!("expected struct patch");
         };
         assert_eq!(patch.prepended_fields, vec![Arc::new(lit(7i64))]);
@@ -990,7 +982,7 @@ mod tests {
             panic!("expected project");
         };
         assert_eq!(project.schema, state.logical_schema);
-        let Expression::StructPatch(patch) = project.expr.as_ref() else {
+        let Expr::StructPatch(patch) = project.expr.as_ref() else {
             panic!("expected struct patch");
         };
         let base_row_id_patch = patch
@@ -1014,7 +1006,7 @@ mod tests {
         assert!(!row_id_patch.keep_input);
         assert_eq!(
             row_id_patch.insertions,
-            vec![Arc::new(Expression::coalesce([
+            vec![Arc::new(Expr::coalesce([
                 col!("row_id_col"),
                 col!(BASE_ROW_ID) + col!("row_indexes_for_row_id_0"),
             ]))]
