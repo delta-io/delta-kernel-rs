@@ -631,10 +631,10 @@ impl RowVisitor for CommitCrcVisitor<'_> {
 static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(schema! {
         nullable ADD_NAME: { not_null "size": LONG },
-        nullable PROTOCOL_NAME: (Protocol::to_schema()),
-        nullable METADATA_NAME: (Metadata::to_schema()),
-        nullable SET_TRANSACTION_NAME: (SetTransaction::to_schema()),
-        nullable DOMAIN_METADATA_NAME: (DomainMetadata::to_schema()),
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&DOMAIN_METADATA_FIELD),
     })
 });
 
