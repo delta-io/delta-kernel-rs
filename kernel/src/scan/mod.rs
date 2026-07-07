@@ -46,6 +46,8 @@ pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod scan_plan;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;

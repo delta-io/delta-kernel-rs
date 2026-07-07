@@ -551,16 +551,16 @@ impl Aggregate {
     /// Starts building an ungrouped [`Aggregate`] over `input_schema`. Add aggregators directly
     /// with [`aggregate`](AggregateBuilder::aggregate) or using named helpers
     /// (e.g. [`max`](AggregateBuilder::max)), and finalize the aggregate by calling
-    /// [`build](AggregateBuilder::build). The output schema follows aggregator insertion order.
+    /// [`build`](AggregateBuilder::build). The output schema follows aggregator insertion order.
     pub fn ungrouped(input_schema: SchemaRef) -> AggregateBuilder {
         Self::group_by(input_schema, std::iter::empty::<ColumnName>())
     }
 
-    /// Starts building an [`Aggregate`] over `input_schema`, grouped by `keys`. Add aggregators
-    /// directly with [`aggregate`](AggregateBuilder::aggregate) or using named helpers
+    /// Starts building an [`Aggregate`] over `input_schema`, grouped by `grouping_keys`. Add
+    /// aggregators directly with [`aggregate`](AggregateBuilder::aggregate) or using named helpers
     /// (e.g. [`max`](AggregateBuilder::max)), and finalize the aggregate by calling
-    /// [`build](AggregateBuilder::build). Grouping keys are emitted first in the output schema,
-    /// followed by aggregators in insertion order.  pub fn group_by( input_schema: SchemaRef, keys:
+    /// [`build`](AggregateBuilder::build). Grouping keys are emitted first in the output schema,
+    /// followed by aggregators in insertion order.
     pub fn group_by(
         input_schema: SchemaRef,
         grouping_keys: impl CollectInto<Vec<ColumnName>>,
