@@ -1001,16 +1001,15 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
     /// not a protocol one.
     ///
-    /// Malformed defaults (a non-string `CURRENT_DEFAULT`, or a non-`NULL` default on a
-    /// non-primitive column) are rejected eagerly at snapshot load (when constructing the
+    /// Malformed defaults (a non-string `CURRENT_DEFAULT`, or a non-`NULL` default on a Variant
+    /// column) are rejected eagerly at snapshot load (when constructing the
     /// [`TableConfiguration`]), so by the time this runs the metadata is already validated.
     /// Orphaned metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults` writer feature)
     /// is tolerated and surfaced here like any other default.
     ///
     /// # Errors
     ///
-    /// Returns an error only in the structurally-unreachable case that a `CURRENT_DEFAULT` became
-    /// malformed after load; propagated from [`StructField::column_default`].
+    /// Propagates any error from [`StructField::column_default`].
     #[cfg(feature = "column-defaults-in-dev")]
     pub fn column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
         let mut defaults = HashMap::new();

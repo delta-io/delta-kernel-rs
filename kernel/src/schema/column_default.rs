@@ -2,20 +2,17 @@
 //!
 //! # Invariants
 //!
-//! The rules kernel enforces on column defaults, and where each comes from. Each is enforced in
-//! code below (see [`ColumnDefault`]'s constructor and [`validate_column_defaults_metadata`],
-//! plus the IcebergCompatV3 check in [`crate::table_features`]).
+//! The rules kernel applies to column defaults, and where each comes from (enforced, or tolerated
+//! as noted), in [`ColumnDefault`]'s constructor, [`validate_column_defaults_metadata`], and the
+//! IcebergCompatV3 check in [`crate::table_features`].
 //!
 //! - `CURRENT_DEFAULT` metadata present without the `allowColumnDefaults` writer feature is
-//!   orphaned metadata, which kernel tolerates on both read and write. Most Delta features tolerate
-//!   metadata whose owning feature is absent, and this matches DBR, which reads and writes such
-//!   tables. (Protocol.)
+//!   orphaned metadata, which kernel tolerates on both read and write. (Protocol.)
 //! - `CURRENT_DEFAULT` metadata must be a SQL string. (Protocol.)
-//! - A Variant column may default only to `NULL`. (Protocol: the Default Columns section requires
-//!   that all columns of `variant` type default to null.)
-//! - An Array, Map, or Struct column may likewise default only to `NULL`. (Delta/Spark parity: the
-//!   protocol does not explicitly restrict these, but kernel matches Spark, which does not
-//!   materialize non-`NULL` defaults on complex types.)
+//! - A Variant column must default to `NULL`; a non-`NULL` variant default is rejected. (Protocol.)
+//! - A non-`NULL` default on an Array, Map, or Struct column is protocol-legal but kernel cannot
+//!   materialize it, so it is tolerated and surfaced via raw SQL (`to_scalar` returns `None`).
+//!   (Kernel.)
 //! - Defaults may appear on nested struct fields, not just top-level columns. Kernel only *writes*
 //!   top-level defaults, but supports *loading* a snapshot of a table authored elsewhere that
 //!   carries nested defaults, so validation descends into nested fields. (Protocol permits nesting;
@@ -61,21 +58,15 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error::unsupported`] when `data_type` is non-primitive (Array, Map, Struct, or
-    /// Variant) and `raw_sql` is not `NULL` (case-insensitive). The protocol permits such a
-    /// default, but kernel does not materialize it (matching Spark), so it is unsupported
-    /// rather than corrupt.
+    /// Returns an [`Error::schema`] when `data_type` is a Variant and `raw_sql` is not `NULL`
+    /// (case-insensitive). A non-`NULL` default on an Array, Map, or Struct column is accepted;
+    /// the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
-        // Enforces the "non-primitive columns default only to NULL" invariant (see module docs).
-        // This is a kernel limitation, not table corruption: the protocol permits a non-`NULL`
-        // default on an Array/Map/Struct column, but kernel does not materialize one (matching
-        // Spark), so it reports the value as unsupported rather than rejecting the table as
-        // corrupt.
-        if data_type.as_primitive_opt().is_none() && !is_null {
-            return Err(Error::unsupported(format!(
-                "non-null column default for non-primitive type {data_type:?} is not \
-                 supported, got {raw_sql:?}"
+
+        if matches!(data_type, DataType::Variant(_)) && !is_null {
+            return Err(Error::schema(format!(
+                "a Variant column's default must be NULL, got {raw_sql:?}"
             )));
         }
         let parsed_sql = parse_sql(&raw_sql, data_type).ok();
@@ -136,7 +127,7 @@ impl<'a> ColumnDefault<'a> {
 ///
 /// Propagates any error from
 /// [`StructField::column_default`](crate::schema::StructField::column_default): a `CURRENT_DEFAULT`
-/// whose value is not a SQL string, or a non-`NULL` default on a non-primitive column.
+/// whose value is not a SQL string, or a non-`NULL` default on a Variant column.
 pub(crate) fn collect_column_defaults(
     schema: &StructType,
 ) -> DeltaResult<Vec<(String, ColumnDefault<'_>)>> {
@@ -216,7 +207,7 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 ///
 /// Propagates any error from [`collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is not
 /// a SQL string (corrupt, since the protocol defines it as a SQL string), or a non-`NULL` default
-/// on a non-primitive column (unsupported by kernel, though the protocol permits it).
+/// on a Variant column (which the protocol forbids).
 pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<()> {
     collect_column_defaults(schema)?;
     Ok(())
@@ -311,19 +302,15 @@ mod tests {
     #[case::non_primitive_array(
         "ARRAY(1)",
         DataType::from(ArrayType::new(DataType::INTEGER, true)),
-        Expect::NewErr("not supported")
+        Expect::Unparsable
     )]
     #[case::non_primitive_map(
         "MAP('k', 1)",
         DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
-        Expect::NewErr("not supported")
+        Expect::Unparsable
     )]
-    #[case::non_primitive_struct("STRUCT(1)", struct_ty(), Expect::NewErr("not supported"))]
-    #[case::non_primitive_variant(
-        "1",
-        DataType::unshredded_variant(),
-        Expect::NewErr("not supported")
-    )]
+    #[case::non_primitive_struct("STRUCT(1)", struct_ty(), Expect::Unparsable)]
+    #[case::non_null_variant("1", DataType::unshredded_variant(), Expect::NewErr("Variant"))]
     fn column_default_from_new(
         #[case] raw_sql: &str,
         #[case] data_type: DataType,
@@ -368,9 +355,13 @@ mod tests {
     )]
     #[case::no_defaults(vec![StructField::nullable("c", DataType::INTEGER)], None)]
     #[case::non_string_metadata(vec![field_with_invalid_default("c")], Some("non-string"))]
-    #[case::non_null_default_on_non_primitive(
+    #[case::non_null_default_on_array_tolerated(
         vec![field_with_default("arr", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")],
-        Some("not supported")
+        None
+    )]
+    #[case::non_null_default_on_variant_rejected(
+        vec![field_with_default("v", DataType::unshredded_variant(), "1")],
+        Some("Variant")
     )]
     #[case::nested_default(
         vec![StructField::nullable(

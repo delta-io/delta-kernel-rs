@@ -65,9 +65,9 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 /// - The default must be a *kernel-parsable* literal. A literal kernel's SQL parser cannot parse
 ///   (so [`ColumnDefault::is_literal`] is `false`, e.g. `current_timestamp()`) is rejected, since
 ///   kernel cannot materialize it into the Iceberg metadata.
-/// - The column must be primitive. A `NULL` default on a non-primitive column is allowed on a
-///   normal table but rejected here, matching Spark, which does not emit non-primitive defaults for
-///   IcebergCompatV3.
+/// - The column must be primitive. A non-primitive column's default -- `NULL` (allowed on a normal
+///   table) or non-`NULL` (tolerated on a normal table but unmaterializable) -- is rejected here,
+///   matching Spark, which does not emit non-primitive defaults for IcebergCompatV3.
 ///
 /// [`ColumnDefault::is_literal`]: crate::schema::ColumnDefault::is_literal
 #[cfg(feature = "column-defaults-in-dev")]
@@ -185,6 +185,11 @@ mod column_default_tests {
     #[case::null_on_non_primitive(
         ArrayType::new(DataType::INTEGER, true).into(),
         "NULL",
+        Some("non-primitive")
+    )]
+    #[case::non_null_on_non_primitive(
+        ArrayType::new(DataType::INTEGER, true).into(),
+        "ARRAY(1)",
         Some("non-primitive")
     )]
     fn check_v3_column_default(

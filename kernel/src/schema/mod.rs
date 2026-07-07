@@ -526,8 +526,7 @@ impl StructField {
     /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
     /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
     ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
-    ///   [`ColumnDefault`] as unsupported (a non-NULL default on a non-primitive type, which the
-    ///   protocol permits but kernel does not materialize).
+    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
     #[cfg(feature = "column-defaults-in-dev")]
     pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
@@ -4287,14 +4286,27 @@ mod tests {
         }
 
         #[test]
-        fn non_null_default_on_non_primitive_errors() {
+        fn non_null_default_on_array_is_tolerated() {
             let data_type = DataType::from(ArrayType::new(DataType::INTEGER, true));
-            let field = field_with_default("c", data_type, "ARRAY(1)");
+            let field = field_with_default("c", data_type.clone(), "ARRAY(1)");
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            // Kernel cannot parse a non-primitive default, so it surfaces via raw SQL.
+            assert_eq!(column_default.raw_sql(), "ARRAY(1)");
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap(), None);
+        }
+
+        #[test]
+        fn non_null_default_on_variant_errors() {
+            let field = field_with_default("v", DataType::unshredded_variant(), "1");
             let err = field
                 .column_default()
-                .expect_err("non-NULL default on a non-primitive type must error")
+                .expect_err("a non-NULL default on a Variant column must error")
                 .to_string();
-            assert!(err.contains("not supported"), "got: {err}");
+            assert!(err.contains("Variant"), "got: {err}");
         }
     }
 

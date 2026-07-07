@@ -349,20 +349,13 @@ mod feature_enabled {
         Ok(())
     }
 
-    /// Snapshot load rejects corrupt column-default metadata: a non-NULL default on a
-    /// non-primitive column (unsupported by kernel) and a non-literal default on an
-    /// `icebergCompatV3` table. The V3 accept/reject matrix itself lives in the
-    /// `check_v3_column_default` unit test in `iceberg_compat::v3`; this only asserts the checks
-    /// are wired into snapshot load. Orphaned metadata is NOT rejected -- see
-    /// `test_load_and_write_allow_orphan_default`.
+    /// Snapshot load rejects a non-literal default on an `icebergCompatV3` table. The V3
+    /// accept/reject matrix itself lives in the `check_v3_column_default` unit test in
+    /// `iceberg_compat::v3`; this only asserts the check is wired into snapshot load. A non-NULL
+    /// default on a non-primitive column is NOT rejected -- see
+    /// `test_load_tolerates_non_primitive_non_null_default`. Orphaned metadata is NOT rejected --
+    /// see `test_load_and_write_allow_orphan_default`.
     #[rstest]
-    #[case::non_primitive_default(
-        "non_primitive",
-        DataType::from(ArrayType::new(DataType::INTEGER, true)),
-        "ARRAY(1)",
-        vec!["allowColumnDefaults"],
-        "not supported"
-    )]
     #[case::v3_non_literal_default(
         "v3_non_literal",
         DataType::TIMESTAMP,
@@ -461,6 +454,47 @@ mod feature_enabled {
         // Write: a write context builds without error.
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
         txn.unpartitioned_write_context()?;
+
+        Ok(())
+    }
+
+    /// A non-`NULL` default on a non-primitive (Array) column is protocol-legal but
+    /// unmaterializable by kernel: the snapshot loads, and the default surfaces via raw SQL
+    /// (`to_scalar` returns `None`) so the connector can evaluate it itself. Contrast a
+    /// non-`NULL` Variant default, which the protocol forbids and kernel rejects at load.
+    #[tokio::test]
+    async fn test_load_tolerates_non_primitive_non_null_default(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable(
+            "c",
+            ArrayType::new(DataType::INTEGER, true),
+        )])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", "ARRAY(1)")]))?;
+
+        let (store, engine, table_location) =
+            engine_store_setup("test_load_non_primitive_default", None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            &[],    /* partition_columns */
+            true,   /* use_37_protocol */
+            vec![], /* reader_features */
+            vec!["allowColumnDefaults"],
+        )
+        .await?;
+
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let defaults = txn.column_defaults()?;
+
+        let c = &defaults["c"];
+        assert_eq!(c.raw_sql(), "ARRAY(1)");
+        assert_eq!(
+            c.to_scalar()?,
+            None,
+            "kernel cannot parse a non-primitive default"
+        );
 
         Ok(())
     }
