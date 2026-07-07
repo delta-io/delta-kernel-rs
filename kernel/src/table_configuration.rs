@@ -2659,8 +2659,7 @@ mod test {
         }
     }
 
-    /// The table properties that enable adaptiveMetadata-preview's property-gated dependencies
-    /// (rowTracking, deletionVectors, inCommitTimestamp).
+    /// The table properties that enable adaptiveMetadata-preview's property-gated dependencies.
     fn all_adaptive_metadata_props() -> Vec<(&'static str, &'static str)> {
         vec![
             (ENABLE_ROW_TRACKING, "true"),
@@ -2678,8 +2677,7 @@ mod test {
             .collect()
     }
 
-    /// The full set of adaptiveMetadata-preview dependency features (columnMapping,
-    /// deletionVectors, rowTracking, domainMetadata, inCommitTimestamp).
+    /// The full set of adaptiveMetadata-preview dependency features.
     fn all_adaptive_metadata_deps() -> Vec<TableFeature> {
         vec![
             TableFeature::ColumnMapping,
