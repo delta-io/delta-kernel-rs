@@ -26,10 +26,17 @@ mod column_names;
 pub(crate) mod literal_expression_transform;
 pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
-#[cfg(feature = "column-defaults-in-dev")]
+#[cfg(any(
+    feature = "column-defaults-in-dev",
+    feature = "check-constraints-in-dev"
+))]
 mod sql;
 #[cfg(feature = "column-defaults-in-dev")]
 pub(crate) use self::sql::parse_sql;
+#[cfg(feature = "check-constraints-in-dev")]
+// TODO: remove this allow once check-constraints discovery calls parse_sql_simple_predicate.
+#[allow(unused_imports)]
+pub(crate) use self::sql::parse_sql_simple_predicate;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
