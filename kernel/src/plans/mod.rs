@@ -4,13 +4,10 @@
 mod builder;
 pub mod ir;
 pub mod proto;
-mod scan_shape;
 
 pub use builder::PlanBuilder;
 use bytes::Bytes;
 pub use ir::{IoOperation, Operation};
-#[allow(unused_imports)]
-pub(crate) use scan_shape::{CheckpointShape, ScanShape, StatsInfo};
 
 use crate::{
     AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,
