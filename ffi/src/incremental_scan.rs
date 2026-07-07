@@ -14,6 +14,10 @@
 //! [`incremental_scan_builder_build`] returns [`OptionalValue::None`] (not an error) when the
 //! target snapshot's commit list can't cover the range, which is the signal to fall back to a
 //! full scan.
+//!
+//! The Arrow batch step (`incremental_scan_stream_next_arrow` and
+//! [`FilteredEngineDataArrowResult`]) requires the `default-engine-base` feature; the builder,
+//! summary, and visitor entry points are always available.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -99,8 +103,10 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
 /// the target snapshot's commit list can't cover `(base_version, target_version]`.
 ///
 /// [`OptionalValue::None`] is not an error. It means an incremental advance isn't possible
-/// (typically a checkpoint truncated the log below `base_version`), so the caller should fall
-/// back to a full scan. The builder is always freed by this call, whether or not it succeeds.
+/// (the target snapshot no longer retains commit `base_version + 1`, the first version in the
+/// range, typically because a checkpoint above `base_version` truncated it), so the caller
+/// should fall back to a full scan. The builder is always freed by this call, whether or not it
+/// succeeds.
 ///
 /// Returns an error if `base_version >= target_version`, the target snapshot's protocol has an
 /// unsupported reader feature, or the engine fails to open the commit stream.
@@ -155,8 +161,10 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 /// first. The engine must free each non-null result with
 /// [`free_filtered_engine_data_arrow_result`].
 ///
-/// Once this returns an error the stream is dead: later calls return `Ok(null)` and
-/// [`incremental_scan_stream_into_summary`] will error. Rebuild the stream to retry.
+/// A read failure from the underlying commit stream kills it: later calls return `Ok(null)` and
+/// [`incremental_scan_stream_into_summary`] will error, so rebuild the stream to retry. A failure
+/// converting a successfully-read batch to Arrow is non-terminal; the errored batch's rows are
+/// dropped, but the stream can still be advanced and its summary is unaffected.
 ///
 /// # Safety
 ///
@@ -355,8 +363,8 @@ pub unsafe extern "C" fn free_incremental_scan_summary(
     summary.drop_handle();
 }
 
-/// Result of [`incremental_scan_stream_next_arrow`]: an Arrow C Data Interface batch of live Add
-/// actions plus a boolean selection vector.
+/// Result of [`incremental_scan_stream_next_arrow`]: an Arrow C Data Interface batch of commit
+/// actions plus a boolean selection vector marking the live Adds within it.
 ///
 /// The engine must free this with [`free_filtered_engine_data_arrow_result`] exactly once.
 ///
@@ -365,7 +373,9 @@ pub unsafe extern "C" fn free_incremental_scan_summary(
 #[cfg(feature = "default-engine-base")]
 #[repr(C)]
 pub struct FilteredEngineDataArrowResult {
-    /// Arrow C Data Interface batch of Add actions for one source commit.
+    /// Arrow C Data Interface batch for one source commit, projecting the `add` and `remove`
+    /// action columns. Rows include Removes and Adds cancelled by a later commit in the range,
+    /// so honor `selection_vector`: only its `true` rows are live Adds.
     pub arrow_data: ArrowFFIData,
     /// Boolean selection vector; `true` at index `i` means row `i` is a live Add. Length equals
     /// the batch row count.
@@ -714,7 +724,7 @@ mod tests {
         let surviving = unsafe { stream.clone_handle() };
         let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
 
-        let next = unsafe { incremental_scan_stream_next_arrow(surviving.clone_handle()) };
+        let next = unsafe { incremental_scan_stream_next_arrow(surviving.shallow_copy()) };
         assert_extern_result_error_with_message(next, KernelError::GenericError, None);
         let again = unsafe { incremental_scan_stream_into_summary(surviving) };
         assert_extern_result_error_with_message(again, KernelError::GenericError, None);
