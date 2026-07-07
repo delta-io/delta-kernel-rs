@@ -909,9 +909,10 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
-    use crate::snapshot::Snapshot;
+    use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{Action, LocalMockTable};
+    use crate::utils::FoldWithOption as _;
     use crate::Version;
 
     fn get_test_schema() -> SchemaRef {
@@ -1028,11 +1029,10 @@ mod tests {
         let table = mock_table_with_timestamps(timestamps, ict_enablement).await;
         let engine = SyncEngine::new();
         let path = Url::from_directory_path(table.table_root()).unwrap();
-        let mut builder = Snapshot::builder_for(path);
-        if let Some(v) = at_version {
-            builder = builder.at_version(v);
-        }
-        let snapshot = builder.build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(path)
+            .fold_with(at_version, SnapshotBuilder::at_version)
+            .build(&engine)
+            .unwrap();
         let log_segment = LogSegment::for_timestamp_conversion(
             engine.storage_handler().as_ref(),
             snapshot.log_segment().log_root.clone(),

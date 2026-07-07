@@ -163,7 +163,7 @@ impl KernelStringSlice {
     }
 }
 
-/// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.
+/// A non-owned slice of raw bytes, intended for arg-passing between kernel and engine.
 ///
 /// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
 /// must not be retained beyond the foreign function call it was passed into.
@@ -311,6 +311,33 @@ fn allocate_kernel_string_impl(
 ) -> DeltaResult<Handle<ExclusiveRustString>> {
     let s = unsafe { String::try_from_slice(&kernel_str) }?;
     Ok(Box::new(s).into())
+}
+
+/// A kernel-allocated type representing an owned byte buffer. This can be obtained by
+/// calling [`allocate_kernel_bytes`] with a [`KernelBytesSlice`]. Kernel takes ownership of the
+/// handle when it consumes the bytes and the engine must not use the handle afterwards.
+#[cfg(feature = "declarative-plans")]
+#[handle_descriptor(target=Vec<u8>, mutable=true, sized=true)]
+pub struct ExclusiveRustBytes;
+
+/// Allow engines to create an opaque pointer to [`ExclusiveRustBytes`] by copying the provided
+/// `bytes` into kernel-owned memory.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid [`KernelBytesSlice`] whose pointer references at least
+/// `len` readable bytes. The slice only needs to remain valid until after this call returns.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn allocate_kernel_bytes(
+    bytes: KernelBytesSlice,
+) -> Handle<ExclusiveRustBytes> {
+    let copied = if bytes.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec()
+    };
+    Box::new(copied).into()
 }
 
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it

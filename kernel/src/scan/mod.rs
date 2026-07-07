@@ -39,7 +39,7 @@ use crate::schema::{
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::IteratorExt;
+use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 pub(crate) mod data_skipping;
@@ -268,10 +268,7 @@ impl ScanBuilder {
     ///
     /// [`Snapshot`]: crate::Snapshot
     pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
-        match schema_opt {
-            Some(schema) => self.with_schema(schema),
-            None => self,
-        }
+        self.fold_with(schema_opt, ScanBuilder::with_schema)
     }
 
     /// Optionally provide an expression to filter rows. For example, using the predicate `x <
@@ -1229,10 +1226,9 @@ impl Scan {
                     // to `rest` in a moment anyway
                     let mut sv = selection_vector.take();
                     let rest = split_vector(sv.as_mut(), len, None);
-                    let result = match sv {
-                        Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
-                        None => logical,
-                    };
+                    let result = logical.fold_with(sv, |logical, sv| {
+                        logical.and_then(|data| data.apply_selection_vector(sv))
+                    });
                     selection_vector = rest;
                     result
                 }))

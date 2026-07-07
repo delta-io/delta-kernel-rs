@@ -778,6 +778,7 @@ mod tests {
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         make_test_tc, test_deep_nested_schema_missing_leaf_cm,
     };
+    use crate::utils::FoldWithOption as _;
 
     #[test]
     fn test_column_mapping_mode() {
@@ -1902,11 +1903,10 @@ mod tests {
         #[case] annotation: Option<MetadataValue>,
         #[case] expected: Option<&str>,
     ) {
-        let mut field = StructField::new("a", DataType::INTEGER, true);
-        if let Some(value) = annotation {
-            field = field
-                .add_metadata([(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), value)]);
-        }
+        let field =
+            StructField::new("a", DataType::INTEGER, true).fold_with(annotation, |field, value| {
+                field.add_metadata([(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(), value)])
+            });
         let result = expect_physical_name(&field);
         match expected {
             Some(expected) => assert_eq!(result.unwrap(), expected),

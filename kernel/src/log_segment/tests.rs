@@ -19,7 +19,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -35,7 +35,8 @@ use crate::scan::test_utils::{
 use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
 use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
 use crate::utils::test_utils::{
-    assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
+    assert_batch_matches, assert_result_error_with_message, create_log_path,
+    create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
     DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
@@ -201,20 +202,6 @@ async fn write_json_to_store(
     Ok(())
 }
 
-fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
-    create_log_path_with_size(path, 0)
-}
-
-fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
-    ParsedLogPath::try_from(FileMeta {
-        location: Url::parse(path).expect("Invalid file URL"),
-        last_modified: 0,
-        size,
-    })
-    .unwrap()
-    .unwrap()
-}
-
 /// Builds a staged-commit log path (`ParsedLogPath`) for each version: a
 /// `memory:///_delta_log/_staged_commits/<v>.<uuid>.json` entry that parses to
 /// `file_type: StagedCommit`.
@@ -309,6 +296,7 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_uuid_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(1),
@@ -404,6 +392,7 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_out_of_date_last_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -450,6 +439,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
@@ -501,6 +491,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
@@ -547,6 +538,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
 #[tokio::test]
 async fn build_snapshot_with_bad_checkpoint_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(1),
@@ -640,6 +632,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
     // Snapshot should be made of the most recent complete checkpoint and the commit files that
     // follow it.
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -751,6 +744,7 @@ async fn build_snapshot_without_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: None,
@@ -799,6 +793,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
 #[tokio::test]
 async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -841,6 +836,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
 #[rstest::rstest]
 #[case::no_hint(None)]
 #[case::stale_hint(Some(LastCheckpointHint {
+    v2_checkpoint: None,
     version: 10, // stale: 10 > end_version 5, so it is discarded
     size: 10,
     parts: None,
@@ -2657,49 +2653,38 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to
-/// LogSegment
-#[tokio::test]
-async fn test_checkpoint_schema_propagation_from_hint() {
-    // Create a sample schema that would be in _last_checkpoint
-    let sample_schema: SchemaRef = schema_ref! {
-        nullable "add": {},
-        nullable "remove": {},
-    };
-
-    let checkpoint_metadata = LastCheckpointHint {
-        version: 5,
-        size: 10,
-        parts: Some(1),
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: Some(sample_schema.clone()),
-        checksum: None,
-        tags: None,
-    };
-
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(6, "json"),
-        ],
-        Some(&checkpoint_metadata),
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+/// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from
+/// "no applicable hint / no sidecar info" (`None`) -- the empty-vs-absent contract the accessor's
+/// doc promises. Real V2 fixtures only carry non-empty sidecar lists, so this synthetic case is the
+/// only place it is exercised.
+#[test]
+fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
+    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
         log_root,
-        vec![], // log_tail
-        Some(checkpoint_metadata),
         None,
-    )
-    .unwrap();
+        Some(LastCheckpointHint {
+            version: 1,
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: selected.to_string(),
+                sidecar_files: Some(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )?;
 
-    assert_eq!(log_segment.last_checkpoint_version(), Some(5));
-    assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
+    assert_eq!(log_segment.checkpoint_sidecars(), Some([].as_slice()));
+    Ok(())
 }
 
 /// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
@@ -2745,9 +2730,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         },
         log_root,
         None,
-        Some(LastCheckpointHintSummary {
+        Some(LastCheckpointHint {
             version: hint_version,
-            schema: Some(hint_schema.clone()),
+            checkpoint_schema: Some(hint_schema.clone()),
+            ..Default::default()
         }),
     )?;
 
@@ -2777,6 +2763,74 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     }
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
+    Ok(())
+}
+
+/// For a V2 (UUID-named) parquet checkpoint, `get_file_actions_schema_and_sidecars` uses the
+/// `_last_checkpoint` hint schema only when the hint names the selected checkpoint; a hint that
+/// names a different same-version V2 checkpoint is ignored and the footer is read instead.
+#[rstest]
+#[case::identity_matches(true)]
+#[case::identity_mismatch(false)]
+#[tokio::test]
+async fn test_get_file_actions_schema_v2_identity_filter(
+    #[case] identity_matches: bool,
+) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let selected = "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet";
+    let other = "00000000000000000001.checkpoint.016ae953-37a9-438e-8683-9a9a4a79a395.parquet";
+
+    // Schema actually written to the selected (leaf, no-sidecar) V2 checkpoint footer.
+    let footer_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    add_checkpoint_to_store(&store, add_batch_simple(footer_schema.clone()), selected).await?;
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let cp_size = get_file_size(&store, &format!("_delta_log/{selected}")).await;
+
+    // A distinct hint schema so we can tell whether the hint or the footer was used.
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
+    let hint_name = if identity_matches { selected } else { other };
+
+    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2 = create_log_path(&commit_v2_path);
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
+            ascending_commit_files: vec![commit_v2.clone()],
+            latest_commit_file: Some(commit_v2),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHint {
+            version: 1,
+            checkpoint_schema: Some(hint_schema.clone()),
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: hint_name.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )?;
+
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
+    if identity_matches {
+        assert_eq!(
+            schema, hint_schema,
+            "matching hint identity -> use hint schema"
+        );
+    } else {
+        assert_eq!(
+            schema, footer_schema,
+            "mismatched hint identity -> read footer schema, not the stale hint"
+        );
+    }
+    assert!(sidecars.is_empty(), "leaf V2 checkpoint has no sidecars");
     Ok(())
 }
 
@@ -2836,9 +2890,11 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         },
         log_root,
         None,
-        use_hint.then(|| LastCheckpointHintSummary {
+        use_hint.then(|| LastCheckpointHint {
             version: 1,
-            schema: Some(v1_schema.clone()),
+            parts: Some(2),
+            checkpoint_schema: Some(v1_schema.clone()),
+            ..Default::default()
         }),
     )?;
 
@@ -3969,7 +4025,7 @@ async fn test_try_new_with_checkpoint(
     );
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
-    assert!(result.last_checkpoint_hint_summary().is_none());
+    assert!(result.last_checkpoint_metadata.is_none());
     assert_eq!(
         result.listed.latest_crc_file.as_ref().map(|c| c.version),
         expected_crc_version

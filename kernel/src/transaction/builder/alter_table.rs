@@ -38,6 +38,7 @@ use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
@@ -187,14 +188,14 @@ impl AlterTableTransactionBuilder<Modifying> {
             current_max_column_id,
         )?;
 
-        let mut evolved_metadata = table_config
+        let evolved_metadata = table_config
             .metadata()
             .clone()
-            .with_schema(evolved_schema.clone())?;
-        if let Some(id) = new_max_column_id {
-            evolved_metadata = evolved_metadata
-                .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string());
-        }
+            .with_schema(evolved_schema.clone())?
+            .fold_with(new_max_column_id, |evolved_metadata, id| {
+                evolved_metadata
+                    .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+            });
 
         // Validates the evolved metadata against the protocol.
         let evolved_table_config = TableConfiguration::try_new_with_schema(
