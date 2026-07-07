@@ -236,7 +236,11 @@ pub(crate) mod test_utils {
     use crate::actions::{
         get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
     };
-    use crate::arrow::array::{RecordBatch, StringArray, StructArray};
+    use crate::arrow::array::{
+        new_empty_array, new_null_array, ArrayRef, Int64Array, MapArray, RecordBatch, StringArray,
+        StructArray,
+    };
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
@@ -250,7 +254,7 @@ pub(crate) mod test_utils {
     use crate::path::ParsedLogPath;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
-    use crate::transaction::{CreateTable, Transaction};
+    use crate::transaction::{CreateTable, Transaction, BASE_ADD_FILES_SCHEMA};
     use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef};
 
     /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
@@ -379,6 +383,48 @@ pub(crate) mod test_utils {
     /// comparing
     pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
         assert_eq!(into_record_batch(actual), into_record_batch(expected));
+    }
+
+    /// Build an addFile with all required fields populated.
+    ///
+    /// When `all_nullable` is true, every field is marked nullable.
+    pub(crate) fn valid_add_file_batch(all_nullable: bool) -> RecordBatch {
+        let schema = if all_nullable {
+            let fields = BASE_ADD_FILES_SCHEMA
+                .fields()
+                .map(|f| StructField::nullable(f.name().clone(), f.data_type().clone()));
+            StructType::try_new(fields).expect("nullable add-file schema")
+        } else {
+            BASE_ADD_FILES_SCHEMA.as_ref().clone()
+        };
+        let arrow_schema: ArrowSchema = (&schema).try_into_arrow().expect("arrow schema");
+        let columns: Vec<ArrayRef> = arrow_schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "path" => Arc::new(StringArray::from(vec!["dummy"])) as ArrayRef,
+                "size" | "modificationTime" => Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+                "partitionValues" => {
+                    let DataType::Map(entries_field, sorted) = field.data_type() else {
+                        panic!("partitionValues must be a map type");
+                    };
+                    let entries = new_empty_array(entries_field.data_type())
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("map entries struct")
+                        .clone();
+                    // One row, empty partition map.
+                    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0]));
+                    Arc::new(
+                        MapArray::try_new(entries_field.clone(), offsets, entries, None, *sorted)
+                            .expect("empty map array"),
+                    )
+                }
+                // Non-mandatory fields (e.g. `stats`) are left null.
+                _ => new_null_array(field.data_type(), 1),
+            })
+            .collect();
+        RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid add-file batch")
     }
 
     pub(crate) fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
