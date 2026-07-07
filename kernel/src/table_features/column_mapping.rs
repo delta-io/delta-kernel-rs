@@ -237,15 +237,15 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
                 logical_field_path(),
             )));
         }
-        (ColumnMappingMode::None, Some(_)) if stale_policy == StaleAnnotationPolicy::Ignore => {
-            field.name()
-        }
-        (ColumnMappingMode::None, Some(_)) => {
-            return Err(Error::schema(format!(
-                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
-                logical_field_path(),
-            )));
-        }
+        (ColumnMappingMode::None, Some(_)) => match stale_policy {
+            StaleAnnotationPolicy::Ignore => field.name(),
+            StaleAnnotationPolicy::Reject => {
+                return Err(Error::schema(format!(
+                    "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                    logical_field_path(),
+                )));
+            }
+        },
     };
 
     let annotation = ColumnMetadataKey::ColumnMappingId.as_ref();
@@ -266,13 +266,15 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
                 logical_field_path(),
             )));
         }
-        (ColumnMappingMode::None, Some(_)) if stale_policy == StaleAnnotationPolicy::Ignore => None,
-        (ColumnMappingMode::None, Some(_)) => {
-            return Err(Error::schema(format!(
-                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
-                logical_field_path(),
-            )));
-        }
+        (ColumnMappingMode::None, Some(_)) => match stale_policy {
+            StaleAnnotationPolicy::Ignore => None,
+            StaleAnnotationPolicy::Reject => {
+                return Err(Error::schema(format!(
+                    "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                    logical_field_path(),
+                )));
+            }
+        },
     };
 
     // CM-disabled mode synthesizes `physical_name = field.name()`, which only has to be unique

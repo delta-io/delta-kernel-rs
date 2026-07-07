@@ -2312,6 +2312,29 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
+/// What a [`MakePhysical`] walk does with each field. The two modes bundle the physical-rewrite
+/// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
+/// a mapping-disabled table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MakePhysicalMode {
+    /// Rewrite each field to its physical name + metadata (the read/build path). A stale
+    /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
+    /// physical metadata.
+    Rewrite,
+    /// Validate annotations only, without rewriting (the strict write-path check). A stale
+    /// annotation in `None` mode is rejected.
+    ValidateStrict,
+}
+
+impl MakePhysicalMode {
+    fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
+        match self {
+            Self::Rewrite => StaleAnnotationPolicy::Ignore,
+            Self::ValidateStrict => StaleAnnotationPolicy::Reject,
+        }
+    }
+}
+
 pub(crate) struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
@@ -2324,13 +2347,9 @@ pub(crate) struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
-    /// When `true`, skips the physical-name + metadata rewrite, only validates the column
-    /// mapping annotations.
-    validation_only: bool,
-    /// How to treat a stale `delta.columnMapping.*` annotation found while mapping is disabled.
-    /// `make_physical` tolerates them (read path); `validate_schema_column_mapping` rejects them
-    /// (explicit strict write-path check).
-    stale_policy: StaleAnnotationPolicy,
+    /// Whether this walk rewrites fields to physical form or only validates (see
+    /// [`MakePhysicalMode`]).
+    mode: MakePhysicalMode,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -2339,8 +2358,7 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
-            validation_only: false,
-            stale_policy: StaleAnnotationPolicy::Ignore,
+            mode: MakePhysicalMode::Rewrite,
         }
     }
 
@@ -2351,8 +2369,7 @@ impl<'a> MakePhysical<'a> {
         schema: &'a StructType,
     ) -> DeltaResult<()> {
         let mut walker = Self {
-            validation_only: true,
-            stale_policy: StaleAnnotationPolicy::Reject,
+            mode: MakePhysicalMode::ValidateStrict,
             ..Self::new(mode)
         };
         walker.transform_struct(schema).map(|_| ())
@@ -2395,7 +2412,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
             field,
             self.column_mapping_mode,
-            self.stale_policy,
+            self.mode.stale_annotation_policy(),
             &self.logical_path,
             Some(&mut self.seen_ids),
             self.sibling_names_stack.last_mut(),
@@ -2407,7 +2424,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
         self.transform_inner(field.name(), |this| {
             let field = this.recurse_into_struct_field(field)?;
-            if this.validation_only {
+            if this.mode == MakePhysicalMode::ValidateStrict {
                 return Ok(field);
             }
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
