@@ -705,9 +705,9 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
 }
 
 /// ICT enabled, checkpoint at the current version, but v_end's commit file is unreadable: the
-/// ICT read fails, and rather than persist a CRC with a missing ICT the write fails closed.
+/// ICT read error propagates instead of being laundered into a generic "CRC unresolved" error.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_returns_unsupported(
+async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
@@ -739,9 +739,10 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_r
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh.crc().is_none());
+    // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
     assert!(matches!(
         fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+        Err(e) if !matches!(e, delta_kernel::Error::ChecksumWriteUnsupported(_))
     ));
 
     Ok(())

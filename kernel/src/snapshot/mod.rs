@@ -103,6 +103,12 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
+/// Build a [`Error::ChecksumWriteUnsupported`] for a resolution root that could not yield a
+/// writable CRC. `reason` completes the sentence "Cannot resolve a CRC to write: ...".
+fn unresolved_crc(reason: &str) -> Error {
+    Error::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
+}
+
 impl Snapshot {
     // ============================================================================
     // Construction entry points
@@ -855,6 +861,8 @@ impl Snapshot {
     ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent.
+    /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot
+    ///   be read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
     #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
     pub fn write_checksum(
@@ -876,11 +884,7 @@ impl Snapshot {
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
-        let crc = self.resolve_crc_for_write(engine)?.ok_or_else(|| {
-            Error::ChecksumWriteUnsupported(
-                "No CRC could be resolved for this snapshot version.".to_string(),
-            )
-        })?;
+        let crc = self.resolve_crc_for_write(engine)?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
@@ -906,7 +910,7 @@ impl Snapshot {
         }
     }
 
-    /// Resolve the CRC to write for this snapshot's version, or `None` when none can be produced.
+    /// Resolve the CRC to write for this snapshot's version.
     ///
     /// Tries the newest available root, stopping at the first that applies:
     /// 1. The in-memory CRC, used as-is. E.g. a snapshot at N that did incremental CRC replay from
@@ -915,35 +919,42 @@ impl Snapshot {
     /// 2. A stale on-disk CRC, advanced over the tail commits via reverse replay.
     /// 3. A checkpoint, advanced over the tail commits via reverse replay.
     /// 4. A full reverse replay of the commit history.
-    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Option<Arc<Crc>>> {
+    ///
+    /// Returns [`Error::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
+    /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
+    /// stats).
+    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
         // Case 1: an in-memory CRC at this version is ready to write as-is.
         if let Some(crc) = &self.crc {
-            return Ok(Some(crc.clone()));
+            return Ok(crc.clone());
         }
 
         let end = self.version();
         let log_segment = &self.log_segment;
 
-        // Case 2: a stale on-disk CRC (older than this version, since an equal one would have
-        // short-circuited to `AlreadyExists`). Advance it over the tail commits.
+        // Case 2: a stale on-disk CRC, older than this version. An on-disk CRC at exactly this
+        // version would have short-circuited to `AlreadyExists` in `write_checksum`. Advance it
+        // over the tail commits.
         // TODO: `read_latest_crc` re-reads the CRC from disk. `LazyCrc` was deleted in the pivot
         //       to incremental CRC being optional; reintroduce something like it so a CRC already
         //       read during snapshot load is reused here instead of re-read.
         if let Some(base) = log_segment.read_latest_crc(engine) {
             let crc = log_segment.build_crc_from_base(engine, &base)?;
-            return Ok(Some(Arc::new(crc)));
+            return Ok(Arc::new(crc));
         }
 
         // Case 3: no CRC, but a checkpoint to root at.
         if let Some(checkpoint_version) = log_segment.checkpoint_version {
             if checkpoint_version == end {
-                // No tail commits, so read v_end's ICT from its commit file. A failed read leaves
-                // it absent, and `try_write_crc_file`'s ICT guard fails the write closed.
-                let Some(mut crc) = log_segment.build_crc_from_checkpoint(engine)? else {
-                    return Ok(None);
-                };
-                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine).ok().flatten();
-                return Ok(Some(Arc::new(crc)));
+                // A checkpoint carries no ICT (it has no commitInfo). Since there's no tail delta
+                // to carry it either, we defer to `get_in_commit_timestamp`, which reads the commit
+                // at the checkpoint version and returns None when ICT is disabled, or errors when
+                // it is enabled but unreadable.
+                let mut crc = log_segment
+                    .build_crc_from_checkpoint(engine)?
+                    .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
+                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                return Ok(Arc::new(crc));
             }
             // Replay the tail commits first: a non-incremental tail dooms file stats no matter
             // what the checkpoint holds, so skip the larger checkpoint read in that case.
@@ -952,20 +963,22 @@ impl Snapshot {
                 checkpoint_version,
                 Some(FileSizeHistogram::create_default()),
             )?;
-            if !delta.is_incremental_safe {
-                return Ok(None);
-            }
-            let Some(base) = log_segment.build_crc_from_checkpoint(engine)? else {
-                return Ok(None);
-            };
+            require!(
+                delta.is_incremental_safe,
+                unresolved_crc("commits after the checkpoint are not incremental-safe")
+            );
+            let base = log_segment
+                .build_crc_from_checkpoint(engine)?
+                .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
             // The tail delta carries v_end's ICT, which `apply` sets on the result.
-            return Ok(Some(Arc::new(base.apply(delta, end))));
+            return Ok(Arc::new(base.apply(delta, end)));
         }
 
         // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
-        Ok(log_segment
+        let crc = log_segment
             .build_crc_from_version_zero(engine)?
-            .map(Arc::new))
+            .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
+        Ok(Arc::new(crc))
     }
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
