@@ -2,7 +2,7 @@
 
 use std::sync::LazyLock;
 
-use super::{ActionValidator, Validation};
+use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
@@ -18,9 +18,9 @@ const MODIFICATION_TIME: usize = 3;
 static MANDATORY_ADD_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
-impl ActionValidator {
+impl StagedDataValidator {
     pub(crate) fn staged_add_file() -> Self {
-        ActionValidator::new(
+        StagedDataValidator::new(
             &MANDATORY_ADD_FILE_COLUMNS,
             vec![Box::new(AddFileRequiredFields)],
         )
@@ -74,8 +74,9 @@ mod tests {
     use crate::arrow::array::new_null_array;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::utils::test_utils::valid_add_file_batch;
-    use crate::{DeltaResult, EngineData};
+    use crate::expressions::ColumnName;
+    use crate::utils::test_utils::{assert_result_error_with_message, valid_add_file_batch};
+    use crate::EngineData;
 
     fn nullable_add_file() -> RecordBatch {
         valid_add_file_batch(true /* all_nullable */)
@@ -90,16 +91,26 @@ mod tests {
         RecordBatch::try_new(schema, columns).expect("record batch with nulled field")
     }
 
-    fn add_validator() -> ActionValidator {
-        ActionValidator::staged_add_file()
+    fn add_validator() -> StagedDataValidator {
+        StagedDataValidator::staged_add_file()
     }
 
-    fn assert_err_contains(result: DeltaResult<()>, needle: &str) {
-        let err = result.expect_err("expected validation error").to_string();
-        assert!(
-            err.contains(needle),
-            "error {err:?} should contain {needle:?}"
+    /// Guards the invariant that the column-index consts match the leaf order of
+    /// `MANDATORY_ADD_FILE_COLUMNS`.
+    #[test]
+    fn column_indices_match_schema_order() {
+        let (names, _) = MANDATORY_ADD_FILE_COLUMNS.as_ref();
+        assert_eq!(names[PATH], ColumnName::new(["path"]));
+        assert_eq!(
+            names[PARTITION_VALUES],
+            ColumnName::new(["partitionValues"])
         );
+        assert_eq!(names[SIZE], ColumnName::new(["size"]));
+        assert_eq!(
+            names[MODIFICATION_TIME],
+            ColumnName::new(["modificationTime"])
+        );
+        assert_eq!(names.len(), 4);
     }
 
     #[test]
@@ -116,7 +127,7 @@ mod tests {
     fn null_required_field_rejected(#[case] field: &str) {
         let batch = set_field_as_null(&nullable_add_file(), field);
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        assert_err_contains(
+        assert_result_error_with_message(
             add_validator().validate(&adds),
             &format!("missing required field '{field}'"),
         );

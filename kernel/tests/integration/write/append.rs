@@ -420,10 +420,12 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
         let corrupted = RecordBatch::try_new(nullable_schema, columns)?;
         txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
 
-        let err = match txn.commit(engine.as_ref()) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("commit should reject an add missing required field '{field}'"),
-        };
+        let err = txn
+            .commit(engine.as_ref())
+            .expect_err(&format!(
+                "commit should reject an add missing required field '{field}'"
+            ))
+            .to_string();
         assert!(
             err.contains(&format!("missing required field '{field}'")),
             "field {field}: unexpected error {err:?}"

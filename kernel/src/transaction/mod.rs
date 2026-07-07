@@ -420,7 +420,8 @@ impl<S> Transaction<S> {
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
         // Validate required fields for addFile.
-        write_validation::ActionValidator::staged_add_file().validate(&self.add_files_metadata)?;
+        write_validation::StagedDataValidator::staged_add_file()
+            .validate(&self.add_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
