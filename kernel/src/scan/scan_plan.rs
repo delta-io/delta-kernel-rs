@@ -39,7 +39,10 @@ use super::data_skipping::as_checkpoint_skipping_predicate;
 use super::state_info::StateInfo;
 use super::transform_spec::FieldTransformSpec;
 use super::{PhysicalPredicate, PrefixColumns};
-use crate::actions::{ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::{
+    ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+};
 use crate::expressions::{
     col, column_name, joined_column_expr, ColumnName, Expression as Expr,
     ExpressionStructPatchBuilder, Predicate,
@@ -47,7 +50,8 @@ use crate::expressions::{
 use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
-    schema_ref, DataType, MapType, SchemaRef, SchemaStructPatchBuilder, StructField,
+    lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
+    StructField, ToSchema as _,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::ExpressionTransform;
@@ -58,16 +62,17 @@ use crate::{DeltaResult, Error, PlanBuilder};
 
 // Both add and remove provide path + DV (storageType, pathOrInlineDv, offset) columns. We coalesce
 // and materialize them as top-level scaffolding columns so the plan's aggregate and anti-join
-// operators can correclty pair up adds with removes.
-const KEY_PATH: &str = "key_path";
-const KEY_DV_STORAGE: &str = "key_dv_storage";
-const KEY_DV_PATH: &str = "key_dv_path";
-const KEY_DV_OFFSET: &str = "key_dv_offset";
+// operators can correctly pair up adds with removes.
+const FILE_ACTION_KEY_PATH: &str = "key_path";
+const FILE_ACTION_KEY_DV_STORAGE: &str = "key_dv_storage";
+const FILE_ACTION_KEY_DV_PATH: &str = "key_dv_path";
+const FILE_ACTION_KEY_DV_OFFSET: &str = "key_dv_offset";
 /// The `add` action sub-fields reparsed in place from their raw log encodings: `stats` (JSON string
 /// -> typed stats struct, which pruning points at via `add.stats.minValues.*` etc.) and
 /// `partitionValues` (string map -> typed partition struct).
 const STATS: &str = "stats";
 const PARTITION_VALUES: &str = "partitionValues";
+const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 /// Per-file version, carried as a file-constant column so the aggregate can pick the newest action.
 const VERSION: &str = "version";
 /// The `struct(add, remove)` carrier that the aggregate takes the newest of.
@@ -86,7 +91,7 @@ const BASE_ROW_ID: &str = "baseRowId";
 
 /// The version-tagged read schema for a log file set: `add` (+ `remove` for commits) plus the
 /// file-constant `version` column.
-fn read_schema(include_remove: bool) -> SchemaRef {
+fn json_read_schema(include_remove: bool) -> SchemaRef {
     schema_ref! {
         (&ADD_FIELD),
         ..(include_remove.then_some(&REMOVE_FIELD)),
@@ -94,42 +99,71 @@ fn read_schema(include_remove: bool) -> SchemaRef {
     }
 }
 
-/// The file-identity keys, mirroring `FileActionKey`: `(output column name, leaf type, trailing
-/// path shared by the `add`/`remove` actions)`. Single source of truth for the group-by/join key
-/// columns ([`key_columns`]), their schema fields ([`key_fields`]), and the projection that
-/// materializes them ([`append_identity_keys`]).
-static IDENTITY_KEYS: LazyLock<[(&str, DataType, ColumnName); 4]> = LazyLock::new(|| {
+/// The checkpoint root read schema, used only to discover V2 sidecar file references.
+fn sidecar_read_schema() -> SchemaRef {
+    schema_ref! {
+        (&SIDECAR_FIELD),
+        nullable (VERSION): LONG,
+    }
+}
+
+/// Like [`json_read_schema`], but includes struct stats and partition values columns.
+fn parquet_read_schema(
+    include_remove: bool,
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+) -> DeltaResult<SchemaRef> {
+    let add_patch = SchemaStructPatchBuilder::new()
+        .fold_with(stats_schema, |patch, ss| {
+            patch.append(StructField::nullable(STATS_PARSED, ss.as_ref().clone()))
+        })
+        .fold_with(partition_schema, |patch, ps| {
+            patch.append(StructField::nullable(
+                PARTITION_VALUES_PARSED,
+                ps.as_ref().clone(),
+            ))
+        });
+    Ok(schema_ref! {
+        (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
+        ..(include_remove.then_some(&REMOVE_FIELD)),
+        nullable (VERSION): LONG,
+    })
+}
+
+/// The subset of file action fields that uniquely identifies a logical file in the log, used for
+/// deduplication of adds and removes during log replay.
+static FILE_ACTION_KEYS: LazyLock<[(&str, DataType, ColumnName); 4]> = LazyLock::new(|| {
     [
-        (KEY_PATH, DataType::STRING, column_name!("path")),
+        (FILE_ACTION_KEY_PATH, DataType::STRING, column_name!("path")),
         (
-            KEY_DV_STORAGE,
+            FILE_ACTION_KEY_DV_STORAGE,
             DataType::STRING,
             column_name!("deletionVector.storageType"),
         ),
         (
-            KEY_DV_PATH,
+            FILE_ACTION_KEY_DV_PATH,
             DataType::STRING,
             column_name!("deletionVector.pathOrInlineDv"),
         ),
         (
-            KEY_DV_OFFSET,
+            FILE_ACTION_KEY_DV_OFFSET,
             DataType::INTEGER,
             column_name!("deletionVector.offset"),
         ),
     ]
 });
 
-/// The identity (`key_*`) scaffolding fields, all nullable.
-fn key_fields() -> Vec<StructField> {
-    IDENTITY_KEYS
+/// The file action key as fields
+fn file_action_key_fields() -> Vec<StructField> {
+    FILE_ACTION_KEYS
         .iter()
         .map(|(name, dtype, _)| StructField::nullable(*name, dtype.clone()))
         .collect()
 }
 
-/// The `key_*` group-by / join keys as [`ColumnName`]s.
-fn key_columns() -> Vec<ColumnName> {
-    IDENTITY_KEYS
+/// The file action key as column names
+fn file_action_key_columns() -> Vec<ColumnName> {
+    FILE_ACTION_KEYS
         .iter()
         .map(|(name, ..)| ColumnName::new([*name]))
         .collect()
@@ -137,11 +171,11 @@ fn key_columns() -> Vec<ColumnName> {
 
 /// Append the identity keys to a projection patch, each produced by `key_expr(trailing)` -- which
 /// differs per arm: coalesced across add/remove for commits, add-only for checkpoints.
-fn append_identity_keys<'a>(
+fn append_file_action_keys<'a>(
     patch: ProjectionStructPatchBuilder<'a>,
     key_expr: impl Fn(&ColumnName) -> Expr,
 ) -> ProjectionStructPatchBuilder<'a> {
-    IDENTITY_KEYS
+    FILE_ACTION_KEYS
         .iter()
         .fold(patch, |patch, (name, dtype, trailing)| {
             patch.append(
@@ -151,10 +185,16 @@ fn append_identity_keys<'a>(
         })
 }
 
+#[derive(Clone, Copy)]
+enum ParsedSource {
+    Null,
+    Columns,
+}
+
 /// Reparse the `add` action's `stats` (JSON string -> typed struct) and `partitionValues` (string
-/// map -> typed struct) *in place*, per the scan's schemas -- so pruning and callers see a single
-/// typed `add.stats` / `add.partitionValues`, never a second parallel column. v1 reparses the add
-/// side only (removes keep their raw encodings, which nothing downstream reads).
+/// map -> typed struct) *in place*, preferring checkpoint-native parsed columns when present. The
+/// normalized output has a single typed `add.stats` / `add.partitionValues`; internal `_parsed`
+/// siblings are dropped after use.
 ///
 /// A `None` schema is the corner case where the caller wants neither pruning nor that parsed
 /// column: the field is nulled out but keeps its canonical log type ([`DataType::STRING`] for
@@ -163,29 +203,43 @@ fn reparse_add<'a>(
     patch: ProjectionStructPatchBuilder<'a>,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
+    parsed_source: ParsedSource,
 ) -> ProjectionStructPatchBuilder<'a> {
     let add = [ADD_NAME];
     let patch = match stats_schema {
-        Some(ss) => patch.replace_at(
-            add,
-            STATS,
-            StructField::nullable(STATS, ss.as_ref().clone()),
-            Expr::parse_json(col!("add.stats"), Arc::clone(ss)),
-        ),
+        Some(ss) => {
+            let field = StructField::nullable(STATS, ss.as_ref().clone());
+            let expr = Expr::parse_json(col!("add.stats"), Arc::clone(ss));
+            match parsed_source {
+                ParsedSource::Null => patch.replace_at(add, STATS, field, expr),
+                ParsedSource::Columns => {
+                    let expr = Expr::coalesce([col!(ADD_NAME, STATS_PARSED), expr]);
+                    patch
+                        .replace_at(add, STATS, field, expr)
+                        .drop_at(add, STATS_PARSED)
+                }
+            }
+        }
         None => patch.replace_expr_at(add, STATS, Expr::null_literal(DataType::STRING)),
     };
     match partition_schema {
-        Some(ps) => patch.replace_at(
-            add,
-            PARTITION_VALUES,
-            StructField::nullable(PARTITION_VALUES, ps.as_ref().clone()),
-            Expr::map_to_struct(col!("add.partitionValues")),
-        ),
-        None => patch.replace_expr_at(
-            add,
-            PARTITION_VALUES,
-            Expr::null_literal(partition_values_map_type()),
-        ),
+        Some(ps) => {
+            let field = StructField::nullable(PARTITION_VALUES, ps.as_ref().clone());
+            let expr = Expr::map_to_struct(col!("add.partitionValues"));
+            match parsed_source {
+                ParsedSource::Null => patch.replace_at(add, PARTITION_VALUES, field, expr),
+                ParsedSource::Columns => {
+                    let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
+                    patch
+                        .replace_at(add, PARTITION_VALUES, field, expr)
+                        .drop_at(add, PARTITION_VALUES_PARSED)
+                }
+            }
+        }
+        None => {
+            let expr = Expr::null_literal(partition_values_map_type());
+            patch.replace_expr_at(add, PARTITION_VALUES, expr)
+        }
     }
 }
 
@@ -203,9 +257,6 @@ fn reparsed_add_field(
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<StructField> {
-    let DataType::Struct(add_type) = ADD_FIELD.data_type() else {
-        return Err(Error::internal_error("ADD_FIELD must be a struct"));
-    };
     let patch = SchemaStructPatchBuilder::new()
         .fold_with(stats_schema, |patch, ss| {
             patch.replace(STATS, StructField::nullable(STATS, ss.as_ref().clone()))
@@ -214,7 +265,7 @@ fn reparsed_add_field(
             let field = StructField::nullable(PARTITION_VALUES, ps.as_ref().clone());
             patch.replace(PARTITION_VALUES, field)
         });
-    Ok(StructField::nullable(ADD_NAME, patch.build(add_type)?))
+    Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
 }
 
 /// Build the commit arm: scan JSON commits, normalize + prune (guarded), and wrap each surviving
@@ -229,7 +280,7 @@ fn commit_arm(
 ) -> DeltaResult<PlanBuilder> {
     // Prune (per-file, before the aggregate). Removes lack add-side stats/partitions, so guard with
     // `add IS NULL` to keep every tombstone -- they never prune in this cut, only anti-join.
-    let key_present = col!(KEY_PATH).is_not_null();
+    let key_present = col!(FILE_ACTION_KEY_PATH).is_not_null();
     let filter = key_present.fold_with(prune, |key_present, prune| {
         let gated_prune = Predicate::or(prune.clone(), col!("add").is_null());
         Predicate::and(key_present, gated_prune)
@@ -240,33 +291,108 @@ fn commit_arm(
     // columns, so a plain struct projection reads better than a patch.
     let wrapped_schema = schema_ref! {
         nullable (VERSION): LONG,
-        ..(key_fields()),
+        ..(file_action_key_fields()),
         nullable (PAIR): { (add_field), (&REMOVE_FIELD) },
     };
-    let wrap_exprs = vec![
-        col!(VERSION),
-        col!(KEY_PATH),
-        col!(KEY_DV_STORAGE),
-        col!(KEY_DV_PATH),
-        col!(KEY_DV_OFFSET),
-        Expr::struct_from([col!("add"), col!("remove")]),
-    ];
+    let mut wrap_exprs = vec![col!(VERSION)];
+    wrap_exprs.extend(file_action_key_columns().into_iter().map(Into::into));
+    wrap_exprs.push(Expr::struct_from([col!("add"), col!("remove")]));
 
-    PlanBuilder::scan_json(commit_files, &[VERSION], read_schema(true))?
+    PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
         .project_patch(|patch| {
             reparse_add(
-                append_identity_keys(patch, |trailing| {
+                append_file_action_keys(patch, |col| {
                     Expr::coalesce([
-                        joined_column_expr!("add", trailing),
-                        joined_column_expr!("remove", trailing),
+                        joined_column_expr!("add", col),
+                        joined_column_expr!("remove", col),
                     ])
                 }),
                 stats_schema,
                 partition_schema,
+                ParsedSource::Null,
             )
         })?
         .filter(filter)?
         .project(Expr::struct_from(wrap_exprs), wrapped_schema)
+}
+
+fn normalize_checkpoint_actions(
+    source: PlanBuilder,
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+    prune: Option<&Predicate>,
+    parsed_source: ParsedSource,
+) -> DeltaResult<PlanBuilder> {
+    let add_present = col!("add").is_not_null();
+    let filter = add_present.fold_with(prune, |add_present, prune| {
+        Predicate::and(add_present, prune.clone())
+    });
+    source
+        .project_patch(|patch| {
+            reparse_add(
+                append_file_action_keys(patch, |col| joined_column_expr!("add", col)),
+                stats_schema,
+                partition_schema,
+                parsed_source,
+            )
+        })?
+        .filter(filter)
+}
+
+static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable (FILE_PATH): STRING,
+    nullable (FILE_SIZE): LONG,
+    nullable (NUM_RECORDS): LONG,
+    nullable (DV): (DeletionVectorDescriptor::to_schema()),
+    nullable (VERSION): LONG,
+};
+
+fn sidecar_actions(
+    json_parts: Vec<ScanFile>,
+    parquet_parts: Vec<ScanFile>,
+    action_schema: SchemaRef,
+    log_root: &Url,
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+    prune: Option<&Predicate>,
+) -> DeltaResult<PlanBuilder> {
+    let sidecar_roots = PlanBuilder::union_all([
+        PlanBuilder::scan_json(json_parts, &[VERSION], sidecar_read_schema())?,
+        PlanBuilder::scan_parquet(parquet_parts, &[VERSION], sidecar_read_schema())?,
+    ])?;
+    let sidecar_files = sidecar_roots
+        .filter(col!(SIDECAR_NAME).is_not_null())?
+        .project(
+            Expr::struct_from([
+                col!(SIDECAR_NAME, "path"),
+                col!(SIDECAR_NAME, "sizeInBytes"),
+                Expr::null_literal(DataType::LONG),
+                Expr::null_literal(DeletionVectorDescriptor::to_schema().into()),
+                col!(VERSION),
+            ]),
+            SIDECAR_FILE_META_SCHEMA.clone(),
+        )?;
+
+    let load = Load::new(
+        action_schema,
+        FileType::Parquet,
+        LoadColumnFileMeta::new(
+            ColumnName::new([FILE_PATH]),
+            ColumnName::new([FILE_SIZE]),
+            ColumnName::new([NUM_RECORDS]),
+        ),
+        ColumnName::new([DV]),
+    )
+    .with_base_url(log_root.join("_sidecars/")?)
+    .with_file_constant_columns([VERSION]);
+
+    normalize_checkpoint_actions(
+        sidecar_files.load(load)?,
+        stats_schema,
+        partition_schema,
+        prune,
+        ParsedSource::Columns,
+    )
 }
 
 /// Build the checkpoint arm: scan the checkpoint parts, normalize + prune (no guard -- adds always
@@ -274,33 +400,43 @@ fn commit_arm(
 /// anti-join against the commit keys and `{ add }` projection (see [`build_metadata_scan_plan`]).
 ///
 /// A checkpoint version is homogeneous (all JSON or all Parquet), so at most one of `json_parts` /
-/// `parquet_parts` is non-empty -- the log segment already partitions the single checkpoint by
-/// format. Both read the same `{ add, version }` schema, so a `union_all` routes whichever format
-/// is present without a `UnionAll` node (absent arms collapse away).
+/// `parquet_parts` is non-empty. The root checkpoint is read twice: once as file actions and once
+/// as sidecar metadata. The sidecar relation is then loaded as parquet file actions and unioned
+/// with the root file actions.
 fn checkpoint_arm(
     json_parts: Vec<ScanFile>,
     parquet_parts: Vec<ScanFile>,
+    log_root: &Url,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
     prune: Option<&Predicate>,
 ) -> DeltaResult<PlanBuilder> {
-    let add_present = col!("add").is_not_null();
-    let filter = add_present.fold_with(prune, |add_present, prune| {
-        Predicate::and(add_present, prune.clone())
-    });
-
+    let schema = parquet_read_schema(false, stats_schema, partition_schema)?;
     PlanBuilder::union_all([
-        PlanBuilder::scan_json(json_parts, &[VERSION], read_schema(false))?,
-        PlanBuilder::scan_parquet(parquet_parts, &[VERSION], read_schema(false))?,
-    ])?
-    .project_patch(|patch| {
-        reparse_add(
-            append_identity_keys(patch, |trailing| joined_column_expr!("add", trailing)),
+        normalize_checkpoint_actions(
+            PlanBuilder::scan_json(json_parts.clone(), &[VERSION], json_read_schema(false))?,
             stats_schema,
             partition_schema,
-        )
-    })?
-    .filter(filter)
+            prune,
+            ParsedSource::Null,
+        )?,
+        normalize_checkpoint_actions(
+            PlanBuilder::scan_parquet(parquet_parts.clone(), &[VERSION], Arc::clone(&schema))?,
+            stats_schema,
+            partition_schema,
+            prune,
+            ParsedSource::Columns,
+        )?,
+        sidecar_actions(
+            json_parts,
+            parquet_parts,
+            schema,
+            log_root,
+            stats_schema,
+            partition_schema,
+            prune,
+        )?,
+    ])
 }
 
 /// The physical partition-column names carried in `state`'s typed partition schema (empty when the
@@ -346,8 +482,8 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
 /// filter is rewritten from. `commit_files` and the checkpoint parts (`json_checkpoint_files` /
 /// `parquet_checkpoint_files`, as partitioned by
 /// `LogSegment::checkpoint_version_tagged_scan_files`) are version-tagged [`ScanFile`]s --
-/// typically straight from the log segment (newest commit wins). A checkpoint version is
-/// homogeneous, so at most one checkpoint partition is non-empty.
+/// typically straight from the log segment (newest commit wins). `log_root` is the `_delta_log/`
+/// URL used to resolve V2 sidecar paths.
 ///
 /// Returns `None` when nothing can survive: an empty table (no files after absence collapse) or a
 /// statically-unsatisfiable predicate ([`PhysicalPredicate::StaticSkipAll`]).
@@ -356,6 +492,7 @@ pub(crate) fn build_metadata_scan_plan(
     commit_files: Vec<ScanFile>,
     json_checkpoint_files: Vec<ScanFile>,
     parquet_checkpoint_files: Vec<ScanFile>,
+    log_root: Url,
 ) -> DeltaResult<Option<Plan>> {
     // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
     if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
@@ -381,7 +518,7 @@ pub(crate) fn build_metadata_scan_plan(
         partition_schema,
         prune,
     )?
-    .aggregate_by(key_columns(), |a| {
+    .aggregate_by(file_action_key_columns(), |a| {
         a.max_non_null_by(ColumnName::new([PAIR]), ColumnName::new([VERSION]))
     })?;
 
@@ -390,11 +527,16 @@ pub(crate) fn build_metadata_scan_plan(
     let checkpoint_live = checkpoint_arm(
         json_checkpoint_files,
         parquet_checkpoint_files,
+        &log_root,
         stats_schema,
         partition_schema,
         prune,
     )?
-    .anti_join(deduped_commit.clone(), key_columns(), key_columns())?
+    .anti_join(
+        deduped_commit.clone(),
+        file_action_key_columns(),
+        file_action_key_columns(),
+    )?
     .project(Expr::struct_from([col!("add")]), output_schema.clone())?;
 
     // Live commit adds: keep the identities whose newest action is an add, projected to `{ add }`.
@@ -623,6 +765,10 @@ mod tests {
         }
     }
 
+    fn log_root() -> Url {
+        Url::parse("file:///_delta_log/").unwrap()
+    }
+
     /// A discriminant tag for asserting a node's operator (mirrors the builder's own test helper).
     fn op_tag(op: &Operator) -> &'static str {
         match op {
@@ -642,12 +788,21 @@ mod tests {
         plan.nodes.iter().map(|n| op_tag(&n.op)).collect()
     }
 
-    /// The full metadata plan (commits + checkpoint, with pruning) linearizes to the expected
-    /// commit arm (scan_json -> project -> filter -> project -> aggregate), a checkpoint arm
-    /// (scan_parquet -> project -> filter -> anti-join against the shared aggregate -> project),
-    /// the live-commit extraction (filter -> project reusing the shared aggregate), and a
-    /// terminal union. A predicate on the stats column `x` yields a pruning [`Filter`]; the typed
-    /// partition schema retypes `add.partitionValues` in place.
+    fn add_struct(schema: &SchemaRef) -> &StructType {
+        let DataType::Struct(add_struct) = schema
+            .field(ADD_NAME)
+            .expect("schema should contain add")
+            .data_type()
+        else {
+            panic!("add should be a struct");
+        };
+        add_struct
+    }
+
+    /// The full metadata plan linearizes to the commit arm, the live-commit extraction, and the
+    /// checkpoint arm. The checkpoint arm reads root file actions and root sidecar references
+    /// separately, loads sidecar parquet actions, unions both checkpoint action sources, and then
+    /// anti-joins against the shared commit aggregate.
     #[test]
     fn metadata_plan_has_expected_shape() -> DeltaResult<()> {
         let predicate = col!("x").gt(lit(5i64));
@@ -663,6 +818,7 @@ mod tests {
             vec![scan_file("file:///1.json", 1)],
             vec![],
             vec![scan_file("file:///0.parquet", 0)],
+            log_root(),
         )?
         .expect("non-empty");
 
@@ -678,23 +834,63 @@ mod tests {
                 "aggregate",    // 4 newest-action-per-key (shared)
                 "filter",       // 5 live commit adds (probe node 4)
                 "project",      // 6 extract add
-                "scan_parquet", // 7 checkpoint
+                "scan_parquet", // 7 checkpoint root actions
                 "project",      // 8 normalize
                 "filter",       // 9 prune
-                "semi_join",    // 10 anti-join vs commit keys (build = node 4)
-                "project",      // 11 surviving checkpoint adds
-                "union_all",    // 12 terminal
+                "scan_parquet", // 10 checkpoint roots for sidecar refs
+                "filter",       // 11 keep sidecar rows
+                "project",      // 12 sidecar file metadata
+                "load",         // 13 sidecar file actions
+                "project",      // 14 normalize sidecar actions
+                "filter",       // 15 prune sidecar actions
+                "union_all",    // 16 root + sidecar checkpoint actions
+                "semi_join",    // 17 anti-join vs commit keys (build = node 4)
+                "project",      // 18 surviving checkpoint adds
+                "union_all",    // 19 terminal
             ],
         );
 
         // The aggregate (node 4) is emitted once and referenced by both the live-add filter and
         // the anti-join build side.
         assert_eq!(plan.nodes[5].inputs, vec![4]);
-        assert_eq!(plan.nodes[10].inputs, vec![9, 4]);
-        let Operator::SemiJoin(join) = &plan.nodes[10].op else {
+        assert_eq!(plan.nodes[17].inputs, vec![16, 4]);
+        let Operator::SemiJoin(join) = &plan.nodes[17].op else {
             panic!("expected anti-join");
         };
         assert!(join.inverted);
+
+        let Operator::ScanParquet(root_scan) = &plan.nodes[7].op else {
+            panic!("expected parquet checkpoint root action scan");
+        };
+        assert!(add_struct(&root_scan.schema).field(STATS_PARSED).is_some());
+        assert!(add_struct(&root_scan.schema)
+            .field(PARTITION_VALUES_PARSED)
+            .is_some());
+
+        let Operator::Project(root_normalize) = &plan.nodes[8].op else {
+            panic!("expected root normalize project");
+        };
+        assert!(add_struct(&root_normalize.schema)
+            .field(STATS_PARSED)
+            .is_none());
+        assert!(add_struct(&root_normalize.schema)
+            .field(PARTITION_VALUES_PARSED)
+            .is_none());
+
+        let Operator::Load(sidecar_load) = &plan.nodes[13].op else {
+            panic!("expected sidecar load");
+        };
+        assert_eq!(
+            sidecar_load.base_url.as_ref().map(Url::as_str),
+            Some("file:///_delta_log/_sidecars/")
+        );
+        assert_eq!(sidecar_load.file_constant_columns, vec![VERSION]);
+        assert!(add_struct(&sidecar_load.schema)
+            .field(STATS_PARSED)
+            .is_some());
+        assert!(add_struct(&sidecar_load.schema)
+            .field(PARTITION_VALUES_PARSED)
+            .is_some());
         Ok(())
     }
 
@@ -714,6 +910,7 @@ mod tests {
             vec![scan_file("file:///1.json", 1)],
             vec![],
             vec![scan_file("file:///0.parquet", 0)],
+            log_root(),
         )?
         .expect("non-empty");
         assert_eq!(
@@ -729,6 +926,13 @@ mod tests {
                 "scan_parquet",
                 "project",
                 "filter",
+                "scan_parquet",
+                "filter",
+                "project",
+                "load",
+                "project",
+                "filter",
+                "union_all",
                 "semi_join",
                 "project",
                 "union_all",
@@ -748,9 +952,14 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        let plan =
-            build_metadata_scan_plan(&state, vec![scan_file("file:///1.json", 1)], vec![], vec![])?
-                .expect("non-empty");
+        let plan = build_metadata_scan_plan(
+            &state,
+            vec![scan_file("file:///1.json", 1)],
+            vec![],
+            vec![],
+            log_root(),
+        )?
+        .expect("non-empty");
         assert_eq!(
             tags(&plan),
             vec![
@@ -785,11 +994,26 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        let plan = build_metadata_scan_plan(&state, vec![], json_parts, parquet_parts)?
+        let plan = build_metadata_scan_plan(&state, vec![], json_parts, parquet_parts, log_root())?
             .expect("non-empty");
-        // No union node (lone present partition forwarded), no anti-join node (absent build
-        // forwarded the probe), no commit arm.
-        assert_eq!(tags(&plan), vec![scan_tag, "project", "filter", "project"]);
+        // No anti-join node (absent build forwarded the probe) and no commit arm. The checkpoint
+        // relation still unions root file actions with sidecar file actions.
+        assert_eq!(
+            tags(&plan),
+            vec![
+                scan_tag,
+                "project",
+                "filter",
+                scan_tag,
+                "filter",
+                "project",
+                "load",
+                "project",
+                "filter",
+                "union_all",
+                "project"
+            ]
+        );
         Ok(())
     }
 
@@ -803,7 +1027,7 @@ mod tests {
             StatsOptions::default(),
             PartitionValuesOptions::default(),
         );
-        assert!(build_metadata_scan_plan(&state, vec![], vec![], vec![])?.is_none());
+        assert!(build_metadata_scan_plan(&state, vec![], vec![], vec![], log_root())?.is_none());
         Ok(())
     }
 
