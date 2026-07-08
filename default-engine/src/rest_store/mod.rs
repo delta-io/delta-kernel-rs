@@ -11,7 +11,7 @@
 //!   request, so an implementation can refresh short-lived credentials.
 //! - [`RestEndpointConfig`] -- the REST dialect: path-to-URL mapping, list and write query
 //!   parameters, and list-response JSON field names. HTTP `404 -> NotFound` and `409 ->
-//!   AlreadyExists` are mapped in [`RestObjectStore`](RestObjectStore).
+//!   AlreadyExists` are mapped in [`RestObjectStore`].
 //!
 //! Only the operations kernel needs are implemented (read, head, list, write, delete); the rest
 //! return [`ObjectStoreError::NotSupported`].
