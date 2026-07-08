@@ -1067,6 +1067,32 @@ impl StructType {
         Ok(result)
     }
 
+    /// Resolves a column path case-insensitively (matching Delta/Spark column resolution),
+    /// returning references to all [`StructField`]s along the path. Like
+    /// [`Self::fields_of_path`] but folds ASCII case when matching each segment, so the
+    /// returned fields carry the schema's canonical casing regardless of how the path was
+    /// written.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate
+    /// field is not a struct type.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(crate) fn fields_of_path_ci<'a>(
+        &'a self,
+        col: &ColumnName,
+    ) -> DeltaResult<Vec<&'a StructField>> {
+        let mut result = Vec::with_capacity(col.path().len());
+        self.visit_fields_of_path_by(
+            col,
+            |parent, name| {
+                parent
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(name))
+            },
+            |f| result.push(f),
+        )?;
+        Ok(result)
+    }
+
     /// Visits all fields along the given column path, using a caller-provided field name resolver.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not

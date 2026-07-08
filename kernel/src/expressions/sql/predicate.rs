@@ -1,11 +1,11 @@
 //! Single-comparison CHECK-constraint parser: `<operand> <op> <operand>` into a [`Predicate`].
 //!
-//! The grammar is exactly one comparison. Rather than a bespoke tokenizer and parser, this splits
-//! the string at its single top-level comparison operator, then reuses the crate's existing
-//! parsers for each side: [`ColumnName::from_str`] for a (dotted, backtick-quoted) column path, and
-//! [`super::parse_sql`] for a literal. A literal's type is inferred from the column on the other
-//! side of the comparison. Column references resolve case-insensitively, matching Delta/Spark and
-//! kernel's other column-resolution paths.
+//! The grammar is exactly one comparison. This splits the string at its single top-level
+//! comparison operator, then reuses the crate's existing parsers for each side:
+//! [`ColumnName::from_str`] for a (dotted, backtick-quoted) column path, and [`super::parse_sql`]
+//! for a literal. A literal's type is inferred from the column on the other side of the
+//! comparison. Column references resolve case-insensitively, matching Delta/Spark and kernel's
+//! other column-resolution paths.
 //!
 //! Junctions (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are out of grammar. They fail
 //! either at the split (no operator, or more than one) or at operand classification, and the caller
@@ -18,9 +18,9 @@ use crate::expressions::{ColumnName, Expression, Predicate};
 use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
 
-/// Comparison operators, longest spelling first so a single left-to-right prefix scan is maximal
-/// munch: `<=>` is matched before `<=` before `<`. `==` aliases `=`; `<>` and `!=` both mean
-/// not-equal. The [`CmpOp`] records which comparison to build during [`lower`].
+/// Comparison operators and the [`CmpOp`] each produces. `==` aliases `=`; `<>` and `!=` both mean
+/// not-equal. [`munch`] picks the longest match, so overlapping spellings (`<`, `<=`, `<=>`) need
+/// no particular order here.
 const OPERATORS: &[(&str, CmpOp)] = &[
     ("<=>", CmpOp::NullSafeEq),
     ("<=", CmpOp::Le),
@@ -59,9 +59,34 @@ enum Operand<'a> {
     Literal(&'a str),
 }
 
-/// Parse a single-comparison constraint against `schema` into a [`Predicate`]. See the module doc
-/// and [`super::parse_sql_simple_predicate`] for the supported grammar and error contract.
-pub(super) fn parse_comparison(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
+/// Parse a single-comparison CHECK-constraint SQL string into a kernel [`Predicate`], resolving
+/// column references against `schema` and inferring each literal's type from the column it is
+/// compared against.
+///
+/// The supported grammar is exactly one comparison `<operand> <op> <operand>`, where each operand
+/// is a column reference (case-insensitive, dotted paths allowed), a literal, or `NULL`, and
+/// `<op>` is one of `< <= > >= = == != <> <=>`. Literal leaves are parsed by [`super::parse_sql`],
+/// typed from the column on the other side of the comparison; a comparison must therefore
+/// reference at least one column.
+///
+/// Junctions (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are intentionally out of scope
+/// and surface as errors.
+///
+/// The returned [`Predicate`] carries no CHECK-constraint NULL convention on its own. A SQL CHECK
+/// constraint fails a row only when the predicate evaluates to FALSE; a TRUE *or NULL* result
+/// passes (e.g. `CHECK (x > 0)` passes when `x` is NULL). The caller enforcing the constraint must
+/// therefore reject a row only on FALSE, not "keep rows where the predicate is TRUE"; the latter
+/// wrongly drops every NULL row.
+///
+/// # Errors
+///
+/// Returns an error for any input outside the supported grammar (junctions, functions, arithmetic,
+/// `IN`, `BETWEEN`, ...), for unknown columns, and for type-incompatible literals. Callers treat
+/// that error as the signal that a constraint is *not kernel-parsable*.
+// TODO: remove the allow once check-constraints discovery calls this. It has no in-crate caller,
+//       so dead-code analysis flags the entry point until then.
+#[allow(dead_code)]
+pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
     let (left, op, right) = split_at_operator(sql)?;
     lower(op, classify(left, schema)?, classify(right, schema)?)
 }
@@ -103,12 +128,13 @@ fn split_at_operator(sql: &str) -> DeltaResult<(&str, CmpOp, &str)> {
     Ok((sql[..start].trim(), op, sql[end..].trim()))
 }
 
-/// The longest operator `rest` begins with, and its byte length, or `None` if none. `OPERATORS` is
-/// ordered longest-first, so the first prefix match is the longest (maximal munch).
+/// The longest operator `rest` begins with, and its byte length, or `None` if none. Maximal munch:
+/// `<=>` wins over `<=` wins over `<`, so a prefix operator never shadows a longer one.
 fn munch(rest: &str) -> Option<(CmpOp, usize)> {
     OPERATORS
         .iter()
-        .find(|(spelling, _)| rest.starts_with(spelling))
+        .filter(|(spelling, _)| rest.starts_with(spelling))
+        .max_by_key(|(spelling, _)| spelling.len())
         .map(|(spelling, op)| (*op, spelling.len()))
 }
 
@@ -135,28 +161,19 @@ fn classify<'a>(text: &'a str, schema: &StructType) -> DeltaResult<Operand<'a>> 
     Ok(Operand::Literal(text))
 }
 
-/// Resolve a (case-insensitive) column path against `schema`, returning the *canonical* path (the
-/// schema's stored field names) and the leaf field's type. The canonical names are what the engine
-/// sees in the logical batch, so the emitted column reference must use them rather than the
-/// as-written casing.
+/// Resolve a column path against `schema`, returning the *canonical* path (the schema's stored
+/// field names) and the leaf field's type. The canonical names are what the engine sees in the
+/// logical batch, so the emitted column reference must use them rather than the as-written casing.
 fn resolve_column(
     column: &ColumnName,
     schema: &StructType,
 ) -> DeltaResult<(Vec<String>, DataType)> {
-    let mut fields = Vec::with_capacity(column.path().len());
-    schema.visit_fields_of_path_by(
-        column,
-        |parent, name| {
-            parent
-                .fields()
-                .find(|f| f.name().eq_ignore_ascii_case(name))
-        },
-        |field| fields.push(field),
-    )?;
+    let fields = schema.fields_of_path_ci(column)?;
     let canonical = fields.iter().map(|f| f.name().to_string()).collect();
+    // `fields_of_path_ci` errors on an empty path, so on success there is always a leaf.
     let leaf = fields
         .last()
-        .ok_or_else(|| Error::generic("CHECK constraint references an empty column path"))?;
+        .ok_or_else(|| Error::generic("empty column path"))?;
     Ok((canonical, leaf.data_type().clone()))
 }
 
@@ -168,16 +185,15 @@ fn resolve_column(
 /// - at least one operand is a column, so a literal can be typed from it;
 /// - every column operand is primitive-typed (struct/array/map have no scalar comparison);
 /// - the two operands share a single comparison type, because the engine compares only matching
-///   types (no implicit numeric coercion) -- see [`type_literal_from_column`] (FLOAT-vs-literal)
-///   and the column-vs-column arm (cross-type columns).
+///   types (no implicit numeric coercion). See [`type_literal_from_column`] (FLOAT-vs-literal) and
+///   the column-vs-column arm (cross-type columns).
 ///
 /// Even a predicate that lowers can still diverge from Spark at *evaluation* time, on comparison
 /// semantics the parser cannot re-express as a `Predicate`. These are engine-wide gaps (not
-/// constraint-specific) and are left to the enforcement layer rather than rejected here, which
-/// would forgo nearly all float and string constraints:
+/// constraint-specific) and are left to the enforcement layer:
 /// - NaN: Spark SQL makes `NaN = NaN` true and orders NaN above every value; kernel compares floats
 ///   with IEEE semantics (NaN unordered), so a float/double constraint on a NaN-bearing column can
-///   silently disagree -- affecting even the DOUBLE and FLOAT-vs-FLOAT cases that lower here.
+///   silently disagree, affecting even the DOUBLE and FLOAT-vs-FLOAT cases that lower here.
 /// - String collation: kernel compares bytewise; a non-default collation (e.g. `UTF8_LCASE`) would
 ///   compare differently under Spark.
 fn lower(op: CmpOp, left: Operand<'_>, right: Operand<'_>) -> DeltaResult<Predicate> {
@@ -195,7 +211,12 @@ fn lower(op: CmpOp, left: Operand<'_>, right: Operand<'_>) -> DeltaResult<Predic
             }
         }
     }
-    let (left, right) = match (left, right) {
+    // Resolve the single type the comparison happens at. A literal is typed from the column on
+    // the other side, so at least one operand must be a column. The engine compares only matching
+    // Arrow types (no numeric coercion), so a cross-type column-vs-column comparison Spark would
+    // coerce is rejected; the full-`DataType` check also rejects mismatched decimal
+    // precision/scale and TIMESTAMP vs TIMESTAMP_NTZ.
+    let cmp_type = match (&left, &right) {
         (
             Operand::Column {
                 canonical: l,
@@ -205,48 +226,29 @@ fn lower(op: CmpOp, left: Operand<'_>, right: Operand<'_>) -> DeltaResult<Predic
                 canonical: r,
                 data_type: r_type,
             },
-        ) => {
-            // The engine compares only matching Arrow types -- it applies no numeric coercion (it
-            // would error on e.g. INT vs LONG). Spark instead coerces both columns to a common type
-            // and compares there, so a cross-type comparison kernel cannot reproduce is rejected
-            // (left to the connector). The check is on the full `DataType`, so it also rejects
-            // mismatched decimal precision/scale and TIMESTAMP vs TIMESTAMP_NTZ.
-            if l_type != r_type {
-                return Err(Error::generic(format!(
-                    "CHECK constraint comparing columns of different types is not supported: \
-                     '{}' has type {l_type:?}, '{}' has type {r_type:?}",
-                    l.join("."),
-                    r.join(".")
-                )));
-            }
-            (Expression::column(l), Expression::column(r))
+        ) if l_type != r_type => {
+            return Err(Error::generic(format!(
+                "CHECK constraint comparing columns of different types is not supported: \
+                 '{}' has type {l_type:?}, '{}' has type {r_type:?}",
+                l.join("."),
+                r.join(".")
+            )))
         }
-        (
-            Operand::Column {
-                canonical,
-                data_type,
-            },
-            Operand::Literal(raw),
-        ) => (
-            Expression::column(canonical),
-            type_literal_from_column(raw, &data_type)?,
-        ),
-        (
-            Operand::Literal(raw),
-            Operand::Column {
-                canonical,
-                data_type,
-            },
-        ) => (
-            type_literal_from_column(raw, &data_type)?,
-            Expression::column(canonical),
-        ),
+        (Operand::Column { data_type, .. }, _) | (_, Operand::Column { data_type, .. }) => {
+            data_type.clone()
+        }
         (Operand::Literal(_), Operand::Literal(_)) => {
             return Err(Error::generic(
                 "CHECK constraint comparison must reference at least one column",
             ))
         }
     };
+    // A column becomes a reference; a literal is typed from `cmp_type` via `parse_sql`.
+    let convert = |operand: Operand<'_>| match operand {
+        Operand::Column { canonical, .. } => Ok(Expression::column(canonical)),
+        Operand::Literal(raw) => type_literal_from_column(raw, &cmp_type),
+    };
+    let (left, right) = (convert(left)?, convert(right)?);
     Ok(match op {
         CmpOp::Eq => Predicate::eq(left, right),
         CmpOp::Ne => Predicate::ne(left, right),
@@ -254,31 +256,32 @@ fn lower(op: CmpOp, left: Operand<'_>, right: Operand<'_>) -> DeltaResult<Predic
         CmpOp::Le => Predicate::le(left, right),
         CmpOp::Gt => Predicate::gt(left, right),
         CmpOp::Ge => Predicate::ge(left, right),
-        // Null-safe equal: `a <=> b` is "a is not distinct from b" -- kernel has no direct
+        // Null-safe equal: `a <=> b` is "a is not distinct from b". Kernel has no direct
         // constructor, so negate the distinct predicate.
         CmpOp::NullSafeEq => Predicate::not(Predicate::distinct(left, right)),
     })
 }
 
 /// Type a literal from the column it is compared with (via [`parse_sql`]), rejecting the
-/// FLOAT-column cases where kernel would silently disagree with Spark.
+/// FLOAT-column-vs-DECIMAL/DOUBLE-literal cases where kernel would obviously disagree with Spark.
 ///
 /// Kernel types a literal from the compared column, so against a FLOAT column it narrows the
 /// literal to f32 and compares at f32. Spark instead types the literal on its own and coerces to a
-/// common type; whether the FLOAT column stays f32 or is widened to f64 depends on the literal's
-/// Spark type:
-/// - INT/LONG literal (an integer in i64 range): the common type is FLOAT, so Spark casts the
-///   *literal* to f32 and compares at f32 -- identical to kernel. Safe to lower.
+/// common type:
 /// - DECIMAL/DOUBLE literal (has a `.`/exponent, or an integer beyond i64): the common type is
 ///   DOUBLE, so Spark widens the *column* to f64 and compares at f64. For a literal not exactly
 ///   representable in f32 (e.g. `0.1`) this reaches the opposite result from kernel's f32 compare,
 ///   silently. Kernel has no cast expression and the engine cannot compare f32 to f64, so it cannot
-///   reproduce Spark's widening; these are left to the connector.
+///   reproduce Spark's widening; these are rejected and left to the connector.
+/// - INT/LONG literal (an integer in i64 range): allowed. Under legacy coercion the common type is
+///   FLOAT, so Spark casts the *literal* to f32 and compares at f32, matching kernel. Under ANSI
+///   coercion (the default) INT+FLOAT widens to DOUBLE, so Spark compares the widened column at
+///   f64; that disagrees with kernel's f32 compare only for a literal not exactly representable in
+///   f32 (`|literal| > 2^24`), where the connector's enforcement layer is the backstop.
 ///
 /// `NULL` is allowed (a null comparison involves no f32/f64 rounding). The i64 gate is exactly
-/// Spark's INT/LONG-vs-DECIMAL literal boundary, and is intentionally conservative: an f32-exact
-/// exponent literal like `1e3` would in fact agree, but is still rejected rather than
-/// special-cased. Only FLOAT is affected; a DOUBLE column already compares at f64, matching Spark.
+/// Spark's INT/LONG-vs-DECIMAL literal boundary. Only FLOAT is affected; a DOUBLE column already
+/// compares at f64, matching Spark.
 fn type_literal_from_column(raw: &str, column_type: &DataType) -> DeltaResult<Expression> {
     let is_null = raw.eq_ignore_ascii_case("null");
     let is_int_or_long_literal = raw.parse::<i64>().is_ok();
@@ -413,6 +416,12 @@ mod tests {
         "name = 'O''Brien'",
         Predicate::eq(col("name"), Expression::literal("O'Brien"))
     )]
+    // An operator character inside a string literal is not the comparison operator: the split
+    // skips the quoted span, so the sole operator is the `=`.
+    #[case::operator_char_inside_string_literal(
+        "name = '< >='",
+        Predicate::eq(col("name"), Expression::literal("< >="))
+    )]
     // Same-type column-vs-column comparisons are allowed; cross-type ones are rejected (see the
     // not-kernel-parsable cases below). FLOAT-vs-FLOAT stays at f32, matching Spark.
     #[case::column_vs_column("amount2 < amount", Predicate::lt(col("amount2"), col("amount")))]
@@ -495,12 +504,14 @@ mod tests {
     #[case::cross_type_int_long_columns("price < amount")]
     #[case::cross_type_float_double_columns("weight < ratio")]
     // Non-primitive (struct/array/map) columns have no scalar comparison and are rejected on either
-    // side of the operator -- symmetric with the literal path, which rejects non-primitive targets.
+    // side of the operator, symmetric with the literal path, which rejects non-primitive targets.
     #[case::struct_column_vs_struct_column("nested = nested")]
     #[case::struct_column_vs_null("nested = NULL")]
     #[case::struct_column_vs_literal("nested = 0")]
+    // A non-primitive column on the right is rejected too (the guard checks both operands).
+    #[case::primitive_column_vs_struct_column("amount = nested")]
     // No implicit casts: a literal whose SQL form does not match the compared column's type is
-    // rejected -- including a quoted number for a numeric column, which Spark would coerce.
+    // rejected, including a quoted number for a numeric column, which Spark would coerce.
     #[case::string_literal_for_numeric_column("amount = 'foo'")]
     #[case::quoted_number_for_numeric_column("amount = '10'")]
     #[case::literal_out_of_range_for_column("price = 9999999999")]
@@ -547,5 +558,16 @@ mod tests {
             StructField::nullable("true", DataType::BOOLEAN),
         ]);
         assert_eq!(parse_sql_simple_predicate(sql, &schema).unwrap(), expected);
+    }
+
+    /// An operator character inside a backtick-quoted column name is part of the identifier, not
+    /// the comparison operator: the split skips the backtick span, so the sole operator is the `=`.
+    #[test]
+    fn operator_char_inside_backtick_column_is_not_the_comparison_operator() {
+        let schema = StructType::new_unchecked([StructField::nullable("a>b", DataType::LONG)]);
+        assert_eq!(
+            parse_sql_simple_predicate("`a>b` = 0", &schema).unwrap(),
+            Predicate::eq(Expression::column(["a>b"]), Expression::literal(0i64))
+        );
     }
 }

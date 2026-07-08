@@ -8,57 +8,24 @@
 //! grammar rather than defining a kernel-specific dialect, so the forms it accepts match what
 //! Spark reads and writes.
 //!
-//! This is an intentionally light start, covering only the forms Delta metadata contains today. If
-//! the supported SQL surface grows, options include moving parsing behind the
+//! This is an intentionally light start, covering only the forms Delta metadata contains. If the
+//! supported SQL surface grows, options include moving parsing behind the
 //! [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 //!
-//! Where kernel cannot yet match Spark's coercion it errors rather than guess, so the constraint is
-//! left to the connector (fail-closed, never a silent wrong answer). One notable such gap: a
-//! decimal literal must match the column's scale exactly (`parse_scalar` does not pad), so
-//! `amount >= 0` on a `DECIMAL(10,2)` column is rejected where Spark would read `0` as `0.00`.
-//! Padding the literal's scale to the column would recover these.
+//! Where kernel cannot match Spark's coercion it errors rather than guess, leaving the constraint
+//! to the connector (fail-closed). One such gap: a decimal literal must match the column's scale
+//! exactly (`parse_scalar` does not pad), so `amount >= 0` on a `DECIMAL(10,2)` column is rejected
+//! where Spark would read `0` as `0.00`.
+//! TODO: pad the literal's scale to the column so these are accepted.
 
-#[cfg(feature = "check-constraints-in-dev")]
-use crate::expressions::Predicate;
 use crate::expressions::{Expression, Scalar};
-#[cfg(feature = "check-constraints-in-dev")]
-use crate::schema::StructType;
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
 
 #[cfg(feature = "check-constraints-in-dev")]
 mod predicate;
-
-/// Parse a single-comparison CHECK-constraint SQL string into a kernel [`Predicate`], resolving
-/// column references against `schema` and inferring each literal's type from the column it is
-/// compared against.
-///
-/// The supported grammar is exactly one comparison `<operand> <op> <operand>`, where each operand
-/// is a column reference (case-insensitive, dotted paths allowed), a literal, or `NULL`, and
-/// `<op>` is one of `< <= > >= = == != <> <=>`. Literal leaves are parsed by [`parse_sql`], typed
-/// from the column on the other side of the comparison; a comparison must therefore reference at
-/// least one column.
-///
-/// Junctions (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are intentionally out of scope
-/// and surface as errors.
-///
-/// The returned [`Predicate`] carries no CHECK-constraint NULL convention on its own. A SQL CHECK
-/// constraint fails a row only when the predicate evaluates to FALSE; a TRUE *or NULL* result
-/// passes (e.g. `CHECK (x > 0)` passes when `x` is NULL). The caller enforcing the constraint must
-/// therefore reject a row only on FALSE, not "keep rows where the predicate is TRUE" -- the latter
-/// wrongly drops every NULL row.
-///
-/// # Errors
-///
-/// Returns an error for any input outside the supported grammar (junctions, functions, arithmetic,
-/// `IN`, `BETWEEN`, ...), for unknown columns, and for type-incompatible literals. Callers treat
-/// that error as the signal that a constraint is *not kernel-parsable*.
 #[cfg(feature = "check-constraints-in-dev")]
-// TODO: remove once check-constraints discovery calls this; no in-crate caller until then.
-#[allow(dead_code)]
-pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
-    predicate::parse_comparison(sql, schema)
-}
+pub(crate) use predicate::parse_sql_simple_predicate;
 
 /// Parse a SQL string into an [`Expression`] that yields a value of the given [`DataType`]
 /// (e.g. the type of the column whose default is being parsed).
@@ -78,12 +45,6 @@ pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> Delt
 ///
 /// Returns an error if the input is not a SQL form this parser accepts, or if the parsed value
 /// is not compatible with `data_type` (incompatible type, out of range, etc.).
-// Reached via the `column-defaults-in-dev` re-export, or the check-constraints lowering path under
-// `check-constraints-in-dev`; with neither it has no in-crate caller.
-#[cfg_attr(
-    not(feature = "column-defaults-in-dev"),
-    allow(dead_code, reason = "wired up by the check-constraints lowering path")
-)]
 pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
