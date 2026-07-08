@@ -35,6 +35,10 @@ mod scalars;
 mod sql;
 #[cfg(feature = "column-defaults-in-dev")]
 pub(crate) use self::sql::parse_sql;
+#[cfg(feature = "check-constraints-in-dev")]
+// TODO: Wire up `parse_sql_simple_predicate` to check-constraints discovery; remove this allow
+#[allow(unused_imports)]
+pub(crate) use self::sql::parse_sql_simple_predicate;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
