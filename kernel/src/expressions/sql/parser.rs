@@ -99,9 +99,25 @@ impl Parser {
         Ok(op)
     }
 
-    // operand := Literal | Ident ( '.' Ident )*
+    // operand := ('+' | '-')? Literal | Ident ( '.' Ident )*
+    //
+    // A leading sign applies only to a numeric literal (the tokenizer emits it as a separate
+    // Plus/Minus operator): the sign is folded back into the literal's raw text so the existing
+    // `parse_sql` types it, e.g. `-234` -> Literal("-234"). A sign before anything else (a column,
+    // string/date literal, keyword) is not a single-comparison operand and errors -- unary minus on
+    // a column and binary arithmetic are out of grammar.
     fn parse_operand(&mut self) -> DeltaResult<Operand> {
         match self.advance() {
+            Some(sign @ (Token::Plus | Token::Minus)) => match self.advance() {
+                Some(Token::Literal(raw)) if starts_numeric(&raw) => {
+                    let sign = if sign == Token::Minus { "-" } else { "+" };
+                    Ok(Operand::Literal(format!("{sign}{raw}")))
+                }
+                other => Err(Error::generic(format!(
+                    "expected a numeric literal after '{}' in CHECK constraint, found {other:?}",
+                    if sign == Token::Minus { '-' } else { '+' }
+                ))),
+            },
             Some(Token::Literal(raw)) => Ok(Operand::Literal(raw)),
             Some(Token::Ident(first)) => {
                 let mut path = vec![first];
@@ -123,6 +139,13 @@ impl Parser {
             ))),
         }
     }
+}
+
+/// Whether a literal's raw text is a number (so a leading sign may fold into it). Numeric literals
+/// begin with a digit or a leading-dot (`.5`); string/binary/date/boolean/null literals do not, so
+/// a sign before them (`-'foo'`) is rejected.
+fn starts_numeric(raw: &str) -> bool {
+    raw.starts_with(|c: char| c.is_ascii_digit() || c == '.')
 }
 
 #[cfg(test)]
@@ -175,6 +198,18 @@ mod tests {
         col(&["a", "b"]),
         Operand::Literal("1".into())
     )]
+    // A leading Minus/Plus folds into a numeric literal's raw text (the tokenizer emits it as a
+    // separate operator): `a > -234` -> right operand Literal("-234").
+    #[case(
+        vec![ident("a"), Token::Gt, Token::Minus, Token::Literal("234".into())],
+        col(&["a"]),
+        Operand::Literal("-234".into())
+    )]
+    #[case(
+        vec![Token::Plus, Token::Literal("5".into()), Token::Lt, ident("a")],
+        Operand::Literal("+5".into()),
+        col(&["a"])
+    )]
     fn parses_operand_shapes(
         #[case] tokens: Vec<Token>,
         #[case] left: Operand,
@@ -200,6 +235,12 @@ mod tests {
     #[case::keyword_junction(vec![
         ident("a"), Token::Gt, Token::Literal("0".into()),
         Token::Keyword(Keyword::And), ident("b"), Token::Lt, Token::Literal("9".into()),
+    ])]
+    // A sign applies only to a numeric literal: unary minus on a column (`-a`) and a sign before a
+    // non-numeric literal (`-'foo'`) are out of grammar.
+    #[case::sign_before_column(vec![Token::Minus, ident("a"), Token::Gt, Token::Literal("0".into())])]
+    #[case::sign_before_string(vec![
+        ident("a"), Token::Eq, Token::Minus, Token::Literal("'foo'".into()),
     ])]
     fn rejects_non_single_comparison(#[case] tokens: Vec<Token>) {
         assert!(parse(tokens).is_err());
