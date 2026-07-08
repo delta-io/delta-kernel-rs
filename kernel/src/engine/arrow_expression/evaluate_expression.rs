@@ -3,10 +3,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use itertools::Itertools;
 use tracing::warn;
 
+use crate::arrow::array::timezone::Tz;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -375,7 +376,16 @@ pub fn evaluate_expression(
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema)?;
+            let session_tz = m
+                .session_timezone
+                .as_deref()
+                .map(|tz| {
+                    tz.parse::<Tz>().map_err(|_| {
+                        Error::generic(format!("Invalid session timezone for MAP_TO_STRUCT: {tz}"))
+                    })
+                })
+                .transpose()?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema, session_tz.as_ref())?;
             Ok(Arc::new(result) as ArrayRef)
         }
         (MapToStruct(_), dt) => Err(Error::Generic(format!(
@@ -895,37 +905,56 @@ pub fn coalesce_arrays(
     Ok(make_array(mutable.freeze()))
 }
 
+/// Parses `raw` as a wall-clock timestamp in `tz`, returning the UTC instant in microseconds, or
+/// `None` if `raw` is not a valid timestamp. An offset-less string is interpreted in `tz`; a string
+/// carrying an explicit `Z`/offset honors that offset regardless of `tz`.
+fn parse_datetime_micros<T: TimeZone>(tz: &T, raw: &str) -> Option<i64> {
+    Some(string_to_datetime(tz, raw).ok()?.timestamp_micros())
+}
+
 /// Parses one raw partition-value string into its target [`Scalar`], or `None` for a null value.
 ///
 /// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
 ///
 /// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
-/// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
-/// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
-/// timestamp carrying an explicit offset) and interpret no-offset timestamps as UTC, matching
-/// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
-/// harmless on the read path. All other types go through `parse_scalar`.
-fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
+/// faster than `parse_scalar`'s chrono path. These arrow parsers accept a superset of the
+/// canonical formats (e.g. `20240115`, or a timestamp carrying an explicit offset); spec-compliant
+/// writers only emit canonical values, so the extra leniency is harmless on the read path. For
+/// dates, and for timestamps when `session_tz` is `None`, the result matches `parse_scalar`. All
+/// other types go through `parse_scalar`.
+///
+/// `session_tz` resolves offset-less `TIMESTAMP` value strings; `None` = UTC (matching
+/// `parse_scalar`). A non-`None` zone deliberately diverges from `parse_scalar`'s UTC
+/// interpretation for offset-less values. A string with an explicit `Z`/offset honors that offset
+/// regardless, and `TIMESTAMP_NTZ` is always UTC-relative (zone-independent).
+fn parse_partition_scalar(
+    prim: &PrimitiveType,
+    raw: &str,
+    session_tz: Option<&Tz>,
+) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
+    let parse_error = || Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()));
     match prim {
         PrimitiveType::Date => {
-            let days = Date32Type::parse(raw).ok_or_else(|| {
-                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-            })?;
+            let days = Date32Type::parse(raw).ok_or_else(parse_error)?;
             return Ok(Some(Scalar::Date(days)));
         }
+        // Offset-less timestamps resolve in the session zone (UTC when unset); explicit offsets are
+        // honored by the parser regardless.
         PrimitiveType::Timestamp => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
+            let micros = match session_tz {
+                Some(tz) => parse_datetime_micros(tz, raw),
+                None => parse_datetime_micros(&Utc, raw),
+            }
+            .ok_or_else(parse_error)?;
             return Ok(Some(Scalar::Timestamp(micros)));
         }
+        // NTZ is a zoneless wall-clock, so it is always UTC-relative regardless of the session
+        // zone.
         PrimitiveType::TimestampNtz => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
+            let micros = parse_datetime_micros(&Utc, raw).ok_or_else(parse_error)?;
             return Ok(Some(Scalar::TimestampNtz(micros)));
         }
         _ => {}
@@ -936,7 +965,8 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
-/// casts via [`PrimitiveType::empty_string_partition_cast`].
+/// casts via [`PrimitiveType::empty_string_partition_cast`]. `session_tz` resolves offset-less
+/// `TIMESTAMP` value strings; `None` = UTC.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -944,6 +974,7 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
+    session_tz: Option<&Tz>,
 ) -> DeltaResult<StructArray> {
     let map_array = map_arr
         .as_any()
@@ -1024,7 +1055,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw)? {
+                match parse_partition_scalar(target_types[i], raw, session_tz)? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -2359,6 +2390,131 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1718443800000000); // 2024-06-15T09:30:00Z
+    }
+
+    /// Evaluates `map_to_struct_in_timezone({ts: raw}, session_tz)` for a single output field of
+    /// type `ts_type` (`TIMESTAMP` or `TIMESTAMP_NTZ`), returning the parsed micros of row 0 (or
+    /// the evaluation error).
+    fn eval_ts_partition_in_tz(
+        raw: &str,
+        ts_type: PrimitiveType,
+        session_tz: Option<&str>,
+    ) -> DeltaResult<i64> {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("ts");
+        builder.values().append_value(raw);
+        builder.append(true).unwrap();
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![StructField::nullable("ts", ts_type)]);
+        let result_type = DataType::from(output_schema);
+        let expr =
+            Expr::map_to_struct_in_timezone(column_expr!("pv"), session_tz.map(str::to_string));
+        let result = evaluate_expression(&expr, &batch, Some(&result_type))?;
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let ts = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        Ok(ts.value(0))
+    }
+
+    #[test]
+    fn map_to_struct_offset_less_timestamp_uses_session_tz() {
+        // "2024-01-15 16:00:00" in America/New_York (UTC-5 in January) is 2024-01-15T21:00:00Z.
+        let micros = eval_ts_partition_in_tz(
+            "2024-01-15 16:00:00",
+            PrimitiveType::Timestamp,
+            Some("America/New_York"),
+        )
+        .unwrap();
+        assert_eq!(micros, 1_705_352_400_000_000);
+    }
+
+    #[test]
+    fn map_to_struct_offset_less_timestamp_fixed_offset_zone() {
+        // A fixed-offset zone (-05:00) resolves the same as the equivalent IANA name in January.
+        let micros = eval_ts_partition_in_tz(
+            "2024-01-15 16:00:00",
+            PrimitiveType::Timestamp,
+            Some("-05:00"),
+        )
+        .unwrap();
+        assert_eq!(micros, 1_705_352_400_000_000);
+    }
+
+    #[test]
+    fn map_to_struct_offset_less_timestamp_defaults_to_utc() {
+        // With no session zone, an offset-less string resolves as UTC: 2024-01-15T16:00:00Z.
+        let micros =
+            eval_ts_partition_in_tz("2024-01-15 16:00:00", PrimitiveType::Timestamp, None).unwrap();
+        assert_eq!(micros, 1_705_334_400_000_000);
+    }
+
+    #[test]
+    fn map_to_struct_explicit_z_ignores_session_tz() {
+        // An explicit `Z` pins the instant, so the session zone must not shift it.
+        let with_tz = eval_ts_partition_in_tz(
+            "2024-01-15T16:00:00Z",
+            PrimitiveType::Timestamp,
+            Some("America/Los_Angeles"),
+        )
+        .unwrap();
+        let without_tz =
+            eval_ts_partition_in_tz("2024-01-15T16:00:00Z", PrimitiveType::Timestamp, None)
+                .unwrap();
+        assert_eq!(with_tz, 1_705_334_400_000_000);
+        assert_eq!(with_tz, without_tz);
+    }
+
+    #[test]
+    fn map_to_struct_timestamp_ntz_ignores_session_tz() {
+        // TIMESTAMP_NTZ is a zoneless wall-clock: the session zone must not shift it, so 16:00
+        // stays 16:00 (UTC-relative) regardless of the zone.
+        let with_tz = eval_ts_partition_in_tz(
+            "2024-01-15 16:00:00",
+            PrimitiveType::TimestampNtz,
+            Some("America/New_York"),
+        )
+        .unwrap();
+        assert_eq!(with_tz, 1_705_334_400_000_000);
+    }
+
+    #[test]
+    fn map_to_struct_invalid_session_tz_errors() {
+        let err = eval_ts_partition_in_tz(
+            "2024-01-15 16:00:00",
+            PrimitiveType::Timestamp,
+            Some("Not/AZone"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid session timezone"),
+            "expected an invalid-timezone error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn map_to_struct_offset_less_timestamp_in_dst_gap_errors() {
+        // 02:30 on 2024-03-10 does not exist in America/New_York (clocks jump 02:00 -> 03:00), so
+        // the wall-clock is unresolvable and the parse errors rather than picking an offset.
+        let err = eval_ts_partition_in_tz(
+            "2024-03-10 02:30:00",
+            PrimitiveType::Timestamp,
+            Some("America/New_York"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ParseError(..)),
+            "expected a ParseError for a DST-gap wall-clock, got: {err}"
+        );
     }
 
     #[test]

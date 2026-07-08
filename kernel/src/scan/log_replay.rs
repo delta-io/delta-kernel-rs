@@ -54,11 +54,17 @@ impl Default for ScanStatsOptions {
 }
 
 /// Read-time partition value toggles consumed by [`ScanLogReplayProcessor`].
-#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScanPartitionValuesOptions {
     /// Emit the typed `partitionValues_parsed` struct column in scan metadata output,
     /// independent of any predicate.
     pub(crate) parsed_struct: bool,
+    /// Session timezone for resolving offset-less `TIMESTAMP` partition value strings
+    /// reconstructed from the string map; `None` = UTC. See
+    /// [`PartitionValuesOptions::with_session_timezone`].
+    ///
+    /// [`PartitionValuesOptions::with_session_timezone`]: crate::scan::PartitionValuesOptions::with_session_timezone
+    pub(crate) session_timezone: Option<String>,
 }
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
@@ -307,6 +313,7 @@ impl ScanLogReplayProcessor {
                     synthesize_json,
                     partition_schema_for_transform.clone(),
                     false,
+                    partition_values_options.session_timezone.as_deref(),
                 ),
                 output_schema.clone().into(),
             )?,
@@ -320,6 +327,7 @@ impl ScanLogReplayProcessor {
                     synthesize_json,
                     partition_schema_for_transform,
                     has_partition_values_parsed,
+                    partition_values_options.session_timezone.as_deref(),
                 ),
                 output_schema.into(),
             )?,
@@ -717,6 +725,9 @@ fn scan_row_schema_with_parsed_columns(
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
 ///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
 ///   the `partitionValues` string map.
+/// - `session_timezone`: Session zone for resolving offset-less `TIMESTAMP` partition value strings
+///   when reconstructing the struct from the string map; `None` = UTC. Ignored on the native
+///   `partitionValues_parsed` passthrough (the writer-frozen instant is read as-is).
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
@@ -728,6 +739,7 @@ fn get_add_transform_expr(
     synthesize_json: bool,
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
+    session_timezone: Option<&str>,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
@@ -778,8 +790,12 @@ fn get_add_transform_expr(
             // Checkpoint carries a native partitionValues_parsed column - read it directly.
             column_expr!("add.partitionValues_parsed")
         } else {
-            // No native column (JSON commit): reconstruct from the string map.
-            Expression::map_to_struct(column_expr!("add.partitionValues"))
+            // No native column (JSON commit): reconstruct from the string map, resolving
+            // offset-less TIMESTAMP values in the session zone.
+            Expression::map_to_struct_in_timezone(
+                column_expr!("add.partitionValues"),
+                session_timezone.map(str::to_string),
+            )
         };
         fields.push(Arc::new(pv_parsed_expr));
     }
@@ -1906,6 +1922,7 @@ mod tests {
             true,  // synthesize_json
             partition_schema.clone(),
             false, // has_partition_values_parsed
+            None,  // session_timezone
         );
         assert_eq!(
             count_to_json(&with_synthesis),
@@ -1921,6 +1938,7 @@ mod tests {
             false, // synthesize_json
             partition_schema,
             false, // has_partition_values_parsed
+            None,  // session_timezone
         );
         assert_eq!(
             count_to_json(&without_synthesis),

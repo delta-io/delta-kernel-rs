@@ -207,6 +207,14 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// JSON null on write) reconstructs into the checkpoint identically to how the scan reconstructs it
 /// from a commit.
 ///
+/// The fallback resolves offset-less `TIMESTAMP` partition values as UTC (the checkpoint writer has
+/// no session zone), so a kernel-written checkpoint freezes the UTC instant. A subsequent scan with
+/// [`PartitionValuesOptions::with_session_timezone`] reads that frozen column directly and does not
+/// re-resolve it, which is the documented divergence on that option. Aligning the checkpoint write
+/// path with a session zone is a follow-up.
+///
+/// [`PartitionValuesOptions::with_session_timezone`]: crate::scan::PartitionValuesOptions::with_session_timezone
+///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
     Arc::new(Expression::coalesce([

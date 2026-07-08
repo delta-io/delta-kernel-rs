@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
     Array, BinaryArray, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate};
+use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::scan::state::ScanFile;
@@ -155,12 +156,15 @@ fn scan_metadata_emits_partition_values_parsed_across_column_mapping(
 // did, then assert the kernel reconstructs `partitionValues_parsed` with the empty-string cast: ""
 // stays "" for string, becomes empty bytes for binary, and becomes null for every other type.
 
-/// Writes a foreign-writer table under `table_path`: protocol + metadata declaring string, binary,
-/// and integer partition columns (with `writeStatsAsStruct` enabled so a checkpoint writes its own
-/// `partitionValues_parsed` column), followed by one `add` commit holding `add_actions`.
+/// Writes a foreign-writer table under `table_path`: protocol + metadata declaring `fields` as the
+/// schema and `partition_columns` as the partition columns, with `configuration` applied (e.g.
+/// `delta.checkpoint.writeStatsAsStruct`), followed by one `add` commit holding `add_actions`.
 /// Returns the table URL.
 async fn write_foreign_partition_table(
     table_path: &std::path::Path,
+    fields: serde_json::Value,
+    partition_columns: &[&str],
+    configuration: serde_json::Value,
     add_actions: &[String],
 ) -> Url {
     std::fs::create_dir_all(table_path).unwrap();
@@ -168,24 +172,15 @@ async fn write_foreign_partition_table(
     let table_root = url.to_string();
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
 
-    let schema_string = serde_json::json!({
-        "type": "struct",
-        "fields": [
-            {"name": "p_str", "type": "string", "nullable": true, "metadata": {}},
-            {"name": "p_bin", "type": "binary", "nullable": true, "metadata": {}},
-            {"name": "p_int", "type": "integer", "nullable": true, "metadata": {}},
-            {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
-        ],
-    })
-    .to_string();
+    let schema_string = serde_json::json!({"type": "struct", "fields": fields}).to_string();
     let protocol = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     let metadata = serde_json::json!({
         "metaData": {
             "id": "00000000-0000-0000-0000-000000000000",
             "format": {"provider": "parquet", "options": {}},
             "schemaString": schema_string,
-            "partitionColumns": ["p_str", "p_bin", "p_int"],
-            "configuration": {"delta.checkpoint.writeStatsAsStruct": "true"},
+            "partitionColumns": partition_columns,
+            "configuration": configuration,
             "createdTime": 1700000000000_i64,
         },
     })
@@ -205,12 +200,12 @@ async fn write_foreign_partition_table(
     url
 }
 
-/// Builds an `add` action whose `partitionValues` map holds the given raw strings.
-fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
+/// Builds an `add` action whose `partitionValues` map is `partition_values`.
+fn add_action(path: &str, partition_values: serde_json::Value) -> String {
     serde_json::json!({
         "add": {
             "path": path,
-            "partitionValues": {"p_str": p_str, "p_bin": p_bin, "p_int": p_int},
+            "partitionValues": partition_values,
             "size": 100,
             "modificationTime": 1700000000000_i64,
             "dataChange": true,
@@ -218,6 +213,22 @@ fn add_action(path: &str, p_str: &str, p_bin: &str, p_int: &str) -> String {
         },
     })
     .to_string()
+}
+
+/// Schema fields for the string/binary/integer foreign partition fixture.
+fn str_bin_int_fields() -> serde_json::Value {
+    serde_json::json!([
+        {"name": "p_str", "type": "string", "nullable": true, "metadata": {}},
+        {"name": "p_bin", "type": "binary", "nullable": true, "metadata": {}},
+        {"name": "p_int", "type": "integer", "nullable": true, "metadata": {}},
+        {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
+    ])
+}
+
+/// The `writeStatsAsStruct=true` configuration, so a kernel checkpoint writes its own native
+/// `partitionValues_parsed` column (exercising the passthrough read branch).
+fn write_stats_as_struct_config() -> serde_json::Value {
+    serde_json::json!({"delta.checkpoint.writeStatsAsStruct": "true"})
 }
 
 /// A foreign writer can persist a literal "" in the `partitionValues` map. On read, kernel
@@ -237,11 +248,12 @@ async fn parsed_partition_values_read_foreign_empty_string(
     let table_path = temp_dir.path().join("foreign-empty-string");
     let url = write_foreign_partition_table(
         &table_path,
+        str_bin_int_fields(),
+        &["p_str", "p_bin", "p_int"],
+        write_stats_as_struct_config(),
         &[add_action(
             "p_str=/p_bin=/p_int=/part-0.parquet",
-            "",
-            "",
-            "",
+            serde_json::json!({"p_str": "", "p_bin": "", "p_int": ""}),
         )],
     )
     .await;
@@ -322,9 +334,18 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
     let table_path = temp_dir.path().join("empty-string-pruning");
     let url = write_foreign_partition_table(
         &table_path,
+        str_bin_int_fields(),
+        &["p_str", "p_bin", "p_int"],
+        write_stats_as_struct_config(),
         &[
-            add_action("p_str=/empty.parquet", "", "", ""),
-            add_action("p_str=other/other.parquet", "other", "other", "7"),
+            add_action(
+                "p_str=/empty.parquet",
+                serde_json::json!({"p_str": "", "p_bin": "", "p_int": ""}),
+            ),
+            add_action(
+                "p_str=other/other.parquet",
+                serde_json::json!({"p_str": "other", "p_bin": "other", "p_int": "7"}),
+            ),
         ],
     )
     .await;
@@ -389,5 +410,193 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         surviving(Predicate::eq(col!("p_bin"), lit(b"other".as_slice()))),
         vec![other.clone()],
         "empty-bytes file must be pruned under p_bin = X'6f74686572'"
+    );
+}
+
+// === Session-timezone timestamp partition resolution ===
+//
+// An offset-less TIMESTAMP partition string carries no zone, so the instant it denotes depends on
+// the session zone. Kernel resolves it in the zone supplied via
+// `PartitionValuesOptions::with_session_timezone`; a string with an explicit `Z`/offset pins its
+// own instant and ignores the zone. These tests reconstruct `partitionValues_parsed` from the
+// string map (the tz-aware path) on both a JSON commit and a kernel checkpoint written with the
+// default `writeStatsAsStruct=false`, so the checkpoint carries no native `partitionValues_parsed`
+// column and the read reconstructs from the map rather than reading a writer-frozen (UTC) struct.
+
+/// Schema fields for a single `TIMESTAMP` partition column `p_ts` plus a `value` data column.
+fn ts_partition_fields() -> serde_json::Value {
+    serde_json::json!([
+        {"name": "p_ts", "type": "timestamp", "nullable": true, "metadata": {}},
+        {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
+    ])
+}
+
+/// Reads the single `p_ts` value each file surfaces in `partitionValues_parsed`, keyed by the
+/// file's basename, scanning `url` with the given session zone.
+fn scan_p_ts_by_file(
+    engine: &dyn delta_kernel::Engine,
+    url: &Url,
+    session_timezone: &str,
+) -> std::collections::HashMap<String, i64> {
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_session_timezone(session_timezone),
+        )
+        .build()
+        .unwrap();
+
+    let mut by_file = std::collections::HashMap::new();
+    for scan_metadata in scan.scan_metadata(engine).unwrap() {
+        let (data, selection) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        let paths = get_column!(batch, "path", StringArray);
+        let pv = get_column!(batch, "partitionValues_parsed", StructArray);
+        let p_ts = pv
+            .column_by_name("p_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let file = paths.value(row).rsplit('/').next().unwrap().to_string();
+            assert!(!p_ts.is_null(row), "p_ts must be non-null for {file}");
+            by_file.insert(file, p_ts.value(row));
+        }
+    }
+    by_file
+}
+
+/// On a non-UTC session, an offset-less TIMESTAMP partition string resolves in the session zone,
+/// while a string with an explicit `Z` keeps its own instant. Both hold whether the parsed struct
+/// is reconstructed from a JSON commit or from a kernel checkpoint's string map, and across an IANA
+/// name and a fixed offset.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timestamp_partition_resolves_in_session_timezone(
+    #[values(false, true)] native_checkpoint: bool,
+    // `America/New_York` is UTC-5 in January; `-05:00` is the equivalent fixed offset, covering
+    // the fixed-offset `Tz` parse path alongside the IANA-name path.
+    #[values("America/New_York", "-05:00")] session_tz: &str,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("timestamp-session-tz");
+    // `bare.parquet`: offset-less, resolves in the session zone. `utc.parquet`: explicit `Z`,
+    // fixed.
+    let url = write_foreign_partition_table(
+        &table_path,
+        ts_partition_fields(),
+        &["p_ts"],
+        serde_json::json!({}),
+        &[
+            add_action(
+                "p_ts=2024-01-15 16%3A00%3A00/bare.parquet",
+                serde_json::json!({"p_ts": "2024-01-15 16:00:00"}),
+            ),
+            add_action(
+                "p_ts=2024-01-15 16%3A00%3A00Z/utc.parquet",
+                serde_json::json!({"p_ts": "2024-01-15T16:00:00Z"}),
+            ),
+        ],
+    )
+    .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+
+    if native_checkpoint {
+        let snapshot = Snapshot::builder_for(url.clone())
+            .build(engine.as_ref())
+            .unwrap();
+        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    }
+
+    // Micros for the instant each raw string denotes under a UTC-5 session zone:
+    // - "2024-01-15 16:00:00" (offset-less) -> 2024-01-15T21:00:00Z
+    // - "2024-01-15T16:00:00Z" (explicit Z) -> 2024-01-15T16:00:00Z, zone ignored
+    let bare_micros = 1_705_352_400_000_000_i64;
+    let utc_micros = 1_705_334_400_000_000_i64;
+
+    let by_file = scan_p_ts_by_file(engine.as_ref(), &url, session_tz);
+    assert_eq!(by_file.get("bare.parquet"), Some(&bare_micros));
+    assert_eq!(by_file.get("utc.parquet"), Some(&utc_micros));
+}
+
+// TIMESTAMP_NTZ is a zoneless wall-clock and must stay UTC-relative even under a non-UTC session
+// zone. That is guarded at the unit level (`map_to_struct_timestamp_ntz_ignores_session_tz` in
+// `evaluate_expression`), which avoids requiring the `timestampNtz` table feature here.
+
+/// Partition pruning on a TIMESTAMP column resolves the predicate against the session-zone-parsed
+/// `partitionValues_parsed` column. An offset-less partition value is kept or pruned based on the
+/// instant it denotes in the session zone, so an equality predicate written as the equivalent `Z`
+/// instant keeps the matching file and prunes the other. This is the mispruning the session zone
+/// fixes: under UTC the offset-less value would resolve to a different instant and the predicate
+/// would prune the wrong file.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timestamp_partition_pruning_in_session_timezone(
+    #[values(false, true)] native_checkpoint: bool,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("timestamp-pruning-session-tz");
+    // Two offset-less values one hour apart. Under America/New_York (UTC-5) they denote
+    // 2024-01-15T21:00:00Z and 2024-01-15T22:00:00Z respectively.
+    let url = write_foreign_partition_table(
+        &table_path,
+        ts_partition_fields(),
+        &["p_ts"],
+        serde_json::json!({}),
+        &[
+            add_action(
+                "p_ts=2024-01-15 16%3A00%3A00/a.parquet",
+                serde_json::json!({"p_ts": "2024-01-15 16:00:00"}),
+            ),
+            add_action(
+                "p_ts=2024-01-15 17%3A00%3A00/b.parquet",
+                serde_json::json!({"p_ts": "2024-01-15 17:00:00"}),
+            ),
+        ],
+    )
+    .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+
+    if native_checkpoint {
+        let snapshot = Snapshot::builder_for(url.clone())
+            .build(engine.as_ref())
+            .unwrap();
+        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    }
+
+    let surviving = |predicate: Predicate| -> Vec<String> {
+        let snapshot = Snapshot::builder_for(url.clone())
+            .build(engine.as_ref())
+            .unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .with_partition_values(
+                PartitionValuesOptions::with_struct().with_session_timezone("America/New_York"),
+            )
+            .with_predicate(Arc::new(predicate))
+            .build()
+            .unwrap();
+        let mut paths = Vec::new();
+        for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+            paths = scan_metadata
+                .unwrap()
+                .visit_scan_files(paths, collect_path)
+                .unwrap();
+        }
+        paths.sort();
+        paths
+    };
+
+    // 16:00 in America/New_York is 21:00Z. The predicate written as that instant keeps a.parquet
+    // and prunes b.parquet (whose value is 22:00Z).
+    let a = "p_ts=2024-01-15 16%3A00%3A00/a.parquet".to_string();
+    let target = lit(Scalar::Timestamp(1_705_352_400_000_000)); // 2024-01-15T21:00:00Z
+    assert_eq!(
+        surviving(Predicate::eq(col!("p_ts"), target)),
+        vec![a],
+        "only the file whose session-zone instant equals the predicate survives"
     );
 }
