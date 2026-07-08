@@ -36,6 +36,11 @@ pub(super) enum Token {
     Ne,
     /// `<=>`, Spark's null-safe equality (`NULL <=> NULL` is true).
     NullSafeEq,
+    /// `+` and `-`. Emitted as standalone operators (matching Spark, where a leading sign is unary
+    /// minus/plus, not part of the number). A number is never lexed with a sign; the caller
+    /// reassembles a signed literal from `Minus`/`Plus` followed by a numeric `Literal`.
+    Plus,
+    Minus,
     /// The `AND`/`OR`/`NOT`/`IS` keywords. Recognized here (not left as [`Token::Ident`]) so a
     /// backtick-quoted column literally named `` `AND` `` stays an `Ident`, distinct from the
     /// keyword. The current parser has no grammar for them and rejects them; they are tokenized so
@@ -128,15 +133,18 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
                 chars.next();
                 tokens.push(Token::Ident(parse_escaped_field_name(&mut chars)?));
             }
+            // `+`/`-` are standalone operators (Spark treats a leading sign as unary +/-, not part
+            // of the number); the parser reassembles a signed literal from the sign + number.
             // TODO: recognize `(` / `)` as LParen / RParen tokens once the grammar supports
-            // grouping; today a sign is only valid as the start of a numeric literal (no arithmetic
-            // operators yet), so `a - b` and `(a)` are rejected here.
-            '+' | '-' => match peek_second(&chars) {
-                Some(d) if d.is_ascii_digit() || d == '.' => {
-                    tokens.push(Token::Literal(take_number(&mut chars)))
-                }
-                _ => return Err(unexpected(c, sql)),
-            },
+            // grouping.
+            '+' => {
+                chars.next();
+                tokens.push(Token::Plus);
+            }
+            '-' => {
+                chars.next();
+                tokens.push(Token::Minus);
+            }
             c if c.is_ascii_digit() => tokens.push(Token::Literal(take_number(&mut chars))),
             c if c.is_ascii_alphabetic() || c == '_' => {
                 tokens.push(classify_word(&mut chars, sql)?)
@@ -186,14 +194,13 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
     }
 }
 
-/// Consume a numeric literal: optional leading sign, integer/fraction digits, optional exponent.
+/// Consume an unsigned numeric literal: integer/fraction digits and an optional exponent. A leading
+/// `+`/`-` is a separate operator token (see the `Plus`/`Minus` arms), not consumed here; the
+/// exponent's own sign (`2e+1`) is part of the number.
 ///
-/// Example: `-2e+1` returns `-2e+1`. Stops before a second operator, so `1+1` yields just `1`.
+/// Example: `2e+1` returns `2e+1`. Stops before a second operator, so `1+1` yields just `1`.
 fn take_number(chars: &mut CharStream<'_>) -> String {
     let mut out = String::new();
-    if let Some(sign) = chars.next_if(|c| *c == '+' || *c == '-') {
-        out.push(sign);
-    }
     while let Some(c) = chars.next_if(|c| c.is_ascii_digit() || *c == '.') {
         out.push(c);
     }
@@ -279,6 +286,8 @@ mod tests {
     #[case("<=>", Token::NullSafeEq)]
     #[case("!>", Token::Le)]
     #[case("!<", Token::Ge)]
+    #[case("+", Token::Plus)]
+    #[case("-", Token::Minus)]
     fn tokenizes_each_operator(#[case] op: &str, #[case] expected: Token) {
         assert_eq!(
             tokenize(&format!("a {op} 1")).unwrap(),
@@ -291,13 +300,24 @@ mod tests {
         );
     }
 
+    /// A leading `+`/`-` is a standalone operator, not part of the number -- so a signed literal
+    /// lexes as two tokens (the parser reassembles it), and whitespace between the sign and the
+    /// digits (`- 5`) is irrelevant. The exponent's own sign stays inside the number.
+    #[rstest]
+    #[case("-5", &[Token::Minus, lit("5")])]
+    #[case("- 5", &[Token::Minus, lit("5")])]
+    #[case("+5", &[Token::Plus, lit("5")])]
+    #[case("-.5", &[Token::Minus, lit(".5")])]
+    #[case("-2e+1", &[Token::Minus, lit("2e+1")])]
+    fn tokenizes_signed_number_as_sign_then_literal(#[case] sql: &str, #[case] expected: &[Token]) {
+        assert_eq!(tokenize(sql).unwrap(), expected);
+    }
+
     #[rstest]
     #[case("42", lit("42"))]
-    #[case("-5", lit("-5"))]
     #[case(".5", lit(".5"))]
-    #[case("-.5", lit("-.5"))]
     #[case("1e3", lit("1e3"))]
-    #[case("-2e+1", lit("-2e+1"))]
+    #[case("2e+1", lit("2e+1"))] // the exponent sign is part of the number
     #[case("'foo'", lit("'foo'"))]
     #[case("'O''Brien'", lit("'O''Brien'"))] // doubled '' escape retained
     #[case("NULL", lit("NULL"))]
