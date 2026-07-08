@@ -234,7 +234,7 @@ impl Display for ColumnName {
 }
 
 // Simple column names contain only simple chars, and do not need to be wrapped in backticks.
-fn is_simple_char(c: char) -> bool {
+pub(crate) fn is_simple_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
@@ -341,8 +341,11 @@ fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     Ok(name)
 }
 
-/// Parses a field name escaped with backticks, e.g. "`ab``c``d`".
-fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
+/// Parses a field name escaped with backticks, e.g. "`ab``c``d`", returning its unescaped logical
+/// name. The caller must have already consumed the opening backtick. Shared with the
+/// check-constraint tokenizer ([`crate::expressions::sql`]) so backtick-quoted column references
+/// parse identically.
+pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     let mut name = String::new();
     loop {
         match chars.next() {
