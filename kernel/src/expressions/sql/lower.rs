@@ -5,6 +5,7 @@
 //! comparison, and the literal itself is parsed by reusing [`super::parse_sql`].
 
 // WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
+// TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
 #![allow(dead_code)]
 
 use super::parse_sql;

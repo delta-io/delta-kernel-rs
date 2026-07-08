@@ -59,7 +59,7 @@ mod token;
 /// `IN`, `BETWEEN`, ...), for unknown columns, and for type-incompatible literals. Callers treat
 /// that error as the signal that a constraint is *not kernel-parsable*.
 #[cfg(feature = "check-constraints-in-dev")]
-// TODO: remove once check-constraints discovery calls this; no in-crate caller until then.
+// TODO(#2896): remove once check-constraints discovery calls this; no in-crate caller until then.
 #[allow(dead_code)]
 pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
     let tokens = token::tokenize(sql)?;
