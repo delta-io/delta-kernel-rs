@@ -288,16 +288,25 @@ mod tests {
         "ratio < 1e3",
         Predicate::lt(col("ratio"), Expression::literal(Scalar::Double(1000.0)))
     )]
-    // Signed numbers: a leading sign, and a signed exponent, each stay part of one numeric literal.
+    // Signed numbers: the tokenizer emits the sign as a separate operator and the parser folds it
+    // back into the literal, so `-5` and `- 5` (whitespace-insensitive, matching Spark) both lower
+    // to the same negative literal. A leading `+` is accepted and is a no-op.
     #[case::negative_literal(
         "amount = -5",
         Predicate::eq(col("amount"), Expression::literal(-5i64))
+    )]
+    #[case::negative_literal_with_space(
+        "amount = - 5",
+        Predicate::eq(col("amount"), Expression::literal(-5i64))
+    )]
+    #[case::positive_literal(
+        "amount = +5",
+        Predicate::eq(col("amount"), Expression::literal(5i64))
     )]
     #[case::signed_exponent(
         "ratio >= -2e+1",
         Predicate::ge(col("ratio"), Expression::literal(Scalar::Double(-20.0)))
     )]
-    // A leading sign immediately followed by a leading-dot decimal stays one numeric literal.
     #[case::negative_leading_dot_decimal(
         "ratio > -.5",
         Predicate::gt(col("ratio"), Expression::literal(Scalar::Double(-0.5)))
