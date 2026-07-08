@@ -665,13 +665,13 @@ mod tests {
             .filename;
         if &v2.path == selected {
             assert_eq!(
-                seg.checkpoint_sidecars(),
+                seg.checkpoint_hint_sidecars(),
                 v2.sidecar_files.as_deref(),
                 "{table}: matched hint exposes its sidecars"
             );
         } else {
             assert!(
-                seg.checkpoint_schema().is_none() && seg.checkpoint_sidecars().is_none(),
+                seg.checkpoint_hint_schema().is_none() && seg.checkpoint_hint_sidecars().is_none(),
                 "{table}: mismatched hint ({}) must be suppressed",
                 v2.path
             );

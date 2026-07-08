@@ -78,14 +78,14 @@ impl CheckpointScanShape {
         // capture the schema for a leaf checkpiont if available, since that schema carries the
         // parsed stats.
         let hint_sidecar = segment
-            .checkpoint_sidecars()
+            .checkpoint_hint_sidecars()
             .and_then(|sidecars| sidecars.first());
         let (sidecar, root_checkpoint_schema) = match (file_type, hint_sidecar) {
-            // The `_last_checkpoint` hint lists a sidecar so this checkpoint is  a manifest.
+            // The `_last_checkpoint` hint lists a sidecar so this checkpoint is a manifest.
             (_, Some(sidecar)) => (Some(sidecar.to_filemeta(&segment.log_root)?), None),
             (FileType::Parquet, None) => {
                 // Prefer the `_last_checkpoint` schema hint to avoid a footer read.
-                let cp_schema = match segment.checkpoint_schema() {
+                let cp_schema = match segment.checkpoint_hint_schema() {
                     Some(schema) => schema,
                     None => read_footer_schema(exec, root_checkpoint)?,
                 };
@@ -101,7 +101,7 @@ impl CheckpointScanShape {
                 let leaf_checkpoint_schema = sidecar.is_none().then_some(cp_schema);
                 (sidecar, leaf_checkpoint_schema)
             }
-            // It is not possible to know ahead of time if a json checkpoint is a manifets or
+            // It is not possible to know ahead of time if a json checkpoint is a manifest or
             // if it is leaf level. We try to read a sidecar file to decide.
             (FileType::Json, None) => (
                 collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)?,

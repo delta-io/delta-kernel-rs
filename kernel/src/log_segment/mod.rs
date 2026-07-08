@@ -114,9 +114,9 @@ pub(crate) struct LogSegment {
 
     /// The retained `_last_checkpoint` hint, if one was read when this segment was built. The hint
     /// may describe a different checkpoint than the one this segment selected, so for validated
-    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_schema`] /
-    /// [`Self::checkpoint_sidecars`] accessors built on it). Read this field directly only when
-    /// the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
+    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_hint_schema`] /
+    /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
+    /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
@@ -269,7 +269,7 @@ impl LogSegment {
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
-    pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
+    pub(crate) fn checkpoint_hint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
     }
 
@@ -278,7 +278,7 @@ impl LogSegment {
     /// `sidecarFiles`; `Some(&[])` if the hint listed none. A non-empty slice identifies a manifest
     /// checkpoint whose file actions live in those sidecars.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
-    pub(crate) fn checkpoint_sidecars(&self) -> Option<&[Sidecar]> {
+    pub(crate) fn checkpoint_hint_sidecars(&self) -> Option<&[Sidecar]> {
         self.checkpoint_hint()?
             .v2_checkpoint
             .as_ref()?
@@ -817,7 +817,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
-        let hint_schema = self.checkpoint_schema();
+        let hint_schema = self.checkpoint_hint_schema();
 
         // All parts of a multi-part checkpoint belong to the same table version and follow
         // the same V1 spec, so reading any one part's schema is sufficient.
