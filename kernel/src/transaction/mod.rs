@@ -1370,7 +1370,7 @@ impl<S> Transaction<S> {
                     .table_root()
                     .join("_delta_log/")?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
-                let crc = crc_delta.into_crc_for_version_zero().ok_or_else(|| {
+                let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
                     Error::internal_error("CREATE TABLE CRC delta is missing protocol or metadata")
                 })?;
                 let stats = PostCommitStats {
