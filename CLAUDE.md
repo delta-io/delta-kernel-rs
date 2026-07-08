@@ -113,13 +113,15 @@ directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` ac
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.
 - **Consider `TestTableBuilder` (`test_utils::table_builder`) to build the table under test.**
-  When a test needs a Delta table in a specific state -- a given set of features, a partitioned
-  or clustered layout, checkpoints, CRC files, a stale/missing `_last_checkpoint` hint, or
-  post-cleanup logs -- the builder is often a good fit, composing these axes (`LogState x
-  FeatureSet x DataLayoutConfig x TableConfig`) through the real kernel write path so the table
-  is protocol-correct by construction. Load a snapshot at any `VersionTarget` with the
-  `build_snapshot!` macro. For coverage across many table states, the `default_sweep`
-  cross-product template (or a per-axis template with your own `#[values]`) can help; see
+  Unlike `create_table`, which produces an empty table (just `00.json`) with a given set of
+  features and data layout, the builder *builds up* a multi-version table: data files written
+  across many commits, plus checkpoints, CRC files, a stale/missing `_last_checkpoint` hint, or
+  post-cleanup logs. So when a test needs a populated table history in a specific state, the
+  builder is often a good fit, composing these axes (`LogState x FeatureSet x DataLayoutConfig x
+  TableConfig`) through the real kernel write path so the table is protocol-correct by
+  construction. Load a snapshot at any `VersionTarget` with the `build_snapshot!` macro. For
+  coverage across many table states, the `default_sweep` cross-product template (or a per-axis
+  template with your own `#[values]`) can help; see
   `kernel/tests/integration/cross_product/mod.rs`. Drop to lower-level setup like
   `test_table_setup` (or hand-rolled `add_commit` / `LocalMockTable`) only when necessary --
   e.g. for states the builder cannot express, such as corrupt or malformed logs.
