@@ -6,6 +6,7 @@
 //! Lowering ([`super::lower`]) resolves the operands against the table schema.
 
 // WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
+// TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
 #![allow(dead_code)]
 
 use super::token::Token;
