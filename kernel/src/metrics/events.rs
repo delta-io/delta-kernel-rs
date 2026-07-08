@@ -1194,10 +1194,10 @@ pub struct ScanMetadataCompleted {
     pub num_predicate_filtered: u64,
     /// Peak size of the deduplication hash set.
     pub peak_hash_set_size: usize,
-    /// Time spent in the deduplication visitor (milliseconds).
-    pub dedup_visitor_time_ms: u64,
-    /// Time spent evaluating predicates (milliseconds).
-    pub predicate_eval_time_ms: u64,
+    /// Time spent in the deduplication visitor.
+    pub dedup_visitor_time: Duration,
+    /// Time spent evaluating predicates.
+    pub predicate_eval_time: Duration,
 }
 
 impl ScanMetadataCompleted {
@@ -1219,8 +1219,8 @@ impl ScanMetadataCompleted {
             num_non_file_actions: v.num_non_file_actions,
             num_predicate_filtered: v.num_predicate_filtered,
             peak_hash_set_size: v.peak_hash_set_size as usize,
-            dedup_visitor_time_ms: v.dedup_visitor_time_ms,
-            predicate_eval_time_ms: v.predicate_eval_time_ms,
+            dedup_visitor_time: Duration::from_nanos(v.dedup_visitor_time_ns),
+            predicate_eval_time: Duration::from_nanos(v.predicate_eval_time_ns),
         }
     }
 }
@@ -1240,8 +1240,8 @@ impl fmt::Display for ScanMetadataCompleted {
             num_non_file_actions,
             num_predicate_filtered,
             peak_hash_set_size,
-            dedup_visitor_time_ms,
-            predicate_eval_time_ms,
+            dedup_visitor_time,
+            predicate_eval_time,
         } = self;
         write!(
             f,
@@ -1251,7 +1251,7 @@ impl fmt::Display for ScanMetadataCompleted {
              active_add_files_bytes={active_add_files_bytes}, \
              remove_files_seen={num_remove_files_seen}, non_file_actions={num_non_file_actions}, \
              predicate_filtered={num_predicate_filtered}, peak_hash_set_size={peak_hash_set_size}, \
-             dedup_visitor_time_ms={dedup_visitor_time_ms}, predicate_eval_time_ms={predicate_eval_time_ms})"
+             dedup_visitor_time={dedup_visitor_time:?}, predicate_eval_time={predicate_eval_time:?})"
         )
     }
 }
@@ -1270,8 +1270,8 @@ struct ScanMetadataCompletedAttrs {
     num_non_file_actions: u64,
     num_predicate_filtered: u64,
     peak_hash_set_size: u64,
-    dedup_visitor_time_ms: u64,
-    predicate_eval_time_ms: u64,
+    dedup_visitor_time_ns: u64,
+    predicate_eval_time_ns: u64,
 }
 
 impl Visit for ScanMetadataCompletedAttrs {
@@ -1297,8 +1297,8 @@ impl Visit for ScanMetadataCompletedAttrs {
             "num_non_file_actions" => self.num_non_file_actions = value,
             "num_predicate_filtered" => self.num_predicate_filtered = value,
             "peak_hash_set_size" => self.peak_hash_set_size = value,
-            "dedup_visitor_time_ms" => self.dedup_visitor_time_ms = value,
-            "predicate_eval_time_ms" => self.predicate_eval_time_ms = value,
+            "dedup_visitor_time_ns" => self.dedup_visitor_time_ns = value,
+            "predicate_eval_time_ns" => self.predicate_eval_time_ns = value,
             _ => {}
         }
     }
@@ -1533,8 +1533,8 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
         num_non_file_actions = e.num_non_file_actions,
         num_predicate_filtered = e.num_predicate_filtered,
         peak_hash_set_size = e.peak_hash_set_size as u64,
-        dedup_visitor_time_ms = e.dedup_visitor_time_ms,
-        predicate_eval_time_ms = e.predicate_eval_time_ms,
+        dedup_visitor_time_ns = e.dedup_visitor_time.as_nanos() as u64,
+        predicate_eval_time_ns = e.predicate_eval_time.as_nanos() as u64,
     );
 }
 

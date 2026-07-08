@@ -9,9 +9,9 @@
 //!
 //! - [`AuthHeaderProvider`] -- headers attached to every request (auth, identity). Consulted per
 //!   request, so an implementation can refresh short-lived credentials.
-//! - [`RestEndpointConfig`] -- the REST dialect, described as data: path-to-URL mapping, list and
-//!   write query parameters, list-response field names, and backend-specific HTTP statuses (e.g.
-//!   409) to [`ObjectStoreError`] mapping.
+//! - [`RestEndpointConfig`] -- the REST dialect: path-to-URL mapping, list and write query
+//!   parameters, and list-response JSON field names. HTTP `404 -> NotFound` and `409 ->
+//!   AlreadyExists` are mapped in [`RestObjectStore`](RestObjectStore).
 //!
 //! Only the operations kernel needs are implemented (read, head, list, write, delete); the rest
 //! return [`ObjectStoreError::NotSupported`].
@@ -20,7 +20,7 @@ use delta_kernel::object_store::Error as ObjectStoreError;
 
 mod auth;
 mod client;
-mod contract;
+mod config;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -29,25 +29,15 @@ pub use auth::{
     headers_from_pairs, AuthHeaderProvider, RefreshingHeaderProvider, StaticHeaderProvider,
 };
 pub use client::{build_rest_client, RestClientOptions};
-pub use contract::RestEndpointConfig;
+pub use config::RestEndpointConfig;
 pub use store::RestObjectStore;
 
-/// Build a generic [`ObjectStoreError`] from a source error.
-pub(crate) fn generic_err<E: std::error::Error + Send + Sync + 'static>(
-    err: E,
+/// Build a generic [`ObjectStoreError`] from a source error or message.
+pub(crate) fn generic_error(
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> ObjectStoreError {
     ObjectStoreError::Generic {
         store: "RestObjectStore",
-        source: Box::new(err),
-    }
-}
-
-/// Build a generic [`ObjectStoreError`] from a message.
-pub(crate) fn generic_msg(
-    msg: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-) -> ObjectStoreError {
-    ObjectStoreError::Generic {
-        store: "RestObjectStore",
-        source: msg.into(),
+        source: source.into(),
     }
 }

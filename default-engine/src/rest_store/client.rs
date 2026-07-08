@@ -1,5 +1,5 @@
 //! Builds the [`reqwest::Client`] backing a [`RestObjectStore`](super::RestObjectStore), including
-//! optional mTLS and DNS overrides.
+//! optional TLS client auth, DNS overrides, and request timeouts.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,10 +9,11 @@ use reqwest::Client;
 #[cfg(any(feature = "rustls", feature = "native-tls"))]
 use reqwest::{Certificate, Identity};
 
-use super::{generic_err, generic_msg};
+use super::generic_error;
 
 /// Options for the [`reqwest::Client`] backing a [`RestObjectStore`](super::RestObjectStore). All
-/// fields are optional; the default value yields a plain client.
+/// fields are optional; the default value yields a plain client. When `cert_path`, `key_path`, and
+/// `ca_path` are all set, mutual TLS is enabled.
 #[derive(Debug, Clone, Default)]
 pub struct RestClientOptions {
     /// PEM client-certificate path. mTLS is enabled only when cert, key, and CA are all set.
@@ -36,16 +37,16 @@ pub struct RestClientOptions {
 
 #[cfg(feature = "rustls")]
 fn build_identity(cert: &str, key: &str) -> ObjectStoreResult<Identity> {
-    let mut bundle = std::fs::read(cert).map_err(generic_err)?;
-    bundle.extend_from_slice(&std::fs::read(key).map_err(generic_err)?);
-    Identity::from_pem(&bundle).map_err(generic_err)
+    let mut bundle = std::fs::read(cert).map_err(generic_error)?;
+    bundle.extend_from_slice(&std::fs::read(key).map_err(generic_error)?);
+    Identity::from_pem(&bundle).map_err(generic_error)
 }
 
 #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
 fn build_identity(cert: &str, key: &str) -> ObjectStoreResult<Identity> {
-    let cert_pem = std::fs::read(cert).map_err(generic_err)?;
-    let key_pem = std::fs::read(key).map_err(generic_err)?;
-    Identity::from_pkcs8_pem(&cert_pem, &key_pem).map_err(generic_err)
+    let cert_pem = std::fs::read(cert).map_err(generic_error)?;
+    let key_pem = std::fs::read(key).map_err(generic_error)?;
+    Identity::from_pkcs8_pem(&cert_pem, &key_pem).map_err(generic_error)
 }
 
 // CA-cert read and builder assembly are backend-agnostic, so they live once here.
@@ -58,7 +59,7 @@ fn configure_mtls(
 ) -> ObjectStoreResult<reqwest::ClientBuilder> {
     let identity = build_identity(cert, key)?;
     let ca_cert =
-        Certificate::from_pem(&std::fs::read(ca).map_err(generic_err)?).map_err(generic_err)?;
+        Certificate::from_pem(&std::fs::read(ca).map_err(generic_error)?).map_err(generic_error)?;
     Ok(builder.identity(identity).add_root_certificate(ca_cert))
 }
 
@@ -69,7 +70,7 @@ fn configure_mtls(
     _key: &str,
     _ca: &str,
 ) -> ObjectStoreResult<reqwest::ClientBuilder> {
-    Err(generic_msg(
+    Err(generic_error(
         "mTLS requires the `rustls` or `native-tls` feature to be enabled",
     ))
 }
@@ -99,7 +100,7 @@ pub fn build_rest_client(opts: &RestClientOptions) -> ObjectStoreResult<Client> 
         (None, None, None) => {}
         // A partial mTLS config is an error, not a silent fall-through to a plain client.
         _ => {
-            return Err(generic_msg(
+            return Err(generic_error(
                 "partial mTLS config: cert_path, key_path, and ca_path must be set \
                  together (or all omitted)",
             ));
@@ -111,12 +112,12 @@ pub fn build_rest_client(opts: &RestClientOptions) -> ObjectStoreResult<Client> 
             continue;
         }
         let (host, addr) = entry.split_once('=').ok_or_else(|| {
-            generic_msg(format!(
+            generic_error(format!(
                 "invalid DNS override (expected `host=ip:port`): {entry}"
             ))
         })?;
-        let addr: SocketAddr = addr.parse().map_err(generic_err)?;
+        let addr: SocketAddr = addr.parse().map_err(generic_error)?;
         builder = builder.resolve(host, addr);
     }
-    builder.build().map_err(generic_err)
+    builder.build().map_err(generic_error)
 }

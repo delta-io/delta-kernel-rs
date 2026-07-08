@@ -229,7 +229,7 @@ mod tests {
     use super::*;
     use crate::expressions::{column_name, ColumnName};
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
+        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
         StructField, StructType,
     };
 
@@ -409,19 +409,14 @@ mod tests {
     // === apply_schema_operations: SetNullable tests ===
 
     fn deeply_nested_required_schema() -> StructType {
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![StructField::nullable(
-                    "location",
-                    StructType::try_new(vec![StructField::not_null("zipcode", DataType::STRING)])
-                        .unwrap(),
-                )])
-                .unwrap(),
-            ),
-        ])
-        .unwrap()
+        schema! {
+            not_null "id": INTEGER,
+            nullable "address": {
+                nullable "location": {
+                    not_null "zipcode": STRING,
+                },
+            },
+        }
     }
 
     #[rstest]

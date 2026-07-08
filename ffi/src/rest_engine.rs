@@ -2,7 +2,7 @@
 //!
 //! Mirrors the object-store engine builder (`get_engine_builder` / `set_builder_option` /
 //! `builder_build`): create a builder for a base URL, set string options, optionally register a
-//! per-request auth callback, then build. Options describe the REST contract (the
+//! per-request auth callback, then build. Options describe the REST endpoint config (the
 //! [`RestEndpointConfig`] field names), request headers (`header.<Name>`), TLS material
 //! (`tls.cert_path` / `tls.key_path` / `tls.ca_path` / `tls.dns_override` / `tls.timeout_secs`),
 //! and resilience (`retry.max_retries`, `put.verify_on_ambiguous`), so a backend is configured
@@ -13,16 +13,18 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
-use delta_kernel::{DeltaResult, Engine, Error};
+use delta_kernel::{DeltaResult, Error};
 use delta_kernel_default_engine::rest_store::{
     build_rest_client, headers_from_pairs, AuthHeaderProvider, RefreshingHeaderProvider,
     RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
 };
-use delta_kernel_default_engine::DefaultEngineBuilder;
 
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::{engine_to_handle, KernelStringSlice, SharedExternEngine, TryFromStringSlice};
+use crate::{
+    build_engine_from_store, IoConcurrencyConfig, KernelStringSlice, MultithreadedExecutorConfig,
+    SharedExternEngine, TryFromStringSlice,
+};
 
 /// Supplies the current auth/identity headers for a REST engine. The implementation calls the
 /// named [`rest_engine_emit_auth_header`] export once per header it wants attached, and may call
@@ -114,14 +116,21 @@ pub struct RestEngineBuilder {
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
     auth_callback: Option<AuthCallbackContext>,
+    multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
+    io_config: IoConcurrencyConfig,
 }
 
 impl RestEngineBuilder {
-    fn opt_or(&self, key: &str, default: &str) -> String {
+    fn require_option(&self, key: &str) -> DeltaResult<String> {
         self.options
             .get(key)
+            .filter(|v| !v.is_empty())
             .cloned()
-            .unwrap_or_else(|| default.to_string())
+            .ok_or_else(|| Error::generic(format!("missing required REST engine option `{key}`")))
+    }
+
+    fn optional_prefix(&self, key: &str) -> String {
+        self.options.get(key).cloned().unwrap_or_default()
     }
 }
 
@@ -147,6 +156,8 @@ fn get_rest_engine_builder_impl(
         allocate_fn,
         options: HashMap::new(),
         auth_callback: None,
+        multithreaded_executor_config: None,
+        io_config: IoConcurrencyConfig::default(),
     })))
 }
 
@@ -173,6 +184,44 @@ fn set_rest_engine_builder_option_impl(
     let value = unsafe { String::try_from_slice(&value) }?;
     builder.options.insert(key, value);
     Ok(true)
+}
+
+/// Configure the builder to use a multi-threaded executor instead of the default
+/// single-threaded background executor.
+///
+/// # Safety
+/// Caller must pass a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn set_rest_engine_builder_with_multithreaded_executor(
+    builder: &mut RestEngineBuilder,
+    worker_threads: usize,
+    max_blocking_threads: usize,
+) {
+    let worker_threads = (worker_threads != 0).then_some(worker_threads);
+    let max_blocking_threads = (max_blocking_threads != 0).then_some(max_blocking_threads);
+
+    builder.multithreaded_executor_config = Some(MultithreadedExecutorConfig {
+        worker_threads,
+        max_blocking_threads,
+    });
+}
+
+/// Configure read-path I/O concurrency for the engine's JSON and Parquet handlers.
+///
+/// # Safety
+/// Caller must pass a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn set_rest_engine_builder_with_io_concurrency(
+    builder: &mut RestEngineBuilder,
+    buffer_size: usize,
+    batch_size: usize,
+) {
+    use std::num::NonZero;
+
+    builder.io_config = IoConcurrencyConfig {
+        buffer_size: NonZero::new(buffer_size),
+        batch_size: NonZero::new(batch_size),
+    };
 }
 
 /// Register an [`AuthHeaderCallback`] supplying the current headers (for short-lived, refreshable
@@ -207,26 +256,43 @@ pub unsafe extern "C" fn rest_engine_builder_build(
     rest_engine_builder_build_impl(&builder).into_extern_result(&builder.allocate_fn)
 }
 
+fn rest_endpoint_config_from_builder(
+    builder: &RestEngineBuilder,
+) -> DeltaResult<RestEndpointConfig> {
+    Ok(RestEndpointConfig {
+        files_prefix: builder.optional_prefix("files_prefix"),
+        directories_prefix: builder.optional_prefix("directories_prefix"),
+        page_token_param: builder.require_option("page_token_param")?,
+        start_from_param: builder.require_option("start_from_param")?,
+        recursive_param: builder.require_option("recursive_param")?,
+        overwrite_param: builder.require_option("overwrite_param")?,
+        contents_field: builder.require_option("contents_field")?,
+        next_page_token_field: builder.require_option("next_page_token_field")?,
+        entry_path_field: builder.require_option("entry_path_field")?,
+        entry_size_field: builder.require_option("entry_size_field")?,
+        entry_is_directory_field: builder.require_option("entry_is_directory_field")?,
+        entry_last_modified_field: builder.require_option("entry_last_modified_field")?,
+        entry_strip_prefix: builder.options.get("entry_strip_prefix").cloned(),
+    })
+}
+
+fn parse_bool_option(key: &str, value: Option<&String>) -> DeltaResult<bool> {
+    match value {
+        None => Ok(false),
+        Some(v) => match v.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(Error::generic(format!(
+                "invalid {key} `{other}`: expected `true` or `false`"
+            ))),
+        },
+    }
+}
+
 fn rest_engine_builder_build_impl(
     builder: &RestEngineBuilder,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    // Field-name and query-param fallbacks mirror the Databricks Files API; a caller targeting a
-    // different REST backend overrides any of them via `set_rest_engine_builder_option`.
-    let config = RestEndpointConfig {
-        files_prefix: builder.opt_or("files_prefix", ""),
-        directories_prefix: builder.opt_or("directories_prefix", ""),
-        page_token_param: builder.opt_or("page_token_param", "page_token"),
-        start_from_param: builder.opt_or("start_from_param", "start_from"),
-        recursive_param: builder.opt_or("recursive_param", "recursive"),
-        overwrite_param: builder.opt_or("overwrite_param", "overwrite"),
-        contents_field: builder.opt_or("contents_field", "contents"),
-        next_page_token_field: builder.opt_or("next_page_token_field", "nextPageToken"),
-        entry_path_field: builder.opt_or("entry_path_field", "path"),
-        entry_size_field: builder.opt_or("entry_size_field", "fileSize"),
-        entry_is_directory_field: builder.opt_or("entry_is_directory_field", "isDirectory"),
-        entry_last_modified_field: builder.opt_or("entry_last_modified_field", "lastModified"),
-        entry_strip_prefix: builder.options.get("entry_strip_prefix").cloned(),
-    };
+    let config = rest_endpoint_config_from_builder(builder)?;
 
     // When an auth callback is registered, the kernel pulls headers from it (caching for the TTL
     // it reports, if any). Otherwise use the static `header.<Name>` options.
@@ -279,18 +345,22 @@ fn rest_engine_builder_build_impl(
         })
         .transpose()?
         .unwrap_or(0);
-    let verify = builder
-        .options
-        .get("put.verify_on_ambiguous")
-        .is_some_and(|v| v == "true");
+    let verify = parse_bool_option(
+        "put.verify_on_ambiguous",
+        builder.options.get("put.verify_on_ambiguous"),
+    )?;
 
     let store = Arc::new(
         RestObjectStore::new(builder.base_url.clone(), client, auth, Arc::new(config))
             .with_max_retries(max_retries)
             .with_verify_on_ambiguous(verify),
     );
-    let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
-    Ok(engine_to_handle(engine, builder.allocate_fn))
+    build_engine_from_store(
+        store,
+        builder.multithreaded_executor_config.clone(),
+        builder.io_config.clone(),
+        builder.allocate_fn,
+    )
 }
 
 /// Discard a builder without building it.
@@ -304,23 +374,31 @@ pub unsafe extern "C" fn free_rest_engine_builder(builder: *mut RestEngineBuilde
     }
 }
 
+/// Minimal dialect options for unit tests and examples.
+#[cfg(test)]
+fn test_dialect_options() -> HashMap<String, String> {
+    [
+        ("page_token_param", "page_token"),
+        ("start_from_param", "start_from"),
+        ("recursive_param", "recursive"),
+        ("overwrite_param", "overwrite"),
+        ("contents_field", "contents"),
+        ("next_page_token_field", "next_page_token"),
+        ("entry_path_field", "path"),
+        ("entry_size_field", "size"),
+        ("entry_is_directory_field", "is_directory"),
+        ("entry_last_modified_field", "last_modified"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ffi_test_utils::allocate_err;
     use crate::kernel_string_slice;
-
-    fn builder(options: &[(&str, &str)]) -> RestEngineBuilder {
-        RestEngineBuilder {
-            base_url: "http://localhost".to_string(),
-            allocate_fn: allocate_err,
-            options: options
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            auth_callback: None,
-        }
-    }
 
     // Building the engine spawns a Tokio background thread (DefaultEngine's executor) that the test
     // does not join, which Miri's leak check rejects. The `build_rejects_*` tests cover the build
@@ -328,39 +406,109 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn build_succeeds_with_defaults_and_options() {
-        let b = builder(&[
-            ("header.Authorization", "Bearer x"),
-            ("files_prefix", "/TablesById/u"),
-            ("entry_strip_prefix", "/TablesById/u"),
-            ("retry.max_retries", "3"),
-            ("put.verify_on_ambiguous", "true"),
-        ]);
+        let mut options = test_dialect_options();
+        options.insert("header.Authorization".into(), "Bearer x".into());
+        options.insert("files_prefix".into(), "/TablesById/u".into());
+        options.insert("entry_strip_prefix".into(), "/TablesById/u".into());
+        options.insert("retry.max_retries".into(), "3".into());
+        options.insert("put.verify_on_ambiguous".into(), "true".into());
+        let b = RestEngineBuilder {
+            base_url: "http://localhost".to_string(),
+            allocate_fn: allocate_err,
+            options,
+            auth_callback: None,
+            multithreaded_executor_config: None,
+            io_config: IoConcurrencyConfig::default(),
+        };
         assert!(rest_engine_builder_build_impl(&b).is_ok());
     }
 
     #[test]
+    fn build_rejects_missing_dialect_option() {
+        let b = RestEngineBuilder {
+            base_url: "http://localhost".to_string(),
+            allocate_fn: allocate_err,
+            options: HashMap::new(),
+            auth_callback: None,
+            multithreaded_executor_config: None,
+            io_config: IoConcurrencyConfig::default(),
+        };
+        assert!(rest_engine_builder_build_impl(&b).is_err());
+    }
+
+    #[test]
     fn build_rejects_invalid_timeout() {
-        assert!(rest_engine_builder_build_impl(&builder(&[("tls.timeout_secs", "nope")])).is_err());
+        let mut options = test_dialect_options();
+        options.insert("tls.timeout_secs".into(), "nope".into());
+        let b = RestEngineBuilder {
+            base_url: "http://localhost".to_string(),
+            allocate_fn: allocate_err,
+            options,
+            auth_callback: None,
+            multithreaded_executor_config: None,
+            io_config: IoConcurrencyConfig::default(),
+        };
+        assert!(rest_engine_builder_build_impl(&b).is_err());
     }
 
     #[test]
     fn build_rejects_invalid_max_retries() {
-        assert!(
-            rest_engine_builder_build_impl(&builder(&[("retry.max_retries", "nope")])).is_err()
-        );
+        let mut options = test_dialect_options();
+        options.insert("retry.max_retries".into(), "nope".into());
+        let b = RestEngineBuilder {
+            base_url: "http://localhost".to_string(),
+            allocate_fn: allocate_err,
+            options,
+            auth_callback: None,
+            multithreaded_executor_config: None,
+            io_config: IoConcurrencyConfig::default(),
+        };
+        assert!(rest_engine_builder_build_impl(&b).is_err());
+    }
+
+    #[test]
+    fn build_rejects_invalid_verify_on_ambiguous() {
+        let mut options = test_dialect_options();
+        options.insert("put.verify_on_ambiguous".into(), "nope".into());
+        let b = RestEngineBuilder {
+            base_url: "http://localhost".to_string(),
+            allocate_fn: allocate_err,
+            options,
+            auth_callback: None,
+            multithreaded_executor_config: None,
+            io_config: IoConcurrencyConfig::default(),
+        };
+        assert!(rest_engine_builder_build_impl(&b).is_err());
     }
 
     #[test]
     fn build_rejects_invalid_header_value() {
-        // A newline is not a valid header value.
-        assert!(rest_engine_builder_build_impl(&builder(&[("header.X", "bad\nvalue")])).is_err());
+        let mut options = test_dialect_options();
+        options.insert("header.X".into(), "bad\nvalue".into());
+        let b = RestEngineBuilder {
+            base_url: "http://localhost".to_string(),
+            allocate_fn: allocate_err,
+            options,
+            auth_callback: None,
+            multithreaded_executor_config: None,
+            io_config: IoConcurrencyConfig::default(),
+        };
+        assert!(rest_engine_builder_build_impl(&b).is_err());
     }
 
     #[test]
     fn build_rejects_partial_mtls() {
-        assert!(
-            rest_engine_builder_build_impl(&builder(&[("tls.cert_path", "/x/cert.pem")])).is_err()
-        );
+        let mut options = test_dialect_options();
+        options.insert("tls.cert_path".into(), "/x/cert.pem".into());
+        let b = RestEngineBuilder {
+            base_url: "http://localhost".to_string(),
+            allocate_fn: allocate_err,
+            options,
+            auth_callback: None,
+            multithreaded_executor_config: None,
+            io_config: IoConcurrencyConfig::default(),
+        };
+        assert!(rest_engine_builder_build_impl(&b).is_err());
     }
 
     extern "C" fn emit_header_and_ttl(_context: *mut c_void, emit_state: *mut c_void) {

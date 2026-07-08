@@ -1,11 +1,10 @@
-//! The REST dialect spoken by [`RestObjectStore`](super::RestObjectStore), described as data.
+//! REST endpoint configuration for [`RestObjectStore`](super::RestObjectStore): URL path prefixes
+//! and JSON field names for list/put request and response shapes.
 
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{
-    Error as ObjectStoreError, ObjectMeta, Result as ObjectStoreResult,
-};
+use delta_kernel::object_store::{ObjectMeta, Result as ObjectStoreResult};
 
-use super::{generic_err, generic_msg};
+use super::generic_error;
 
 /// One page of a list response: the objects on this page plus an optional token for the next.
 pub(crate) struct RestListPage {
@@ -16,9 +15,10 @@ pub(crate) struct RestListPage {
     pub(crate) next_page_token: Option<String>,
 }
 
-/// The REST dialect spoken by a [`RestObjectStore`](super::RestObjectStore), described as data:
-/// path-prefix templates and configurable JSON field names give the request/response shape, so a
-/// backend is configured rather than coded. Holds no credentials -- those come from the
+/// Per-backend HTTP/JSON settings for a [`RestObjectStore`](super::RestObjectStore).
+///
+/// Names URL path prefixes and list-response JSON fields so the store can talk to a REST file API
+/// without service-specific code. Credentials come from
 /// [`AuthHeaderProvider`](super::AuthHeaderProvider).
 #[derive(Debug, Clone)]
 pub struct RestEndpointConfig {
@@ -106,7 +106,7 @@ impl RestEndpointConfig {
     /// re-sort: it checks the order as it streams pages and fails the listing with an error if an
     /// entry arrives out of order, rather than silently producing a wrong snapshot.
     pub(crate) fn parse_list(&self, body: &[u8]) -> ObjectStoreResult<RestListPage> {
-        let root: serde_json::Value = serde_json::from_slice(body).map_err(generic_err)?;
+        let root: serde_json::Value = serde_json::from_slice(body).map_err(generic_error)?;
         let mut objects = Vec::new();
         if let Some(entries) = root.get(&self.contents_field).and_then(|v| v.as_array()) {
             for entry in entries {
@@ -118,7 +118,7 @@ impl RestEndpointConfig {
                     continue;
                 }
                 let Some(path) = entry.get(&self.entry_path_field).and_then(|v| v.as_str()) else {
-                    return Err(generic_msg(format!(
+                    return Err(generic_error(format!(
                         "list entry is missing the `{}` field",
                         self.entry_path_field
                     )));
@@ -127,17 +127,22 @@ impl RestEndpointConfig {
                     Some(prefix) => match path.strip_prefix(prefix.as_str()) {
                         Some(rest) => rest.trim_start_matches('/'),
                         None => {
-                            return Err(generic_msg(format!(
+                            return Err(generic_error(format!(
                                 "list entry `{path}` is outside the configured prefix `{prefix}`"
                             )))
                         }
                     },
                     None => path,
                 };
-                let size = entry
-                    .get(&self.entry_size_field)
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let size = match entry.get(&self.entry_size_field) {
+                    None => 0,
+                    Some(v) => v.as_u64().ok_or_else(|| {
+                        generic_error(format!(
+                            "list entry field `{}` is not a non-negative integer",
+                            self.entry_size_field
+                        ))
+                    })?,
+                };
                 let last_modified = entry
                     .get(&self.entry_last_modified_field)
                     .and_then(|v| v.as_u64())
@@ -149,7 +154,7 @@ impl RestEndpointConfig {
                 // Fail loudly on an unparseable path rather than silently dropping it, so a
                 // misbehaving backend cannot corrupt log replay with a partial listing.
                 let location = Path::parse(path).map_err(|e| {
-                    generic_msg(format!("list entry path `{path}` is not a valid path: {e}"))
+                    generic_error(format!("list entry path `{path}` is not a valid path: {e}"))
                 })?;
                 objects.push(ObjectMeta {
                     location,
@@ -163,6 +168,7 @@ impl RestEndpointConfig {
         let next_page_token = root
             .get(&self.next_page_token_field)
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         Ok(RestListPage {
             objects,
@@ -174,25 +180,5 @@ impl RestEndpointConfig {
     /// configured [`overwrite_param`](Self::overwrite_param).
     pub(crate) fn put_query(&self, overwrite: bool) -> Vec<(String, String)> {
         vec![(self.overwrite_param.clone(), overwrite.to_string())]
-    }
-
-    /// Map a non-success HTTP status to an [`ObjectStoreError`], or `None` to fall back to the
-    /// generic status handling.
-    ///
-    /// `404 -> NotFound` is a universal HTTP semantic enforced by the store itself, so it never
-    /// reaches here; this maps the remaining non-success codes -- a `Create` collision maps
-    /// `409 -> AlreadyExists`.
-    pub(crate) fn map_status(
-        &self,
-        status: reqwest::StatusCode,
-        path: &str,
-    ) -> Option<ObjectStoreError> {
-        match status {
-            reqwest::StatusCode::CONFLICT => Some(ObjectStoreError::AlreadyExists {
-                path: path.to_string(),
-                source: "HTTP 409".into(),
-            }),
-            _ => None,
-        }
     }
 }

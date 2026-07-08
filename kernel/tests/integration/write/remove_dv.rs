@@ -13,7 +13,7 @@ use delta_kernel::expressions::{column_expr, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
@@ -1132,10 +1132,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("country", DataType::STRING),
     ])?);
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let data_schema = schema_ref! { nullable "id": INTEGER };
 
     // Local directory backing: `read_actions_from_commit` reads commit JSON off disk
     // and does not support the default in-memory store's `memory://` URL.

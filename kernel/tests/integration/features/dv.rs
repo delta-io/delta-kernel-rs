@@ -5,17 +5,14 @@ use std::ops::Add;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::actions::deletion_vector_writer::{
-    KernelDeletionVector, StreamingDeletionVectorWriter,
-};
+use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{BooleanArray, Int64Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use itertools::Itertools;
@@ -26,7 +23,10 @@ use test_utils::{
     read_actions_from_commit, record_batch_to_bytes, IntoArray,
 };
 
-use crate::common::write_utils::resolve_struct_field;
+use crate::common::write_utils::{
+    create_dv_update_transaction, get_scan_files, resolve_struct_field,
+    write_deletion_vector_to_store,
+};
 
 /// Helper to write a parquet file with the given data to the table.
 /// Returns the file path (relative to table root) that was written.
@@ -76,64 +76,6 @@ fn test_table_scan(
     let total_rows = count_total_scan_rows(stream)?;
     assert_eq!(total_rows, expected_rows);
     Ok(())
-}
-
-/// Helper to extract scan files from a snapshot
-fn get_scan_files(
-    snapshot: Arc<Snapshot>,
-    engine: &dyn delta_kernel::Engine,
-) -> DeltaResult<Vec<FilteredEngineData>> {
-    let scan = snapshot.scan_builder().build()?;
-    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
-
-    Ok(all_scan_metadata
-        .into_iter()
-        .map(|sm| sm.scan_files)
-        .collect())
-}
-
-/// Helper to get a write context for creating deletion vector paths.
-fn get_write_context(
-    table_url: &url::Url,
-    engine: &dyn delta_kernel::Engine,
-) -> Result<delta_kernel::transaction::WriteContext, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?.unpartitioned_write_context()?)
-}
-
-/// Helper to write a deletion vector to object store and return its descriptor.
-async fn write_deletion_vector_to_store(
-    store: &Arc<dyn delta_kernel::object_store::ObjectStore>,
-    write_context: &delta_kernel::transaction::WriteContext,
-    dv: KernelDeletionVector,
-    prefix: &str,
-) -> Result<
-    delta_kernel::actions::deletion_vector::DeletionVectorDescriptor,
-    Box<dyn std::error::Error>,
-> {
-    use delta_kernel::object_store::path::Path as ObjectStorePath;
-
-    let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
-    let dv_absolute_path = dv_path.absolute_path()?;
-    let dv_object_path = ObjectStorePath::parse(dv_absolute_path.path())?;
-
-    let mut dv_buffer = Vec::new();
-    let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_buffer);
-    let dv_write_result = dv_writer.write_deletion_vector(dv)?;
-    dv_writer.finalize()?;
-
-    store.put(&dv_object_path, dv_buffer.into()).await?;
-
-    Ok(dv_write_result.to_descriptor(&dv_path))
-}
-
-/// Helper to create a transaction for deletion vector updates.
-fn create_dv_update_transaction(
-    table_url: &url::Url,
-    engine: &dyn delta_kernel::Engine,
-) -> Result<delta_kernel::transaction::Transaction, Box<dyn std::error::Error>> {
-    Ok(load_and_begin_transaction(table_url.clone(), engine)?
-        .with_engine_info("test engine")
-        .with_operation("DELETE".to_string()))
 }
 
 /// Helper to verify that scan results match expected ids and values (after sorting).
@@ -298,14 +240,12 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let mut dv_file1_first = KernelDeletionVector::new();
     dv_file1_first.add_deleted_row_indexes(FILE1_FIRST_DELETE_INDEXES);
 
-    // Step 5: Get write context and write the first deletion vector to a file
-    let write_context = get_write_context(&table_url, engine.as_ref())?;
-    let dv_descriptor_1 =
-        write_deletion_vector_to_store(&store, &write_context, dv_file1_first, "").await?;
-
-    // Step 6: Update deletion vectors for first file only
+    // Step 5: Update deletion vectors for first file only
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let write_context = txn.unpartitioned_write_context()?;
+    let dv_descriptor_1 =
+        write_deletion_vector_to_store(&store, &write_context, dv_file1_first, "").await?;
     let scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
 
     let mut dv_map = HashMap::new();
@@ -318,7 +258,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
         CommitResult::CommittedTransaction(_)
     ));
 
-    // Step 9: Verify first deletion - should have 17 rows (7 from file 1 + 10 from file 2)
+    // Step 6: Verify first deletion - should have 17 rows (7 from file 1 + 10 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let stream = scan.execute(engine.clone())?;
@@ -329,7 +269,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
         "Should have 17 rows after deleting 3 rows from first file"
     );
 
-    // Step 10: Second deletion - Delete row 1 from file 1 and rows 12, 15 from file 2
+    // Step 7: Second deletion - Delete row 1 from file 1 and rows 12, 15 from file 2
     let mut dv_file1_second = KernelDeletionVector::new();
     dv_file1_second.add_deleted_row_indexes(FILE1_FIRST_DELETE_INDEXES); // Previous deletions
     dv_file1_second.add_deleted_row_indexes([FILE1_SECOND_DELETE_INDEX]); // Additional deletion
@@ -337,15 +277,16 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     let mut dv_file2 = KernelDeletionVector::new();
     dv_file2.add_deleted_row_indexes(FILE2_DELETE_INDEXES); // Delete rows at indices 2 and 5 (ids 12, 15)
 
+    // Step 8: Update deletion vectors for both files
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let write_context = txn.unpartitioned_write_context()?;
+
     // Write deletion vectors for both files
     let dv_descriptor_1_second =
         write_deletion_vector_to_store(&store, &write_context, dv_file1_second, "").await?;
     let dv_descriptor_2 =
         write_deletion_vector_to_store(&store, &write_context, dv_file2, "").await?;
-
-    // Step 11: Update deletion vectors for both files
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
 
     let mut dv_map1 = HashMap::new();
     dv_map1.insert(data_file_path_1.clone(), dv_descriptor_1_second);
@@ -371,7 +312,7 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
         CommitResult::CommittedTransaction(_)
     ));
 
-    // Step 12: Verify final deletion - should have 14 rows (6 from file 1 + 8 from file 2)
+    // Step 9: Verify final deletion - should have 14 rows (6 from file 1 + 8 from file 2)
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
     let stream = scan.execute(engine.clone())?;
@@ -404,13 +345,9 @@ async fn test_dv_update_stats_tight_bound(
     #[case] initial_tight_bounds: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Nested schema: a `point` struct with two leaf columns.
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "point",
-        StructType::try_new(vec![
-            StructField::nullable("x", DataType::INTEGER),
-            StructField::nullable("y", DataType::INTEGER),
-        ])?,
-    )])?);
+    let schema = schema_ref! {
+        nullable "point": { nullable "x": INTEGER, nullable "y": INTEGER },
+    };
 
     let temp_dir = tempdir()?;
     let base_url = url::Url::from_directory_path(temp_dir.path()).unwrap();
@@ -481,11 +418,11 @@ async fn test_dv_update_stats_tight_bound(
     // Apply a DV to the file and commit.
     let mut dv = KernelDeletionVector::new();
     dv.add_deleted_row_indexes([3u64]);
-    let write_context = get_write_context(&table_url, engine.as_ref())?;
-    let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
-
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = create_dv_update_transaction(&table_url, engine.as_ref())?;
+    let write_context = txn.unpartitioned_write_context()?;
+    let dv_descriptor = write_deletion_vector_to_store(&store, &write_context, dv, "").await?;
+
     let scan_files = get_scan_files(snapshot, engine.as_ref())?;
     let mut dv_map = HashMap::new();
     dv_map.insert(data_file_path.to_string(), dv_descriptor);

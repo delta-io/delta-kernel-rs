@@ -176,7 +176,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ArrayType, MapType, MetadataValue, PrimitiveType, StructType};
+    use crate::schema::{schema, ArrayType, MetadataValue, PrimitiveType, StructType};
 
     // === LegacyNestedIdsVisitor: parquet.field.nested.ids detection ===
 
@@ -189,75 +189,45 @@ mod tests {
         f
     }
 
+    // `array<integer>` fields carrying nested-id metadata under the new vs. legacy key.
+    fn nested_ids_field(name: &str) -> StructField {
+        let ty = ArrayType::new(DataType::INTEGER, true);
+        field_with_metadata(name, ty, ColumnMetadataKey::ColumnMappingNestedIds.as_ref())
+    }
+    fn legacy_ids_field(name: &str) -> StructField {
+        let ty = ArrayType::new(DataType::INTEGER, true);
+        field_with_metadata(name, ty, ColumnMetadataKey::ParquetFieldNestedIds.as_ref())
+    }
+
     fn simple_schema() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])
+        schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        }
     }
 
     fn schema_with_good_nested_ids() -> StructType {
-        StructType::new_unchecked(vec![field_with_metadata(
-            "x",
-            ArrayType::new(DataType::INTEGER, true),
-            ColumnMetadataKey::ColumnMappingNestedIds.as_ref(),
-        )])
+        schema! { (nested_ids_field("x")) }
     }
 
     fn schema_with_legacy_at(name: &str) -> StructType {
-        StructType::new_unchecked(vec![field_with_metadata(
-            name,
-            ArrayType::new(DataType::INTEGER, true),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )])
+        schema! { (legacy_ids_field(name)) }
     }
 
     fn schema_struct_with_legacy_at_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![field_with_metadata(
-            "inner",
-            ArrayType::new(DataType::INTEGER, true),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )]);
-        StructType::new_unchecked(vec![StructField::nullable("parent", inner)])
+        schema! { nullable "parent": { (legacy_ids_field("inner")) } }
     }
 
     fn schema_array_struct_with_legacy_at_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![field_with_metadata(
-            "inner",
-            ArrayType::new(DataType::INTEGER, true),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )]);
-        StructType::new_unchecked(vec![StructField::nullable(
-            "arr",
-            ArrayType::new(inner, true),
-        )])
+        schema! { nullable "arr": [ nullable { (legacy_ids_field("inner")) } ] }
     }
 
     fn schema_map_value_struct_with_legacy_at_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![field_with_metadata(
-            "inner",
-            ArrayType::new(DataType::INTEGER, true),
-            ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-        )]);
-        StructType::new_unchecked(vec![StructField::nullable(
-            "m",
-            MapType::new(DataType::STRING, inner, true),
-        )])
+        schema! { nullable "m": { STRING => nullable { (legacy_ids_field("inner")) } } }
     }
 
     fn schema_two_legacy_fields() -> StructType {
-        StructType::new_unchecked(vec![
-            field_with_metadata(
-                "a",
-                ArrayType::new(DataType::INTEGER, true),
-                ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-            ),
-            field_with_metadata(
-                "b",
-                ArrayType::new(DataType::INTEGER, true),
-                ColumnMetadataKey::ParquetFieldNestedIds.as_ref(),
-            ),
-        ])
+        schema! { (legacy_ids_field("a")), (legacy_ids_field("b")) }
     }
 
     #[rstest]
@@ -303,54 +273,34 @@ mod tests {
     }
 
     fn schema_struct_with_float_inner() -> StructType {
-        let inner = StructType::new_unchecked(vec![StructField::nullable("f", DataType::FLOAT)]);
-        StructType::new_unchecked(vec![StructField::nullable("s", inner)])
+        schema! { nullable "s": { nullable "f": FLOAT } }
     }
 
     fn schema_array_of_float() -> StructType {
-        StructType::new_unchecked(vec![StructField::nullable(
-            "arr",
-            ArrayType::new(DataType::FLOAT, true),
-        )])
+        schema! { nullable "arr": [ nullable FLOAT ] }
     }
 
     fn schema_map_key_float() -> StructType {
-        StructType::new_unchecked(vec![StructField::nullable(
-            "m",
-            MapType::new(DataType::FLOAT, DataType::STRING, true),
-        )])
+        schema! { nullable "m": { FLOAT => nullable STRING } }
     }
 
     fn schema_map_value_float() -> StructType {
-        StructType::new_unchecked(vec![StructField::nullable(
-            "m",
-            MapType::new(DataType::STRING, DataType::FLOAT, true),
-        )])
+        schema! { nullable "m": { STRING => nullable FLOAT } }
     }
 
     fn schema_float_long() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::FLOAT),
-        ])
+        schema! {
+            nullable "a": LONG,
+            nullable "b": FLOAT,
+        }
     }
 
     /// `a: array<map<string, array<float>>>` followed by a sibling `b: array<float>`.
     fn schema_deep_nested_float() -> StructType {
-        StructType::new_unchecked(vec![
-            StructField::nullable(
-                "a",
-                ArrayType::new(
-                    MapType::new(
-                        DataType::STRING,
-                        ArrayType::new(DataType::FLOAT, true),
-                        true,
-                    ),
-                    true,
-                ),
-            ),
-            StructField::nullable("b", ArrayType::new(DataType::FLOAT, true)),
-        ])
+        schema! {
+            nullable "a": [ nullable { STRING => nullable [ nullable FLOAT ] } ],
+            nullable "b": [ nullable FLOAT ],
+        }
     }
 
     #[rstest]

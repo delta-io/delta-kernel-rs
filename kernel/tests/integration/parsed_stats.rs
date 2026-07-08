@@ -2,9 +2,12 @@
 
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, STATS_PARSED};
 use delta_kernel::arrow::array::{
-    Array, BooleanArray, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, RecordBatch, StringArray, StructArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
+use delta_kernel::arrow::util::display::array_value_to_string;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -17,6 +20,7 @@ use test_utils::{get_column, test_context};
 /// Validate that JSON stats object values match the corresponding parsed struct array.
 ///
 /// Panics on missing fields to surface regressions where the parsed-stats schema drops a column.
+// TODO: cover interval columns once the default engine supports writing/stats for them.
 fn assert_stats_struct_matches_json(
     struct_array: &StructArray,
     json_object: &serde_json::Map<String, serde_json::Value>,
@@ -36,31 +40,60 @@ fn assert_stats_struct_matches_json(
             continue;
         }
         match json_val {
-            serde_json::Value::Number(_) => {
-                let int_col = col
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap_or_else(|| {
-                        panic!("{path}: expected Int64Array, got {:?}", col.data_type())
-                    });
-                assert_eq!(
-                    json_val.as_i64().unwrap(),
-                    int_col.value(row_idx),
-                    "{path} mismatch at row {row_idx}"
-                );
+            serde_json::Value::Number(n) => {
+                if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
+                    assert_eq!(
+                        n.as_i64().unwrap(),
+                        i64::from(arr.value(row_idx)),
+                        "{path} mismatch at row {row_idx}"
+                    );
+                } else if let Some(arr) = col.as_any().downcast_ref::<Int16Array>() {
+                    assert_eq!(
+                        n.as_i64().unwrap(),
+                        i64::from(arr.value(row_idx)),
+                        "{path} mismatch at row {row_idx}"
+                    );
+                } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                    assert_eq!(
+                        n.as_i64().unwrap(),
+                        i64::from(arr.value(row_idx)),
+                        "{path} mismatch at row {row_idx}"
+                    );
+                } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    assert_eq!(
+                        n.as_i64().unwrap(),
+                        arr.value(row_idx),
+                        "{path} mismatch at row {row_idx}"
+                    );
+                } else if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
+                    assert_eq!(
+                        n.as_f64().unwrap(),
+                        f64::from(arr.value(row_idx)),
+                        "{path} mismatch at row {row_idx}"
+                    );
+                } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                    assert_eq!(
+                        n.as_f64().unwrap(),
+                        arr.value(row_idx),
+                        "{path} mismatch at row {row_idx}"
+                    );
+                } else if let Some(arr) = col.as_any().downcast_ref::<Decimal128Array>() {
+                    let ArrowDataType::Decimal128(_, scale) = arr.data_type() else {
+                        unreachable!("Decimal128Array always has a Decimal128 data type")
+                    };
+                    assert_eq!(
+                        n.as_f64().unwrap(),
+                        arr.value(row_idx) as f64 / 10f64.powi(i32::from(*scale)),
+                        "{path} mismatch at row {row_idx}"
+                    );
+                } else {
+                    panic!("{path}: expected numeric array, got {:?}", col.data_type());
+                }
             }
             serde_json::Value::String(s) => {
-                let str_col = col
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap_or_else(|| {
-                        panic!("{path}: expected StringArray, got {:?}", col.data_type())
-                    });
-                assert_eq!(
-                    str_col.value(row_idx),
-                    s.as_str(),
-                    "{path} mismatch at row {row_idx}"
-                );
+                let actual = array_value_to_string(col.as_ref(), row_idx)
+                    .unwrap_or_else(|e| panic!("{path}: cannot format parsed value: {e}"));
+                assert_eq!(&actual, s, "{path} mismatch at row {row_idx}");
             }
             serde_json::Value::Object(sub_obj) => {
                 let sub_struct = col
@@ -79,24 +112,6 @@ fn assert_stats_struct_matches_json(
             }
             other => panic!("{path}: unsupported JSON variant {other:?} at row {row_idx}"),
         }
-    }
-}
-
-/// Validate only nested-struct entries, not primitives.
-// TODO(#2673): also validate primitive stats.
-fn validate_struct_stats(
-    parsed: &StructArray,
-    json_obj: &serde_json::Map<String, serde_json::Value>,
-    row_idx: usize,
-    field_prefix: &str,
-) {
-    for (key, val) in json_obj {
-        let serde_json::Value::Object(sub_obj) = val else {
-            continue;
-        };
-        let path = format!("{field_prefix}.{key}");
-        let sub_struct = get_column!(parsed, key, StructArray);
-        assert_stats_struct_matches_json(sub_struct, sub_obj, row_idx, &path);
     }
 }
 
@@ -181,19 +196,19 @@ fn scan_metadata_with_stats_columns_kernel_written(
                 .get(MIN_VALUES)
                 .and_then(|v| v.as_object())
                 .expect("stats JSON must contain minValues object");
-            validate_struct_stats(min_values, min_obj, i, MIN_VALUES);
+            assert_stats_struct_matches_json(min_values, min_obj, i, MIN_VALUES);
 
             let max_obj = json_stats
                 .get(MAX_VALUES)
                 .and_then(|v| v.as_object())
                 .expect("stats JSON must contain maxValues object");
-            validate_struct_stats(max_values, max_obj, i, MAX_VALUES);
+            assert_stats_struct_matches_json(max_values, max_obj, i, MAX_VALUES);
 
             let null_obj = json_stats
                 .get(NULL_COUNT)
                 .and_then(|v| v.as_object())
                 .expect("stats JSON must contain nullCount object");
-            validate_struct_stats(null_count, null_obj, i, NULL_COUNT);
+            assert_stats_struct_matches_json(null_count, null_obj, i, NULL_COUNT);
 
             total_num_records += num_records.value(i);
             file_count += 1;

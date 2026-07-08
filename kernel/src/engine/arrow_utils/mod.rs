@@ -1509,8 +1509,8 @@ mod tests {
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec, MetadataValue,
-        StructField, StructType,
+        schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
+        MetadataValue, StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1749,11 +1749,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(int_array) as ArrowArrayRef]).unwrap();
         let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
 
-        let output_schema: crate::schema::SchemaRef =
-            Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-                "a",
-                DataType::INTEGER,
-            )]));
+        let output_schema: crate::schema::SchemaRef = schema_ref! { nullable "a": INTEGER };
         let err = match parse_json(engine_data, output_schema) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("Expected error for non-string array input"),
@@ -2065,10 +2061,7 @@ mod tests {
             ArrowField::new("v", ArrowDataType::Int16, true)
         }
         // Top level variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "v",
-            DataType::unshredded_variant(),
-        )]));
+        let requested_schema = schema_ref! { nullable "v": (DataType::unshredded_variant()) };
         let unshredded_parquet_schema =
             Arc::new(ArrowSchema::new(vec![unshredded_variant_parquet_schema()]));
         let shredded_parquet_schema =
@@ -3248,23 +3241,13 @@ mod tests {
 
     #[test]
     fn reorder_map_with_structs() {
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null(
-                "map",
-                MapType::new(
-                    StructType::new_unchecked([
-                        StructField::not_null("k1", DataType::STRING),
-                        StructField::not_null("k2", DataType::STRING),
-                    ]),
-                    StructType::new_unchecked([
-                        StructField::not_null("v2", DataType::STRING),
-                        StructField::not_null("v1", DataType::STRING),
-                    ]),
-                    false,
-                ),
-            ),
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "i": INTEGER,
+            not_null "map": {
+                { not_null "k1": STRING, not_null "k2": STRING }
+                    => not_null { not_null "v2": STRING, not_null "v1": STRING }
+            },
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new_map(
@@ -4243,20 +4226,12 @@ mod tests {
         let batch = RecordBatch::try_new(src_schema, vec![outer_col]).unwrap();
 
         // Kernel target with different names at every level: tgt_x, tgt_y, tgt_z.
-        let target_schema: SchemaRef =
-            Arc::new(StructType::new_unchecked([StructField::not_null(
-                "outer",
-                StructType::new_unchecked([
-                    StructField::not_null("tgt_x", DataType::INTEGER),
-                    StructField::not_null(
-                        "tgt_y",
-                        StructType::new_unchecked([StructField::not_null(
-                            "tgt_z",
-                            DataType::INTEGER,
-                        )]),
-                    ),
-                ]),
-            )]));
+        let target_schema: SchemaRef = schema_ref! {
+            not_null "outer": {
+                not_null "tgt_x": INTEGER,
+                not_null "tgt_y": { not_null "tgt_z": INTEGER },
+            },
+        };
 
         let ordering = [ReorderIndex::identity(0)];
         let result =

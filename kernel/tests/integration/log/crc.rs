@@ -11,7 +11,7 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -197,10 +197,7 @@ async fn test_incremental_update_advances_crc_with_real_file_stats(
 async fn test_snapshot_loads_when_crc_at_version_is_corrupt() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
@@ -260,10 +257,7 @@ async fn test_crc_returns_resolved_crc_at_snapshot_version() -> DeltaResult<()> 
 async fn test_crc_returns_none_when_no_crc() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -287,10 +281,7 @@ fn create_table_and_commit(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,
 ) -> DeltaResult<delta_kernel::transaction::CommittedTransaction> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let txn = create_table(table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
         .build(engine, Box::new(FileSystemCommitter::new()))?
@@ -553,16 +544,240 @@ async fn test_write_checksum_double_write_returns_already_exists(
     Ok(())
 }
 
-#[tokio::test]
-async fn test_write_checksum_with_no_in_memory_crc_returns_error() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let _ = create_table_and_commit(&table_path, engine.as_ref())?;
+/// The root that `resolve_crc_for_write` resolves the CRC from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteRoot {
+    /// No checkpoint and no CRC.
+    VersionZero,
+    /// A checkpoint at the snapshot's version with no tail commits.
+    CheckpointNoTail,
+    /// A checkpoint below the snapshot's version with tail commits.
+    CheckpointWithTail,
+    /// A stale on-disk CRC, loaded with [`IncrementalReplay::Unlimited`].
+    StaleCrcIncrementalBuild,
+    /// A stale on-disk CRC, loaded with [`IncrementalReplay::Disabled`].
+    StaleCrcNonIncrementalBuild,
+}
 
-    // Load from disk -- no CRC file on disk, so no in-memory CRC
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+/// For each resolution root: build a table, load a snapshot, write the CRC, and validate its
+/// contents (file stats, active domains, set transactions).
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_checksum_resolves_correct_crc_from_each_root(
+    #[values(
+        WriteRoot::VersionZero,
+        WriteRoot::CheckpointNoTail,
+        WriteRoot::CheckpointWithTail,
+        WriteRoot::StaleCrcIncrementalBuild,
+        WriteRoot::StaleCrcNonIncrementalBuild
+    )]
+    root: WriteRoot,
+    #[values(false, true)] ict_enabled: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
-    let result = snapshot.write_checksum(engine.as_ref());
-    assert!(result.is_err());
+    // === Create the table with domain metadata (and optionally ICT) enabled ===
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let mut builder = create_table(&table_path, schema, "test_engine")
+        .with_table_properties([("delta.feature.domainMetadata", "supported")]);
+    if ict_enabled {
+        builder = builder.with_table_properties([("delta.enableInCommitTimestamps", "true")]);
+    }
+    let mut snap = builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    const CHECKPOINT_OR_CRC_VERSION: i64 = 4;
+    let (checkpoint_or_crc_version, latest): (Option<i64>, i64) = match root {
+        WriteRoot::VersionZero => (None, CHECKPOINT_OR_CRC_VERSION),
+        WriteRoot::CheckpointNoTail => (Some(CHECKPOINT_OR_CRC_VERSION), CHECKPOINT_OR_CRC_VERSION),
+        WriteRoot::CheckpointWithTail
+        | WriteRoot::StaleCrcIncrementalBuild
+        | WriteRoot::StaleCrcNonIncrementalBuild => (
+            Some(CHECKPOINT_OR_CRC_VERSION),
+            CHECKPOINT_OR_CRC_VERSION + 2,
+        ),
+    };
+    let removed_domain = "d1";
+
+    // === Commit loop: accumulate domain metadata and set transactions ===
+    // Each commit v adds one file, sets domain "d{v}"->"cfg{v}" and set-txn "app{v}"->v. At v=3 we
+    // also remove "d1", so the final CRC must reflect the removal.
+    for v in 1..=latest {
+        let arrow_schema = TryFromKernel::try_from_kernel(snap.schema().as_ref())?;
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(Int32Array::from(vec![v as i32]))],
+        )
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        let mut txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_operation("WRITE".to_string())
+            .with_data_change(true)
+            .with_domain_metadata(format!("d{v}"), format!("cfg{v}"))
+            .with_transaction_id(format!("app{v}"), v);
+        if v == 3 {
+            txn = txn.with_domain_metadata_removed(removed_domain.to_string());
+        }
+        let write_context = txn.unpartitioned_write_context()?;
+        let adds = engine
+            .write_parquet(&ArrowEngineData::new(batch), &write_context)
+            .await?;
+        txn.add_files(adds);
+        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+        if checkpoint_or_crc_version == Some(v) {
+            match root {
+                WriteRoot::CheckpointNoTail | WriteRoot::CheckpointWithTail => {
+                    snap = snap.checkpoint(engine.as_ref(), None)?.1;
+                }
+                WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
+                    snap.write_checksum(engine.as_ref())?;
+                }
+                WriteRoot::VersionZero => unreachable!("VersionZero has no seed version"),
+            }
+        }
+    }
+
+    // === Load from disk, write the checksum, reload, assert the persisted CRC ===
+    let incremental_build = root == WriteRoot::StaleCrcIncrementalBuild;
+    let replay = if incremental_build {
+        IncrementalReplay::Unlimited
+    } else {
+        IncrementalReplay::Disabled
+    };
+    let fresh = Snapshot::builder_for(&table_path)
+        .with_incremental_crc_replay(replay)
+        .build(engine.as_ref())?;
+    assert_eq!(fresh.crc().is_some(), incremental_build);
+
+    // Confirm the load actually reached the intended resolution root, so a mis-resolution that
+    // still produced correct contents cannot pass silently.
+    match root {
+        WriteRoot::CheckpointNoTail | WriteRoot::CheckpointWithTail => assert_eq!(
+            fresh.log_segment().checkpoint_version,
+            Some(CHECKPOINT_OR_CRC_VERSION as u64)
+        ),
+        WriteRoot::VersionZero => assert!(fresh.log_segment().checkpoint_version.is_none()),
+        WriteRoot::StaleCrcIncrementalBuild | WriteRoot::StaleCrcNonIncrementalBuild => {
+            assert!(crc_file_path(&table_path, CHECKPOINT_OR_CRC_VERSION as u64).exists())
+        }
+    }
+
+    assert_eq!(
+        fresh.write_checksum(engine.as_ref())?.0,
+        ChecksumWriteResult::Written
+    );
+
+    // Reload from disk so the assertions below run against the persisted CRC.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let crc = reloaded.crc().unwrap();
+
+    assert_eq!(crc.version as i64, latest);
+    assert_eq!(crc.in_commit_timestamp_opt.is_some(), ict_enabled);
+
+    // File stats cover every live file (one per commit), checked against disk ground truth.
+    let disk = parquet_file_sizes_on_disk(&table_path);
+    let stats = crc.file_stats().unwrap();
+    assert_eq!(stats.num_files() as usize, disk.len());
+    assert_eq!(stats.table_size_bytes(), disk.iter().sum::<i64>());
+
+    // Domain metadata: every set domain is present with its config, except the removed one.
+    let dms = crc.domain_metadata_state.expect_complete();
+    assert!(!dms.contains_key(removed_domain));
+    for v in 1..=latest {
+        let domain = format!("d{v}");
+        if domain == removed_domain {
+            continue;
+        }
+        assert_eq!(dms[&domain].configuration(), format!("cfg{v}"));
+    }
+
+    // Set transactions: every committed app id is present.
+    let txns = crc.set_transaction_state.expect_complete();
+    assert_eq!(txns.len() as i64, latest);
+    for v in 1..=latest {
+        assert!(txns.contains_key(&format!("app{v}")));
+    }
+
+    Ok(())
+}
+
+/// ICT enabled, checkpoint at the current version, but v_end's commit file is unreadable: the
+/// ICT read error propagates instead of being laundered into a generic "CRC unresolved" error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_propagates_read_error(
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let snap = create_table(&table_path, schema, "test_engine")
+        .with_table_properties([
+            ("delta.feature.inCommitTimestamp", "supported"),
+            ("delta.enableInCommitTimestamps", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_version = snap.version();
+
+    // Corrupt v_end's commit file so its ICT can't be read (the snapshot still loads from the
+    // checkpoint at the same version).
+    let commit = _temp_dir
+        .path()
+        .join(format!("_delta_log/{checkpoint_version:020}.json"));
+    std::fs::write(&commit, b"}}} not valid commit json").unwrap();
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh.crc().is_none());
+    // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
+    assert!(matches!(
+        fresh.write_checksum(engine.as_ref()),
+        Err(e) if !matches!(e, delta_kernel::Error::ChecksumWriteUnsupported(_))
+    ));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupported(
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let snap = create_table(&table_path, schema, "test_engine")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snap = insert_data(
+        snap,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let (_, snap) = snap.checkpoint(engine.as_ref(), None)?;
+    // Non-incremental operation in the tail dooms file stats regardless of the checkpoint.
+    begin_transaction(snap, engine.as_ref())?
+        .with_operation("ANALYZE STATS".to_string())
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert!(fresh.crc().is_none());
+    assert!(matches!(
+        fresh.write_checksum(engine.as_ref()),
+        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
+    ));
 
     Ok(())
 }
@@ -719,10 +934,7 @@ async fn test_write_checksum_with_no_dms_writes_empty_list(
 
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     let mut builder = create_table(&table_path, schema, "test_engine");
     if dm_supported {
@@ -1143,10 +1355,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
     #[case] expected: Option<i64>,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     // v0: create the table with optional retention property
     let mut builder = create_table(&table_path, schema, "test_engine");
@@ -1193,10 +1402,7 @@ async fn test_set_txn_expiration_via_crc_fast_path(
 #[tokio::test]
 async fn test_partial_set_txn_expired_hit_returns_none_via_fast_path() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     // v0: create the table with zero-second retention so any past lastUpdated expires.
     let committed = create_table(&table_path, schema, "test_engine")
@@ -1255,10 +1461,7 @@ async fn test_set_txn_null_last_updated_never_expires_via_log_replay() -> DeltaR
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     // v0: create table with aggressive retention
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     create_table(&table_path, schema, "test_engine")
         .with_table_properties([(
             "delta.setTransactionRetentionDuration",
@@ -1703,10 +1906,7 @@ async fn test_stale_crc_fresh_build_advance_matrix(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
 
     // === Step 1: Create table with clustering, rowTracking, ICT ===
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let mut snap = create_table(&table_path, schema, "test_engine")
         .with_data_layout(DataLayout::clustered(["id"]))
         .with_table_properties([
@@ -1833,19 +2033,6 @@ async fn test_stale_crc_fresh_build_advance_matrix(
         fresh.get_app_id_version("app", real_engine_iff_crc_missing)?,
         Some(LATEST_VERSION)
     );
-
-    // === Check: write_checksum ===
-    if expect_crc_present {
-        assert_eq!(
-            fresh.write_checksum(engine.as_ref())?.0,
-            ChecksumWriteResult::Written
-        );
-    } else {
-        assert!(matches!(
-            fresh.write_checksum(engine.as_ref()),
-            Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
-        ));
-    }
 
     Ok(())
 }

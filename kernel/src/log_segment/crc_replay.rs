@@ -3,6 +3,10 @@
 //! Reverse-replays a log segment's commit files to produce a [`CrcDelta`] covering
 //! commits `(X, Y]`. Per the incremental equation `Crc[X] + CrcDelta = Crc[Y]`, that
 //! delta is applied to a stale base via [`Crc::apply`].
+//!
+//! The base `Crc[X]` itself can also be built here: [`LogSegment::build_crc_from_checkpoint`]
+//! reads a checkpoint into a Complete CRC, and [`LogSegment::build_crc_from_version_zero`] builds
+//! one from a full reverse replay when there is neither a CRC nor a checkpoint to root at.
 //
 // TODO(#2615): support log compaction files.
 
@@ -16,55 +20,43 @@ use crate::actions::visitors::{
     visit_metadata_at, visit_protocol_at, METADATA_LEAVES, PROTOCOL_LEAVES,
 };
 use crate::actions::{
-    DomainMetadata, Metadata, Protocol, SetTransaction, ADD_NAME, COMMIT_INFO_NAME,
-    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    DomainMetadata, SetTransaction, ADD_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_FIELD,
+    METADATA_FIELD, PROTOCOL_FIELD, REMOVE_NAME, SET_TRANSACTION_FIELD,
 };
 use crate::crc::{
     is_incremental_safe_operation, read_crc_file_or_none, size_to_u64, Crc, CrcDelta,
     FileSizeHistogram, FileStatsDelta,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::path::ParsedLogPath;
 use crate::schema::{
-    column_name, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, RowVisitor, Version};
+use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
 
 #[allow(clippy::expect_used)]
 static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
-    // an Add row.
-    let add = StructField::nullable(
-        ADD_NAME,
-        StructType::new_unchecked([StructField::not_null("size", DataType::LONG)]),
-    );
-    // remove.size is optional, so we read remove.path (required) to know a row is a Remove
-    // before reading its size.
-    let remove = StructField::nullable(
-        REMOVE_NAME,
-        StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::nullable("size", DataType::LONG),
-        ]),
-    );
-    let commit_info = StructField::nullable(
-        COMMIT_INFO_NAME,
-        StructType::new_unchecked([
-            StructField::nullable("operation", DataType::STRING),
-            StructField::nullable("inCommitTimestamp", DataType::LONG),
-        ]),
-    );
-    let base = StructType::new_unchecked([
-        add,
-        remove,
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        commit_info,
-    ]);
+    let base = schema! {
+        // size is the only Add leaf the visitor reads, and it is required, so its presence marks
+        // an Add row.
+        nullable ADD_NAME: { not_null "size": LONG },
+        // remove.size is optional, so we read remove.path (required) to know a row is a Remove
+        // before reading its size.
+        nullable REMOVE_NAME: {
+            not_null "path": STRING,
+            nullable "size": LONG,
+        },
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&DOMAIN_METADATA_FIELD),
+        nullable COMMIT_INFO_NAME: {
+            nullable "operation": STRING,
+            nullable "inCommitTimestamp": LONG,
+        },
+    };
     let with_file = base
         .add_metadata_column("_file", MetadataColumnSpec::FilePath)
         .expect("add _file metadata column");
@@ -93,7 +85,7 @@ impl LogSegment {
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
-        let advanced = self.build_incremental_crc_from_base(engine, base)?;
+        let advanced = self.build_crc_from_base(engine, base)?;
         Ok(Some(Arc::new(advanced)))
     }
 
@@ -125,8 +117,8 @@ impl LogSegment {
     /// Produce a fresh `Crc` at `self.end_version` by reverse-replaying the commits in
     /// `(base_crc.version, self.end_version]` and applying the resulting delta to
     /// `base_crc` via [`Crc::apply`].
-    #[instrument(name = "log_seg.build_incremental_crc_from_base", skip_all, err)]
-    pub(crate) fn build_incremental_crc_from_base(
+    #[instrument(name = "log_seg.build_crc_from_base", skip_all, err)]
+    pub(crate) fn build_crc_from_base(
         &self,
         engine: &dyn Engine,
         base_crc: &Crc,
@@ -138,8 +130,75 @@ impl LogSegment {
                 FileSizeHistogram::create_empty_with_boundaries(h.sorted_bin_boundaries().to_vec())
             })
             .transpose()?;
-        let delta = self.build_incremental_crc_delta(engine, base_crc.version, seed_histogram)?;
+        let delta = self.build_crc_delta_from_base(engine, base_crc.version, seed_histogram)?;
         Ok(base_crc.clone().apply(delta, self.end_version))
+    }
+
+    /// Build a Complete base [`Crc`] at `checkpoint_version` from this segment's checkpoint files.
+    /// The tail commits are folded in separately by the caller as a [`CrcDelta`], so this reads
+    /// only the checkpoint. Returns `None` when the segment has no checkpoint, or if protocol or
+    /// metadata could not be recovered from it.
+    ///
+    /// File stats sum the checkpoint's AddFile actions (a reconciled checkpoint holds only live
+    /// files). Domain metadata and set transactions are
+    /// [`Complete`](DomainMetadataState::Complete) since a checkpoint is authoritative.
+    /// `in_commit_timestamp_opt` is left `None`: a checkpoint carries no `commitInfo`, so the
+    /// caller sets the ICT on the returned CRC afterward.
+    pub(crate) fn build_crc_from_checkpoint(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Crc>> {
+        let Some(version) = self.checkpoint_version else {
+            return Ok(None);
+        };
+        // No commit boundaries here, so the delta stays incremental-safe. It covers the full
+        // table, which `into_complete_crc` turns into a Complete CRC.
+        let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
+        // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
+        let batches = self
+            .create_checkpoint_stream(engine, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)?
+            .actions;
+        for batch in batches {
+            let batch = batch?;
+            let mut visitor = CheckpointCrcVisitor { acc: &mut acc };
+            visitor.visit_rows_of(batch.actions())?;
+        }
+        Ok(acc.into_crc_delta().into_complete_crc(version))
+    }
+
+    /// Build a Complete [`Crc`] at `end_version` by reverse-replaying every commit in the segment,
+    /// for a segment with no CRC and no checkpoint to root at. The commits must run contiguously
+    /// from version 0.
+    ///
+    /// Returns `None` if protocol or metadata could not be recovered. File stats degrade to
+    /// [`Indeterminate`](FileStatsState::Indeterminate) if the replay is not incremental-safe.
+    pub(crate) fn build_crc_from_version_zero(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<Crc>> {
+        require!(
+            self.checkpoint_version.is_none(),
+            Error::internal_error("build_crc_from_version_zero called with a checkpoint present")
+        );
+        let Some(first) = self.listed.ascending_commit_files.first() else {
+            return Ok(None);
+        };
+        // A log with no checkpoint must start at version 0; a higher first version means a table
+        // truncated without a checkpoint.
+        require!(
+            first.version == 0,
+            Error::generic(format!(
+                "Cannot build CRC: log has no checkpoint but its first commit is at version {} \
+                 (expected 0); the log appears truncated without a checkpoint",
+                first.version
+            ))
+        );
+        let delta = self.replay_commits_into_crc_delta(
+            engine,
+            self.listed.ascending_commit_files.iter(),
+            Some(FileSizeHistogram::create_default()),
+        )?;
+        Ok(delta.into_complete_crc(self.end_version))
     }
 
     /// Build a `CrcDelta` covering commits `(base_version, self.end_version]` via reverse
@@ -148,7 +207,7 @@ impl LogSegment {
     ///
     /// Errors if `base_version >= self.end_version` or if the segment is missing the
     /// commit at `base_version + 1` (i.e. has a gap above `base_version`).
-    pub(crate) fn build_incremental_crc_delta(
+    pub(crate) fn build_crc_delta_from_base(
         &self,
         engine: &dyn Engine,
         base_version: Version,
@@ -157,8 +216,8 @@ impl LogSegment {
         require!(
             base_version < self.end_version,
             Error::internal_error(format!(
-                "build_incremental_crc_delta: base_version ({}) must be strictly less than \
-                 end_version ({})",
+                "build_crc_delta_from_base: base_version ({}) must be strictly less \
+                 than end_version ({})",
                 base_version, self.end_version,
             ))
         );
@@ -174,23 +233,41 @@ impl LogSegment {
         require!(
             first_above == Some(base_version + 1),
             Error::internal_error(format!(
-                "build_incremental_crc_delta: segment is missing commit {} \
+                "build_crc_delta_from_base: segment is missing commit {} \
                  (lowest commit above base_version is {:?})",
                 base_version + 1,
                 first_above,
             ))
         );
 
+        self.replay_commits_into_crc_delta(engine, deltas.into_iter(), seed_histogram)
+    }
+
+    /// Replay the given commits into a [`CrcDelta`]. The shared core of
+    /// [`Self::build_crc_delta_from_base`] and [`Self::build_crc_from_version_zero`].
+    /// `ascending_commits` are taken oldest-first; `seed_histogram` is an empty histogram with the
+    /// downstream base's bin boundaries, or `None` to skip histogram tracking.
+    fn replay_commits_into_crc_delta<'a>(
+        &self,
+        engine: &dyn Engine,
+        ascending_commits: impl DoubleEndedIterator<Item = &'a ParsedLogPath>,
+        seed_histogram: Option<FileSizeHistogram>,
+    ) -> DeltaResult<CrcDelta> {
+        // Replay newest-first: ICT capture reads from the newest commit only.
+        let locations: Vec<FileMeta> = ascending_commits
+            .rev()
+            .map(|c| c.location.clone())
+            .collect();
         let mut acc = CrcReplayAccumulator::new(seed_histogram);
-        let files: Vec<_> = deltas.iter().rev().map(|c| c.location.clone()).collect();
-        let batches = engine
-            .json_handler()
-            .read_json_files(&files, REPLAY_SCHEMA.clone(), None)?;
+        let batches =
+            engine
+                .json_handler()
+                .read_json_files(&locations, REPLAY_SCHEMA.clone(), None)?;
 
         for batch_result in batches {
             // Transient visitor borrows the shared accumulator for the duration of the
             // batch; same pattern as `ActionReconciliationVisitor`.
-            let mut visitor = CrcReplayVisitor { acc: &mut acc };
+            let mut visitor = CommitCrcVisitor { acc: &mut acc };
             visitor.visit_rows_of(batch_result?.as_ref())?;
         }
 
@@ -366,9 +443,112 @@ impl CrcReplayAccumulator {
         }
     }
 
+    /// Apply the shared columns (`shared`, laid out by [`shared_columns`] then the protocol and
+    /// metadata leaves) from row `i` to the delta. Each visitor reads its source-specific columns
+    /// (commit: `_file`/commitInfo/remove) and passes the trailing shared slice here so the shared
+    /// leaves live in one place.
+    fn apply_shared_columns<'a>(
+        &mut self,
+        i: usize,
+        shared: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<()> {
+        // `add.size` (required) marks an Add row.
+        if let Some(size) = shared[SHARED_COL_ADD_SIZE].get_opt(i, "add.size")? {
+            self.on_add(size)?;
+        }
+        if let Some(domain) = shared[SHARED_COL_DM_DOMAIN].get_opt(i, "domainMetadata.domain")? {
+            let configuration: String =
+                shared[SHARED_COL_DM_CONFIG].get(i, "domainMetadata.configuration")?;
+            let removed: bool = shared[SHARED_COL_DM_REMOVED].get(i, "domainMetadata.removed")?;
+            self.on_domain_metadata(domain, configuration, removed);
+        }
+        if let Some(app_id) = shared[SHARED_COL_TXN_APP_ID].get_opt(i, "txn.appId")? {
+            let version: i64 = shared[SHARED_COL_TXN_VERSION].get(i, "txn.version")?;
+            let last_updated: Option<i64> =
+                shared[SHARED_COL_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
+            self.on_set_transaction(app_id, version, last_updated);
+        }
+        let leaves = &shared[N_SHARED_SINGLE_LEAF_COLS..];
+        let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
+        if self.delta.protocol.is_none() {
+            self.delta.protocol = visit_protocol_at(i, &leaves[..n_protocol_leaves])?;
+        }
+        if self.delta.metadata.is_none() {
+            self.delta.metadata = visit_metadata_at(i, &leaves[n_protocol_leaves..])?;
+        }
+        Ok(())
+    }
+
     fn into_crc_delta(self) -> CrcDelta {
         self.delta
     }
+}
+
+// ===== Shared column indices =====
+// Indices into the shared slice each visitor passes to
+// [`CrcReplayAccumulator::apply_shared_columns`], laid out by [`shared_columns`].
+// The slice starts at the first shared column.
+const SHARED_COL_ADD_SIZE: usize = 0;
+const SHARED_COL_DM_DOMAIN: usize = 1;
+const SHARED_COL_DM_CONFIG: usize = 2;
+const SHARED_COL_DM_REMOVED: usize = 3;
+const SHARED_COL_TXN_APP_ID: usize = 4;
+const SHARED_COL_TXN_VERSION: usize = 5;
+const SHARED_COL_TXN_LAST_UPDATED: usize = 6;
+/// The single-leaf shared columns end here; the protocol and metadata leaves follow them in the
+/// shared slice.
+const N_SHARED_SINGLE_LEAF_COLS: usize = SHARED_COL_TXN_LAST_UPDATED + 1;
+
+/// The columns every source carries (add file, domain metadata, set transaction), in the order
+/// [`CrcReplayAccumulator::apply_shared_columns`] assumes. Each visitor appends these to its
+/// source-specific columns.
+fn shared_columns() -> Vec<(DataType, ColumnName)> {
+    vec![
+        (DataType::LONG, column_name!("add.size")),
+        (DataType::STRING, column_name!("domainMetadata.domain")),
+        (
+            DataType::STRING,
+            column_name!("domainMetadata.configuration"),
+        ),
+        (DataType::BOOLEAN, column_name!("domainMetadata.removed")),
+        (DataType::STRING, column_name!("txn.appId")),
+        (DataType::LONG, column_name!("txn.version")),
+        (DataType::LONG, column_name!("txn.lastUpdated")),
+    ]
+}
+
+/// Append the protocol and metadata leaf columns (in that order) to a visitor's fixed columns,
+/// shared by both replay visitors' `selected_column_names_and_types`.
+fn append_protocol_metadata_leaves(
+    fixed: Vec<(DataType, ColumnName)>,
+) -> (Vec<ColumnName>, Vec<DataType>) {
+    let (mut types, mut names): (Vec<_>, Vec<_>) = fixed.into_iter().unzip();
+    for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
+        let (leaf_names, leaf_types) = leaves.as_ref();
+        names.extend_from_slice(leaf_names);
+        types.extend_from_slice(leaf_types);
+    }
+    (names, types)
+}
+
+/// Validate that `getters` carries exactly the columns a replay visitor projects: `n_fixed`
+/// fixed columns plus the protocol and metadata leaves. `visitor_name` names the visitor in the
+/// error.
+fn check_visitor_getters(
+    getters: &[&dyn GetData<'_>],
+    n_fixed: usize,
+    visitor_name: &str,
+) -> DeltaResult<()> {
+    let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
+    let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
+    require!(
+        getters.len() == n_fixed + n_protocol_leaves + n_metadata_leaves,
+        Error::internal_error(format!(
+            "Wrong number of {visitor_name} getters: {}",
+            getters.len()
+        ))
+    );
+    Ok(())
 }
 
 // ============================================================================
@@ -376,68 +556,40 @@ impl CrcReplayAccumulator {
 // ============================================================================
 
 // ===== Visitor column indices =====
-// Indices into the column list returned by [`CrcReplayVisitor::selected_column_names_and_types`].
+// Indices into the column list returned by [`CommitCrcVisitor::selected_column_names_and_types`].
 const COL_FILE: usize = 0;
 const COL_OP: usize = 1;
 const COL_ICT: usize = 2;
-const COL_ADD_SIZE: usize = 3;
-const COL_REMOVE_PATH: usize = 4;
-const COL_REMOVE_SIZE: usize = 5;
-const COL_DM_DOMAIN: usize = 6;
-const COL_DM_CONFIG: usize = 7;
-const COL_DM_REMOVED: usize = 8;
-const COL_TXN_APP_ID: usize = 9;
-const COL_TXN_VERSION: usize = 10;
-const COL_TXN_LAST_UPDATED: usize = 11;
-const N_FIXED_COLS: usize = COL_TXN_LAST_UPDATED + 1;
+const COL_REMOVE_PATH: usize = 3;
+const COL_REMOVE_SIZE: usize = 4;
+/// Source-specific columns end here; the shared columns follow.
+const N_CRC_SPECIFIC_COLS: usize = COL_REMOVE_SIZE + 1;
+const N_FIXED_COLS: usize = N_CRC_SPECIFIC_COLS + N_SHARED_SINGLE_LEAF_COLS;
 
 /// Thin shim that pulls leaf values from `getters` and forwards them to the accumulator's
 /// `on_*` methods. All behavior lives in [`CrcReplayAccumulator`].
-struct CrcReplayVisitor<'a> {
+struct CommitCrcVisitor<'a> {
     acc: &'a mut CrcReplayAccumulator,
 }
 
-impl RowVisitor for CrcReplayVisitor<'_> {
+impl RowVisitor for CommitCrcVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-            const STRING: DataType = DataType::STRING;
-            const LONG: DataType = DataType::LONG;
-            const BOOLEAN: DataType = DataType::BOOLEAN;
-            let fixed = vec![
-                (STRING, column_name!("_file")),
-                (STRING, column_name!("commitInfo.operation")),
-                (LONG, column_name!("commitInfo.inCommitTimestamp")),
-                (LONG, column_name!("add.size")),
-                (STRING, column_name!("remove.path")),
-                (LONG, column_name!("remove.size")),
-                (STRING, column_name!("domainMetadata.domain")),
-                (STRING, column_name!("domainMetadata.configuration")),
-                (BOOLEAN, column_name!("domainMetadata.removed")),
-                (STRING, column_name!("txn.appId")),
-                (LONG, column_name!("txn.version")),
-                (LONG, column_name!("txn.lastUpdated")),
+            let mut fixed = vec![
+                (DataType::STRING, column_name!("_file")),
+                (DataType::STRING, column_name!("commitInfo.operation")),
+                (DataType::LONG, column_name!("commitInfo.inCommitTimestamp")),
+                (DataType::STRING, column_name!("remove.path")),
+                (DataType::LONG, column_name!("remove.size")),
             ];
-            let (mut types, mut names): (Vec<_>, Vec<_>) = fixed.into_iter().unzip();
-            for leaves in [&*PROTOCOL_LEAVES, &*METADATA_LEAVES] {
-                let (leaf_names, leaf_types) = leaves.as_ref();
-                names.extend_from_slice(leaf_names);
-                types.extend_from_slice(leaf_types);
-            }
-            (names, types).into()
+            fixed.extend(shared_columns());
+            append_protocol_metadata_leaves(fixed).into()
         });
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let n_protocol_leaves = PROTOCOL_LEAVES.as_ref().0.len();
-        let n_metadata_leaves = METADATA_LEAVES.as_ref().0.len();
-        require!(
-            getters.len() == N_FIXED_COLS + n_protocol_leaves + n_metadata_leaves,
-            Error::internal_error(format!(
-                "Wrong number of CrcReplayVisitor getters: {}",
-                getters.len()
-            ))
-        );
+        check_visitor_getters(getters, N_FIXED_COLS, "CommitCrcVisitor")?;
         if row_count == 0 {
             return Ok(());
         }
@@ -453,10 +605,6 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 self.acc.on_commit_info(operation.as_deref(), ict);
             }
 
-            if let Some(size) = getters[COL_ADD_SIZE].get_opt(i, "add.size")? {
-                self.acc.on_add(size)?;
-            }
-
             let remove_path: Option<String> = getters[COL_REMOVE_PATH].get_opt(i, "remove.path")?;
             if let Some(path) = remove_path {
                 let remove_size: Option<i64> =
@@ -464,31 +612,50 @@ impl RowVisitor for CrcReplayVisitor<'_> {
                 self.acc.on_remove(&path, remove_size)?;
             }
 
-            let dm_domain: Option<String> =
-                getters[COL_DM_DOMAIN].get_opt(i, "domainMetadata.domain")?;
-            if let Some(domain) = dm_domain {
-                let configuration: String =
-                    getters[COL_DM_CONFIG].get(i, "domainMetadata.configuration")?;
-                let removed: bool = getters[COL_DM_REMOVED].get(i, "domainMetadata.removed")?;
-                self.acc.on_domain_metadata(domain, configuration, removed);
-            }
+            self.acc
+                .apply_shared_columns(i, &getters[N_CRC_SPECIFIC_COLS..])?;
+        }
+        Ok(())
+    }
+}
 
-            let txn_app_id: Option<String> = getters[COL_TXN_APP_ID].get_opt(i, "txn.appId")?;
-            if let Some(app_id) = txn_app_id {
-                let version: i64 = getters[COL_TXN_VERSION].get(i, "txn.version")?;
-                let last_updated: Option<i64> =
-                    getters[COL_TXN_LAST_UPDATED].get_opt(i, "txn.lastUpdated")?;
-                self.acc.on_set_transaction(app_id, version, last_updated);
-            }
+// ============================================================================
+// Checkpoint base construction
+// ============================================================================
 
-            if self.acc.delta.protocol.is_none() {
-                self.acc.delta.protocol =
-                    visit_protocol_at(i, &getters[N_FIXED_COLS..N_FIXED_COLS + n_protocol_leaves])?;
-            }
-            if self.acc.delta.metadata.is_none() {
-                self.acc.delta.metadata =
-                    visit_metadata_at(i, &getters[N_FIXED_COLS + n_protocol_leaves..])?;
-            }
+/// Action schema for reading a checkpoint into a base [`Crc`], projecting only the leaves the
+/// accumulator needs. `add.size` is the only Add leaf read, and it is required, so its presence
+/// marks an Add row (a checkpoint Add missing `size` errors at read time). A checkpoint has no
+/// `remove` or `commitInfo` to project.
+#[allow(clippy::expect_used)]
+static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(schema! {
+        nullable ADD_NAME: { not_null "size": LONG },
+        (&PROTOCOL_FIELD),
+        (&METADATA_FIELD),
+        (&SET_TRANSACTION_FIELD),
+        (&DOMAIN_METADATA_FIELD),
+    })
+});
+
+// A checkpoint has no source-specific columns, so its projection is the shared columns.
+
+/// Pulls leaf values from a checkpoint batch into the shared [`CrcReplayAccumulator`].
+struct CheckpointCrcVisitor<'a> {
+    acc: &'a mut CrcReplayAccumulator,
+}
+
+impl RowVisitor for CheckpointCrcVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| append_protocol_metadata_leaves(shared_columns()).into());
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        check_visitor_getters(getters, N_SHARED_SINGLE_LEAF_COLS, "CheckpointCrcVisitor")?;
+        for i in 0..row_count {
+            self.acc.apply_shared_columns(i, getters)?;
         }
         Ok(())
     }
@@ -647,10 +814,22 @@ mod tests {
     #[test]
     fn visitor_schema_length_matches_column_indices() {
         let mut acc = CrcReplayAccumulator::new(None);
-        let visitor = CrcReplayVisitor { acc: &mut acc };
+        let visitor = CommitCrcVisitor { acc: &mut acc };
         let (names, types) = visitor.selected_column_names_and_types();
         let expected =
             N_FIXED_COLS + PROTOCOL_LEAVES.as_ref().0.len() + METADATA_LEAVES.as_ref().0.len();
+        assert_eq!(names.len(), expected);
+        assert_eq!(types.len(), expected);
+    }
+
+    #[test]
+    fn checkpoint_visitor_schema_length_matches_column_indices() {
+        let mut acc = CrcReplayAccumulator::new(None);
+        let visitor = CheckpointCrcVisitor { acc: &mut acc };
+        let (names, types) = visitor.selected_column_names_and_types();
+        let expected = N_SHARED_SINGLE_LEAF_COLS
+            + PROTOCOL_LEAVES.as_ref().0.len()
+            + METADATA_LEAVES.as_ref().0.len();
         assert_eq!(names.len(), expected);
         assert_eq!(types.len(), expected);
     }
@@ -779,9 +958,7 @@ mod tests {
             set_transaction_state: SetTransactionState::Complete(HashMap::new()),
             ..Default::default()
         };
-        let crc = segment
-            .build_incremental_crc_from_base(&engine, &base)
-            .unwrap();
+        let crc = segment.build_crc_from_base(&engine, &base).unwrap();
 
         // Newest-wins: v2's upgraded protocol (now carries `rowTracking` on top of v0's
         // features), v2's metadata, v2's ICT.
@@ -825,7 +1002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_incremental_crc_delta_errors_when_base_version_geq_end_version() {
+    async fn build_crc_delta_from_base_errors_when_base_version_geq_end_version() {
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let root = "memory:///t/";
@@ -848,9 +1025,37 @@ mod tests {
         .unwrap();
         for base in [0, 5] {
             assert_result_error_with_message(
-                segment.build_incremental_crc_delta(&engine, base, None),
+                segment.build_crc_delta_from_base(&engine, base, None),
                 "must be strictly less than end_version",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn build_crc_from_version_zero_no_checkpoint_first_commit_nonzero_errors() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let root = "memory:///t/";
+        add_commit(
+            root,
+            store.as_ref(),
+            1,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#.to_string(),
+        )
+        .await
+        .unwrap();
+        let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
+        let segment = LogSegment::for_snapshot_impl(
+            engine.storage_handler().as_ref(),
+            log_root,
+            vec![],
+            None,
+            Some(1),
+        )
+        .unwrap();
+        assert_result_error_with_message(
+            segment.build_crc_from_version_zero(&engine),
+            "log appears truncated without a checkpoint",
+        );
     }
 }

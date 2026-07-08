@@ -1,12 +1,13 @@
 //! Auth header providers for [`RestObjectStore`](super::RestObjectStore): the headers attached to
 //! every request, including refresh of short-lived credentials.
 
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use delta_kernel::object_store::Result as ObjectStoreResult;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
-use super::generic_err;
+use super::generic_error;
 
 /// Supplies the HTTP headers attached to every request a
 /// [`RestObjectStore`](super::RestObjectStore) makes.
@@ -59,8 +60,8 @@ pub fn headers_from_pairs(
 ) -> ObjectStoreResult<HeaderMap> {
     let mut headers = HeaderMap::new();
     for (name, value) in pairs {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(generic_err)?;
-        let value = HeaderValue::from_str(&value).map_err(generic_err)?;
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(generic_error)?;
+        let value = HeaderValue::from_str(&value).map_err(generic_error)?;
         headers.insert(name, value);
     }
     Ok(headers)
@@ -101,7 +102,7 @@ impl RefreshingHeaderProvider {
 impl AuthHeaderProvider for RefreshingHeaderProvider {
     fn headers(&self) -> ObjectStoreResult<HeaderMap> {
         // Hold the lock across the (rare) produce call so concurrent refreshes are single-flight.
-        let mut cached = self.cached.lock().unwrap();
+        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((headers, deadline)) = cached.as_ref() {
             if deadline.saturating_duration_since(std::time::Instant::now()) > HEADER_REFRESH_BUFFER
             {

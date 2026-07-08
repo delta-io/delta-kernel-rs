@@ -219,6 +219,11 @@ impl TableConfiguration {
         validate_variant_type_feature_support(&table_config)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
+        // TODO(#2630): Validate column-default metadata here so a table that declares a
+        // `CURRENT_DEFAULT` without the `allowColumnDefaults` feature, or with malformed default
+        // metadata, is rejected eagerly as corrupted rather than lazily in
+        // `Transaction::column_defaults`.
+
         Ok(table_config)
     }
 
@@ -449,6 +454,15 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn logical_schema(&self) -> SchemaRef {
         self.logical_schema.clone()
+    }
+
+    /// Borrows this table's logical schema, tied to `&self` (no `Arc` clone).
+    ///
+    /// Use this over [`logical_schema`](Self::logical_schema) when callers need to derive
+    /// `&self`-bound borrows from the schema (e.g. `&DataType` of a field).
+    #[cfg(feature = "column-defaults-in-dev")]
+    pub(crate) fn logical_schema_ref(&self) -> &SchemaRef {
+        &self.logical_schema
     }
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.
@@ -864,7 +878,7 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType};
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -900,10 +914,7 @@ mod test {
         min_reader_version: i32,
         min_writer_version: i32,
     ) -> TableConfiguration {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -954,10 +965,7 @@ mod test {
 
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1002,10 +1010,7 @@ mod test {
     fn dv_supported_not_enabled() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1030,10 +1035,7 @@ mod test {
     fn dv_enabled() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1065,10 +1067,7 @@ mod test {
         #[case] wv: i32,
         #[case] op: Operation,
     ) {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol =
             Protocol::new_unchecked(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST);
@@ -1162,10 +1161,7 @@ mod test {
     fn ict_enabled_from_table_creation() {
         use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1197,10 +1193,7 @@ mod test {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1241,10 +1234,7 @@ mod test {
             ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1275,10 +1265,7 @@ mod test {
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
@@ -1292,10 +1279,7 @@ mod test {
     }
     #[test]
     fn fails_on_unsupported_feature() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new_modern(["unknown"], ["unknown"]).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1308,10 +1292,7 @@ mod test {
     fn dv_not_supported() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1339,10 +1320,7 @@ mod test {
     fn test_try_new_from() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1360,10 +1338,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let new_schema = schema_ref! { nullable "value": INTEGER };
         let new_metadata = Metadata::try_new(
             None,
             None,
@@ -1420,10 +1395,7 @@ mod test {
     #[test]
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "ts",
-            DataType::TIMESTAMP_NTZ,
-        )]));
+        let schema = schema_ref! { nullable "ts": TIMESTAMP_NTZ };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_timestamp_ntz_features =
@@ -1460,10 +1432,7 @@ mod test {
     #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "v",
-            DataType::unshredded_variant(),
-        )]));
+        let schema = schema_ref! { nullable "v": (DataType::unshredded_variant()) };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_variant_features =
@@ -1505,10 +1474,7 @@ mod test {
         let metadata = Metadata::try_new(
             None,
             None,
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                DataType::INTEGER,
-            )])),
+            schema_ref! { nullable "value": INTEGER },
             vec![],
             0,
             HashMap::new(),
@@ -1728,10 +1694,7 @@ mod test {
 
     #[test]
     fn test_illegal_writer_feature_combination() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, vec![TableFeature::RowTracking])
@@ -1746,10 +1709,7 @@ mod test {
 
     #[test]
     fn test_row_tracking_with_domain_metadata_requirement() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new_modern(
             TableFeature::EMPTY_LIST,
@@ -2681,10 +2641,7 @@ mod test {
     ) -> TableConfiguration {
         let schema: SchemaRef = match cm_mode {
             Some(ColumnMappingMode::Name | ColumnMappingMode::Id) => schema_with_column_mapping(),
-            _ => Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                DataType::INTEGER,
-            )])),
+            _ => schema_ref! { nullable "value": INTEGER },
         };
         let mut props: HashMap<String, String> = extra_props
             .iter()

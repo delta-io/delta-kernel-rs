@@ -51,17 +51,25 @@ The caller owns the returned builder handle and must call either `snapshot_build
 
 ## Commit Range Flow
 
-A `CommitRange` describes a contiguous commits of table. Build one
-via the commit range builder (`ffi/src/commit_range.rs`):
+A `CommitRange` describes a contiguous range of a table's commits. Build one via the commit range
+builder (`ffi/src/commit_range.rs`):
 
 ```
 commit_range_builder_for(path, start_version, engine)
   -> commit_range_builder_set_end_version(builder, end_version)  // optional; else latest version
   -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
+  -> commit_range_commits(range, engine, actions, actions_len)   // -> SharedCommitActionsIterator
+       // or commit_range_commits_with_snapshot(range, engine, start_snapshot, actions, actions_len)
+  -> commit_range_commits_next(iter, ctx, visitor)               // visitor receives a SharedCommitAction
+       // in the visitor: commit_action_version / commit_action_timestamp
+       //                  commit_action_get_actions(action, engine) -> ExclusiveFileReadResultIterator
+       //                    -> read_result_next(...) -> free_read_result_iter(...)
 ```
 
 The caller owns the builder and must call either `commit_range_builder_build` or
-`free_commit_range_builder`. Release the range with `free_commit_range`.
+`free_commit_range_builder`. Release the range with `free_commit_range` and the commits iterator
+with `free_commit_actions_iter`. Each `SharedCommitAction` handed to the visitor must be released
+with `free_commit_action`.
 
 ## Write Flow
 
@@ -76,6 +84,8 @@ get_default_engine() -> transaction() -> with_engine_info() -> with_operation() 
 ```
 
 `commit()` and `create_table_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
+
+Write context: `get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_builder_with_partition_columns`.
 
 Deletion vector update flow:
 
@@ -127,7 +137,7 @@ cargo build -p delta_kernel_ffi --release
 Feature flags:
 - `default-engine-rustls` (default)
 - `default-engine-native-tls`
-- `arrow` (default; currently maps to `arrow-58`)
-- `arrow-58`, `arrow-57`
+- `arrow` (default; currently maps to `arrow-59`)
+- `arrow-59`, `arrow-58`
 - `delta-kernel-unity-catalog`
 - `tracing`

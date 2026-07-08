@@ -32,6 +32,7 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
@@ -143,6 +144,7 @@ impl CreateTableTransaction {
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
+        correlation_id: Option<Arc<str>>,
     ) -> DeltaResult<Self> {
         let span = tracing::info_span!(
             "txn",
@@ -152,7 +154,7 @@ impl CreateTableTransaction {
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
-            correlation_id: None,
+            correlation_id,
             read_snapshot_opt: None,
             effective_table_config,
             should_emit_protocol: true,

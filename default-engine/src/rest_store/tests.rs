@@ -2,13 +2,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use delta_kernel::object_store::path::Path;
-// 0.13 puts the get/put/copy convenience methods on ObjectStoreExt; 0.12 has them on
-// ObjectStore directly, where importing the Ext trait too would make the calls ambiguous.
-#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-use delta_kernel::object_store::ObjectStoreExt;
 use delta_kernel::object_store::{
-    Error as ObjectStoreError, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
-    Result as ObjectStoreResult, UpdateVersion,
+    Error as ObjectStoreError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode,
+    PutOptions, PutPayload, Result as ObjectStoreResult, UpdateVersion,
 };
 use futures::StreamExt as _;
 use reqwest::header::HeaderMap;
@@ -54,36 +50,21 @@ fn refreshing_header_provider_with_ttl_caches() {
     assert_eq!(second.get("authorization").unwrap(), "Bearer token-0");
 }
 
-/// The Databricks Files API dialect: empty path prefixes, `*_param` query names, and the
-/// `contents`/`nextPageToken`/`path`/`fileSize`/`isDirectory`/`lastModified` list-response field
-/// names. A test overrides any field it cares about and spreads the rest from here.
-fn default_config() -> RestEndpointConfig {
+fn test_config() -> RestEndpointConfig {
     RestEndpointConfig {
-        files_prefix: String::new(),
-        directories_prefix: String::new(),
+        files_prefix: "files".into(),
+        directories_prefix: "dirs".into(),
         page_token_param: "page_token".into(),
         start_from_param: "start_from".into(),
         recursive_param: "recursive".into(),
         overwrite_param: "overwrite".into(),
         contents_field: "contents".into(),
-        next_page_token_field: "nextPageToken".into(),
+        next_page_token_field: "next_page_token".into(),
         entry_path_field: "path".into(),
-        entry_size_field: "fileSize".into(),
-        entry_is_directory_field: "isDirectory".into(),
-        entry_last_modified_field: "lastModified".into(),
-        entry_strip_prefix: None,
-    }
-}
-
-/// A minimal REST dialect for tests: files at `/files/{path}`, directories at `/dirs/{path}`, and
-/// a `{ "contents": [{path, size}], "nextPageToken" }` list body. Other field names and the
-/// canonical 404 -> NotFound / 409 -> AlreadyExists status mapping come from [`default_config`].
-fn test_config() -> RestEndpointConfig {
-    RestEndpointConfig {
-        files_prefix: "files".into(),
-        directories_prefix: "dirs".into(),
         entry_size_field: "size".into(),
-        ..default_config()
+        entry_is_directory_field: "is_directory".into(),
+        entry_last_modified_field: "last_modified".into(),
+        entry_strip_prefix: None,
     }
 }
 
@@ -166,6 +147,35 @@ async fn ranged_get_non_partial_response_yields_error() {
 }
 
 #[tokio::test]
+async fn ranged_get_unexpected_content_range_yields_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files/a.txt"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 5-8/9")
+                .set_body_bytes(b"body".as_slice()),
+        )
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let err = store
+        .get_opts(
+            &Path::from("a.txt"),
+            GetOptions {
+                range: Some((0..4).into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Generic { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn head_uses_http_head_and_returns_meta_without_body() {
     let server = MockServer::start().await;
     Mock::given(method("HEAD"))
@@ -193,6 +203,31 @@ async fn head_uses_http_head_and_returns_meta_without_body() {
     // head must not stream a body.
     let body = res.bytes().await.unwrap();
     assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn head_missing_content_length_yields_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let err = store
+        .get_opts(
+            &Path::from("a.txt"),
+            GetOptions {
+                head: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Generic { .. }),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -262,8 +297,9 @@ async fn list_paginates_across_pages() {
         .and(path("/dirs/d"))
         .and(wiremock::matchers::query_param_is_missing("page_token"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"contents":[{"path":"d/1","size":1}],"nextPageToken":"p2"}"#),
+            ResponseTemplate::new(200).set_body_string(
+                r#"{"contents":[{"path":"d/1","size":1}],"next_page_token":"p2"}"#,
+            ),
         )
         .mount(&server)
         .await;
@@ -317,8 +353,9 @@ async fn list_not_found_mid_pagination_yields_error() {
         .and(path("/dirs/d"))
         .and(wiremock::matchers::query_param_is_missing("page_token"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"contents":[{"path":"d/1","size":1}],"nextPageToken":"p2"}"#),
+            ResponseTemplate::new(200).set_body_string(
+                r#"{"contents":[{"path":"d/1","size":1}],"next_page_token":"p2"}"#,
+            ),
         )
         .mount(&server)
         .await;
@@ -338,6 +375,76 @@ async fn list_not_found_mid_pagination_yields_error() {
         "got {:?}",
         results[1]
     );
+}
+
+#[tokio::test]
+async fn list_empty_next_page_token_ends_listing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dirs/d"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"contents":[{"path":"d/1","size":1}],"next_page_token":""}"#),
+        )
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let metas: Vec<_> = store
+        .list(Some(&Path::from("d")))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].location.as_ref(), "d/1");
+}
+
+#[tokio::test]
+async fn list_rejects_non_integer_size() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dirs/d"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"contents":[{"path":"d/1","size":"big"}]}"#),
+        )
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let err = store
+        .list(Some(&Path::from("d")))
+        .next()
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Generic { .. }),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_empty_bounded_range_returns_no_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "5"))
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new());
+    let result = store
+        .get_opts(
+            &Path::from("a.txt"),
+            GetOptions {
+                range: Some(GetRange::Bounded(0..0)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.range, 0..0);
+    assert_eq!(result.bytes().await.unwrap().len(), 0);
 }
 
 /// `list_with_offset` must exclude the offset entry itself even if the backend echoes it
@@ -395,8 +502,9 @@ async fn list_out_of_order_across_pages_yields_error() {
         .and(path("/dirs/d"))
         .and(wiremock::matchers::query_param_is_missing("page_token"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"contents":[{"path":"d/3","size":3}],"nextPageToken":"p2"}"#),
+            ResponseTemplate::new(200).set_body_string(
+                r#"{"contents":[{"path":"d/3","size":3}],"next_page_token":"p2"}"#,
+            ),
         )
         .mount(&server)
         .await;
@@ -479,18 +587,28 @@ async fn unsupported_operations_error_not_panic() {
 }
 
 #[tokio::test]
-async fn config_driven_contract_parses_list_and_reads() {
+async fn config_driven_list_parses_and_reads() {
     let server = MockServer::start().await;
     let config = RestEndpointConfig {
         files_prefix: "api/2.0/fs/files".into(),
         directories_prefix: "api/2.0/fs/directories".into(),
-        ..default_config()
+        page_token_param: "page_token".into(),
+        start_from_param: "start_from".into(),
+        recursive_param: "recursive".into(),
+        overwrite_param: "overwrite".into(),
+        contents_field: "contents".into(),
+        next_page_token_field: "next_page_token".into(),
+        entry_path_field: "path".into(),
+        entry_size_field: "file_size".into(),
+        entry_is_directory_field: "is_directory".into(),
+        entry_last_modified_field: "last_modified".into(),
+        entry_strip_prefix: None,
     };
     // Listing with one file and one subdirectory; the directory entry must be filtered out.
     Mock::given(method("GET"))
         .and(path("/api/2.0/fs/directories/d"))
         .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"contents":[{"path":"d/f1","fileSize":7,"isDirectory":false,"lastModified":1000},{"path":"d/sub","isDirectory":true}]}"#,
+            r#"{"contents":[{"path":"d/f1","file_size":7,"is_directory":false,"last_modified":1000},{"path":"d/sub","is_directory":true}]}"#,
         ))
         .mount(&server)
         .await;
@@ -542,7 +660,8 @@ fn store_with_strip_prefix(server: &MockServer, prefix: &str) -> RestObjectStore
     let config = RestEndpointConfig {
         directories_prefix: "dirs".into(),
         entry_strip_prefix: Some(prefix.into()),
-        ..default_config()
+        entry_size_field: "file_size".into(),
+        ..test_config()
     };
     RestObjectStore::new(
         server.uri(),
@@ -559,7 +678,7 @@ async fn list_strips_entry_prefix() {
         .and(path("/dirs/d"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_string(r#"{"contents":[{"path":"/TablesById/u/d/f1","fileSize":1}]}"#),
+                .set_body_string(r#"{"contents":[{"path":"/TablesById/u/d/f1","file_size":1}]}"#),
         )
         .mount(&server)
         .await;
@@ -792,7 +911,6 @@ async fn delete_missing_maps_to_not_found() {
     assert!(matches!(err, ObjectStoreError::NotFound { .. }));
 }
 
-#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
 #[tokio::test]
 async fn delete_stream_deletes_each_path() {
     let server = MockServer::start().await;

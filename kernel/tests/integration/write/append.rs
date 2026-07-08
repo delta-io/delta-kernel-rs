@@ -12,7 +12,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error as KernelError};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
@@ -188,10 +188,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         StructField::nullable("number", DataType::INTEGER),
         StructField::nullable("partition", DataType::STRING),
     ])?);
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let data_schema = schema_ref! { nullable "number": INTEGER };
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
@@ -327,15 +324,9 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let table_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let table_schema = schema_ref! { nullable "number": INTEGER };
     // incompatible data schema: one string column named 'string'
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "string",
-        DataType::STRING,
-    )])?);
+    let data_schema = schema_ref! { nullable "string": STRING };
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?

@@ -7,25 +7,20 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
-// object_store 0.13 (arrow-58) routes copy through copy_opts(CopyOptions); 0.12 (arrow-57)
-// uses copy/copy_if_not_exists. Import CopyOptions only where it exists.
-#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-use delta_kernel::object_store::CopyOptions;
 use delta_kernel::object_store::{
-    Attributes, Error as ObjectStoreError, GetOptions, GetRange, GetResult, GetResultPayload,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as ObjectStoreResult,
+    Attributes, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange, GetResult,
+    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use futures::stream::BoxStream;
-// `delete_stream` (.then) exists only on the object_store 0.13 (arrow-58) code path.
-#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
 use futures::StreamExt as _;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
+use tracing::{info, warn};
 
 use super::auth::AuthHeaderProvider;
-use super::contract::RestEndpointConfig;
-use super::{generic_err, generic_msg};
+use super::config::RestEndpointConfig;
+use super::generic_error;
 
 /// A generic REST/HTTP-backed [`ObjectStore`]. See the [module docs](super).
 #[derive(Debug, Clone)]
@@ -86,30 +81,53 @@ impl RestObjectStore {
 
     /// Send an idempotent request, retrying transient failures (5xx, connect/timeout) up to
     /// [`Self::max_retries`]. Returns the response for the caller to map via
-    /// [`Self::check_status`].
+    /// [`Self::ensure_success_response`]. `target` labels retry-summary log lines (path or
+    /// operation).
     async fn send_idempotent(
         &self,
+        target: &str,
         make: impl Fn(&Client, HeaderMap) -> reqwest::RequestBuilder,
     ) -> ObjectStoreResult<reqwest::Response> {
-        let mut retry = 0;
+        let mut retries = 0u32;
+        let mut last_failure = None::<RetryFailure>;
         loop {
-            let last = retry >= self.max_retries;
+            let exhausted = retries >= self.max_retries;
             // Fetch headers per attempt so a refreshable provider can produce a fresh token.
             let headers = self.headers()?;
             match make(&self.client, headers).send().await {
-                Ok(resp) if !last && resp.status().is_server_error() => {}
-                Ok(resp) => return Ok(resp),
-                Err(e) if !last && is_transient(&e) => {}
-                Err(e) => return Err(generic_err(e)),
+                Ok(resp) if !exhausted && is_retryable_http_status(resp.status()) => {
+                    last_failure = Some(RetryFailure::ServerError(resp.status()));
+                }
+                Ok(resp) => {
+                    if retries > 0 {
+                        log_retry_outcome(target, retries, last_failure.as_ref().unwrap(), true);
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if !exhausted && is_transient(&e) => {
+                    last_failure = Some(RetryFailure::Transport(e.to_string()));
+                }
+                Err(e) => {
+                    if retries > 0 {
+                        let transport_failure = RetryFailure::Transport(e.to_string());
+                        let failure = last_failure.as_ref().unwrap_or(&transport_failure);
+                        log_retry_outcome(target, retries, failure, false);
+                    }
+                    return Err(generic_error(e));
+                }
             }
-            retry += 1;
-            backoff(retry).await;
+            retries += 1;
+            backoff(retries).await;
         }
     }
 
     /// PUT a `Create`, verifying the result on an ambiguous outcome (5xx or transient transport
     /// error). Reads the object back to distinguish a write that landed (success) from a real
     /// conflict, retrying only while the write is confirmed absent.
+    ///
+    /// Does not call [`Self::ensure_success_response`] directly: HTTP 5xx is treated as ambiguous
+    /// (retry + read-back), not as a terminal error. Typed conflicts follow the first-attempt vs
+    /// retry rules below.
     ///
     /// A `409` (conflict) on the *first* attempt is a genuine pre-existing object and returns
     /// `AlreadyExists` immediately. On a *retry*, a `409` is most likely the writer's own
@@ -125,7 +143,8 @@ impl RestObjectStore {
         query: &[(String, String)],
         body: Bytes,
     ) -> ObjectStoreResult<PutResult> {
-        let mut retry = 0;
+        let mut retries = 0u32;
+        let mut last_failure = None::<RetryFailure>;
         loop {
             // Fetch headers per attempt so a refreshable provider can produce a fresh token.
             match self
@@ -139,27 +158,40 @@ impl RestObjectStore {
             {
                 Ok(resp) => {
                     let status = resp.status();
-                    if let Some(err) = self.status_error(status, path) {
+                    if let Some(err) = self.typed_http_error(status, path) {
                         // A conflict on a retry may be our own landed write, so reconcile it via
                         // read-back rather than trusting it; on the first attempt it is a genuine
                         // pre-existing conflict and is returned as-is.
                         let conflict = matches!(err, ObjectStoreError::AlreadyExists { .. });
-                        if !(conflict && retry > 0) {
+                        if !(conflict && retries > 0) {
                             return Err(err);
                         }
-                    } else if !status.is_server_error() {
-                        resp.error_for_status().map_err(generic_err)?;
+                        last_failure = Some(RetryFailure::ServerError(status));
+                    } else if !is_retryable_http_status(status) {
+                        self.ensure_success_response(resp, path)?;
+                        if retries > 0 {
+                            log_retry_outcome(path, retries, last_failure.as_ref().unwrap(), true);
+                        }
                         return Ok(put_result());
+                    } else {
+                        last_failure = Some(RetryFailure::ServerError(status));
                     }
                 }
-                Err(e) if is_transient(&e) => {}
-                Err(e) => return Err(generic_err(e)),
+                Err(e) if is_transient(&e) => {
+                    last_failure = Some(RetryFailure::Transport(e.to_string()));
+                }
+                Err(e) => return Err(generic_error(e)),
             }
             // Ambiguous outcome -- read back to tell a landed write from a real conflict. A
             // transient read-back failure leaves the outcome ambiguous, so treat it like an absent
             // write and consume a retry rather than making it terminal.
             match self.read_back(path, &body).await {
-                Ok(WriteState::Matches) => return Ok(put_result()),
+                Ok(WriteState::Matches) => {
+                    if retries > 0 {
+                        log_retry_outcome(path, retries, last_failure.as_ref().unwrap(), true);
+                    }
+                    return Ok(put_result());
+                }
                 Ok(WriteState::Differs) => {
                     return Err(ObjectStoreError::AlreadyExists {
                         path: path.to_string(),
@@ -167,16 +199,26 @@ impl RestObjectStore {
                     })
                 }
                 Ok(WriteState::Absent) => {}
-                Err(e) if retry >= self.max_retries => return Err(e),
-                Err(_) => {}
+                Err(e) if retries >= self.max_retries => {
+                    let transport_failure = RetryFailure::Transport(e.to_string());
+                    let failure = last_failure.as_ref().unwrap_or(&transport_failure);
+                    log_retry_outcome(path, retries, failure, false);
+                    return Err(e);
+                }
+                Err(e) => {
+                    last_failure = Some(RetryFailure::Transport(e.to_string()));
+                }
             }
-            if retry >= self.max_retries {
-                return Err(generic_msg(format!(
+            if retries >= self.max_retries {
+                if let Some(failure) = &last_failure {
+                    log_retry_outcome(path, retries, failure, false);
+                }
+                return Err(generic_error(format!(
                     "put could not confirm write for `{path}`"
                 )));
             }
-            retry += 1;
-            backoff(retry).await;
+            retries += 1;
+            backoff(retries).await;
         }
     }
 
@@ -196,37 +238,82 @@ impl RestObjectStore {
         let path = location.as_ref().trim_end_matches('/');
         let url = self.config.file_url(&self.base_url, path);
         let response = self
-            .send_idempotent(|c, h| c.delete(&url).headers(h))
+            .send_idempotent(path, |c, h| c.delete(&url).headers(h))
             .await?;
-        self.check_status(response, path)?;
+        self.ensure_success_response(response, path)?;
         Ok(())
     }
 
-    /// Map a non-success HTTP status to an error. `404 -> NotFound` is enforced here -- a universal
-    /// HTTP semantic that must not depend on the contract config -- and the remaining codes are
-    /// delegated to the config's mapping (e.g. `409 -> AlreadyExists`). Returns `None` on success
-    /// or a status the config does not claim.
-    fn status_error(&self, status: reqwest::StatusCode, path: &str) -> Option<ObjectStoreError> {
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Some(ObjectStoreError::NotFound {
+    // === HTTP response status handling ===
+    //
+    // Three separate concerns show up across REST calls:
+    //
+    // 1. **Retry classification** ([`is_retryable_http_status`], [`is_transient`]) -- 5xx / dropped
+    //    connections may succeed on another attempt. These are *not* terminal errors yet.
+    // 2. **Typed mapping** ([`Self::typed_http_error`]) -- select status codes become specific
+    //    [`ObjectStoreError`] variants (`404 -> NotFound`, `409 -> AlreadyExists`). Returns `None`
+    //    for 2xx and for statuses with no typed mapping.
+    // 3. **Generic non-2xx** ([`Self::reject_remaining_non_success`]) -- reqwest's
+    //    `error_for_status` turns any remaining failure into [`ObjectStoreError::Generic`].
+    //
+    // Most callers use [`Self::ensure_success_response`], which applies (2) then (3). List and
+    // verified-create have extra rules documented on their helpers.
+
+    /// If `status` maps to a typed [`ObjectStoreError`] (`404`, `409`, ...), return it. Returns
+    /// `None` for 2xx and for statuses with no typed mapping (see
+    /// [`Self::reject_remaining_non_success`]).
+    fn typed_http_error(
+        &self,
+        status: reqwest::StatusCode,
+        path: &str,
+    ) -> Option<ObjectStoreError> {
+        match status {
+            reqwest::StatusCode::NOT_FOUND => Some(ObjectStoreError::NotFound {
                 path: path.to_string(),
                 source: "HTTP 404".into(),
-            });
+            }),
+            reqwest::StatusCode::CONFLICT => Some(ObjectStoreError::AlreadyExists {
+                path: path.to_string(),
+                source: "HTTP 409".into(),
+            }),
+            _ => None,
         }
-        self.config.map_status(status, path)
     }
 
-    /// Apply [`Self::status_error`], then reqwest's default error-for-status, returning the
-    /// response unchanged on success.
-    fn check_status(
+    /// Apply reqwest's catch-all check for any remaining non-2xx after typed mapping.
+    fn reject_remaining_non_success(
+        response: reqwest::Response,
+    ) -> ObjectStoreResult<reqwest::Response> {
+        response.error_for_status().map_err(generic_error)
+    }
+
+    /// Typed status mapping, then generic non-2xx rejection. Returns the response on success.
+    fn ensure_success_response(
         &self,
         response: reqwest::Response,
         path: &str,
     ) -> ObjectStoreResult<reqwest::Response> {
-        if let Some(err) = self.status_error(response.status(), path) {
+        if let Some(err) = self.typed_http_error(response.status(), path) {
             return Err(err);
         }
-        response.error_for_status().map_err(generic_err)
+        Self::reject_remaining_non_success(response)
+    }
+
+    /// Like [`Self::ensure_success_response`], but a first-page `NotFound` yields `Ok(None)` so an
+    /// absent directory lists as empty. A `NotFound` mid-pagination is an error.
+    fn ensure_list_response(
+        &self,
+        response: reqwest::Response,
+        path: &str,
+        page_token: Option<&str>,
+    ) -> ObjectStoreResult<Option<reqwest::Response>> {
+        if let Some(err) = self.typed_http_error(response.status(), path) {
+            if matches!(err, ObjectStoreError::NotFound { .. }) && page_token.is_none() {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        Ok(Some(Self::reject_remaining_non_success(response)?))
     }
 
     /// GET `path` (optionally with a `Range` header) and return the body, response headers, and
@@ -241,19 +328,19 @@ impl RestObjectStore {
         let range = range_header
             .map(reqwest::header::HeaderValue::from_str)
             .transpose()
-            .map_err(generic_err)?;
+            .map_err(generic_error)?;
         let response = self
-            .send_idempotent(|c, mut h| {
+            .send_idempotent(path, |c, mut h| {
                 if let Some(v) = &range {
                     h.insert(reqwest::header::RANGE, v.clone());
                 }
                 c.get(&url).headers(h)
             })
             .await?;
-        let response = self.check_status(response, path)?;
+        let response = self.ensure_success_response(response, path)?;
         let status = response.status();
         let resp_headers = response.headers().clone();
-        let body = response.bytes().await.map_err(generic_err)?;
+        let body = response.bytes().await.map_err(generic_error)?;
         Ok((body, resp_headers, status))
     }
 
@@ -261,14 +348,26 @@ impl RestObjectStore {
     /// downloading the body. Used to serve `get_opts(head = true)` / `head()`.
     async fn head_meta(&self, path: &str, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let url = self.config.file_url(&self.base_url, path);
-        let response = self.send_idempotent(|c, h| c.head(&url).headers(h)).await?;
-        let response = self.check_status(response, path)?;
+        let response = self
+            .send_idempotent(path, |c, h| c.head(&url).headers(h))
+            .await?;
+        let response = self.ensure_success_response(response, path)?;
         let headers = response.headers();
-        let size = headers
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        let size = match headers.get(reqwest::header::CONTENT_LENGTH) {
+            None => {
+                return Err(generic_error(format!(
+                    "HEAD for `{path}` is missing a Content-Length header"
+                )));
+            }
+            Some(v) => {
+                let s = v
+                    .to_str()
+                    .map_err(|e| generic_error(format!("invalid Content-Length header: {e}")))?;
+                s.parse::<u64>().map_err(|e| {
+                    generic_error(format!("invalid Content-Length header `{s}`: {e}"))
+                })?
+            }
+        };
         let last_modified = parse_last_modified(headers);
         let e_tag = parse_etag(headers);
         Ok(ObjectMeta {
@@ -295,7 +394,7 @@ impl RestObjectStore {
             let mut page_token: Option<String> = None;
             // start_from applies only to the first request; page_token drives later pages.
             let mut start_from = start_from;
-            // The contract requires ascending paths across the whole listing; verified here so a
+            // Listings must be ascending by path across the whole stream; verified here so a
             // misordered backend fails loudly instead of corrupting log replay.
             let mut last_path: Option<Path> = None;
             'pages: loop {
@@ -306,29 +405,32 @@ impl RestObjectStore {
                     recursive,
                 );
                 start_from = None;
+                let list_target = if prefix.is_empty() {
+                    "list".to_string()
+                } else {
+                    format!("list `{prefix}`")
+                };
                 let response = match store
-                    .send_idempotent(|c, h| c.get(url.as_str()).query(&query).headers(h))
+                    .send_idempotent(&list_target, |c, h| {
+                        c.get(url.as_str()).query(&query).headers(h)
+                    })
                     .await
                 {
                     Ok(r) => r,
                     Err(e) => { yield Err(e); break; }
                 };
-                if let Some(err) = store.status_error(response.status(), &prefix) {
-                    // A missing directory lists as empty -- but only on the first page. A NotFound
-                    // mid-pagination (page_token set) means the listing was truncated, so surface it
-                    // rather than silently returning a partial result.
-                    if !matches!(err, ObjectStoreError::NotFound { .. }) || page_token.is_some() {
-                        yield Err(err);
-                    }
-                    break;
-                }
-                let response = match response.error_for_status() {
-                    Ok(r) => r,
-                    Err(e) => { yield Err(generic_err(e)); break; }
+                let response = match store.ensure_list_response(
+                    response,
+                    &prefix,
+                    page_token.as_deref(),
+                ) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => break,
+                    Err(e) => { yield Err(e); break; }
                 };
                 let body = match response.bytes().await {
                     Ok(b) => b,
-                    Err(e) => { yield Err(generic_err(e)); break; }
+                    Err(e) => { yield Err(generic_error(e)); break; }
                 };
                 let page = match store.config.parse_list(&body) {
                     Ok(p) => p,
@@ -343,7 +445,7 @@ impl RestObjectStore {
                     }
                     if let Some(last) = &last_path {
                         if meta.location < *last {
-                            yield Err(generic_msg(format!(
+                            yield Err(generic_error(format!(
                                 "REST listing returned out-of-order entry `{}` after `{}`; \
                                  RestEndpointConfig must return lexicographically sorted paths",
                                 meta.location, last
@@ -379,7 +481,7 @@ fn get_range_to_header(range: &GetRange) -> String {
 /// a server that sends a partial response with a bogus `Content-Range` should surface as an error,
 /// not silently degrade the reported range/size.
 fn parse_content_range(header: &str) -> ObjectStoreResult<(std::ops::Range<u64>, u64)> {
-    let invalid = || generic_msg(format!("malformed Content-Range header: `{header}`"));
+    let invalid = || generic_error(format!("malformed Content-Range header: `{header}`"));
     let (range_part, total_part) = header
         .strip_prefix("bytes ")
         .and_then(|inner| inner.split_once('/'))
@@ -418,9 +520,50 @@ enum WriteState {
     Absent,
 }
 
+/// The last failure that triggered a retry.
+enum RetryFailure {
+    ServerError(reqwest::StatusCode),
+    Transport(String),
+}
+
+impl std::fmt::Display for RetryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServerError(status) => write!(f, "HTTP {status}"),
+            Self::Transport(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Log once when a request retried before completing. Per-attempt lines are omitted to avoid noise.
+fn log_retry_outcome(target: &str, retries: u32, last_failure: &RetryFailure, succeeded: bool) {
+    if succeeded {
+        info!(
+            target,
+            retries,
+            last_failure = %last_failure,
+            "REST request succeeded after retries"
+        );
+    } else {
+        warn!(
+            target,
+            retries,
+            last_failure = %last_failure,
+            "REST request failed after retries"
+        );
+    }
+}
+
+/// HTTP 5xx may succeed on retry; callers classify it before mapping to a terminal error.
+fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+}
+
 /// Transport-level failures worth retrying for an idempotent request.
 fn is_transient(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
+    err.is_timeout()
+        || err.is_connect()
+        || ((err.is_request() || err.is_body()) && err.status().is_none())
 }
 
 /// Exponential backoff for retry `n` (1-based): 100ms doubling, capped at 2s. `n.min(6)` bounds
@@ -458,7 +601,6 @@ impl ObjectStore for RestObjectStore {
         // don't download the object just to read its size/etag (e.g. parquet footer probes).
         if options.head {
             let meta = self.head_meta(path_str, location).await?;
-            // Enforce client-side conditional preconditions against the HEAD metadata.
             options.check_preconditions(&meta)?;
             let size = meta.size;
             return Ok(GetResult {
@@ -469,27 +611,57 @@ impl ObjectStore for RestObjectStore {
             });
         }
 
-        let ranged = options.range.is_some();
+        if matches!(options.range.as_ref(), Some(GetRange::Bounded(r)) if r.is_empty()) {
+            let meta = self.head_meta(path_str, location).await?;
+            options.check_preconditions(&meta)?;
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(Box::pin(futures::stream::empty())),
+                range: 0..0,
+                meta,
+                attributes: Attributes::new(),
+            });
+        }
+
         let range_header = options.range.as_ref().map(get_range_to_header);
         let (content, headers, status) = self.get_file(path_str, range_header.as_deref()).await?;
 
-        // A ranged request that comes back non-partial (a 200 with the full body) must not be
-        // silently treated as the requested slice. Mirror object_store's `NotPartial` behavior and
-        // surface an error rather than handing back the wrong bytes.
-        if ranged && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(generic_msg(format!(
-                "ranged GET for `{path_str}` returned a non-partial response (HTTP {status}); \
-                 expected 206 Partial Content"
-            )));
-        }
-
-        // Derive byte range + total size from Content-Range (partial responses) or the body length.
-        let (range, total_size) = match headers
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-        {
-            Some(cr) => parse_content_range(cr)?,
-            None => (0..content.len() as u64, content.len() as u64),
+        let (range, total_size) = if let Some(requested) = &options.range {
+            // A ranged request that comes back non-partial (a 200 with the full body) must not be
+            // silently treated as the requested slice. Mirror object_store's `NotPartial` behavior.
+            if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(generic_error(format!(
+                    "ranged GET for `{path_str}` returned a non-partial response (HTTP {status}); \
+                     expected 206 Partial Content"
+                )));
+            }
+            let content_range = headers
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    generic_error(format!(
+                        "ranged GET for `{path_str}` is missing a Content-Range header"
+                    ))
+                })?;
+            let (actual, total) = parse_content_range(content_range)?;
+            let expected = requested
+                .as_range(total)
+                .map_err(|e| generic_error(format!("invalid range for `{path_str}`: {e}")))?;
+            if actual != expected {
+                return Err(generic_error(format!(
+                    "ranged GET for `{path_str}` returned unexpected Content-Range \
+                     `{content_range}`; expected bytes {expected:?}"
+                )));
+            }
+            (actual, total)
+        } else {
+            // Derive byte range + total size from Content-Range (if present) or the body length.
+            match headers
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(cr) => parse_content_range(cr)?,
+                None => (0..content.len() as u64, content.len() as u64),
+            }
         };
 
         let last_modified = parse_last_modified(&headers);
@@ -545,8 +717,8 @@ impl ObjectStore for RestObjectStore {
             .body(body)
             .send()
             .await
-            .map_err(generic_err)?;
-        self.check_status(response, path_str)?;
+            .map_err(generic_error)?;
+        self.ensure_success_response(response, path_str)?;
         Ok(put_result())
     }
 
@@ -576,14 +748,6 @@ impl ObjectStore for RestObjectStore {
         self.list_paginated(prefix, Some(offset_str), Some(offset.clone()), true)
     }
 
-    // object_store 0.12 (arrow-57) has `delete` on the trait; 0.13 (arrow-58) replaced it with the
-    // required `delete_stream` (and `delete` moved to ObjectStoreExt) -- both route to delete_one.
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        self.delete_one(location).await
-    }
-
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     fn delete_stream(
         &self,
         locations: BoxStream<'static, ObjectStoreResult<Path>>,
@@ -600,8 +764,7 @@ impl ObjectStore for RestObjectStore {
     }
 
     // === Operations Delta never issues against a REST file store ===
-    // These return NotSupported. object_store's copy API differs across backends: 0.13 (arrow-58)
-    // has copy_opts, 0.12 (arrow-57) has copy / copy_if_not_exists -- cfg-gated to match.
+    // These return NotSupported.
 
     async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
         Err(not_supported("list_with_delimiter"))
@@ -615,7 +778,6 @@ impl ObjectStore for RestObjectStore {
         Err(not_supported("multipart upload"))
     }
 
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
     async fn copy_opts(
         &self,
         _from: &Path,
@@ -623,16 +785,6 @@ impl ObjectStore for RestObjectStore {
         _options: CopyOptions,
     ) -> ObjectStoreResult<()> {
         Err(not_supported("copy"))
-    }
-
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    async fn copy(&self, _from: &Path, _to: &Path) -> ObjectStoreResult<()> {
-        Err(not_supported("copy"))
-    }
-
-    #[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> ObjectStoreResult<()> {
-        Err(not_supported("copy_if_not_exists"))
     }
 }
 

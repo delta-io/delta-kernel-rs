@@ -155,8 +155,8 @@ consumed. It provides detailed statistics about the log replay process:
 | `num_non_file_actions` | Non-file actions (protocol, metadata, etc.) seen during replay. |
 | `num_predicate_filtered` | Files eliminated by predicate evaluation (data skipping and partition pruning). |
 | `peak_hash_set_size` | Peak size of the internal deduplication set. Indicates memory pressure during log replay. |
-| `dedup_visitor_time_ms` | Milliseconds spent in the deduplication visitor. |
-| `predicate_eval_time_ms` | Milliseconds spent evaluating predicates. |
+| `dedup_visitor_time_ns` | Nanoseconds spent in the deduplication visitor. |
+| `predicate_eval_time_ns` | Nanoseconds spent evaluating predicates. |
 
 #### The ScanType enum
 
