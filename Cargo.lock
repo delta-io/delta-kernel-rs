@@ -4772,14 +4772,12 @@ name = "unity-catalog-delta-rest-client"
 version = "0.25.0"
 dependencies = [
  "chrono",
- "clap",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "unity-catalog-delta-client-api",
  "url",
 ]
