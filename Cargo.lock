@@ -1390,7 +1390,6 @@ version = "0.25.0"
 dependencies = [
  "bytes",
  "cbindgen",
- "delta-kernel-unity-catalog",
  "delta_kernel",
  "delta_kernel_default_engine",
  "delta_kernel_ffi_macros",
@@ -1409,7 +1408,6 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "trybuild",
- "unity-catalog-delta-client-api",
  "url",
 ]
 
