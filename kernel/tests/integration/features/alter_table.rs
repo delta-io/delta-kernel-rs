@@ -1097,10 +1097,10 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
 }
 
 /// A mapping-disabled table carrying residual `delta.columnMapping.*` annotations reads fine
-/// (see the read-side tolerance), but ALTER is still rejected: the write path validates the whole
-/// evolved schema, so a stale annotation on an untouched column fails even when the ALTER only adds
-/// a clean column. delta-spark tolerates this; closing the gap is tracked in
-/// https://github.com/delta-io/delta-kernel-rs/issues/2885. This test pins the current strict
+/// (`StructField::make_physical` tolerates them), but ALTER is still rejected: the strict check
+/// validates the whole evolved schema, so a stale annotation on an untouched column fails even
+/// when the ALTER only adds a clean column. delta-spark tolerates this; closing the gap is tracked
+/// in https://github.com/delta-io/delta-kernel-rs/issues/2885. This test pins the current strict
 /// behavior until then.
 #[tokio::test]
 async fn add_column_rejected_when_table_has_stale_column_mapping() -> DeltaResult<()> {

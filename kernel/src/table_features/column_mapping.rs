@@ -115,10 +115,10 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 /// How to treat a stale `delta.columnMapping.*` annotation found on a field while column mapping
 /// is disabled ([`ColumnMappingMode::None`]).
 ///
-/// A table can carry these annotations after column mapping was enabled and then disabled. They
-/// are inert while mapping is off -- physical names resolve to logical names -- so the read path
-/// tolerates them (matching delta-spark, which ignores them on read), while the write path rejects
-/// them so kernel never persists a table in that shape.
+/// A table can carry residual annotations while mapping is off. They are inert -- physical names
+/// resolve to logical names -- so reads tolerate them (matching delta-spark, which ignores them in
+/// `NoMapping` mode), while CREATE / ALTER reject them so kernel never persists a table in that
+/// shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StaleAnnotationPolicy {
     /// Ignore a stale annotation and resolve the field by its logical name.
@@ -966,9 +966,10 @@ mod tests {
             });
     }
 
-    // `validate_schema_column_mapping` is the strict entry point (used by the write path), so a
-    // stale annotation on a mapping-disabled table is rejected. The read path's leniency is
-    // covered by `test_validate_and_extract_tolerates_stale_annotations_when_disabled`.
+    // `validate_schema_column_mapping` is the strict validator (CREATE / ALTER reach it via the
+    // `validate_schema_column_mapping_strict` alias), so a stale annotation on a mapping-disabled
+    // table is rejected. The lenient path is covered by
+    // `test_validate_and_extract_tolerates_stale_annotations_when_disabled`.
     #[test]
     fn test_column_mapping_disabled() {
         let schema = create_schema(None, None, None, None);

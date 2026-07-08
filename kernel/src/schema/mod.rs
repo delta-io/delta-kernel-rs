@@ -725,8 +725,8 @@ impl StructField {
     /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
     /// encountered (metadata columns should not participate in column mapping). When column
     /// mapping is disabled, a stale annotation is tolerated (resolved by logical name and dropped
-    /// from the physical metadata); the write path rejects it via a separate strict validation
-    /// pass instead.
+    /// from the physical metadata); CREATE / ALTER reject it via a separate strict validation pass
+    /// instead.
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]

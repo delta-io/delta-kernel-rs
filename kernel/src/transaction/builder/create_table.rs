@@ -899,9 +899,8 @@ impl CreateTableTransactionBuilder {
         // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
 
-        // Reject stale column-mapping annotations on a mapping-disabled table. `make_physical`
-        // (run when building the `TableConfiguration` below) tolerates these on the read path, so
-        // this explicit check keeps writes from persisting a table in that shape.
+        // Validates column mapping in strict mode (rejects stale CM annotations on a
+        // mapping-disabled table).
         validate_schema_column_mapping_strict(&effective_schema, column_mapping_mode)?;
 
         // Validate data layout and resolve column names (physical for clustering, logical

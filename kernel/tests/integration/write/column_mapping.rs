@@ -480,12 +480,11 @@ async fn test_duplicated_phy_path_rejected(
     Ok(())
 }
 
-/// A table left with `delta.columnMapping.*` annotations after mapping was enabled and then
-/// disabled must still be readable: mapping is off, so the annotations are inert and columns
-/// resolve by logical name. Kernel matches delta-spark, which ignores residual annotations when
-/// mapping is disabled.
+/// A table left with residual `delta.columnMapping.*` annotations while mapping is off must still
+/// be readable and appendable: the annotations are inert and columns resolve by logical name.
+/// Kernel matches delta-spark, which ignores residual annotations in `NoMapping` mode.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_read_tolerates_stale_column_mapping_when_disabled(
+async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tmp_dir = tempfile::tempdir()?;
     let table_url = Url::from_directory_path(tmp_dir.path()).unwrap();
@@ -499,7 +498,7 @@ async fn test_read_tolerates_stale_column_mapping_when_disabled(
     );
 
     // A `value` column carrying a stale physicalName + id, with no columnMapping feature in the
-    // protocol and mode absent (so it resolves to None) -- the enable-then-disable artifact.
+    // protocol and mode absent (so it resolves to None).
     let stale_schema = schema_ref! {
         nullable "id": INTEGER,
         nullable "value": INTEGER
@@ -526,13 +525,7 @@ async fn test_read_tolerates_stale_column_mapping_when_disabled(
 
     // Snapshot load succeeds and reports column mapping disabled.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    assert_eq!(
-        snapshot
-            .table_properties()
-            .column_mapping_mode
-            .unwrap_or(ColumnMappingMode::None),
-        ColumnMappingMode::None
-    );
+    assert_eq!(snapshot.table_properties().column_mapping_mode, None);
     // The `value` column resolves by its logical name, not the stale physical name.
     let physical_name = get_any_level_column_physical_name(
         snapshot.schema().as_ref(),

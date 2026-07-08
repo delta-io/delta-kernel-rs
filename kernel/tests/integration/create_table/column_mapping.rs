@@ -279,10 +279,9 @@ fn test_column_mapping_invalid_mode_rejected() {
 }
 
 /// CREATE TABLE with column mapping disabled must reject an input schema that already carries
-/// `delta.columnMapping.*` annotations, so kernel never originates a table in that shape. The
-/// read path tolerates such annotations (they can pre-exist from an enable-then-disable), but the
-/// write path stays strict. Tracked for future tolerance in
-/// https://github.com/delta-io/delta-kernel-rs/issues/2885.
+/// `delta.columnMapping.*` annotations, so kernel never originates a table in that shape. Reads
+/// tolerate such residual annotations, but CREATE / ALTER stay strict. Tracked for future
+/// tolerance in https://github.com/delta-io/delta-kernel-rs/issues/2885.
 #[test]
 fn test_create_table_rejects_stale_column_mapping_when_disabled() {
     let (_temp_dir, table_path, engine) = test_table_setup().unwrap();
