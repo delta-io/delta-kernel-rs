@@ -7,6 +7,7 @@
 //! Example: `` `col1` > 5 `` tokenizes to `[Ident("col1"), Gt, Literal("5")]`.
 
 // WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
+// TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
 #![allow(dead_code)]
 
 use std::iter::Peekable;
@@ -309,6 +310,9 @@ mod tests {
     #[case("+5", &[Token::Plus, lit("5")])]
     #[case("-.5", &[Token::Minus, lit(".5")])]
     #[case("-2e+1", &[Token::Minus, lit("2e+1")])]
+    // `1+1` is three tokens (the sign never glues onto the following number), so the number after
+    // an operator is not swallowed into the previous one.
+    #[case("1+1", &[lit("1"), Token::Plus, lit("1")])]
     fn tokenizes_signed_number_as_sign_then_literal(#[case] sql: &str, #[case] expected: &[Token]) {
         assert_eq!(tokenize(sql).unwrap(), expected);
     }
