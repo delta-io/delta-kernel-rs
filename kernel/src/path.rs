@@ -302,7 +302,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         matches!(self.file_type, LogPathFileType::Unknown)
     }
 
-    /// uses the `Location`'s extension to determine if this is json or not
+    /// Whether this log path's file extension is `json`.
     #[internal_api]
     #[allow(dead_code)] // not all cfgs exercise this
     pub(crate) fn is_json(&self) -> bool {

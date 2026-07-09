@@ -666,7 +666,7 @@ mod tests {
         if &v2.path == selected {
             assert_eq!(
                 seg.checkpoint_hint_sidecars(),
-                v2.sidecar_files.as_deref(),
+                v2.sidecar_files.as_ref(),
                 "{table}: matched hint exposes its sidecars"
             );
         } else {

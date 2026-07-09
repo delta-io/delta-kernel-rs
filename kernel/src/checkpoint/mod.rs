@@ -137,7 +137,7 @@ mod sidecar;
 
 #[cfg(feature = "declarative-plans")]
 #[allow(unused_imports)]
-pub(crate) use checkpoint_scan_shape::{CheckpointScanShape, CheckpointShape, CheckpointStatsInfo};
+pub(crate) use checkpoint_scan_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };

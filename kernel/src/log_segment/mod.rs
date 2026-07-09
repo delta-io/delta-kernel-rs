@@ -275,15 +275,16 @@ impl LogSegment {
 
     /// The hint's sidecar references, when it describes the selected checkpoint (see
     /// [`Self::checkpoint_hint`]). `None` if there is no matching hint or it omitted
-    /// `sidecarFiles`; `Some(&[])` if the hint listed none. A non-empty slice identifies a manifest
-    /// checkpoint whose file actions live in those sidecars.
+    /// `sidecarFiles`; `Some(empty)` if the hint listed none (a definitive inline leaf). A
+    /// non-empty list identifies a manifest checkpoint whose file actions live in those
+    /// sidecars.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
-    pub(crate) fn checkpoint_hint_sidecars(&self) -> Option<&[Sidecar]> {
+    pub(crate) fn checkpoint_hint_sidecars(&self) -> Option<&Vec<Sidecar>> {
         self.checkpoint_hint()?
             .v2_checkpoint
             .as_ref()?
             .sidecar_files
-            .as_deref()
+            .as_ref()
     }
 
     /// Succinct summary string for logging purposes.

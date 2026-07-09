@@ -2683,7 +2683,7 @@ fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
         }),
     )?;
 
-    assert_eq!(log_segment.checkpoint_hint_sidecars(), Some([].as_slice()));
+    assert_eq!(log_segment.checkpoint_hint_sidecars(), Some(&vec![]));
     Ok(())
 }
 
