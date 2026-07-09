@@ -69,7 +69,10 @@ async fn test_clustered_table_write_and_checkpoint(
     let batch = generate_batch(vec![
         ("id", vec![1, 2, 3].into_array_ref()),
         ("name", vec!["alice", "bob", "charlie"].into_array_ref()),
-        ("city", vec!["seattle", "portland", "seattle"].into_array_ref()),
+        (
+            "city",
+            vec!["seattle", "portland", "seattle"].into_array_ref(),
+        ),
     ])?;
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     assert_eq!(snapshot.version(), 1);
