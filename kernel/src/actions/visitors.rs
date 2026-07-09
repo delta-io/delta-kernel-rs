@@ -570,7 +570,9 @@ pub(crate) fn visit_metadata_at<'a>(
     let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
     // get format out of primitives
     let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-    // options for format is always empty, so skip getters[4]
+    let format_options_map_opt: Option<HashMap<_, _>> =
+        getters[4].get_opt(row_index, "metadata.format.options")?;
+    let format_options = format_options_map_opt.unwrap_or_else(HashMap::new);
     let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
     let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
     let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
@@ -584,7 +586,7 @@ pub(crate) fn visit_metadata_at<'a>(
         description,
         format: Format {
             provider: format_provider,
-            options: HashMap::new(),
+            options: format_options,
         },
         schema_string,
         partition_columns,
@@ -790,6 +792,31 @@ mod tests {
             configuration,
         };
         assert_eq!(parsed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_metadata_format_options() -> DeltaResult<()> {
+        // A metaData action carrying a non-empty format.options map must round-trip through
+        // the visitor rather than being dropped (getters[4] was previously skipped).
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{"contentDefinedChunking.enabled":"true","contentDefinedChunking.minChunkSize":"65536"}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#,
+        ]
+        .into();
+        let data = parse_json_batch(json_strings);
+        let parsed = Metadata::try_new_from_data(data.as_ref())?.unwrap();
+
+        let expected_options = HashMap::from_iter([
+            (
+                "contentDefinedChunking.enabled".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "contentDefinedChunking.minChunkSize".to_string(),
+                "65536".to_string(),
+            ),
+        ]);
+        assert_eq!(parsed.format.options, expected_options);
         Ok(())
     }
 
