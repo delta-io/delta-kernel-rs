@@ -2,30 +2,29 @@
 //!
 //! # Invariants
 //!
-//! The rules kernel applies to column defaults, and where each comes from (enforced, or tolerated
-//! as noted), in [`ColumnDefault`]'s constructor, [`validate_column_defaults_metadata`], and the
-//! IcebergCompatV3 check in [`crate::table_features`].
+//! The rules Kernel applies to column defaults, and where each comes from. This applies to
+//! [`ColumnDefault::new`], [`validate_column_defaults_metadata`], and the IcebergCompatV3 check in
+//! [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
+//! divergences are called out as such.
 //!
-//! - `CURRENT_DEFAULT` metadata present without the `allowColumnDefaults` writer feature is
-//!   orphaned metadata, which kernel tolerates on both read and write. (Protocol.)
-//! - `CURRENT_DEFAULT` metadata must be a SQL string. (Protocol.)
-//! - A Variant column must default to `NULL`; a non-`NULL` variant default is rejected. (Protocol.)
-//! - A non-`NULL` default on an Array, Map, or Struct column is protocol-legal but kernel cannot
+//! - Kernel tolerates orphaned metadata on both read and write. Orphaned metadata is a
+//!   `CURRENT_DEFAULT` present without the `allowColumnDefaults` writer feature.
+//! - `CURRENT_DEFAULT` metadata must be a SQL string.
+//! - A Variant column must default to NULL; a non-NULL variant default is rejected.
+//! - A non-NULL default on an Array, Map, or Struct column is protocol-legal but kernel cannot
 //!   materialize it, so it is tolerated and surfaced via raw SQL (`to_scalar` returns `None`).
-//!   (Kernel.)
-//! - Defaults may appear on nested struct fields, not just top-level columns. Kernel only *writes*
-//!   top-level defaults, but supports *loading* a snapshot of a table authored elsewhere that
-//!   carries nested defaults, so validation descends into nested fields. (Protocol permits nesting;
-//!   the write-side restriction is a kernel limitation.)
+//! - Defaults may appear on nested struct fields, not just top-level columns, so validation
+//!   descends into nested fields. Kernel only *writes* top-level defaults (a kernel limitation),
+//!   but *loads* a snapshot of a table authored elsewhere that carries nested defaults.
 //! - Parsing is best-effort: unparseable SQL (e.g. `current_timestamp()`) is not an error; the
-//!   connector falls back to the raw SQL. (Kernel.)
+//!   connector falls back to the raw SQL.
 //! - On an IcebergCompatV3 table, kernel imposes two extra limitations on every default:
-//!     - It must be a literal. (Protocol requires a literal; kernel enforces this via its own SQL
-//!       parser, so a literal kernel cannot parse is rejected too.)
-//!     - Its column must be primitive. (Kernel limitation: kernel does not materialize
-//!       non-primitive defaults, so it rejects them even where the protocol would allow a `NULL`.)
+//!     - It must be a kernel-parsable literal. The protocol requires a literal; kernel enforces
+//!       this with its own SQL parser, so a literal kernel cannot parse is rejected too.
+//!     - Its column must be primitive. Kernel cannot materialize non-primitive defaults, so it
+//!       rejects them even where the protocol would allow a NULL (a kernel limitation).
 
-use crate::expressions::{parse_sql, Expression, Scalar};
+use crate::expressions::{parse_sql, ColumnName, Expression, Scalar};
 use crate::schema::{DataType, StructField, StructType};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
@@ -107,8 +106,8 @@ impl<'a> ColumnDefault<'a> {
 
     /// Returns `true` iff the default parsed to a literal expression.
     ///
-    /// SQL the kernel could not parse (e.g. arithmetic or function calls) returns `false`. Note
-    /// that `NULL` parses to a literal, so this is `true` for a `NULL` default regardless of the
+    /// Returns `false` for SQL the kernel could not parse (e.g. arithmetic or function calls). Note
+    /// that NULL parses to a literal, so this is `true` for a NULL default regardless of the
     /// column type.
     pub(crate) fn is_literal(&self) -> bool {
         matches!(self.parsed_sql, Some(Expression::Literal(_)))
@@ -119,10 +118,6 @@ impl<'a> ColumnDefault<'a> {
 /// a `CURRENT_DEFAULT`, descending through nested structs, arrays, and maps (see the nesting
 /// invariant in the module docs).
 ///
-/// A `CURRENT_DEFAULT` lives on a [`StructField`], so container slots contribute a synthetic path
-/// segment on the way to any struct nested inside them: `element` for an array, `key`/`value` for a
-/// map. `path` is collected for clarity in error reporting.
-///
 /// # Errors
 ///
 /// Propagates any error from
@@ -130,7 +125,7 @@ impl<'a> ColumnDefault<'a> {
 /// whose value is not a SQL string, or a non-`NULL` default on a Variant column.
 pub(crate) fn collect_column_defaults(
     schema: &StructType,
-) -> DeltaResult<Vec<(String, ColumnDefault<'_>)>> {
+) -> DeltaResult<Vec<(ColumnName, ColumnDefault<'_>)>> {
     let mut collector = ColumnDefaultCollector {
         path: Vec::new(),
         defaults: Vec::new(),
@@ -139,17 +134,13 @@ pub(crate) fn collect_column_defaults(
     Ok(collector.defaults)
 }
 
-/// Recursive [`SchemaTransform`] that gathers every field's column default with its dotted path.
+/// Recursive [`SchemaTransform`] that gathers every field's column default with its column name.
 ///
-/// Uses the `DeltaResult<()>` carrier so [`StructField::column_default`]'s error propagates with
-/// `?` and short-circuits the traversal. Container element types have no metadata of their own, so
-/// the array/map hooks only push a synthetic path segment before recursing toward any nested
-/// struct.
-///
-/// [`StructField::column_default`]: crate::schema::StructField::column_default
+/// Container element types have no metadata of their own, so the array/map hooks only push a
+/// synthetic path segment before recursing toward any nested struct.
 struct ColumnDefaultCollector<'a> {
     path: Vec<String>,
-    defaults: Vec<(String, ColumnDefault<'a>)>,
+    defaults: Vec<(ColumnName, ColumnDefault<'a>)>,
 }
 
 impl<'a> ColumnDefaultCollector<'a> {
@@ -169,7 +160,8 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
         self.path.push(field.name().clone());
         if let Some(column_default) = field.column_default()? {
-            self.defaults.push((self.path.join("."), column_default));
+            self.defaults
+                .push((ColumnName::new(&self.path), column_default));
         }
         let result = self.recurse_into_struct_field(field);
         self.path.pop();
@@ -199,15 +191,14 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 /// Inspects nested fields as well as top-level columns; see [`collect_column_defaults`].
 ///
 /// This does not couple defaults to the `allowColumnDefaults` feature: a `CURRENT_DEFAULT`
-/// present without the feature is orphaned metadata, which kernel tolerates (see the module docs).
+/// present without the feature is orphaned metadata, which is allowed (see the module docs).
 ///
 /// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
 ///
 /// # Errors
 ///
 /// Propagates any error from [`collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is not
-/// a SQL string (corrupt, since the protocol defines it as a SQL string), or a non-`NULL` default
-/// on a Variant column (which the protocol forbids).
+/// a SQL string, or a non-NULL default on a Variant column.
 pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<()> {
     collect_column_defaults(schema)?;
     Ok(())
@@ -249,6 +240,11 @@ mod tests {
 
     fn struct_ty() -> DataType {
         DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
+    }
+
+    /// A struct type whose single field `inner` carries an integer default.
+    fn struct_with_inner_default() -> DataType {
+        DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap()
     }
 
     fn date_days(year: i32, month: u32, day: u32) -> i32 {
@@ -380,6 +376,29 @@ mod tests {
             (Err(e), Some(needle)) => assert!(e.to_string().contains(needle), "got: {e}"),
             (result, expected) => panic!("unexpected outcome: {result:?} vs {expected:?}"),
         }
+    }
+
+    #[rstest]
+    #[case::array_element(
+        DataType::from(ArrayType::new(struct_with_inner_default(), true)),
+        ["arr", "element", "inner"]
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(DataType::STRING, struct_with_inner_default(), true)),
+        ["arr", "value", "inner"]
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(struct_with_inner_default(), DataType::INTEGER, true)),
+        ["arr", "key", "inner"]
+    )]
+    fn collect_nested_container_default_path(
+        #[case] container: DataType,
+        #[case] expected_path: [&str; 3],
+    ) {
+        let schema = StructType::try_new([StructField::nullable("arr", container)]).unwrap();
+        let defaults = collect_column_defaults(&schema).unwrap();
+        let [(path, _)] = defaults.try_into().expect("exactly one default");
+        assert_eq!(path, ColumnName::new(expected_path));
     }
 
     #[test]
