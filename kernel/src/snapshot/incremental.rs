@@ -94,6 +94,8 @@ impl Snapshot {
         let existing_log_segment = &existing_snapshot.log_segment;
         let existing_snapshot_version = existing_snapshot.version();
         let requested_version = target_version.into();
+        // Intent-based, no explicit target version means the snapshot will be built as latest.
+        let built_as_latest = requested_version.is_none();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
@@ -183,6 +185,7 @@ impl Snapshot {
                     engine,
                     metric_context,
                     incremental_replay,
+                    built_as_latest,
                 );
                 return Ok(Arc::new(snapshot?));
             }
@@ -338,6 +341,7 @@ impl Snapshot {
             combined_log_segment,
             table_configuration,
             crc_at_version,
+            built_as_latest,
         )?))
     }
 

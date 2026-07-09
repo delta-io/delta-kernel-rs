@@ -74,6 +74,11 @@ pub struct Snapshot {
     /// means `crc.version == self.version()` and the CRC can be queried at zero I/O. `None`
     /// means no CRC was loadable (no CRC on disk at this version, or the read failed).
     crc: Option<Arc<Crc>>,
+    /// Whether this snapshot was built as latest.
+    ///
+    /// Intent-based: reflects what the caller asked for, not whether this is factually the newest
+    /// version. True iff the snapshot is not a time travel or post-commit snapshot.
+    built_as_latest: bool,
 }
 
 impl PartialEq for Snapshot {
@@ -133,17 +138,26 @@ impl Snapshot {
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
     ) -> DeltaResult<Self> {
-        Self::new_with_crc(log_segment, table_configuration, None)
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            None,  /* crc */
+            false, /* built_as_latest */
+        )
     }
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
     ///
     /// A `Some(crc)` must be at the table configuration's version; otherwise this returns an
     /// internal error.
+    ///
+    /// `built_as_latest` records whether the snapshot is being built as latest(intent-based).
+    ///  See [`Snapshot::built_as_latest`].
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
+        built_as_latest: bool,
     ) -> DeltaResult<Self> {
         if let Some(crc) = crc.as_ref() {
             require!(
@@ -167,6 +181,7 @@ impl Snapshot {
             log_segment,
             table_configuration,
             crc,
+            built_as_latest,
         })
     }
 
@@ -181,6 +196,7 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
     ) -> DeltaResult<Self> {
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
@@ -207,7 +223,12 @@ impl Snapshot {
 
         tracing::Span::current().record("version", table_configuration.version());
 
-        Self::new_with_crc(log_segment, table_configuration, crc_at_version)
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            crc_at_version,
+            built_as_latest,
+        )
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -258,7 +279,15 @@ impl Snapshot {
             .as_deref()
             .map(|base| Arc::new(base.clone().apply(crc_delta, new_version)));
 
-        Snapshot::new_with_crc(new_log_segment, new_table_configuration, new_crc)
+        // Conservatively set built_as_latest to false for all post-commit snapshots, even if
+        // current snapshot is built as latest. This is to reduce the risk when concurrent writes
+        // are happening and the current snapshot is built as latest.
+        Snapshot::new_with_crc(
+            new_log_segment,
+            new_table_configuration,
+            new_crc,
+            false, /* built_as_latest */
+        )
     }
 
     // ============================================================================
@@ -287,6 +316,15 @@ impl Snapshot {
     /// Version of this `Snapshot` in the table.
     pub fn version(&self) -> Version {
         self.table_configuration().version()
+    }
+
+    /// Whether this snapshot was built as latest.
+    ///
+    /// This is intent-based: it reflects what the caller asked for, not whether this snapshot is
+    /// factually the newest version of the table. True iff the snapshot is not a time travel or
+    /// post-commit snapshot.
+    pub fn built_as_latest(&self) -> bool {
+        self.built_as_latest
     }
 
     /// Table [`Schema`] at this `Snapshot`s version.
@@ -894,6 +932,7 @@ impl Snapshot {
                     new_log_segment,
                     self.table_configuration().clone(),
                     self.crc.clone(),
+                    self.built_as_latest,
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -1036,6 +1075,7 @@ impl Snapshot {
                 new_log_segment,
                 self.table_configuration().clone(),
                 self.crc.clone(),
+                self.built_as_latest,
             )?),
         ))
     }
@@ -1105,6 +1145,7 @@ impl Snapshot {
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
             self.crc.clone(),
+            self.built_as_latest,
         )?))
     }
 }
@@ -1267,7 +1308,12 @@ mod tests {
         let log_segment =
             LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
 
-        Snapshot::new_with_crc(log_segment, table_cfg, None)
+        Snapshot::new_with_crc(
+            log_segment,
+            table_cfg,
+            None,  /* crc */
+            false, /* built_as_latest */
+        )
     }
 
     #[test]
@@ -2029,6 +2075,10 @@ mod tests {
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
+        // The base was built as a latest query, but we don't consider post-commit snapshots to be
+        // latest.
+        assert!(base_snapshot.built_as_latest());
+        assert!(!post_commit_snapshot.built_as_latest());
     }
 
     #[test]
