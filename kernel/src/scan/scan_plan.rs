@@ -112,7 +112,6 @@ static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 
 /// Like [`json_read_schema`], but includes struct stats and partition values columns.
 fn parquet_read_schema(
-    include_remove: bool,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<SchemaRef> {
@@ -128,7 +127,6 @@ fn parquet_read_schema(
         });
     Ok(schema_ref! {
         (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
-        ..(include_remove.then_some(&REMOVE_FIELD)),
         nullable (VERSION): LONG,
     })
 }
@@ -169,29 +167,28 @@ trait ProjectionStructPatchBuilderExt<'a> {
         self,
         stats_schema: Option<&SchemaRef>,
         partition_schema: Option<&SchemaRef>,
-        parsed_source: ParsedSource,
+        is_parquet_source: bool,
     ) -> Self;
 }
 
 impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
     fn reparse_add(
-        self,
+        mut self,
         stats_schema: Option<&SchemaRef>,
         partition_schema: Option<&SchemaRef>,
-        parsed_source: ParsedSource,
+        is_parquet_source: bool,
     ) -> Self {
         let add = [ADD_NAME];
-        let patch = match stats_schema {
+        self = match stats_schema {
             Some(ss) => {
                 let field = StructField::nullable(STATS, ss.as_ref().clone());
                 let expr = Expr::parse_json(col!("add.stats"), Arc::clone(ss));
-                match parsed_source {
-                    ParsedSource::Null => self.replace_at(add, STATS, field, expr),
-                    ParsedSource::Columns => {
-                        let expr = Expr::coalesce([col!(ADD_NAME, STATS_PARSED), expr]);
-                        self.replace_at(add, STATS, field, expr)
-                            .drop_at(add, STATS_PARSED)
-                    }
+                if is_parquet_source {
+                    let expr = Expr::coalesce([col!(ADD_NAME, STATS_PARSED), expr]);
+                    self.replace_at(add, STATS, field, expr)
+                        .drop_at(add, STATS_PARSED)
+                } else {
+                    self.replace_at(add, STATS, field, expr)
                 }
             }
             None => self.replace_expr_at(add, STATS, Expr::null_literal(DataType::STRING)),
@@ -200,28 +197,20 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             Some(ps) => {
                 let field = StructField::nullable(PARTITION_VALUES, ps.as_ref().clone());
                 let expr = Expr::map_to_struct(col!("add.partitionValues"));
-                match parsed_source {
-                    ParsedSource::Null => patch.replace_at(add, PARTITION_VALUES, field, expr),
-                    ParsedSource::Columns => {
-                        let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
-                        patch
-                            .replace_at(add, PARTITION_VALUES, field, expr)
-                            .drop_at(add, PARTITION_VALUES_PARSED)
-                    }
+                if is_parquet_source {
+                    let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
+                    self.replace_at(add, PARTITION_VALUES, field, expr)
+                        .drop_at(add, PARTITION_VALUES_PARSED)
+                } else {
+                    self.replace_at(add, PARTITION_VALUES, field, expr)
                 }
             }
             None => {
                 let expr = Expr::null_literal(partition_values_map_type());
-                patch.replace_expr_at(add, PARTITION_VALUES, expr)
+                self.replace_expr_at(add, PARTITION_VALUES, expr)
             }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum ParsedSource {
-    Null,
-    Columns,
 }
 
 /// The canonical `add.partitionValues` log type: a `map<string, string>` whose values may be null
@@ -263,7 +252,7 @@ fn normalize_commit_actions(
         ))?
         .project_patch(|patch| {
             patch
-                .reparse_add(stats_schema, partition_schema, ParsedSource::Null)
+                .reparse_add(stats_schema, partition_schema, false)
                 .append(
                     FILE_ACTION_KEY_FIELD.clone(),
                     file_action_key_expr(|col| {
@@ -282,13 +271,13 @@ fn normalize_checkpoint_actions(
     source: PlanBuilder,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
-    parsed_source: ParsedSource,
+    is_parquet_source: bool,
 ) -> DeltaResult<PlanBuilder> {
     source
         .filter(col!("add.path").is_not_null())?
         .project_patch(|patch| {
             patch
-                .reparse_add(stats_schema, partition_schema, parsed_source)
+                .reparse_add(stats_schema, partition_schema, is_parquet_source)
                 .append(
                     FILE_ACTION_KEY_FIELD.clone(),
                     file_action_key_expr(|col| joined_column_expr!("add", col)),
@@ -302,6 +291,7 @@ fn sidecar_actions(
     action_schema: SchemaRef,
     log_root: &Url,
 ) -> DeltaResult<PlanBuilder> {
+    // Degenerate union: At most one of parquet or json checkpoint root is present
     let sidecar_roots = PlanBuilder::union_all([
         PlanBuilder::scan_json(json_parts, &[VERSION], sidecar_read_schema())?,
         PlanBuilder::scan_parquet(parquet_parts, &[VERSION], sidecar_read_schema())?,
@@ -351,25 +341,27 @@ fn checkpoint_arm(
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
-    let schema = parquet_read_schema(false, stats_schema, partition_schema)?;
+    let schema = parquet_read_schema(stats_schema, partition_schema)?;
+    // Degenerate union: At most one of parquet or json checkpoint root is present, and it may or
+    // may not contain any sidecars.
     PlanBuilder::union_all([
         normalize_checkpoint_actions(
             PlanBuilder::scan_json(json_parts.clone(), &[VERSION], json_read_schema(false))?,
             stats_schema,
             partition_schema,
-            ParsedSource::Null,
+            false,
         )?,
         normalize_checkpoint_actions(
             PlanBuilder::scan_parquet(parquet_parts.clone(), &[VERSION], Arc::clone(&schema))?,
             stats_schema,
             partition_schema,
-            ParsedSource::Columns,
+            true,
         )?,
         normalize_checkpoint_actions(
             sidecar_actions(json_parts, parquet_parts, schema, log_root)?,
             stats_schema,
             partition_schema,
-            ParsedSource::Columns,
+            true,
         )?,
     ])
 }
@@ -484,6 +476,8 @@ pub(crate) fn build_metadata_scan_plan(
         .filter(col!("add").is_not_null())?
         .project(Expr::struct_from([col!("add")]), output_schema)?;
 
+    // NOTE: All four combos of present/absent commit and checkpoint are possible, depending on
+    // e.g. whether a checkpoint exists and what got pruned away.
     PlanBuilder::union_all([commit_live, checkpoint_live])?.build_opt()
 }
 
@@ -643,13 +637,20 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::arrow::array::{StringArray, StructArray};
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{lit, Scalar};
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::path::Path;
+    use crate::object_store::ObjectStoreExt as _;
     use crate::plans::ir::nodes::Operator;
+    use crate::plans::Operation as PlanOperation;
     use crate::scan::state_info::tests::get_state_info_with_options;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::{MetadataColumnSpec, StructType};
     use crate::table_features::TableFeature;
-    use crate::FileMeta;
+    use crate::{Engine as _, FileMeta};
 
     /// Build a [`StateInfo`] for the plan tests: a legacy-protocol table with the given schema,
     /// partition columns, optional predicate, and stats / partition-value options.
@@ -923,6 +924,77 @@ mod tests {
                 "project"
             ],
         );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_plan_executes_commit_dedup_with_sync_executor() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        futures::executor::block_on(async {
+            store
+                .put(
+                    &Path::from("_delta_log/00000000000000000000.json"),
+                    r#"{"add":{"path":"a.parquet","size":1,"modificationTime":1,"dataChange":true,"partitionValues":{}}}
+{"add":{"path":"b.parquet","size":1,"modificationTime":1,"dataChange":true,"partitionValues":{}}}
+"#
+                    .into(),
+                )
+                .await?;
+            store
+                .put(
+                    &Path::from("_delta_log/00000000000000000001.json"),
+                    r#"{"remove":{"path":"a.parquet","deletionTimestamp":2,"dataChange":true}}
+"#
+                    .into(),
+                )
+                .await?;
+            DeltaResult::<()>::Ok(())
+        })?;
+
+        let state = state(
+            data_schema(),
+            vec![],
+            None,
+            StatsOptions::default(),
+            PartitionValuesOptions::default(),
+        );
+        let plan = build_metadata_scan_plan(
+            &state,
+            vec![
+                scan_file("memory:///_delta_log/00000000000000000000.json", 0),
+                scan_file("memory:///_delta_log/00000000000000000001.json", 1),
+            ],
+            vec![],
+            vec![],
+            Url::parse("memory:///_delta_log/").unwrap(),
+        )?
+        .expect("non-empty");
+
+        let engine = SyncEngine::new_with_store(store);
+        let mut batches = engine
+            .plan_executor()
+            .execute_op(PlanOperation::QueryPlan(plan))?
+            .into_data()?;
+        let batch = batches
+            .next()
+            .expect("one batch")?
+            .try_into_record_batch()?;
+        assert!(batches.next().is_none());
+        assert_eq!(batch.num_rows(), 1);
+
+        let add = batch
+            .column_by_name(ADD_NAME)
+            .expect("add column")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("add struct");
+        let paths = add
+            .column_by_name("path")
+            .expect("add.path")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path string");
+        assert_eq!(paths.value(0), "b.parquet");
         Ok(())
     }
 

@@ -960,6 +960,22 @@ impl Scan {
         Ok(iter.into_iter().flatten().on_complete(on_complete))
     }
 
+    #[cfg(feature = "declarative-plans")]
+    #[allow(dead_code)]
+    fn declarative_metadata_scan_plan(&self) -> DeltaResult<Option<crate::plans::ir::plan::Plan>> {
+        let log_segment = self.snapshot.log_segment();
+        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+        let (json_checkpoint_files, parquet_checkpoint_files) =
+            log_segment.checkpoint_version_tagged_scan_files()?;
+        scan_plan::build_metadata_scan_plan(
+            &self.state_info,
+            commit_files,
+            json_checkpoint_files,
+            parquet_checkpoint_files,
+            log_segment.log_root.clone(),
+        )
+    }
+
     // Factored out to facilitate testing
     fn replay_for_scan_metadata(
         &self,
