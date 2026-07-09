@@ -67,18 +67,18 @@ async fn test_clustered_table_write_and_checkpoint(
 
     // First write: 3 rows
     let batch = generate_batch(vec![
-        ("id", vec![1, 2, 3].into_array()),
-        ("name", vec!["alice", "bob", "charlie"].into_array()),
-        ("city", vec!["seattle", "portland", "seattle"].into_array()),
+        ("id", vec![1, 2, 3].into_array_ref()),
+        ("name", vec!["alice", "bob", "charlie"].into_array_ref()),
+        ("city", vec!["seattle", "portland", "seattle"].into_array_ref()),
     ])?;
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     assert_eq!(snapshot.version(), 1);
 
     // Second write: 2 more rows
     let batch = generate_batch(vec![
-        ("id", vec![4, 5].into_array()),
-        ("name", vec!["dave", "eve"].into_array()),
-        ("city", vec!["austin", "portland"].into_array()),
+        ("id", vec![4, 5].into_array_ref()),
+        ("name", vec!["dave", "eve"].into_array_ref()),
+        ("city", vec!["austin", "portland"].into_array_ref()),
     ])?;
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     assert_eq!(snapshot.version(), 2);
@@ -179,7 +179,7 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     // This should succeed -- all-null clustering columns are valid.
     let all_null_region: ArrayRef = Arc::new(Int32Array::from(vec![None, None, None]));
     let batch = generate_batch(vec![
-        ("category", vec!["a", "b", "c"].into_array()),
+        ("category", vec!["a", "b", "c"].into_array_ref()),
         ("region_id", all_null_region),
     ])
     .unwrap();

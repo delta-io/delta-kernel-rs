@@ -367,29 +367,29 @@ pub fn record_batch_to_bytes_with_props(
 
 /// Anything that implements `IntoArray` can turn itself into a reference to an arrow array
 pub trait IntoArray {
-    fn into_array(self) -> ArrayRef;
+    fn into_array_ref(self) -> ArrayRef;
 }
 
 impl IntoArray for Vec<i32> {
-    fn into_array(self) -> ArrayRef {
+    fn into_array_ref(self) -> ArrayRef {
         Arc::new(Int32Array::from(self))
     }
 }
 
 impl IntoArray for Vec<i64> {
-    fn into_array(self) -> ArrayRef {
+    fn into_array_ref(self) -> ArrayRef {
         Arc::new(Int64Array::from(self))
     }
 }
 
 impl IntoArray for Vec<bool> {
-    fn into_array(self) -> ArrayRef {
+    fn into_array_ref(self) -> ArrayRef {
         Arc::new(BooleanArray::from(self))
     }
 }
 
 impl IntoArray for Vec<&'static str> {
-    fn into_array(self) -> ArrayRef {
+    fn into_array_ref(self) -> ArrayRef {
         Arc::new(StringArray::from(self))
     }
 }
@@ -408,8 +408,8 @@ where
 /// respectively
 pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
     generate_batch(vec![
-        ("id", vec![1, 2, 3].into_array()),
-        ("val", vec!["a", "b", "c"].into_array()),
+        ("id", vec![1, 2, 3].into_array_ref()),
+        ("val", vec!["a", "b", "c"].into_array_ref()),
     ])
 }
 
