@@ -42,10 +42,9 @@ pub(super) enum Token {
     /// reassembles a signed literal from `Minus`/`Plus` followed by a numeric `Literal`.
     Plus,
     Minus,
-    /// The `AND`/`OR`/`NOT`/`IS` keywords. Recognized here (not left as [`Token::Ident`]) so a
-    /// backtick-quoted column literally named `` `AND` `` stays an `Ident`, distinct from the
-    /// keyword. The current parser has no grammar for them and rejects them; they are tokenized so
-    /// it can do so unambiguously.
+    /// The `AND`/`OR`/`NOT`/`IS` keywords. Recognized here so a backtick-quoted column
+    /// named `` `AND` `` stays an `Ident`, distinct from the keyword. The current
+    /// parser has no grammar for them and rejects them.
     Keyword(Keyword),
 }
 
@@ -136,7 +135,7 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
             }
             // `+`/`-` are standalone operators (Spark treats a leading sign as unary +/-, not part
             // of the number); the parser reassembles a signed literal from the sign + number.
-            // TODO: recognize `(` / `)` as LParen / RParen tokens once the grammar supports
+            // TODO(#2895): recognize `(` / `)` as LParen / RParen tokens once the grammar supports
             // grouping.
             '+' => {
                 chars.next();
