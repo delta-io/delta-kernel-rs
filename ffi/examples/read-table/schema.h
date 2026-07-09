@@ -254,6 +254,25 @@ DEFINE_VISIT_SIMPLE_TYPE(date)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp_ntz)
 DEFINE_VISIT_SIMPLE_TYPE(void)
+DEFINE_VISIT_SIMPLE_TYPE(variant)
+
+void visit_interval_year_month(void* data,
+                               uintptr_t sibling_list_id,
+                               struct KernelStringSlice name,
+                               bool is_nullable,
+                               const CStringMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "interval year to month");
+}
+
+void visit_interval_day_time(void* data,
+                             uintptr_t sibling_list_id,
+                             struct KernelStringSlice name,
+                             bool is_nullable,
+                             const CStringMap * metadata)
+{
+  visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, "interval day to second");
+}
 
 // free all the data in the builder and the builder itself
 void free_builder(SchemaBuilder* builder)
@@ -308,7 +327,10 @@ CSchema* get_cschema(SharedSnapshot* snapshot, SharedExternEngine* engine)
     .visit_date = visit_date,
     .visit_timestamp = visit_timestamp,
     .visit_timestamp_ntz = visit_timestamp_ntz,
+    .visit_interval_year_month = visit_interval_year_month,
+    .visit_interval_day_time = visit_interval_day_time,
     .visit_void = visit_void,
+    .visit_variant = visit_variant,
   };
   SharedSchema* schema = logical_schema(snapshot);
   uintptr_t schema_list_id = visit_schema(schema, &visitor);

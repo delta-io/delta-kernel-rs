@@ -93,6 +93,10 @@ pub struct EngineExpressionVisitor {
     /// Visit a 32bit integer `date` representing days since UNIX epoch 1970-01-01.  The `date`
     /// belongs to the list identified by `sibling_list_id`.
     pub visit_literal_date: VisitLiteralFn<i32>,
+    /// Visit an `interval year to month` literal as a signed month count.
+    pub visit_literal_interval_year_month: VisitLiteralFn<i32>,
+    /// Visit an `interval day to second` literal as a signed microsecond count.
+    pub visit_literal_interval_day_time: VisitLiteralFn<i64>,
     /// Visit binary data at the `buffer` with length `len` belonging to the list identified by
     /// `sibling_list_id`.
     pub visit_literal_binary:
@@ -588,13 +592,21 @@ fn visit_expression_scalar(
                 scale
             )
         }
-        // TODO (#2811): the following is intentional just for this PR, will be addressed
-        // when FFI support for interval types is added
-        Scalar::IntervalYearMonth(_) => {
-            visit_unknown(visitor, sibling_list_id, "interval_year_month_literal")
+        Scalar::IntervalYearMonth(val) => {
+            call!(
+                visitor,
+                visit_literal_interval_year_month,
+                sibling_list_id,
+                *val
+            )
         }
-        Scalar::IntervalDayTime(_) => {
-            visit_unknown(visitor, sibling_list_id, "interval_day_time_literal")
+        Scalar::IntervalDayTime(val) => {
+            call!(
+                visitor,
+                visit_literal_interval_day_time,
+                sibling_list_id,
+                *val
+            )
         }
         Scalar::Struct(struct_data) => {
             visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
@@ -737,4 +749,249 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
     let top_level = call!(visitor, make_field_list, 1);
     visit_predicate_impl(visitor, predicate, top_level);
     top_level
+}
+
+#[cfg(test)]
+mod tests {
+    use delta_kernel::expressions::{Expression, Scalar};
+    use rstest::rstest;
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum LiteralEvent {
+        IntervalYearMonth { sibling_list_id: usize, value: i32 },
+        IntervalDayTime { sibling_list_id: usize, value: i64 },
+    }
+
+    #[derive(Default)]
+    struct TestExpressionBuilder {
+        next_list_id: usize,
+        events: Vec<LiteralEvent>,
+    }
+
+    extern "C" fn make_field_list(data: *mut c_void, _reserve: usize) -> usize {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let list_id = builder.next_list_id;
+        builder.next_list_id += 1;
+        list_id
+    }
+
+    extern "C" fn visit_literal_interval_year_month(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i32,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::IntervalYearMonth {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    extern "C" fn visit_literal_interval_day_time(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i64,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::IntervalDayTime {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    macro_rules! ignored_literal_fn {
+        ($fn_name:ident, $value_type:ty) => {
+            extern "C" fn $fn_name(
+                _data: *mut c_void,
+                _sibling_list_id: usize,
+                _value: $value_type,
+            ) {
+            }
+        };
+    }
+
+    ignored_literal_fn!(ignore_i32, i32);
+    ignored_literal_fn!(ignore_i64, i64);
+    ignored_literal_fn!(ignore_i16, i16);
+    ignored_literal_fn!(ignore_i8, i8);
+    ignored_literal_fn!(ignore_f32, f32);
+    ignored_literal_fn!(ignore_f64, f64);
+    ignored_literal_fn!(ignore_bool, bool);
+    ignored_literal_fn!(ignore_string_slice, KernelStringSlice);
+
+    extern "C" fn ignore_binary(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _buffer: *const u8,
+        _len: usize,
+    ) {
+    }
+
+    extern "C" fn ignore_decimal(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _value_ms: i64,
+        _value_ls: u64,
+        _precision: u8,
+        _scale: u8,
+    ) {
+    }
+
+    extern "C" fn ignore_struct_literal(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _child_field_list_id: usize,
+        _child_value_list_id: usize,
+    ) {
+    }
+
+    extern "C" fn ignore_child_list(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _child_list_id: usize,
+    ) {
+    }
+
+    extern "C" fn ignore_map_literal(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _key_list_id: usize,
+        _value_list_id: usize,
+    ) {
+    }
+
+    extern "C" fn ignore_null(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _type_tag: u8,
+        _precision: u8,
+        _scale: u8,
+    ) {
+    }
+
+    extern "C" fn ignore_parse_json(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _child_list_id: usize,
+        _output_schema: Handle<SharedSchema>,
+    ) {
+    }
+
+    extern "C" fn ignore_column(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _name: KernelStringSlice,
+    ) {
+    }
+
+    extern "C" fn ignore_struct_patch(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _input_path_list_id: usize,
+        _prepended_field_list_id: usize,
+        _field_patch_list_id: usize,
+        _appended_field_list_id: usize,
+    ) {
+    }
+
+    extern "C" fn ignore_field_patch(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _field_name: KernelStringSlice,
+        _insertion_expr_list_id: usize,
+        _keep_input: bool,
+        _optional: bool,
+    ) {
+    }
+
+    extern "C" fn ignore_opaque_expr(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _op: Handle<SharedOpaqueExpressionOp>,
+        _child_list_id: usize,
+    ) {
+    }
+
+    extern "C" fn ignore_opaque_pred(
+        _data: *mut c_void,
+        _sibling_list_id: usize,
+        _op: Handle<SharedOpaquePredicateOp>,
+        _child_list_id: usize,
+    ) {
+    }
+
+    fn test_visitor(builder: &mut TestExpressionBuilder) -> EngineExpressionVisitor {
+        EngineExpressionVisitor {
+            data: builder as *mut _ as *mut c_void,
+            make_field_list,
+            visit_literal_int: ignore_i32,
+            visit_literal_long: ignore_i64,
+            visit_literal_short: ignore_i16,
+            visit_literal_byte: ignore_i8,
+            visit_literal_float: ignore_f32,
+            visit_literal_double: ignore_f64,
+            visit_literal_string: ignore_string_slice,
+            visit_literal_bool: ignore_bool,
+            visit_literal_timestamp: ignore_i64,
+            visit_literal_timestamp_ntz: ignore_i64,
+            visit_literal_date: ignore_i32,
+            visit_literal_interval_year_month,
+            visit_literal_interval_day_time,
+            visit_literal_binary: ignore_binary,
+            visit_literal_decimal: ignore_decimal,
+            visit_literal_struct: ignore_struct_literal,
+            visit_literal_array: ignore_child_list,
+            visit_literal_map: ignore_map_literal,
+            visit_literal_null: ignore_null,
+            visit_and: ignore_child_list,
+            visit_or: ignore_child_list,
+            visit_not: ignore_child_list,
+            visit_is_null: ignore_child_list,
+            visit_to_json: ignore_child_list,
+            visit_parse_json: ignore_parse_json,
+            visit_map_to_struct: ignore_child_list,
+            visit_lt: ignore_child_list,
+            visit_gt: ignore_child_list,
+            visit_eq: ignore_child_list,
+            visit_distinct: ignore_child_list,
+            visit_in: ignore_child_list,
+            visit_add: ignore_child_list,
+            visit_minus: ignore_child_list,
+            visit_multiply: ignore_child_list,
+            visit_divide: ignore_child_list,
+            visit_coalesce: ignore_child_list,
+            visit_array: ignore_child_list,
+            visit_column: ignore_column,
+            visit_struct_expr: ignore_child_list,
+            visit_struct_patch_expr: ignore_struct_patch,
+            visit_field_patch: ignore_field_patch,
+            visit_opaque_expr: ignore_opaque_expr,
+            visit_opaque_pred: ignore_opaque_pred,
+            visit_unknown: ignore_column,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(26)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(987_654)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
+    )]
+    fn visit_expression_uses_interval_literal_callbacks(
+        #[case] expression: Expression,
+        #[case] expected: LiteralEvent,
+    ) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(builder.events, vec![expected]);
+    }
 }
