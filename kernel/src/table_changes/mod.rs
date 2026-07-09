@@ -49,12 +49,45 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
+mod net_changes;
 mod physical_to_logical;
 mod resolve_dvs;
 pub mod scan;
 mod scan_file;
 
-pub use scan_file::{CdfChangeKind, CdfListingFile};
+pub use scan_file::{TableChangesFileAction, TableChangesScanFile};
+
+/// Selects how [`TableChanges::scan_file_listing`] presents the row-tracking change-feed files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TableChangesListingMode {
+    /// One [`TableChangesFileAction`] per commit occurrence, with no cross-commit collapsing: a
+    /// same-commit `add`+`remove` of one path groups into `{add, remove}` (an in-commit update),
+    /// and an unpaired `add` or `remove` is single-sided. Like `NetChanges`, this buffers the full
+    /// range before returning (see the method-level note on [`TableChanges::scan_file_listing`]).
+    ///
+    /// The `{add, remove}` grouping here is a *same-commit-only* convenience: a cross-commit
+    /// update (a `remove` in one commit and the re-`add` in a later one) is **not** grouped --
+    /// it surfaces as two separate single-sided actions. So `{add, remove}` present does not
+    /// enumerate every update in this mode; the connector should reconcile pre-image and
+    /// post-image rows by row id across the whole listing regardless of grouping (see
+    /// [`TableChangesFileAction`]). To get each path's update grouped into one action, use
+    /// [`NetChanges`](Self::NetChanges).
+    AllChanges,
+    /// Each file path reduced to its net effect across the whole range, as one
+    /// [`TableChangesFileAction`]: a net insert (`{add: Some}`), a net delete (`{remove: Some}`),
+    /// or -- when a path is removed then re-added with a different deletion vector -- a net update
+    /// (`{add: Some, remove: Some}`) whose remove side is the pre-image (earliest remove, with its
+    /// DV) and add side the post-image (latest add, with its DV); the connector reconciles them by
+    /// row id. The result reflects the net effect, not the intermediate actions: a path added,
+    /// removed, then re-added within the range still collapses to a single net-insert. Paths that
+    /// net to no change are dropped; dropping is conservative (only structurally identical
+    /// boundary deletion vectors are dropped), so a surviving path is not a guarantee its rows
+    /// changed. Because the net effect is a property of the whole range, this mode buffers
+    /// every per-commit action before emitting -- its memory is proportional to the range's
+    /// action count and it is not streaming.
+    NetChanges,
+}
 
 /// Selects which semantics a [`TableChanges`] uses to derive the change data feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +123,7 @@ impl CdfMode {
     }
 
     /// Whether a file written with `candidate` schema can be read against the change feed's
-    /// `read_schema`. The write time CDF currently requires exact schema equality. the read time
+    /// `read_schema`. The write time CDF currently requires exact schema equality. The read time
     /// path allows additive evolution (`candidate` must be readable as `read_schema`).
     pub(crate) fn schemas_compatible(
         self,
@@ -103,6 +136,10 @@ impl CdfMode {
         }
     }
 
+    /// Maps a start-vs-end boundary schema mismatch to the per-mode error. The write time path
+    /// reports a generic message; the read time path returns
+    /// [`Error::change_data_feed_incompatible_schema`] with the arguments as `(end, start)` (the
+    /// end schema is the read schema that the start schema must be readable as).
     pub(crate) fn boundary_schema_error(self, start: &StructType, end: &StructType) -> Error {
         match self {
             CdfMode::WriteTime => Error::generic(format!(
@@ -376,10 +413,23 @@ impl TableChanges {
     /// Returns a *listing-only* iterator of the files that must be read to produce a row-tracking
     /// Change Data Feed over this `TableChanges`' version range, **without reading any data**.
     ///
-    /// Each [`CdfListingFile`] carries the per-file deletion-vector and row-tracking metadata that
-    /// the connector needs to (a) perform the actual data scan itself and (b) reconstruct change
-    /// events by matching an update's pre-image and post-image rows on their row ids. `cdc`
-    /// (`_change_data`) files are never referenced.
+    /// Each [`TableChangesFileAction`] groups a file's change into its `add` and `remove` sides;
+    /// which sides are present encodes the change (insert / delete / update). It carries the
+    /// per-file deletion-vector and row-tracking metadata the connector needs to (a) perform the
+    /// data scan itself and (b) reconstruct change events by reading each side under its own DV and
+    /// reconciling an update's pre-image and post-image rows by row id. `cdc` (`_change_data`)
+    /// files are never referenced.
+    ///
+    /// `mode` selects how the files are presented ([`TableChangesListingMode`]):
+    /// - [`TableChangesListingMode::AllChanges`] yields one action per commit occurrence (a
+    ///   same-commit `add`+`remove` of one path groups into `{add, remove}`; an unpaired `add` or
+    ///   `remove` is single-sided).
+    /// - [`TableChangesListingMode::NetChanges`] collapses each path to its net effect across the
+    ///   range.
+    ///
+    /// Both modes buffer the full range before returning (NetChanges must, to compute the net
+    /// effect); the returned iterator walks that materialized listing. Its memory is proportional
+    /// to the range's action count.
     ///
     /// This requires the `TableChanges` to have been constructed with
     /// [`TableChanges::try_new_row_tracking`]; calling it on a change-data-file `TableChanges`
@@ -393,7 +443,8 @@ impl TableChanges {
     pub fn scan_file_listing(
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<CdfListingFile>>> {
+        mode: TableChangesListingMode,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesFileAction>>> {
         if self.mode != CdfMode::ReadTime {
             return Err(Error::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
@@ -409,11 +460,17 @@ impl TableChanges {
             commits,
             schema,
             None,
-            CdfMode::ReadTime,
+            self.mode,
         )?;
-        let listing = scan_metadata_to_scan_file(scan_metadata)
-            .map(|scan_file| CdfListingFile::try_from_scan_file(scan_file?));
-        Ok(listing)
+        // Any listing error surfaces here rather than mid-iteration.
+        let actions = scan_metadata_to_scan_file(scan_metadata)
+            .map(|scan_file| TableChangesFileAction::try_from_scan_file(scan_file?))
+            .collect::<DeltaResult<Vec<_>>>()?;
+        let actions = match mode {
+            TableChangesListingMode::AllChanges => actions,
+            TableChangesListingMode::NetChanges => net_changes::collapse_net_changes(actions)?,
+        };
+        Ok(actions.into_iter().map(Ok))
     }
 }
 
@@ -425,7 +482,8 @@ mod tests {
     use itertools::{assert_equal, Itertools};
 
     use super::*;
-    use crate::actions::{Add, Metadata, Protocol};
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+    use crate::actions::{Add, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::CDF_FIELDS;
@@ -433,6 +491,56 @@ mod tests {
     use crate::table_properties::ENABLE_ROW_TRACKING;
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::{Engine, Error};
+
+    // === Row-tracking listing e2e helpers ===
+
+    /// The `(id, value)` schema shared by the row-tracking listing end-to-end tests.
+    fn listing_test_schema() -> Arc<StructType> {
+        Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ]))
+    }
+
+    /// The v0 setup actions (protocol + row-tracking-enabled metadata) for `schema`, shared by the
+    /// row-tracking listing end-to-end tests. Callers chain their v0 data actions onto these.
+    fn row_tracking_setup_actions(schema: Arc<StructType>) -> [Action; 2] {
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            [TableFeature::RowTracking, TableFeature::DomainMetadata],
+        )
+        .unwrap();
+        [Action::Protocol(protocol), Action::Metadata(metadata)]
+    }
+
+    /// Two distinct deletion-vector descriptors used as the before/after DVs of an update in the
+    /// row-tracking listing end-to-end tests.
+    fn listing_test_dvs() -> (DeletionVectorDescriptor, DeletionVectorDescriptor) {
+        let dv1 = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        };
+        let dv2 = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
+            offset: Some(1),
+            size_in_bytes: 38,
+            cardinality: 3,
+        };
+        (dv1, dv2)
+    }
 
     #[test]
     fn table_changes_checks_enable_cdf_flag() {
@@ -503,7 +611,7 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let table_changes =
             Arc::new(TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap());
-        let res = table_changes.scan_file_listing(engine);
+        let res = table_changes.scan_file_listing(engine, TableChangesListingMode::AllChanges);
         assert!(
             matches!(res, Err(Error::Unsupported(_))),
             "scan_file_listing on a cdc-file TableChanges must return an unsupported error"
@@ -542,22 +650,11 @@ mod tests {
             StructField::nullable("value", DataType::STRING),
         ]));
         let rt_config = HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]);
-        let protocol = Protocol::try_new_modern(
-            TableFeature::EMPTY_LIST,
-            [TableFeature::RowTracking, TableFeature::DomainMetadata],
-        )
-        .unwrap();
 
         // v0: start schema + row tracking. v1: a data commit (no metadata) using the start schema.
         // v2: a metadata commit that drops `extra` -- never re-declaring the start schema in range.
         mock_table
-            .commit([
-                Action::Protocol(protocol),
-                Action::Metadata(
-                    Metadata::try_new(None, None, start_schema, vec![], 0, rt_config.clone())
-                        .unwrap(),
-                ),
-            ])
+            .commit(row_tracking_setup_actions(start_schema))
             .await;
         mock_table
             .commit([Action::Add(Add {
@@ -587,26 +684,8 @@ mod tests {
     async fn scan_file_listing_surfaces_row_tracking_files_end_to_end() {
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]));
 
         // version 0: protocol + metadata (row tracking enabled) + an insert.
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema.clone(),
-            vec![],
-            0,
-            HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            TableFeature::EMPTY_LIST,
-            [TableFeature::RowTracking, TableFeature::DomainMetadata],
-        )
-        .unwrap();
         let add_v0 = Add {
             path: "path_0".into(),
             data_change: true,
@@ -624,11 +703,11 @@ mod tests {
             ..Default::default()
         };
         mock_table
-            .commit([
-                Action::Protocol(protocol),
-                Action::Metadata(metadata),
-                Action::Add(add_v0),
-            ])
+            .commit(
+                row_tracking_setup_actions(listing_test_schema())
+                    .into_iter()
+                    .chain([Action::Add(add_v0)]),
+            )
             .await;
         mock_table.commit([Action::Add(add_v1)]).await;
 
@@ -636,25 +715,261 @@ mod tests {
         let table_changes = Arc::new(
             TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 0, Some(1)).unwrap(),
         );
-        let listing: Vec<CdfListingFile> = table_changes
-            .scan_file_listing(engine)
+        let listing: Vec<TableChangesFileAction> = table_changes
+            .scan_file_listing(engine, TableChangesListingMode::AllChanges)
             .unwrap()
             .try_collect()
             .unwrap();
 
-        // Both inserts surface (no cdc files), each carrying its base row id.
+        // Both inserts surface (no cdc files) as single-sided add actions, each carrying its base
+        // row id.
         assert_eq!(listing.len(), 2);
-        let f0 = listing
+        let add_side = |path: &str| {
+            listing
+                .iter()
+                .filter_map(|fa| fa.add.as_ref())
+                .find(|a| a.path == path)
+                .unwrap_or_else(|| panic!("{path} add side present"))
+                .clone()
+        };
+        assert!(listing.iter().all(|fa| fa.remove.is_none()));
+        assert_eq!(add_side("path_0").base_row_id, Some(0));
+        assert_eq!(add_side("path_1").base_row_id, Some(5));
+    }
+
+    #[tokio::test]
+    async fn scan_file_listing_net_changes_collapses_a_cross_commit_update() {
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        let (dv1, dv2) = listing_test_dvs();
+
+        // v0: enable row tracking and add `f` with dv1.
+        mock_table
+            .commit(
+                row_tracking_setup_actions(listing_test_schema())
+                    .into_iter()
+                    .chain([Action::Add(Add {
+                        path: "f".into(),
+                        data_change: true,
+                        size: 100,
+                        deletion_vector: Some(dv1.clone()),
+                        base_row_id: Some(0),
+                        default_row_commit_version: Some(0),
+                        ..Default::default()
+                    })]),
+            )
+            .await;
+        // v1: remove `f` (dv1) with no paired add in the same commit -> an unpaired remove.
+        mock_table
+            .commit([Action::Remove(Remove {
+                path: "f".into(),
+                data_change: true,
+                deletion_vector: Some(dv1.clone()),
+                ..Default::default()
+            })])
+            .await;
+        // v2: re-add `f` (dv2) with no paired remove in the same commit -> a bare add. Across the
+        // range the remove@v1 and this add@v2 are the two boundaries of a net update.
+        mock_table
+            .commit([Action::Add(Add {
+                path: "f".into(),
+                data_change: true,
+                size: 100,
+                deletion_vector: Some(dv2.clone()),
+                base_row_id: Some(0),
+                default_row_commit_version: Some(2),
+                ..Default::default()
+            })])
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let new_table_changes = || {
+            Arc::new(
+                TableChanges::try_new_row_tracking(table_root.clone(), engine.as_ref(), 1, Some(2))
+                    .unwrap(),
+            )
+        };
+        let listing: Vec<TableChangesFileAction> = new_table_changes()
+            .scan_file_listing(engine.clone(), TableChangesListingMode::NetChanges)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        // `f`'s net effect over 1..=2 is an update from dv1 to dv2, surfaced as one grouped action:
+        // the remove side is the pre-image (dv1) at the first remove (v1) and the add side the
+        // post-image (dv2) at the last add (v2). Each side carries only its own DV; the connector
+        // reconciles the two by row id.
+        assert_eq!(
+            listing.len(),
+            1,
+            "expected one grouped net update: {listing:?}"
+        );
+        let update = &listing[0];
+        let net_remove = update.remove.as_ref().expect("net update remove side");
+        assert_eq!(net_remove.commit_version, 1);
+        assert_eq!(net_remove.deletion_vector, Some(dv1.clone()));
+        let net_add = update.add.as_ref().expect("net update add side");
+        assert_eq!(net_add.commit_version, 2);
+        assert_eq!(net_add.deletion_vector, Some(dv2.clone()));
+
+        // AllChanges does NOT group a cross-commit update: the same history surfaces as two
+        // separate single-sided actions -- a delete at v1 and an insert at v2 -- since grouping is
+        // same-commit only. This is the documented mode contrast.
+        let all: Vec<TableChangesFileAction> = new_table_changes()
+            .scan_file_listing(engine, TableChangesListingMode::AllChanges)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "expected two ungrouped single-sided actions: {all:?}"
+        );
+        let all_remove = all
             .iter()
-            .find(|f| f.path == "path_0")
-            .expect("path_0 present");
-        assert_eq!(f0.change_kind, CdfChangeKind::Add);
-        assert_eq!(f0.base_row_id, Some(0));
-        let f1 = listing
+            .find(|fa| fa.remove.is_some())
+            .expect("a standalone remove side");
+        assert!(all_remove.add.is_none(), "remove must be single-sided");
+        assert_eq!(all_remove.remove.as_ref().unwrap().commit_version, 1);
+        let all_add = all
             .iter()
-            .find(|f| f.path == "path_1")
-            .expect("path_1 present");
-        assert_eq!(f1.change_kind, CdfChangeKind::Add);
-        assert_eq!(f1.base_row_id, Some(5));
+            .find(|fa| fa.add.is_some())
+            .expect("a standalone add side");
+        assert!(all_add.remove.is_none(), "add must be single-sided");
+        assert_eq!(all_add.add.as_ref().unwrap().commit_version, 2);
+    }
+
+    /// A same-commit deletion-vector update (an `add` and a `remove` of the same path in one
+    /// commit) flows through the real log-replay pipeline as a paired action. Both modes surface it
+    /// identically: one grouped `{add, remove}` action at that commit, the add side carrying the
+    /// post-image DV and the remove side the pre-image DV. (The two modes only diverge for a
+    /// *cross-commit* update, covered by
+    /// `scan_file_listing_net_changes_collapses_a_cross_commit_update`.)
+    #[tokio::test]
+    async fn scan_file_listing_same_commit_dv_update_grouped_in_both_modes() {
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        let (dv1, dv2) = listing_test_dvs();
+
+        // v0: enable row tracking and add `f` with dv1.
+        mock_table
+            .commit(
+                row_tracking_setup_actions(listing_test_schema())
+                    .into_iter()
+                    .chain([Action::Add(Add {
+                        path: "f".into(),
+                        data_change: true,
+                        size: 100,
+                        deletion_vector: Some(dv1.clone()),
+                        base_row_id: Some(0),
+                        default_row_commit_version: Some(0),
+                        ..Default::default()
+                    })]),
+            )
+            .await;
+        // v1: a same-commit DV update of `f` -- remove the dv1 baseline and re-add with dv2 in the
+        // one commit. Log replay pairs these into a single grouped action carrying both sides.
+        mock_table
+            .commit([
+                Action::Remove(Remove {
+                    path: "f".into(),
+                    data_change: true,
+                    deletion_vector: Some(dv1.clone()),
+                    ..Default::default()
+                }),
+                Action::Add(Add {
+                    path: "f".into(),
+                    data_change: true,
+                    size: 100,
+                    deletion_vector: Some(dv2.clone()),
+                    base_row_id: Some(0),
+                    default_row_commit_version: Some(1),
+                    ..Default::default()
+                }),
+            ])
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let new_table_changes = || {
+            Arc::new(
+                TableChanges::try_new_row_tracking(table_root.clone(), engine.as_ref(), 1, Some(1))
+                    .unwrap(),
+            )
+        };
+
+        // Both modes group the same-commit DV update into one `{add, remove}` action at v1: the add
+        // side carries the post-image (dv2), the remove side the pre-image (dv1).
+        let assert_grouped = |listing: Vec<TableChangesFileAction>| {
+            assert_eq!(listing.len(), 1, "expected one grouped action: {listing:?}");
+            let update = &listing[0];
+            let add = update.add.as_ref().expect("add side");
+            let remove = update.remove.as_ref().expect("remove side");
+            assert_eq!(add.commit_version, 1);
+            assert_eq!(add.deletion_vector, Some(dv2.clone()));
+            assert_eq!(remove.commit_version, 1);
+            assert_eq!(remove.deletion_vector, Some(dv1.clone()));
+        };
+
+        let all: Vec<TableChangesFileAction> = new_table_changes()
+            .scan_file_listing(engine.clone(), TableChangesListingMode::AllChanges)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_grouped(all);
+
+        let net: Vec<TableChangesFileAction> = new_table_changes()
+            .scan_file_listing(engine, TableChangesListingMode::NetChanges)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert_grouped(net);
+    }
+
+    #[tokio::test]
+    async fn scan_builder_rejects_row_tracking_table_changes() {
+        // Symmetric to `scan_file_listing_rejects_cdc_file_table_changes`: a row-tracking
+        // (`ReadTime`) `TableChanges` carries different feed semantics than the data-reading scan
+        // path, so building a scan from it must be rejected rather than silently mis-scanned.
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        mock_table
+            .commit(row_tracking_setup_actions(listing_test_schema()))
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let table_changes =
+            TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 0, Some(0)).unwrap();
+        let res = table_changes.into_scan_builder().build();
+        assert!(
+            matches!(res, Err(Error::Unsupported(_))),
+            "building a data scan from a row-tracking TableChanges must be unsupported, got {res:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::all_changes(TableChangesListingMode::AllChanges)]
+    #[case::net_changes(TableChangesListingMode::NetChanges)]
+    #[tokio::test]
+    async fn scan_file_listing_empty_range_yields_no_actions(
+        #[case] mode: TableChangesListingMode,
+    ) {
+        // A range whose only commit is the row-tracking setup (protocol + metadata, no data files)
+        // has no add/remove actions to list, so both modes must return an empty listing.
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+        mock_table
+            .commit(row_tracking_setup_actions(listing_test_schema()))
+            .await;
+
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let table_changes = Arc::new(
+            TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 0, Some(0)).unwrap(),
+        );
+        let listing: Vec<TableChangesFileAction> = table_changes
+            .scan_file_listing(engine, mode)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        assert!(listing.is_empty(), "expected an empty listing: {listing:?}");
     }
 }

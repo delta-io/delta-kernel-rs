@@ -119,8 +119,8 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///    In this phase, we do the following:
 ///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
 ///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead of
-///       time whether to filter out add/remove actions. In [`CdfMode::ReadTime`] mode `cdc`
-///       actions are ignored entirely (never flagged), so add/remove actions always drive the feed.
+///       time whether to filter out add/remove actions. In [`CdfMode::ReadTime`] mode `cdc` actions
+///       are ignored entirely (never flagged), so add/remove actions always drive the feed.
 ///     - Constructs the remove deletion vector map from paths belonging to `remove` actions to the
 ///       action's corresponding [`DvInfo`]. This map will be filtered to only contain paths that
 ///       exists in another `add` action _within the same commit_. We store the result in
