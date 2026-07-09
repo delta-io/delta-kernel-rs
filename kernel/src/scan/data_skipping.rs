@@ -9,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, column_expr_ref, column_name, joined_column_expr, BinaryPredicateOp, ColumnName,
+    column_expr, column_name, joined_column_expr, BinaryPredicateOp, ColumnName,
     Expression as Expr, ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef,
     Predicate as Pred, PredicateRef, Scalar,
 };
@@ -230,15 +230,17 @@ impl DataSkippingFilter {
     /// The stats schema is derived from the predicate's column references via
     /// [`TableConfiguration::build_expected_stats_schemas`], matching the write side exactly;
     /// references outside the table's stats columns fold to NULL (keeping the file). Partition
-    /// pruning is not wired in here, so partition predicates fold to keep-all.
+    /// values are parsed from the raw `add.partitionValues` string map with
+    /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
     ///
     /// Returns `None` (equivalent to keep-all) when the predicate is ineligible for data
-    /// skipping or when the stats schema cannot be built.
+    /// skipping or when neither data stats nor referenced partition columns are available.
     ///
     /// # Parameters
     /// - `engine`: Engine for creating evaluators.
     /// - `physical_predicate`: The predicate, already lowered to physical column names.
-    /// - `table_configuration`: Source of the stats schema and stats-column gate.
+    /// - `table_configuration`: Source of the stats schema, partition schema, and stats-column
+    ///   gate.
     /// - `input_schema`: Schema of the raw action batches passed to [`apply()`](Self::apply).
     /// - `metrics`: Optional metrics to record data skipping statistics.
     pub(crate) fn for_raw_action_batch(
@@ -262,21 +264,24 @@ impl DataSkippingFilter {
             .build_expected_stats_schemas(None, Some(&predicate_refs))
             .ok()?
             .physical;
+        let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
 
-        // Parse JSON stats from the raw action batch's `add.stats` column, and identify Add
-        // rows by `add.path IS NOT NULL` (raw batches keep the nested layout).
+        // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
+        // from the raw `add.partitionValues` string map, and identify Add rows by
+        // `add.path IS NOT NULL` (raw batches keep the nested layout).
         let stats_expr = Arc::new(Expr::parse_json(
             column_expr!("add.stats"),
             physical_stats_schema.clone(),
         ));
+        let partition_expr = Arc::new(Expr::map_to_struct(column_expr!("add.partitionValues")));
         let is_add_expr = Arc::new(Pred::is_not_null(column_expr!("add.path")).into());
         Self::new(
             engine,
             Some(physical_predicate),
             Some(&physical_stats_schema),
             stats_expr,
-            None, // partition pruning not wired in for raw-action-batch skipping
-            column_expr_ref!("partitionValues_parsed"),
+            partition_schema.as_ref(),
+            partition_expr,
             is_add_expr,
             input_schema,
             &physical_stats_columns,

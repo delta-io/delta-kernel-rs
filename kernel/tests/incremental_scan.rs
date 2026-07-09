@@ -1213,6 +1213,19 @@ fn add_partitioned(path: &str, val: &str) -> String {
     )
 }
 
+// Build a raw Add carrying both a `val` partition value and `id` stats over `[id_min, id_max]`,
+// for predicates that touch both a partition and a data column.
+fn add_partitioned_with_id_stats(path: &str, val: &str, id_min: i32, id_max: i32) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"id\\\":0}},\
+         \\\"minValues\\\":{{\\\"id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{\"val\":\"{val}\"}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+    )
+}
+
 // Column-mapping (name mode) metadata whose `id` column maps to the physical name `col-id`.
 const COLUMN_MAPPING_METADATA: &str = "{\"metaData\":{\"id\":\"cm-test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"integer\\\",\\\"nullable\\\":true,\\\"metadata\\\":{\\\"delta.columnMapping.id\\\":1,\\\"delta.columnMapping.physicalName\\\":\\\"col-id\\\"}}]}\",\"partitionColumns\":[],\"configuration\":{\"delta.columnMapping.mode\":\"name\",\"delta.columnMapping.maxColumnId\":\"1\"},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\"]}}";
 
@@ -1225,6 +1238,31 @@ fn add_with_physical_id_stats(path: &str, id_min: i32, id_max: i32) -> String {
     format!(
         "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
          \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+    )
+}
+
+// Metadata declaring an `id: integer` column AND the deletionVectors feature, so a DV-bearing
+// Add carrying `id` stats parses and an `id`-predicate is skipping-eligible.
+const DV_AND_ID_METADATA: &str = "{\"metaData\":{\"id\":\"dv-id-test\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"integer\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}}]}\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
+
+// Build a raw DV-bearing Add carrying `id` stats over `[id_min, id_max]`.
+fn add_with_dv_and_id_stats(
+    path: &str,
+    storage_type: &str,
+    path_or_inline: &str,
+    offset: i32,
+    id_min: i32,
+    id_max: i32,
+) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"id\\\":0}},\
+         \\\"minValues\\\":{{\\\"id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\",\
+         \"deletionVector\":{{\"storageType\":\"{storage_type}\",\"pathOrInlineDv\":\"{path_or_inline}\",\
+         \"offset\":{offset},\"sizeInBytes\":10,\"cardinality\":1}}}}}}"
     )
 }
 
@@ -1581,13 +1619,11 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-// Predicate over a partition column folds to keep-all: partition-value pruning is not wired in
-// on this path, so every live Add survives regardless of the partition predicate. Locks in the
-// documented conservative behavior (and doubles as the regression guard once partition pruning
-// lands).
+// A predicate over a partition column prunes added files by their partition value: values are
+// parsed from the raw `add.partitionValues` map via `map_to_struct`, so `val = 'x'` drops the
+// file in partition `y`.
 #[tokio::test]
-async fn partition_column_predicate_keeps_all_added_files() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn partition_column_predicate_prunes_added_files() -> Result<(), Box<dyn std::error::Error>> {
     let (storage, engine, table_url) = setup_test();
     let table_root = table_url.as_str();
 
@@ -1610,7 +1646,6 @@ async fn partition_column_predicate_keeps_all_added_files() -> Result<(), Box<dy
         .at_version(1)
         .build(engine.as_ref())?;
 
-    // `val = 'x'` is a partition predicate; it must not prune either file.
     let predicate: PredicateRef = Arc::new(column_expr!("val").eq(Expr::literal("x")));
     let listing = unwrap_listing(
         target
@@ -1621,8 +1656,58 @@ async fn partition_column_predicate_keeps_all_added_files() -> Result<(), Box<dy
 
     assert_eq!(
         listing.summary.live_adds,
-        HashSet::from([key("a.parquet"), key("b.parquet")]),
-        "a partition-column predicate folds to keep-all"
+        HashSet::from([key("a.parquet")]),
+        "only the file in partition `val = 'x'` survives"
+    );
+
+    Ok(())
+}
+
+// A mixed predicate `id > 25 AND val = 'x'` prunes on both axes: the data conjunct skips on
+// `add.stats`, the partition conjunct skips on `add.partitionValues`. Only the file satisfying
+// both survives; a file failing either is dropped.
+#[tokio::test]
+async fn mixed_data_and_partition_predicate_prunes_on_both(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_partitioned(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // match: id in [20,30] and val=x. wrong_val: in-range id but val=y. wrong_id: val=x but
+    // id in [0,5]. Only `match` satisfies `id > 25 AND val = 'x'`.
+    let v1 = [
+        add_partitioned_with_id_stats("match.parquet", "x", 20, 30),
+        add_partitioned_with_id_stats("wrong_val.parquet", "y", 20, 30),
+        add_partitioned_with_id_stats("wrong_id.parquet", "x", 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(Pred::and(
+        column_expr!("id").gt(Expr::literal(25i32)),
+        column_expr!("val").eq(Expr::literal("x")),
+    ));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("match.parquet")]),
+        "only the file matching both the data and partition conjuncts survives"
     );
 
     Ok(())
@@ -1669,6 +1754,92 @@ async fn pushdown_resolves_column_mapping_physical_names() -> Result<(), Box<dyn
         listing.summary.live_adds,
         HashSet::from([key("high.parquet")]),
         "predicate on logical `id` resolves to physical `col-id` stats and drops the low file"
+    );
+
+    Ok(())
+}
+
+// A DV-bearing Add is pruned by its stats like any other, and the surviving live Add is keyed by
+// its full `(path, dv_unique_id)`, not path alone. Two DV-bearing Adds with disjoint `id` ranges:
+// `id > 25` drops the out-of-range one and keeps the in-range one under its DV key.
+#[tokio::test]
+async fn pushdown_prunes_dv_bearing_adds_keyed_by_dv() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        DV_AND_ID_METADATA.to_string(),
+    )
+    .await?;
+    let v1 = [
+        add_with_dv_and_id_stats("keep.parquet", "u", "abc", 1, 20, 30),
+        add_with_dv_and_id_stats("prune.parquet", "u", "xyz", 2, 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key_with_dv("keep.parquet", "uabc@1")]),
+        "the in-range DV Add survives keyed by its full (path, dv_unique_id)"
+    );
+
+    Ok(())
+}
+
+// A predicate that references no columns and is not statically false (`lit(true)`) resolves to
+// `PhysicalPredicate::None`, which folds to keep-all. Distinct from the tautology case (which
+// references `id` and keeps all via the filter), this exercises the `None -> KeepAll` arm.
+#[tokio::test]
+async fn column_free_predicate_keeps_all_added_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let v1 = [
+        add_with_id_stats("a.parquet", 0, 9),
+        add_with_id_stats("b.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(Pred::literal(true));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("a.parquet"), key("b.parquet")]),
+        "a column-free predicate is ineligible for skipping and keeps every live Add"
     );
 
     Ok(())

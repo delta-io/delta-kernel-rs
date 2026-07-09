@@ -857,6 +857,71 @@ async fn data_skipping_filter() {
     assert_eq!(sv, &[false, true, false, false, true]);
 }
 
+// The shared `for_raw_action_batch` filter prunes on partition values on the table_changes path
+// too: partition values are parsed from `add.partitionValues` via `map_to_struct`, so `part = 'x'`
+// drops the Add in partition `y`.
+#[tokio::test]
+async fn data_skipping_filter_prunes_partition_values() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([
+            Action::Add(Add {
+                path: "in_x".into(),
+                partition_values: HashMap::from([("part".to_string(), "x".to_string())]),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "in_y".into(),
+                partition_values: HashMap::from([("part".to_string(), "y".to_string())]),
+                data_change: true,
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    // Partitioned schema: `part` is the partition column, `id` a data column.
+    let logical_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("part", DataType::STRING),
+    ]));
+    let metadata = Metadata::try_new(
+        None,
+        None,
+        logical_schema.clone(),
+        vec!["part".to_string()],
+        0,
+        HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+    )
+    .unwrap();
+    let protocol = Protocol::try_new_legacy(1, 4).unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = TableConfiguration::try_new(metadata, protocol, table_root_url, 0).unwrap();
+
+    let predicate = Predicate::binary(
+        BinaryPredicateOp::Equal,
+        column_expr!("part"),
+        Scalar::from("x"),
+    );
+    let predicate =
+        match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
+            Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+            other => panic!("Unexpected result: {other:?}"),
+        };
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema, predicate)
+        .unwrap()
+        .flat_map(|scan_metadata| scan_metadata.unwrap().selection_vector)
+        .collect_vec();
+
+    // Only the Add in partition `x` survives; the one in `y` is pruned.
+    assert_eq!(sv, &[true, false]);
+}
+
 #[tokio::test]
 async fn failing_protocol() {
     let engine = Arc::new(SyncEngine::new());
