@@ -46,6 +46,8 @@ enum LitType {
   Timestamp,
   TimestampNtz,
   Date,
+  IntervalYearMonth,
+  IntervalDayTime,
   Binary,
   Decimal,
   Null,
@@ -235,6 +237,16 @@ DEFINE_SIMPLE_SCALAR(visit_expr_boolean_literal, Boolean, _Bool, boolean_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_literal, Timestamp, int64_t, long_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_ntz_literal, TimestampNtz, int64_t, long_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_date_literal, Date, int32_t, integer_data);
+DEFINE_SIMPLE_SCALAR(
+    visit_expr_interval_year_month_literal,
+    IntervalYearMonth,
+    int32_t,
+    integer_data);
+DEFINE_SIMPLE_SCALAR(
+    visit_expr_interval_day_time_literal,
+    IntervalDayTime,
+    int64_t,
+    long_data);
 #undef DEFINE_SIMPLE_SCALAR
 
 void visit_expr_string_literal(void* data, uintptr_t sibling_list_id, KernelStringSlice string) {
@@ -491,6 +503,8 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_literal_timestamp = visit_expr_timestamp_literal,
     .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
     .visit_literal_date = visit_expr_date_literal,
+    .visit_literal_interval_year_month = visit_expr_interval_year_month_literal,
+    .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
@@ -543,6 +557,8 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_literal_timestamp = visit_expr_timestamp_literal,
     .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
     .visit_literal_date = visit_expr_date_literal,
+    .visit_literal_interval_year_month = visit_expr_interval_year_month_literal,
+    .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
@@ -667,6 +683,8 @@ void free_expression_item(ExpressionItem ref) {
         case Timestamp:
         case TimestampNtz:
         case Date:
+        case IntervalYearMonth:
+        case IntervalDayTime:
         case Decimal:
         case Null:
           break;

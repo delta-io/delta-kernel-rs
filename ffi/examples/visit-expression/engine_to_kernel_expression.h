@@ -56,6 +56,10 @@ uintptr_t convert_engine_to_kernel_literal(
           lit->value.long_data);
     case Date:
       return visit_expression_literal_date(state, lit->value.integer_data);
+    case IntervalYearMonth:
+      return visit_expression_literal_interval_year_month(state, lit->value.integer_data);
+    case IntervalDayTime:
+      return visit_expression_literal_interval_day_time(state, lit->value.long_data);
     case Binary: {
       return visit_expression_literal_binary(
           state, lit->value.binary.buf, lit->value.binary.len);
@@ -340,5 +344,4 @@ SharedPredicate* convert_engine_to_kernel_predicate(
     abort();
   }
 }
-
 

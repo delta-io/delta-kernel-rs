@@ -363,6 +363,28 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, Expression::literal(Scalar::TimestampNtz(value)))
 }
 
+/// Visit an interval year-month literal expression.
+///
+/// The value is a signed count of months.
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_interval_year_month(
+    state: &mut KernelExpressionVisitorState,
+    value: i32,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::IntervalYearMonth(value)))
+}
+
+/// Visit an interval day-time literal expression.
+///
+/// The value is a signed count of microseconds.
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_interval_day_time(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::IntervalDayTime(value)))
+}
+
 /// visit a binary literal expression
 ///
 /// # Safety
@@ -411,10 +433,10 @@ fn visit_expression_literal_decimal_impl(
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Primitive types use fixed discriminants 0-11. Decimal uses 12 and requires additional
-/// precision/scale parameters. Non-primitive types (struct, array, map, variant) use the
-/// [`NonPrimitive`](Self::NonPrimitive) sentinel -- these cannot be reconstructed from a type
-/// tag alone.
+/// Primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
+/// precision/scale parameters. Non-primitive types (struct, array, map, variant) and void use
+/// the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be reconstructed from
+/// a type tag alone.
 ///
 /// NOTE: These values are part of the FFI contract. Changing existing discriminants is a breaking
 /// change.
@@ -450,9 +472,14 @@ pub(crate) enum NullTypeTag {
     /// WARNING: This variant MUST remain `= 12`. It is the only tag with special handling
     /// (precision/scale parameters), and C consumers key on the value `12` directly.
     Decimal = 12,
-    /// Sentinel for non-primitive null types (struct, array, map, variant). Emitted by the
-    /// kernel-to-engine visitor when the null's type is not a primitive. Engines that receive
-    /// this tag should use opaque expressions or a schema visitor to obtain full type details.
+    /// Null of type `interval year to month` (signed month count).
+    IntervalYearMonth = 13,
+    /// Null of type `interval day to second` (signed microsecond duration).
+    IntervalDayTime = 14,
+    /// Sentinel for non-primitive null types (struct, array, map, variant) and void. Emitted by
+    /// the kernel-to-engine visitor when the null's type cannot be reconstructed from a compact
+    /// tag. Engines that receive this tag should use opaque expressions or a schema visitor to
+    /// obtain full type details.
     ///
     /// Passing this tag to [`visit_expression_literal_null`] returns an error because the
     /// original complex type cannot be reconstructed from a tag alone.
@@ -477,6 +504,8 @@ impl TryFrom<u8> for NullTypeTag {
             10 => Ok(Self::Timestamp),
             11 => Ok(Self::TimestampNtz),
             12 => Ok(Self::Decimal),
+            13 => Ok(Self::IntervalYearMonth),
+            14 => Ok(Self::IntervalDayTime),
             255 => Ok(Self::NonPrimitive),
             other => Err(delta_kernel::Error::generic(format!(
                 "Unrecognized null type tag: {other}"
@@ -505,10 +534,8 @@ impl NullTypeTag {
                 PrimitiveType::Date => (Self::Date, 0, 0),
                 PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
                 PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
-                    // No FFI null tag for intervals; the sentinel avoids a new discriminant
-                    (Self::NonPrimitive, 0, 0)
-                }
+                PrimitiveType::IntervalYearMonth => (Self::IntervalYearMonth, 0, 0),
+                PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this
@@ -550,6 +577,8 @@ impl NullTypeTag {
             Self::Date => Ok(DataType::DATE),
             Self::Timestamp => Ok(DataType::TIMESTAMP),
             Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
+            Self::IntervalYearMonth => Ok(DataType::INTERVAL_YEAR_MONTH),
+            Self::IntervalDayTime => Ok(DataType::INTERVAL_DAY_TIME),
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
                 precision, scale,
             )?)),
@@ -839,6 +868,8 @@ mod tests {
     #[case(DataType::DATE, NullTypeTag::Date, 0, 0)]
     #[case(DataType::TIMESTAMP, NullTypeTag::Timestamp, 0, 0)]
     #[case(DataType::TIMESTAMP_NTZ, NullTypeTag::TimestampNtz, 0, 0)]
+    #[case(DataType::INTERVAL_YEAR_MONTH, NullTypeTag::IntervalYearMonth, 0, 0)]
+    #[case(DataType::INTERVAL_DAY_TIME, NullTypeTag::IntervalDayTime, 0, 0)]
     fn from_data_type_primitive(
         #[case] dt: DataType,
         #[case] expected_tag: NullTypeTag,
@@ -906,6 +937,8 @@ mod tests {
     #[case(NullTypeTag::Date, DataType::DATE)]
     #[case(NullTypeTag::Timestamp, DataType::TIMESTAMP)]
     #[case(NullTypeTag::TimestampNtz, DataType::TIMESTAMP_NTZ)]
+    #[case(NullTypeTag::IntervalYearMonth, DataType::INTERVAL_YEAR_MONTH)]
+    #[case(NullTypeTag::IntervalDayTime, DataType::INTERVAL_DAY_TIME)]
     fn to_data_type_primitive(#[case] tag: NullTypeTag, #[case] expected: DataType) {
         assert_eq!(tag.to_data_type(0, 0).unwrap(), expected);
     }
@@ -952,13 +985,15 @@ mod tests {
     #[case(10, NullTypeTag::Timestamp)]
     #[case(11, NullTypeTag::TimestampNtz)]
     #[case(12, NullTypeTag::Decimal)]
+    #[case(13, NullTypeTag::IntervalYearMonth)]
+    #[case(14, NullTypeTag::IntervalDayTime)]
     #[case(255, NullTypeTag::NonPrimitive)]
     fn try_from_u8_valid(#[case] value: u8, #[case] expected: NullTypeTag) {
         assert_eq!(NullTypeTag::try_from(value).unwrap(), expected);
     }
 
     #[rstest]
-    #[case(13)]
+    #[case(15)]
     #[case(42)]
     #[case(254)]
     fn try_from_u8_invalid(#[case] value: u8) {
@@ -984,7 +1019,7 @@ mod tests {
     #[test]
     fn visit_null_unrecognized_tag_returns_error() {
         let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 13, 0, 0).is_err());
+        assert!(visit_expression_literal_null_impl(&mut state, 15, 0, 0).is_err());
     }
 
     #[test]
@@ -1010,6 +1045,8 @@ mod tests {
     #[case(DataType::DATE)]
     #[case(DataType::TIMESTAMP)]
     #[case(DataType::TIMESTAMP_NTZ)]
+    #[case(DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::INTERVAL_DAY_TIME)]
     fn null_type_round_trips_through_tag_encoding(#[case] data_type: DataType) {
         let (tag, precision, scale) = NullTypeTag::from_data_type(&data_type);
         let mut state = KernelExpressionVisitorState::default();
@@ -1029,6 +1066,24 @@ mod tests {
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, Expression::literal(Scalar::Null(dt)));
+    }
+
+    #[rstest]
+    #[case(Scalar::IntervalYearMonth(17))]
+    #[case(Scalar::IntervalDayTime(1_234_567))]
+    fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
+        let mut state = KernelExpressionVisitorState::default();
+        let id = match expected {
+            Scalar::IntervalYearMonth(value) => {
+                visit_expression_literal_interval_year_month(&mut state, value)
+            }
+            Scalar::IntervalDayTime(value) => {
+                visit_expression_literal_interval_day_time(&mut state, value)
+            }
+            _ => unreachable!(),
+        };
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(expr, Expression::literal(expected));
     }
 
     // ============================================================================
