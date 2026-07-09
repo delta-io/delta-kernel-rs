@@ -7,7 +7,7 @@ use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
 use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
 use crate::log_replay::LogReplayProcessor;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{CheckpointReadIntent, LogSegment};
 use crate::path::ParsedLogPath;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
@@ -117,9 +117,14 @@ impl LogCompactionWriter {
             Some(self.end_version),
         )?;
 
-        // Read actions from the version-filtered log segment
-        let actions_iter =
-            compaction_log_segment.read_actions(engine, COMPACTION_ACTIONS_SCHEMA.clone())?;
+        // Read actions from the version-filtered log segment. Compaction reads file actions, so a
+        // V2 table's sidecars must be resolved.
+        let is_v2_supported = self.snapshot.table_configuration().supports_v2_checkpoint();
+        let actions_iter = compaction_log_segment.read_actions(
+            engine,
+            COMPACTION_ACTIONS_SCHEMA.clone(),
+            CheckpointReadIntent::FileActions { is_v2_supported },
+        )?;
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 

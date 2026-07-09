@@ -186,6 +186,7 @@ use delta_kernel::committer::{
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::expressions::Scalar;
+use delta_kernel::log_segment::CheckpointReadIntent;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
@@ -1381,7 +1382,12 @@ pub fn read_add_infos(
     engine: &impl Engine,
 ) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
     let schema = LOG_ADD_SCHEMA.clone();
-    let batches = snapshot.log_segment().read_actions(engine, schema)?;
+    let is_v2_supported = snapshot.table_configuration().supports_v2_checkpoint();
+    let batches = snapshot.log_segment().read_actions(
+        engine,
+        schema,
+        CheckpointReadIntent::FileActions { is_v2_supported },
+    )?;
     let mut actions = Vec::new();
     for batch_result in batches {
         let actions_batch = batch_result?;

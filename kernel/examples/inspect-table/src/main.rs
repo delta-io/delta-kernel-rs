@@ -14,6 +14,7 @@ use delta_kernel::actions::{
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::log_segment::CheckpointReadIntent;
 use delta_kernel::metrics::{LoggingMetricsReporter, WithMetricsReporterLayer};
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
@@ -222,9 +223,12 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::Actions { oldest_first } => {
             let actions_schema = get_all_actions_schema();
-            let actions = snapshot
-                .log_segment()
-                .read_actions(&engine, actions_schema.clone())?;
+            let is_v2_supported = snapshot.table_configuration().supports_v2_checkpoint();
+            let actions = snapshot.log_segment().read_actions(
+                &engine,
+                actions_schema.clone(),
+                CheckpointReadIntent::FileActions { is_v2_supported },
+            )?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {

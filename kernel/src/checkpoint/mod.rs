@@ -120,6 +120,7 @@ use crate::expressions::{
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
+use crate::log_segment::CheckpointReadIntent;
 use crate::path::{self, ParsedLogPath};
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
@@ -468,11 +469,14 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
-        // Read actions from log segment
-        let actions = self
-            .snapshot
-            .log_segment()
-            .read_actions(engine, self.read_schema.clone())?;
+        // Read actions from log segment. The checkpoint read schema includes file actions, so a
+        // V2 source table's sidecars must be resolved.
+        let is_v2_supported = self.snapshot.table_configuration().supports_v2_checkpoint();
+        let actions = self.snapshot.log_segment().read_actions(
+            engine,
+            self.read_schema.clone(),
+            CheckpointReadIntent::FileActions { is_v2_supported },
+        )?;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(

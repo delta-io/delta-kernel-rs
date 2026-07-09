@@ -152,6 +152,21 @@ fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> 
     Some(Arc::new(predicates.fold(first, Predicate::or)))
 }
 
+/// Which category of actions a checkpoint read needs from a [`LogSegment`].
+///
+/// File actions (add/remove) may live in sidecar files on V2 checkpoints, while non-file actions
+/// only ever live in the top-level checkpoint. The read path uses this to decide whether sidecars
+/// must be resolved.
+#[derive(Debug, Clone, Copy)]
+#[internal_api]
+pub(crate) enum CheckpointReadIntent {
+    /// Reads only non-file actions (protocol, metaData, txn, domainMetadata).
+    NonFileActions,
+    /// Reads file actions (add/remove). `is_v2_supported` is whether the table supports the
+    /// `v2Checkpoint` feature; when it does, a parquet checkpoint may be V2 and carry sidecars.
+    FileActions { is_v2_supported: bool },
+}
+
 impl LogSegment {
     /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
     ///
@@ -697,6 +712,7 @@ impl LogSegment {
     /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
     /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
     #[internal_api]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
@@ -705,6 +721,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        intent: CheckpointReadIntent,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -727,6 +744,7 @@ impl LogSegment {
             effective_predicate,
             stats_schema,
             partition_schema,
+            intent,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -743,6 +761,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         action_schema: SchemaRef,
+        intent: CheckpointReadIntent,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let result = self.read_actions_with_projected_checkpoint_actions(
             engine,
@@ -751,6 +770,7 @@ impl LogSegment {
             None,
             None,
             None,
+            intent,
         )?;
         Ok(result.actions)
     }
@@ -815,6 +835,7 @@ impl LogSegment {
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
+        is_v2_supported: bool,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_schema();
@@ -827,9 +848,10 @@ impl LogSegment {
 
         match &checkpoint.file_type {
             MultiPartCheckpoint { .. } => {
-                // Multi-part checkpoints are always V1 and never have sidecars.
+                // Multi-part checkpoints are always V1 and never have sidecars, so the hint is
+                // trusted regardless of `is_v2_supported`.
                 let schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref(), false)?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
@@ -839,9 +861,15 @@ impl LogSegment {
             }
             SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
-                // Check for sidecar column to distinguish.
-                let checkpoint_schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                // Distinguish by the sidecar column; when the table could be V2 the hint is
+                // trusted only if it proves V2, else the footer is read (see
+                // `read_checkpoint_schema`).
+                let checkpoint_schema = Self::read_checkpoint_schema(
+                    engine,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                    is_v2_supported,
+                )?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
                     self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
                 } else {
@@ -852,16 +880,26 @@ impl LogSegment {
         }
     }
 
-    /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
-    /// available or reading the parquet footer otherwise.
+    /// Returns the checkpoint's parquet schema, from the `_last_checkpoint` hint when it is safe to
+    /// trust or from the parquet footer otherwise. When the table could hold a V2 checkpoint
+    /// (`is_v2_supported`), the hint is trusted only if it already has a `sidecar` column, since a
+    /// hint that omits `sidecar` cannot rule out a V2 checkpoint whose `checkpointSchema` was
+    /// written without it. A checkpoint that can only be V1 (`is_v2_supported` false) trusts the
+    /// hint whenever present.
     fn read_checkpoint_schema(
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
+        is_v2_supported: bool,
     ) -> DeltaResult<SchemaRef> {
         match hint_schema {
-            Some(schema) => Ok(schema.clone()),
-            None => Ok(engine
+            // Trust the hint: always for V1-only checkpoints, or for possibly-V2 ones that already
+            // show a `sidecar` column.
+            Some(hint) if !is_v2_supported || hint.field(SIDECAR_NAME).is_some() => {
+                Ok(hint.clone())
+            }
+            // No hint, or a possibly-V2 hint without `sidecar`: read the footer to decide.
+            _ => Ok(engine
                 .parquet_handler()
                 .read_parquet_footer(&checkpoint.location)?
                 .schema),
@@ -900,15 +938,23 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        intent: CheckpointReadIntent,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let need_file_actions = schema_contains_file_actions(&action_schema);
+        // The intent must agree with the projected schema: only file-action reads request the
+        // add/remove columns that sidecars carry.
+        debug_assert_eq!(
+            matches!(intent, CheckpointReadIntent::FileActions { .. }),
+            schema_contains_file_actions(&action_schema),
+            "checkpoint read intent must match the projected schema's file-action columns",
+        );
 
-        let (file_actions_schema, sidecar_files) = if need_file_actions {
-            self.get_file_actions_schema_and_sidecars(engine)?
-        } else {
-            (None, vec![])
+        let (file_actions_schema, sidecar_files) = match intent {
+            CheckpointReadIntent::FileActions { is_v2_supported } => {
+                self.get_file_actions_schema_and_sidecars(engine, is_v2_supported)?
+            }
+            CheckpointReadIntent::NonFileActions => (None, vec![]),
         };
 
         // Check if checkpoint has compatible stats_parsed and add it to the schema if so
@@ -924,8 +970,9 @@ impl LogSegment {
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
 
         // Build final schema with any additional fields needed
-        // (stats_parsed, partitionValues_parsed, sidecar)
-        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
+        // (stats_parsed, partitionValues_parsed, sidecar). Sidecars are only resolved for
+        // file-action reads, so a non-empty `sidecar_files` already implies that intent.
+        let needs_sidecar = !sidecar_files.is_empty();
         let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
         let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
             let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =

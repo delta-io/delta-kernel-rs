@@ -519,6 +519,13 @@ impl TableConfiguration {
             || self.is_feature_supported(&TableFeature::CatalogOwnedPreview)
     }
 
+    /// Whether this table supports the `v2Checkpoint` feature, meaning a parquet checkpoint may be
+    /// a V2 checkpoint carrying sidecar files.
+    #[internal_api]
+    pub(crate) fn supports_v2_checkpoint(&self) -> bool {
+        self.is_feature_supported(&TableFeature::V2Checkpoint)
+    }
+
     /// The [`ColumnMappingMode`] for this table at this version.
     #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::instrument;
 
-use super::LogSegment;
+use super::{CheckpointReadIntent, LogSegment};
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::log_replay::ActionsBatch;
@@ -54,7 +54,11 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
+        self.read_actions(
+            engine,
+            LOG_DOMAIN_METADATA_SCHEMA.clone(),
+            CheckpointReadIntent::NonFileActions,
+        )
     }
 }
 
