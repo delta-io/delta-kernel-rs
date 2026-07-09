@@ -246,8 +246,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a supported primitive type (Struct, Array, Map, and intervals are rejected because the
-///    Delta protocol does not define their partition-value serialization)
+/// 4. Of a supported primitive type (Struct, Array, and Map are rejected because the Delta protocol
+///    does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -1658,36 +1658,21 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_validate_partition_columns_interval_types_rejected(
+    fn test_validate_partition_columns_nested_interval_types_rejected(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
-        #[values(false, true)] nested: bool,
     ) {
-        let (field, column) = if nested {
-            (
-                StructField::not_null(
-                    "nested",
-                    StructType::new_unchecked([StructField::not_null("col", data_type)]),
-                ),
-                ColumnName::new(["nested", "col"]),
-            )
-        } else {
-            (
-                StructField::not_null("col", data_type),
-                ColumnName::new(["col"]),
-            )
-        };
-        let schema =
-            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER), field]);
+        let schema = StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::not_null(
+                "nested",
+                StructType::new_unchecked([StructField::not_null("col", data_type)]),
+            ),
+        ]);
 
-        let error = validate_partition_columns(&schema, &[column])
-            .expect_err("interval partition columns must be rejected")
+        let error = validate_partition_columns(&schema, &[ColumnName::new(["nested", "col"])])
+            .expect_err("nested partition columns must be rejected")
             .to_string();
-        if nested {
-            assert!(error.contains("must be a top-level column"));
-        } else {
-            assert!(error.contains("unsupported interval type"));
-            assert!(error.contains("partition columns"));
-        }
+        assert!(error.contains("must be a top-level column"));
     }
 
     #[rstest::rstest]
@@ -1697,6 +1682,8 @@ mod tests {
     #[case::timestamp(DataType::TIMESTAMP)]
     #[case::boolean(DataType::BOOLEAN)]
     #[case::long(DataType::LONG)]
+    #[case::interval_year_month(DataType::INTERVAL_YEAR_MONTH)]
+    #[case::interval_day_time(DataType::INTERVAL_DAY_TIME)]
     fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),

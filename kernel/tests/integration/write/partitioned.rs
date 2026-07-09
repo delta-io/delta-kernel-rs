@@ -125,21 +125,39 @@ async fn test_write_partitioned_normal_values_roundtrip(
     Ok(())
 }
 
-/// Writes a year-month interval partition column, asserts the partitionValues entry is the Spark
-/// ANSI interval literal (CM=None), and verifies the value round-trips through a scan. Gated on
-/// `interval-type-in-dev` because writing an interval table requires the `intervalType` feature.
+/// Writes an interval partition column, asserts the partitionValues entry is the Spark ANSI
+/// interval literal (CM=None), and verifies the value round-trips through a scan. Gated on
+/// `interval-type-in-dev` because writing an interval table requires interval writer support.
 #[cfg(feature = "interval-type-in-dev")]
 #[rstest]
-#[case::cm_none(ColumnMappingMode::None)]
-#[case::cm_name(ColumnMappingMode::Name)]
-#[case::cm_id(ColumnMappingMode::Id)]
+#[case::year_month(
+    DataType::INTERVAL_YEAR_MONTH,
+    Arc::new(Int32Array::from(vec![30])) as ArrayRef,
+    Scalar::IntervalYearMonth(30),
+    "INTERVAL '2-6' YEAR TO MONTH"
+)]
+#[case::day_time(
+    DataType::INTERVAL_DAY_TIME,
+    Arc::new(Int64Array::from(vec![131_445_000_000i64])) as ArrayRef,
+    Scalar::IntervalDayTime(131_445_000_000),
+    "INTERVAL '1 12:30:45.000000' DAY TO SECOND"
+)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_write_partitioned_interval_year_month_roundtrip(
-    #[case] cm_mode: ColumnMappingMode,
+async fn test_write_partitioned_interval_roundtrip(
+    #[case] interval: DataType,
+    #[case] partition_arrow_column: ArrayRef,
+    #[case] partition_value: Scalar,
+    #[case] expected_partition_value: &str,
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    cm_mode: ColumnMappingMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("value", DataType::INTEGER),
-        StructField::nullable("period", DataType::INTERVAL_YEAR_MONTH),
+        StructField::nullable("period", interval),
     ])?);
     // Full logical-schema columns; the partition column's data is dropped by the logical->physical
     // transform, and its value comes from `partition_values`.
@@ -148,36 +166,168 @@ async fn test_write_partitioned_interval_year_month_roundtrip(
         &["period"],
         cm_mode,
         true, // write_partition_values_parsed
-        vec![
-            Arc::new(Int32Array::from(vec![7])),
-            Arc::new(Int32Array::from(vec![30])),
-        ],
-        HashMap::from([("period".to_string(), Scalar::IntervalYearMonth(30))]),
+        vec![Arc::new(Int32Array::from(vec![7])), partition_arrow_column],
+        HashMap::from([("period".to_string(), partition_value.clone())]),
     )
     .await?;
 
-    // CM=None: the raw partitionValues entry is the Spark ANSI interval literal (2y6m).
+    // CM=None: the raw partitionValues entry is the Spark ANSI interval literal.
     if cm_mode == ColumnMappingMode::None {
         let (add, _rel) = read_single_add(&table_path, 1)?;
         assert_eq!(
             add["partitionValues"]["period"].as_str(),
-            Some("INTERVAL '2-6' YEAR TO MONTH"),
+            Some(expected_partition_value),
             "interval partition value should serialize to the ANSI literal"
         );
     }
 
-    // The partition value round-trips: scan materializes `period` back as its physical int32.
+    // The partition value round-trips: scan materializes `period` back as its physical integer.
     let sorted = read_sorted(&snapshot, engine)?;
-    let int_col = |i: usize| {
+    assert_eq!(
         sorted
-            .column(i)
+            .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap()
-            .value(0)
-    };
-    assert_eq!(int_col(0), 7, "value column");
-    assert_eq!(int_col(1), 30, "period column (months)");
+            .value(0),
+        7,
+        "value column"
+    );
+    match partition_value {
+        Scalar::IntervalYearMonth(months) => {
+            assert_eq!(
+                sorted
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                months,
+                "period column (months)"
+            );
+        }
+        Scalar::IntervalDayTime(micros) => {
+            assert_eq!(
+                sorted
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                micros,
+                "period column (microseconds)"
+            );
+        }
+        _ => unreachable!("test cases only pass interval partition values"),
+    }
+
+    Ok(())
+}
+
+/// Materialized interval partition columns are written into the Parquet file as physical integer
+/// values and still round-trip through scan output as logical partition columns.
+#[cfg(feature = "interval-type-in-dev")]
+#[rstest]
+#[case::year_month(
+    DataType::INTERVAL_YEAR_MONTH,
+    Scalar::IntervalYearMonth(30),
+    "INTERVAL '2-6' YEAR TO MONTH"
+)]
+#[case::day_time(
+    DataType::INTERVAL_DAY_TIME,
+    Scalar::IntervalDayTime(131_445_000_000),
+    "INTERVAL '1 12:30:45.000000' DAY TO SECOND"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_materialized_partitioned_interval_roundtrip(
+    #[case] interval: DataType,
+    #[case] partition_value: Scalar,
+    #[case] expected_partition_value: &str,
+    #[values(
+        ColumnMappingMode::None,
+        ColumnMappingMode::Name,
+        ColumnMappingMode::Id
+    )]
+    cm_mode: ColumnMappingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("value", DataType::INTEGER),
+        StructField::nullable("period", interval),
+    ])?);
+
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let _ = create_table(&table_path, schema, "test/1.0")
+        .with_data_layout(DataLayout::partitioned(["period"]))
+        .with_table_properties([
+            ("delta.feature.materializePartitionColumns", "supported"),
+            ("delta.columnMapping.mode", cm_mode_str(cm_mode)),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+
+    let data_schema = StructType::try_new(vec![StructField::nullable("value", DataType::INTEGER)])?;
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("period".to_string(), partition_value.clone())]),
+    )
+    .await?;
+
+    let logical_schema = snapshot.schema();
+    let value_physical = logical_schema
+        .field("value")
+        .unwrap()
+        .physical_name(cm_mode);
+    let period_physical = logical_schema
+        .field("period")
+        .unwrap()
+        .physical_name(cm_mode);
+    let (add, rel_path) = read_single_add(&table_path, 1)?;
+    assert_eq!(
+        add["partitionValues"][period_physical].as_str(),
+        Some(expected_partition_value),
+        "interval partition value should serialize to the ANSI literal"
+    );
+
+    let parquet_path = Url::from_directory_path(&table_path)
+        .unwrap()
+        .join(&rel_path)?
+        .to_file_path()
+        .unwrap();
+    let file_batch = read_parquet_file(&parquet_path);
+    assert_eq!(
+        get_column!(file_batch, value_physical, Int32Array).value(0),
+        7
+    );
+    assert_interval_value(&file_batch, period_physical, &partition_value);
+
+    let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
+    assert!(
+        stats[MIN_VALUES].get(value_physical).is_some(),
+        "data column 'value' should have minValues"
+    );
+    assert!(
+        stats[MIN_VALUES].get(period_physical).is_none(),
+        "materialized partition column should not have minValues"
+    );
+    assert!(
+        stats[MAX_VALUES].get(period_physical).is_none(),
+        "materialized partition column should not have maxValues"
+    );
+    assert!(
+        stats[NULL_COUNT].get(period_physical).is_none(),
+        "materialized partition column should not have nullCount"
+    );
+
+    let sorted = read_sorted(&snapshot, engine.clone() as Arc<dyn delta_kernel::Engine>)?;
+    assert_eq!(get_column!(sorted, "value", Int32Array).value(0), 7);
+    assert_interval_value(&sorted, "period", &partition_value);
 
     Ok(())
 }
@@ -566,6 +716,27 @@ macro_rules! assert_col {
             $batch.schema().field($idx).name()
         );
     };
+}
+
+#[cfg(feature = "interval-type-in-dev")]
+fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scalar) {
+    match expected {
+        Scalar::IntervalYearMonth(months) => {
+            assert_eq!(
+                get_column!(batch, column_name, Int32Array).value(0),
+                *months,
+                "interval year-month column {column_name}"
+            );
+        }
+        Scalar::IntervalDayTime(micros) => {
+            assert_eq!(
+                get_column!(batch, column_name, Int64Array).value(0),
+                *micros,
+                "interval day-time column {column_name}"
+            );
+        }
+        _ => panic!("expected interval scalar, got {expected:?}"),
+    }
 }
 
 /// Asserts the normal-values row reads back correctly (1 row, all 13 partition columns).
