@@ -3,6 +3,7 @@
 //! This module provides:
 //! - Read-side: Mode detection and schema validation
 //! - Write-side: Schema transformation for assigning IDs and physical names
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -731,6 +732,91 @@ impl<'a> SchemaTransform<'a> for MaxColumnId {
     }
 }
 
+/// The field-metadata keys that are meaningful only when column mapping is enabled. The detector
+/// [`schema_has_column_mapping_metadata`] and the stripper [`drop_column_mapping_metadata`] both
+/// key off this exact set, matching the `COLUMN_MAPPING_METADATA_KEYS` delta-spark strips and
+/// detects together.
+const COLUMN_MAPPING_METADATA_KEYS: &[ColumnMetadataKey] = &[
+    ColumnMetadataKey::ColumnMappingId,
+    ColumnMetadataKey::ColumnMappingPhysicalName,
+    ColumnMetadataKey::ColumnMappingNestedIds,
+    ColumnMetadataKey::ParquetFieldId,
+    ColumnMetadataKey::ParquetFieldNestedIds,
+];
+
+/// Returns whether any field in `schema` (recursively) carries any [`COLUMN_MAPPING_METADATA_KEYS`]
+/// annotation. Detection is by key presence (not value type), so a malformed annotation still
+/// counts -- the detector and [`drop_column_mapping_metadata`] must agree on what "carries column
+/// mapping metadata" means, else a write could strip a field the detector deemed clean (or persist
+/// one it missed).
+pub(crate) fn schema_has_column_mapping_metadata(schema: &StructType) -> bool {
+    struct HasCmMetadata(bool);
+    impl<'a> SchemaTransform<'a> for HasCmMetadata {
+        transform_output_type!(|'a, T| ());
+        fn transform_struct_field(&mut self, field: &'a StructField) {
+            if COLUMN_MAPPING_METADATA_KEYS
+                .iter()
+                .any(|key| field.metadata.contains_key(key.as_ref()))
+            {
+                self.0 = true;
+            }
+            self.recurse_into_struct_field(field)
+        }
+    }
+    let mut visitor = HasCmMetadata(false);
+    visitor.transform_struct(schema);
+    visitor.0
+}
+
+/// Strips the stray column-mapping annotations a write introduces into a previously-clean table,
+/// returning `Some(stripped_schema)` when a strip is needed and `None` when `candidate` can be
+/// persisted as-is.
+///
+/// A strip is needed only when `candidate` carries column-mapping annotations that `current` did
+/// not -- i.e. the write is introducing them into a clean table, so persisting `candidate` verbatim
+/// would originate a self-inconsistent table. When `current` already carries residual annotations
+/// they are left in place (matching delta-spark, which strips only annotations a commit newly
+/// introduces); `None` is returned.
+///
+/// Callers MUST gate this on `ColumnMappingMode::None`: with mapping enabled the annotations are
+/// load-bearing and must never be stripped. `current` is the pre-write schema (`None` for CREATE,
+/// which has no prior schema); `candidate` is the schema the write would otherwise persist.
+pub(crate) fn strip_stray_column_mapping_metadata(
+    current: Option<&StructType>,
+    candidate: &StructType,
+) -> Option<StructType> {
+    let current_has_cm = current.is_some_and(schema_has_column_mapping_metadata);
+    (!current_has_cm && schema_has_column_mapping_metadata(candidate))
+        .then(|| drop_column_mapping_metadata(candidate))
+}
+
+/// Removes every [`COLUMN_MAPPING_METADATA_KEYS`] annotation from every field in `schema`
+/// (recursively), leaving all other field metadata intact.
+pub(crate) fn drop_column_mapping_metadata(schema: &StructType) -> StructType {
+    struct DropCmMetadata;
+    impl<'a> SchemaTransform<'a> for DropCmMetadata {
+        transform_output_type!(|'a, T| Cow<'a, T>);
+        fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+            let data_type = self.transform(&field.data_type);
+            let mut metadata = field.metadata.clone();
+            let mut had_cm = false;
+            for key in COLUMN_MAPPING_METADATA_KEYS {
+                had_cm |= metadata.remove(key.as_ref()).is_some();
+            }
+            match data_type {
+                Cow::Borrowed(_) if !had_cm => Cow::Borrowed(field),
+                data_type => Cow::Owned(StructField {
+                    name: field.name.clone(),
+                    data_type: data_type.into_owned(),
+                    nullable: field.is_nullable(),
+                    metadata,
+                }),
+            }
+        }
+    }
+    DropCmMetadata.transform_struct(schema).into_owned()
+}
+
 /// Translates a logical [`ColumnName`] to physical. It can be top level or nested.
 ///
 /// Uses `StructType::walk_column_fields` to walk the column path through nested structs,
@@ -966,9 +1052,8 @@ mod tests {
             });
     }
 
-    // `validate_schema_column_mapping` is the strict validator (CREATE / ALTER reach it via the
-    // `validate_schema_column_mapping_strict` alias), so a stale annotation on a mapping-disabled
-    // table is rejected. The lenient path is covered by
+    // `validate_schema_column_mapping` is the strict validator: a stale annotation on a
+    // mapping-disabled table is rejected. The lenient path (used by reads) is covered by
     // `test_validate_and_extract_tolerates_stale_annotations_when_disabled`.
     #[test]
     fn test_column_mapping_disabled() {
@@ -1051,6 +1136,129 @@ mod tests {
         )]);
         validate_schema_column_mapping(&schema, ColumnMappingMode::Id)
             .expect_err("missing annotation on struct field inside map value");
+    }
+
+    #[test]
+    fn test_schema_has_column_mapping_metadata() {
+        // Clean schema -> false.
+        let clean = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+        assert!(!schema_has_column_mapping_metadata(&clean));
+
+        // id-only, physicalName-only -> true.
+        let id_only = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
+            .add_metadata([(
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            )])]);
+        assert!(schema_has_column_mapping_metadata(&id_only));
+        let name_only = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
+            .add_metadata([(
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-a".to_string()),
+            )])]);
+        assert!(schema_has_column_mapping_metadata(&name_only));
+
+        // Annotation on a nested struct leaf (clean top level) -> true.
+        let nested = StructType::new_unchecked([StructField::nullable(
+            "outer",
+            StructType::new_unchecked([make_cm_field("leaf", 2, DataType::INTEGER)]),
+        )]);
+        assert!(schema_has_column_mapping_metadata(&nested));
+
+        // Detection is by key presence, not value type: a `parquet.field.id`-only field and a
+        // wrong-typed id both count (they must, so the stripper -- which removes by presence --
+        // never leaves a key the detector deemed absent).
+        let pq_only = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
+            .add_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(5),
+            )])]);
+        assert!(schema_has_column_mapping_metadata(&pq_only));
+        let wrong_typed =
+            StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
+                .add_metadata([(
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::String("not-a-number".to_string()),
+                )])]);
+        assert!(schema_has_column_mapping_metadata(&wrong_typed));
+    }
+
+    #[test]
+    fn test_drop_column_mapping_metadata() {
+        // Top-level annotated field also carrying an unrelated key; nested annotated leaf.
+        let annotated_top = StructField::nullable("a", DataType::INTEGER).add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-a".to_string()),
+            ),
+            ("delta.identity.start", MetadataValue::Number(7)),
+        ]);
+        let schema = StructType::new_unchecked([
+            annotated_top,
+            StructField::nullable(
+                "outer",
+                StructType::new_unchecked([make_cm_field("leaf", 2, DataType::INTEGER)]),
+            ),
+        ]);
+
+        let stripped = drop_column_mapping_metadata(&schema);
+        assert!(!schema_has_column_mapping_metadata(&stripped));
+
+        // Unrelated metadata is preserved.
+        let a = stripped.field("a").unwrap();
+        assert!(a.column_mapping_id().is_none());
+        assert!(!a.has_physical_name_annotation());
+        assert_eq!(
+            a.metadata().get("delta.identity.start"),
+            Some(&MetadataValue::Number(7))
+        );
+
+        // Nested leaf is stripped too.
+        let DataType::Struct(outer) = stripped.field("outer").unwrap().data_type() else {
+            panic!("expected struct");
+        };
+        assert!(outer.field("leaf").unwrap().column_mapping_id().is_none());
+    }
+
+    #[test]
+    fn test_drop_column_mapping_metadata_strips_array_and_map_nested_leaves() {
+        // Annotated struct leaves living inside an array element and a map value.
+        let elem = StructType::new_unchecked([make_cm_field("in_arr", 3, DataType::INTEGER)]);
+        let val = StructType::new_unchecked([make_cm_field("in_map", 4, DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([
+            StructField::nullable("arr", ArrayType::new(elem, true)),
+            StructField::nullable("m", MapType::new(DataType::STRING, val, true)),
+        ]);
+        assert!(schema_has_column_mapping_metadata(&schema));
+
+        let stripped = drop_column_mapping_metadata(&schema);
+        assert!(!schema_has_column_mapping_metadata(&stripped));
+    }
+
+    #[test]
+    fn test_strip_stray_column_mapping_metadata() {
+        // Mode gating lives at the call sites; this helper only decides strip-vs-leave from the
+        // current-vs-candidate comparison.
+        let clean = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+        let annotated = StructType::new_unchecked([make_cm_field("a", 1, DataType::INTEGER)]);
+
+        // CREATE (no prior schema) introducing annotations -> stripped.
+        let stripped = strip_stray_column_mapping_metadata(None, &annotated)
+            .expect("newly-introduced annotations should be stripped");
+        assert!(!schema_has_column_mapping_metadata(&stripped));
+
+        // ALTER on a clean table introducing annotations -> stripped.
+        assert!(strip_stray_column_mapping_metadata(Some(&clean), &annotated).is_some());
+
+        // ALTER on an already-annotated table -> left in place (no strip).
+        assert!(strip_stray_column_mapping_metadata(Some(&annotated), &annotated).is_none());
+
+        // Candidate carries no annotations -> nothing to strip.
+        assert!(strip_stray_column_mapping_metadata(None, &clean).is_none());
     }
 
     fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {

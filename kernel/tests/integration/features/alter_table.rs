@@ -814,32 +814,45 @@ fn field_with_stray_cm_id(name: &str, ty: DataType) -> StructField {
     f
 }
 
-/// On a non-CM table, `apply_schema_operations` doesn't reject stray CM metadata up front --
-/// `StructType::make_physical` (run from `TableConfiguration::try_new_with_schema`) is the
-/// gate. This test locks in that downstream rejection, including for nested annotations.
+/// On a clean non-CM table, an ALTER that adds a column carrying stray CM metadata has that
+/// metadata stripped (the commit introduces it into a previously-clean table), rather than
+/// rejected -- matching delta-spark. Covers a top-level annotation and one nested in a struct.
 #[rstest]
-#[case::top_level(field_with_stray_cm_id("tainted", DataType::STRING))]
-#[case::nested_in_struct(StructField::nullable(
-    "outer",
-    StructType::try_new(vec![field_with_stray_cm_id("inner", DataType::STRING)]).unwrap(),
-))]
+#[case::top_level(field_with_stray_cm_id("tainted", DataType::STRING), &["tainted"])]
+#[case::nested_in_struct(
+    StructField::nullable(
+        "outer",
+        StructType::try_new(vec![field_with_stray_cm_id("inner", DataType::STRING)]).unwrap(),
+    ),
+    &["outer", "inner"],
+)]
 #[tokio::test]
-async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
+async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     #[case] field: StructField,
+    #[case] stripped_path: &[&str],
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
-    let err = snapshot
+    snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())
-        .unwrap_err();
-    let msg = err.to_string();
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // Reload from disk so we assert on the persisted schemaString, not the in-memory config.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let path: Vec<String> = stripped_path.iter().map(|s| s.to_string()).collect();
+    let leaf = reloaded_schema.field_at_path(&path);
     assert!(
-        msg.contains("column mapping") || msg.contains("columnMapping"),
-        "error should mention column mapping, got: {msg}"
+        leaf.column_mapping_id().is_none()
+            && leaf
+                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+                .is_none(),
+        "stray column-mapping metadata at {stripped_path:?} should be stripped"
     );
     Ok(())
 }
@@ -1096,30 +1109,34 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
     Ok(())
 }
 
-/// A mapping-disabled table carrying residual `delta.columnMapping.*` annotations reads fine
-/// (`StructField::make_physical` tolerates them), but ALTER is still rejected: the strict check
-/// validates the whole evolved schema, so a stale annotation on an untouched column fails even
-/// when the ALTER only adds a clean column. delta-spark tolerates this; closing the gap is tracked
-/// in https://github.com/delta-io/delta-kernel-rs/issues/2885. This test pins the current strict
-/// behavior until then.
+/// A mapping-disabled table that already carries residual `delta.columnMapping.*` annotations is
+/// left untouched by an ALTER: the pre-existing annotation on `value` survives, and whatever the
+/// added column carries is persisted verbatim -- kernel strips only annotations a commit newly
+/// introduces into a *clean* table, so an already-dirty table is never rewritten (delta-spark's
+/// `addsColumnMappingMetadata` is false here). The clean-table strip is covered by
+/// `add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped`.
+///
+/// Cases: adding a clean column (stays clean) and adding a stray-annotated column (annotation
+/// left in place, not stripped).
+#[rstest]
+#[case::clean_column(StructField::nullable("added", DataType::STRING), None)]
+#[case::introduced_stray(field_with_stray_cm_id("added", DataType::STRING), Some(99))]
 #[tokio::test]
-async fn add_column_rejected_when_table_has_stale_column_mapping() -> DeltaResult<()> {
+async fn add_column_on_stale_table_leaves_schema_untouched(
+    #[case] added_field: StructField,
+    #[case] expected_added_cm_id: Option<i64>,
+) -> DeltaResult<()> {
     let (store, engine, table_url) = engine_store_setup("alter_stale_cm", None);
 
-    // `value` carries a stale physicalName + id; protocol omits columnMapping and no mode is set
-    // (resolves to None) -- the enable-then-disable artifact.
+    // `value` carries a stale id; protocol omits columnMapping and no mode is set (resolves to
+    // None) -- residual annotations already on the table.
     let stale_schema = StructType::try_new([
         StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::INTEGER).add_metadata([
-            ("delta.columnMapping.id", MetadataValue::Number(2)),
-            (
-                "delta.columnMapping.physicalName",
-                MetadataValue::String("col-2f8a".to_string()),
-            ),
-        ]),
+        StructField::nullable("value", DataType::INTEGER)
+            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))]),
     ])?;
     let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
-    // v0 written directly to bypass create_table validation (which rejects stale annotations).
+    // v0 written directly to bypass create_table validation (which strips stale annotations).
     let v0 = format!(
         r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}
 {{"metaData":{{"id":"alter-stale-cm","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}
@@ -1129,18 +1146,25 @@ async fn add_column_rejected_when_table_has_stale_column_mapping() -> DeltaResul
         .await
         .unwrap();
 
-    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-
-    // Adding a brand-new clean column still fails, and the error names the untouched stale field.
-    let err = snapshot
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    snapshot
         .alter_table()
-        .add_column(StructField::nullable("region", DataType::STRING))
-        .build(&engine, committer())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("Column mapping is not enabled but field 'value'"),
-        "expected the ALTER to be rejected naming the untouched stale field, got: {err}"
+        .add_column(added_field)
+        .build(&engine, committer())?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    // Reload from disk so we assert on the persisted schemaString, not the in-memory config.
+    let reloaded = Snapshot::builder_for(table_url).build(&engine)?;
+    let schema = reloaded.schema();
+
+    // The pre-existing annotation on the untouched `value` field survives verbatim.
+    assert_eq!(schema.field("value").unwrap().column_mapping_id(), Some(2));
+    // The added column is persisted verbatim -- clean stays clean, stray annotation is left in
+    // place (not stripped, because the table was already dirty).
+    assert_eq!(
+        schema.field("added").unwrap().column_mapping_id(),
+        expected_added_cm_id
     );
     Ok(())
 }
