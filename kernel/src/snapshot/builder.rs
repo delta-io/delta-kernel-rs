@@ -259,6 +259,9 @@ impl SnapshotBuilder {
         // the hint is still used when its version <= effective_version.
         let effective_version = version.or(max_catalog_version);
 
+        // Intent-based: a snapshot is built as latest if there is no explicit time-travel version.
+        let built_as_latest = version.is_none();
+
         let result = if let Some(table_root) = table_root {
             try_parse_uri(table_root).and_then(|table_url| {
                 let log_segment = LogSegment::for_snapshot(
@@ -274,6 +277,7 @@ impl SnapshotBuilder {
                     engine,
                     metric_context,
                     incremental_replay,
+                    built_as_latest,
                 )
                 .map(Into::into)
             })
@@ -485,11 +489,69 @@ mod tests {
 
         let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
         assert_eq!(snapshot.version(), 1);
+        assert!(snapshot.built_as_latest());
 
         let snapshot = SnapshotBuilder::new_for(table_root.clone())
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
+        assert!(!snapshot.built_as_latest());
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn built_as_latest_is_intent_based() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        let engine = engine.as_ref();
+        create_table(&store, &table_root).await?;
+
+        for version in 2..=4 {
+            add_commit(
+                &table_root,
+                store.as_ref(),
+                version,
+                actions_to_string(vec![TestAction::Add(format!(
+                    "part-{version:05}-test.parquet"
+                ))]),
+            )
+            .await?;
+        }
+        let latest_version = 4;
+
+        // A fresh build with no explicit version is built as latest.
+        let latest = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
+        assert_eq!(latest.version(), latest_version);
+        assert!(latest.built_as_latest());
+
+        // Time-travelling to any version(including the newest) is not a latest query by
+        // intent, even though the resolved version may match the latest build above.
+        for version in 0..=latest_version {
+            let pinned = SnapshotBuilder::new_for(table_root.clone())
+                .at_version(version)
+                .build(engine)?;
+            assert_eq!(pinned.version(), version);
+            assert!(
+                !pinned.built_as_latest(),
+                "at_version({version}) must not be a latest query"
+            );
+        }
+
+        // Incrementally building snapshot without an explicit version is built as latest.
+        let base = SnapshotBuilder::new_for(table_root.clone())
+            .at_version(0)
+            .build(engine)?;
+        assert!(!base.built_as_latest());
+        let updated = SnapshotBuilder::new_from(base.clone()).build(engine)?;
+        assert_eq!(updated.version(), latest_version);
+        assert!(updated.built_as_latest());
+
+        // ...while an incremental update pinned to a specific version is not.
+        let updated_pinned = SnapshotBuilder::new_from(base)
+            .at_version(3)
+            .build(engine)?;
+        assert_eq!(updated_pinned.version(), 3);
+        assert!(!updated_pinned.built_as_latest());
 
         Ok(())
     }
