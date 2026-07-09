@@ -1,9 +1,9 @@
 //! Interval-type integration tests for the CreateTable API.
 //!
-//! Tests that creating a table with ANSI interval columns automatically adds the
-//! `intervalType-preview` reader-writer feature to the protocol. The create + read-back path
-//! requires kernel support, so the positive tests are gated behind the `interval-type-in-dev` cargo
-//! feature.
+//! Tests that creating a table with ANSI interval columns does not automatically add the
+//! `intervalType-preview` reader-writer feature to the protocol. The write path requires kernel
+//! support, so positive interval create-table tests are gated behind the `interval-type-in-dev`
+//! cargo feature.
 
 use std::sync::Arc;
 
@@ -40,6 +40,22 @@ fn test_create_table_no_interval_no_feature() -> DeltaResult<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "interval-type-in-dev"))]
+#[test]
+fn test_create_table_interval_blocked_when_feature_off() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::not_null("id", DataType::INTEGER),
+        StructField::nullable("iv", DataType::INTERVAL_DAY_TIME),
+    ])?);
+
+    let result = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    test_utils::assert_result_error_with_message(result, "interval-type-in-dev");
+    Ok(())
+}
+
 #[cfg(feature = "interval-type-in-dev")]
 mod feature_enabled {
     use delta_kernel::schema::SchemaRef;
@@ -70,11 +86,10 @@ mod feature_enabled {
         ]))
     }
 
-    /// Creating a table whose schema contains an interval column auto-enables
-    /// `intervalType-preview` in BOTH the reader and writer feature lists, and the schema
-    /// round-trips.
+    /// Creating a table whose schema contains an interval column does not auto-enable
+    /// `intervalType-preview`, and the schema round-trips.
     #[rstest]
-    fn test_create_table_with_interval(
+    fn test_create_table_with_interval_does_not_auto_enable_feature(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
         #[values(top_level_interval_schema, nested_interval_schema)] make_schema: fn(
             DataType,
@@ -93,17 +108,14 @@ mod feature_enabled {
         let table_config = snapshot.table_configuration();
 
         assert!(
-            table_config.is_feature_supported(&TableFeature::IntervalTypePreview),
-            "intervalType feature should be supported"
+            !table_config.is_feature_supported(&TableFeature::IntervalTypePreview),
+            "intervalType feature should not be auto-enabled"
         );
         let protocol = table_config.protocol();
-        assert!(protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION);
-        assert!(protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION);
-        // intervalType is a reader-writer feature: it must appear in both lists.
-        assert!(protocol
+        assert!(!protocol
             .reader_features()
             .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
-        assert!(protocol
+        assert!(!protocol
             .writer_features()
             .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
 
@@ -112,6 +124,34 @@ mod feature_enabled {
             schema.as_ref(),
             "schema should round-trip through create table"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_table_interval_feature_signal_supported() -> DeltaResult<()> {
+        let (_temp_dir, table_path, engine) = test_table_setup()?;
+        let schema = top_level_interval_schema(DataType::INTERVAL_DAY_TIME);
+
+        let _ = create_table(&table_path, schema, "Test/1.0")
+            .with_table_properties([("delta.feature.intervalType-preview", "supported")])
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+            .commit(engine.as_ref())?;
+
+        let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+        let table_config = snapshot.table_configuration();
+        assert!(
+            table_config.is_feature_supported(&TableFeature::IntervalTypePreview),
+            "intervalType feature signal should be supported"
+        );
+        let protocol = table_config.protocol();
+        assert!(protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION);
+        assert!(protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION);
+        assert!(protocol
+            .reader_features()
+            .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
+        assert!(protocol
+            .writer_features()
+            .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
         Ok(())
     }
 }

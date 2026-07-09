@@ -19,14 +19,13 @@ use url::Url;
 use crate::actions::{Metadata, Protocol};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
-    expected_stats_schema, is_skipping_eligible_datatype, stats_column_names, StatsConfig,
-    StripFieldMetadataTransform,
+    expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
 #[cfg(feature = "column-defaults-in-dev")]
 use crate::schema::validate_column_defaults_metadata;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
-use crate::schema::{schema_has_invariants, DataType, SchemaRef, StructField, StructType};
+use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
@@ -353,30 +352,6 @@ impl TableConfiguration {
             &config,
             required_columns,
         )
-    }
-
-    /// Subset of [`physical_stats_column_names`](Self::physical_stats_column_names) whose leaf type
-    /// is eligible for min/max statistics ([`is_skipping_eligible_datatype`]). `nullCount` is
-    /// collected for every stats column, but min/max only for these. This notably excludes interval
-    /// columns -- which are physically int32/int64 and would otherwise be aggregated -- matching
-    /// DBR, which records interval `nullCount` but no min/max.
-    pub(crate) fn physical_min_max_stats_column_names(
-        &self,
-        required_columns: Option<&[ColumnName]>,
-    ) -> Vec<ColumnName> {
-        let schema = self.physical_data_schema_without_partition_columns();
-        self.physical_stats_column_names(required_columns)
-            .into_iter()
-            .filter(|col| {
-                matches!(
-                    schema
-                        .fields_of_path(col)
-                        .ok()
-                        .and_then(|fields| fields.last().map(|field| field.data_type())),
-                    Some(DataType::Primitive(ptype)) if is_skipping_eligible_datatype(ptype)
-                )
-            })
-            .collect()
     }
 
     /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests

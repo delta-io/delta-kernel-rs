@@ -1,19 +1,18 @@
 //! Integration tests for writing ANSI interval columns (the `intervalType-preview` feature).
 //!
 //! Covers the unpartitioned blind-append round-trip and the write-time feature enforcement.
-//! Partitioned interval writes are out of scope here (they require `Scalar::Interval*`, added in
-//! a later stack branch).
+//! Partitioned interval writes are out of scope here (they require `Scalar::Interval*`, planning
+//! to add in a later PR).
 
 use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, StructField, StructType};
 use test_utils::{create_table, engine_store_setup, load_and_begin_transaction};
 
-/// Writing interval data to a table whose protocol does not declare the `intervalType-preview`
-/// feature is refused (the table is not silently upgraded). Holds regardless of the cargo gate,
-/// since this is protocol correctness rather than kernel-support gating.
+/// Writing interval data is gated by the `interval-type-in-dev` cargo feature, not by the
+/// `intervalType-preview` table feature.
 #[tokio::test]
-async fn test_write_interval_requires_feature() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_interval_featureless_table_gate() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "iv",
         DataType::INTERVAL_DAY_TIME,
@@ -24,13 +23,18 @@ async fn test_write_interval_requires_feature() -> Result<(), Box<dyn std::error
     // A (3,7) table that has an interval column but does NOT list the intervalType feature.
     let table_url = create_table(store, table_location, schema, &[], true, vec![], vec![]).await?;
 
-    let err = load_and_begin_transaction(table_url, &engine)
-        .expect_err("starting a write transaction must refuse interval columns without the feature")
-        .to_string();
-    assert!(
-        err.contains("intervalType") && err.contains("interval columns"),
-        "error must explain the missing intervalType feature; got: {err}",
-    );
+    let result = load_and_begin_transaction(table_url, &engine);
+    if cfg!(feature = "interval-type-in-dev") {
+        result.expect("interval writes should be allowed when the cargo feature is enabled");
+    } else {
+        let err = result
+            .expect_err("interval writes should be blocked when the cargo feature is disabled")
+            .to_string();
+        assert!(
+            err.contains("interval-type-in-dev"),
+            "error must explain the missing cargo feature; got: {err}",
+        );
+    }
     Ok(())
 }
 

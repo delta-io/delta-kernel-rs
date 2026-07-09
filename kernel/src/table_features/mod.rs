@@ -16,9 +16,7 @@ use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
-pub(crate) use interval_type::{
-    schema_contains_interval_type, validate_interval_type_feature_support,
-};
+pub(crate) use interval_type::validate_interval_type_feature_support;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -151,9 +149,9 @@ pub(crate) enum TableFeature {
     DeletionVectors,
     /// ANSI interval types, in preview pending RFC ratification (`intervalType-preview`).
     ///
-    /// TODO(#2840): intervalType is not fully supported yet. Kernel support is gated by the
-    /// `interval-type-in-dev` cargo feature, and the feature is auto-enabled (like timestampNtz)
-    /// when a schema contains an interval column.
+    /// TODO(#2840): intervalType support is gated by the `interval-type-in-dev` cargo feature.
+    /// Connectors may enable this protocol feature explicitly; it is not auto-enabled from schema
+    /// contents, for compatibility with legacy featureless interval tables.
     #[strum(serialize = "intervalType-preview")]
     #[serde(rename = "intervalType-preview")]
     IntervalTypePreview,
@@ -570,7 +568,6 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#2840): drop the gate once the RFC is ratified and interval support is merged.
 static INTERVAL_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
