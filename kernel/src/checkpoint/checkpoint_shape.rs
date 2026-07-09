@@ -1,9 +1,9 @@
-//! Resolves a snapshot's checkpoint shape for scanning. This falls into the following cases: no
-//! checkpoint, leaf (file actions inline, including multi-part), or manifest (which references
-//! sidecar files). When stats are requested, also reports whether the checkpoint has compatible
-//! parsed stats. Driven through a [`PlanExecutor`].
+//! Resolves a snapshot's checkpoint shape. This falls into the following cases: no checkpoint,
+//! leaf (file actions inline, including multi-part), or manifest (which references sidecar files).
+//! When stats are requested, also reports whether the checkpoint has compatible parsed stats.
+//! Driven through a [`PlanExecutor`].
 
-// Public surface for the FSR scan builder; no other in-crate caller yet.
+// No in-crate caller yet; the FSR scan builder will consume this.
 #![allow(dead_code)]
 
 use url::Url;
@@ -29,7 +29,7 @@ pub(crate) enum CheckpointType {
     Manifest,
 }
 
-/// A scan's resolved checkpoint type and parsed-stats schema.
+/// A snapshot's resolved checkpoint type and parsed-stats schema.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CheckpointShape {
     /// What kind of checkpoint the snapshot has.
@@ -40,8 +40,8 @@ pub(crate) struct CheckpointShape {
 }
 
 impl CheckpointShape {
-    /// Resolve `snapshot`'s scan shape. Determines the checkpoint topology and, when `stats_schema`
-    /// is `Some`, whether the checkpoint contains parsed stats compatible with it.
+    /// Resolve `snapshot`'s checkpoint shape. Determines the checkpoint type and, when
+    /// `stats_schema` is `Some`, whether the checkpoint contains parsed stats compatible with it.
     pub(crate) fn resolve(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
