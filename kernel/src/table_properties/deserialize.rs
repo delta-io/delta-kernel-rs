@@ -104,9 +104,42 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
+        // A `delta.constraints.<name>` key records a CHECK constraint, keyed by name (see
+        // `strip_constraint_prefix`). Any other unrecognized key returns `None` and is preserved
+        // in `unknown_properties` by the caller. With `check-constraints-in-dev` off there is no
+        // `check_constraints` field, so constraint keys fall through to `unknown_properties` too.
+        #[cfg(feature = "check-constraints-in-dev")]
+        _ => {
+            let name = strip_constraint_prefix(k)?;
+            props
+                .check_constraints
+                .insert(name.to_string(), v.to_string());
+        }
+        #[cfg(not(feature = "check-constraints-in-dev"))]
         _ => return None,
     }
     Some(())
+}
+
+/// If `key` is a CHECK-constraint configuration key (`delta.constraints.<name>`), returns the
+/// constraint name. The prefix is matched case-insensitively so kernel discovers the same set of
+/// constraints Delta-Spark does (Spark recognizes the prefix case-insensitively).
+///
+/// The name is the text after the matched prefix regardless of the prefix's case
+/// (`DELTA.CONSTRAINTS.foo` -> `foo`) -- a deliberate kernel normalization. Delta-Spark instead
+/// strips the prefix case-sensitively, so it would leave a non-lowercase prefix attached to the
+/// name; the two agree for the lowercase `delta.constraints.` prefix that real writers emit.
+/// Normalizing also collapses keys differing only in prefix case to one name (last-writer-wins).
+///
+/// Returns `None` for the bare prefix with no name (`delta.constraints.`); the caller preserves
+/// such a malformed key in `unknown_properties` rather than recording a nameless constraint.
+#[cfg(feature = "check-constraints-in-dev")]
+fn strip_constraint_prefix(key: &str) -> Option<&str> {
+    let prefix = key.get(..CHECK_CONSTRAINT_PREFIX.len())?;
+    prefix
+        .eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX)
+        .then(|| &key[CHECK_CONSTRAINT_PREFIX.len()..])
+        .filter(|name| !name.is_empty())
 }
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
