@@ -2,13 +2,15 @@
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
+// Crate-visible alias so kernel code avoids the deprecated `pub` re-export above.
+pub(crate) use column_mapping::validate_schema_column_mapping as validate_schema_column_mapping_strict;
 pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
     column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
-    validate_column_mapping_id,
+    validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
@@ -68,7 +70,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 /// - **WriterOnly** (applies only to writers).
 /// There are no ReaderOnly features. See `TableFeature::feature_type` for the category of each.
 ///
-/// The kernel currently supports all reader features except `V2Checkpoint`.
+/// The kernel currently supports all reader features.
 #[derive(
     Serialize,
     Deserialize,
@@ -82,11 +84,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
     EnumCount,
     Hash,
 )]
-#[strum(
-    serialize_all = "camelCase",
-    parse_err_fn = xxx__not_needed__default_variant_means_parsing_is_infallible__xxx,
-    parse_err_ty = Infallible // ignored, sadly: https://github.com/Peternator7/strum/issues/430
-)]
+#[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 #[derive(EnumIter)]
@@ -795,38 +793,15 @@ impl TableFeature {
     }
 }
 
-/// Like `Into<TableFeature>`, but avoids collisions between strum's derived `EnumString` and the
-/// blanket impl `TryFrom<&str>` that `From<&str> for TableFeature` would trigger.
-///
-/// Parsing is infallible: the `Unknown` default variant catches any unrecognized feature name. If
-/// https://github.com/Peternator7/strum/pull/432 merges, use impl From for TableFeature instead.
-pub(crate) trait IntoTableFeature {
-    fn into_table_feature(self) -> TableFeature;
-}
-
-impl IntoTableFeature for TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self
+impl From<String> for TableFeature {
+    fn from(value: String) -> Self {
+        value.as_str().into()
     }
 }
 
-impl IntoTableFeature for &TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self.clone()
-    }
-}
-
-/// Parsing is infallible thanks to `TableFeature::Unknown` default variant
-impl IntoTableFeature for &str {
-    fn into_table_feature(self) -> TableFeature {
-        #[allow(clippy::unwrap_used)] // infallible, see strum parse_err_fn
-        self.parse().unwrap()
-    }
-}
-
-impl IntoTableFeature for String {
-    fn into_table_feature(self) -> TableFeature {
-        self.as_str().into_table_feature()
+impl From<&TableFeature> for TableFeature {
+    fn from(value: &TableFeature) -> Self {
+        value.clone()
     }
 }
 
@@ -850,6 +825,56 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
             .cloned()
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
+pub(crate) fn add_feature_to_lists(
+    feature: TableFeature,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    match feature.feature_type() {
+        FeatureType::ReaderWriter => {
+            if !reader_features.contains(&feature) {
+                reader_features.push(feature.clone());
+            }
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+        FeatureType::WriterOnly | FeatureType::Unknown => {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+    }
+}
+
+/// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
+/// satisfied by `table_properties`, appending it to `reader_features`/`writer_features`
+/// (deduplicated). Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they need
+/// no property-driven enablement. `RowTracking` additionally pulls in its `DomainMetadata`
+/// dependency.
+pub(crate) fn auto_enable_property_driven_features(
+    allowed_table_features: &[TableFeature],
+    table_properties: &TableProperties,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    for table_feature in allowed_table_features {
+        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
+            if check(table_properties) {
+                add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
+                if *table_feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        reader_features,
+                        writer_features,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1061,7 +1086,7 @@ mod tests {
 
             // strum
             assert_eq!(feature.to_string(), expected);
-            assert_eq!(feature, expected.into_table_feature());
+            assert_eq!(feature, TableFeature::from(expected));
 
             // json
             let serialized = serde_json::to_string(&feature).unwrap();

@@ -128,7 +128,7 @@ pub(crate) mod row_tracking;
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
 pub use arrow_compat::*;
 
 #[cfg(feature = "internal-api")]
@@ -188,7 +188,7 @@ use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
 #[cfg(feature = "declarative-plans")]
-pub use plans::{IoOperation, Operation, PlanExecutor, PlanResult, QueryPlanBuilder};
+pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
@@ -628,6 +628,12 @@ pub trait StorageHandler: AsAny {
     ///
     /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
     fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
+
+    /// Delete the file at the given path.
+    ///
+    /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
+    /// For any other error, this must propagate the corresponding error.
+    fn delete(&self, path: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
@@ -896,7 +902,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// **Non-compliance produces files with incorrect `field_id`s**, which may lead to
     /// read failures when column mapping mode is `id` and to failures when converting
-    /// the table to Iceberg.   
+    /// the table to Iceberg.
     ///
     /// # Parameters
     ///

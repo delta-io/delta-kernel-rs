@@ -50,7 +50,7 @@ rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 prost = { version = "0.13", optional = true }
 tracing = { version = "0.1", features = ["log"] }
@@ -64,20 +64,7 @@ z85 = "3.0.6"
 # lives in the `delta_kernel_default_engine` crate now.
 reqwest = { version = "0.13", default-features = false, optional = true }
 # both arrow versions below are optional and require object_store
-object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
 object_store_13 = { package = "object_store", version = "0.13.2", optional = true, features = ["aws", "azure", "gcp", "http"] }
-
-# arrow 57
-[dependencies.arrow_57]
-package = "arrow"
-version = "57"
-features = ["chrono-tz", "ffi", "json"]
-optional = true
-[dependencies.parquet_57]
-package = "parquet"
-version = "57"
-features = ["async", "object_store"]
-optional = true
 
 # arrow 58
 [dependencies.arrow_58]
@@ -91,24 +78,36 @@ version = "58"
 features = ["async", "object_store"]
 optional = true
 
+# arrow 59
+[dependencies.arrow_59]
+package = "arrow"
+version = "59"
+features = ["chrono-tz", "ffi", "json"]
+optional = true
+[dependencies.parquet_59]
+package = "parquet"
+version = "59"
+features = ["async", "object_store"]
+optional = true
+
 [features]
 # no default features
 default = []
 # internal-api will make everything marked #[internal_api] public.
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).
-prettyprint = ["arrow_57?/prettyprint", "arrow_58?/prettyprint"]
+prettyprint = ["arrow_58?/prettyprint", "arrow_59?/prettyprint"]
 # test-utils exposes test-only constructors for downstream crate tests
 test-utils = ["prettyprint"]
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-58"] # latest arrow version
+arrow = ["arrow-59"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
 arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
+arrow-59 = ["dep:arrow_59", "dep:parquet_59", "dep:object_store_13"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 
@@ -144,8 +143,8 @@ protoc-bin-vendored = { version = "3.2", optional = true }
 
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["test-utils"] }
-# NOTE: test_utils forcibly pulls the default engine and arrow-57. By default it ALSO pulls
-# arrow-58, which takes precedence and would make it impossible to test against arrow-57.
+# NOTE: test_utils forcibly pulls the default engine and arrow-58. By default it ALSO pulls
+# arrow-59, which takes precedence and would make it impossible to test against arrow-58.
 test_utils = { path = "../test-utils", default-features = false }
 # Used by the test-only SyncEngine to drive object_store calls via `futures::executor::block_on`.
 futures = "0.3"

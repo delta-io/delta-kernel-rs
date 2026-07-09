@@ -45,6 +45,17 @@ impl Drop for FileReadResultIterator {
     }
 }
 
+impl FileReadResultIterator {
+    /// Wrap a kernel `EngineData` iterator (paired with the engine that produced it) into a handle
+    /// the engine can drain via [`read_result_next`] and release with [`free_read_result_iter`].
+    pub(crate) fn into_handle(
+        data: FileDataReadResultIterator,
+        engine: Arc<dyn ExternEngine>,
+    ) -> Handle<ExclusiveFileReadResultIterator> {
+        Box::new(FileReadResultIterator { data, engine }).into()
+    }
+}
+
 /// Call the engine back with the next `EngineData` batch read by Parquet/Json handler. The
 /// _engine_ "owns" the data that is passed into the `engine_visitor`, since it is allocated by the
 /// `Engine` being used for log-replay. If the engine wants the kernel to free this data, it _must_

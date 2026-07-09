@@ -34,8 +34,6 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// Returns an error when `data_type` is non-primitive (Array, Map, Struct, or Variant) and
     /// `raw_sql` is not `NULL` (case-insensitive).
-    // No production caller yet, remove this allow when that wiring exists.
-    #[allow(unused)]
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
         // Spark only allows a non-primitive column default when it is NULL; match that behavior.

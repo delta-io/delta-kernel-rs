@@ -8,7 +8,7 @@ use delta_kernel::arrow::array::{Int32Array, RecordBatch};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -98,9 +98,7 @@ async fn test_write_parquet_succeed_with_logical_partition_names(
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
         // Create data with only the non-partition column
-        let data_schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
-        );
+        let data_schema = schema_ref! { nullable "id": INTEGER };
         let batch = RecordBatch::try_new(
             Arc::new(data_schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2]))],

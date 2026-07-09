@@ -1,16 +1,14 @@
 use std::slice;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use url::Url;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
-use crate::actions::{
-    CommitInfo, Metadata, Protocol, COMMIT_INFO_NAME, METADATA_NAME, PROTOCOL_NAME,
-};
+use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
 use crate::engine_data::RowVisitor as _;
 use crate::path::ParsedLogPath;
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{ensure_table_can_be_read, Operation};
 use crate::{DeltaResult, Engine, Error, FileDataReadResultIterator, Version};
@@ -35,13 +33,11 @@ pub enum DeltaAction {
 
 /// Read schema for the per-commit header: protocol + metadata (for validation and the effective
 /// table configuration) plus commitInfo (for the in-commit timestamp).
-static HEADER_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
-    ]))
-});
+static HEADER_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&COMMIT_INFO_FIELD),
+};
 
 /// Per-commit handle returned by [`super::CommitRange::commits`].
 ///

@@ -165,16 +165,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Arrow parquet reader cannot annotate Unknown logical type from BOOLEAN physical type",
-        &[
-            "void_001_void_top_level/specs/void_001_void_top_level_read_all",
-            "void_002_void_nested_struct/specs/void_002_void_nested_struct_read_all",
-            "void_005_void_schema_evolution/specs/void_005_void_schema_evolution_read_all",
-            "void_006_void_multiple_columns/specs/void_006_void_multiple_columns_read_all",
-            "void_007_void_with_backticks/specs/void_007_void_with_backticks_read_all",
-        ],
-    ),
-    (
         "Interval reads not yet supported in the default engine",
         &[
             "intv_001_interval_ym_basic/specs/intv_001_interval_ym_basic_read_all",

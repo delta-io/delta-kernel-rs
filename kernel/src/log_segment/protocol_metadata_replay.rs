@@ -8,11 +8,12 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 use super::LogSegment;
-use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
+use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
 use crate::metrics::SnapshotLoadMetricContext;
+use crate::schema::schema_ref;
 use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
@@ -123,7 +124,10 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
+        let schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+        };
         self.read_actions(engine, schema)
     }
 }

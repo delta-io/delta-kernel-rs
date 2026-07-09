@@ -2,7 +2,7 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use serde::{Deserialize, Serialize};
@@ -11,10 +11,13 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
-use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{
+    lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef, StructField, StructType,
+    ToSchema as _,
+};
 use crate::table_features::{
-    FeatureType, IntoTableFeature, TableFeature, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -82,70 +85,83 @@ pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
 #[internal_api]
 pub(crate) const STATS_PARSED: &str = "stats_parsed";
 
-static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
-        StructField::nullable(CDC_NAME, Cdc::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-    ]))
+pub(crate) static ADD_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(ADD_NAME, Add::to_schema()));
+pub(crate) static REMOVE_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(REMOVE_NAME, Remove::to_schema()));
+pub(crate) static METADATA_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(METADATA_NAME, Metadata::to_schema()));
+pub(crate) static PROTOCOL_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()));
+pub(crate) static SET_TRANSACTION_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()));
+pub(crate) static COMMIT_INFO_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()));
+pub(crate) static CDC_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(CDC_NAME, Cdc::to_schema()));
+pub(crate) static DOMAIN_METADATA_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()));
+pub(crate) static CHECKPOINT_METADATA_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
 });
+pub(crate) static SIDECAR_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
 
-static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(
-        get_commit_schema().fields().cloned().chain([
-            StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
-            StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-        ]),
-    ))
-});
+static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+};
+
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&CHECKPOINT_METADATA_FIELD),
+    (&SIDECAR_FIELD),
+};
 
 /// Schema for Add actions in the Delta log.
 /// Wraps the Add action schema in a top-level struct with "add" field name.
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME,
-        Add::to_schema(),
-    )]))
-});
+#[internal_api]
+pub(crate) static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&ADD_FIELD) };
 
 /// Schema for Remove actions in the Delta log.
 /// Wraps the Remove action schema in a top-level struct with "remove" field name.
-static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        REMOVE_NAME,
-        Remove::to_schema(),
-    )]))
-});
+#[internal_api]
+pub(crate) static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&REMOVE_FIELD) };
+
+#[internal_api]
+pub(crate) static LOG_METADATA_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&METADATA_FIELD) };
+
+#[internal_api]
+pub(crate) static LOG_PROTOCOL_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&PROTOCOL_FIELD) };
 
 /// Schema for CommitInfo actions in the Delta log.
 /// Wraps the CommitInfo schema in a top-level struct with "commitInfo" field name.
-static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        COMMIT_INFO_NAME,
-        CommitInfo::to_schema(),
-    )]))
-});
+#[internal_api]
+pub(crate) static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&COMMIT_INFO_FIELD) };
 
 /// Schema for transaction (txn) actions in the Delta log.
 /// Wraps the SetTransaction schema in a top-level struct with "txn" field name.
-static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        SET_TRANSACTION_NAME,
-        SetTransaction::to_schema(),
-    )]))
-});
+#[internal_api]
+pub(crate) static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&SET_TRANSACTION_FIELD) };
 
-static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        DOMAIN_METADATA_NAME,
-        DomainMetadata::to_schema(),
-    )]))
-});
+#[internal_api]
+pub(crate) static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&DOMAIN_METADATA_FIELD) };
 
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits
@@ -161,27 +177,6 @@ pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
     &ALL_ACTIONS_SCHEMA
 }
 
-#[internal_api]
-pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
-    &LOG_ADD_SCHEMA
-}
-
-pub(crate) fn get_log_remove_schema() -> &'static SchemaRef {
-    &LOG_REMOVE_SCHEMA
-}
-
-pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
-    &LOG_COMMIT_INFO_SCHEMA
-}
-
-pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
-    &LOG_TXN_SCHEMA
-}
-
-pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
-    &LOG_DOMAIN_METADATA_SCHEMA
-}
-
 /// Returns true if the schema contains file actions (add or remove)
 /// columns.
 #[internal_api]
@@ -193,10 +188,8 @@ pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
 ///
 /// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
 /// schema in a top-level "add" struct.
-pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME, schema,
-    )]))
+pub(crate) fn as_log_add_schema(add_schema: SchemaRef) -> SchemaRef {
+    schema_ref! { nullable ADD_NAME: (add_schema) }
 }
 
 // Serde derives are needed for CRC file deserialization (see `crc::reader`).
@@ -471,17 +464,17 @@ pub(crate) struct Protocol {
 /// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
 /// otherwise infallible (unrecognized names become `TableFeature::Unknown`).
 fn parse_features(
-    features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+    features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
 ) -> Option<Vec<TableFeature>> {
-    let features = features?.into_iter().map(|f| f.into_table_feature());
+    let features = features?.into_iter().map(Into::into);
     Some(features.collect())
 }
 
 impl Protocol {
     /// Try to create a new modern Protocol instance with the given table feature lists
     pub(crate) fn try_new_modern(
-        reader_features: impl IntoIterator<Item = impl IntoTableFeature>,
-        writer_features: impl IntoIterator<Item = impl IntoTableFeature>,
+        reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
+        writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
     ) -> DeltaResult<Self> {
         Self::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
@@ -509,8 +502,8 @@ impl Protocol {
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
-        writer_features: Option<impl IntoIterator<Item = impl IntoTableFeature>>,
+        reader_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
+        writer_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
     ) -> DeltaResult<Self> {
         require!(
             min_reader_version >= MIN_VALID_RW_VERSION,
@@ -951,7 +944,8 @@ impl SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(ToSchema, Debug, PartialEq)]
+#[derive(ToSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
@@ -997,7 +991,8 @@ impl Sidecar {
 /// specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
@@ -1073,6 +1068,8 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rstest::rstest;
     use serde_json::json;
 
@@ -1086,7 +1083,7 @@ mod tests {
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::schema::{schema_ref, ArrayType, DataType, MapType, StructField};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
@@ -1716,10 +1713,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1744,10 +1738,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1757,10 +1748,7 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1847,10 +1835,7 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1898,10 +1883,7 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
-            "id",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),
@@ -1916,7 +1898,7 @@ mod tests {
         let metadata_id = metadata.id.clone();
 
         // test with the full log schema that wraps metadata in a "metaData" field
-        let commit_schema = get_commit_schema().project(&[METADATA_NAME]).unwrap();
+        let commit_schema = LOG_METADATA_SCHEMA.clone();
         let actual = metadata
             .into_engine_data(commit_schema, &engine)
             .unwrap()
@@ -2006,7 +1988,7 @@ mod tests {
         assert_eq!(record_batch, expected);
 
         // test with the full log schema that wraps protocol in a "protocol" field
-        let commit_schema = get_commit_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let commit_schema = LOG_PROTOCOL_SCHEMA.clone();
         let engine_data = protocol.into_engine_data(commit_schema, &engine);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2140,7 +2122,7 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_empty_schema() {
-        let schema = Arc::new(StructType::new_unchecked([]));
+        let schema = schema_ref! {};
         assert!(!schema_contains_file_actions(&schema));
     }
 

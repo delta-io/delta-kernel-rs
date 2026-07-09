@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::{get_log_add_schema, NUM_RECORDS, TIGHT_BOUNDS};
+use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
@@ -410,7 +410,7 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 /// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues
 /// with null values in required fields that aren't selected.
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_with_all_fields_nullable(get_log_add_schema()).into());
+    LazyLock::new(|| schema_with_all_fields_nullable(&LOG_ADD_SCHEMA).into());
 
 /// Returns the schema for nullable restored add actions with dataChange field.
 /// This schema extends the nullable restored add schema with a dataChange boolean field

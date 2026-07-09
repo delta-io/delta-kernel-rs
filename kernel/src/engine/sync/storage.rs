@@ -6,12 +6,7 @@ use url::Url;
 
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
-use crate::object_store::DynObjectStore;
-// `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
-// off the `ObjectStore` trait. In arrow-57 mode the compat shim makes the import a no-op, so
-// silence the resulting unused-import warning.
-#[allow(unused_imports)]
-use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 pub(crate) struct SyncStorageHandler {
@@ -98,6 +93,15 @@ impl StorageHandler for SyncStorageHandler {
             last_modified: meta.last_modified.timestamp_millis(),
             size: meta.size,
         })
+    }
+
+    fn delete(&self, url: &Url) -> DeltaResult<()> {
+        let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
+        match futures::executor::block_on(store.delete(&path)) {
+            Ok(()) => Ok(()),
+            Err(crate::object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -313,5 +317,36 @@ mod tests {
             store.get(&path).await.unwrap().bytes().await.unwrap()
         });
         assert_eq!(bytes.as_ref(), b"third");
+    }
+
+    // TODO(#2872): add a double-delete test to exercise idempotency on the in-memory store.
+    #[tokio::test]
+    async fn delete_store_removes_file() {
+        let store = std::sync::Arc::new(InMemory::new());
+        let storage = SyncStorageHandler::new(Some(store));
+        let url = Url::parse("memory:///file.json").unwrap();
+
+        storage
+            .put(&url, bytes::Bytes::from("hello"), false)
+            .unwrap();
+        storage.delete(&url).unwrap();
+
+        assert!(matches!(
+            storage.head(&url).unwrap_err(),
+            Error::FileNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_is_ok() {
+        let store = std::sync::Arc::new(InMemory::new());
+        let storage = SyncStorageHandler::new(Some(store));
+        let url = Url::parse("memory:///missing.json").unwrap();
+
+        assert!(matches!(
+            storage.head(&url).unwrap_err(),
+            Error::FileNotFound(_)
+        ));
+        storage.delete(&url).unwrap();
     }
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::Snapshot;
 use test_utils::test_table_setup_mt;
@@ -41,10 +41,7 @@ async fn test_row_tracking_remove_gate(
     #[case] expect_err: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "number": INTEGER };
     let table_url = Url::from_directory_path(&table_path).unwrap();
 
     // v0: create table with the requested initial properties.

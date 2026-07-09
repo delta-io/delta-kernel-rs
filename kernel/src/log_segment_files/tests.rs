@@ -191,6 +191,10 @@ impl StorageHandler for CountingStorageHandler {
     fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
         panic!("head should not be called during listing");
     }
+
+    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        panic!("delete should not be called during listing");
+    }
 }
 
 /// Helper to call `LogSegmentFiles::list()` and destructure the result for assertions.
@@ -371,6 +375,9 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
         }
         fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
             panic!("head should not be called during listing");
+        }
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            panic!("delete should not be called during listing");
         }
     }
 

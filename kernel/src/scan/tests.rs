@@ -24,7 +24,7 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
+    self, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
 };
 use crate::transaction::create_table::create_table;
 use crate::{
@@ -372,10 +372,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store);
 
-    let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "id",
-        DataType::LONG,
-    )]));
+    let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
@@ -1769,10 +1766,12 @@ mod scan_metadata_completed_tests {
 
     use rstest::rstest;
 
+    use super::ScanBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
 
     fn run_scan(
@@ -1790,14 +1789,12 @@ mod scan_metadata_completed_tests {
         let engine = Arc::new(SyncEngine::new());
         let guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-        let mut builder = snapshot.scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        if let Some(id) = correlation_id {
-            builder = builder.with_correlation_id(id);
-        }
-        let scan = builder.build().unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .fold_with(correlation_id, ScanBuilder::with_correlation_id)
+            .build()
+            .unwrap();
         let results: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()

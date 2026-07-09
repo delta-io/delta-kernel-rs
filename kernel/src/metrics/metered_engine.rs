@@ -126,6 +126,9 @@ mod tests {
         fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
             unreachable!("not exercised")
         }
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            Ok(())
+        }
     }
 
     /// Engine that delegates everything to a [`SyncEngine`] except `storage_handler`, which

@@ -179,6 +179,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryFromArrow as _;
     use crate::partition::serialization::serialize_partition_value;
     use crate::schema::PrimitiveType;
+    use crate::utils::FoldWithOption as _;
 
     // ============================================================================
     // extract_primitive_scalar: non-null values for each supported type
@@ -300,10 +301,7 @@ mod tests {
         #[case] tz: Option<&str>,
     ) {
         let array = TimestampMicrosecondArray::from(vec![1_000_000i64]);
-        let array = match tz {
-            Some(tz) => array.with_timezone(tz),
-            None => array,
-        };
+        let array = array.fold_with(tz, TimestampMicrosecondArray::with_timezone);
         assert_eq!(
             extract_primitive_scalar(&array, 0).unwrap(),
             Scalar::TimestampNtz(1_000_000)
