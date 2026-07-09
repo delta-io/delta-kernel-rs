@@ -77,6 +77,7 @@ mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
 pub mod test_ffi;
 pub mod transaction;
+use transaction::MutableCommitter;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
@@ -1235,6 +1236,30 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot_ref
         .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
         .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
+        .into_extern_result(&engine_ref)
+}
+
+/// Publish unpublished catalog commits on a catalog-managed snapshot. Mirrors the kernel's
+/// [`delta_kernel::snapshot::Snapshot::publish`] API across the C ABI.
+///
+/// The caller owns the returned snapshot handle and must release it via [`free_snapshot`].
+/// The input snapshot and committer handles are borrowed, not consumed.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot, committer, and engine handles.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_publish_with_committer(
+    snapshot: Handle<SharedSnapshot>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let committer_ref = unsafe { committer.as_ref() };
+    snapshot_ref
+        .publish(engine_ref.engine().as_ref(), committer_ref)
+        .map(|updated| updated.into())
         .into_extern_result(&engine_ref)
 }
 

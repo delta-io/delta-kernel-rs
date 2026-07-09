@@ -87,6 +87,18 @@ get_default_engine() -> transaction() -> with_engine_info() -> with_operation() 
 
 Write context: `get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_builder_with_partition_columns`.
 
+Catalog-managed publish flow (after a catalog committer stages commits):
+
+```
+committed_transaction_post_commit_snapshot()
+  -> snapshot_publish_with_committer(snapshot, committer, engine)  // borrows inputs
+  -> free_snapshot (returned snapshot)
+```
+
+`snapshot_publish_with_committer` mirrors [`Snapshot::publish`]: it copies ratified staged commits
+into `_delta_log/` via the catalog committer's `publish()` implementation. The input snapshot and
+committer handles are borrowed, not consumed; the caller owns the returned snapshot handle.
+
 Deletion vector update flow:
 
 ```
