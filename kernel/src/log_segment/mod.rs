@@ -14,7 +14,7 @@ use crate::actions::{
     METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
-use crate::expressions::ColumnName;
+use crate::expressions::{column_name, ColumnName};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -114,9 +114,9 @@ pub(crate) struct LogSegment {
 
     /// The retained `_last_checkpoint` hint, if one was read when this segment was built. The hint
     /// may describe a different checkpoint than the one this segment selected, so for validated
-    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_schema`] /
-    /// [`Self::checkpoint_sidecars`] accessors built on it). Read this field directly only when
-    /// the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
+    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_hint_schema`] /
+    /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
+    /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
@@ -128,10 +128,10 @@ pub(crate) struct LogSegment {
 /// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
 fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
     match action_name {
-        METADATA_NAME => Some(ColumnName::new([METADATA_NAME, "id"])),
-        PROTOCOL_NAME => Some(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])),
-        SET_TRANSACTION_NAME => Some(ColumnName::new([SET_TRANSACTION_NAME, "appId"])),
-        DOMAIN_METADATA_NAME => Some(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])),
+        METADATA_NAME => Some(column_name!(METADATA_NAME, "id")),
+        PROTOCOL_NAME => Some(column_name!(PROTOCOL_NAME, "minReaderVersion")),
+        SET_TRANSACTION_NAME => Some(column_name!(SET_TRANSACTION_NAME, "appId")),
+        DOMAIN_METADATA_NAME => Some(column_name!(DOMAIN_METADATA_NAME, "domain")),
         _ => None,
     }
 }
@@ -269,21 +269,22 @@ impl LogSegment {
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
-    pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
+    pub(crate) fn checkpoint_hint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
     }
 
     /// The hint's sidecar references, when it describes the selected checkpoint (see
     /// [`Self::checkpoint_hint`]). `None` if there is no matching hint or it omitted
-    /// `sidecarFiles`; `Some(&[])` if the hint listed none. A non-empty slice identifies a manifest
-    /// checkpoint whose file actions live in those sidecars.
+    /// `sidecarFiles`; `Some(empty)` if the hint listed none (a definitive inline leaf). A
+    /// non-empty list identifies a manifest checkpoint whose file actions live in those
+    /// sidecars.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
-    pub(crate) fn checkpoint_sidecars(&self) -> Option<&[Sidecar]> {
+    pub(crate) fn checkpoint_hint_sidecars(&self) -> Option<&Vec<Sidecar>> {
         self.checkpoint_hint()?
             .v2_checkpoint
             .as_ref()?
             .sidecar_files
-            .as_deref()
+            .as_ref()
     }
 
     /// Succinct summary string for logging purposes.
@@ -817,7 +818,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
-        let hint_schema = self.checkpoint_schema();
+        let hint_schema = self.checkpoint_hint_schema();
 
         // All parts of a multi-part checkpoint belong to the same table version and follow
         // the same V1 spec, so reading any one part's schema is sufficient.
@@ -1192,7 +1193,7 @@ impl LogSegment {
     }
 
     /// Schema to read just the sidecar column from a checkpoint file.
-    fn sidecar_read_schema() -> SchemaRef {
+    pub(crate) fn sidecar_read_schema() -> SchemaRef {
         static SIDECAR_SCHEMA: LazyLock<SchemaRef> =
             lazy_schema_ref! { nullable SIDECAR_NAME: (Sidecar::to_schema()) };
         SIDECAR_SCHEMA.clone()
