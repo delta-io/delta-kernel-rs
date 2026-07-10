@@ -80,6 +80,7 @@ pub struct Snapshot {
 }
 
 impl PartialEq for Snapshot {
+    // Content equality: `built_as_latest` is intent metadata, deliberately excluded.
     fn eq(&self, other: &Self) -> bool {
         self.log_segment == other.log_segment
             && self.table_configuration == other.table_configuration

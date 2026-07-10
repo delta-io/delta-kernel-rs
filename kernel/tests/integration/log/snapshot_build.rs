@@ -134,34 +134,36 @@ async fn built_as_latest_survives_version_preserving_ops(
     Ok(())
 }
 
-/// A fresh/incremental build is built as latest iff no explicit version is requested.
+/// A fresh or incremental build is built as latest iff no explicit version is requested.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn built_as_latest_on_fresh_and_incremental_build(
-    #[values(true, false)] base_built_as_latest: bool,
+    #[values(None, Some(1), Some(3))] time_travel_version: Option<Version>,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
-    // Fresh build at the newest version (3): latest iff no explicit version was requested.
+    // Fresh build: latest iff no explicit version was requested (a time-travel version is not).
     let mut builder = maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), 3, kind);
-    if !base_built_as_latest {
-        builder = builder.at_version(3);
+    if let Some(v) = time_travel_version {
+        builder = builder.at_version(v);
     }
     let base = builder.build(engine.as_ref())?;
-    assert_eq!(base.version(), 3);
-    assert_eq!(base.built_as_latest(), base_built_as_latest);
+    assert_eq!(base.version(), time_travel_version.unwrap_or(3));
+    assert_eq!(base.built_as_latest(), time_travel_version.is_none());
 
-    // Incremental with no explicit version is built as latest, regardless of the base's intent.
+    // Incremental build: latest iff no explicit version was requested (a time-travel version is
+    // not).
     let refreshed = maybe_attach_max_catalog_version(Snapshot::builder_from(base.clone()), 3, kind)
         .build(engine.as_ref())?;
+    assert_eq!(refreshed.version(), 3);
     assert!(refreshed.built_as_latest());
 
-    // Incremental with an explicit version is not.
     let pinned = maybe_attach_max_catalog_version(Snapshot::builder_from(base), 3, kind)
         .at_version(3)
         .build(engine.as_ref())?;
+    assert_eq!(pinned.version(), 3);
     assert!(!pinned.built_as_latest());
 
     Ok(())

@@ -573,6 +573,8 @@ mod tests {
             true, /* built_as_latest */
         )?;
         assert_eq!(result, base_snapshot);
+        // `PartialEq` ignores `built_as_latest`, so assert it explicitly.
+        assert!(result.built_as_latest());
 
         Ok(())
     }
