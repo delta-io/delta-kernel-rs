@@ -49,8 +49,9 @@ pub trait StorageHandler {
 ### Key contracts
 
 - **`list_from`**: Results must be sorted lexicographically by path. If the path ends with
-  `/`, list all files in that directory. Otherwise, list files lexicographically greater than
-  the given path in the same directory.
+  `/`, list files within that directory. Otherwise, list files lexicographically greater than
+  the given path in the same directory. The listing is a single directory level: files in nested
+  subdirectories must not be returned, and subdirectories must not appear as entries.
 
 - **`copy_atomic`**: Must fail with `Error::FileAlreadyExists` if the destination exists.
   This is used for commit publishing in catalog-managed tables.

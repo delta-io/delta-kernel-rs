@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
+use delta_kernel::object_store::aws::AmazonS3Builder;
+use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
+use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
+use delta_kernel::object_store::list::PaginatedListStore;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{self, Error, ObjectStore};
+use delta_kernel::object_store::{self, DynObjectStore, Error, ObjectStore, ObjectStoreScheme};
 use delta_kernel::Error as DeltaError;
 use url::Url;
 
@@ -18,6 +22,10 @@ type HandlerClosure = Arc<dyn Fn(&Url, HashMap<String, String>) -> ClosureReturn
 type Handlers = HashMap<String, HandlerClosure>;
 /// The URL_REGISTRY contains the custom URL scheme handlers that will parse URL options
 static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(HashMap::default()));
+
+/// An object store paired with an optional [`PaginatedListStore`] handle for the same backend.
+/// The handle is `Some` only for backends supporting single-level listing (delimiter pushdown).
+pub type StoreWithPaginated = (Arc<DynObjectStore>, Option<Arc<dyn PaginatedListStore>>);
 
 /// Insert a new URL handler for [store_from_url_opts] with the given `scheme`. This allows
 /// users to provide their own custom URL handler to plug new
@@ -107,6 +115,121 @@ where
 
     Ok(Arc::new(store))
 }
+
+/// Like [`store_from_url_opts`], but also returns a [`PaginatedListStore`] handle for backends
+/// that support single-level listing (delimiter pushdown) (S3/GCS/Azure). Pass the handle to
+/// [`DefaultEngineBuilder::with_paginated_list_store`] to enable delimiter-pushdown log listing.
+///
+/// The returned handle is `None` for local/memory/http and any scheme registered via
+/// [`insert_url_handler`], which use the client-side one-level fallback. Because a paginated
+/// backend must be constructed as its concrete type (the handle is unreachable through
+/// `Arc<dyn ObjectStore>`), this bypasses [`store_from_url_opts`] for cloud schemes and builds the
+/// concrete store directly.
+///
+/// [`DefaultEngineBuilder::with_paginated_list_store`]: crate::DefaultEngineBuilder::with_paginated_list_store
+pub fn paginated_store_from_url_opts<I, K, V>(
+    url: &Url,
+    options: I,
+) -> delta_kernel::DeltaResult<StoreWithPaginated>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: Into<String>,
+{
+    // A custom handler for this scheme takes precedence and yields no paginated handle.
+    if let Ok(handlers) = URL_REGISTRY.read() {
+        if handlers.contains_key(url.scheme()) {
+            return Ok((store_from_url_opts(url, options)?, None));
+        }
+    }
+
+    let (scheme, _path) = ObjectStoreScheme::parse(url).map_err(object_store::Error::from)?;
+    let opts = options
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_string(), v.into()));
+    Ok(match scheme {
+        ObjectStoreScheme::AmazonS3 => {
+            let store = Arc::new(build_cloud_store(AmazonS3Builder::new(), url, opts)?);
+            (store.clone(), Some(store))
+        }
+        ObjectStoreScheme::GoogleCloudStorage => {
+            let store = Arc::new(build_cloud_store(
+                GoogleCloudStorageBuilder::new(),
+                url,
+                opts,
+            )?);
+            (store.clone(), Some(store))
+        }
+        ObjectStoreScheme::MicrosoftAzure => {
+            let store = Arc::new(build_cloud_store(MicrosoftAzureBuilder::new(), url, opts)?);
+            (store.clone(), Some(store))
+        }
+        // Local / Memory / Http / unknown: no PaginatedListStore, use the client-side fallback.
+        _ => (store_from_url_opts(url, opts)?, None),
+    })
+}
+
+/// Builds a concrete cloud store from `url` and string `options`, mirroring
+/// `object_store::parse_url_opts`: options whose key does not parse into the builder's config-key
+/// type are ignored.
+fn build_cloud_store<B: CloudBuilder>(
+    builder: B,
+    url: &Url,
+    options: impl IntoIterator<Item = (String, String)>,
+) -> delta_kernel::DeltaResult<B::Store> {
+    let builder = options.into_iter().fold(
+        builder.with_url(url.to_string()),
+        |builder, (key, value)| match key.to_ascii_lowercase().parse() {
+            Ok(config_key) => builder.with_config(config_key, value),
+            Err(_) => builder,
+        },
+    );
+    Ok(builder.build()?)
+}
+
+/// The subset of a cloud object-store builder used by [`build_cloud_store`]: seed a URL, set typed
+/// config keys parsed from strings, and build.
+trait CloudBuilder: Sized {
+    type ConfigKey: std::str::FromStr;
+    type Store: ObjectStore + PaginatedListStore;
+    fn with_url(self, url: String) -> Self;
+    fn with_config(self, key: Self::ConfigKey, value: String) -> Self;
+    fn build(self) -> object_store::Result<Self::Store>;
+}
+
+macro_rules! impl_cloud_builder {
+    ($builder:ty, $key:ty, $store:ty) => {
+        impl CloudBuilder for $builder {
+            type ConfigKey = $key;
+            type Store = $store;
+            fn with_url(self, url: String) -> Self {
+                self.with_url(url)
+            }
+            fn with_config(self, key: Self::ConfigKey, value: String) -> Self {
+                self.with_config(key, value)
+            }
+            fn build(self) -> object_store::Result<Self::Store> {
+                self.build()
+            }
+        }
+    };
+}
+
+impl_cloud_builder!(
+    AmazonS3Builder,
+    delta_kernel::object_store::aws::AmazonS3ConfigKey,
+    delta_kernel::object_store::aws::AmazonS3
+);
+impl_cloud_builder!(
+    GoogleCloudStorageBuilder,
+    delta_kernel::object_store::gcp::GoogleConfigKey,
+    delta_kernel::object_store::gcp::GoogleCloudStorage
+);
+impl_cloud_builder!(
+    MicrosoftAzureBuilder,
+    delta_kernel::object_store::azure::AzureConfigKey,
+    delta_kernel::object_store::azure::MicrosoftAzure
+);
 
 #[cfg(test)]
 mod tests {
