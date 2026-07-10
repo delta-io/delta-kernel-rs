@@ -29,8 +29,8 @@ pub(crate) const STORE_BACKEND_REST: &str = "rest";
 /// Output buffer for a [`CAuthHeaderCallback`] invocation.
 ///
 /// Opaque to callers: populate it by calling [`rest_engine_emit_auth_header`] and
-/// [`rest_engine_emit_auth_ttl`] with the `out` pointer passed to the callback. Do not read fields
-/// or retain the pointer past the callback return.
+/// [`rest_engine_emit_auth_ttl`] with the `out` pointer your callback receives. Do not read fields
+/// or keep the pointer after the callback returns.
 #[repr(C)]
 pub struct CAuthHeaderCollector {
     _private: [u8; 0],
@@ -55,7 +55,7 @@ pub type CAuthHeaderCallback =
 
 /// Kernel-side storage for what a [`CAuthHeaderCallback`] emits in one invocation.
 #[derive(Default)]
-struct AuthCollector {
+struct AuthHeaderEmission {
     headers: Vec<(String, String)>,
     ttl_ms: Option<u64>,
 }
@@ -79,43 +79,40 @@ impl FfiAuthHeaderProvider {
         Self { callback, context }
     }
 
-    /// Invoke the callback and return what it emitted. Taking `&self` makes the enclosing closure
-    /// capture the whole (`Send + Sync`) struct rather than the bare `NullableCvoid` field (Rust
-    /// 2021 disjoint closure capture would otherwise grab the non-`Send` field).
-    fn collect(&self) -> AuthCollector {
-        let mut collected = AuthCollector::default();
+    fn collect(&self) -> AuthHeaderEmission {
+        let mut emission = AuthHeaderEmission::default();
         (self.callback)(
             self.context,
-            &mut collected as *mut AuthCollector as *mut CAuthHeaderCollector,
+            &mut emission as *mut AuthHeaderEmission as *mut CAuthHeaderCollector,
         );
-        collected
+        emission
     }
 }
 
-fn auth_collector_from_out(out: *mut CAuthHeaderCollector) -> *mut AuthCollector {
+fn auth_header_emission_from_out(out: *mut CAuthHeaderCollector) -> *mut AuthHeaderEmission {
     out.cast()
 }
 
 /// Emit one `(name, value)` header during a [`CAuthHeaderCallback`] invocation.
 ///
-/// `out` is the pointer the kernel passed to the active callback; `name`/`value` are borrowed for
-/// the call (the kernel copies them). Non-UTF-8 names/values are skipped.
+/// Pass the `out` pointer your callback received from the kernel. `name` and `value` are borrowed
+/// for this call; the kernel copies them. Non-UTF-8 names or values are skipped.
 ///
 /// # Safety
-/// `out` must be the pointer the kernel passed to the active [`CAuthHeaderCallback`], and the
-/// `name`/`value` slices must be valid for the duration of the call.
+/// `out` must be the collector pointer passed to the current [`CAuthHeaderCallback`] invocation.
+/// `name` and `value` must remain valid for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn rest_engine_emit_auth_header(
     out: *mut CAuthHeaderCollector,
     name: KernelStringSlice,
     value: KernelStringSlice,
 ) {
-    // SAFETY: `out` is the `&mut AuthCollector` from `collect`.
-    let collected = unsafe { &mut *auth_collector_from_out(out) };
+    // SAFETY: `out` is the `&mut AuthHeaderEmission` from `collect`.
+    let emission = unsafe { &mut *auth_header_emission_from_out(out) };
     let name = unsafe { String::try_from_slice(&name) };
     let value = unsafe { String::try_from_slice(&value) };
     if let (Ok(name), Ok(value)) = (name, value) {
-        collected.headers.push((name, value));
+        emission.headers.push((name, value));
     }
 }
 
@@ -123,12 +120,12 @@ pub unsafe extern "C" fn rest_engine_emit_auth_header(
 /// stay valid.
 ///
 /// # Safety
-/// `out` must be the pointer the kernel passed to the active [`CAuthHeaderCallback`].
+/// `out` must be the collector pointer passed to the current [`CAuthHeaderCallback`] invocation.
 #[no_mangle]
 pub unsafe extern "C" fn rest_engine_emit_auth_ttl(out: *mut CAuthHeaderCollector, ttl_ms: u64) {
-    // SAFETY: `out` is the `&mut AuthCollector` from `collect`.
-    let collected = unsafe { &mut *auth_collector_from_out(out) };
-    collected.ttl_ms = Some(ttl_ms);
+    // SAFETY: `out` is the `&mut AuthHeaderEmission` from `collect`.
+    let emission = unsafe { &mut *auth_header_emission_from_out(out) };
+    emission.ttl_ms = Some(ttl_ms);
 }
 
 /// Returns whether `options` select the REST object store backend.

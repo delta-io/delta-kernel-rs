@@ -22,7 +22,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, Error, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -843,7 +843,7 @@ fn get_default_engine_impl(
         rest_engine::build_rest_object_store(&url, &options, auth_callback)?
     } else {
         if auth_callback.is_some() {
-            return Err(Error::generic(format!(
+            return Err(delta_kernel::Error::generic(format!(
                 "set_builder_auth_callback requires `{}` = `{}`",
                 rest_engine::STORE_BACKEND_KEY,
                 rest_engine::STORE_BACKEND_REST

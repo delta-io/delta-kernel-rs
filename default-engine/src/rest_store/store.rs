@@ -21,6 +21,10 @@ use tracing::{info, warn};
 use super::auth::AuthHeaderProvider;
 use super::config::RestEndpointConfig;
 use super::generic_error;
+use super::response::{
+    classify_put_create_response, ensure_list_response, ensure_success_response,
+    is_retryable_http_status, PutCreateDisposition, RetryFailure,
+};
 
 /// A generic REST/HTTP-backed [`ObjectStore`]. See the [module docs](super).
 #[derive(Debug, Clone)]
@@ -81,8 +85,7 @@ impl RestObjectStore {
 
     /// Send an idempotent request, retrying transient failures (5xx, connect/timeout) up to
     /// [`Self::max_retries`]. Returns the response for the caller to map via
-    /// [`Self::ensure_success_response`]. `target` labels retry-summary log lines (path or
-    /// operation).
+    /// [`ensure_success_response`]. `target` labels retry-summary log lines (path or operation).
     async fn send_idempotent(
         &self,
         target: &str,
@@ -125,9 +128,9 @@ impl RestObjectStore {
     /// error). Reads the object back to distinguish a write that landed (success) from a real
     /// conflict, retrying only while the write is confirmed absent.
     ///
-    /// Does not call [`Self::ensure_success_response`] directly on every status: policy is encoded
-    /// in [`Self::classify_put_create_response`]. HTTP 5xx and retry-time 409 are ambiguous
-    /// (read-back + retry), not terminal errors.
+    /// Does not call [`ensure_success_response`] directly on every status: policy is encoded in
+    /// [`classify_put_create_response`]. HTTP 5xx and retry-time 409 are ambiguous (read-back +
+    /// retry), not terminal errors.
     ///
     /// A `409` (conflict) on the *first* attempt is a genuine pre-existing object and returns
     /// `AlreadyExists` immediately. On a *retry*, a `409` is most likely the writer's own
@@ -156,7 +159,7 @@ impl RestObjectStore {
                 .send()
                 .await
             {
-                Ok(resp) => self.classify_put_create_response(resp, path, retries)?,
+                Ok(resp) => classify_put_create_response(resp, path, retries)?,
                 Err(e) if is_transient(&e) => PutCreateDisposition::Ambiguous {
                     failure: RetryFailure::Transport(e.to_string()),
                 },
@@ -233,114 +236,8 @@ impl RestObjectStore {
         let response = self
             .send_idempotent(path, |c, h| c.delete(&url).headers(h))
             .await?;
-        self.ensure_success_response(response, path)?;
+        ensure_success_response(response, path)?;
         Ok(())
-    }
-
-    // === HTTP response status handling ===
-    //
-    // Three separate concerns show up across REST calls:
-    //
-    // 1. **Retry classification** ([`is_retryable_http_status`], [`is_transient`]) -- 5xx / dropped
-    //    connections may succeed on another attempt. These are *not* terminal errors yet.
-    // 2. **Typed mapping** ([`Self::typed_http_error`]) -- select status codes become specific
-    //    [`ObjectStoreError`] variants (`404 -> NotFound`, `409 -> AlreadyExists`). Returns `None`
-    //    for 2xx and for statuses with no typed mapping.
-    // 3. **Generic non-2xx** ([`Self::reject_remaining_non_success`]) -- reqwest's
-    //    `error_for_status` turns any remaining failure into [`ObjectStoreError::Generic`].
-    //
-    // Most callers use [`Self::ensure_success_response`], which applies (2) then (3). List and
-    // verified-create encode extra rules in [`Self::ensure_list_response`] and
-    // [`Self::classify_put_create_response`].
-
-    /// If `status` maps to a typed [`ObjectStoreError`] (`404`, `409`, ...), return it. Returns
-    /// `None` for 2xx and for statuses with no typed mapping (see
-    /// [`Self::reject_remaining_non_success`]).
-    fn typed_http_error(
-        &self,
-        status: reqwest::StatusCode,
-        path: &str,
-    ) -> Option<ObjectStoreError> {
-        match status {
-            reqwest::StatusCode::NOT_FOUND => Some(ObjectStoreError::NotFound {
-                path: path.to_string(),
-                source: "HTTP 404".into(),
-            }),
-            reqwest::StatusCode::CONFLICT => Some(ObjectStoreError::AlreadyExists {
-                path: path.to_string(),
-                source: "HTTP 409".into(),
-            }),
-            _ => None,
-        }
-    }
-
-    /// Apply reqwest's catch-all check for any remaining non-2xx after typed mapping.
-    fn reject_remaining_non_success(
-        response: reqwest::Response,
-    ) -> ObjectStoreResult<reqwest::Response> {
-        response.error_for_status().map_err(generic_error)
-    }
-
-    /// Typed status mapping, then generic non-2xx rejection. Returns the response on success.
-    fn ensure_success_response(
-        &self,
-        response: reqwest::Response,
-        path: &str,
-    ) -> ObjectStoreResult<reqwest::Response> {
-        if let Some(err) = self.typed_http_error(response.status(), path) {
-            return Err(err);
-        }
-        Self::reject_remaining_non_success(response)
-    }
-
-    /// Like [`Self::ensure_success_response`], but a first-page `NotFound` yields `Ok(None)` so an
-    /// absent directory lists as empty. A `NotFound` mid-pagination is an error.
-    fn ensure_list_response(
-        &self,
-        response: reqwest::Response,
-        path: &str,
-        page_token: Option<&str>,
-    ) -> ObjectStoreResult<Option<reqwest::Response>> {
-        if let Some(err) = self.typed_http_error(response.status(), path) {
-            if matches!(err, ObjectStoreError::NotFound { .. }) && page_token.is_none() {
-                return Ok(None);
-            }
-            return Err(err);
-        }
-        Ok(Some(Self::reject_remaining_non_success(response)?))
-    }
-
-    /// Classify a verified-create PUT response: success, a terminal error, or an ambiguous
-    /// outcome that requires read-back reconciliation.
-    ///
-    /// - **Success** -- 2xx after [`Self::reject_remaining_non_success`] validation.
-    /// - **Terminal** -- definite failure (`404`, first-attempt `409`, or other non-retryable 4xx).
-    /// - **Ambiguous** -- retryable 5xx, or `409` on a retry (may be our own landed write).
-    fn classify_put_create_response(
-        &self,
-        response: reqwest::Response,
-        path: &str,
-        retries: u32,
-    ) -> ObjectStoreResult<PutCreateDisposition> {
-        let status = response.status();
-        if status.is_success() {
-            Self::reject_remaining_non_success(response)?;
-            return Ok(PutCreateDisposition::Success);
-        }
-        if let Some(err) = self.typed_http_error(status, path) {
-            if matches!(err, ObjectStoreError::AlreadyExists { .. }) && retries > 0 {
-                return Ok(PutCreateDisposition::Ambiguous {
-                    failure: RetryFailure::ServerError(status),
-                });
-            }
-            return Ok(PutCreateDisposition::Terminal(err));
-        }
-        if is_retryable_http_status(status) {
-            return Ok(PutCreateDisposition::Ambiguous {
-                failure: RetryFailure::ServerError(status),
-            });
-        }
-        Self::reject_remaining_non_success(response).map(|_| PutCreateDisposition::Success)
     }
 
     /// GET `path` (optionally with a `Range` header) and return the body, response headers, and
@@ -364,7 +261,7 @@ impl RestObjectStore {
                 c.get(&url).headers(h)
             })
             .await?;
-        let response = self.ensure_success_response(response, path)?;
+        let response = ensure_success_response(response, path)?;
         let status = response.status();
         let resp_headers = response.headers().clone();
         let body = response.bytes().await.map_err(generic_error)?;
@@ -378,7 +275,7 @@ impl RestObjectStore {
         let response = self
             .send_idempotent(path, |c, h| c.head(&url).headers(h))
             .await?;
-        let response = self.ensure_success_response(response, path)?;
+        let response = ensure_success_response(response, path)?;
         let headers = response.headers();
         let size = match headers.get(reqwest::header::CONTENT_LENGTH) {
             None => {
@@ -446,7 +343,7 @@ impl RestObjectStore {
                     Ok(r) => r,
                     Err(e) => { yield Err(e); break; }
                 };
-                let response = match store.ensure_list_response(
+                let response = match ensure_list_response(
                     response,
                     &prefix,
                     page_token.as_deref(),
@@ -547,28 +444,6 @@ enum WriteState {
     Absent,
 }
 
-/// How [`RestObjectStore::put_create_verified`] should treat a PUT attempt.
-enum PutCreateDisposition {
-    Success,
-    Terminal(ObjectStoreError),
-    Ambiguous { failure: RetryFailure },
-}
-
-/// The last failure that triggered a retry.
-enum RetryFailure {
-    ServerError(reqwest::StatusCode),
-    Transport(String),
-}
-
-impl std::fmt::Display for RetryFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ServerError(status) => write!(f, "HTTP {status}"),
-            Self::Transport(msg) => write!(f, "{msg}"),
-        }
-    }
-}
-
 /// Log once when a request retried before completing. Per-attempt lines are omitted to avoid noise.
 fn log_retry_outcome(target: &str, retries: u32, last_failure: &RetryFailure, succeeded: bool) {
     if succeeded {
@@ -586,11 +461,6 @@ fn log_retry_outcome(target: &str, retries: u32, last_failure: &RetryFailure, su
             "REST request failed after retries"
         );
     }
-}
-
-/// HTTP 5xx may succeed on retry; callers classify it before mapping to a terminal error.
-fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error()
 }
 
 /// Transport-level failures worth retrying for an idempotent request.
@@ -745,7 +615,7 @@ impl ObjectStore for RestObjectStore {
             .send()
             .await
             .map_err(generic_error)?;
-        self.ensure_success_response(response, path_str)?;
+        ensure_success_response(response, path_str)?;
         Ok(put_result())
     }
 

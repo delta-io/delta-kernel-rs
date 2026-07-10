@@ -21,6 +21,7 @@ use delta_kernel::object_store::Error as ObjectStoreError;
 mod auth;
 mod client;
 mod config;
+mod response;
 mod store;
 #[cfg(test)]
 mod tests;
