@@ -24,9 +24,12 @@ pub mod credentials;
 pub mod error;
 pub mod models;
 
-pub use clients::{CommitClient, GetCommitsClient};
+pub use clients::{CommitClient, GetCommitsClient, UpdateTableClient};
 #[cfg(any(test, feature = "test-utils"))]
 pub use clients::{InMemoryCommitsClient, TableData};
 pub use credentials::{AwsTempCredentials, Operation, TemporaryTableCredentials};
 pub use error::{Error, Result};
-pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+pub use models::{
+    CatalogConfig, Commit, CommitRequest, CommitsRequest, CommitsResponse, LoadTableResponse,
+    Protocol, Requirement, TableMetadata, Update, UpdateTableRequest,
+};

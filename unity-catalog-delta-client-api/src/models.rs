@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +40,8 @@ pub struct CommitsResponse {
     pub latest_table_version: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub struct Commit {
     pub version: i64,
     pub timestamp: i64,
@@ -108,4 +111,299 @@ impl CommitRequest {
     }
 
     // TODO: expose metadata/protocol (with_metadata, with_protocol)
+}
+
+// ============================================================================
+// update_table: typed requirements + updates
+// ============================================================================
+
+/// A precondition that the catalog server must validate before applying a
+/// commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Requirement {
+    /// Assert that the table being updated has the given UUID. Used to detect
+    /// the case where a table has been dropped and recreated under the same
+    /// name between the client's last read and this update.
+    AssertTableUuid { uuid: String },
+    /// Assert that the table's etag matches the expected value. Used for
+    /// optimistic-concurrency control on metadata-only updates.
+    AssertEtag { etag: String },
+}
+
+/// A typed update to apply atomically as part of an `update_table` call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum Update {
+    /// Register a new staged commit with the catalog.
+    AddCommit { commit: Commit },
+    /// Inform the catalog of the latest published version.
+    SetLatestBackfilledVersion {
+        #[serde(rename = "latest-published-version")]
+        latest_published_version: i64,
+    },
+}
+
+/// Body of a `POST /delta/v1/catalogs/{c}/schemas/{s}/tables/{t}`
+/// (`update_table`) request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateTableRequest {
+    /// Catalog name. Used for URL path only; not serialized.
+    #[serde(skip)]
+    pub catalog: String,
+    /// Schema name. Used for URL path only; not serialized.
+    #[serde(skip)]
+    pub schema: String,
+    /// Table name. Used for URL path only; not serialized.
+    #[serde(skip)]
+    pub table_name: String,
+    /// Preconditions the catalog must validate.
+    pub requirements: Vec<Requirement>,
+    /// Updates to apply atomically.
+    pub updates: Vec<Update>,
+}
+
+impl UpdateTableRequest {
+    pub fn new(
+        catalog: impl Into<String>,
+        schema: impl Into<String>,
+        table_name: impl Into<String>,
+        requirements: Vec<Requirement>,
+        updates: Vec<Update>,
+    ) -> Self {
+        Self {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table_name: table_name.into(),
+            requirements,
+            updates,
+        }
+    }
+
+    /// The table UUID asserted by this request's `AssertTableUuid` requirement, if present.
+    pub fn table_uuid(&self) -> Option<&str> {
+        self.requirements.iter().find_map(|r| match r {
+            Requirement::AssertTableUuid { uuid } => Some(uuid.as_str()),
+            Requirement::AssertEtag { .. } => None,
+        })
+    }
+
+    /// The `AddCommit` staged-commit reference in this request's updates, if present.
+    pub fn add_commit(&self) -> Option<&Commit> {
+        self.updates.iter().find_map(|u| match u {
+            Update::AddCommit { commit } => Some(commit),
+            Update::SetLatestBackfilledVersion { .. } => None,
+        })
+    }
+}
+
+// ============================================================================
+// load_table: read-side response
+// ============================================================================
+
+/// Response from `GET /delta/v1/catalogs/{c}/schemas/{s}/tables/{t}`
+/// (`load_table`).
+///
+/// The server returns the table's full metadata plus any unpublished commits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LoadTableResponse {
+    /// Full table metadata.
+    pub metadata: TableMetadata,
+    /// Unpublished commits known to the catalog at this read, in descending
+    /// version order (newest first).
+    #[serde(default)]
+    pub commits: Vec<Commit>,
+    /// Optional UniForm conversion metadata. Modeled as opaque JSON.
+    #[serde(default)]
+    pub uniform: Option<serde_json::Value>,
+    /// Highest version the catalog knows about, including data-only commits.
+    /// Compare with `metadata.last_commit_version`, which only tracks
+    /// metadata-changing commits.
+    #[serde(default)]
+    pub latest_table_version: Option<i64>,
+}
+
+/// Full table metadata returned by `load_table`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TableMetadata {
+    /// Entity tag for optimistic-concurrency control.
+    pub etag: String,
+    /// Table type, e.g. `"MANAGED"` or `"EXTERNAL"`.
+    pub table_type: String,
+    /// Stable table UUID, matching `Metadata.id` in the Delta log.
+    pub table_uuid: String,
+    /// Cloud-storage location of the table's `_delta_log/` parent.
+    pub location: String,
+    /// Creation time in epoch milliseconds.
+    pub created_time: i64,
+    /// Last update time in epoch milliseconds.
+    pub updated_time: i64,
+    /// Schema as a Delta `StructType` JSON value.
+    pub columns: serde_json::Value,
+    /// Partition column names, in declaration order.
+    #[serde(default)]
+    pub partition_columns: Vec<String>,
+    /// Raw `metaData.configuration` properties.
+    pub properties: HashMap<String, String>,
+    /// Version of the last commit that changed table metadata.
+    #[serde(default)]
+    pub last_commit_version: Option<i64>,
+    /// Timestamp of the last metadata-changing commit, in epoch milliseconds.
+    #[serde(default)]
+    pub last_commit_timestamp_ms: Option<i64>,
+}
+
+// ============================================================================
+// /config: protocol negotiation
+// ============================================================================
+
+/// Response from `GET /delta/v1/config`.
+///
+/// The server returns the list of versioned endpoints the client should use
+/// for subsequent calls, plus the negotiated protocol version.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CatalogConfig {
+    /// Supported endpoints, e.g. `"POST /delta/v1/catalogs/{catalog}/schemas/{schema}/tables"`.
+    pub endpoints: Vec<String>,
+    /// Negotiated protocol version, e.g. `"1.0"`.
+    pub protocol_version: String,
+}
+
+// ============================================================================
+// Protocol wire type
+// ============================================================================
+
+/// Typed protocol fields used in read responses and credential vending.
+///
+/// Mirrors Delta's `Protocol` action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct Protocol {
+    /// Minimum reader version required to read the table.
+    pub min_reader_version: i32,
+    /// Minimum writer version required to write to the table.
+    pub min_writer_version: i32,
+    /// Reader features (Delta's `readerFeatures` list).
+    #[serde(default)]
+    pub reader_features: Vec<String>,
+    /// Writer features (Delta's `writerFeatures` list).
+    #[serde(default)]
+    pub writer_features: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_table_response_decodes_full_body() {
+        // Both load_table and update_table return this full table-state body. Decode a
+        // representative one and pin the kebab-case field renames on TableMetadata.
+        let body = r#"{
+            "metadata": {
+                "etag": "e1",
+                "table-type": "MANAGED",
+                "table-uuid": "abc",
+                "location": "s3://bucket/t",
+                "created-time": 1,
+                "updated-time": 2,
+                "columns": {"type": "struct", "fields": []},
+                "partition-columns": ["p"],
+                "properties": {},
+                "last-commit-version": 5,
+                "last-commit-timestamp-ms": 6
+            },
+            "commits": [],
+            "latest-table-version": 7
+        }"#;
+        let resp: LoadTableResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.metadata.table_type, "MANAGED");
+        assert_eq!(resp.metadata.table_uuid, "abc");
+        assert_eq!(resp.metadata.last_commit_timestamp_ms, Some(6));
+        assert_eq!(resp.latest_table_version, Some(7));
+    }
+
+    // === Serde golden tests: pin the wire tag + renamed keys for the tagged enums. ===
+
+    fn sample_commit() -> Commit {
+        Commit::new(7, 1234, "00000000000000000007.uuid.json", 100, 5678)
+    }
+
+    #[test]
+    fn update_add_commit_wire_shape() {
+        let v = serde_json::to_value(Update::AddCommit {
+            commit: sample_commit(),
+        })
+        .unwrap();
+        assert_eq!(v["action"], "add-commit");
+        assert!(v.get("commit").is_some());
+    }
+
+    #[test]
+    fn update_set_latest_backfilled_version_wire_shape() {
+        let v = serde_json::to_value(Update::SetLatestBackfilledVersion {
+            latest_published_version: 9,
+        })
+        .unwrap();
+        assert_eq!(v["action"], "set-latest-backfilled-version");
+        assert_eq!(v["latest-published-version"], 9);
+    }
+
+    #[test]
+    fn requirement_assert_table_uuid_wire_shape() {
+        let v = serde_json::to_value(Requirement::AssertTableUuid {
+            uuid: "abc".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["type"], "assert-table-uuid");
+        assert_eq!(v["uuid"], "abc");
+    }
+
+    #[test]
+    fn requirement_assert_etag_wire_shape() {
+        let v = serde_json::to_value(Requirement::AssertEtag {
+            etag: "e1".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["type"], "assert-etag");
+        assert_eq!(v["etag"], "e1");
+    }
+
+    #[test]
+    fn commit_wire_shape() {
+        let v = serde_json::to_value(sample_commit()).unwrap();
+        assert_eq!(v["version"], 7);
+        assert_eq!(v["timestamp"], 1234);
+        assert_eq!(v["file-name"], "00000000000000000007.uuid.json");
+        assert_eq!(v["file-size"], 100);
+        assert_eq!(v["file-modification-timestamp"], 5678);
+    }
+
+    #[test]
+    fn update_table_request_skips_routing_fields() {
+        let req = UpdateTableRequest::new("cat", "sch", "tbl", vec![], vec![]);
+        let v = serde_json::to_value(&req).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in ["catalog", "schema", "table_name", "table-name"] {
+            assert!(
+                !obj.contains_key(key),
+                "routing field {key} must not be serialized"
+            );
+        }
+        assert!(obj.contains_key("requirements"));
+        assert!(obj.contains_key("updates"));
+    }
+
+    #[test]
+    fn catalog_config_decodes_kebab_protocol_version() {
+        let config: CatalogConfig = serde_json::from_str(
+            r#"{"endpoints": ["POST /delta/v1/catalogs/{catalog}/schemas/{schema}/tables"], "protocol-version": "1.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.protocol_version, "1.0");
+        assert_eq!(config.endpoints.len(), 1);
+    }
 }
