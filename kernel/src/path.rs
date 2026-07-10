@@ -301,6 +301,13 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Unknown)
     }
+
+    /// Whether this log path's file extension is `json`.
+    #[internal_api]
+    #[allow(dead_code)] // not all cfgs exercise this
+    pub(crate) fn is_json(&self) -> bool {
+        self.extension == "json"
+    }
 }
 
 impl ParsedLogPath<FileMeta> {

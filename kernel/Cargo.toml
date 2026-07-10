@@ -125,6 +125,9 @@ column-defaults-in-dev = []
 # work: the SQL predicate parser and, later, `checkConstraints` write enforcement. Remove once
 # full check-constraints support ships.
 check-constraints-in-dev = []
+# Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
+# (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
+adaptive-metadata-in-dev = []
 
 # Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,
 # ensure_data_types, parquet_row_group_skipping). Used by the delta_kernel_default_engine crate
