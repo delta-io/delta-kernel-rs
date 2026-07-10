@@ -171,8 +171,8 @@ enum ResolvedOperand {
 fn resolve_operand(operand: &Operand, schema: &StructType) -> DeltaResult<ResolvedOperand> {
     match operand {
         Operand::Literal(raw) => Ok(ResolvedOperand::Literal(raw.clone())),
-        Operand::Column(path) => {
-            let (canonical, data_type) = resolve_column(path, schema)?;
+        Operand::Column(column) => {
+            let (canonical, data_type) = resolve_column(column, schema)?;
             Ok(ResolvedOperand::Column {
                 canonical,
                 data_type,
@@ -181,15 +181,17 @@ fn resolve_operand(operand: &Operand, schema: &StructType) -> DeltaResult<Resolv
     }
 }
 
-/// Resolve a (case-insensitive) column path against `schema`, returning the *canonical* path (the
-/// schema's stored field names) and the leaf field's type. The canonical names are what the engine
-/// sees in the logical batch, so the emitted column reference must use them rather than the
+/// Resolve a (case-insensitive) column reference against `schema`, returning the *canonical* path
+/// (the schema's stored field names) and the leaf field's type. The canonical names are what the
+/// engine sees in the logical batch, so the emitted column reference must use them rather than the
 /// as-written casing.
-fn resolve_column(path: &[String], schema: &StructType) -> DeltaResult<(Vec<String>, DataType)> {
-    let column = ColumnName::new(path.iter().cloned());
-    let mut fields = Vec::with_capacity(path.len());
+fn resolve_column(
+    column: &ColumnName,
+    schema: &StructType,
+) -> DeltaResult<(Vec<String>, DataType)> {
+    let mut fields = Vec::with_capacity(column.len());
     schema.visit_fields_of_path_by(
-        &column,
+        column,
         |parent, name| {
             parent
                 .fields()
