@@ -131,6 +131,12 @@ async fn built_as_latest_survives_version_preserving_ops(
     assert_eq!(crc_result, ChecksumWriteResult::Written);
     assert_eq!(after_checksum.built_as_latest(), built_base_snap_as_latest);
 
+    // publish() (catalog-managed only) also retains the intent flag.
+    if matches!(kind, TableKind::CatalogManaged) {
+        let published = base.publish(engine.as_ref(), &TestCatalogCommitter)?;
+        assert_eq!(published.built_as_latest(), built_base_snap_as_latest);
+    }
+
     // A post-commit snapshot was not considered built as latest.
     let post_commit = append_row(base, &engine, kind, 4).await?;
     assert_eq!(post_commit.version(), 4);

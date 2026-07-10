@@ -330,8 +330,8 @@ impl Snapshot {
     ///
     /// `true` when built without an explicit time-travel version (a `max_catalog_version` ceiling
     /// is not time-travel). `false` for a snapshot built at an explicit version, and for
-    /// post-commit and create-table snapshots. Version-preserving derivations
-    /// ([`checkpoint`](Self::checkpoint), [`write_checksum`](Self::write_checksum),
+    /// post-commit snapshots (including the one produced by creating a table). Version-preserving
+    /// derivations ([`checkpoint`](Self::checkpoint), [`write_checksum`](Self::write_checksum),
     /// [`publish`](Self::publish)) retain this flag.
     pub fn built_as_latest(&self) -> bool {
         self.built_as_latest

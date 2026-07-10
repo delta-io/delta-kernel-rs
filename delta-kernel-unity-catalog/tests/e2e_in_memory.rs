@@ -135,14 +135,10 @@ async fn test_insert_and_publish() -> Result<(), TestError> {
 
     for _ in 3..=beyond_max {
         snapshot = commit(&snapshot, &commits_client, &engine)?;
-        // A post-commit snapshot is not considered built as latest.
-        assert!(!snapshot.built_as_latest());
 
         let committer = UCCommitter::new(commits_client.clone(), TABLE_ID);
 
         snapshot = snapshot.publish(&engine, &committer)?;
-        // publish() preserves the intent flag.
-        assert!(!snapshot.built_as_latest());
     }
     Ok(())
 }
