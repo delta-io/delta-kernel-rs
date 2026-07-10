@@ -70,8 +70,6 @@ mod token;
 /// can distinguish them without string-matching messages. What a caller *does* with each -- fall
 /// back to its own enforcement, hard-fail, etc. -- is that caller's contract, not this function's.
 #[cfg(feature = "check-constraints-in-dev")]
-// TODO(#2896): remove once check-constraints discovery calls this; no in-crate caller until then.
-#[allow(dead_code)]
 pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
     let tokens = token::tokenize(sql)?;
     if tokens.is_empty() {
