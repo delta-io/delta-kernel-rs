@@ -86,8 +86,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 
-    // The create-table snapshot is not built as latest.
-    assert!(!create_snapshot.built_as_latest());
+    // The create-table snapshot is built as latest (version 0 is necessarily the latest).
+    assert!(create_snapshot.built_as_latest());
     create_snapshot.write_checksum(engine.as_ref())?;
 
     let mut snap = maybe_attach_max_catalog_version(Snapshot::builder_for(table_path), 0, kind)
@@ -98,9 +98,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     Ok(())
 }
 
-/// `built_as_latest` reflects the builder's intent and is carried through the version-preserving
-/// derivations `checkpoint` and `write_checksum`. A post-commit snapshot is not considered built
-/// as latest.
+/// `built_as_latest` reflects the builder's intent and is inherited by snapshots directly derived
+/// from it: `checkpoint`, `write_checksum`, `publish`, and a post-commit advance.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn built_as_latest_survives_version_preserving_ops(
@@ -137,10 +136,10 @@ async fn built_as_latest_survives_version_preserving_ops(
         assert_eq!(published.built_as_latest(), built_base_snap_as_latest);
     }
 
-    // A post-commit snapshot was not considered built as latest.
+    // A post-commit snapshot inherits the base snapshot's intent.
     let post_commit = append_row(base, &engine, kind, 4).await?;
     assert_eq!(post_commit.version(), 4);
-    assert!(!post_commit.built_as_latest());
+    assert_eq!(post_commit.built_as_latest(), built_base_snap_as_latest);
 
     Ok(())
 }
