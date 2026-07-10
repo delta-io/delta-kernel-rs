@@ -10,6 +10,8 @@
 //! writers must know that the table property delta.appendOnly should be checked before writing the
 //! table.
 
+#[cfg(feature = "check-constraints-in-dev")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::time::Duration;
@@ -27,7 +29,7 @@ pub use deserialize::ParseIntervalError;
 pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
 
 /// Prefix under which CHECK constraints are stored in the table configuration, as
-/// `delta.constraints.<name>`. The prefix is matched case-insensitively.
+/// `delta.constraints.<name>`. See `strip_constraint_prefix` for how it is matched.
 #[cfg(feature = "check-constraints-in-dev")]
 pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
 
@@ -248,12 +250,12 @@ pub struct TableProperties {
 
     /// CHECK constraints declared on the table, keyed by constraint name -- the suffix of each
     /// `delta.constraints.<name>` configuration key -- with the raw constraint SQL as the value.
-    /// Empty when the table declares no constraints. The SQL is stored verbatim here; parsing it
-    /// into a predicate is the responsibility of a higher layer.
-    // TODO(#2896): gated on `check-constraints-in-dev` while enforcement is in development; with
-    // the flag off these keys stay in `unknown_properties`. Ungate once CHECK constraints ship.
+    /// The SQL is stored verbatim; parsing it into a predicate is the responsibility of a higher
+    /// layer. Ordered by name for deterministic iteration.
+    // TODO(#2896): `pub(crate)` + feature-gated while enforcement is in development. Expose a
+    // public accessor and ungate once CHECK constraints ship.
     #[cfg(feature = "check-constraints-in-dev")]
-    pub check_constraints: HashMap<String, String>,
+    pub(crate) check_constraints: BTreeMap<String, String>,
 
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
@@ -674,7 +676,7 @@ mod tests {
             parquet_compression_codec: Some(ParquetCompressionCodec::Zstd),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
             #[cfg(feature = "check-constraints-in-dev")]
-            check_constraints: HashMap::new(),
+            check_constraints: BTreeMap::new(),
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
@@ -682,14 +684,14 @@ mod tests {
 
     #[cfg(feature = "check-constraints-in-dev")]
     #[test]
-    fn check_constraints_parsed_keyed_by_name() {
+    fn check_constraints_keyed_by_name() {
         let props = TableProperties::from([
             ("delta.constraints.positive", "amount > 0"),
             ("delta.constraints.name_check", "name = 'a'"),
         ]);
         assert_eq!(
             props.check_constraints,
-            HashMap::from([
+            BTreeMap::from([
                 ("positive".to_string(), "amount > 0".to_string()),
                 ("name_check".to_string(), "name = 'a'".to_string()),
             ])
@@ -698,17 +700,18 @@ mod tests {
         assert!(props.unknown_properties.is_empty());
     }
 
-    // The `delta.constraints.` prefix is matched case-insensitively; the name is the text after it.
-    // The upper/mixed-case cases yield `c1` by kernel normalization, which deliberately differs
-    // from Delta-Spark for non-lowercase prefixes (see `strip_constraint_prefix`). A
-    // non-constraint key (`None`) -- the bare prefix or any non-match -- falls through to
-    // `unknown_properties`.
+    // `Some(name)` => a recognized constraint keyed by `name`; `None` => routed to
+    // `unknown_properties`. See `strip_constraint_prefix` for the Spark-parity keying: the prefix
+    // is recognized case-insensitively but stripped case-sensitively, so a non-lowercase prefix
+    // stays part of the name (matching Spark's `stripPrefix`).
     #[cfg(feature = "check-constraints-in-dev")]
     #[rstest]
     #[case::lowercase_prefix("delta.constraints.c1", Some("c1"))]
-    #[case::uppercase_prefix("DELTA.CONSTRAINTS.c1", Some("c1"))]
-    #[case::mixed_case_prefix("Delta.Constraints.c1", Some("c1"))]
+    #[case::uppercase_prefix("DELTA.CONSTRAINTS.c1", Some("DELTA.CONSTRAINTS.c1"))]
+    #[case::mixed_case_prefix("Delta.Constraints.c1", Some("Delta.Constraints.c1"))]
     #[case::name_case_preserved("delta.constraints.MyCheck", Some("MyCheck"))]
+    // A whitespace-only name is not empty, so it is a (malformed) constraint, matching Spark.
+    #[case::whitespace_name("delta.constraints. ", Some(" "))]
     #[case::bare_prefix_to_unknown("delta.constraints.", None)]
     #[case::unrecognized_long_key("delta.someOtherKey", None)]
     // Same byte length as the prefix but not the prefix (only the trailing `.` differs): pins the
@@ -759,5 +762,26 @@ mod tests {
     fn check_constraints_empty_when_none_declared() {
         let props = TableProperties::from([(APPEND_ONLY, "true")]);
         assert!(props.check_constraints.is_empty());
+    }
+
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[test]
+    fn check_constraints_case_variant_prefixes_are_distinct() {
+        // Case-sensitive stripping keys these under different names (matching Spark), so both
+        // survive rather than collapsing to one entry with an iteration-order-dependent value.
+        let props = TableProperties::from([
+            ("delta.constraints.c1", "amount > 0"),
+            ("DELTA.CONSTRAINTS.c1", "amount > 100"),
+        ]);
+        assert_eq!(
+            props.check_constraints,
+            BTreeMap::from([
+                ("c1".to_string(), "amount > 0".to_string()),
+                (
+                    "DELTA.CONSTRAINTS.c1".to_string(),
+                    "amount > 100".to_string()
+                ),
+            ])
+        );
     }
 }

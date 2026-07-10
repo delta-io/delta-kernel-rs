@@ -104,10 +104,8 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
-        // A `delta.constraints.<name>` key records a CHECK constraint, keyed by name (see
-        // `strip_constraint_prefix`). Any other unrecognized key returns `None` and is preserved
-        // in `unknown_properties` by the caller. With `check-constraints-in-dev` off there is no
-        // `check_constraints` field, so constraint keys fall through to `unknown_properties` too.
+        // A `delta.constraints.<name>` key records a CHECK constraint; see
+        // `strip_constraint_prefix`.
         #[cfg(feature = "check-constraints-in-dev")]
         _ => {
             let name = strip_constraint_prefix(k)?;
@@ -122,23 +120,19 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
 }
 
 /// If `key` is a CHECK-constraint configuration key (`delta.constraints.<name>`), returns the
-/// constraint name. The prefix is matched case-insensitively so kernel discovers the same set of
-/// constraints Delta-Spark does (Spark recognizes the prefix case-insensitively).
+/// constraint name, matching Delta-Spark's keying: the prefix is recognized case-insensitively (so
+/// kernel discovers every constraint Spark does), but stripped case-sensitively. A key whose prefix
+/// is not the exact lowercase `delta.constraints.` therefore keeps it as part of the name
+/// (`DELTA.CONSTRAINTS.foo` -> `DELTA.CONSTRAINTS.foo`), exactly as Spark's `stripPrefix` does --
+/// so two keys differing only in prefix case yield distinct names and never collide.
 ///
-/// The name is the text after the matched prefix regardless of the prefix's case
-/// (`DELTA.CONSTRAINTS.foo` -> `foo`) -- a deliberate kernel normalization. Delta-Spark instead
-/// strips the prefix case-sensitively, so it would leave a non-lowercase prefix attached to the
-/// name; the two agree for the lowercase `delta.constraints.` prefix that real writers emit.
-/// Normalizing also collapses keys differing only in prefix case to one name (last-writer-wins).
-///
-/// Returns `None` for the bare prefix with no name (`delta.constraints.`); the caller preserves
-/// such a malformed key in `unknown_properties` rather than recording a nameless constraint.
+/// Returns `None` for the exact bare prefix `delta.constraints.` (empty name).
 #[cfg(feature = "check-constraints-in-dev")]
 fn strip_constraint_prefix(key: &str) -> Option<&str> {
     let prefix = key.get(..CHECK_CONSTRAINT_PREFIX.len())?;
     prefix
         .eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX)
-        .then(|| &key[CHECK_CONSTRAINT_PREFIX.len()..])
+        .then(|| key.strip_prefix(CHECK_CONSTRAINT_PREFIX).unwrap_or(key))
         .filter(|name| !name.is_empty())
 }
 
