@@ -18,7 +18,7 @@ use test_utils::{insert_data_with, test_table_setup_mt, TestCatalogCommitter};
 /// The newest version of the table built by [`setup_multi_version_table`].
 const LATEST_VERSION: Version = 3;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TableKind {
     FileSystem,
     CatalogManaged,
@@ -92,7 +92,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 
     let mut snap = maybe_attach_max_catalog_version(Snapshot::builder_for(table_path), 0, kind)
         .build(engine.as_ref())?;
-    for value in 1..=3 {
+    for value in 1..=LATEST_VERSION as i32 {
         snap = append_row(snap, engine, kind, value).await?;
     }
     Ok(())
@@ -102,7 +102,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 /// from it: `checkpoint`, `write_checksum`, `publish`, and a post-commit advance.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn built_as_latest_survives_version_preserving_ops(
+async fn built_as_latest_is_inherited_by_derived_snapshots(
     #[values(true, false)] built_base_snap_as_latest: bool,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
 ) -> DeltaResult<()> {
@@ -131,7 +131,7 @@ async fn built_as_latest_survives_version_preserving_ops(
     assert_eq!(after_checksum.built_as_latest(), built_base_snap_as_latest);
 
     // publish() (catalog-managed only) also retains the intent flag.
-    if matches!(kind, TableKind::CatalogManaged) {
+    if kind == TableKind::CatalogManaged {
         let published = base.publish(engine.as_ref(), &TestCatalogCommitter)?;
         assert_eq!(published.built_as_latest(), built_base_snap_as_latest);
     }
