@@ -15,6 +15,9 @@ use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{insert_data_with, test_table_setup_mt, TestCatalogCommitter};
 
+/// The newest version of the table built by [`setup_multi_version_table`].
+const LATEST_VERSION: Version = 3;
+
 #[derive(Debug, Clone, Copy)]
 enum TableKind {
     FileSystem,
@@ -96,7 +99,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 }
 
 /// `built_as_latest` reflects the builder's intent and is carried through the version-preserving
-/// derivations `checkpoint` and `write_checksum`. A post-commit snapshot is not latest.
+/// derivations `checkpoint` and `write_checksum`. A post-commit snapshot is not considered built
+/// as latest.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn built_as_latest_survives_version_preserving_ops(
@@ -106,13 +110,14 @@ async fn built_as_latest_survives_version_preserving_ops(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
-    let mut builder = maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), 3, kind)
-        .with_incremental_crc_replay(IncrementalReplay::Unlimited);
+    let mut builder =
+        maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), LATEST_VERSION, kind)
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited);
     if !built_base_snap_as_latest {
-        builder = builder.at_version(3);
+        builder = builder.at_version(LATEST_VERSION);
     }
     let base = builder.build(engine.as_ref())?;
-    assert_eq!(base.version(), 3);
+    assert_eq!(base.version(), LATEST_VERSION);
     assert_eq!(base.built_as_latest(), built_base_snap_as_latest);
 
     let (ckpt_result, after_checkpoint) = base.checkpoint(engine.as_ref(), None)?;
@@ -144,26 +149,34 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
-    // Fresh build: latest iff no explicit version was requested (a time-travel version is not).
-    let mut builder = maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), 3, kind);
+    // Fresh build: latest iff no explicit version was requested.
+    let mut builder =
+        maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), LATEST_VERSION, kind);
     if let Some(v) = time_travel_version {
         builder = builder.at_version(v);
     }
     let base = builder.build(engine.as_ref())?;
-    assert_eq!(base.version(), time_travel_version.unwrap_or(3));
+    assert_eq!(
+        base.version(),
+        time_travel_version.unwrap_or(LATEST_VERSION)
+    );
     assert_eq!(base.built_as_latest(), time_travel_version.is_none());
 
-    // Incremental build: latest iff no explicit version was requested (a time-travel version is
-    // not).
-    let refreshed = maybe_attach_max_catalog_version(Snapshot::builder_from(base.clone()), 3, kind)
-        .build(engine.as_ref())?;
-    assert_eq!(refreshed.version(), 3);
+    // Incremental build: latest iff no explicit version was requested.
+    let refreshed = maybe_attach_max_catalog_version(
+        Snapshot::builder_from(base.clone()),
+        LATEST_VERSION,
+        kind,
+    )
+    .build(engine.as_ref())?;
+    assert_eq!(refreshed.version(), LATEST_VERSION);
     assert!(refreshed.built_as_latest());
 
-    let pinned = maybe_attach_max_catalog_version(Snapshot::builder_from(base), 3, kind)
-        .at_version(3)
-        .build(engine.as_ref())?;
-    assert_eq!(pinned.version(), 3);
+    let pinned =
+        maybe_attach_max_catalog_version(Snapshot::builder_from(base), LATEST_VERSION, kind)
+            .at_version(LATEST_VERSION)
+            .build(engine.as_ref())?;
+    assert_eq!(pinned.version(), LATEST_VERSION);
     assert!(!pinned.built_as_latest());
 
     Ok(())

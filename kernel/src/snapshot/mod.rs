@@ -284,9 +284,9 @@ impl Snapshot {
             .as_deref()
             .map(|base| Arc::new(base.clone().apply(crc_delta, new_version)));
 
-        // Conservatively set built_as_latest to false for all post-commit snapshots, even if
-        // current snapshot is built as latest. This is to reduce the risk when concurrent writes
-        // are happening and the current snapshot is built as latest.
+        // A post-commit snapshot is assembled from the committed version without re-scanning the
+        // filesystem or asking the catalog, so it cannot know whether it is the latest version;
+        // it is not considered built as latest, even when the source snapshot was.
         Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
@@ -330,7 +330,9 @@ impl Snapshot {
     ///
     /// `true` when built without an explicit time-travel version (a `max_catalog_version` ceiling
     /// is not time-travel). `false` for a snapshot built at an explicit version, and for
-    /// post-commit and create-table snapshots.
+    /// post-commit and create-table snapshots. Version-preserving derivations
+    /// ([`checkpoint`](Self::checkpoint), [`write_checksum`](Self::write_checksum),
+    /// [`publish`](Self::publish)) retain this flag.
     pub fn built_as_latest(&self) -> bool {
         self.built_as_latest
     }
