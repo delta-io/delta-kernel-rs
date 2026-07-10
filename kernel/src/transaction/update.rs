@@ -33,6 +33,8 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
+#[cfg(feature = "column-defaults-in-dev")]
+use crate::table_features::iceberg_compat_v3_column_default_warnings;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
@@ -75,6 +77,16 @@ impl Transaction {
         );
 
         let effective_table_config = read_snapshot.table_configuration().clone();
+
+        // IcebergCompatV3 restricts column defaults to kernel-materializable literals on primitive
+        // columns. This is surfaced as a warning on the DML/write path so a valid
+        // table carrying a default that kernel cannot materialize still loads and writes.
+        #[cfg(feature = "column-defaults-in-dev")]
+        if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            for warning in iceberg_compat_v3_column_default_warnings(&effective_table_config)? {
+                tracing::warn!("{warning}");
+            }
+        }
 
         Ok(Transaction {
             span,

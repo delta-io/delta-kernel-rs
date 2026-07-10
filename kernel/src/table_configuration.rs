@@ -220,8 +220,7 @@ impl TableConfiguration {
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
-        // default on a Variant column). Independent of the IcebergCompatV3 check below, which
-        // applies its own narrower (literal, primitive-column) rules.
+        // default on a Variant column).
         #[cfg(feature = "column-defaults-in-dev")]
         validate_column_defaults_metadata(&table_config.logical_schema)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;

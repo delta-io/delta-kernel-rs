@@ -3,8 +3,8 @@
 //! # Invariants
 //!
 //! The rules Kernel applies to column defaults, and where each comes from. This applies to
-//! [`ColumnDefault::new`], [`validate_column_defaults_metadata`], and the IcebergCompatV3 check in
-//! [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
+//! [`ColumnDefault::new`], [`validate_column_defaults_metadata`], and the IcebergCompatV3 warnings
+//! in [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
 //! divergences are called out as such.
 //!
 //! - Kernel tolerates orphaned metadata on both read and write. Orphaned metadata is a
@@ -18,11 +18,10 @@
 //!   but *loads* a snapshot of a table authored elsewhere that carries nested defaults.
 //! - Parsing is best-effort: unparseable SQL (e.g. `current_timestamp()`) is not an error; the
 //!   connector falls back to the raw SQL.
-//! - On an IcebergCompatV3 table, kernel imposes two extra limitations on every default:
-//!     - It must be a kernel-parsable literal. The protocol requires a literal; kernel enforces
-//!       this with its own SQL parser, so a literal kernel cannot parse is rejected too.
-//!     - Its column must be primitive. Kernel cannot materialize non-primitive defaults, so it
-//!       rejects them even where the protocol would allow a NULL (a kernel limitation).
+//! - On an IcebergCompatV3 table, kernel warns on two kinds of default it cannot materialize into
+//!   the Iceberg metadata:
+//!     - A default that is not a kernel-parsable literal
+//!     - A default on a non-primitive column
 
 use crate::expressions::{parse_sql, ColumnName, Expression, Scalar};
 use crate::schema::{DataType, StructField, StructType};

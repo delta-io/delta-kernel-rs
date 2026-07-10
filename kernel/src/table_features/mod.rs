@@ -13,6 +13,8 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+#[cfg(feature = "column-defaults-in-dev")]
+pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_default_warnings;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
@@ -438,11 +440,6 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 ///
 /// TODO: Implement the write-side requirements for IcebergCompatV3.
 /// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
-///
-/// Column defaults are enforced (gated by `column-defaults-in-dev`) in `iceberg_compat::v3`'s
-/// `check_column_defaults`: the spec requires literal defaults, and kernel additionally restricts
-/// them to primitive columns for parity with Spark, which does not emit non-primitive defaults on
-/// IcebergCompatV3 tables.
 ///
 /// Attention in the future:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3

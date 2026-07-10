@@ -349,33 +349,29 @@ mod feature_enabled {
         Ok(())
     }
 
-    /// Snapshot load rejects a non-literal default on an `icebergCompatV3` table. The V3
-    /// accept/reject matrix itself lives in the `check_v3_column_default` unit test in
-    /// `iceberg_compat::v3`; this only asserts the check is wired into snapshot load. A non-NULL
-    /// default on a non-primitive column is NOT rejected -- see
-    /// `test_load_tolerates_non_primitive_non_null_default`. Orphaned metadata is NOT rejected --
-    /// see `test_load_and_write_allow_orphan_default`.
+    /// On an `icebergCompatV3` table, a column default kernel cannot materialize (a non-literal
+    /// default, or a default on a non-primitive column) is a warning, not an error: the snapshot
+    /// loads and a DML transaction constructs without error. The V3 warning accept/reject matrix
+    /// itself lives in the `v3_column_default_warning` unit test in `iceberg_compat::v3`; this only
+    /// asserts kernel does not reject such a table on the read/write path.
     #[rstest]
-    #[case::v3_non_literal_default(
-        "v3_non_literal",
-        DataType::TIMESTAMP,
-        "current_timestamp()",
-        vec!["allowColumnDefaults", "icebergCompatV3"],
-        "literal"
+    #[case::non_literal("non_literal", DataType::TIMESTAMP, "current_timestamp()")]
+    #[case::non_primitive(
+        "non_primitive",
+        DataType::from(ArrayType::new(DataType::INTEGER, true)),
+        "ARRAY(1)"
     )]
     #[tokio::test]
-    async fn test_load_rejects_invalid_column_default(
+    async fn test_load_and_write_tolerate_v3_unmaterializable_default(
         #[case] label: &str,
         #[case] field_type: DataType,
         #[case] default_sql: &str,
-        #[case] writer_features: Vec<&str>,
-        #[case] error_needle: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let base = StructType::try_new(vec![StructField::nullable("c", field_type)])?;
         let schema = schema_with_column_defaults(&base, HashMap::from([("c", default_sql)]))?;
 
         let (store, engine, table_location) =
-            engine_store_setup(&format!("test_load_rejects_{label}"), None);
+            engine_store_setup(&format!("test_v3_tolerates_{label}"), None);
         let table_url = create_table(
             store,
             table_location,
@@ -383,15 +379,15 @@ mod feature_enabled {
             &[],    /* partition_columns */
             true,   /* use_37_protocol */
             vec![], /* reader_features */
-            writer_features,
+            vec!["allowColumnDefaults", "icebergCompatV3"],
         )
         .await?;
 
-        let err = Snapshot::builder_for(table_url)
-            .build(&engine)
-            .expect_err("invalid column default must be rejected at load")
-            .to_string();
-        assert!(err.contains(error_needle), "got: {err}");
+        // Read: the snapshot loads despite the unmaterializable default.
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+        // Write: a DML transaction constructs without error (a warning is logged, not returned).
+        snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
 
         Ok(())
     }
