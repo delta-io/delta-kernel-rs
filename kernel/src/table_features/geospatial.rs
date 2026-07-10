@@ -1,25 +1,23 @@
 //! Validation logic for the `geospatial` table feature.
 
-use std::borrow::Cow;
-
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
 use crate::transforms::SchemaTransform;
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{transform_output_type, DeltaResult, Error};
 
 struct UsesGeo(bool);
 
 impl<'a> SchemaTransform<'a> for UsesGeo {
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+    transform_output_type!(|'a, T| ());
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) {
         if matches!(
             ptype,
             PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)
         ) {
             self.0 = true;
         }
-        None
     }
 }
 
@@ -27,7 +25,7 @@ impl<'a> SchemaTransform<'a> for UsesGeo {
 /// including nested structs, arrays, and maps.
 pub(crate) fn schema_contains_geospatial(schema: &Schema) -> bool {
     let mut visitor = UsesGeo(false);
-    let _ = visitor.transform_struct(schema);
+    visitor.transform_struct(schema);
     visitor.0
 }
 

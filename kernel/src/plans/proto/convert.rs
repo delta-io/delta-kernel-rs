@@ -4,7 +4,7 @@ use super::plan::agg as proto_agg;
 use super::schema::data_type::Kind as DataTypeKind;
 use super::schema::metadata_value::Value as MetadataValueKind;
 use super::schema::primitive_type::Kind as PrimitiveTypeKind;
-use super::schema::SimplePrimitiveType as Simple;
+use super::schema::{EdgeInterpolationAlgorithm as EdgeAlgo, SimplePrimitiveType as Simple};
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -22,8 +22,8 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
-    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, DataType, DecimalType, EdgeInterpolationAlgorithm, GeographyType, GeometryType,
+    MapType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use crate::{DeltaResult, Error, FileMeta, FileSlice};
 
@@ -628,6 +628,12 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Timestamp => PrimitiveTypeKind::Simple(Simple::Timestamp as i32),
             PrimitiveType::TimestampNtz => PrimitiveTypeKind::Simple(Simple::TimestampNtz as i32),
             PrimitiveType::Decimal(decimal) => PrimitiveTypeKind::Decimal((*decimal).into()),
+            PrimitiveType::Geometry(geometry) => {
+                PrimitiveTypeKind::Geometry(geometry.as_ref().into())
+            }
+            PrimitiveType::Geography(geography) => {
+                PrimitiveTypeKind::Geography(geography.as_ref().into())
+            }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
             PrimitiveType::IntervalYearMonth => {
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
@@ -645,6 +651,35 @@ impl From<DecimalType> for proto_schema::DecimalType {
         proto_schema::DecimalType {
             precision: u32::from(decimal.precision()),
             scale: u32::from(decimal.scale()),
+        }
+    }
+}
+
+impl From<&GeometryType> for proto_schema::GeometryType {
+    fn from(geometry: &GeometryType) -> Self {
+        proto_schema::GeometryType {
+            srid: geometry.srid().to_string(),
+        }
+    }
+}
+
+impl From<&GeographyType> for proto_schema::GeographyType {
+    fn from(geography: &GeographyType) -> Self {
+        proto_schema::GeographyType {
+            srid: geography.srid().to_string(),
+            algorithm: EdgeAlgo::from(geography.algorithm()) as i32,
+        }
+    }
+}
+
+impl From<&EdgeInterpolationAlgorithm> for EdgeAlgo {
+    fn from(algorithm: &EdgeInterpolationAlgorithm) -> Self {
+        match algorithm {
+            EdgeInterpolationAlgorithm::Spherical => EdgeAlgo::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty => EdgeAlgo::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas => EdgeAlgo::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer => EdgeAlgo::Andoyer,
+            EdgeInterpolationAlgorithm::Karney => EdgeAlgo::Karney,
         }
     }
 }
@@ -792,6 +827,12 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                 }
             }
             PrimitiveTypeKind::Decimal(decimal) => PrimitiveType::Decimal(decimal.try_into()?),
+            PrimitiveTypeKind::Geometry(geometry) => {
+                PrimitiveType::Geometry(Box::new(geometry.try_into()?))
+            }
+            PrimitiveTypeKind::Geography(geography) => {
+                PrimitiveType::Geography(Box::new(geography.try_into()?))
+            }
         };
         Ok(primitive)
     }
@@ -806,6 +847,47 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
         let scale = u8::try_from(proto.scale)
             .map_err(|_| Error::invalid_decimal(format!("scale out of range: {}", proto.scale)))?;
         DecimalType::try_new(precision, scale)
+    }
+}
+
+impl TryFrom<proto_schema::GeometryType> for GeometryType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::GeometryType) -> DeltaResult<Self> {
+        GeometryType::try_new(&proto.srid)
+    }
+}
+
+impl TryFrom<proto_schema::GeographyType> for GeographyType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::GeographyType) -> DeltaResult<Self> {
+        let algorithm = EdgeAlgo::try_from(proto.algorithm)
+            .map_err(|_| {
+                Error::invalid_geo_params(format!(
+                    "unknown EdgeInterpolationAlgorithm value: {}",
+                    proto.algorithm
+                ))
+            })?
+            .try_into()?;
+        GeographyType::try_new(Some(&proto.srid), Some(algorithm))
+    }
+}
+
+impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
+    type Error = Error;
+    fn try_from(proto: EdgeAlgo) -> DeltaResult<Self> {
+        let algorithm = match proto {
+            EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
+            EdgeAlgo::Vincenty => EdgeInterpolationAlgorithm::Vincenty,
+            EdgeAlgo::Thomas => EdgeInterpolationAlgorithm::Thomas,
+            EdgeAlgo::Andoyer => EdgeInterpolationAlgorithm::Andoyer,
+            EdgeAlgo::Karney => EdgeInterpolationAlgorithm::Karney,
+            EdgeAlgo::Unspecified => {
+                return Err(Error::invalid_geo_params(
+                    "EdgeInterpolationAlgorithm is unspecified",
+                ))
+            }
+        };
+        Ok(algorithm)
     }
 }
 
@@ -886,8 +968,8 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType,
+        ArrayType, DataType, DecimalType, EdgeInterpolationAlgorithm, GeographyType, GeometryType,
+        MapType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType,
     };
     use crate::{DeltaResult, FileMeta, FileSlice};
 
@@ -2046,6 +2128,33 @@ mod tests {
         assert_data_type_round_trips(DataType::Primitive(
             PrimitiveType::decimal(precision, scale).unwrap(),
         ));
+    }
+
+    #[rstest]
+    #[case(GeometryType::default())]
+    #[case(GeometryType::try_new("EPSG:4326").unwrap())]
+    fn round_trip_geometry(#[case] geometry: GeometryType) {
+        assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geometry(Box::new(
+            geometry,
+        ))));
+    }
+
+    #[rstest]
+    fn round_trip_geography(
+        #[values(None, Some("EPSG:4326"))] srid: Option<&str>,
+        #[values(
+            EdgeInterpolationAlgorithm::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer,
+            EdgeInterpolationAlgorithm::Karney
+        )]
+        algorithm: EdgeInterpolationAlgorithm,
+    ) {
+        let geography = GeographyType::try_new(srid, Some(algorithm)).unwrap();
+        assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geography(Box::new(
+            geography,
+        ))));
     }
 
     #[rstest]
