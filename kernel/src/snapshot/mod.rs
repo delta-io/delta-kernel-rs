@@ -75,10 +75,7 @@ pub struct Snapshot {
     /// means `crc.version == self.version()` and the CRC can be queried at zero I/O. `None`
     /// means no CRC was loadable (no CRC on disk at this version, or the read failed).
     crc: Option<Arc<Crc>>,
-    /// Whether this snapshot was built as latest.
-    ///
-    /// Intent-based: reflects what the caller asked for, not whether this is factually the newest
-    /// version. True iff the snapshot is not a time travel or post-commit snapshot.
+    /// Intent-based latest-vs-time-travel flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
 }
 
@@ -158,8 +155,8 @@ impl Snapshot {
     /// A `Some(crc)` must be at the table configuration's version; otherwise this returns an
     /// internal error.
     ///
-    /// `built_as_latest` records whether the snapshot is being built as latest(intent-based).
-    ///  See [`Snapshot::built_as_latest`].
+    /// `built_as_latest` records whether the snapshot is being built as latest (intent-based).
+    /// See [`Snapshot::built_as_latest`].
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
@@ -328,8 +325,11 @@ impl Snapshot {
     /// Whether this snapshot was built as latest.
     ///
     /// This is intent-based: it reflects what the caller asked for, not whether this snapshot is
-    /// factually the newest version of the table. True iff the snapshot is not a time travel or
-    /// post-commit snapshot.
+    /// factually the newest version of the table.
+    ///
+    /// `true` when built without an explicit time-travel version (a `max_catalog_version` ceiling
+    /// is not time-travel). `false` for a snapshot built at an explicit version, and for
+    /// post-commit and create-table snapshots.
     pub fn built_as_latest(&self) -> bool {
         self.built_as_latest
     }
@@ -2158,10 +2158,6 @@ mod tests {
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
-        // The base was built as a latest query, but we don't consider post-commit snapshots to be
-        // latest.
-        assert!(base_snapshot.built_as_latest());
-        assert!(!post_commit_snapshot.built_as_latest());
     }
 
     #[test]

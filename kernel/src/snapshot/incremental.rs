@@ -90,17 +90,16 @@ impl Snapshot {
         target_version: impl Into<Option<Version>>,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
     ) -> DeltaResult<Arc<Self>> {
         let existing_log_segment = &existing_snapshot.log_segment;
         let existing_snapshot_version = existing_snapshot.version();
         let requested_version = target_version.into();
-        // Intent-based, no explicit target version means the snapshot will be built as latest.
-        let built_as_latest = requested_version.is_none();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
             // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
-                return Ok(existing_snapshot.clone());
+                return Self::reuse_with_intent(&existing_snapshot, built_as_latest);
             }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
@@ -147,7 +146,7 @@ impl Snapshot {
                 }
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => {
-                    return Ok(existing_snapshot.clone());
+                    return Self::reuse_with_intent(&existing_snapshot, built_as_latest);
                 }
             }
         }
@@ -200,7 +199,7 @@ impl Snapshot {
             // We must check checkpoint_version here: if a checkpoint at or below the existing
             // snapshot version was discovered, we still need to fall through to advance the
             // checkpoint base even though the version did not change.
-            return Ok(existing_snapshot.clone());
+            return Self::reuse_with_intent(&existing_snapshot, built_as_latest);
         }
 
         // Case F: lightweight P+M replay on new commits, merge with existing segment.
@@ -346,6 +345,23 @@ impl Snapshot {
     // ============================================================================
     // Helpers
     // ============================================================================
+
+    /// Return `existing` when its intent flag already matches `built_as_latest`,
+    /// otherwise a copy carrying the new flag.
+    fn reuse_with_intent(
+        existing: &Arc<Snapshot>,
+        built_as_latest: bool,
+    ) -> DeltaResult<Arc<Snapshot>> {
+        if existing.built_as_latest == built_as_latest {
+            return Ok(existing.clone());
+        }
+        Ok(Arc::new(Snapshot::new_with_crc(
+            existing.log_segment.clone(),
+            existing.table_configuration.clone(),
+            existing.crc.clone(),
+            built_as_latest,
+        )?))
+    }
 
     /// Determine the on-disk CRC file the combined segment should carry.
     ///
@@ -554,6 +570,7 @@ mod tests {
             None,
             SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
+            true, /* built_as_latest */
         )?;
         assert_eq!(result, base_snapshot);
 
@@ -631,6 +648,7 @@ mod tests {
             Some(2),
             SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
+            false, /* built_as_latest */
         )?;
 
         // Latest commit should now be version 2
@@ -689,6 +707,7 @@ mod tests {
             Some(1),
             SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
+            false, /* built_as_latest */
         )?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
@@ -700,6 +719,7 @@ mod tests {
             Some(0),
             SnapshotLoadMetricContext::default(),
             IncrementalReplay::Disabled,
+            false, /* built_as_latest */
         );
         assert!(matches!(
             older_version,
