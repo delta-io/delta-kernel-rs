@@ -17,6 +17,10 @@ pub trait UpdateTableClient: Send + Sync {
     async fn update_table(&self, request: UpdateTableRequest) -> Result<()>;
 }
 
+// The `CommitClient` and `GetCommitsClient` traits below back the legacy Delta-Commits path and
+// are superseded by `UpdateTableClient` (above). They will be deleted once the read and commit
+// paths are swapped onto the new Delta-Tables API.
+
 /// Trait for committing new versions to a UC-managed Delta table.
 ///
 /// Implementations of this trait are responsible for performing any necessary

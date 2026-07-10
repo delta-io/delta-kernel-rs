@@ -2,6 +2,15 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+// ============================================================================
+// Delta-Commits API (legacy)
+//
+// These types back the current Delta-Commits read/commit path. They are superseded by the
+// Delta-Tables types below (update_table / load_table) and will be deleted once the read and
+// commit paths are swapped onto the new API. Kept here so the crate and its downstream consumers
+// keep compiling during the migration.
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitsRequest {
     pub table_id: String,
@@ -121,7 +130,7 @@ impl CommitRequest {
 /// commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum Requirement {
+pub enum DeltaTableRequirement {
     /// Assert that the table being updated has the given UUID. Used to detect
     /// the case where a table has been dropped and recreated under the same
     /// name between the client's last read and this update.
@@ -134,7 +143,7 @@ pub enum Requirement {
 /// A typed update to apply atomically as part of an `update_table` call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "kebab-case")]
-pub enum Update {
+pub enum DeltaTableUpdate {
     /// Register a new staged commit with the catalog.
     AddCommit { commit: Commit },
     /// Inform the catalog of the latest published version.
@@ -148,19 +157,19 @@ pub enum Update {
 /// (`update_table`) request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateTableRequest {
-    /// Catalog name. Used for URL path only; not serialized.
+    /// Catalog name. Used for URL routing.
     #[serde(skip)]
     pub catalog: String,
-    /// Schema name. Used for URL path only; not serialized.
+    /// Schema name. Used for URL routing.
     #[serde(skip)]
     pub schema: String,
-    /// Table name. Used for URL path only; not serialized.
+    /// Table name. Used for URL routing.
     #[serde(skip)]
     pub table_name: String,
     /// Preconditions the catalog must validate.
-    pub requirements: Vec<Requirement>,
+    pub requirements: Vec<DeltaTableRequirement>,
     /// Updates to apply atomically.
-    pub updates: Vec<Update>,
+    pub updates: Vec<DeltaTableUpdate>,
 }
 
 impl UpdateTableRequest {
@@ -168,31 +177,47 @@ impl UpdateTableRequest {
         catalog: impl Into<String>,
         schema: impl Into<String>,
         table_name: impl Into<String>,
-        requirements: Vec<Requirement>,
-        updates: Vec<Update>,
-    ) -> Self {
-        Self {
+        requirements: Vec<DeltaTableRequirement>,
+        updates: Vec<DeltaTableUpdate>,
+    ) -> crate::error::Result<Self> {
+        let count = |is_variant: fn(&DeltaTableRequirement) -> bool| {
+            requirements.iter().filter(|r| is_variant(r)).count()
+        };
+        if count(|r| matches!(r, DeltaTableRequirement::AssertTableUuid { .. })) > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one AssertTableUuid requirement"
+                    .to_string(),
+            ));
+        }
+        if count(|r| matches!(r, DeltaTableRequirement::AssertEtag { .. })) > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one AssertEtag requirement"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
             catalog: catalog.into(),
             schema: schema.into(),
             table_name: table_name.into(),
             requirements,
             updates,
-        }
+        })
     }
 
     /// The table UUID asserted by this request's `AssertTableUuid` requirement, if present.
+    /// [`new`](Self::new) guarantees at most one such requirement.
     pub fn table_uuid(&self) -> Option<&str> {
         self.requirements.iter().find_map(|r| match r {
-            Requirement::AssertTableUuid { uuid } => Some(uuid.as_str()),
-            Requirement::AssertEtag { .. } => None,
+            DeltaTableRequirement::AssertTableUuid { uuid } => Some(uuid.as_str()),
+            _ => None,
         })
     }
 
     /// The `AddCommit` staged-commit reference in this request's updates, if present.
-    pub fn add_commit(&self) -> Option<&Commit> {
+    pub fn staged_commit(&self) -> Option<&Commit> {
         self.updates.iter().find_map(|u| match u {
-            Update::AddCommit { commit } => Some(commit),
-            Update::SetLatestBackfilledVersion { .. } => None,
+            DeltaTableUpdate::AddCommit { commit } => Some(commit),
+            _ => None,
         })
     }
 }
@@ -215,6 +240,7 @@ pub struct LoadTableResponse {
     #[serde(default)]
     pub commits: Vec<Commit>,
     /// Optional UniForm conversion metadata. Modeled as opaque JSON.
+    // TODO: decode into a typed struct once a consumer needs UniForm metadata.
     #[serde(default)]
     pub uniform: Option<serde_json::Value>,
     /// Highest version the catalog knows about, including data-only commits.
@@ -276,9 +302,10 @@ pub struct CatalogConfig {
 // Protocol wire type
 // ============================================================================
 
-/// Typed protocol fields used in read responses and credential vending.
+/// Typed Delta protocol wire model (mirrors kernel's `Protocol` action).
 ///
-/// Mirrors Delta's `Protocol` action.
+/// TODO: introduce `CreateTableRequest` and `CreateStagingTableResponse`, which both carry a
+/// typed `protocol` field.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Protocol {
@@ -334,7 +361,7 @@ mod tests {
 
     #[test]
     fn update_add_commit_wire_shape() {
-        let v = serde_json::to_value(Update::AddCommit {
+        let v = serde_json::to_value(DeltaTableUpdate::AddCommit {
             commit: sample_commit(),
         })
         .unwrap();
@@ -344,7 +371,7 @@ mod tests {
 
     #[test]
     fn update_set_latest_backfilled_version_wire_shape() {
-        let v = serde_json::to_value(Update::SetLatestBackfilledVersion {
+        let v = serde_json::to_value(DeltaTableUpdate::SetLatestBackfilledVersion {
             latest_published_version: 9,
         })
         .unwrap();
@@ -354,7 +381,7 @@ mod tests {
 
     #[test]
     fn requirement_assert_table_uuid_wire_shape() {
-        let v = serde_json::to_value(Requirement::AssertTableUuid {
+        let v = serde_json::to_value(DeltaTableRequirement::AssertTableUuid {
             uuid: "abc".to_string(),
         })
         .unwrap();
@@ -364,7 +391,7 @@ mod tests {
 
     #[test]
     fn requirement_assert_etag_wire_shape() {
-        let v = serde_json::to_value(Requirement::AssertEtag {
+        let v = serde_json::to_value(DeltaTableRequirement::AssertEtag {
             etag: "e1".to_string(),
         })
         .unwrap();
@@ -384,7 +411,7 @@ mod tests {
 
     #[test]
     fn update_table_request_skips_routing_fields() {
-        let req = UpdateTableRequest::new("cat", "sch", "tbl", vec![], vec![]);
+        let req = UpdateTableRequest::new("cat", "sch", "tbl", vec![], vec![]).unwrap();
         let v = serde_json::to_value(&req).unwrap();
         let obj = v.as_object().unwrap();
         for key in ["catalog", "schema", "table_name", "table-name"] {
@@ -395,6 +422,94 @@ mod tests {
         }
         assert!(obj.contains_key("requirements"));
         assert!(obj.contains_key("updates"));
+    }
+
+    #[test]
+    fn table_uuid_returns_none_when_only_etag_requirement_present() {
+        let req = UpdateTableRequest::new(
+            "c",
+            "s",
+            "t",
+            vec![DeltaTableRequirement::AssertEtag { etag: "e1".into() }],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(req.table_uuid(), None);
+    }
+
+    #[test]
+    fn table_uuid_returns_uuid_when_assert_table_uuid_present() {
+        let req = UpdateTableRequest::new(
+            "c",
+            "s",
+            "t",
+            vec![DeltaTableRequirement::AssertTableUuid { uuid: "abc".into() }],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(req.table_uuid(), Some("abc"));
+    }
+
+    #[test]
+    fn new_rejects_duplicate_requirements() {
+        for dup in [
+            vec![
+                DeltaTableRequirement::AssertTableUuid { uuid: "a".into() },
+                DeltaTableRequirement::AssertTableUuid { uuid: "b".into() },
+            ],
+            vec![
+                DeltaTableRequirement::AssertEtag { etag: "e1".into() },
+                DeltaTableRequirement::AssertEtag { etag: "e2".into() },
+            ],
+        ] {
+            assert!(
+                UpdateTableRequest::new("c", "s", "t", dup, vec![]).is_err(),
+                "duplicate requirement of the same type must be rejected"
+            );
+        }
+
+        // One of each type is allowed.
+        assert!(UpdateTableRequest::new(
+            "c",
+            "s",
+            "t",
+            vec![
+                DeltaTableRequirement::AssertTableUuid { uuid: "a".into() },
+                DeltaTableRequirement::AssertEtag { etag: "e1".into() },
+            ],
+            vec![],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn staged_commit_returns_commit_when_add_commit_present() {
+        let req = UpdateTableRequest::new(
+            "c",
+            "s",
+            "t",
+            vec![],
+            vec![DeltaTableUpdate::AddCommit {
+                commit: sample_commit(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(req.staged_commit(), Some(&sample_commit()));
+    }
+
+    #[test]
+    fn staged_commit_returns_none_when_no_add_commit_present() {
+        let req = UpdateTableRequest::new(
+            "c",
+            "s",
+            "t",
+            vec![],
+            vec![DeltaTableUpdate::SetLatestBackfilledVersion {
+                latest_published_version: 9,
+            }],
+        )
+        .unwrap();
+        assert_eq!(req.staged_commit(), None);
     }
 
     #[test]
