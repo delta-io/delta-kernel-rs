@@ -169,14 +169,14 @@ fn peek_second(chars: &CharStream<'_>) -> Option<char> {
 /// Consume a `'...'` string literal, returning its raw text *including* the surrounding quotes and
 /// any doubled `''` escapes.
 ///
-/// Example: `'it''s'` returns `'it''s'` (verbatim). The caller must guarantee a leading `'`.
+/// Example: `'it''s'` returns `'it''s'` (verbatim). Returns an error if the input does not start
+/// with a `'`.
 fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<String> {
-    debug_assert_eq!(
-        chars.peek(),
-        Some(&'\''),
-        "take_quoted_string requires a leading quote"
-    );
-    chars.next();
+    if chars.next_if_eq(&'\'').is_none() {
+        return Err(Error::generic(format!(
+            "string literal must start with a quote in {sql}"
+        )));
+    }
     let mut out = String::from('\'');
     loop {
         match chars.next() {
@@ -203,12 +203,9 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
 /// leading `+`/`-` is a separate operator token (see the `Plus`/`Minus` arms), not consumed here;
 /// the exponent's own sign (`2e+1`) is part of the number.
 ///
-/// A leading dot needs no digit before it, so `.2` is a number. The `.` is not validated: `3.14159`
-/// and `0.2` are numbers, as is a malformed `1.2.3` (emitted verbatim). `3/4` is not a number: `/`
-/// is not consumed, so only the `3` is taken.
-///
-/// Examples: `3.14159` -> `3.14159`; `.2` -> `.2`; `2e+1` -> `2e+1`. Stops before a second
-/// operator, so `1+1` yields just `1`.
+/// Examples: `3.14159` -> `3.14159`; `.2` -> `.2` (no leading digit needed); `2e+1` -> `2e+1`;
+/// `1.2.3` -> `1.2.3` (malformed, emitted verbatim); `3/4` -> `3` (stops at `/`); `1+1` -> `1`
+/// (stops before a second operator).
 fn take_number(chars: &mut CharStream<'_>) -> String {
     let mut out = String::new();
     while let Some(c) = chars.next_if(|c| c.is_ascii_digit() || *c == '.') {
