@@ -58,7 +58,7 @@ pub(super) enum Keyword {
 }
 
 /// Tokenize `sql`, or return an error for any character/run outside the recognized token set (e.g.
-/// arithmetic operators, parentheses, an unterminated string).
+/// parentheses, `*` or `/`, a lone `!`, or an unterminated string).
 pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
     let mut chars = sql.chars().peekable();
     let mut tokens = Vec::new();
@@ -171,6 +171,11 @@ fn peek_second(chars: &CharStream<'_>) -> Option<char> {
 ///
 /// Example: `'it''s'` returns `'it''s'` (verbatim). The caller must guarantee a leading `'`.
 fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<String> {
+    debug_assert_eq!(
+        chars.peek(),
+        Some(&'\''),
+        "take_quoted_string requires a leading quote"
+    );
     chars.next();
     let mut out = String::from('\'');
     loop {
@@ -194,11 +199,16 @@ fn take_quoted_string(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Stri
     }
 }
 
-/// Consume an unsigned numeric literal: integer/fraction digits and an optional exponent. A leading
-/// `+`/`-` is a separate operator token (see the `Plus`/`Minus` arms), not consumed here; the
-/// exponent's own sign (`2e+1`) is part of the number.
+/// Consume an unsigned numeric literal: a run of digits and `.` followed by an optional exponent. A
+/// leading `+`/`-` is a separate operator token (see the `Plus`/`Minus` arms), not consumed here;
+/// the exponent's own sign (`2e+1`) is part of the number.
 ///
-/// Example: `2e+1` returns `2e+1`. Stops before a second operator, so `1+1` yields just `1`.
+/// A leading dot needs no digit before it, so `.2` is a number. The `.` is not validated: `3.14159`
+/// and `0.2` are numbers, as is a malformed `1.2.3` (emitted verbatim). `3/4` is not a number: `/`
+/// is not consumed, so only the `3` is taken.
+///
+/// Examples: `3.14159` -> `3.14159`; `.2` -> `.2`; `2e+1` -> `2e+1`. Stops before a second
+/// operator, so `1+1` yields just `1`.
 fn take_number(chars: &mut CharStream<'_>) -> String {
     let mut out = String::new();
     while let Some(c) = chars.next_if(|c| c.is_ascii_digit() || *c == '.') {
@@ -250,7 +260,9 @@ fn classify_word(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Token> {
     Ok(token)
 }
 
-/// Peek (without consuming) past any whitespace to see whether the next character is a `'`.
+/// Peek (without consuming) past any whitespace to see whether the next character is a `'`. Used to
+/// tell a typed literal from a plain identifier: in `TIMESTAMP '..'` a quote follows (true), but a
+/// bare `timestamp` column has none (false).
 fn quote_follows(chars: &CharStream<'_>) -> bool {
     let mut lookahead = chars.clone();
     while matches!(lookahead.peek(), Some(c) if c.is_whitespace()) {
