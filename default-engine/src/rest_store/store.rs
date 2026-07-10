@@ -125,9 +125,9 @@ impl RestObjectStore {
     /// error). Reads the object back to distinguish a write that landed (success) from a real
     /// conflict, retrying only while the write is confirmed absent.
     ///
-    /// Does not call [`Self::ensure_success_response`] directly: HTTP 5xx is treated as ambiguous
-    /// (retry + read-back), not as a terminal error. Typed conflicts follow the first-attempt vs
-    /// retry rules below.
+    /// Does not call [`Self::ensure_success_response`] directly on every status: policy is encoded
+    /// in [`Self::classify_put_create_response`]. HTTP 5xx and retry-time 409 are ambiguous
+    /// (read-back + retry), not terminal errors.
     ///
     /// A `409` (conflict) on the *first* attempt is a genuine pre-existing object and returns
     /// `AlreadyExists` immediately. On a *retry*, a `409` is most likely the writer's own
@@ -147,7 +147,7 @@ impl RestObjectStore {
         let mut last_failure = None::<RetryFailure>;
         loop {
             // Fetch headers per attempt so a refreshable provider can produce a fresh token.
-            match self
+            let disposition = match self
                 .client
                 .put(url)
                 .query(query)
@@ -156,32 +156,24 @@ impl RestObjectStore {
                 .send()
                 .await
             {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if let Some(err) = self.typed_http_error(status, path) {
-                        // A conflict on a retry may be our own landed write, so reconcile it via
-                        // read-back rather than trusting it; on the first attempt it is a genuine
-                        // pre-existing conflict and is returned as-is.
-                        let conflict = matches!(err, ObjectStoreError::AlreadyExists { .. });
-                        if !(conflict && retries > 0) {
-                            return Err(err);
-                        }
-                        last_failure = Some(RetryFailure::ServerError(status));
-                    } else if !is_retryable_http_status(status) {
-                        self.ensure_success_response(resp, path)?;
-                        if retries > 0 {
-                            log_retry_outcome(path, retries, last_failure.as_ref().unwrap(), true);
-                        }
-                        return Ok(put_result());
-                    } else {
-                        last_failure = Some(RetryFailure::ServerError(status));
-                    }
-                }
-                Err(e) if is_transient(&e) => {
-                    last_failure = Some(RetryFailure::Transport(e.to_string()));
-                }
+                Ok(resp) => self.classify_put_create_response(resp, path, retries)?,
+                Err(e) if is_transient(&e) => PutCreateDisposition::Ambiguous {
+                    failure: RetryFailure::Transport(e.to_string()),
+                },
                 Err(e) => return Err(generic_error(e)),
+            };
+
+            match disposition {
+                PutCreateDisposition::Success => {
+                    if retries > 0 {
+                        log_retry_outcome(path, retries, last_failure.as_ref().unwrap(), true);
+                    }
+                    return Ok(put_result());
+                }
+                PutCreateDisposition::Terminal(err) => return Err(err),
+                PutCreateDisposition::Ambiguous { failure } => last_failure = Some(failure),
             }
+
             // Ambiguous outcome -- read back to tell a landed write from a real conflict. A
             // transient read-back failure leaves the outcome ambiguous, so treat it like an absent
             // write and consume a retry rather than making it terminal.
@@ -214,7 +206,8 @@ impl RestObjectStore {
                     log_retry_outcome(path, retries, failure, false);
                 }
                 return Err(generic_error(format!(
-                    "put could not confirm write for `{path}`"
+                    "exceeded max retries ({}) during put for `{path}` without confirming the write landed",
+                    self.max_retries
                 )));
             }
             retries += 1;
@@ -257,7 +250,8 @@ impl RestObjectStore {
     //    `error_for_status` turns any remaining failure into [`ObjectStoreError::Generic`].
     //
     // Most callers use [`Self::ensure_success_response`], which applies (2) then (3). List and
-    // verified-create have extra rules documented on their helpers.
+    // verified-create encode extra rules in [`Self::ensure_list_response`] and
+    // [`Self::classify_put_create_response`].
 
     /// If `status` maps to a typed [`ObjectStoreError`] (`404`, `409`, ...), return it. Returns
     /// `None` for 2xx and for statuses with no typed mapping (see
@@ -314,6 +308,39 @@ impl RestObjectStore {
             return Err(err);
         }
         Ok(Some(Self::reject_remaining_non_success(response)?))
+    }
+
+    /// Classify a verified-create PUT response: success, a terminal error, or an ambiguous
+    /// outcome that requires read-back reconciliation.
+    ///
+    /// - **Success** -- 2xx after [`Self::reject_remaining_non_success`] validation.
+    /// - **Terminal** -- definite failure (`404`, first-attempt `409`, or other non-retryable 4xx).
+    /// - **Ambiguous** -- retryable 5xx, or `409` on a retry (may be our own landed write).
+    fn classify_put_create_response(
+        &self,
+        response: reqwest::Response,
+        path: &str,
+        retries: u32,
+    ) -> ObjectStoreResult<PutCreateDisposition> {
+        let status = response.status();
+        if status.is_success() {
+            Self::reject_remaining_non_success(response)?;
+            return Ok(PutCreateDisposition::Success);
+        }
+        if let Some(err) = self.typed_http_error(status, path) {
+            if matches!(err, ObjectStoreError::AlreadyExists { .. }) && retries > 0 {
+                return Ok(PutCreateDisposition::Ambiguous {
+                    failure: RetryFailure::ServerError(status),
+                });
+            }
+            return Ok(PutCreateDisposition::Terminal(err));
+        }
+        if is_retryable_http_status(status) {
+            return Ok(PutCreateDisposition::Ambiguous {
+                failure: RetryFailure::ServerError(status),
+            });
+        }
+        Self::reject_remaining_non_success(response).map(|_| PutCreateDisposition::Success)
     }
 
     /// GET `path` (optionally with a `Range` header) and return the body, response headers, and
@@ -520,6 +547,13 @@ enum WriteState {
     Absent,
 }
 
+/// How [`RestObjectStore::put_create_verified`] should treat a PUT attempt.
+enum PutCreateDisposition {
+    Success,
+    Terminal(ObjectStoreError),
+    Ambiguous { failure: RetryFailure },
+}
+
 /// The last failure that triggered a retry.
 enum RetryFailure {
     ServerError(reqwest::StatusCode),
@@ -597,6 +631,10 @@ impl ObjectStore for RestObjectStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
         let path_str = location.as_ref().trim_end_matches('/');
 
+        if let Some(range) = &options.range {
+            range.is_valid().map_err(generic_error)?;
+        }
+
         // A head-only request resolves metadata via HTTP HEAD and returns an empty body, so we
         // don't download the object just to read its size/etag (e.g. parquet footer probes).
         if options.head {
@@ -606,17 +644,6 @@ impl ObjectStore for RestObjectStore {
             return Ok(GetResult {
                 payload: GetResultPayload::Stream(Box::pin(futures::stream::empty())),
                 range: 0..size,
-                meta,
-                attributes: Attributes::new(),
-            });
-        }
-
-        if matches!(options.range.as_ref(), Some(GetRange::Bounded(r)) if r.is_empty()) {
-            let meta = self.head_meta(path_str, location).await?;
-            options.check_preconditions(&meta)?;
-            return Ok(GetResult {
-                payload: GetResultPayload::Stream(Box::pin(futures::stream::empty())),
-                range: 0..0,
                 meta,
                 attributes: Attributes::new(),
             });

@@ -22,7 +22,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, Error, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -573,12 +573,17 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
     delta_kernel::try_parse_uri(path)
 }
 
-/// A builder that allows setting options on the `Engine` before actually building it
+/// A builder that allows setting options on the `Engine` before actually building it.
+///
+/// For a normal object store backend, `url` is the table storage location (`s3://…`, `file://…`).
+/// For REST (`store.backend` = `rest` via [`set_builder_option`]), `url` is the REST service base
+/// URL; see [`rest_engine`] for dialect, TLS, and auth options.
 #[cfg(feature = "default-engine-base")]
 pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
+    auth_callback: Option<rest_engine::FfiAuthHeaderProvider>,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
@@ -638,6 +643,7 @@ fn get_engine_builder_impl(
         url: url?,
         allocate_fn,
         options: HashMap::default(),
+        auth_callback: None,
         multithreaded_executor_config: None,
         io_config: IoConcurrencyConfig::default(),
     });
@@ -727,6 +733,28 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
     };
 }
 
+/// Register a [`rest_engine::CAuthHeaderCallback`] supplying per-request auth headers for a REST
+/// backend (`store.backend` = `rest`). When set, the callback supplies the full header set and
+/// static `header.<Name>` options are ignored. `context` is passed back on each invocation and
+/// must remain valid until the engine produced by [`builder_build`] is freed.
+///
+/// IMPORTANT: The pointer passed for `context` MUST be thread-safe (i.e. safe to send between
+/// threads) and MUST remain valid for as long as the built engine is used. It is valid to pass
+/// NULL as the context.
+///
+/// # Safety
+/// Caller must pass a valid builder pointer; `callback` and `context` must stay valid for the
+/// lifetime of the built engine.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_auth_callback(
+    builder: &mut EngineBuilder,
+    callback: rest_engine::CAuthHeaderCallback,
+    context: NullableCvoid,
+) {
+    builder.auth_callback = Some(rest_engine::FfiAuthHeaderProvider::new(callback, context));
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -744,6 +772,7 @@ pub unsafe extern "C" fn builder_build(
     get_default_engine_impl(
         builder_box.url,
         builder_box.options,
+        builder_box.auth_callback,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
         builder_box.allocate_fn,
@@ -774,6 +803,7 @@ fn get_default_default_engine_impl(
         url?,
         Default::default(),
         None,
+        None,
         IoConcurrencyConfig::default(),
         allocate_error,
     )
@@ -802,18 +832,30 @@ fn engine_to_handle(
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
+    auth_callback: Option<rest_engine::FfiAuthHeaderProvider>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
-    let store = store_from_url_opts(&url, options)?;
+    let store = if rest_engine::uses_rest_backend(&options)? {
+        rest_engine::build_rest_object_store(&url, &options, auth_callback)?
+    } else {
+        if auth_callback.is_some() {
+            return Err(Error::generic(format!(
+                "set_builder_auth_callback requires `{}` = `{}`",
+                rest_engine::STORE_BACKEND_KEY,
+                rest_engine::STORE_BACKEND_REST
+            )));
+        }
+        store_from_url_opts(&url, options)?
+    };
     build_engine_from_store(store, executor_config, io_config, allocate_error)
 }
 
 /// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
-/// tuning. Shared by the URL-scheme engine builder and the REST engine builder.
+/// tuning. Shared by the URL-scheme and REST engine builder paths.
 #[cfg(feature = "default-engine-base")]
 pub(crate) fn build_engine_from_store(
     store: Arc<dyn ObjectStore>,

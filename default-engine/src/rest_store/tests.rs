@@ -425,15 +425,10 @@ async fn list_rejects_non_integer_size() {
 }
 
 #[tokio::test]
-async fn get_empty_bounded_range_returns_no_bytes() {
+async fn get_empty_bounded_range_is_invalid() {
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path("/files/a.txt"))
-        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "5"))
-        .mount(&server)
-        .await;
     let store = store_for(&server, HeaderMap::new());
-    let result = store
+    let err = store
         .get_opts(
             &Path::from("a.txt"),
             GetOptions {
@@ -442,9 +437,14 @@ async fn get_empty_bounded_range_returns_no_bytes() {
             },
         )
         .await
-        .unwrap();
-    assert_eq!(result.range, 0..0);
-    assert_eq!(result.bytes().await.unwrap().len(), 0);
+        .unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Generic { .. }),
+        "got {err:?}"
+    );
+    assert!(err
+        .to_string()
+        .contains("Range started at 0 and ended at 0"));
 }
 
 /// `list_with_offset` must exclude the offset entry itself even if the backend echoes it
