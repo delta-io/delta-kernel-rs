@@ -23,7 +23,7 @@ use super::config::RestEndpointConfig;
 use super::generic_error;
 use super::response::{
     classify_put_create_response, ensure_list_response, ensure_success_response,
-    is_retryable_http_status, PutCreateDisposition, RetryFailure,
+    is_retryable_http_status, is_transient, PutCreateDisposition, RetryFailure,
 };
 
 /// A generic REST/HTTP-backed [`ObjectStore`]. See the [module docs](super).
@@ -150,21 +150,17 @@ impl RestObjectStore {
         let mut last_failure = None::<RetryFailure>;
         loop {
             // Fetch headers per attempt so a refreshable provider can produce a fresh token.
-            let disposition = match self
-                .client
-                .put(url)
-                .query(query)
-                .headers(self.headers()?)
-                .body(body.clone())
-                .send()
-                .await
-            {
-                Ok(resp) => classify_put_create_response(resp, path, retries)?,
-                Err(e) if is_transient(&e) => PutCreateDisposition::Ambiguous {
-                    failure: RetryFailure::Transport(e.to_string()),
-                },
-                Err(e) => return Err(generic_error(e)),
-            };
+            let disposition = classify_put_create_response(
+                self.client
+                    .put(url)
+                    .query(query)
+                    .headers(self.headers()?)
+                    .body(body.clone())
+                    .send()
+                    .await,
+                path,
+                retries,
+            )?;
 
             match disposition {
                 PutCreateDisposition::Success => {
@@ -231,7 +227,7 @@ impl RestObjectStore {
     /// Delete a single object via HTTP `DELETE`. DELETE is idempotent, so transient failures are
     /// retried via [`Self::send_idempotent`].
     async fn delete_one(&self, location: &Path) -> ObjectStoreResult<()> {
-        let path = location.as_ref().trim_end_matches('/');
+        let path = location.as_ref();
         let url = self.config.file_url(&self.base_url, path);
         let response = self
             .send_idempotent(path, |c, h| c.delete(&url).headers(h))
@@ -463,13 +459,6 @@ fn log_retry_outcome(target: &str, retries: u32, last_failure: &RetryFailure, su
     }
 }
 
-/// Transport-level failures worth retrying for an idempotent request.
-fn is_transient(err: &reqwest::Error) -> bool {
-    err.is_timeout()
-        || err.is_connect()
-        || ((err.is_request() || err.is_body()) && err.status().is_none())
-}
-
 /// Exponential backoff for retry `n` (1-based): 100ms doubling, capped at 2s. `n.min(6)` bounds
 /// the shift (`50 << 6` already exceeds the ceiling).
 async fn backoff(n: u32) {
@@ -499,7 +488,7 @@ fn parse_etag(headers: &HeaderMap) -> Option<String> {
 #[async_trait]
 impl ObjectStore for RestObjectStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        let path_str = location.as_ref().trim_end_matches('/');
+        let path_str = location.as_ref();
 
         if let Some(range) = &options.range {
             range.is_valid().map_err(generic_error)?;
@@ -597,7 +586,7 @@ impl ObjectStore for RestObjectStore {
             PutMode::Create => false,
             PutMode::Update(_) => return Err(not_supported("PutMode::Update")),
         };
-        let path_str = location.as_ref().trim_end_matches('/');
+        let path_str = location.as_ref();
         let url = self.config.file_url(&self.base_url, path_str);
         let query = self.config.put_query(overwrite);
         let body: Bytes = payload.into();

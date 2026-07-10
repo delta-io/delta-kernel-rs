@@ -1,11 +1,10 @@
 //! REST [`RestObjectStore`] support for [`EngineBuilder`](crate::EngineBuilder).
 //!
-//! Set `store.backend` to `rest` via [`set_builder_option`](crate::set_builder_option), then
-//! configure the REST file API dialect (the [`RestEndpointConfig`] field names), request headers
-//! (`header.<Name>`), TLS (`tls.*`), and resilience (`retry.max_retries`,
-//! `put.verify_on_ambiguous`). The builder `url` is the REST service base URL (not a Delta table
-//! path). Optionally register a per-request auth callback via
-//! [`set_builder_auth_callback`](crate::set_builder_auth_callback).
+//! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) to select the REST
+//! backend, then configure the REST file API dialect (the [`RestEndpointConfig`] field names),
+//! request headers (`header.<Name>`), TLS (`tls.*`), and resilience (`retry.max_retries`,
+//! `put.verify_on_ambiguous`) via [`set_builder_option`](crate::set_builder_option). The builder
+//! `url` is the REST service base URL (not a Delta table path).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,10 +20,9 @@ use url::Url;
 
 use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
-/// [`set_builder_option`](crate::set_builder_option) key selecting the REST object store backend.
+/// [`set_builder_option`](crate::set_builder_option) key for the legacy REST backend selector.
+/// Use [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) instead.
 pub(crate) const STORE_BACKEND_KEY: &str = "store.backend";
-/// Value of [`STORE_BACKEND_KEY`] that builds a [`RestObjectStore`].
-pub(crate) const STORE_BACKEND_REST: &str = "rest";
 
 /// Output buffer for a [`CAuthHeaderCallback`] invocation.
 ///
@@ -33,7 +31,9 @@ pub(crate) const STORE_BACKEND_REST: &str = "rest";
 /// or keep the pointer after the callback returns.
 #[repr(C)]
 pub struct CAuthHeaderCollector {
-    _private: [u8; 0],
+    // Not ZST: cbindgen emits `[u8; 0]` as a zero-length array, which ISO C rejects under
+    // -Wpedantic.
+    _private: u8,
 }
 
 /// Supplies auth headers for a REST-backed engine.
@@ -45,8 +45,8 @@ pub struct CAuthHeaderCollector {
 /// request.
 ///
 /// `context` is the opaque pointer registered via
-/// [`set_builder_auth_callback`](crate::set_builder_auth_callback). Both pointers are only valid
-/// for the duration of the call and must not be retained.
+/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). Both pointers are only
+/// valid for the duration of the call and must not be retained.
 ///
 /// Named emit exports (rather than function-pointer arguments) allow FFI runtimes that cannot
 /// invoke arbitrary function pointers (e.g. JNR-FFI) to emit headers via bound symbols.
@@ -128,15 +128,18 @@ pub unsafe extern "C" fn rest_engine_emit_auth_ttl(out: *mut CAuthHeaderCollecto
     emission.ttl_ms = Some(ttl_ms);
 }
 
-/// Returns whether `options` select the REST object store backend.
-pub(crate) fn uses_rest_backend(options: &HashMap<String, String>) -> DeltaResult<bool> {
-    match options.get(STORE_BACKEND_KEY) {
-        None => Ok(false),
-        Some(v) if v == STORE_BACKEND_REST => Ok(true),
-        Some(v) => Err(Error::generic(format!(
-            "invalid {STORE_BACKEND_KEY} `{v}`: expected `{STORE_BACKEND_REST}` or omit"
-        ))),
+/// Reject the legacy `store.backend` builder option; REST is enabled via
+/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
+pub(crate) fn reject_legacy_store_backend_option(
+    options: &HashMap<String, String>,
+) -> DeltaResult<()> {
+    if options.contains_key(STORE_BACKEND_KEY) {
+        return Err(Error::generic(format!(
+            "do not set `{STORE_BACKEND_KEY}` via set_builder_option; \
+             call set_builder_rest_object_store instead"
+        )));
     }
+    Ok(())
 }
 
 /// Build a [`RestObjectStore`] from an engine builder's URL, options, and optional auth callback.
@@ -247,27 +250,6 @@ fn parse_bool_option(key: &str, value: Option<&String>) -> DeltaResult<bool> {
     }
 }
 
-/// Minimal dialect options for unit tests.
-#[cfg(test)]
-fn test_dialect_options() -> HashMap<String, String> {
-    [
-        (STORE_BACKEND_KEY, STORE_BACKEND_REST),
-        ("page_token_param", "page_token"),
-        ("start_from_param", "start_from"),
-        ("recursive_param", "recursive"),
-        ("overwrite_param", "overwrite"),
-        ("contents_field", "contents"),
-        ("next_page_token_field", "next_page_token"),
-        ("entry_path_field", "path"),
-        ("entry_size_field", "size"),
-        ("entry_is_directory_field", "is_directory"),
-        ("entry_last_modified_field", "last_modified"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use url::Url;
@@ -279,23 +261,29 @@ mod tests {
         Url::parse("http://localhost/").unwrap()
     }
 
-    #[test]
-    fn uses_rest_backend_false_when_unset() {
-        assert!(!uses_rest_backend(&HashMap::new()).unwrap());
+    fn test_dialect_options() -> HashMap<String, String> {
+        [
+            ("page_token_param", "page_token"),
+            ("start_from_param", "start_from"),
+            ("recursive_param", "recursive"),
+            ("overwrite_param", "overwrite"),
+            ("contents_field", "contents"),
+            ("next_page_token_field", "next_page_token"),
+            ("entry_path_field", "path"),
+            ("entry_size_field", "size"),
+            ("entry_is_directory_field", "is_directory"),
+            ("entry_last_modified_field", "last_modified"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
     }
 
     #[test]
-    fn uses_rest_backend_true_when_rest() {
+    fn reject_legacy_store_backend_option_errors() {
         let mut options = HashMap::new();
-        options.insert(STORE_BACKEND_KEY.into(), STORE_BACKEND_REST.into());
-        assert!(uses_rest_backend(&options).unwrap());
-    }
-
-    #[test]
-    fn uses_rest_backend_rejects_unknown_value() {
-        let mut options = HashMap::new();
-        options.insert(STORE_BACKEND_KEY.into(), "s3".into());
-        assert!(uses_rest_backend(&options).is_err());
+        options.insert(STORE_BACKEND_KEY.into(), "rest".into());
+        assert!(reject_legacy_store_backend_option(&options).is_err());
     }
 
     #[test]
@@ -311,11 +299,7 @@ mod tests {
 
     #[test]
     fn build_rejects_missing_dialect_option() {
-        let options = HashMap::from([(
-            STORE_BACKEND_KEY.to_string(),
-            STORE_BACKEND_REST.to_string(),
-        )]);
-        assert!(build_rest_object_store(&test_base_url(), &options, None).is_err());
+        assert!(build_rest_object_store(&test_base_url(), &HashMap::new(), None).is_err());
     }
 
     #[test]

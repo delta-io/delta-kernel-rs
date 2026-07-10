@@ -2,9 +2,8 @@
 //!
 //! Three separate concerns show up across REST calls:
 //!
-//! 1. **Retry classification** ([`is_retryable_http_status`], transport-level transient errors) --
-//!    5xx / dropped connections may succeed on another attempt. These are *not* terminal errors
-//!    yet.
+//! 1. **Retry classification** ([`is_retryable_http_status`], [`is_transient`]) -- 5xx / dropped
+//!    connections may succeed on another attempt. These are *not* terminal errors yet.
 //! 2. **Typed mapping** ([`typed_http_error`]) -- select status codes become specific
 //!    [`ObjectStoreError`] variants (`404 -> NotFound`, `409 -> AlreadyExists`). Returns `None` for
 //!    2xx and for statuses with no typed mapping.
@@ -44,6 +43,13 @@ pub(crate) enum PutCreateDisposition {
 /// HTTP 5xx may succeed on retry; callers classify it before mapping to a terminal error.
 pub(crate) fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error()
+}
+
+/// Transport-level failures worth retrying for an idempotent request.
+pub(crate) fn is_transient(err: &reqwest::Error) -> bool {
+    err.is_timeout()
+        || err.is_connect()
+        || ((err.is_request() || err.is_body()) && err.status().is_none())
 }
 
 /// If `status` maps to a typed [`ObjectStoreError`] (`404`, `409`, ...), return it. Returns `None`
@@ -99,17 +105,28 @@ pub(crate) fn ensure_list_response(
     Ok(Some(reject_remaining_non_success(response)?))
 }
 
-/// Classify a verified-create PUT response: success, a terminal error, or an ambiguous outcome
-/// that requires read-back reconciliation.
+/// Classify a verified-create PUT attempt: success, a terminal error, or an ambiguous outcome that
+/// requires read-back reconciliation.
 ///
 /// - **Success** -- 2xx after [`reject_remaining_non_success`] validation.
-/// - **Terminal** -- definite failure (`404`, first-attempt `409`, or other non-retryable 4xx).
-/// - **Ambiguous** -- retryable 5xx, or `409` on a retry (may be our own landed write).
+/// - **Terminal** -- definite failure (`404`, first-attempt `409`, other non-retryable 4xx, or
+///   non-transient transport error).
+/// - **Ambiguous** -- retryable 5xx, `409` on a retry (may be our own landed write), or transient
+///   transport error.
 pub(crate) fn classify_put_create_response(
-    response: reqwest::Response,
+    response: Result<reqwest::Response, reqwest::Error>,
     path: &str,
     retries: u32,
 ) -> ObjectStoreResult<PutCreateDisposition> {
+    let response = match response {
+        Ok(resp) => resp,
+        Err(e) if is_transient(&e) => {
+            return Ok(PutCreateDisposition::Ambiguous {
+                failure: RetryFailure::Transport(e.to_string()),
+            });
+        }
+        Err(e) => return Err(generic_error(e)),
+    };
     let status = response.status();
     if status.is_success() {
         reject_remaining_non_success(response)?;
