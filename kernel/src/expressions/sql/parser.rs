@@ -9,14 +9,18 @@
 // TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
 #![allow(dead_code)]
 
+use std::iter::Peekable;
+use std::vec;
+
 use super::token::Token;
+use crate::expressions::ColumnName;
 use crate::{DeltaResult, Error};
 
-/// An operand of a comparison: a column reference (raw path segments, as written) or a literal
-/// (raw source text, e.g. `42`, `'foo'`, `NULL`). Both are resolved/typed during lowering.
+/// An operand of a comparison: a column reference (its as-written path) or a literal (raw source
+/// text, e.g. `42`, `'foo'`, `NULL`). Both are resolved/typed during lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Operand {
-    Column(Vec<String>),
+    Column(ColumnName),
     Literal(String),
 }
 
@@ -30,12 +34,11 @@ pub(super) enum CmpOp {
     Ge,
     Eq,
     Ne,
-    /// `<=>`, null-safe equality; lowering maps it to a not-distinct predicate.
+    /// `<=>`, null-safe equality; lowering maps it to `not(distinct(..))`.
     NullSafeEq,
 }
 
-/// A single parsed comparison `left <op> right`. Operands are resolved against the table schema
-/// during lowering ([`super::lower`]).
+/// A single parsed comparison `left <op> right`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Comparison {
     pub(super) op: CmpOp,
@@ -46,9 +49,11 @@ pub(super) struct Comparison {
 /// Parse a token stream into a single [`Comparison`]. The grammar has no junctions, so any tokens
 /// left over after one comparison are an error.
 pub(super) fn parse(tokens: Vec<Token>) -> DeltaResult<Comparison> {
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens: tokens.into_iter().peekable(),
+    };
     let comparison = parser.parse_comparison()?;
-    if parser.pos != parser.tokens.len() {
+    if parser.advance().is_some() {
         return Err(Error::generic(
             "unexpected trailing input in CHECK constraint: only a single comparison is supported",
         ));
@@ -57,32 +62,27 @@ pub(super) fn parse(tokens: Vec<Token>) -> DeltaResult<Comparison> {
 }
 
 struct Parser {
-    tokens: Vec<Token>,
-    pos: usize,
+    tokens: Peekable<vec::IntoIter<Token>>,
 }
 
 impl Parser {
-    fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)
+    fn peek(&mut self) -> Option<&Token> {
+        self.tokens.peek()
     }
 
     fn advance(&mut self) -> Option<Token> {
-        let token = self.tokens.get(self.pos).cloned();
-        if token.is_some() {
-            self.pos += 1;
-        }
-        token
+        self.tokens.next()
     }
 
     // comparison := operand cmp operand
     fn parse_comparison(&mut self) -> DeltaResult<Comparison> {
         let left = self.parse_operand()?;
-        let op = self.cmp_op()?;
+        let op = self.parse_cmp_op()?;
         let right = self.parse_operand()?;
         Ok(Comparison { op, left, right })
     }
 
-    fn cmp_op(&mut self) -> DeltaResult<CmpOp> {
+    fn parse_cmp_op(&mut self) -> DeltaResult<CmpOp> {
         let op = match self.advance() {
             Some(Token::Lt) => CmpOp::Lt,
             Some(Token::Le) => CmpOp::Le,
@@ -91,11 +91,7 @@ impl Parser {
             Some(Token::Eq) => CmpOp::Eq,
             Some(Token::Ne) => CmpOp::Ne,
             Some(Token::NullSafeEq) => CmpOp::NullSafeEq,
-            other => {
-                return Err(Error::generic(format!(
-                    "expected a comparison operator in CHECK constraint, found {other:?}"
-                )))
-            }
+            other => return Err(expected("a comparison operator", other)),
         };
         Ok(op)
     }
@@ -109,44 +105,50 @@ impl Parser {
     // a column and binary arithmetic are out of grammar.
     fn parse_operand(&mut self) -> DeltaResult<Operand> {
         match self.advance() {
-            Some(sign @ (Token::Plus | Token::Minus)) => match self.advance() {
-                Some(Token::Literal(raw)) if starts_numeric(&raw) => {
-                    let sign = if sign == Token::Minus { "-" } else { "+" };
-                    Ok(Operand::Literal(format!("{sign}{raw}")))
-                }
-                other => Err(Error::generic(format!(
-                    "expected a numeric literal after '{}' in CHECK constraint, found {other:?}",
-                    if sign == Token::Minus { '-' } else { '+' }
-                ))),
-            },
-            Some(Token::Literal(raw)) => Ok(Operand::Literal(raw)),
-            Some(Token::Ident(first)) => {
-                let mut path = vec![first];
-                while self.peek() == Some(&Token::Dot) {
-                    self.advance();
-                    match self.advance() {
-                        Some(Token::Ident(segment)) => path.push(segment),
-                        other => {
-                            return Err(Error::generic(format!(
-                            "expected an identifier after '.' in CHECK constraint, found {other:?}"
-                        )))
-                        }
+            Some(sign @ (Token::Plus | Token::Minus)) => {
+                let sign = if sign == Token::Minus { '-' } else { '+' };
+                match self.advance() {
+                    Some(Token::Literal(raw)) if starts_numeric(&raw) => {
+                        Ok(Operand::Literal(format!("{sign}{raw}")))
                     }
+                    other => Err(expected(
+                        &format!("a numeric literal after '{sign}'"),
+                        other,
+                    )),
                 }
-                Ok(Operand::Column(path))
             }
-            other => Err(Error::generic(format!(
-                "expected a column or literal in CHECK constraint, found {other:?}"
-            ))),
+            Some(Token::Literal(raw)) => Ok(Operand::Literal(raw)),
+            Some(Token::Ident(first)) => self.parse_column_path(first),
+            other => Err(expected("a column or literal", other)),
         }
+    }
+
+    // Continue a dotted column path after its first `Ident`: `( '.' Ident )*`.
+    fn parse_column_path(&mut self, first: String) -> DeltaResult<Operand> {
+        let mut path = vec![first];
+        while self.peek() == Some(&Token::Dot) {
+            self.advance();
+            match self.advance() {
+                Some(Token::Ident(segment)) => path.push(segment),
+                other => return Err(expected("an identifier after '.'", other)),
+            }
+        }
+        Ok(Operand::Column(ColumnName::new(path)))
     }
 }
 
-/// Whether a literal's raw text is a number (so a leading sign may fold into it). Numeric literals
-/// begin with a digit or a leading-dot (`.5`); string/binary/date/boolean/null literals do not, so
-/// a sign before them (`-'foo'`) is rejected.
+/// Whether a literal's raw text is numeric -- begins with a digit or a leading dot (`.5`), unlike
+/// string/binary/date/boolean/null literals.
 fn starts_numeric(raw: &str) -> bool {
     raw.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+}
+
+/// Build the `expected {what} in CHECK constraint, found {found:?}` error shared by the parser's
+/// operand and operator sites.
+fn expected(what: &str, found: Option<Token>) -> Error {
+    Error::generic(format!(
+        "expected {what} in CHECK constraint, found {found:?}"
+    ))
 }
 
 #[cfg(test)]
@@ -155,13 +157,14 @@ mod tests {
 
     use super::super::token::{Keyword, Token};
     use super::{parse, CmpOp, Comparison, Operand};
+    use crate::expressions::ColumnName;
 
     fn ident(s: &str) -> Token {
         Token::Ident(s.to_string())
     }
 
     fn col(segments: &[&str]) -> Operand {
-        Operand::Column(segments.iter().map(|s| s.to_string()).collect())
+        Operand::Column(ColumnName::new(segments.iter().map(|s| s.to_string())))
     }
 
     /// Each operator token maps to its `CmpOp`, with the two operands preserved in order.
@@ -199,8 +202,6 @@ mod tests {
         col(&["a", "b"]),
         Operand::Literal("1".into())
     )]
-    // A leading Minus/Plus folds into a numeric literal's raw text (the tokenizer emits it as a
-    // separate operator): `a > -234` -> right operand Literal("-234").
     #[case(
         vec![ident("a"), Token::Gt, Token::Minus, Token::Literal("234".into())],
         col(&["a"]),
@@ -210,6 +211,12 @@ mod tests {
         vec![Token::Plus, Token::Literal("5".into()), Token::Lt, ident("a")],
         Operand::Literal("+5".into()),
         col(&["a"])
+    )]
+    // A sign folds into a leading-dot decimal too (`.5`): `starts_numeric` accepts a leading `.`.
+    #[case(
+        vec![ident("a"), Token::Gt, Token::Minus, Token::Literal(".5".into())],
+        col(&["a"]),
+        Operand::Literal("-.5".into())
     )]
     fn parses_operand_shapes(
         #[case] tokens: Vec<Token>,
@@ -221,9 +228,7 @@ mod tests {
         assert_eq!(got.right, right);
     }
 
-    /// Anything outside a single `operand op operand` is rejected: trailing tokens (no junctions),
-    /// a missing operator, a dangling dotted path, an operator with no left operand, and empty
-    /// input.
+    /// Anything outside a single `operand op operand` is rejected.
     #[rstest]
     #[case::trailing(vec![ident("a"), Token::Gt, Token::Literal("0".into()), ident("extra")])]
     #[case::missing_operator(vec![ident("a"), ident("b")])]
@@ -237,11 +242,13 @@ mod tests {
         ident("a"), Token::Gt, Token::Literal("0".into()),
         Token::Keyword(Keyword::And), ident("b"), Token::Lt, Token::Literal("9".into()),
     ])]
-    // A sign applies only to a numeric literal: unary minus on a column (`-a`) and a sign before a
-    // non-numeric literal (`-'foo'`) are out of grammar.
     #[case::sign_before_column(vec![Token::Minus, ident("a"), Token::Gt, Token::Literal("0".into())])]
     #[case::sign_before_string(vec![
         ident("a"), Token::Eq, Token::Minus, Token::Literal("'foo'".into()),
+    ])]
+    #[case::sign_then_eof(vec![ident("a"), Token::Gt, Token::Minus])]
+    #[case::double_sign(vec![
+        ident("a"), Token::Gt, Token::Minus, Token::Minus, Token::Literal("5".into()),
     ])]
     fn rejects_non_single_comparison(#[case] tokens: Vec<Token>) {
         assert!(parse(tokens).is_err());
