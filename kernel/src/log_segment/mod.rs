@@ -14,7 +14,7 @@ use crate::actions::{
     METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
-use crate::expressions::ColumnName;
+use crate::expressions::{column_name, ColumnName};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -128,10 +128,10 @@ pub(crate) struct LogSegment {
 /// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
 fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
     match action_name {
-        METADATA_NAME => Some(ColumnName::new([METADATA_NAME, "id"])),
-        PROTOCOL_NAME => Some(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])),
-        SET_TRANSACTION_NAME => Some(ColumnName::new([SET_TRANSACTION_NAME, "appId"])),
-        DOMAIN_METADATA_NAME => Some(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])),
+        METADATA_NAME => Some(column_name!(METADATA_NAME, "id")),
+        PROTOCOL_NAME => Some(column_name!(PROTOCOL_NAME, "minReaderVersion")),
+        SET_TRANSACTION_NAME => Some(column_name!(SET_TRANSACTION_NAME, "appId")),
+        DOMAIN_METADATA_NAME => Some(column_name!(DOMAIN_METADATA_NAME, "domain")),
         _ => None,
     }
 }
