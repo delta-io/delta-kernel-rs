@@ -2,13 +2,15 @@
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
+// Crate-visible alias so kernel code avoids the deprecated `pub` re-export above.
+pub(crate) use column_mapping::validate_schema_column_mapping as validate_schema_column_mapping_strict;
 pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
     column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
-    validate_column_mapping_id,
+    validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
@@ -165,6 +167,12 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    /// Iceberg V4 adaptive metadata tree as the table's native content metadata format.
+    ///
+    /// TODO(#2866): gated by the `adaptive-metadata-in-dev` cargo feature until fully supported.
+    #[strum(serialize = "adaptiveMetadata-preview")]
+    #[serde(rename = "adaptiveMetadata-preview")]
+    AdaptiveMetadataPreview,
 
     #[serde(untagged)]
     #[strum(default)]
@@ -245,10 +253,7 @@ pub(crate) enum FeatureRequirement {
     NotSupported(TableFeature),
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
-    /// Custom validation logic. Currently unused, but already integrated into the
-    /// validation pipeline(`TableConfiguration::validate_feature_requirements`), so kept for
-    /// future use.
-    #[allow(dead_code)]
+    /// Custom validation logic run against the protocol and table properties.
     Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
 
@@ -633,6 +638,35 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// Dependencies per the adaptiveMetadata RFC (delta-io/delta#6978) "Table Feature Enablement"
+// section. Enforcement is covered by `test_adaptive_metadata_feature_requirements`.
+// TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
+static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[
+        FeatureRequirement::Enabled(TableFeature::ColumnMapping),
+        FeatureRequirement::Custom(|_protocol, properties| {
+            require!(
+                properties.column_mapping_mode == Some(ColumnMappingMode::Id),
+                Error::invalid_protocol(
+                    "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
+                )
+            );
+            Ok(())
+        }),
+        FeatureRequirement::Enabled(TableFeature::RowTracking),
+        FeatureRequirement::Enabled(TableFeature::DomainMetadata),
+        FeatureRequirement::Enabled(TableFeature::DeletionVectors),
+        FeatureRequirement::Enabled(TableFeature::InCommitTimestamp),
+    ],
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 /// By definition, kernel cannot know how to handle unknown features and must assume they're always
 /// enabled if supported in protocol. However, the read path ignores all writer-only features,
 /// including unknown ones. Unknown features are never inferred from legacy protocol versions.
@@ -664,7 +698,8 @@ impl TableFeature {
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShredding
-            | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
+            | TableFeature::VariantShreddingPreview
+            | TableFeature::AdaptiveMetadataPreview => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -731,6 +766,7 @@ impl TableFeature {
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
             TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
+            TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
             TableFeature::Unknown(_) => &UNKNOWN_FEATURE_INFO,
@@ -971,6 +1007,30 @@ mod tests {
         .unwrap(),
         ExpectRead::Ok
     )]
+    // adaptiveMetadata-preview is gated by the `adaptive-metadata-in-dev` cargo feature: readable
+    // only when the flag is on, otherwise rejected as unsupported.
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case::adaptive_metadata_supported(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Ok
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "adaptive-metadata-in-dev"),
+        case::adaptive_metadata_gated_off(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Unsupported
+        )
+    )]
     fn validate_protocol_for_read(#[case] protocol: Protocol, #[case] expected: ExpectRead) {
         let result = ensure_table_can_be_read(&protocol);
         match expected {
@@ -1019,6 +1079,7 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };

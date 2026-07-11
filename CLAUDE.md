@@ -78,6 +78,10 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
   listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
   carrier type and the SQL literal parser (`parse_sql`).
+- `adaptive-metadata-in-dev` -- adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
+  (experimental, in development). Gates `KernelSupport::Supported` for the
+  `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
+  with the cargo feature off).
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -236,14 +240,13 @@ is the source of truth. Key concepts:
 
 **Table features**:
 
-- Writer: `appendOnly`, `invariants`, `checkConstraints`, `generatedColumns`,
-  `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
-  `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`,
-  `clustering`, `inCommitTimestamp`
-- Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
-  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
-  `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
-  `typeWidening`
+- Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
+  `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
+  `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`, `rowTracking`
+- Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
+  `columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
+  `vacuumProtocolCheck`, `variantShredding`, `variantShredding-preview`, `variantType`,
+  `variantType-preview`
 
 Keep this list updated when new protocol features are added to kernel.
 

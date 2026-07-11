@@ -2683,7 +2683,7 @@ fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
         }),
     )?;
 
-    assert_eq!(log_segment.checkpoint_sidecars(), Some([].as_slice()));
+    assert_eq!(log_segment.checkpoint_hint_sidecars(), Some(&vec![]));
     Ok(())
 }
 
@@ -2741,10 +2741,13 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     assert_eq!(log_segment.checkpoint_version, Some(1));
     assert_eq!(log_segment.end_version, 2);
     if expect_hint_schema_used {
-        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+        assert_eq!(
+            log_segment.checkpoint_hint_schema().as_ref(),
+            Some(&hint_schema)
+        );
     } else {
         assert!(
-            log_segment.checkpoint_schema().is_none(),
+            log_segment.checkpoint_hint_schema().is_none(),
             "hint should not have been returned since version does not match checkpoint_version"
         );
     }
