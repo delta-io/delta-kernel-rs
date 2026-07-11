@@ -24,7 +24,9 @@ use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::{
+    emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
+};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -189,32 +191,31 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Self> {
+        let pm_start = std::time::Instant::now();
+
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
         let base_crc = log_segment.read_latest_crc(engine);
-        let crc_at_version = log_segment.try_build_crc_within_budget(
-            engine,
-            base_crc.as_ref(),
-            incremental_replay,
-        )?;
+        let crc_resolution = log_segment
+            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
-        //         first commit.
-        // TODO(#2677): emit an `IncrementalCrcLoad` metric on the CRC branch; the
-        //              `ProtocolMetadataLoaded` span only fires on the replay branch below.
-        let (metadata, protocol) = match crc_at_version.as_deref() {
-            Some(c) => (c.metadata.clone(), c.protocol.clone()),
-            None => {
-                log_segment.read_protocol_metadata(engine, base_crc.as_ref(), metric_context)?
-            }
+        //         first commit. The replay reports its own source (seeded vs full).
+        let (metadata, protocol, source) = match crc_resolution.crc_and_source() {
+            Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), source),
+            None => log_segment
+                .read_protocol_metadata(engine, base_crc.as_ref())
+                .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
         };
+        emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
 
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
         tracing::Span::current().record("version", table_configuration.version());
 
-        Self::new_with_crc(log_segment, table_configuration, crc_at_version)
+        Self::new_with_crc(log_segment, table_configuration, crc_resolution.into_crc())
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.

@@ -14,7 +14,7 @@
 //! default rather than failing the operation being observed.
 
 use std::fmt;
-use std::str::FromStr as _;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +40,12 @@ impl MetricId {
     /// Generate a new unique `MetricId`.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// The nil id (all-zero UUID). The [`Default`] value and the decode seed when a span omits
+    /// `operation_id`.
+    pub(crate) fn nil() -> Self {
+        Self(Uuid::nil())
     }
 
     /// Return the 16 raw bytes of the underlying UUID. Useful for FFI consumers that want to
@@ -71,8 +77,10 @@ impl MetricId {
 }
 
 impl Default for MetricId {
+    /// The nil (all-zero) id. A real operation id comes from [`MetricId::new`]; `Default` is the
+    /// zero value used as a decode seed and in zero-initialized metric structs.
     fn default() -> Self {
-        Self::new()
+        Self::nil()
     }
 }
 
@@ -117,28 +125,31 @@ impl MetricEvent {
         match self {
             // Lifecycle success: duration must be set by the tracing layer on span close.
             Self::LogSegmentLoadSuccess(e) => e.set_duration(d),
-            Self::ProtocolMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SnapshotBuildSuccess(e) => e.set_duration(d),
             Self::TransactionCommitSuccess(e) => e.set_duration(d),
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
             Self::CrcReadSuccess(e) => e.set_duration(d),
 
-            // For now, failure events carry no duration; storage/scan events set it at
-            // construction; read events have no duration field.
+            // Emit-based success events set their duration as a creation attribute, so the
+            // span-close hook must not overwrite it.
+            Self::ProtocolMetadataLoadSuccess(_)
+            | Self::ScanMetadataCompleted(_)
+            | Self::StorageListCompleted(_)
+            | Self::StorageReadCompleted(_)
+            | Self::StorageCopyCompleted(_) => {}
+
+            // Failure events carry no duration.
             Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::SnapshotBuildFailure(_)
             | Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure
-            | Self::ScanMetadataCompleted(_)
-            | Self::StorageListCompleted(_)
-            | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_)
-            | Self::JsonReadCompleted(_)
-            | Self::ParquetReadCompleted(_) => {}
+            | Self::CrcReadFailure => {}
+
+            // Read events have no duration field.
+            Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
         }
     }
 
@@ -260,8 +271,6 @@ impl MetricEvent {
             Self::SetTransactionLoadSuccess(_) => Self::SetTransactionLoadFailure,
             Self::CrcReadSuccess(_) => Self::CrcReadFailure,
             // Events with no failure form pass through unchanged.
-            // Note: here we list explicitly so adding a lifecycle event without a failure mapping
-            //       fails to compile.
             e @ (Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::SnapshotBuildFailure(_)
@@ -304,6 +313,22 @@ impl fmt::Display for MetricEvent {
             Self::StorageCopyCompleted(e) => e.fmt(f),
         }
     }
+}
+
+/// Parse a snake_case label span field into its enum, defaulting on an empty (unset) or
+/// unrecognized value. An unrecognized value warns; an empty value is the expected "field unset"
+/// case (e.g. a failure-emit span) and does not.
+fn parse_label_or_default<T: FromStr<Err = strum::ParseError> + Default>(
+    value: &str,
+    field: &str,
+) -> T {
+    if value.is_empty() {
+        return T::default();
+    }
+    T::from_str(value).unwrap_or_else(|e| {
+        warn!("Invalid {field} '{value}' on span: {e}. Using default.");
+        T::default()
+    })
 }
 
 // ====================================================================
@@ -429,17 +454,43 @@ impl fmt::Display for LogSegmentLoadFailure {
 
 pub(crate) const PROTOCOL_METADATA_LOADED_SPAN: &str = "segment.read_metadata";
 
-/// Protocol and metadata actions were read from the log.
-#[derive(Debug, Clone)]
+/// How a snapshot load resolved Protocol and Metadata: served directly by a CRC, derived by
+/// advancing or seeding a replay from a stale CRC, or from full log replay when no CRC applies.
+/// New variants may be added as more resolution paths appear.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProtocolMetadataSource {
+    /// A CRC already sat at the target version; used as-is with zero replay.
+    CrcAtTarget,
+    /// A stale CRC was advanced to the target version by reverse replay.
+    CrcAdvancedByReplay,
+    /// A stale CRC seeded a pruned P&M replay of the commits above it (falling back to the
+    /// CRC's own P&M when the pruned replay found no newer Protocol or Metadata).
+    CrcSeededPmOnlyReplay,
+    /// No CRC baseline; P&M came from log replay (full history on a fresh load, or the new
+    /// commits on an incremental load).
+    #[default]
+    FullReplay,
+}
+
+impl ProtocolMetadataSource {
+    fn parse_lenient(s: &str) -> Self {
+        parse_label_or_default(s, "pm_source")
+    }
+}
+
+/// Protocol and metadata actions were resolved for a snapshot.
+#[derive(Debug, Clone, Default)]
 pub struct ProtocolMetadataLoadSuccess {
-    // === Set on span creation ===
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-
-    // === Set on span close ===
+    pub source: ProtocolMetadataSource,
     pub duration: Duration,
 }
 
@@ -447,16 +498,37 @@ impl ProtocolMetadataLoadSuccess {
     pub(crate) const SPAN_NAME: &'static str = PROTOCOL_METADATA_LOADED_SPAN;
 
     pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
-        Self {
-            operation_id: MetricId::from_attrs(attrs),
-            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
-            correlation_id: correlation_id_from_attrs(attrs),
-            duration: Duration::default(),
+        let mut event = Self::default();
+        attrs.record(&mut event);
+        event
+    }
+}
+
+impl Visit for ProtocolMetadataLoadSuccess {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == IS_CATALOG_MANAGED_FIELD {
+            self.table_type = TableType::from_catalog_managed(value);
         }
     }
 
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
+            "pm_source" => self.source = ProtocolMetadataSource::parse_lenient(value),
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "duration_ns" {
+            self.duration = Duration::from_nanos(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
+            self.operation_id = id;
+        }
     }
 }
 
@@ -466,12 +538,13 @@ impl fmt::Display for ProtocolMetadataLoadSuccess {
             operation_id,
             table_type,
             correlation_id,
+            source,
             duration,
         } = self;
         write!(
             f,
             "ProtocolMetadataLoadSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, duration={duration:?})"
+             correlation_id={correlation_id:?}, source={source}, duration={duration:?})"
         )
     }
 }
@@ -1126,6 +1199,23 @@ pub struct SnapshotLoadMetricContext {
     pub(crate) is_catalog_managed: bool,
 }
 
+/// Decode the `operation_id` debug-string span field into a [`MetricId`]. Returns `None` when the
+/// field is not `operation_id`; returns the nil id (with a warning) when the value is malformed.
+/// Shared by the self-visiting event decoders.
+pub(crate) fn record_operation_id(
+    field: &Field,
+    value: &dyn fmt::Debug,
+    span_name: &str,
+) -> Option<MetricId> {
+    (field.name() == "operation_id").then(|| {
+        let s = format!("{value:?}");
+        Uuid::from_str(&s).map(MetricId).unwrap_or_else(|e| {
+            warn!("Invalid uuid '{s}' on {span_name}: {e}. Using nil.");
+            MetricId::nil()
+        })
+    })
+}
+
 pub(crate) fn read_is_catalog_managed(attrs: &Attributes<'_>) -> bool {
     #[derive(Default)]
     struct V(bool);
@@ -1538,6 +1628,40 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
     );
 }
 
+/// Emit a [`MetricEvent::ProtocolMetadataLoadSuccess`]. Call once per snapshot load on the P&M
+/// resolution path, on success.
+pub(crate) fn emit_protocol_metadata_load(
+    ctx: &SnapshotLoadMetricContext,
+    source: ProtocolMetadataSource,
+    duration: Duration,
+) {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        ProtocolMetadataLoadSuccess::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %ctx.operation_id,
+        is_catalog_managed = ctx.is_catalog_managed,
+        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        pm_source = source.as_ref(),
+        duration_ns = duration.as_nanos() as u64,
+    );
+}
+
+/// Emit a [`MetricEvent::ProtocolMetadataLoadFailure`] on the load error path (the flipped
+/// `...Success` span, per the README's failure-events pattern).
+pub(crate) fn emit_protocol_metadata_load_failure(ctx: &SnapshotLoadMetricContext) {
+    let span = tracing::span!(
+        tracing::Level::INFO,
+        ProtocolMetadataLoadSuccess::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %ctx.operation_id,
+        is_catalog_managed = ctx.is_catalog_managed,
+        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+    );
+    let _enter = span.enter();
+    tracing::info!(error = tracing::field::debug("protocol/metadata load failed"));
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -1637,6 +1761,34 @@ mod tests {
         #[case] expected: ScanType,
     ) {
         assert_eq!(ScanType::parse_lenient(value), expected);
+    }
+
+    #[rstest]
+    #[case::crc_at_target(ProtocolMetadataSource::CrcAtTarget, "crc_at_target")]
+    #[case::crc_advanced(ProtocolMetadataSource::CrcAdvancedByReplay, "crc_advanced_by_replay")]
+    #[case::crc_seeded(
+        ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+        "crc_seeded_pm_only_replay"
+    )]
+    #[case::full_replay(ProtocolMetadataSource::FullReplay, "full_replay")]
+    fn protocol_metadata_source_serializes_to_wire_name_and_parses_back(
+        #[case] source: ProtocolMetadataSource,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = source.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(ProtocolMetadataSource::from_str(wire).unwrap(), source);
+    }
+
+    #[rstest]
+    #[case::known("crc_at_target", ProtocolMetadataSource::CrcAtTarget)]
+    #[case::empty_defaults_to_full_replay("", ProtocolMetadataSource::FullReplay)]
+    #[case::unknown_defaults_to_full_replay("totally_unknown", ProtocolMetadataSource::FullReplay)]
+    fn protocol_metadata_source_parse_lenient(
+        #[case] value: &str,
+        #[case] expected: ProtocolMetadataSource,
+    ) {
+        assert_eq!(ProtocolMetadataSource::parse_lenient(value), expected);
     }
 
     #[test]

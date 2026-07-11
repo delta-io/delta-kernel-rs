@@ -28,6 +28,7 @@ use crate::crc::{
     FileSizeHistogram, FileStatsDelta,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
     column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
@@ -63,30 +64,62 @@ static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(with_file)
 });
 
+/// Outcome of resolving a CRC at a log segment's end version, from
+/// [`LogSegment::try_build_crc_within_budget`].
+pub(crate) enum CrcResolution {
+    /// The base CRC is at the target version.
+    AtTarget(Arc<Crc>),
+    /// A stale base CRC was advanced to the target version.
+    AdvancedByReplay(Arc<Crc>),
+    /// No usable CRC at the target: either no base CRC, or the base was too stale for the replay
+    /// budget.
+    Unresolved,
+}
+
+impl CrcResolution {
+    /// The resolved CRC, or `None` if none was resolved.
+    pub(crate) fn into_crc(self) -> Option<Arc<Crc>> {
+        match self {
+            Self::AtTarget(crc) | Self::AdvancedByReplay(crc) => Some(crc),
+            Self::Unresolved => None,
+        }
+    }
+
+    /// The resolved CRC paired with its P&M source label, or `None` for [`Self::Unresolved`].
+    pub(crate) fn crc_and_source(&self) -> Option<(&Arc<Crc>, ProtocolMetadataSource)> {
+        match self {
+            Self::AtTarget(crc) => Some((crc, ProtocolMetadataSource::CrcAtTarget)),
+            Self::AdvancedByReplay(crc) => Some((crc, ProtocolMetadataSource::CrcAdvancedByReplay)),
+            Self::Unresolved => None,
+        }
+    }
+}
+
 impl LogSegment {
     /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
     /// Handles three cases:
-    /// - Case 1: no base CRC available -> return None
-    /// - Case 2: base CRC at `end_version` -> return it as-is
-    /// - Case 3: stale base CRC older than `end_version` -> advance it to `end_version` when
-    ///   `incremental_replay` permits, else fall back to normal log replay (return None)
+    /// - Case 1: no base CRC available -> [`CrcResolution::Unresolved`]
+    /// - Case 2: base CRC at `end_version` -> [`CrcResolution::AtTarget`]
+    /// - Case 3: stale base CRC older than `end_version` -> [`CrcResolution::AdvancedByReplay`]
+    ///   when `incremental_replay` permits, else fall back to normal log replay
+    ///   ([`CrcResolution::Unresolved`])
     pub(crate) fn try_build_crc_within_budget(
         &self,
         engine: &dyn Engine,
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
-    ) -> DeltaResult<Option<Arc<Crc>>> {
+    ) -> DeltaResult<CrcResolution> {
         let Some(base) = base else {
-            return Ok(None);
+            return Ok(CrcResolution::Unresolved);
         };
         if base.version == self.end_version {
-            return Ok(Some(base.clone()));
+            return Ok(CrcResolution::AtTarget(base.clone()));
         }
         if !incremental_replay.should_advance(base.version, self.end_version)? {
-            return Ok(None);
+            return Ok(CrcResolution::Unresolved);
         }
         let advanced = self.build_crc_from_base(engine, base)?;
-        Ok(Some(Arc::new(advanced)))
+        Ok(CrcResolution::AdvancedByReplay(Arc::new(advanced)))
     }
 
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or

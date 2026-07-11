@@ -10,7 +10,9 @@ use tracing::instrument;
 use super::{IncrementalReplay, Snapshot};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::{
+    emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
+};
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -292,24 +294,24 @@ impl Snapshot {
 
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
-        // `incremental_replay`.
+        // `incremental_replay`. Time from here so the CRC-advance cost lands in the P&M duration,
+        // matching the fresh path.
+        let pm_start = std::time::Instant::now();
         let base_crc = combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.crc());
-        let crc_at_version = combined_log_segment.try_build_crc_within_budget(
-            engine,
-            base_crc.as_ref(),
-            incremental_replay,
-        )?;
+        let crc_resolution = combined_log_segment
+            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         let existing_table_config = existing_snapshot.table_configuration();
-        let (new_metadata, new_protocol) = match &crc_at_version {
-            Some(crc) => {
+        let (new_metadata, new_protocol, source) = match crc_resolution.crc_and_source() {
+            Some((crc, source)) => {
                 // If we were able to build a new CRC, then re-use it for TableConfiguration
                 // creation.
                 let new_metadata = (crc.metadata != *existing_table_config.metadata())
                     .then(|| crc.metadata.clone());
                 let new_protocol = (crc.protocol != *existing_table_config.protocol())
                     .then(|| crc.protocol.clone());
-                (new_metadata, new_protocol)
+                (new_metadata, new_protocol, source)
             }
             None => {
                 // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
@@ -321,9 +323,12 @@ impl Snapshot {
                     .filter(|c| c.version > existing_snapshot_version);
                 combined_log_segment
                     .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine, newer_base)?
+                    .read_protocol_metadata_opt(engine, newer_base)
+                    .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?
             }
         };
+        emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
+
         let table_configuration = TableConfiguration::try_new_from(
             existing_table_config,
             new_metadata,
@@ -335,7 +340,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
-            crc_at_version,
+            crc_resolution.into_crc(),
         )?))
     }
 
@@ -402,12 +407,17 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
+    use crate::metrics::{
+        MetricEvent, MetricId, ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
+    };
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::LogPathFileType;
     use crate::snapshot::commit;
-    use crate::utils::test_utils::string_array_to_engine_data;
+    use crate::utils::test_utils::{
+        install_thread_local_metrics_reporter, string_array_to_engine_data, CapturingReporter,
+    };
 
     // ============================================================================
     // Helpers
@@ -1791,6 +1801,188 @@ mod tests {
             .collect();
         assert_eq!(versions_and_his, vec![(1, 2), (2, 2)]);
 
+        Ok(())
+    }
+
+    // ============================================================================
+    // ProtocolMetadataLoad source classification
+    // ============================================================================
+
+    fn protocol_metadata_load(events: &[MetricEvent]) -> ProtocolMetadataLoadSuccess {
+        let mut it = events.iter().filter_map(|e| match e {
+            MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+            _ => None,
+        });
+        let found = it.next().expect("expected a ProtocolMetadataLoadSuccess");
+        assert!(it.next().is_none(), "expected exactly one matching event");
+        found.clone()
+    }
+
+    #[rstest]
+    #[case::no_crc(None, IncrementalReplay::Disabled, ProtocolMetadataSource::FullReplay)]
+    #[case::crc_at_target(
+        Some(3),
+        IncrementalReplay::Disabled,
+        ProtocolMetadataSource::CrcAtTarget
+    )]
+    #[case::stale_crc_advanced(
+        Some(1),
+        IncrementalReplay::Unlimited,
+        ProtocolMetadataSource::CrcAdvancedByReplay
+    )]
+    #[case::stale_crc_seeds_replay(
+        Some(1),
+        IncrementalReplay::Disabled,
+        ProtocolMetadataSource::CrcSeededPmOnlyReplay
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fresh_build_classifies_protocol_metadata_source(
+        #[case] planted_crc_version: Option<u64>,
+        #[case] mode: IncrementalReplay,
+        #[case] expected_source: ProtocolMetadataSource,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+        if let Some(v) = planted_crc_version {
+            ctx.store
+                .put(
+                    &delta_path_for_version(v, "crc"),
+                    make_test_crc_json(200, 2).to_string().into(),
+                )
+                .await?;
+        }
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let corr = "req-abc";
+        let _snapshot = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .with_incremental_crc_replay(mode)
+            .with_correlation_id(corr)
+            .build(ctx.engine.as_ref())?;
+
+        let events = reporter.events();
+        let pm = protocol_metadata_load(&events);
+        assert_eq!(pm.source, expected_source);
+
+        // The operation_id and correlation_id survive the emit->decode round-trip.
+        assert_eq!(pm.correlation_id.as_deref(), Some(corr));
+        assert_ne!(pm.operation_id, MetricId::nil());
+
+        // The CRC-advance replay cost is folded into the P&M duration on the advanced case.
+        if expected_source == ProtocolMetadataSource::CrcAdvancedByReplay {
+            assert!(pm.duration > std::time::Duration::ZERO);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::no_crc(None, IncrementalReplay::Disabled, ProtocolMetadataSource::FullReplay)]
+    #[case::crc_at_target(
+        Some(5),
+        IncrementalReplay::Disabled,
+        ProtocolMetadataSource::CrcAtTarget
+    )]
+    #[case::stale_crc_advanced(
+        Some(1),
+        IncrementalReplay::Unlimited,
+        ProtocolMetadataSource::CrcAdvancedByReplay
+    )]
+    // A CRC newer than the existing snapshot (v3) but below the target (v5), with advance
+    // disabled, seeds a pruned replay rather than being used at target or advanced.
+    #[case::stale_crc_seeds_replay(
+        Some(4),
+        IncrementalReplay::Disabled,
+        ProtocolMetadataSource::CrcSeededPmOnlyReplay
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_build_classifies_protocol_metadata_source(
+        #[case] planted_crc_version: Option<u64>,
+        #[case] mode: IncrementalReplay,
+        #[case] expected_source: ProtocolMetadataSource,
+    ) -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 6).await?;
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+        if let Some(v) = planted_crc_version {
+            ctx.store
+                .put(
+                    &delta_path_for_version(v, "crc"),
+                    make_test_crc_json(200, 2).to_string().into(),
+                )
+                .await?;
+        }
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let updated = Snapshot::builder_from(base)
+            .at_version(5)
+            .with_incremental_crc_replay(mode)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(updated.version(), 5);
+
+        let pm = protocol_metadata_load(&reporter.events());
+        assert_eq!(pm.source, expected_source);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_build_no_pm_change_classifies_full_replay() -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(1)
+            .build(ctx.engine.as_ref())?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let updated = Snapshot::builder_from(base).build(ctx.engine.as_ref())?;
+        assert_eq!(updated.version(), 3);
+
+        // No P&M change in the new commits, no newer CRC: the replay finds nothing above the
+        // existing snapshot, so the source is the not-CRC-rooted `FullReplay`.
+        let pm = protocol_metadata_load(&reporter.events());
+        assert_eq!(pm.source, ProtocolMetadataSource::FullReplay);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fresh_build_missing_protocol_metadata_emits_failure() -> DeltaResult<()> {
+        let ctx = setup_incremental_snapshot_test()?;
+        // A commit with only an add action: no protocol or metadata anywhere in the log.
+        commit(
+            ctx.url.as_str(),
+            &ctx.store,
+            0,
+            vec![add_action("f0.parquet")],
+        )
+        .await;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let result = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref());
+        assert!(result.is_err());
+
+        let events = reporter.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_))),
+            "expected a ProtocolMetadataLoadFailure"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+            "no success event should fire on the failure path"
+        );
         Ok(())
     }
 }

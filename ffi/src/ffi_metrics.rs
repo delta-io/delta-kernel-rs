@@ -336,6 +336,7 @@ impl MetricEvent {
                 correlation_id,
                 table_type,
                 duration,
+                ..
             }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
