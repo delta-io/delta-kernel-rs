@@ -7,7 +7,6 @@
 //! `url` is the REST service base URL (not a Delta table path).
 
 use std::collections::HashMap;
-use std::mem::offset_of;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,42 +36,26 @@ pub struct CAuthHeaderPair {
 
 /// Output buffer for a [`CAuthHeaderCallback`] invocation.
 ///
-/// Populate it by calling [`rest_engine_emit_auth_header`] and [`rest_engine_emit_auth_ttl`] with
-/// the `out` pointer your callback receives, or fill `headers[0..count]` directly. `name` and
-/// `value` slices must remain valid until the callback returns; the kernel copies them before the
-/// next refresh.
+/// Set `count`, fill `headers[0..count]`, and optionally set `ttl_ms`. `name` and `value` slices
+/// must remain valid until the callback returns; the kernel copies them before the next refresh.
 #[repr(C)]
 pub struct CAuthHeaders {
     pub count: u32,
     pub headers: [CAuthHeaderPair; AUTH_MAX_HEADERS],
-    /// How long (in milliseconds) the emitted headers stay valid. `0` means refresh on every
-    /// request. Set via [`rest_engine_emit_auth_ttl`].
+    /// How long (in milliseconds) the headers stay valid. `0` means refresh on every request.
     pub ttl_ms: u64,
 }
 
 /// Supplies auth headers for a REST-backed engine.
 ///
-/// The kernel invokes this when it needs fresh headers. The implementation writes into `out` by
-/// calling [`rest_engine_emit_auth_header`] once per header and may call
-/// [`rest_engine_emit_auth_ttl`] once to report how long those headers stay valid. With a TTL the
-/// kernel caches them and re-invokes near expiry; without one it invokes the callback on every
-/// request.
+/// The kernel invokes this when it needs fresh headers. Fill `out` with `headers[0..count]` and
+/// set `ttl_ms` to report how long those headers stay valid. With a non-zero TTL the kernel caches
+/// them and re-invokes near expiry; with `ttl_ms = 0` it invokes the callback on every request.
 ///
 /// `context` is the opaque pointer registered via
 /// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). Both pointers are only
 /// valid for the duration of the call and must not be retained.
-///
-/// Named emit exports (rather than function-pointer arguments) allow FFI runtimes that cannot
-/// invoke arbitrary function pointers (e.g. JNR-FFI) to emit headers via bound symbols.
 pub type CAuthHeaderCallback = extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders);
-
-/// Kernel-side buffer for one callback invocation. `headers` is the C-visible face passed to the
-/// callback; `emitted` stores copies produced by [`rest_engine_emit_auth_header`].
-#[repr(C)]
-struct AuthHeaderCollectBuffer {
-    headers: CAuthHeaders,
-    emitted: Vec<(String, String)>,
-}
 
 /// Rust-side adapter pairing a [`CAuthHeaderCallback`] with its opaque `context`. Marked `Send +
 /// Sync` so the per-request closure can be shared across threads.
@@ -94,25 +77,9 @@ impl FfiAuthHeaderProvider {
     }
 
     fn collect(&self) -> DeltaResult<(Vec<(String, String)>, Option<u64>)> {
-        let mut buffer = AuthHeaderCollectBuffer {
-            headers: empty_c_auth_headers(),
-            emitted: Vec::new(),
-        };
-        (self.callback)(self.context, &mut buffer.headers);
-        let pairs = if buffer.emitted.is_empty() {
-            auth_pairs_from_c(&buffer.headers)?
-        } else {
-            buffer.emitted
-        };
-        Ok((pairs, ttl_ms_from_c(buffer.headers.ttl_ms)))
-    }
-}
-
-fn collect_buffer_from_out(out: *mut CAuthHeaders) -> *mut AuthHeaderCollectBuffer {
-    // SAFETY: `out` always points at `AuthHeaderCollectBuffer::headers` during a callback.
-    unsafe {
-        out.byte_sub(offset_of!(AuthHeaderCollectBuffer, headers))
-            .cast()
+        let mut headers = empty_c_auth_headers();
+        (self.callback)(self.context, &mut headers);
+        Ok((auth_pairs_from_c(&headers)?, ttl_ms_from_c(headers.ttl_ms)))
     }
 }
 
@@ -153,43 +120,6 @@ pub(crate) fn auth_pairs_from_c(headers: &CAuthHeaders) -> DeltaResult<Vec<(Stri
         pairs.push((name, value));
     }
     Ok(pairs)
-}
-
-/// Emit one `(name, value)` header during a [`CAuthHeaderCallback`] invocation.
-///
-/// Pass the `out` pointer your callback received from the kernel. `name` and `value` are borrowed
-/// for this call; the kernel copies them. Headers beyond [`AUTH_MAX_HEADERS`] are ignored.
-/// Non-UTF-8 names or values are skipped.
-///
-/// # Safety
-/// `out` must be the [`CAuthHeaders`] pointer passed to the current [`CAuthHeaderCallback`]
-/// invocation. `name` and `value` must remain valid for the duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn rest_engine_emit_auth_header(
-    out: *mut CAuthHeaders,
-    name: KernelStringSlice,
-    value: KernelStringSlice,
-) {
-    let buffer = unsafe { &mut *collect_buffer_from_out(out) };
-    let name = unsafe { String::try_from_slice(&name) };
-    let value = unsafe { String::try_from_slice(&value) };
-    if let (Ok(name), Ok(value)) = (name, value) {
-        if buffer.emitted.len() < AUTH_MAX_HEADERS {
-            buffer.emitted.push((name, value));
-        }
-    }
-}
-
-/// Report how long (in milliseconds) the headers emitted in this [`CAuthHeaderCallback`] invocation
-/// stay valid.
-///
-/// # Safety
-/// `out` must be the [`CAuthHeaders`] pointer passed to the current [`CAuthHeaderCallback`]
-/// invocation.
-#[no_mangle]
-pub unsafe extern "C" fn rest_engine_emit_auth_ttl(out: *mut CAuthHeaders, ttl_ms: u64) {
-    let headers = unsafe { &mut *out };
-    headers.ttl_ms = ttl_ms;
 }
 
 /// Reject the legacy `store.backend` builder option; REST is enabled via
@@ -401,9 +331,9 @@ mod tests {
     }
 
     extern "C" fn fill_auth_direct(_: NullableCvoid, out: *mut CAuthHeaders) {
-        let headers = test_auth_headers(&[("authorization", "Bearer t")]);
+        let mut headers = test_auth_headers(&[("authorization", "Bearer t")]);
+        headers.ttl_ms = 60_000;
         unsafe { *out = headers };
-        unsafe { rest_engine_emit_auth_ttl(out, 60_000) };
     }
 
     #[test]
@@ -420,36 +350,9 @@ mod tests {
         assert_eq!(ttl_ms, Some(60_000));
     }
 
-    extern "C" fn emit_header_and_ttl(_context: NullableCvoid, out: *mut CAuthHeaders) {
-        let name = "authorization";
-        let value = "Bearer t";
-        unsafe {
-            rest_engine_emit_auth_header(
-                out,
-                kernel_string_slice!(name),
-                kernel_string_slice!(value),
-            );
-            rest_engine_emit_auth_ttl(out, 60_000);
-        };
-    }
-
-    #[test]
-    fn auth_callback_collects_emitted_headers_and_ttl() {
-        let provider = FfiAuthHeaderProvider {
-            callback: emit_header_and_ttl,
-            context: None,
-        };
-        let (pairs, ttl_ms) = provider.collect().unwrap();
-        assert_eq!(
-            pairs,
-            vec![("authorization".to_string(), "Bearer t".to_string())]
-        );
-        assert_eq!(ttl_ms, Some(60_000));
-    }
-
     #[test]
     fn build_succeeds_with_refreshing_auth_callback() {
-        let provider = FfiAuthHeaderProvider::new(emit_header_and_ttl, None);
+        let provider = FfiAuthHeaderProvider::new(fill_auth_direct, None);
         assert!(
             build_rest_object_store(&test_base_url(), &test_dialect_options(), Some(provider))
                 .is_ok()

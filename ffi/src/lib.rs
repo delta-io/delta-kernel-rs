@@ -741,8 +741,7 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
 ///
 /// Pass `callback = NULL` to use `header.<Name>` builder options for static auth. Pass a non-null
 /// `callback` for dynamic headers that may expire; the callback fills a
-/// [`rest_engine::CAuthHeaders`] buffer via [`rest_engine::rest_engine_emit_auth_header`] and
-/// [`rest_engine::rest_engine_emit_auth_ttl`], or by writing `headers[0..count]` directly.
+/// [`rest_engine::CAuthHeaders`] buffer by writing `headers[0..count]` and `ttl_ms`.
 ///
 /// When `callback` is non-null, `context` must remain valid for the lifetime of the built engine
 /// and must be safe to use from multiple threads.
