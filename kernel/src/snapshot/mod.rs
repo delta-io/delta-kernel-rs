@@ -75,12 +75,12 @@ pub struct Snapshot {
     /// means `crc.version == self.version()` and the CRC can be queried at zero I/O. `None`
     /// means no CRC was loadable (no CRC on disk at this version, or the read failed).
     crc: Option<Arc<Crc>>,
-    /// Intent-based latest-vs-time-travel flag. See [`Snapshot::built_as_latest`].
+    /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
 }
 
 impl PartialEq for Snapshot {
-    // Content equality: `built_as_latest` is intent metadata, deliberately excluded.
+    // Content equality: `built_as_latest` is best-effort build metadata, deliberately excluded.
     fn eq(&self, other: &Self) -> bool {
         self.log_segment == other.log_segment
             && self.table_configuration == other.table_configuration
@@ -156,8 +156,8 @@ impl Snapshot {
     /// A `Some(crc)` must be at the table configuration's version; otherwise this returns an
     /// internal error.
     ///
-    /// `built_as_latest` records whether the snapshot is being built as latest (intent-based).
-    /// See [`Snapshot::built_as_latest`].
+    /// `built_as_latest` records whether the build confirmed this is the latest version
+    /// (best-effort). See [`Snapshot::built_as_latest`].
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,

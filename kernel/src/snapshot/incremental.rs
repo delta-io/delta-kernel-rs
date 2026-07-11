@@ -97,6 +97,7 @@ impl Snapshot {
         let requested_version = target_version.into();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
+            // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
                 return Ok(existing_snapshot.clone());
             }

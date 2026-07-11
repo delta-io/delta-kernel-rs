@@ -98,8 +98,8 @@ async fn setup_multi_version_table<E: TaskExecutor>(
     Ok(())
 }
 
-/// `built_as_latest` reflects the builder's intent and is inherited by snapshots directly derived
-/// from it: `checkpoint`, `write_checksum`, `publish`, and a post-commit advance.
+/// The version-preserving derivations `checkpoint`, `write_checksum`, and `publish` inherit the
+/// source snapshot's `built_as_latest`, while a post-commit advance is always latest.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn built_as_latest_is_inherited_by_derived_snapshots(
@@ -119,7 +119,7 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     assert_eq!(base.version(), LATEST_VERSION);
     // Pinning a catalog-managed table to LATEST_VERSION (its ratified latest) considered built as
     // latest.
-    let base_is_latest = built_base_snap_as_latest || matches!(kind, TableKind::CatalogManaged);
+    let base_is_latest = built_base_snap_as_latest || kind == TableKind::CatalogManaged;
     assert_eq!(base.built_as_latest(), base_is_latest);
 
     // checkpoint and write_checksum inherit the base's flag.
@@ -156,7 +156,7 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
     let pins_catalog_latest =
-        matches!(kind, TableKind::CatalogManaged) && time_travel_version == Some(LATEST_VERSION);
+        kind == TableKind::CatalogManaged && time_travel_version == Some(LATEST_VERSION);
 
     // Fresh build.
     let mut builder =
@@ -192,7 +192,7 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     assert_eq!(pinned.version(), LATEST_VERSION);
     assert_eq!(
         pinned.built_as_latest(),
-        base_is_latest || matches!(kind, TableKind::CatalogManaged)
+        base_is_latest || kind == TableKind::CatalogManaged
     );
 
     Ok(())
