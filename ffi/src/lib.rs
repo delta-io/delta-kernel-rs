@@ -576,16 +576,15 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
 /// A builder that allows setting options on the `Engine` before actually building it.
 ///
 /// For a normal object store backend, `url` is the table storage location (`s3://…`, `file://…`).
-/// For REST, call [`set_builder_rest_object_store`] and set `url` to the REST service base URL;
-/// see [`rest_engine`] for dialect, TLS, and auth options.
+/// For REST, call [`set_builder_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
+/// and set `url` to the REST service base URL; see [`rest_engine`] for TLS and auth options.
 #[cfg(feature = "default-engine-base")]
 pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
-    /// `None` = URL-scheme store; `Some(None)` = REST with static `header.*` options;
-    /// `Some(Some(_))` = REST with a per-request auth callback.
-    rest_object_store: Option<Option<rest_engine::FfiAuthHeaderProvider>>,
+    /// `None` = URL-scheme store; `Some(_)` = REST backend.
+    rest_object_store: Option<rest_engine::RestBuilderState>,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
@@ -736,29 +735,56 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
 }
 
 /// Select a REST-backed object store for this engine. `url` on the builder must be the REST
-/// service base URL (not a Delta table path). Dialect, TLS, and resilience options are still set
-/// via [`set_builder_option`].
+/// service base URL (not a Delta table path). Pass a [`rest_engine::CRestEndpointConfig`]
+/// describing the REST file API dialect.
+///
+/// Additional configuration is set via [`set_builder_option`] before [`builder_build`]. Use the
+/// [`rest_engine::REST_BUILDER_OPTION_*`] key constants (or the exported `*_KEY` byte arrays in C).
+///
+/// | Key | Value |
+/// |-----|-------|
+/// | [`rest_engine::REST_BUILDER_OPTION_HEADER_PREFIX`]`<Name>` | Static HTTP header (e.g. `header.Authorization` = `Bearer <token>`). Only used when `callback` is null. |
+/// | [`rest_engine::REST_BUILDER_OPTION_TLS_CERT_PATH`] | PEM client certificate path (mTLS; requires cert, key, and CA). |
+/// | [`rest_engine::REST_BUILDER_OPTION_TLS_KEY_PATH`] | PEM client private key path. |
+/// | [`rest_engine::REST_BUILDER_OPTION_TLS_CA_PATH`] | PEM CA bundle path. |
+/// | [`rest_engine::REST_BUILDER_OPTION_TLS_DNS_OVERRIDE`] | Comma-separated `host=ip:port` DNS overrides. |
+/// | [`rest_engine::REST_BUILDER_OPTION_TLS_TIMEOUT_SECS`] | HTTP request timeout in seconds. |
+/// | [`rest_engine::REST_BUILDER_OPTION_RETRY_MAX_RETRIES`] | Max automatic retries on ambiguous failures (default `0`). |
+/// | [`rest_engine::REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS`] | `true` or `false`; verify object exists after ambiguous PUT (default `false`). |
 ///
 /// Pass `callback = NULL` to use `header.<Name>` builder options for static auth. Pass a non-null
 /// `callback` for dynamic headers that may expire; the callback fills a
 /// [`rest_engine::CAuthHeaders`] buffer by writing `headers[0..count]` and `ttl_ms`.
 ///
-/// When `callback` is non-null, `context` must remain valid for the lifetime of the built engine
-/// and must be safe to use from multiple threads.
+/// Each slice in `endpoint_config` must remain valid for the duration of this call. When
+/// `callback` is non-null, `context` must remain valid for the lifetime of the built engine and
+/// must be safe to use from multiple threads.
 ///
 /// IMPORTANT: When `callback` is non-null, `context` MUST be thread-safe.
 ///
 /// # Safety
-/// Caller must pass a valid builder pointer.
+/// Caller must pass a valid builder pointer and a non-null `endpoint_config`.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_rest_object_store(
     builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
-) {
-    let auth_callback = callback.map(|cb| rest_engine::FfiAuthHeaderProvider::new(cb, context));
-    builder.rest_object_store = Some(auth_callback);
+) -> ExternResult<()> {
+    let allocate_error = builder.allocate_fn;
+    let result = (|| {
+        let endpoint_config = endpoint_config
+            .as_ref()
+            .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
+        builder.rest_object_store = Some(rest_engine::rest_builder_state_from_ffi(
+            endpoint_config,
+            callback,
+            context,
+        )?);
+        Ok(())
+    })();
+    result.into_extern_result(&allocate_error)
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
@@ -838,17 +864,15 @@ fn engine_to_handle(
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
-    rest_object_store: Option<Option<rest_engine::FfiAuthHeaderProvider>>,
+    rest_object_store: Option<rest_engine::RestBuilderState>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
-    rest_engine::reject_legacy_store_backend_option(&options)?;
-
-    let store = if let Some(auth_callback) = rest_object_store {
-        rest_engine::build_rest_object_store(&url, &options, auth_callback)?
+    let store = if let Some(rest) = rest_object_store {
+        rest_engine::build_rest_object_store(&url, &options, &rest)?
     } else {
         store_from_url_opts(&url, options)?
     };
