@@ -2,77 +2,137 @@
 //!
 //! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) to select the REST
 //! backend, then configure the REST file API dialect (the [`RestEndpointConfig`] field names),
-//! TLS (`tls.*`), and resilience (`retry.max_retries`, `put.verify_on_ambiguous`) via
-//! [`set_builder_option`](crate::set_builder_option). Pass auth headers via
-//! [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) or legacy
-//! `header.<Name>` options. The builder `url` is the REST service base URL (not a Delta table
-//! path).
+//! request headers (`header.<Name>`), TLS (`tls.*`), and resilience (`retry.max_retries`,
+//! `put.verify_on_ambiguous`) via [`set_builder_option`](crate::set_builder_option). The builder
+//! `url` is the REST service base URL (not a Delta table path).
 
 use std::collections::HashMap;
+use std::mem::offset_of;
 use std::sync::Arc;
+use std::time::Duration;
 
-use delta_kernel::object_store::ObjectStore;
+use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_default_engine::rest_store::{
-    build_rest_client, AuthHeaderProvider, RestClientOptions, RestEndpointConfig, RestObjectStore,
-    StaticHeaderProvider,
+    build_rest_client, headers_from_pairs, AuthHeaderProvider, RefreshingHeaderProvider,
+    RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
 };
 use url::Url;
 
-use crate::{KernelStringSlice, TryFromStringSlice};
+use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
 /// [`set_builder_option`](crate::set_builder_option) key for the legacy REST backend selector.
 /// Use [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) instead.
 pub(crate) const STORE_BACKEND_KEY: &str = "store.backend";
 
-/// Max `(name, value)` pairs in a [`CAuthHeaders`] struct (FSS typically uses ~3–5).
+/// Max `(name, value)` pairs in a [`CAuthHeaders`] struct.
 pub const AUTH_MAX_HEADERS: usize = 8;
 
-/// One HTTP header name/value pair borrowed for the duration of
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
+/// One HTTP header name/value pair borrowed for the duration of a [`CAuthHeaderCallback`] call.
 #[repr(C)]
 pub struct CAuthHeaderPair {
     pub name: KernelStringSlice,
     pub value: KernelStringSlice,
 }
 
-/// Static auth headers for a REST-backed engine.
+/// Output buffer for a [`CAuthHeaderCallback`] invocation.
 ///
-/// Set `count` and fill `headers[0..count]`. When passed to
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store), each slice must remain
-/// valid until that call returns; kernel copies the strings.
+/// Populate it by calling [`rest_engine_emit_auth_header`] and [`rest_engine_emit_auth_ttl`] with
+/// the `out` pointer your callback receives, or fill `headers[0..count]` directly. `name` and
+/// `value` slices must remain valid until the callback returns; the kernel copies them before the
+/// next refresh.
 #[repr(C)]
 pub struct CAuthHeaders {
     pub count: u32,
     pub headers: [CAuthHeaderPair; AUTH_MAX_HEADERS],
+    /// How long (in milliseconds) the emitted headers stay valid. `0` means refresh on every
+    /// request. Set via [`rest_engine_emit_auth_ttl`].
+    pub ttl_ms: u64,
 }
 
-/// REST-specific state stored on [`EngineBuilder`](crate::EngineBuilder) after
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
-#[derive(Default)]
-pub(crate) struct RestBuilderState {
-    /// Headers from [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). When
-    /// `None` at build time, [`build_rest_object_store`] falls back to `header.<Name>` builder
-    /// options.
-    auth_headers: Option<Vec<(String, String)>>,
+/// Supplies auth headers for a REST-backed engine.
+///
+/// The kernel invokes this when it needs fresh headers. The implementation writes into `out` by
+/// calling [`rest_engine_emit_auth_header`] once per header and may call
+/// [`rest_engine_emit_auth_ttl`] once to report how long those headers stay valid. With a TTL the
+/// kernel caches them and re-invokes near expiry; without one it invokes the callback on every
+/// request.
+///
+/// `context` is the opaque pointer registered via
+/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). Both pointers are only
+/// valid for the duration of the call and must not be retained.
+///
+/// Named emit exports (rather than function-pointer arguments) allow FFI runtimes that cannot
+/// invoke arbitrary function pointers (e.g. JNR-FFI) to emit headers via bound symbols.
+pub type CAuthHeaderCallback = extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders);
+
+/// Kernel-side buffer for one callback invocation. `headers` is the C-visible face passed to the
+/// callback; `emitted` stores copies produced by [`rest_engine_emit_auth_header`].
+#[repr(C)]
+struct AuthHeaderCollectBuffer {
+    headers: CAuthHeaders,
+    emitted: Vec<(String, String)>,
 }
 
-/// Build REST builder state. `headers == NULL` selects REST with no bulk auth headers.
-pub(crate) fn rest_builder_state_from_optional_headers(
-    headers: *const CAuthHeaders,
-) -> DeltaResult<RestBuilderState> {
-    let mut rest = RestBuilderState::default();
-    if let Some(headers) = unsafe { headers.as_ref() } {
-        rest.set_auth_headers(headers)?;
+/// Rust-side adapter pairing a [`CAuthHeaderCallback`] with its opaque `context`. Marked `Send +
+/// Sync` so the per-request closure can be shared across threads.
+///
+/// Safety: the FFI caller guarantees `callback` and `context` are safe to invoke from multiple
+/// threads concurrently -- the kernel consults the header provider from async request tasks that
+/// may run on any worker thread.
+#[derive(Clone, Copy)]
+pub(crate) struct FfiAuthHeaderProvider {
+    callback: CAuthHeaderCallback,
+    context: NullableCvoid,
+}
+unsafe impl Send for FfiAuthHeaderProvider {}
+unsafe impl Sync for FfiAuthHeaderProvider {}
+
+impl FfiAuthHeaderProvider {
+    pub(crate) fn new(callback: CAuthHeaderCallback, context: NullableCvoid) -> Self {
+        Self { callback, context }
     }
-    Ok(rest)
+
+    fn collect(&self) -> DeltaResult<(Vec<(String, String)>, Option<u64>)> {
+        let mut buffer = AuthHeaderCollectBuffer {
+            headers: empty_c_auth_headers(),
+            emitted: Vec::new(),
+        };
+        (self.callback)(self.context, &mut buffer.headers);
+        let pairs = if buffer.emitted.is_empty() {
+            auth_pairs_from_c(&buffer.headers)?
+        } else {
+            buffer.emitted
+        };
+        Ok((pairs, ttl_ms_from_c(buffer.headers.ttl_ms)))
+    }
 }
 
-impl RestBuilderState {
-    /// Copies `headers` into this builder state.
-    pub(crate) fn set_auth_headers(&mut self, headers: &CAuthHeaders) -> DeltaResult<()> {
-        self.auth_headers = Some(auth_pairs_from_c(headers)?);
-        Ok(())
+fn collect_buffer_from_out(out: *mut CAuthHeaders) -> *mut AuthHeaderCollectBuffer {
+    // SAFETY: `out` always points at `AuthHeaderCollectBuffer::headers` during a callback.
+    unsafe {
+        out.byte_sub(offset_of!(AuthHeaderCollectBuffer, headers))
+            .cast()
+    }
+}
+
+fn empty_c_auth_headers() -> CAuthHeaders {
+    static EMPTY: &str = "";
+    CAuthHeaders {
+        count: 0,
+        headers: std::array::from_fn(|_| CAuthHeaderPair {
+            name: unsafe { KernelStringSlice::new_unsafe(EMPTY) },
+            value: unsafe { KernelStringSlice::new_unsafe(EMPTY) },
+        }),
+        ttl_ms: 0,
+    }
+}
+
+fn ttl_ms_from_c(ttl_ms: u64) -> Option<u64> {
+    if ttl_ms == 0 {
+        None
+    } else {
+        Some(ttl_ms)
     }
 }
 
@@ -87,12 +147,49 @@ pub(crate) fn auth_pairs_from_c(headers: &CAuthHeaders) -> DeltaResult<Vec<(Stri
 
     let mut pairs = Vec::with_capacity(count);
     for slot in &headers.headers[..count] {
-        // SAFETY: caller keeps slice memory valid until `set_builder_rest_object_store` returns.
+        // SAFETY: callback keeps slice memory valid until it returns.
         let name = unsafe { String::try_from_slice(&slot.name) }?;
         let value = unsafe { String::try_from_slice(&slot.value) }?;
         pairs.push((name, value));
     }
     Ok(pairs)
+}
+
+/// Emit one `(name, value)` header during a [`CAuthHeaderCallback`] invocation.
+///
+/// Pass the `out` pointer your callback received from the kernel. `name` and `value` are borrowed
+/// for this call; the kernel copies them. Headers beyond [`AUTH_MAX_HEADERS`] are ignored.
+/// Non-UTF-8 names or values are skipped.
+///
+/// # Safety
+/// `out` must be the [`CAuthHeaders`] pointer passed to the current [`CAuthHeaderCallback`]
+/// invocation. `name` and `value` must remain valid for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn rest_engine_emit_auth_header(
+    out: *mut CAuthHeaders,
+    name: KernelStringSlice,
+    value: KernelStringSlice,
+) {
+    let buffer = unsafe { &mut *collect_buffer_from_out(out) };
+    let name = unsafe { String::try_from_slice(&name) };
+    let value = unsafe { String::try_from_slice(&value) };
+    if let (Ok(name), Ok(value)) = (name, value) {
+        if buffer.emitted.len() < AUTH_MAX_HEADERS {
+            buffer.emitted.push((name, value));
+        }
+    }
+}
+
+/// Report how long (in milliseconds) the headers emitted in this [`CAuthHeaderCallback`] invocation
+/// stay valid.
+///
+/// # Safety
+/// `out` must be the [`CAuthHeaders`] pointer passed to the current [`CAuthHeaderCallback`]
+/// invocation.
+#[no_mangle]
+pub unsafe extern "C" fn rest_engine_emit_auth_ttl(out: *mut CAuthHeaders, ttl_ms: u64) {
+    let headers = unsafe { &mut *out };
+    headers.ttl_ms = ttl_ms;
 }
 
 /// Reject the legacy `store.backend` builder option; REST is enabled via
@@ -109,16 +206,29 @@ pub(crate) fn reject_legacy_store_backend_option(
     Ok(())
 }
 
-/// Build a [`RestObjectStore`] from an engine builder's URL, options, and REST auth state.
+/// Build a [`RestObjectStore`] from an engine builder's URL, options, and optional auth callback.
 pub(crate) fn build_rest_object_store(
     base_url: &Url,
     options: &HashMap<String, String>,
-    rest: &RestBuilderState,
+    auth_callback: Option<FfiAuthHeaderProvider>,
 ) -> DeltaResult<Arc<dyn ObjectStore>> {
     let config = rest_endpoint_config_from_options(options)?;
 
-    let auth: Arc<dyn AuthHeaderProvider> = match &rest.auth_headers {
-        Some(pairs) => Arc::new(StaticHeaderProvider::from_pairs(pairs.clone())?),
+    let auth: Arc<dyn AuthHeaderProvider> = match auth_callback {
+        Some(cb) => {
+            let provider = cb;
+            Arc::new(RefreshingHeaderProvider::new(move || {
+                let (pairs, ttl_ms) =
+                    provider.collect().map_err(|e| ObjectStoreError::Generic {
+                        store: "RestObjectStore",
+                        source: e.into(),
+                    })?;
+                Ok((
+                    headers_from_pairs(pairs)?,
+                    ttl_ms.map(Duration::from_millis),
+                ))
+            }))
+        }
         None => {
             let header_pairs = options.iter().filter_map(|(k, v)| {
                 k.strip_prefix("header.")
@@ -249,6 +359,7 @@ mod tests {
                 name: kernel_string_slice!(EMPTY),
                 value: kernel_string_slice!(EMPTY),
             }),
+            ttl_ms: 0,
         };
         for (i, (name, value)) in pairs.iter().enumerate() {
             headers.headers[i] = CAuthHeaderPair {
@@ -257,22 +368,6 @@ mod tests {
             };
         }
         headers
-    }
-
-    #[test]
-    fn rest_builder_state_from_null_headers() {
-        let rest = rest_builder_state_from_optional_headers(std::ptr::null()).unwrap();
-        assert!(rest.auth_headers.is_none());
-    }
-
-    #[test]
-    fn rest_builder_state_from_auth_headers() {
-        let headers = test_auth_headers(&[("Authorization", "Bearer x")]);
-        let rest = rest_builder_state_from_optional_headers(&headers).unwrap();
-        assert_eq!(
-            rest.auth_headers,
-            Some(vec![("Authorization".to_string(), "Bearer x".to_string())])
-        );
     }
 
     #[test]
@@ -305,23 +400,67 @@ mod tests {
         assert!(auth_pairs_from_c(&headers).is_err());
     }
 
-    #[test]
-    fn build_succeeds_with_c_auth_headers() {
-        let mut rest = RestBuilderState::default();
-        let headers = test_auth_headers(&[("Authorization", "Bearer x")]);
-        rest.set_auth_headers(&headers).unwrap();
+    extern "C" fn fill_auth_direct(_: NullableCvoid, out: *mut CAuthHeaders) {
+        let headers = test_auth_headers(&[("authorization", "Bearer t")]);
+        unsafe { *out = headers };
+        unsafe { rest_engine_emit_auth_ttl(out, 60_000) };
+    }
 
-        assert!(build_rest_object_store(&test_base_url(), &test_dialect_options(), &rest).is_ok());
+    #[test]
+    fn auth_callback_collects_direct_fill_and_ttl() {
+        let provider = FfiAuthHeaderProvider {
+            callback: fill_auth_direct,
+            context: None,
+        };
+        let (pairs, ttl_ms) = provider.collect().unwrap();
+        assert_eq!(
+            pairs,
+            vec![("authorization".to_string(), "Bearer t".to_string())]
+        );
+        assert_eq!(ttl_ms, Some(60_000));
+    }
+
+    extern "C" fn emit_header_and_ttl(_context: NullableCvoid, out: *mut CAuthHeaders) {
+        let name = "authorization";
+        let value = "Bearer t";
+        unsafe {
+            rest_engine_emit_auth_header(
+                out,
+                kernel_string_slice!(name),
+                kernel_string_slice!(value),
+            );
+            rest_engine_emit_auth_ttl(out, 60_000);
+        };
+    }
+
+    #[test]
+    fn auth_callback_collects_emitted_headers_and_ttl() {
+        let provider = FfiAuthHeaderProvider {
+            callback: emit_header_and_ttl,
+            context: None,
+        };
+        let (pairs, ttl_ms) = provider.collect().unwrap();
+        assert_eq!(
+            pairs,
+            vec![("authorization".to_string(), "Bearer t".to_string())]
+        );
+        assert_eq!(ttl_ms, Some(60_000));
+    }
+
+    #[test]
+    fn build_succeeds_with_refreshing_auth_callback() {
+        let provider = FfiAuthHeaderProvider::new(emit_header_and_ttl, None);
+        assert!(
+            build_rest_object_store(&test_base_url(), &test_dialect_options(), Some(provider))
+                .is_ok()
+        );
     }
 
     #[test]
     fn build_succeeds_with_header_options_fallback() {
         let mut options = test_dialect_options();
         options.insert("header.Authorization".into(), "Bearer x".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &RestBuilderState::default())
-                .is_ok()
-        );
+        assert!(build_rest_object_store(&test_base_url(), &options, None).is_ok());
     }
 
     #[test]
@@ -332,67 +471,46 @@ mod tests {
         options.insert("entry_strip_prefix".into(), "/TablesById/u".into());
         options.insert("retry.max_retries".into(), "3".into());
         options.insert("put.verify_on_ambiguous".into(), "true".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &RestBuilderState::default())
-                .is_ok()
-        );
+        assert!(build_rest_object_store(&test_base_url(), &options, None).is_ok());
     }
 
     #[test]
     fn build_rejects_missing_dialect_option() {
-        assert!(build_rest_object_store(
-            &test_base_url(),
-            &HashMap::new(),
-            &RestBuilderState::default()
-        )
-        .is_err());
+        assert!(build_rest_object_store(&test_base_url(), &HashMap::new(), None).is_err());
     }
 
     #[test]
     fn build_rejects_invalid_timeout() {
         let mut options = test_dialect_options();
         options.insert("tls.timeout_secs".into(), "nope".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &RestBuilderState::default())
-                .is_err()
-        );
+        assert!(build_rest_object_store(&test_base_url(), &options, None).is_err());
     }
 
     #[test]
     fn build_rejects_invalid_max_retries() {
         let mut options = test_dialect_options();
         options.insert("retry.max_retries".into(), "nope".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &RestBuilderState::default())
-                .is_err()
-        );
+        assert!(build_rest_object_store(&test_base_url(), &options, None).is_err());
     }
 
     #[test]
     fn build_rejects_invalid_verify_on_ambiguous() {
         let mut options = test_dialect_options();
         options.insert("put.verify_on_ambiguous".into(), "nope".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &RestBuilderState::default())
-                .is_err()
-        );
+        assert!(build_rest_object_store(&test_base_url(), &options, None).is_err());
+    }
+
+    #[test]
+    fn build_rejects_invalid_header_value() {
+        let mut options = test_dialect_options();
+        options.insert("header.X".into(), "bad\nvalue".into());
+        assert!(build_rest_object_store(&test_base_url(), &options, None).is_err());
     }
 
     #[test]
     fn build_rejects_partial_mtls() {
         let mut options = test_dialect_options();
         options.insert("tls.cert_path".into(), "/x/cert.pem".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &RestBuilderState::default())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn build_rejects_invalid_header_value() {
-        let mut rest = RestBuilderState::default();
-        let headers = test_auth_headers(&[("X", "bad\nvalue")]);
-        rest.set_auth_headers(&headers).unwrap();
-        assert!(build_rest_object_store(&test_base_url(), &test_dialect_options(), &rest).is_err());
+        assert!(build_rest_object_store(&test_base_url(), &options, None).is_err());
     }
 }
