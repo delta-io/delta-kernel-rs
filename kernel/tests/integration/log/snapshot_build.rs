@@ -117,29 +117,30 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     }
     let base = builder.build(engine.as_ref())?;
     assert_eq!(base.version(), LATEST_VERSION);
-    assert_eq!(base.built_as_latest(), built_base_snap_as_latest);
+    // Pinning a catalog-managed table to LATEST_VERSION (its ratified latest) considered built as
+    // latest.
+    let base_is_latest = built_base_snap_as_latest || matches!(kind, TableKind::CatalogManaged);
+    assert_eq!(base.built_as_latest(), base_is_latest);
 
+    // checkpoint and write_checksum inherit the base's flag.
     let (ckpt_result, after_checkpoint) = base.checkpoint(engine.as_ref(), None)?;
     assert_eq!(ckpt_result, CheckpointWriteResult::Written);
-    assert_eq!(
-        after_checkpoint.built_as_latest(),
-        built_base_snap_as_latest
-    );
+    assert_eq!(after_checkpoint.built_as_latest(), base_is_latest);
 
     let (crc_result, after_checksum) = after_checkpoint.write_checksum(engine.as_ref())?;
     assert_eq!(crc_result, ChecksumWriteResult::Written);
-    assert_eq!(after_checksum.built_as_latest(), built_base_snap_as_latest);
+    assert_eq!(after_checksum.built_as_latest(), base_is_latest);
 
-    // publish() (catalog-managed only) also retains the intent flag.
+    // publish() (catalog-managed only) also inherits the base's flag.
     if kind == TableKind::CatalogManaged {
         let published = base.publish(engine.as_ref(), &TestCatalogCommitter)?;
-        assert_eq!(published.built_as_latest(), built_base_snap_as_latest);
+        assert_eq!(published.built_as_latest(), base_is_latest);
     }
 
-    // A post-commit snapshot inherits the base snapshot's intent.
+    // A post-commit snapshot is latest.
     let post_commit = append_row(base, &engine, kind, 4).await?;
     assert_eq!(post_commit.version(), 4);
-    assert_eq!(post_commit.built_as_latest(), built_base_snap_as_latest);
+    assert!(post_commit.built_as_latest());
 
     Ok(())
 }
@@ -154,7 +155,10 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_multi_version_table(&engine, &table_path, kind).await?;
 
-    // Fresh build: latest iff no explicit version was requested.
+    let pins_catalog_latest =
+        matches!(kind, TableKind::CatalogManaged) && time_travel_version == Some(LATEST_VERSION);
+
+    // Fresh build.
     let mut builder =
         maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), LATEST_VERSION, kind);
     if let Some(v) = time_travel_version {
@@ -165,9 +169,11 @@ async fn built_as_latest_on_fresh_and_incremental_build(
         base.version(),
         time_travel_version.unwrap_or(LATEST_VERSION)
     );
-    assert_eq!(base.built_as_latest(), time_travel_version.is_none());
+    // Time travel to the catalog's latest version is also considered built as latest.
+    let base_is_latest = time_travel_version.is_none() || pins_catalog_latest;
+    assert_eq!(base.built_as_latest(), base_is_latest);
 
-    // Incremental build: latest iff no explicit version was requested.
+    // Incremental build without an explicit version is latest.
     let refreshed = maybe_attach_max_catalog_version(
         Snapshot::builder_from(base.clone()),
         LATEST_VERSION,
@@ -177,12 +183,17 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     assert_eq!(refreshed.version(), LATEST_VERSION);
     assert!(refreshed.built_as_latest());
 
+    // Incremental build with a time-travel version, we can only confirm latest if the base was
+    // already latest, or if the time-travel version is the catalog's latest ratified version.
     let pinned =
         maybe_attach_max_catalog_version(Snapshot::builder_from(base), LATEST_VERSION, kind)
             .at_version(LATEST_VERSION)
             .build(engine.as_ref())?;
     assert_eq!(pinned.version(), LATEST_VERSION);
-    assert!(!pinned.built_as_latest());
+    assert_eq!(
+        pinned.built_as_latest(),
+        base_is_latest || matches!(kind, TableKind::CatalogManaged)
+    );
 
     Ok(())
 }

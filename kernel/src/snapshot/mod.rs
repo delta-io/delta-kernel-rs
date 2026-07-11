@@ -284,13 +284,12 @@ impl Snapshot {
             .as_deref()
             .map(|base| Arc::new(base.clone().apply(crc_delta, new_version)));
 
-        // A post-commit snapshot advances the source snapshot to the version it just committed, so
-        // it inherits the source's latest intent.
+        // A successful commit means the post-commit snapshot is the latest version.
         Snapshot::new_with_crc(
             new_log_segment,
             new_table_configuration,
             new_crc,
-            self.built_as_latest,
+            true, /* built_as_latest */
         )
     }
 
@@ -322,18 +321,16 @@ impl Snapshot {
         self.table_configuration().version()
     }
 
-    /// Whether this snapshot was built as latest.
+    /// Whether this snapshot was confirmed to be the latest version when it was built.
     ///
-    /// This is intent-based: it reflects what the caller asked for, not whether this snapshot is
-    /// factually the newest version of the table.
+    /// This is best-effort: `true` means the build could confirm this was the newest version. That
+    /// holds for a build (fresh or incremental) with no time-travel version, a build (fresh or
+    /// incremental) at the catalog's ratified latest version, and a post-commit snapshot. It is not
+    /// a liveness guarantee: a concurrent writer may commit a newer version immediately after, so a
+    /// `true` snapshot can already be stale.
     ///
-    /// `true` when built without an explicit time-travel version (a `max_catalog_version` ceiling
-    /// is not time-travel), and for the snapshot produced by creating a table (version 0 is
-    /// necessarily the latest). `false` for a snapshot built at an explicit version.
-    ///
-    /// A snapshot derived from a source snapshot (e.g. via a post-commit advance,
-    /// [`Self::checkpoint`], [`Self::write_checksum`], or [`Self::publish`]) inherits the
-    /// source's flag.
+    /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
+    /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.
     pub fn built_as_latest(&self) -> bool {
         self.built_as_latest
     }

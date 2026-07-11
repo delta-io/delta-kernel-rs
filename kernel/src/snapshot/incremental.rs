@@ -97,9 +97,8 @@ impl Snapshot {
         let requested_version = target_version.into();
         if let Some(requested_version) = requested_version {
             tracing::Span::current().record("version", requested_version);
-            // Case A: re-requesting the same version.
             if requested_version == existing_snapshot_version {
-                return Self::reuse_with_intent(&existing_snapshot, built_as_latest);
+                return Ok(existing_snapshot.clone());
             }
             // Case B: incremental path only moves forward.
             if requested_version < existing_snapshot_version {
@@ -146,7 +145,7 @@ impl Snapshot {
                 }
                 // Case C.2: no new commits and no explicit target; latest is existing.
                 None => {
-                    return Self::reuse_with_intent(&existing_snapshot, built_as_latest);
+                    return Self::reuse_promoting_built_as_latest(&existing_snapshot, true);
                 }
             }
         }
@@ -199,7 +198,7 @@ impl Snapshot {
             // We must check checkpoint_version here: if a checkpoint at or below the existing
             // snapshot version was discovered, we still need to fall through to advance the
             // checkpoint base even though the version did not change.
-            return Self::reuse_with_intent(&existing_snapshot, built_as_latest);
+            return Self::reuse_promoting_built_as_latest(&existing_snapshot, built_as_latest);
         }
 
         // Case F: lightweight P+M replay on new commits, merge with existing segment.
@@ -346,12 +345,13 @@ impl Snapshot {
     // Helpers
     // ============================================================================
 
-    /// Return `existing` when its intent flag already matches `built_as_latest`,
-    /// otherwise a copy carrying the new flag.
-    fn reuse_with_intent(
+    /// Reuse `existing`, promoting its `built_as_latest` flag to `true` if this build confirmed
+    /// latest.
+    fn reuse_promoting_built_as_latest(
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
     ) -> DeltaResult<Arc<Snapshot>> {
+        let built_as_latest = existing.built_as_latest || built_as_latest;
         if existing.built_as_latest == built_as_latest {
             return Ok(existing.clone());
         }
