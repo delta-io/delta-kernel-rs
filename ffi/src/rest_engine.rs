@@ -1,9 +1,14 @@
-//! REST [`RestObjectStore`] support for [`EngineBuilder`](crate::EngineBuilder).
+//! REST [`RestObjectStore`] wiring for [`EngineBuilder`](crate::EngineBuilder).
 //!
-//! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) with a
-//! [`CRestEndpointConfig`] to select the REST backend. Configure TLS, resilience, and static auth
-//! via [`set_builder_option`](crate::set_builder_option) using the `REST_BUILDER_OPTION_*` key
-//! constants below. The builder `url` is the REST service base URL (not a Delta table path).
+//! Call [`set_builder_rest_object_store`] with a [`CRestEndpointConfig`] to select the REST
+//! backend. The builder `url` must be the REST service base URL, not a Delta table path.
+//!
+//! TLS, retries, and static auth use [`set_builder_option`](crate::set_builder_option) with the
+//! `REST_BUILDER_OPTION_*` keys below. Pass a [`CAuthHeaderCallback`] when headers expire; with
+//! `callback = NULL`, set static headers via `header.<Name>` options instead.
+//!
+//! When `callback` is non-null, `context` must remain valid for the engine lifetime and be safe
+//! to invoke from any thread.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,11 +80,6 @@ pub const REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS: &str = "put.verify_on_amb
 pub static REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS_KEY: [u8; 24] =
     *b"put.verify_on_ambiguous\0";
 
-fn option_key_bytes_match_const(key: &[u8], expected: &str) {
-    let without_nul = &key[..key.len() - 1];
-    assert_eq!(std::str::from_utf8(without_nul).unwrap(), expected);
-}
-
 /// REST file API dialect passed to
 /// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
 ///
@@ -133,8 +133,8 @@ pub struct CAuthHeaders {
 /// valid for the duration of the call and must not be retained.
 pub type CAuthHeaderCallback = extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders);
 
-/// REST-specific state stored on [`EngineBuilder`](crate::EngineBuilder) after
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
+/// State for [`crate::ObjectStoreBackend::Rest`], stored on [`EngineBuilder`](crate::EngineBuilder)
+/// after [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
 pub(crate) struct RestBuilderState {
     endpoint_config: RestEndpointConfig,
     auth_callback: Option<FfiAuthHeaderProvider>,
@@ -153,12 +153,15 @@ pub(crate) struct FfiAuthHeaderProvider {
 unsafe impl Send for FfiAuthHeaderProvider {}
 unsafe impl Sync for FfiAuthHeaderProvider {}
 
+type AuthHeaderPairs = Vec<(String, String)>;
+type CollectedAuthHeaders = (AuthHeaderPairs, Option<u64>);
+
 impl FfiAuthHeaderProvider {
     pub(crate) fn new(callback: CAuthHeaderCallback, context: NullableCvoid) -> Self {
         Self { callback, context }
     }
 
-    fn collect(&self) -> DeltaResult<(Vec<(String, String)>, Option<u64>)> {
+    fn collect(&self) -> DeltaResult<CollectedAuthHeaders> {
         let mut headers = empty_c_auth_headers();
         (self.callback)(self.context, &mut headers);
         Ok((auth_pairs_from_c(&headers)?, ttl_ms_from_c(headers.ttl_ms)))
@@ -372,6 +375,14 @@ mod tests {
 
     use super::*;
     use crate::kernel_string_slice;
+
+    fn option_key_bytes_match_const(key: &[u8], expected: &str) {
+        let without_nul = &key[..key.len() - 1];
+        assert_eq!(
+            std::str::from_utf8(without_nul).expect("option key bytes should be valid UTF-8"),
+            expected
+        );
+    }
 
     fn test_base_url() -> Url {
         Url::parse("http://localhost/").unwrap()
