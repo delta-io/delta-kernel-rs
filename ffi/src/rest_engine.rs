@@ -1,16 +1,22 @@
 //! REST [`RestObjectStore`] wiring for [`EngineBuilder`](crate::EngineBuilder).
 //!
-//! Call [`set_builder_rest_object_store`] with a [`CRestEndpointConfig`] to select the REST
-//! backend. The builder `url` must be the REST service base URL, not a Delta table path.
+//! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) with a
+//! [`CRestEndpointConfig`] to select the REST backend. The builder `url` must be the REST service
+//! base URL, not a Delta table path.
 //!
 //! TLS, retries, and static auth use [`set_builder_option`](crate::set_builder_option) with the
 //! `REST_BUILDER_OPTION_*` keys below. Pass a [`CAuthHeaderCallback`] when headers expire; with
-//! `callback = NULL`, set static headers via `header.<Name>` options instead.
+//! `callback = NULL`, set static headers via `header.<Name>` options instead. When using a
+//! callback, fill each header name/value with
+//! [`allocate_kernel_string`](crate::allocate_kernel_string); the kernel takes ownership of those
+//! handles when the callback returns.
 //!
 //! When `callback` is non-null, `context` must remain valid for the engine lifetime and be safe
 //! to invoke from any thread.
 
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
+use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +28,11 @@ use delta_kernel_default_engine::rest_store::{
 };
 use url::Url;
 
-use crate::{KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice};
+use crate::error::AllocateErrorFn;
+use crate::handle::Handle;
+use crate::{
+    ExclusiveRustString, KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice,
+};
 
 /// Max `(name, value)` pairs in a [`CAuthHeaders`] struct.
 pub const AUTH_MAX_HEADERS: usize = 8;
@@ -68,7 +78,9 @@ pub const REST_BUILDER_OPTION_TLS_TIMEOUT_SECS: &str = "tls.timeout_secs";
 #[no_mangle]
 pub static REST_BUILDER_OPTION_TLS_TIMEOUT_SECS_KEY: [u8; 17] = *b"tls.timeout_secs\0";
 
-/// Maximum automatic retries for ambiguous REST failures; defaults to `0` when unset.
+/// Maximum automatic retries for transient failures (5xx, connect/timeout) on idempotent REST
+/// requests; defaults to `0` when unset. Ambiguous `Create` puts use
+/// [`REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS`] instead.
 pub const REST_BUILDER_OPTION_RETRY_MAX_RETRIES: &str = "retry.max_retries";
 #[no_mangle]
 pub static REST_BUILDER_OPTION_RETRY_MAX_RETRIES_KEY: [u8; 18] = *b"retry.max_retries\0";
@@ -103,17 +115,20 @@ pub struct CRestEndpointConfig {
     pub entry_strip_prefix: OptionalValue<KernelStringSlice>,
 }
 
-/// One HTTP header name/value pair borrowed for the duration of a [`CAuthHeaderCallback`] call.
+/// One HTTP header name/value pair produced by a [`CAuthHeaderCallback`].
+///
+/// Set each field with [`allocate_kernel_string`](crate::allocate_kernel_string); ownership
+/// transfers to the kernel when the callback returns.
 #[repr(C)]
 pub struct CAuthHeaderPair {
-    pub name: KernelStringSlice,
-    pub value: KernelStringSlice,
+    pub name: Handle<ExclusiveRustString>,
+    pub value: Handle<ExclusiveRustString>,
 }
 
 /// Output buffer for a [`CAuthHeaderCallback`] invocation.
 ///
-/// Set `count`, fill `headers[0..count]`, and optionally set `ttl_ms`. `name` and `value` slices
-/// must remain valid until the callback returns; the kernel copies them before the next refresh.
+/// Set `count`, fill `headers[0..count]` with
+/// [`allocate_kernel_string`](crate::allocate_kernel_string) handles, and optionally set `ttl_ms`.
 #[repr(C)]
 pub struct CAuthHeaders {
     pub count: u32,
@@ -124,14 +139,20 @@ pub struct CAuthHeaders {
 
 /// Supplies auth headers for a REST-backed engine.
 ///
-/// The kernel invokes this when it needs fresh headers. Fill `out` with `headers[0..count]` and
-/// set `ttl_ms` to report how long those headers stay valid. With a non-zero TTL the kernel caches
-/// them and re-invokes near expiry; with `ttl_ms = 0` it invokes the callback on every request.
+/// The kernel invokes this when it needs fresh headers. For each entry in `headers[0..count]`,
+/// set `name` and `value` via [`allocate_kernel_string`](crate::allocate_kernel_string) using the
+/// supplied `allocate_error` callback (the same allocator the engine registered on
+/// [`get_engine_builder`](crate::get_engine_builder)). Set `ttl_ms` to report how long those
+/// headers stay valid. With a non-zero TTL the kernel caches them and re-invokes near expiry; with
+/// `ttl_ms = 0` it invokes the callback on every request.
 ///
 /// `context` is the opaque pointer registered via
-/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). Both pointers are only
-/// valid for the duration of the call and must not be retained.
-pub type CAuthHeaderCallback = extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders);
+/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). `allocate_error` is
+/// forwarded on each invocation so the callback can pass it to
+/// [`allocate_kernel_string`](crate::allocate_kernel_string) without the engine having to stash it
+/// separately.
+pub type CAuthHeaderCallback =
+    extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders, allocate_error: AllocateErrorFn);
 
 /// State for [`crate::ObjectStoreBackend::Rest`], stored on [`EngineBuilder`](crate::EngineBuilder)
 /// after [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
@@ -147,9 +168,10 @@ pub(crate) struct RestBuilderState {
 pub(crate) struct FfiAuthHeaderProvider {
     callback: CAuthHeaderCallback,
     context: NullableCvoid,
+    allocate_error: AllocateErrorFn,
 }
-// SAFETY: see [`set_builder_rest_object_store`]: `context` and `callback` must be safe to invoke
-// from any thread concurrently.
+// SAFETY: see [`set_builder_rest_object_store`](crate::set_builder_rest_object_store): `context`
+// and `callback` must be safe to invoke from any thread concurrently.
 unsafe impl Send for FfiAuthHeaderProvider {}
 unsafe impl Sync for FfiAuthHeaderProvider {}
 
@@ -157,14 +179,31 @@ type AuthHeaderPairs = Vec<(String, String)>;
 type CollectedAuthHeaders = (AuthHeaderPairs, Option<u64>);
 
 impl FfiAuthHeaderProvider {
-    pub(crate) fn new(callback: CAuthHeaderCallback, context: NullableCvoid) -> Self {
-        Self { callback, context }
+    pub(crate) fn new(
+        callback: CAuthHeaderCallback,
+        context: NullableCvoid,
+        allocate_error: AllocateErrorFn,
+    ) -> Self {
+        Self {
+            callback,
+            context,
+            allocate_error,
+        }
     }
 
     fn collect(&self) -> DeltaResult<CollectedAuthHeaders> {
-        let mut headers = empty_c_auth_headers();
-        (self.callback)(self.context, &mut headers);
-        Ok((auth_pairs_from_c(&headers)?, ttl_ms_from_c(headers.ttl_ms)))
+        let mut headers = MaybeUninit::<CAuthHeaders>::uninit();
+        let out = headers.as_mut_ptr();
+        // SAFETY: `out` is valid for writes until `headers` is forgotten. The callback initializes
+        // `headers[0..count]`; only those slots are read below.
+        unsafe {
+            (*out).count = 0;
+            (*out).ttl_ms = 0;
+            (self.callback)(self.context, out, self.allocate_error);
+            let ttl_ms = ttl_ms_from_c((*out).ttl_ms);
+            let pairs = take_auth_pairs_from_c(out)?;
+            Ok((pairs, ttl_ms))
+        }
     }
 }
 
@@ -173,23 +212,44 @@ pub(crate) fn rest_builder_state_from_ffi(
     endpoint_config: &CRestEndpointConfig,
     callback: Option<CAuthHeaderCallback>,
     context: NullableCvoid,
+    allocate_error: AllocateErrorFn,
 ) -> DeltaResult<RestBuilderState> {
     Ok(RestBuilderState {
         endpoint_config: rest_endpoint_config_from_c(endpoint_config)?,
-        auth_callback: callback.map(|cb| FfiAuthHeaderProvider::new(cb, context)),
+        auth_callback: callback.map(|cb| FfiAuthHeaderProvider::new(cb, context, allocate_error)),
     })
 }
 
-fn empty_c_auth_headers() -> CAuthHeaders {
-    static EMPTY: &str = "";
-    CAuthHeaders {
-        count: 0,
-        headers: std::array::from_fn(|_| CAuthHeaderPair {
-            name: unsafe { KernelStringSlice::new_unsafe(EMPTY) },
-            value: unsafe { KernelStringSlice::new_unsafe(EMPTY) },
-        }),
-        ttl_ms: 0,
+fn take_string_handle(handle: Handle<ExclusiveRustString>) -> DeltaResult<String> {
+    // SAFETY: each handle is moved out of `CAuthHeaders` exactly once.
+    Ok(*unsafe { handle.into_inner() })
+}
+
+/// Take ownership of initialized `(name, value)` handles in `headers[0..count]`.
+///
+/// # Safety
+///
+/// `(*headers).count` must not exceed [`AUTH_MAX_HEADERS`], and every slot in
+/// `headers[0..count]` must hold handles produced by
+/// [`allocate_kernel_string`](crate::allocate_kernel_string). Padding slots are never read or
+/// dropped.
+unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> DeltaResult<Vec<(String, String)>> {
+    let count = (*headers).count as usize;
+    if count > AUTH_MAX_HEADERS {
+        return Err(Error::generic(format!(
+            "auth header count {count} exceeds max {AUTH_MAX_HEADERS}"
+        )));
     }
+
+    let mut pairs = Vec::with_capacity(count);
+    for i in 0..count {
+        let slot = ptr::read(ptr::addr_of_mut!((*headers).headers[i]));
+        pairs.push((
+            take_string_handle(slot.name)?,
+            take_string_handle(slot.value)?,
+        ));
+    }
+    Ok(pairs)
 }
 
 fn ttl_ms_from_c(ttl_ms: u64) -> Option<u64> {
@@ -198,25 +258,6 @@ fn ttl_ms_from_c(ttl_ms: u64) -> Option<u64> {
     } else {
         Some(ttl_ms)
     }
-}
-
-/// Copy `(name, value)` pairs from borrowed slices in `headers`.
-pub(crate) fn auth_pairs_from_c(headers: &CAuthHeaders) -> DeltaResult<Vec<(String, String)>> {
-    let count = headers.count as usize;
-    if count > AUTH_MAX_HEADERS {
-        return Err(Error::generic(format!(
-            "auth header count {count} exceeds max {AUTH_MAX_HEADERS}"
-        )));
-    }
-
-    let mut pairs = Vec::with_capacity(count);
-    for slot in &headers.headers[..count] {
-        // SAFETY: callback keeps slice memory valid until it returns.
-        let name = unsafe { String::try_from_slice(&slot.name) }?;
-        let value = unsafe { String::try_from_slice(&slot.value) }?;
-        pairs.push((name, value));
-    }
-    Ok(pairs)
 }
 
 /// Copy a [`CRestEndpointConfig`] into an owned [`RestEndpointConfig`].
@@ -374,7 +415,19 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::ffi_test_utils::allocate_err;
     use crate::kernel_string_slice;
+
+    fn test_allocate_error() -> AllocateErrorFn {
+        allocate_err
+    }
+
+    fn test_auth_header_pair(name: &str, value: &str) -> CAuthHeaderPair {
+        CAuthHeaderPair {
+            name: Box::new(name.to_string()).into(),
+            value: Box::new(value.to_string()).into(),
+        }
+    }
 
     fn option_key_bytes_match_const(key: &[u8], expected: &str) {
         let without_nul = &key[..key.len() - 1];
@@ -419,25 +472,23 @@ mod tests {
     }
 
     fn test_rest_builder_state() -> RestBuilderState {
-        rest_builder_state_from_ffi(&test_c_rest_endpoint_config(), None, None).unwrap()
+        rest_builder_state_from_ffi(
+            &test_c_rest_endpoint_config(),
+            None,
+            None,
+            test_allocate_error(),
+        )
+        .unwrap()
     }
 
-    fn test_auth_headers(pairs: &[(&str, &str)]) -> CAuthHeaders {
-        let mut headers = CAuthHeaders {
-            count: pairs.len() as u32,
-            headers: std::array::from_fn(|_| CAuthHeaderPair {
-                name: kernel_string_slice!(EMPTY),
-                value: kernel_string_slice!(EMPTY),
-            }),
-            ttl_ms: 0,
-        };
-        for (i, (name, value)) in pairs.iter().enumerate() {
-            headers.headers[i] = CAuthHeaderPair {
-                name: kernel_string_slice!(name),
-                value: kernel_string_slice!(value),
-            };
+    fn write_test_auth_headers(pairs: &[(&str, &str)], out: *mut CAuthHeaders) {
+        unsafe {
+            (*out).count = pairs.len() as u32;
+            (*out).ttl_ms = 0;
+            for (i, (name, value)) in pairs.iter().enumerate() {
+                (*out).headers[i] = test_auth_header_pair(name, value);
+            }
         }
-        headers
     }
 
     #[test]
@@ -492,12 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn auth_pairs_from_c_copies_slices() {
-        let headers = test_auth_headers(&[
-            ("Authorization", "Bearer t"),
-            ("X-Databricks-Org-Id", "123"),
-        ]);
-        let pairs = auth_pairs_from_c(&headers).unwrap();
+    fn auth_pairs_from_c_takes_handles() {
+        let mut storage = MaybeUninit::<CAuthHeaders>::uninit();
+        write_test_auth_headers(
+            &[
+                ("Authorization", "Bearer t"),
+                ("X-Databricks-Org-Id", "123"),
+            ],
+            storage.as_mut_ptr(),
+        );
+        let pairs = unsafe { take_auth_pairs_from_c(storage.as_mut_ptr()).unwrap() };
         assert_eq!(
             pairs,
             vec![
@@ -509,15 +564,18 @@ mod tests {
 
     #[test]
     fn auth_pairs_from_c_rejects_excess_count() {
-        let mut headers = test_auth_headers(&[]);
-        headers.count = (AUTH_MAX_HEADERS + 1) as u32;
-        assert!(auth_pairs_from_c(&headers).is_err());
+        let mut storage = MaybeUninit::<CAuthHeaders>::uninit();
+        unsafe {
+            (*storage.as_mut_ptr()).count = (AUTH_MAX_HEADERS + 1) as u32;
+        }
+        assert!(unsafe { take_auth_pairs_from_c(storage.as_mut_ptr()).is_err() });
     }
 
-    extern "C" fn fill_auth_direct(_: NullableCvoid, out: *mut CAuthHeaders) {
-        let mut headers = test_auth_headers(&[("authorization", "Bearer t")]);
-        headers.ttl_ms = 60_000;
-        unsafe { *out = headers };
+    extern "C" fn fill_auth_direct(_: NullableCvoid, out: *mut CAuthHeaders, _: AllocateErrorFn) {
+        write_test_auth_headers(&[("authorization", "Bearer t")], out);
+        unsafe {
+            (*out).ttl_ms = 60_000;
+        }
     }
 
     #[test]
@@ -525,6 +583,7 @@ mod tests {
         let provider = FfiAuthHeaderProvider {
             callback: fill_auth_direct,
             context: None,
+            allocate_error: test_allocate_error(),
         };
         let (pairs, ttl_ms) = provider.collect().unwrap();
         assert_eq!(
@@ -540,6 +599,7 @@ mod tests {
             &test_c_rest_endpoint_config(),
             Some(fill_auth_direct),
             None,
+            test_allocate_error(),
         )
         .unwrap();
         assert!(build_rest_object_store(&test_base_url(), &HashMap::new(), &rest).is_ok());
@@ -563,7 +623,7 @@ mod tests {
         let mut config = test_c_rest_endpoint_config();
         config.files_prefix = kernel_string_slice!(prefix);
         config.entry_strip_prefix = OptionalValue::Some(kernel_string_slice!(prefix));
-        let rest = rest_builder_state_from_ffi(&config, None, None).unwrap();
+        let rest = rest_builder_state_from_ffi(&config, None, None, test_allocate_error()).unwrap();
 
         let mut options = HashMap::new();
         options.insert(

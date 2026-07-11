@@ -68,6 +68,40 @@ fn test_config() -> RestEndpointConfig {
     }
 }
 
+#[test]
+fn join_url_omits_empty_prefix_segment() {
+    let mut config = test_config();
+    config.files_prefix.clear();
+    config.directories_prefix.clear();
+    assert_eq!(
+        config.file_url("http://localhost", "a.txt"),
+        "http://localhost/a.txt"
+    );
+    assert_eq!(
+        config.directory_url("http://localhost", "d"),
+        "http://localhost/d"
+    );
+}
+
+#[test]
+fn join_url_keeps_nonempty_prefix() {
+    let config = test_config();
+    assert_eq!(
+        config.file_url("http://localhost/", "a.txt"),
+        "http://localhost/files/a.txt"
+    );
+}
+
+#[test]
+fn parse_list_rejects_non_integer_last_modified() {
+    let config = test_config();
+    let body = r#"{"contents":[{"path":"d/f1","size":1,"last_modified":"not-a-number"}]}"#;
+    assert!(matches!(
+        config.parse_list(body.as_bytes()),
+        Err(ObjectStoreError::Generic { .. })
+    ));
+}
+
 fn store_for(server: &MockServer, headers: HeaderMap) -> RestObjectStore {
     RestObjectStore::new(
         server.uri(),
@@ -737,6 +771,58 @@ async fn get_retries_transient_5xx() {
         .await
         .unwrap();
     assert_eq!(&bytes[..], b"ok");
+}
+
+#[tokio::test]
+async fn put_create_verified_first_attempt_409_is_already_exists() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    let store = store_for(&server, HeaderMap::new()).with_verify_on_ambiguous(true);
+    let err = store
+        .put_opts(
+            &Path::from("a.txt"),
+            PutPayload::from_static(b"hi"),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::AlreadyExists { .. }));
+}
+
+/// A transient read-back failure during verified create propagates once retries are exhausted.
+#[tokio::test]
+async fn put_create_verified_read_back_error_propagates() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/files/a.txt"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let err = store_for(&server, HeaderMap::new())
+        .with_verify_on_ambiguous(true)
+        .put_opts(
+            &Path::from("a.txt"),
+            PutPayload::from_static(b"hi"),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Generic { .. }));
 }
 
 /// PUT returns 500; the verified Create then reads back via `read_back`, with the read-back

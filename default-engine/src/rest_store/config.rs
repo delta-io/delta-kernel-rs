@@ -54,14 +54,19 @@ pub struct RestEndpointConfig {
 }
 
 /// Join `base_url`, a path `prefix`, and a store-relative `path` into a single URL, trimming
-/// stray slashes at each seam.
+/// stray slashes at each seam. Empty `prefix` or `path` segments are omitted so an empty prefix
+/// does not produce a double slash (`{base}//{path}`).
 fn join_url(base_url: &str, prefix: &str, path: &str) -> String {
-    format!(
-        "{}/{}/{}",
-        base_url.trim_end_matches('/'),
-        prefix.trim_matches('/'),
-        path.trim_start_matches('/')
-    )
+    let mut segments = vec![base_url.trim_end_matches('/')];
+    let prefix = prefix.trim_matches('/');
+    if !prefix.is_empty() {
+        segments.push(prefix);
+    }
+    let path = path.trim_start_matches('/');
+    if !path.is_empty() {
+        segments.push(path);
+    }
+    segments.join("/")
 }
 
 impl RestEndpointConfig {
@@ -143,14 +148,19 @@ impl RestEndpointConfig {
                         ))
                     })?,
                 };
-                let last_modified = entry
-                    .get(&self.entry_last_modified_field)
-                    .and_then(|v| v.as_u64())
-                    .map(|ms| {
+                let last_modified = match entry.get(&self.entry_last_modified_field) {
+                    None => chrono::DateTime::UNIX_EPOCH,
+                    Some(v) => {
+                        let ms = v.as_u64().ok_or_else(|| {
+                            generic_error(format!(
+                                "list entry field `{}` is not a non-negative integer",
+                                self.entry_last_modified_field
+                            ))
+                        })?;
                         (std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms))
                             .into()
-                    })
-                    .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+                    }
+                };
                 // Fail loudly on an unparseable path rather than silently dropping it, so a
                 // misbehaving backend cannot corrupt log replay with a partial listing.
                 let location = Path::parse(path).map_err(|e| {

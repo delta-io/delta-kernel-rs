@@ -749,7 +749,9 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid builder pointer and a non-null `endpoint_config`.
+/// Caller must pass a valid builder pointer and a non-null `endpoint_config`. When `callback` is
+/// non-null, `context` must remain valid for the engine lifetime and the callback must be safe to
+/// invoke from any thread concurrently (see [`rest_engine::CAuthHeaderCallback`]).
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_rest_object_store(
@@ -757,16 +759,20 @@ pub unsafe extern "C" fn set_builder_rest_object_store(
     endpoint_config: *const rest_engine::CRestEndpointConfig,
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
-) -> ExternResult<()> {
+) -> ExternResult<bool> {
     let allocate_error = builder.allocate_fn;
     let result = (|| {
         let endpoint_config = endpoint_config
             .as_ref()
             .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
-        builder.object_store_backend = ObjectStoreBackend::Rest(Box::new(
-            rest_engine::rest_builder_state_from_ffi(endpoint_config, callback, context)?,
-        ));
-        Ok(())
+        builder.object_store_backend =
+            ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
+                endpoint_config,
+                callback,
+                context,
+                builder.allocate_fn,
+            )?));
+        Ok(true)
     })();
     result.into_extern_result(&allocate_error)
 }

@@ -102,8 +102,8 @@ impl RestObjectStore {
                     last_failure = Some(RetryFailure::ServerError(resp.status()));
                 }
                 Ok(resp) => {
-                    if retries > 0 {
-                        log_retry_outcome(target, retries, last_failure.as_ref().unwrap(), true);
+                    if let Some(failure) = last_failure.as_ref().filter(|_| retries > 0) {
+                        log_retry_outcome(target, retries, failure, true);
                     }
                     return Ok(resp);
                 }
@@ -164,8 +164,8 @@ impl RestObjectStore {
 
             match disposition {
                 PutCreateDisposition::Success => {
-                    if retries > 0 {
-                        log_retry_outcome(path, retries, last_failure.as_ref().unwrap(), true);
+                    if let Some(failure) = last_failure.as_ref().filter(|_| retries > 0) {
+                        log_retry_outcome(path, retries, failure, true);
                     }
                     return Ok(put_result());
                 }
@@ -178,8 +178,8 @@ impl RestObjectStore {
             // write and consume a retry rather than making it terminal.
             match self.read_back(path, &body).await {
                 Ok(WriteState::Matches) => {
-                    if retries > 0 {
-                        log_retry_outcome(path, retries, last_failure.as_ref().unwrap(), true);
+                    if let Some(failure) = last_failure.as_ref().filter(|_| retries > 0) {
+                        log_retry_outcome(path, retries, failure, true);
                     }
                     return Ok(put_result());
                 }
@@ -677,6 +677,21 @@ impl ObjectStore for RestObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_range_to_header_formats_bounded() {
+        assert_eq!(get_range_to_header(&GetRange::Bounded(2..6)), "bytes=2-5");
+    }
+
+    #[test]
+    fn get_range_to_header_formats_offset() {
+        assert_eq!(get_range_to_header(&GetRange::Offset(10)), "bytes=10-");
+    }
+
+    #[test]
+    fn get_range_to_header_formats_suffix() {
+        assert_eq!(get_range_to_header(&GetRange::Suffix(512)), "bytes=-512");
+    }
 
     #[test]
     fn parse_content_range_accepts_valid() {
