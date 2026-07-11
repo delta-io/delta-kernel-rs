@@ -259,9 +259,8 @@ impl SnapshotBuilder {
         // the hint is still used when its version <= effective_version.
         let effective_version = version.or(max_catalog_version);
 
-        // A snapshot is latest when no explicit time-travel version is requested,
-        // or when the requested version is
-        // exactly the max_catalog_version.
+        // A snapshot is latest when no explicit time-travel version is requested, or when the
+        // requested version is exactly the max_catalog_version.
         let built_as_latest = version.is_none() || version == max_catalog_version;
 
         let result = if let Some(table_root) = table_root {

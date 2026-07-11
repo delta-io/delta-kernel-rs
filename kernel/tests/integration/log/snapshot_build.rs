@@ -103,7 +103,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn built_as_latest_is_inherited_by_derived_snapshots(
-    #[values(true, false)] built_base_snap_as_latest: bool,
+    #[values(true, false)] base_snap_time_travel_to_latest: bool,
     #[values(TableKind::FileSystem, TableKind::CatalogManaged)] kind: TableKind,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
@@ -112,14 +112,14 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     let mut builder =
         maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), LATEST_VERSION, kind)
             .with_incremental_crc_replay(IncrementalReplay::Unlimited);
-    if !built_base_snap_as_latest {
+    if base_snap_time_travel_to_latest {
         builder = builder.at_version(LATEST_VERSION);
     }
     let base = builder.build(engine.as_ref())?;
     assert_eq!(base.version(), LATEST_VERSION);
-    // Pinning a catalog-managed table to LATEST_VERSION (its ratified latest) considered built as
-    // latest.
-    let base_is_latest = built_base_snap_as_latest || kind == TableKind::CatalogManaged;
+    // A build with no time-travel version is latest; time-travel to the catalog's latest ratified
+    // version is also considered built as latest.
+    let base_is_latest = !base_snap_time_travel_to_latest || kind == TableKind::CatalogManaged;
     assert_eq!(base.built_as_latest(), base_is_latest);
 
     // checkpoint and write_checksum inherit the base's flag.
@@ -145,7 +145,6 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     Ok(())
 }
 
-/// A fresh or incremental build is built as latest iff no explicit version is requested.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn built_as_latest_on_fresh_and_incremental_build(
@@ -158,7 +157,6 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     let pins_catalog_latest =
         kind == TableKind::CatalogManaged && time_travel_version == Some(LATEST_VERSION);
 
-    // Fresh build.
     let mut builder =
         maybe_attach_max_catalog_version(Snapshot::builder_for(&table_path), LATEST_VERSION, kind);
     if let Some(v) = time_travel_version {
@@ -183,8 +181,9 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     assert_eq!(refreshed.version(), LATEST_VERSION);
     assert!(refreshed.built_as_latest());
 
-    // Incremental build with a time-travel version, we can only confirm latest if the base was
-    // already latest, or if the time-travel version is the catalog's latest ratified version.
+    // Incremental build time-travelling to LATEST_VERSION. `pinned` is built as latest iff either:
+    // - the base was already built as latest(and we are traveling to the same version), or
+    // - the time-travel version is the catalog's latest ratified version.
     let pinned =
         maybe_attach_max_catalog_version(Snapshot::builder_from(base), LATEST_VERSION, kind)
             .at_version(LATEST_VERSION)
