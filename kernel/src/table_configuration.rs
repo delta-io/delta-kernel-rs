@@ -1692,7 +1692,7 @@ mod test {
             r#"Feature 'typeWidening' is not supported for writes"#,
         );
 
-        // Geospatial is not supported for writes
+        // Geospatial is not supported for writes yet.
         let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
