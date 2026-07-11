@@ -3,8 +3,8 @@
 //! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) to select the REST
 //! backend, then configure the REST file API dialect (the [`RestEndpointConfig`] field names),
 //! TLS (`tls.*`), and resilience (`retry.max_retries`, `put.verify_on_ambiguous`) via
-//! [`set_builder_option`](crate::set_builder_option). Set request headers with
-//! [`set_builder_auth_headers`](crate::set_builder_auth_headers) (preferred) or legacy
+//! [`set_builder_option`](crate::set_builder_option). Pass auth headers via
+//! [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) or legacy
 //! `header.<Name>` options. The builder `url` is the REST service base URL (not a Delta table
 //! path).
 
@@ -29,7 +29,7 @@ pub(crate) const STORE_BACKEND_KEY: &str = "store.backend";
 pub const AUTH_MAX_HEADERS: usize = 8;
 
 /// One HTTP header name/value pair borrowed for the duration of
-/// [`set_builder_auth_headers`](crate::set_builder_auth_headers).
+/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
 #[repr(C)]
 pub struct CAuthHeaderPair {
     pub name: KernelStringSlice,
@@ -38,9 +38,9 @@ pub struct CAuthHeaderPair {
 
 /// Static auth headers for a REST-backed engine.
 ///
-/// Set `count` and fill `headers[0..count]`. Each slice must remain valid until
-/// [`set_builder_auth_headers`](crate::set_builder_auth_headers) returns; kernel copies the
-/// strings.
+/// Set `count` and fill `headers[0..count]`. When passed to
+/// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store), each slice must remain
+/// valid until that call returns; kernel copies the strings.
 #[repr(C)]
 pub struct CAuthHeaders {
     pub count: u32,
@@ -51,9 +51,21 @@ pub struct CAuthHeaders {
 /// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
 #[derive(Default)]
 pub(crate) struct RestBuilderState {
-    /// Headers from [`set_builder_auth_headers`](crate::set_builder_auth_headers). When `None` at
-    /// build time, [`build_rest_object_store`] falls back to `header.<Name>` builder options.
+    /// Headers from [`set_builder_rest_object_store`](crate::set_builder_rest_object_store). When
+    /// `None` at build time, [`build_rest_object_store`] falls back to `header.<Name>` builder
+    /// options.
     auth_headers: Option<Vec<(String, String)>>,
+}
+
+/// Build REST builder state. `headers == NULL` selects REST with no bulk auth headers.
+pub(crate) fn rest_builder_state_from_optional_headers(
+    headers: *const CAuthHeaders,
+) -> DeltaResult<RestBuilderState> {
+    let mut rest = RestBuilderState::default();
+    if let Some(headers) = unsafe { headers.as_ref() } {
+        rest.set_auth_headers(headers)?;
+    }
+    Ok(rest)
 }
 
 impl RestBuilderState {
@@ -75,7 +87,7 @@ pub(crate) fn auth_pairs_from_c(headers: &CAuthHeaders) -> DeltaResult<Vec<(Stri
 
     let mut pairs = Vec::with_capacity(count);
     for slot in &headers.headers[..count] {
-        // SAFETY: caller keeps slice memory valid until `set_builder_auth_headers` returns.
+        // SAFETY: caller keeps slice memory valid until `set_builder_rest_object_store` returns.
         let name = unsafe { String::try_from_slice(&slot.name) }?;
         let value = unsafe { String::try_from_slice(&slot.value) }?;
         pairs.push((name, value));
@@ -245,6 +257,22 @@ mod tests {
             };
         }
         headers
+    }
+
+    #[test]
+    fn rest_builder_state_from_null_headers() {
+        let rest = rest_builder_state_from_optional_headers(std::ptr::null()).unwrap();
+        assert!(rest.auth_headers.is_none());
+    }
+
+    #[test]
+    fn rest_builder_state_from_auth_headers() {
+        let headers = test_auth_headers(&[("Authorization", "Bearer x")]);
+        let rest = rest_builder_state_from_optional_headers(&headers).unwrap();
+        assert_eq!(
+            rest.auth_headers,
+            Some(vec![("Authorization".to_string(), "Bearer x".to_string())])
+        );
     }
 
     #[test]

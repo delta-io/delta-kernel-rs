@@ -22,7 +22,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, Error, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -739,39 +739,25 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
 /// service base URL (not a Delta table path). Dialect, TLS, and resilience options are still set
 /// via [`set_builder_option`].
 ///
-/// Set request headers with [`set_builder_auth_headers`] or legacy `header.<Name>` options.
+/// Pass `headers = NULL` to use legacy `header.<Name>` options for auth. Pass a non-null
+/// [`rest_engine::CAuthHeaders`] to set static request headers in one call; those take precedence
+/// over `header.<Name>` options. When `headers` is non-null, each slot's `name` and `value` slices
+/// must remain valid for the duration of this call.
 ///
 /// # Safety
-/// Caller must pass a valid builder pointer.
+/// Caller must pass a valid builder pointer. A non-null `headers` must point to a valid
+/// [`rest_engine::CAuthHeaders`] for the duration of this call.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
-pub unsafe extern "C" fn set_builder_rest_object_store(builder: &mut EngineBuilder) {
-    builder.rest_object_store = Some(rest_engine::RestBuilderState::default());
-}
-
-/// Set static auth headers for a REST-backed engine.
-///
-/// Each slot's `name` and `value` slices must remain valid for the duration of this call. Kernel
-/// copies the strings into the built engine. Call after [`set_builder_rest_object_store`], before
-/// [`builder_build`]. When set, these headers take precedence over `header.<Name>` builder options.
-///
-/// # Safety
-/// `headers` must point to a valid [`rest_engine::CAuthHeaders`] for the duration of this call.
-#[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn set_builder_auth_headers(
+pub unsafe extern "C" fn set_builder_rest_object_store(
     builder: &mut EngineBuilder,
     headers: *const rest_engine::CAuthHeaders,
 ) -> ExternResult<()> {
     let allocate_error = builder.allocate_fn;
     let result = (|| {
-        let headers = headers
-            .as_ref()
-            .ok_or_else(|| Error::generic("null CAuthHeaders pointer"))?;
-        let rest = builder.rest_object_store.as_mut().ok_or_else(|| {
-            Error::generic("call set_builder_rest_object_store before set_builder_auth_headers")
-        })?;
-        rest.set_auth_headers(headers)
+        let rest = rest_engine::rest_builder_state_from_optional_headers(headers)?;
+        builder.rest_object_store = Some(rest);
+        Ok(())
     })();
     result.into_extern_result(&allocate_error)
 }
