@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
@@ -20,8 +20,9 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::events::LOG_SEGMENT_LOADED_SPAN;
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::{
+    emit_log_segment_load, emit_log_segment_load_failure, SnapshotLoadMetricContext,
+};
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::compare::SchemaComparison;
@@ -321,12 +322,6 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     ///
     /// Reports metrics: `LogSegmentLoadSuccess` or `LogSegmentLoadFailure`.
-    #[instrument(
-        name = LOG_SEGMENT_LOADED_SPAN,
-        err,
-        skip(storage, time_travel_version),
-        fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or(""), num_commit_files, num_checkpoint_files, num_compaction_files, has_latest_crc_file)
-    )]
     #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
@@ -336,37 +331,39 @@ impl LogSegment {
         metric_context: SnapshotLoadMetricContext,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
-        let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-        let result = Self::for_snapshot_impl(
-            storage,
-            log_root,
-            log_tail,
-            checkpoint_hint,
-            time_travel_version,
-        );
+        let start = std::time::Instant::now();
+        let build = || {
+            let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
+            Self::for_snapshot_impl(
+                storage,
+                log_root,
+                log_tail,
+                checkpoint_hint,
+                time_travel_version,
+            )
+        };
+        let log_segment =
+            build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
-        match result {
-            Ok(log_segment) => {
-                tracing::Span::current().record(
-                    "num_commit_files",
-                    log_segment.listed.ascending_commit_files.len() as u64,
-                );
-                tracing::Span::current().record(
-                    "num_checkpoint_files",
-                    log_segment.listed.checkpoint_parts.len() as u64,
-                );
-                tracing::Span::current().record(
-                    "num_compaction_files",
-                    log_segment.listed.ascending_compaction_files.len() as u64,
-                );
-                tracing::Span::current().record(
-                    "has_latest_crc_file",
-                    log_segment.listed.latest_crc_file.is_some(),
-                );
-                Ok(log_segment)
-            }
-            Err(e) => Err(e),
-        }
+        emit_log_segment_load(
+            &metric_context,
+            log_segment.listed.ascending_commit_files.len() as u64,
+            log_segment.listed.checkpoint_parts.len() as u64,
+            log_segment.listed.ascending_compaction_files.len() as u64,
+            log_segment.crc_versions_behind(),
+            start.elapsed(),
+        );
+        Ok(log_segment)
+    }
+
+    /// How many versions behind `end_version` the latest on-disk CRC file is, for the
+    /// `LogSegmentLoad` metric: `None` if there is no CRC file, else `end_version - crc.version`
+    /// (`Some(0)` when a CRC sits at the end version).
+    pub(crate) fn crc_versions_behind(&self) -> Option<u64> {
+        self.listed
+            .latest_crc_file
+            .as_ref()
+            .map(|crc| self.end_version.saturating_sub(crc.version))
     }
 
     // factored out for testing

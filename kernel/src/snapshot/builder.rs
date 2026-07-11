@@ -7,7 +7,7 @@ use tracing::{info, instrument};
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
-use crate::metrics::{MetricId, SnapshotLoadMetricContext};
+use crate::metrics::{LogSegmentLoadPurpose, MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
@@ -48,6 +48,9 @@ pub struct SnapshotBuilder {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
+    /// Whether this builds a fresh snapshot or updates an existing one. Set by the constructor
+    /// and recorded on the load metric events.
+    load_purpose: LogSegmentLoadPurpose,
 }
 
 /// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
@@ -109,6 +112,7 @@ impl SnapshotBuilder {
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
+            load_purpose: LogSegmentLoadPurpose::FreshSnapshot,
         }
     }
 
@@ -122,6 +126,7 @@ impl SnapshotBuilder {
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
+            load_purpose: LogSegmentLoadPurpose::IncrementalSnapshot,
         }
     }
 
@@ -241,12 +246,14 @@ impl SnapshotBuilder {
             incremental_replay,
             operation_id,
             correlation_id,
+            load_purpose,
         } = self;
 
         let metric_context = SnapshotLoadMetricContext {
             operation_id,
             is_catalog_managed: max_catalog_version.is_some(),
             correlation_id,
+            load_purpose,
         };
 
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();

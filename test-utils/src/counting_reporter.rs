@@ -319,7 +319,7 @@ impl MetricsReporter for CountingReporter {
                 self.checkpoint_files.add(e.num_checkpoint_files);
                 self.compaction_files.add(e.num_compaction_files);
                 self.latest_crc_files_found
-                    .add(e.has_latest_crc_file as u64);
+                    .add(e.crc_versions_behind.is_some() as u64);
             }
             MetricEvent::CrcReadSuccess(e) => {
                 self.crc_read_calls.inc();
@@ -397,8 +397,8 @@ mod tests {
     use std::time::Duration;
 
     use delta_kernel::metrics::{
-        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
-        ProtocolMetadataLoadSuccess, ProtocolMetadataSource, SetTransactionLoadSuccess,
+        CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadPurpose, LogSegmentLoadSuccess,
+        MetricId, ProtocolMetadataLoadSuccess, ProtocolMetadataSource, SetTransactionLoadSuccess,
         SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted,
         StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
     };
@@ -466,11 +466,12 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
+            load_purpose: LogSegmentLoadPurpose::FreshSnapshot,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
             num_compaction_files: 1,
-            has_latest_crc_file: true,
+            crc_versions_behind: Some(0),
         }));
         assert_eq!(reporter.log_segment_loads.get(), 1);
         assert_eq!(reporter.commit_files.get(), 7);
@@ -486,11 +487,12 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
+            load_purpose: LogSegmentLoadPurpose::FreshSnapshot,
             duration: dur(),
             num_commit_files: 3,
             num_checkpoint_files: 1,
             num_compaction_files: 0,
-            has_latest_crc_file: false,
+            crc_versions_behind: None,
         }));
         assert_eq!(reporter.log_segment_loads.get(), 1);
         assert_eq!(reporter.latest_crc_files_found.get(), 0);
@@ -615,6 +617,7 @@ mod tests {
                 operation_id: MetricId::new(),
                 table_type: TableType::PathBased,
                 correlation_id: None,
+                load_purpose: LogSegmentLoadPurpose::FreshSnapshot,
                 source: ProtocolMetadataSource::FullReplay,
                 duration: dur(),
             },
@@ -646,11 +649,12 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
+            load_purpose: LogSegmentLoadPurpose::FreshSnapshot,
             duration: dur(),
             num_commit_files: 7,
             num_checkpoint_files: 2,
             num_compaction_files: 1,
-            has_latest_crc_file: true,
+            crc_versions_behind: Some(0),
         }));
         reporter.report(MetricEvent::CrcReadSuccess(CrcReadSuccess {
             duration: dur(),
