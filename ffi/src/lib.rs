@@ -22,7 +22,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, Error, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -583,9 +583,9 @@ pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
-    /// `None` = URL-scheme store; `Some(None)` = REST with static `header.*` options;
-    /// `Some(Some(_))` = REST with a per-request auth callback.
-    rest_object_store: Option<Option<rest_engine::FfiAuthHeaderProvider>>,
+    /// `None` = URL-scheme store; `Some(_)` = REST backend (see
+    /// [`rest_engine::RestBuilderState`]).
+    rest_object_store: Option<rest_engine::RestBuilderState>,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
@@ -739,28 +739,41 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
 /// service base URL (not a Delta table path). Dialect, TLS, and resilience options are still set
 /// via [`set_builder_option`].
 ///
-/// Pass `callback = NULL` to use static `header.<Name>` options. Pass a non-null
-/// [`rest_engine::CAuthHeaderCallback`] to supply headers dynamically; static `header.<Name>`
-/// options are then ignored.
-///
-/// `context` is passed back on each callback invocation and must remain valid until the engine
-/// produced by [`builder_build`] is freed. It is valid to pass NULL when `callback` is NULL.
-///
-/// IMPORTANT: When `callback` is non-null, `context` MUST be thread-safe (safe to send between
-/// threads) and MUST remain valid for as long as the built engine is used.
+/// Set request headers with [`set_builder_auth_headers`] or legacy `header.<Name>` options.
 ///
 /// # Safety
-/// Caller must pass a valid builder pointer; a non-null `callback` and `context` must stay valid
-/// for the lifetime of the built engine.
+/// Caller must pass a valid builder pointer.
 #[cfg(feature = "default-engine-base")]
 #[no_mangle]
-pub unsafe extern "C" fn set_builder_rest_object_store(
+pub unsafe extern "C" fn set_builder_rest_object_store(builder: &mut EngineBuilder) {
+    builder.rest_object_store = Some(rest_engine::RestBuilderState::default());
+}
+
+/// Set static auth headers for a REST-backed engine.
+///
+/// Each slot's `name` and `value` slices must remain valid for the duration of this call. Kernel
+/// copies the strings into the built engine. Call after [`set_builder_rest_object_store`], before
+/// [`builder_build`]. When set, these headers take precedence over `header.<Name>` builder options.
+///
+/// # Safety
+/// `headers` must point to a valid [`rest_engine::CAuthHeaders`] for the duration of this call.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_auth_headers(
     builder: &mut EngineBuilder,
-    callback: Option<rest_engine::CAuthHeaderCallback>,
-    context: NullableCvoid,
-) {
-    let auth_callback = callback.map(|cb| rest_engine::FfiAuthHeaderProvider::new(cb, context));
-    builder.rest_object_store = Some(auth_callback);
+    headers: *const rest_engine::CAuthHeaders,
+) -> ExternResult<()> {
+    let allocate_error = builder.allocate_fn;
+    let result = (|| {
+        let headers = headers
+            .as_ref()
+            .ok_or_else(|| Error::generic("null CAuthHeaders pointer"))?;
+        let rest = builder.rest_object_store.as_mut().ok_or_else(|| {
+            Error::generic("call set_builder_rest_object_store before set_builder_auth_headers")
+        })?;
+        rest.set_auth_headers(headers)
+    })();
+    result.into_extern_result(&allocate_error)
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
@@ -840,7 +853,7 @@ fn engine_to_handle(
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
-    rest_object_store: Option<Option<rest_engine::FfiAuthHeaderProvider>>,
+    rest_object_store: Option<rest_engine::RestBuilderState>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
@@ -849,8 +862,8 @@ fn get_default_engine_impl(
 
     rest_engine::reject_legacy_store_backend_option(&options)?;
 
-    let store = if let Some(auth_callback) = rest_object_store {
-        rest_engine::build_rest_object_store(&url, &options, auth_callback)?
+    let store = if let Some(rest) = rest_object_store {
+        rest_engine::build_rest_object_store(&url, &options, &rest)?
     } else {
         store_from_url_opts(&url, options)?
     };
