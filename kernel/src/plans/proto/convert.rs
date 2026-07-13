@@ -1903,6 +1903,30 @@ mod tests {
         assert_eq!(kind, expected);
     }
 
+    #[rstest]
+    #[case(
+        Scalar::IntervalYearMonth(30),
+        proto_expr::scalar::Value::IntervalYearMonth(30)
+    )]
+    #[case(
+        Scalar::IntervalYearMonth(i32::MIN),
+        proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
+    )]
+    #[case(
+        Scalar::IntervalDayTime(-5),
+        proto_expr::scalar::Value::IntervalDayTime(-5)
+    )]
+    #[case(
+        Scalar::IntervalDayTime(i64::MAX),
+        proto_expr::scalar::Value::IntervalDayTime(i64::MAX)
+    )]
+    fn from_interval_scalar_preserves_payload(
+        #[case] scalar: Scalar,
+        #[case] expected: proto_expr::scalar::Value,
+    ) {
+        assert_eq!(scalar_value_of(scalar), expected);
+    }
+
     #[test]
     fn from_decimal_data() {
         let decimal = DecimalData::try_new(1234i128, DecimalType::try_new(10, 2).unwrap()).unwrap();

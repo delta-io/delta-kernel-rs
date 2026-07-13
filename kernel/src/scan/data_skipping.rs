@@ -310,7 +310,17 @@ impl DataSkippingFilter {
         is_add_expr: ExpressionRef,
     ) -> Option<(SchemaRef, ExpressionRef, HashSet<ColumnName>)> {
         let partition_columns: HashSet<ColumnName> = physical_partition_schema
-            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
+            .map(|s| {
+                s.fields()
+                    .filter(|f| {
+                        !matches!(
+                            f.data_type(),
+                            &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME
+                        )
+                    })
+                    .map(|f| ColumnName::new([f.name()]))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let stats_field =
