@@ -1669,6 +1669,12 @@ mod test {
             7,
         );
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+
+        {
+            let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+            assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+            assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
+        }
     }
 
     #[test]
