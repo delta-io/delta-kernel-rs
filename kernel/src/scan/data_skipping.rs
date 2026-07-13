@@ -233,8 +233,12 @@ impl DataSkippingFilter {
     /// values are parsed from the raw `add.partitionValues` string map with
     /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
     ///
-    /// Returns `None` (equivalent to keep-all) when the predicate is ineligible for data
-    /// skipping or when neither data stats nor referenced partition columns are available.
+    /// Returns `None` (equivalent to keep-all) when the predicate is ineligible for data skipping
+    /// (references no stats columns, or fails evaluator construction).
+    ///
+    /// Pruning applies only to Add rows: Remove and cdc rows (null `add.path`) are never pruned,
+    /// guarded by the `add.path IS NOT NULL` `is_add` expression wired in below. Callers on the
+    /// change-data-feed path rely on this so tombstones survive a non-matching predicate.
     ///
     /// # Parameters
     /// - `engine`: Engine for creating evaluators.
@@ -242,18 +246,16 @@ impl DataSkippingFilter {
     /// - `table_configuration`: Source of the stats schema, partition schema, and stats-column
     ///   gate.
     /// - `input_schema`: Schema of the raw action batches passed to [`apply()`](Self::apply).
-    /// - `metrics`: Optional metrics to record data skipping statistics.
     pub(crate) fn for_raw_action_batch(
         engine: &dyn Engine,
         physical_predicate: PredicateRef,
         table_configuration: &TableConfiguration,
         input_schema: SchemaRef,
-        metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         // Predicate refs become the `requested_physical_columns` filter; refs outside
         // `physical_stats_columns` fold to NULL via the gate below. Clustering columns are
         // deliberately not required here (see the scan path and #2588): loading clustering
-        // domain metadata would add an unbounded log replay to setup.
+        // domain metadata would require a separate scan of the log, which this filter avoids.
         let predicate_refs: Vec<ColumnName> = physical_predicate
             .references()
             .into_iter()
@@ -285,7 +287,7 @@ impl DataSkippingFilter {
             is_add_expr,
             input_schema,
             &physical_stats_columns,
-            metrics,
+            None,
         )
     }
 

@@ -57,7 +57,7 @@ pub(crate) fn table_changes_action_iter(
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
-    // batches with stats parsed from `add.stats` JSON. `None` metrics: not wired in yet.
+    // batches with stats parsed from `add.stats` JSON.
     let filter = physical_predicate
         .and_then(|(predicate, _ref_schema)| {
             DataSkippingFilter::for_raw_action_batch(
@@ -65,7 +65,6 @@ pub(crate) fn table_changes_action_iter(
                 predicate,
                 start_table_configuration,
                 LOG_ADD_SCHEMA.clone(),
-                None,
             )
         })
         .map(Arc::new);

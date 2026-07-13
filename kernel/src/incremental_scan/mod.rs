@@ -43,8 +43,8 @@ impl IncrementalScanBuilder {
     /// exclude `predicate`. `None` (the default) preserves the current behavior: every live
     /// Add is streamed.
     ///
-    /// Removes are unaffected (they carry no stats and must all be reported so consumers can
-    /// drop stale cached entries). Skipping is best-effort and conservative: a file is dropped
+    /// Removes are unaffected: they are never pruned and must all be reported so consumers can
+    /// drop stale cached entries. Skipping is best-effort and conservative: a file is dropped
     /// only when its stats prove no row can match, and files without stats are always kept.
     ///
     /// Skipping reuses the same stats-based filter the read path uses: data-column predicates
@@ -189,7 +189,6 @@ impl IncrementalScanBuilder {
                     physical_predicate,
                     table_configuration,
                     COMMIT_READ_SCHEMA.clone(),
-                    None,
                 );
                 Ok(filter.map_or(AddSkipping::KeepAll, |f| AddSkipping::Filter(Arc::new(f))))
             }

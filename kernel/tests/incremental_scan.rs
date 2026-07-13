@@ -4,10 +4,13 @@
 //! cross-commit deduplication: cross-commit cancellation, chained add/remove/add, log
 //! compaction interactions, catalog-managed staged commits, and vacuum races.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred, PredicateRef};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
@@ -17,17 +20,22 @@ use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::ObjectStoreExt;
+use delta_kernel::scan::state::ScanFile;
+use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::{
-    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
+    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, SnapshotRef, StorageHandler,
 };
 use rstest::rstest;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
     add_commit, add_staged_commit, assert_result_error_with_message,
-    compacted_log_path_for_versions, create_log_path, delta_path_for_version, TestAction,
+    compacted_log_path_for_versions, create_log_path, create_table_and_load_snapshot,
+    delta_path_for_version, test_table_setup_mt, write_batch_to_table, TestAction,
 };
 use url::Url;
 
@@ -1840,6 +1848,145 @@ async fn column_free_predicate_keeps_all_added_files() -> Result<(), Box<dyn std
         listing.summary.live_adds,
         HashSet::from([key("a.parquet"), key("b.parquet")]),
         "a column-free predicate is ineligible for skipping and keeps every live Add"
+    );
+
+    Ok(())
+}
+
+// === Round-trip against a full scan ===
+//
+// The correctness promise of `with_predicate` is that the incremental live-Add set, reconciled
+// against the base, reproduces what a full `Scan` at the target with the same predicate keeps.
+// The two paths parse stats differently: a full scan reads pre-parsed `stats_parsed` (from a
+// checkpoint), while the incremental path parses `add.stats` JSON via `for_raw_action_batch`.
+//
+// The incremental scan reads only raw commit JSON and never touches checkpoints, so it cannot
+// serve a range predating a checkpoint (the target snapshot's log segment drops pre-checkpoint
+// commit JSON). The checkpoint therefore sits at the base version: the full scan at the base
+// prunes via the checkpoint's `stats_parsed`, the incremental delta over `(base, target]` prunes
+// via JSON, and `full_scan(base) union live_adds` must equal `full_scan(target)`.
+
+type MtEngine = DefaultEngine<TokioMultiThreadExecutor>;
+
+// Single-column `id: integer` table.
+fn id_schema() -> Arc<StructType> {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )]))
+}
+
+// One `RecordBatch` holding a single `id` value, so each written file gets a tight [id, id] range.
+fn id_batch(schema: &Arc<StructType>, id: i32) -> RecordBatch {
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
+    RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![id]))],
+    )
+    .unwrap()
+}
+
+// Surviving file paths from a full scan at `snapshot` under `predicate`. A snapshot loaded after a
+// checkpoint prunes using the checkpoint's `stats_parsed`.
+fn full_scan_surviving_paths(
+    snapshot: SnapshotRef,
+    engine: &MtEngine,
+    predicate: PredicateRef,
+) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    fn insert_path(paths: &mut HashSet<String>, scan_file: ScanFile) {
+        paths.insert(scan_file.path);
+    }
+
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let mut paths: HashSet<String> = HashSet::new();
+    for sm in scan.scan_metadata(engine)? {
+        paths = sm?.visit_scan_files(paths, insert_path)?;
+    }
+    Ok(paths)
+}
+
+// Reconciling a base full scan with the incremental delta reproduces a full scan at the target,
+// even though the base prunes via the checkpoint's `stats_parsed` while the incremental delta
+// prunes via `add.stats` JSON. Guards the stats-parsing divergence the two paths could exhibit.
+#[tokio::test(flavor = "multi_thread")]
+async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkpoint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = Url::from_directory_path(&table_path).map_err(|_| "invalid table path")?;
+    let schema = id_schema();
+    let mut snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    // Files added before the checkpoint: id 5, 15, 25. The checkpoint captures their stats.
+    for id in [5, 15, 25] {
+        snapshot = write_batch_to_table(
+            &snapshot,
+            engine.as_ref(),
+            id_batch(&schema, id),
+            HashMap::new(),
+        )
+        .await?;
+    }
+    let (_, snapshot) = snapshot.checkpoint(engine.as_ref(), None)?;
+    let base_version = snapshot.version();
+
+    // Files added after the checkpoint: id 35, 45. These live only in raw commit JSON.
+    let mut snapshot = snapshot;
+    for id in [35, 45] {
+        snapshot = write_batch_to_table(
+            &snapshot,
+            engine.as_ref(),
+            id_batch(&schema, id),
+            HashMap::new(),
+        )
+        .await?;
+    }
+    let target_version = snapshot.version();
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(20i32)));
+
+    // Base full scan (reads the checkpoint's `stats_parsed`) and target full scan, both loaded
+    // fresh off disk so they replay through the checkpoint.
+    let base = Snapshot::builder_for(table_url.clone())
+        .at_version(base_version)
+        .build(engine.as_ref())?;
+    let base_paths = full_scan_surviving_paths(base, engine.as_ref(), predicate.clone())?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(target_version)
+        .build(engine.as_ref())?;
+    let target_paths = full_scan_surviving_paths(target, engine.as_ref(), predicate.clone())?;
+
+    // Incremental delta over `(base, target]` (parses `add.stats` JSON).
+    let listing = unwrap_listing(
+        snapshot
+            .incremental_scan_builder(base_version)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+    let live_adds: HashSet<String> = listing
+        .summary
+        .live_adds
+        .iter()
+        .map(|k| k.path().to_string())
+        .collect();
+
+    // Sanity: the checkpoint kept a pre-checkpoint match (id 25) that the incremental delta does
+    // not re-report, so the reconciliation is doing real work.
+    assert!(
+        !base_paths.is_empty() && !live_adds.is_empty(),
+        "both the base scan and the incremental delta should contribute matches"
+    );
+    assert!(
+        listing.summary.removes.is_empty(),
+        "no removes in this range"
+    );
+
+    // No in-range removes, so reconciliation is a union of the base and the incremental live Adds.
+    let reconciled: HashSet<String> = base_paths.union(&live_adds).cloned().collect();
+    assert_eq!(
+        reconciled, target_paths,
+        "base full scan plus incremental live_adds must equal the full scan at the target"
     );
 
     Ok(())
