@@ -1,9 +1,14 @@
 //! IcebergCompatV3 checks.
 
+#[cfg(feature = "column-defaults-in-dev")]
+use tracing::warn;
+
 use super::{
     check_no_legacy_nested_ids, check_only_supported_types, IcebergCompatCheck,
     IcebergCompatValidator, IcebergCompatVersion,
 };
+#[cfg(feature = "column-defaults-in-dev")]
+use crate::schema::try_collect_column_defaults;
 use crate::schema::DataType;
 use crate::schema::PrimitiveType::*;
 use crate::table_configuration::TableConfiguration;
@@ -49,45 +54,36 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
     )
 }
 
-/// Returns a warning for every column default that violates an IcebergCompatV3 rule, empty when
-/// all defaults are V3-clean.
+/// Validates IcebergCompatV3 column defaults and logs warnings kernel cannot verify.
 ///
-/// The IcebergCompatV3 spec requires only that a column default be a literal. Kernel additionally
-/// warns on two cases it cannot materialize into the Iceberg metadata:
-/// - The default is not a *kernel-parsable* literal (so [`ColumnDefault::is_literal`] is `false`,
-///   e.g. `current_timestamp()`). The table may still be valid: a connector that does not use
-///   kernel's parser can materialize such a default itself.
-/// - The default is on a non-primitive column. Spark does not emit non-primitive defaults for
-///   IcebergCompatV3.
+/// The IcebergCompatV3 spec requires column defaults to be literals. Kernel warns when its parser
+/// cannot verify that requirement. This warning can be a false positive because a connector's
+/// parser may be able to parse the corresponding expression.
 ///
-/// Never an error: this runs on DML transaction construction (see
-/// [`Transaction::try_new_existing_table`]) to surface, not reject, defaults that kernel can't
-/// materialize. Propagates only the corruption error from [`collect_column_defaults`], which is
-/// already surfaced at snapshot load.
+/// This condition remains a warning because the table has already passed metadata validation and
+/// rejecting a DML transaction could block valid tables based on kernel parser limitations. The
+/// check provides defense in depth without treating an interoperability risk as definite
+/// corruption.
 ///
-/// [`ColumnDefault::is_literal`]: crate::schema::ColumnDefault::is_literal
-/// [`collect_column_defaults`]: crate::schema::collect_column_defaults
-/// [`Transaction::try_new_existing_table`]: crate::transaction::Transaction::try_new_existing_table
+/// # Errors
+///
+/// Propagates malformed column-default metadata errors from [`try_collect_column_defaults`].
 #[cfg(feature = "column-defaults-in-dev")]
-pub(crate) fn iceberg_compat_v3_column_default_warnings(
-    tc: &TableConfiguration,
-) -> DeltaResult<Vec<std::string::String>> {
-    let mut warnings = Vec::new();
-    for (path, column_default) in crate::schema::collect_column_defaults(tc.logical_schema_ref())? {
-        if column_default.data_type().as_primitive_opt().is_none() {
-            warnings.push(format!(
-                "kernel does not support a column default on non-primitive column '{path}' on \
-                 icebergCompatV3 tables"
-            ));
-        } else if !column_default.is_literal() {
-            warnings.push(format!(
-                "icebergCompatV3 requires the column default for '{path}' to be a literal kernel \
-                 can parse, got: {}",
+pub(crate) fn iceberg_compat_v3_column_defaults_validation(
+    table_configuration: &TableConfiguration,
+) -> DeltaResult<()> {
+    for (path, column_default) in
+        try_collect_column_defaults(table_configuration.logical_schema_ref())?
+    {
+        if !column_default.is_kernel_parsable_literal() {
+            warn!(
+                "kernel could not verify that the icebergCompatV3 column default for '{path}' is a \
+                 literal, got: {}",
                 column_default.raw_sql()
-            ));
+            );
         }
     }
-    Ok(warnings)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -145,20 +141,20 @@ mod column_default_tests {
     use std::collections::HashMap;
 
     use rstest::rstest;
+    use test_utils::LoggingTest;
     use url::Url;
 
-    use super::iceberg_compat_v3_column_default_warnings;
+    use super::iceberg_compat_v3_column_defaults_validation;
     use crate::actions::{Metadata, Protocol};
-    use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
-    };
+    use crate::schema::ColumnMetadataKey::CurrentDefault;
+    use crate::schema::{ArrayType, DataType, MetadataValue, StructField, StructType};
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;
 
     /// Builds a `TableConfiguration` carrying `schema` with `allowColumnDefaults` enabled, so
-    /// `iceberg_compat_v3_column_default_warnings` can be driven directly. The config does not
+    /// the IcebergCompatV3 column-default validation can be driven directly. The config does not
     /// enable IcebergCompatV3 itself (whose required dependencies are heavy to assemble here); the
-    /// warnings helper is invoked directly instead, and the end-to-end V3 path is covered by the
+    /// validation is invoked directly instead, and the end-to-end V3 path is covered by the
     /// integration tests.
     fn table_config_with_schema(schema: StructType) -> TableConfiguration {
         let metadata = Metadata::try_new(
@@ -179,68 +175,86 @@ mod column_default_tests {
             .unwrap()
     }
 
-    #[rstest]
-    #[case::primitive_literal(DataType::INTEGER, "42", None)]
-    #[case::primitive_null(DataType::INTEGER, "NULL", None)]
-    #[case::non_literal_primitive(DataType::TIMESTAMP, "current_timestamp()", Some("literal"))]
-    #[case::null_on_non_primitive(
-        ArrayType::new(DataType::INTEGER, true).into(),
-        "NULL",
-        Some("non-primitive")
-    )]
-    #[case::non_null_on_non_primitive(
-        ArrayType::new(DataType::INTEGER, true).into(),
-        "ARRAY(1)",
-        Some("non-primitive")
-    )]
-    fn v3_column_default_warning(
-        #[case] data_type: DataType,
-        #[case] default_sql: &str,
-        #[case] expected_warning: Option<&str>,
-    ) {
-        let field = StructField::nullable("a", data_type).add_metadata([(
-            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+    fn field_with_default(
+        name: &str,
+        data_type: impl Into<DataType>,
+        default_sql: &str,
+    ) -> StructField {
+        StructField::nullable(name, data_type).add_metadata([(
+            CurrentDefault.as_ref().to_string(),
             MetadataValue::String(default_sql.to_string()),
-        )]);
-        let tc = table_config_with_schema(StructType::try_new([field]).unwrap());
-
-        let warnings = iceberg_compat_v3_column_default_warnings(&tc).unwrap();
-        match expected_warning {
-            None => assert!(
-                warnings.is_empty(),
-                "expected no warnings, got: {warnings:?}"
-            ),
-            Some(needle) => {
-                let [warning] = warnings.as_slice() else {
-                    panic!("expected exactly one warning, got: {warnings:?}");
-                };
-                assert!(warning.contains(needle), "got: {warning}");
-            }
-        }
+        )])
     }
 
-    #[test]
-    fn v3_column_default_warns_on_nested_non_literal() {
-        let inner = StructField::nullable("inner", DataType::TIMESTAMP).add_metadata([(
-            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-            MetadataValue::String("current_timestamp()".to_string()),
-        )]);
-        let schema = StructType::try_new([StructField::nullable(
+    #[rstest]
+    #[case::primitive_literal(
+        StructType::try_new([field_with_default("a", DataType::INTEGER, "42")]).unwrap(),
+        "a",
+        None
+    )]
+    #[case::primitive_null(
+        StructType::try_new([field_with_default("a", DataType::INTEGER, "NULL")]).unwrap(),
+        "a",
+        None
+    )]
+    #[case::non_literal_primitive(
+        StructType::try_new([field_with_default(
+            "a",
+            DataType::TIMESTAMP,
+            "current_timestamp()"
+        )]).unwrap(),
+        "a",
+        Some("could not verify")
+    )]
+    #[case::null_on_non_primitive(
+        StructType::try_new([field_with_default(
+            "a",
+            ArrayType::new(DataType::INTEGER, true),
+            "NULL"
+        )]).unwrap(),
+        "a",
+        None
+    )]
+    #[case::non_null_on_non_primitive(
+        StructType::try_new([field_with_default(
+            "a",
+            ArrayType::new(DataType::INTEGER, true),
+            "ARRAY(1)"
+        )]).unwrap(),
+        "a",
+        Some("could not verify")
+    )]
+    #[case::nested_non_literal(
+        StructType::try_new([StructField::nullable(
             "s",
-            DataType::try_struct_type([inner]).unwrap(),
-        )])
-        .unwrap();
-        let tc = table_config_with_schema(schema);
+            DataType::try_struct_type([field_with_default(
+                "inner",
+                DataType::TIMESTAMP,
+                "current_timestamp()"
+            )]).unwrap(),
+        )]).unwrap(),
+        "s.inner",
+        Some("could not verify")
+    )]
+    fn v3_column_default_validation(
+        #[case] schema: StructType,
+        #[case] expected_path: &str,
+        #[case] expected_warning: Option<&str>,
+    ) {
+        let table_configuration = table_config_with_schema(schema);
+        let logging = LoggingTest::new();
+        iceberg_compat_v3_column_defaults_validation(&table_configuration).unwrap();
+        let logs = logging.logs();
 
-        let warnings = iceberg_compat_v3_column_default_warnings(&tc).unwrap();
-        let [warning] = warnings.as_slice() else {
-            panic!(
-                "non-literal default on a nested field must warn exactly once, got: {warnings:?}"
-            );
-        };
-        assert!(
-            warning.contains("s.inner"),
-            "expected nested path in warning: {warning}"
-        );
+        match expected_warning {
+            None => assert!(
+                !logs.contains("icebergCompatV3 column default"),
+                "logs: {logs}"
+            ),
+            Some(needle) => {
+                assert!(logs.contains(expected_path), "logs: {logs}");
+                assert!(logs.contains(needle), "logs: {logs}");
+            }
+        }
     }
 }

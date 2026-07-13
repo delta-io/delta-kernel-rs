@@ -7,9 +7,7 @@
 //! in [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
 //! divergences are called out as such.
 //!
-//! - Kernel tolerates orphaned metadata on both read and write. Orphaned metadata is a
-//!   `CURRENT_DEFAULT` present without the `allowColumnDefaults` writer feature.
-//! - `CURRENT_DEFAULT` metadata must be a SQL string.
+//! - `CURRENT_DEFAULT` metadata must be a string.
 //! - A Variant column must default to NULL; a non-NULL variant default is rejected.
 //! - A non-NULL default on an Array, Map, or Struct column is protocol-legal but kernel cannot
 //!   materialize it, so it is tolerated and surfaced via raw SQL (`to_scalar` returns `None`).
@@ -18,12 +16,10 @@
 //!   but *loads* a snapshot of a table authored elsewhere that carries nested defaults.
 //! - Parsing is best-effort: unparseable SQL (e.g. `current_timestamp()`) is not an error; the
 //!   connector falls back to the raw SQL.
-//! - On an IcebergCompatV3 table, kernel warns on two kinds of default it cannot materialize into
-//!   the Iceberg metadata:
-//!     - A default that is not a kernel-parsable literal
-//!     - A default on a non-primitive column
+//! - On an IcebergCompatV3 table, kernel warns when its parser cannot verify that a default is a
+//!   literal.
 
-use crate::expressions::{parse_sql, ColumnName, Expression, Scalar};
+use crate::expressions::{parse_sql, Expression, Scalar};
 use crate::schema::{DataType, StructField, StructType};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
@@ -108,23 +104,23 @@ impl<'a> ColumnDefault<'a> {
     /// Returns `false` for SQL the kernel could not parse (e.g. arithmetic or function calls). Note
     /// that NULL parses to a literal, so this is `true` for a NULL default regardless of the
     /// column type.
-    pub(crate) fn is_literal(&self) -> bool {
+    pub(crate) fn is_kernel_parsable_literal(&self) -> bool {
         matches!(self.parsed_sql, Some(Expression::Literal(_)))
     }
 }
 
 /// Walks a schema and returns the parsed [`ColumnDefault`] of every field carrying
 /// a `CURRENT_DEFAULT`, descending through nested structs, arrays, and maps (see the nesting
-/// invariant in the module docs).
+/// invariant in the module docs). Each default is paired with a human-readable path.
 ///
 /// # Errors
 ///
 /// Propagates any error from
 /// [`StructField::column_default`](crate::schema::StructField::column_default): a `CURRENT_DEFAULT`
-/// whose value is not a SQL string, or a non-`NULL` default on a Variant column.
-pub(crate) fn collect_column_defaults(
+/// whose value is not a string, or a non-`NULL` default on a Variant column.
+pub(crate) fn try_collect_column_defaults(
     schema: &StructType,
-) -> DeltaResult<Vec<(ColumnName, ColumnDefault<'_>)>> {
+) -> DeltaResult<Vec<(String, ColumnDefault<'_>)>> {
     let mut collector = ColumnDefaultCollector {
         path: Vec::new(),
         defaults: Vec::new(),
@@ -133,13 +129,13 @@ pub(crate) fn collect_column_defaults(
     Ok(collector.defaults)
 }
 
-/// Recursive [`SchemaTransform`] that gathers every field's column default with its column name.
+/// Recursive [`SchemaTransform`] that gathers every field's column default with its display path.
 ///
 /// Container element types have no metadata of their own, so the array/map hooks only push a
 /// synthetic path segment before recursing toward any nested struct.
 struct ColumnDefaultCollector<'a> {
     path: Vec<String>,
-    defaults: Vec<(ColumnName, ColumnDefault<'a>)>,
+    defaults: Vec<(String, ColumnDefault<'a>)>,
 }
 
 impl<'a> ColumnDefaultCollector<'a> {
@@ -159,8 +155,7 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
         self.path.push(field.name().clone());
         if let Some(column_default) = field.column_default()? {
-            self.defaults
-                .push((ColumnName::new(&self.path), column_default));
+            self.defaults.push((self.path.join("."), column_default));
         }
         let result = self.recurse_into_struct_field(field);
         self.path.pop();
@@ -187,7 +182,7 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 /// Validates the column-default metadata on a table's logical schema (see [Errors](#errors)).
 ///
 /// Run eagerly at [`TableConfiguration`] construction so an invalid table is rejected at load.
-/// Inspects nested fields as well as top-level columns; see [`collect_column_defaults`].
+/// Inspects nested fields as well as top-level columns; see [`try_collect_column_defaults`].
 ///
 /// This does not couple defaults to the `allowColumnDefaults` feature: a `CURRENT_DEFAULT`
 /// present without the feature is orphaned metadata, which is allowed (see the module docs).
@@ -196,10 +191,10 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 ///
 /// # Errors
 ///
-/// Propagates any error from [`collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is not
-/// a SQL string, or a non-NULL default on a Variant column.
+/// Propagates any error from [`try_collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is
+/// not a string, or a non-NULL default on a Variant column.
 pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<()> {
-    collect_column_defaults(schema)?;
+    try_collect_column_defaults(schema)?;
     Ok(())
 }
 
@@ -395,9 +390,9 @@ mod tests {
         #[case] expected_path: [&str; 3],
     ) {
         let schema = StructType::try_new([StructField::nullable("arr", container)]).unwrap();
-        let defaults = collect_column_defaults(&schema).unwrap();
+        let defaults = try_collect_column_defaults(&schema).unwrap();
         let [(path, _)] = defaults.try_into().expect("exactly one default");
-        assert_eq!(path, ColumnName::new(expected_path));
+        assert_eq!(path, expected_path.join("."));
     }
 
     #[test]

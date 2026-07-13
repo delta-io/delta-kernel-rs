@@ -1005,13 +1005,22 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// column) are rejected eagerly at snapshot load (when constructing the
     /// [`TableConfiguration`]), so by the time this runs the metadata is already validated.
     /// Orphaned metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults` writer feature)
-    /// is tolerated and surfaced here like any other default.
+    /// is tolerated at table load but is not surfaced through this method.
     ///
     /// # Errors
     ///
     /// Propagates any error from [`StructField::column_default`].
     #[cfg(feature = "column-defaults-in-dev")]
-    pub fn column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
+    pub fn top_level_column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            info!(
+                "allowColumnDefaults is not enabled; the schema may contain orphaned column-default metadata"
+            );
+            return Ok(HashMap::new());
+        }
         let mut defaults = HashMap::new();
         for field in self.effective_table_config.logical_schema_ref().fields() {
             if let Some(column_default) = field.column_default()? {
@@ -2168,7 +2177,7 @@ mod tests {
             .unwrap();
             let txn = txn_with_schema(schema);
 
-            let defaults = txn.column_defaults().unwrap();
+            let defaults = txn.top_level_column_defaults().unwrap();
             assert_eq!(
                 defaults.len(),
                 2,
@@ -2193,7 +2202,7 @@ mod tests {
             ])
             .unwrap();
             let txn = txn_with_schema(schema);
-            assert!(txn.column_defaults().unwrap().is_empty());
+            assert!(txn.top_level_column_defaults().unwrap().is_empty());
         }
 
         #[test]
@@ -2213,8 +2222,8 @@ mod tests {
                     .unwrap();
 
             // Orphaned column-default metadata (no `allowColumnDefaults` feature) is tolerated.
-            try_table_config(&base_txn(), schema, [])
-                .expect("orphaned column-default metadata must be tolerated at load");
+            let txn = txn_with_schema_and_writer_features(schema, []);
+            assert!(txn.top_level_column_defaults().unwrap().is_empty());
         }
     }
 

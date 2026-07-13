@@ -30,7 +30,7 @@ pub(crate) mod column_default;
 #[cfg(feature = "column-defaults-in-dev")]
 pub use column_default::ColumnDefault;
 #[cfg(feature = "column-defaults-in-dev")]
-pub(crate) use column_default::{collect_column_defaults, validate_column_defaults_metadata};
+pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -4285,16 +4285,23 @@ mod tests {
             assert_eq!(column_default.to_scalar().unwrap().is_some(), parsable);
         }
 
-        #[test]
-        fn non_null_default_on_array_is_tolerated() {
-            let data_type = DataType::from(ArrayType::new(DataType::INTEGER, true));
-            let field = field_with_default("c", data_type.clone(), "ARRAY(1)");
+        #[rstest]
+        #[case::array(DataType::from(ArrayType::new(DataType::INTEGER, true)), "ARRAY(1)")]
+        #[case::map(
+            DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            "MAP('a', 1)"
+        )]
+        fn non_null_default_on_container_is_tolerated(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+        ) {
+            let field = field_with_default("c", data_type.clone(), raw_sql);
             let column_default = field
                 .column_default()
                 .unwrap()
                 .expect("default must be present");
             // Kernel cannot parse a non-primitive default, so it surfaces via raw SQL.
-            assert_eq!(column_default.raw_sql(), "ARRAY(1)");
+            assert_eq!(column_default.raw_sql(), raw_sql);
             assert_eq!(column_default.data_type(), &data_type);
             assert_eq!(column_default.to_scalar().unwrap(), None);
         }
