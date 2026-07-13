@@ -291,8 +291,8 @@ fn max_non_null_by(
     key: &ColumnName,
     output_type: &ArrowDataType,
 ) -> DeltaResult<ArrayRef> {
-    let value = ensure_column_is_top_level(value)?;
-    let key = ensure_column_is_top_level(key)?;
+    let value = try_into_top_level_name(value)?;
+    let key = try_into_top_level_name(key)?;
     let mut best: Option<(ArrayRef, usize, i64)> = None;
     for batch in input {
         let values = get_column_from_batch(batch, value)?;
@@ -319,7 +319,7 @@ fn max_non_null_by(
 }
 
 /// The single path segment of a top-level column, erroring on nested columns (unsupported here).
-fn ensure_column_is_top_level(name: &ColumnName) -> DeltaResult<&str> {
+fn try_into_top_level_name(name: &ColumnName) -> DeltaResult<&str> {
     match name.path() {
         [segment] => Ok(segment.as_str()),
         _ => Err(Error::generic(format!(
