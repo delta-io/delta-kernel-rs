@@ -1382,6 +1382,7 @@ impl<S> Transaction<S> {
                     log_segment,
                     self.effective_table_config,
                     Some(Arc::new(crc)),
+                    true, /* built_as_latest */
                 )?;
                 (stats, Arc::new(snapshot))
             }
