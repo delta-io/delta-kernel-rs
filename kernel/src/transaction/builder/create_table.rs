@@ -28,8 +28,9 @@ use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     find_max_column_id_in_schema, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    strip_stray_column_mapping_metadata, validate_interval_type_feature_support, ColumnMappingMode,
-    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    strip_stray_column_mapping_metadata, validate_interval_type_feature_support_on_write,
+    ColumnMappingMode, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
+    SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -90,7 +91,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // create table.
     TableFeature::IcebergCompatV3,
     // Connectors can opt into the intervalType-preview protocol feature explicitly. It is not
-    // auto-enabled from the schema because legacy featureless interval tables are writable.
+    // auto-enabled from the schema so tables created for legacy interoperability remain readable
+    // by connectors that predate the feature.
     TableFeature::IntervalTypePreview,
 ];
 
@@ -249,8 +251,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a supported primitive type (Struct, Array, Map, and intervals are rejected because
-///    partition values must be representable as directory-path strings)
+/// 4. Of a supported primitive type (Struct, Array, Map, and intervals are rejected because the
+///    Delta protocol does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -300,7 +302,7 @@ fn validate_partition_columns(
         ) {
             return Err(Error::generic(format!(
                 "Partition column '{col}' has unsupported interval type '{}'. \
-                 Partitioned interval writes are not supported.",
+                 Interval types are not supported for partition columns.",
                 field.data_type()
             )));
         }
@@ -969,7 +971,7 @@ impl CreateTableTransactionBuilder {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
-        validate_interval_type_feature_support(&table_configuration)?;
+        validate_interval_type_feature_support_on_write(&table_configuration)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
@@ -1664,20 +1666,36 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::year_month(DataType::INTERVAL_YEAR_MONTH)]
-    #[case::day_time(DataType::INTERVAL_DAY_TIME)]
-    fn test_validate_partition_columns_interval_types_rejected(#[case] data_type: DataType) {
-        let schema = StructType::new_unchecked(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::not_null("col", data_type),
-        ]);
-        let columns = vec![ColumnName::new(["col"])];
-        let result = validate_partition_columns(&schema, &columns);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported interval type"));
+    fn test_validate_partition_columns_interval_types_rejected(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
+        #[values(false, true)] nested: bool,
+    ) {
+        let (field, column) = if nested {
+            (
+                StructField::not_null(
+                    "nested",
+                    StructType::new_unchecked([StructField::not_null("col", data_type)]),
+                ),
+                ColumnName::new(["nested", "col"]),
+            )
+        } else {
+            (
+                StructField::not_null("col", data_type),
+                ColumnName::new(["col"]),
+            )
+        };
+        let schema =
+            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER), field]);
+
+        let error = validate_partition_columns(&schema, &[column])
+            .expect_err("interval partition columns must be rejected")
+            .to_string();
+        if nested {
+            assert!(error.contains("must be a top-level column"));
+        } else {
+            assert!(error.contains("unsupported interval type"));
+            assert!(error.contains("partition columns"));
+        }
     }
 
     #[rstest::rstest]

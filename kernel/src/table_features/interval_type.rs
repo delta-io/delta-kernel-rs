@@ -7,12 +7,10 @@ use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-/// Validates that writes to tables with ANSI interval columns are allowed.
-///
-/// Interval writes and the `intervalType-preview` table feature are gated by the
-/// `interval-type-in-dev` cargo feature. The table feature is not required for interval columns:
-/// legacy featureless interval tables can be written when the cargo feature is enabled.
-pub(crate) fn validate_interval_type_feature_support(tc: &TableConfiguration) -> DeltaResult<()> {
+/// Validates that writes to tables with ANSI interval columns are allowed
+pub(crate) fn validate_interval_type_feature_support_on_write(
+    tc: &TableConfiguration,
+) -> DeltaResult<()> {
     let interval_type_feature_enabled = tc
         .protocol()
         .has_table_feature(&TableFeature::IntervalTypePreview);
@@ -27,8 +25,6 @@ pub(crate) fn validate_interval_type_feature_support(tc: &TableConfiguration) ->
     Ok(())
 }
 
-/// Checks if any column in the schema (including nested structs, arrays, maps) uses an ANSI
-/// interval primitive type (`IntervalYearMonth` or `IntervalDayTime`).
 pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
     UsesIntervalType.transform_struct(schema).is_err()
 }
@@ -50,7 +46,7 @@ impl<'a> SchemaTransform<'a> for UsesIntervalType {
 mod tests {
     use rstest::rstest;
 
-    use super::validate_interval_type_feature_support;
+    use super::validate_interval_type_feature_support_on_write;
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::table_features::TableFeature;
@@ -71,7 +67,7 @@ mod tests {
     /// Interval columns (top-level and nested) and the `intervalType-preview` table feature require
     /// the `interval-type-in-dev` cargo feature on the write path.
     #[rstest]
-    fn test_interval_write_support_is_feature_gated(
+    fn test_validate_interval_type_feature_support(
         #[values(PrimitiveType::IntervalYearMonth, PrimitiveType::IntervalDayTime)]
         interval: PrimitiveType,
         #[values(false, true)] nested: bool,
@@ -91,7 +87,7 @@ mod tests {
             StructType::new_unchecked([StructField::new("id", DataType::INTEGER, false), iv_field]);
 
         let tc = make_test_tc(schema, modern_protocol(with_table_feature), []).unwrap();
-        let result = validate_interval_type_feature_support(&tc);
+        let result = validate_interval_type_feature_support_on_write(&tc);
         if cfg!(feature = "interval-type-in-dev") {
             result.expect("interval writes must be allowed when the cargo feature is enabled");
         } else {
@@ -105,12 +101,12 @@ mod tests {
     /// A schema with no interval columns passes this write gate only when the table does not list
     /// the interval table feature, unless the cargo feature is enabled.
     #[rstest]
-    fn test_no_interval_columns_needs_no_interval_write_gate(
+    fn test_validate_interval_type_feature_support_without_interval_columns(
         #[values(false, true)] with_table_feature: bool,
     ) {
         let schema = StructType::new_unchecked([StructField::new("id", DataType::INTEGER, false)]);
         let tc = make_test_tc(schema, modern_protocol(with_table_feature), []).unwrap();
-        let result = validate_interval_type_feature_support(&tc);
+        let result = validate_interval_type_feature_support_on_write(&tc);
         if cfg!(feature = "interval-type-in-dev") || !with_table_feature {
             result.expect("no interval write gate applies");
         } else {

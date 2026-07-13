@@ -92,18 +92,27 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
     Ok(())
 }
 
-/// Iceberg (like Delta's protocol) has no interval type, so icebergCompatV3 omits intervals from
+/// IcebergV3 has no interval type, so icebergCompatV3 omits intervals from
 /// its type allowlist. Enabling V3 alongside an interval column must fail at `.build(...)`. This
 /// holds regardless of the `interval-type-in-dev` gate, since the V3 allowlist is the rejection
 /// point and runs before any kernel-support check.
 #[rstest]
-#[case::year_month(DataType::INTERVAL_YEAR_MONTH)]
-#[case::day_time(DataType::INTERVAL_DAY_TIME)]
-fn v3_create_table_rejects_interval_column(#[case] interval: DataType) -> DeltaResult<()> {
+fn v3_create_table_rejects_interval_column(
+    #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+    #[values(false, true)] nested: bool,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let interval_field = if nested {
+        StructField::nullable(
+            "nested",
+            StructType::new_unchecked([StructField::nullable("iv", interval)]),
+        )
+    } else {
+        StructField::nullable("iv", interval)
+    };
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
-        StructField::nullable("iv", interval),
+        interval_field,
     ])?);
 
     let err = create_table(&table_path, schema, "Test/1.0")

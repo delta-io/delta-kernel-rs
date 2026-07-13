@@ -29,7 +29,7 @@ use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_interval_type_feature_support, validate_timestamp_ntz_feature_support,
+    validate_interval_type_feature_support_on_write, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation,
     TableFeature, LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
     TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
@@ -728,10 +728,9 @@ impl TableConfiguration {
             ));
         }
 
-        // Refuse writing interval columns to a table whose protocol does not declare the
-        // `intervalType` feature. Write-only: reads of legacy featureless interval tables (e.g.
-        // DBR-written) must keep working, so this is not validated at construction time.
-        validate_interval_type_feature_support(self)?;
+        // Validate interval support only on write paths. Reads of legacy featureless interval
+        // tables must keep working, so this is not validated at construction time.
+        validate_interval_type_feature_support_on_write(self)?;
 
         Ok(())
     }

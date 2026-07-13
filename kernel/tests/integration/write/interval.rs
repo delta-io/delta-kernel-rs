@@ -1,8 +1,4 @@
-//! Integration tests for writing ANSI interval columns (the `intervalType-preview` feature).
-//!
-//! Covers the unpartitioned blind-append round-trip and the write-time feature enforcement.
-//! Partitioned interval writes are out of scope here (they require `Scalar::Interval*`, planning
-//! to add in a later PR).
+//! Integration tests for writing ANSI interval columns.
 
 use std::sync::Arc;
 
@@ -77,7 +73,8 @@ mod feature_disabled {
 
 #[cfg(feature = "interval-type-in-dev")]
 mod feature_enabled {
-    use delta_kernel::arrow::array::{ArrayRef, Int32Array, Int64Array};
+    use delta_kernel::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -91,8 +88,8 @@ mod feature_enabled {
     use super::*;
 
     /// Unpartitioned blind-append round-trip for both interval families, covering null / zero /
-    /// negative values. Also asserts the committed `add` action carries no `minValues`/`maxValues`
-    /// for the interval column (intervals collect no min/max stats and are not skipping-eligible).
+    /// negative values in a nested schema. Also verifies that ordinary columns retain their full
+    /// statistics while the interval column gets only `nullCount`.
     #[rstest]
     #[case::year_month(
         "test_interval_append_ym",
@@ -110,9 +107,16 @@ mod feature_enabled {
         #[case] interval: DataType,
         #[case] column: ArrayRef,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "iv", interval,
-        )])?);
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::not_null("id", DataType::LONG),
+            StructField::nullable(
+                "nested",
+                StructType::new_unchecked([
+                    StructField::nullable("iv", interval),
+                    StructField::nullable("label", DataType::STRING),
+                ]),
+            ),
+        ])?);
 
         let (store, engine, table_location) = engine_store_setup(name, None);
         let table_url = create_table(
@@ -128,7 +132,27 @@ mod feature_enabled {
 
         let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
-        let data = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), vec![column])?;
+        let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+        let arrow_schema = Arc::new(arrow_schema);
+        let nested_fields = match arrow_schema.field_with_name("nested").unwrap().data_type() {
+            ArrowDataType::Struct(fields) => fields.clone(),
+            data_type => panic!("expected nested struct, got {data_type:?}"),
+        };
+        let nested = StructArray::new(
+            nested_fields,
+            vec![
+                column,
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef,
+            ],
+            None,
+        );
+        let data = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                Arc::new(nested) as ArrayRef,
+            ],
+        )?;
 
         let engine = Arc::new(engine);
         let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
@@ -138,7 +162,6 @@ mod feature_enabled {
         txn.add_files(add_files_metadata);
         assert!(txn.commit(engine.as_ref())?.is_committed());
 
-        // Interval columns must not carry min/max stats in the committed `add` action.
         let commit = store
             .get(&Path::from(format!(
                 "/{name}/_delta_log/00000000000000000001.json"
@@ -151,27 +174,52 @@ mod feature_enabled {
             .iter()
             .find_map(|v| v.get("add"))
             .expect("commit must contain an add action");
-        // Match DBR exactly: interval columns get nullCount but no min/max.
         let stats = add
             .get("stats")
             .and_then(|s| s.as_str())
             .expect("add action must carry stats");
         let stats: serde_json::Value = serde_json::from_str(stats)?;
         assert_eq!(
-            stats.get("nullCount").and_then(|v| v.get("iv")),
+            stats.pointer("/nullCount/id"),
+            Some(&serde_json::json!(0)),
+            "id must have nullCount; got: {stats}",
+        );
+        assert_eq!(
+            stats.pointer("/nullCount/nested/iv"),
             Some(&serde_json::json!(1)),
             "interval column must have nullCount; got: {stats}",
         );
+        assert_eq!(
+            stats.pointer("/nullCount/nested/label"),
+            Some(&serde_json::json!(0)),
+            "label must have nullCount; got: {stats}",
+        );
         for category in ["minValues", "maxValues"] {
-            if let Some(obj) = stats.get(category).and_then(|v| v.as_object()) {
-                assert!(
-                    !obj.contains_key("iv"),
-                    "interval column must not have {category} stats; got: {stats}",
-                );
-            }
+            let nested_stats = stats
+                .get(category)
+                .and_then(|v| v.get("nested"))
+                .and_then(|v| v.as_object())
+                .expect("ordinary nested columns must have min/max stats");
+            assert!(
+                !nested_stats.contains_key("iv"),
+                "interval column must not have {category} stats; got: {stats}",
+            );
+            assert!(
+                nested_stats.contains_key("label"),
+                "label must have {category} stats; got: {stats}",
+            );
         }
+        assert_eq!(stats.pointer("/minValues/id"), Some(&serde_json::json!(1)));
+        assert_eq!(stats.pointer("/maxValues/id"), Some(&serde_json::json!(4)));
+        assert_eq!(
+            stats.pointer("/minValues/nested/label"),
+            Some(&serde_json::json!("a"))
+        );
+        assert_eq!(
+            stats.pointer("/maxValues/nested/label"),
+            Some(&serde_json::json!("d"))
+        );
 
-        // Round-trip read back the raw physical integer values.
         test_read(&ArrowEngineData::new(data), &table_url, engine)?;
         Ok(())
     }

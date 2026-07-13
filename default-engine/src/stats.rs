@@ -421,22 +421,6 @@ fn compute_column_stats(
                 max_value: build_struct(max_fields, max_arrays)?,
             })
         }
-        // Complex types: collect nullCount only (no min/max)
-        DataType::Map(_, _)
-        | DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::ListView(_)
-        | DataType::LargeListView(_) => {
-            if !filter.contains_prefix_of(path) {
-                return Ok(ColumnStats::default());
-            }
-            Ok(ColumnStats {
-                null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
-                min_value: None,
-                max_value: None,
-            })
-        }
         // Void columns (Arrow `Null` / kernel `VOID`): every value is null by definition,
         // and the column has no parquet representation. We still need to publish nullCount
         // for IS NULL / IS NOT NULL data skipping, so synthesize it from the array length.
@@ -461,7 +445,16 @@ fn compute_column_stats(
             let null_count: Option<ArrayRef> =
                 Some(Arc::new(Int64Array::from(vec![column.null_count() as i64])));
 
-            if null_count_only_filter.contains_prefix_of(path) {
+            let complex_type = matches!(
+                column.data_type(),
+                DataType::Map(_, _)
+                    | DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+            );
+            if complex_type || null_count_only_filter.contains_prefix_of(path) {
                 return Ok(ColumnStats {
                     null_count,
                     min_value: None,

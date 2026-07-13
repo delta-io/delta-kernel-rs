@@ -1,17 +1,14 @@
 //! Interval-type integration tests for the CreateTable API.
-//!
-//! Tests that creating a table with ANSI interval columns does not automatically add the
-//! `intervalType-preview` reader-writer feature to the protocol. The write path requires kernel
-//! support, so positive interval create-table tests are gated behind the `interval-type-in-dev`
-//! cargo feature.
 
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use test_utils::test_table_setup;
 
@@ -56,6 +53,40 @@ fn test_create_table_interval_blocked_when_feature_off() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rstest::rstest]
+fn test_create_table_rejects_interval_clustering(
+    #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+    #[values(false, true)] nested: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let (interval_field, clustering_column) = if nested {
+        (
+            StructField::nullable(
+                "nested",
+                StructType::new_unchecked([StructField::nullable("iv", interval)]),
+            ),
+            ColumnName::new(["nested", "iv"]),
+        )
+    } else {
+        (
+            StructField::nullable("iv", interval),
+            ColumnName::new(["iv"]),
+        )
+    };
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::not_null("id", DataType::INTEGER),
+        interval_field,
+    ])?);
+
+    let result = create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::Clustered {
+            columns: vec![clustering_column],
+        })
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    test_utils::assert_result_error_with_message(result, "unsupported type");
+    Ok(())
+}
+
 #[cfg(feature = "interval-type-in-dev")]
 mod feature_enabled {
     use delta_kernel::schema::SchemaRef;
@@ -87,7 +118,8 @@ mod feature_enabled {
     }
 
     /// Creating a table whose schema contains an interval column does not auto-enable
-    /// `intervalType-preview`, and the schema round-trips.
+    /// `intervalType-preview`, and the schema round-trips. The write path requires kernel support,
+    /// so this test is gated behind the `interval-type-in-dev` cargo feature.
     #[rstest]
     fn test_create_table_with_interval_does_not_auto_enable_feature(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,

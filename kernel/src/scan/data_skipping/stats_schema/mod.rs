@@ -781,6 +781,39 @@ mod tests {
         assert_eq!(&expected, &stats_schema);
     }
 
+    #[rstest::rstest]
+    #[case::num_indexed_cols("delta.dataSkippingNumIndexedCols", "1")]
+    #[case::stats_columns("delta.dataSkippingStatsColumns", "iv")]
+    fn test_interval_stats_respect_column_selection(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+        #[case] property_name: &str,
+        #[case] property_value: &str,
+    ) {
+        let properties: TableProperties = [(property_name, property_value)].into();
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("iv", interval),
+            StructField::nullable("value", DataType::LONG),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(
+                NULL_COUNT,
+                StructType::new_unchecked([StructField::nullable("iv", DataType::LONG)]),
+            ),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
+        ]);
+        assert_eq!(expected, stats_schema);
+    }
+
     #[test]
     fn test_stats_schema_complex_types_count_against_limit() {
         // Array, Map, and Variant are leaf columns that count against the column limit,
