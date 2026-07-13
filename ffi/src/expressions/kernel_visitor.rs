@@ -517,17 +517,13 @@ impl NullTypeTag {
                 // void-column path.
                 PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
                 // Geometry/Geography carry an SRID string (and for Geography, an edge
-                // algorithm) that cannot fit in the (tag, u8, u8) payload this function
-                // returns. We route them through NullTypeTag::Binary to stay consistent
-                // with the FFI schema visitor (which routes geo columns through
-                // visit_binary): consumers see a uniformly binary view of geo across
-                // schema and expressions in this PR. CRS is lost at the FFI boundary
-                // either way -- there is no side channel for it here. Once real FFI geo
-                // support lands, new NullTypeTag::Geometry / ::Geography variants will
-                // replace this arm.
-                // TODO: Once real FFI geo support lands, new NullTypeTag::Geometry / ::Geography
-                // variants will replace this arm.
-                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => (Self::Binary, 0, 0),
+                // algorithm) that cannot fit in the (tag, u8, u8) payload. Like intervals
+                // above, they fall back to the sentinel so a reconstruction attempt errors
+                // rather than silently mistyping the null; the SRID is not recoverable from
+                // the tag. See #2914 for adding real geo FFI support.
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                    (Self::NonPrimitive, 0, 0)
+                }
             },
             _ => (Self::NonPrimitive, 0, 0),
         }

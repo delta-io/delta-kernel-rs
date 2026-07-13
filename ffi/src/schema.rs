@@ -344,22 +344,12 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 // TODO(#2811): add visit_interval_* callbacks; skipping silently drops the column
                 tracing::warn!("Skipping unsupported interval field '{name}' in FFI schema visit");
             }
-            // Geometry/Geography are WKB-encoded bytes at the FFI layer -- route through
-            // visit_binary. The SRID (and edge algorithm for Geography) carried on the
-            // kernel PrimitiveType is not surfaced through this visitor; FFI consumers see
-            // only a binary column. The companion null-literal path in
-            // ffi/src/expressions/kernel_visitor.rs emits NullTypeTag::Binary for the same
-            // reason, giving consumers a uniformly binary view across schema and
-            // expressions. This is a pragmatic stub, not a claim that geo is semantically
-            // equivalent to binary -- CRS-aware operations against these columns will
-            // produce meaningless results. Tables with geo columns should not be consumed
-            // through this FFI until dedicated visit_geometry / visit_geography callbacks
-            // carrying the SRID are added.
-            // Geometry/Geography are WKB-encoded bytes at the FFI layer
-            // TODO: Add visit_geometry / visit_geography callbacks carrying the SRID once real FFI
-            // geo support lands
             DataType::Primitive(PrimitiveType::Geometry(_))
-            | DataType::Primitive(PrimitiveType::Geography(_)) => call!(visit_binary),
+            | DataType::Primitive(PrimitiveType::Geography(_)) => {
+                // TODO(#2914): add visit_geometry / visit_geography callbacks carrying the SRID;
+                // skipping silently drops the column
+                tracing::warn!("Skipping unsupported geo field '{name}' in FFI schema visit");
+            }
         }
     }
 

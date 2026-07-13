@@ -47,7 +47,10 @@ pub(crate) fn validate_geospatial_feature_support(tc: &TableConfiguration) -> De
 #[cfg(test)]
 mod tests {
     use crate::actions::Protocol;
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{
+        DataType, EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType,
+        StructField, StructType,
+    };
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{
         assert_result_error_with_message, assert_schema_feature_validation,
@@ -59,7 +62,9 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "geom",
-                DataType::Primitive(PrimitiveType::Geometry(Box::default())),
+                DataType::Primitive(PrimitiveType::Geometry(Box::new(
+                    GeometryType::try_new("EPSG:4326").unwrap(),
+                ))),
                 true,
             ),
         ]);
@@ -73,7 +78,10 @@ mod tests {
                 "nested",
                 DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
                     "inner_geo",
-                    DataType::Primitive(PrimitiveType::Geography(Box::default())),
+                    DataType::Primitive(PrimitiveType::Geography(Box::new(
+                        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical)
+                            .unwrap(),
+                    ))),
                     true,
                 )]))),
                 true,

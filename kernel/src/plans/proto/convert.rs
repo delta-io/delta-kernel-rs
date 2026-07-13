@@ -868,7 +868,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
                 ))
             })?
             .try_into()?;
-        GeographyType::try_new(Some(&proto.srid), Some(algorithm))
+        GeographyType::try_new(&proto.srid, algorithm)
     }
 }
 
@@ -2131,7 +2131,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(GeometryType::default())]
+    #[case(GeometryType::try_new("OGC:CRS84").unwrap())]
     #[case(GeometryType::try_new("EPSG:4326").unwrap())]
     fn round_trip_geometry(#[case] geometry: GeometryType) {
         assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geometry(Box::new(
@@ -2141,7 +2141,7 @@ mod tests {
 
     #[rstest]
     fn round_trip_geography(
-        #[values(None, Some("EPSG:4326"))] srid: Option<&str>,
+        #[values("OGC:CRS84", "EPSG:4326")] srid: &str,
         #[values(
             EdgeInterpolationAlgorithm::Spherical,
             EdgeInterpolationAlgorithm::Vincenty,
@@ -2151,7 +2151,7 @@ mod tests {
         )]
         algorithm: EdgeInterpolationAlgorithm,
     ) {
-        let geography = GeographyType::try_new(srid, Some(algorithm)).unwrap();
+        let geography = GeographyType::try_new(srid, algorithm).unwrap();
         assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geography(Box::new(
             geography,
         ))));

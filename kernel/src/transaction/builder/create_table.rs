@@ -1642,7 +1642,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("non-primitive type"));
+            .contains("has unsupported type"));
     }
 
     #[rstest::rstest]
@@ -1660,7 +1660,7 @@ mod tests {
     )]
     #[case::geography(
         DataType::Primitive(PrimitiveType::Geography(Box::new(GeographyType::try_new(
-            Some("OGC:CRS84"), Some(EdgeInterpolationAlgorithm::Thomas)
+            "OGC:CRS84", EdgeInterpolationAlgorithm::Thomas
         ).unwrap()))),
         false
     )]
