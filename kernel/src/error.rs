@@ -184,7 +184,7 @@ pub enum Error {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
-    /// Invalid SRID or other parameter for a Geometry / Geography type
+    /// Invalid CRS or other parameter for a Geometry / Geography type
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
 

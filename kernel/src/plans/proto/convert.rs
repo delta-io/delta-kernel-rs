@@ -658,7 +658,7 @@ impl From<DecimalType> for proto_schema::DecimalType {
 impl From<&GeometryType> for proto_schema::GeometryType {
     fn from(geometry: &GeometryType) -> Self {
         proto_schema::GeometryType {
-            srid: geometry.srid().to_string(),
+            crs: geometry.crs().to_string(),
         }
     }
 }
@@ -666,7 +666,7 @@ impl From<&GeometryType> for proto_schema::GeometryType {
 impl From<&GeographyType> for proto_schema::GeographyType {
     fn from(geography: &GeographyType) -> Self {
         proto_schema::GeographyType {
-            srid: geography.srid().to_string(),
+            crs: geography.crs().to_string(),
             algorithm: EdgeAlgo::from(geography.algorithm()) as i32,
         }
     }
@@ -853,7 +853,7 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
 impl TryFrom<proto_schema::GeometryType> for GeometryType {
     type Error = Error;
     fn try_from(proto: proto_schema::GeometryType) -> DeltaResult<Self> {
-        GeometryType::try_new(&proto.srid)
+        GeometryType::try_new(&proto.crs)
     }
 }
 
@@ -868,7 +868,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
                 ))
             })?
             .try_into()?;
-        GeographyType::try_new(&proto.srid, algorithm)
+        GeographyType::try_new(&proto.crs, algorithm)
     }
 }
 
@@ -2141,7 +2141,7 @@ mod tests {
 
     #[rstest]
     fn round_trip_geography(
-        #[values("OGC:CRS84", "EPSG:4326")] srid: &str,
+        #[values("OGC:CRS84", "EPSG:4326")] crs: &str,
         #[values(
             EdgeInterpolationAlgorithm::Spherical,
             EdgeInterpolationAlgorithm::Vincenty,
@@ -2151,7 +2151,7 @@ mod tests {
         )]
         algorithm: EdgeInterpolationAlgorithm,
     ) {
-        let geography = GeographyType::try_new(srid, algorithm).unwrap();
+        let geography = GeographyType::try_new(crs, algorithm).unwrap();
         assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geography(Box::new(
             geography,
         ))));

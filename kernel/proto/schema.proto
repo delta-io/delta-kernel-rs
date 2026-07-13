@@ -47,15 +47,15 @@ enum EdgeInterpolationAlgorithm {
   EDGE_INTERPOLATION_ALGORITHM_KARNEY = 5;
 }
 
-// Geometry column type carrying a spatial reference identifier (SRID) in
+// Geometry column type carrying a coordinate reference system (CRS) in
 // AUTHORITY:CODE form.
 message GeometryType {
-  string srid = 1;
+  string crs = 1;
 }
 
-// Geography column type carrying an SRID and an edge interpolation algorithm.
+// Geography column type carrying a CRS and an edge interpolation algorithm.
 message GeographyType {
-  string srid = 1;
+  string crs = 1;
   EdgeInterpolationAlgorithm algorithm = 2;
 }
 

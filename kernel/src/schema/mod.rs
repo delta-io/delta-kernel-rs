@@ -1778,28 +1778,28 @@ fn default_true() -> bool {
     true
 }
 
-/// Validates that an SRID is in AUTHORITY:CODE form: contains a colon, has non-empty text
+/// Validates that a CRS is in AUTHORITY:CODE form: contains a colon, has non-empty text
 /// before and after it, and has no leading or trailing whitespace. Validating the value
-/// against the full set of recognized SRIDs is future work.
-fn validate_srid(srid: &str) -> DeltaResult<()> {
+/// against the full set of recognized CRSes is future work.
+fn validate_crs(crs: &str) -> DeltaResult<()> {
     require!(
-        srid == srid.trim(),
+        crs == crs.trim(),
         Error::invalid_geo_params(format!(
-            "SRID '{srid}' must not have leading or trailing whitespace"
+            "CRS '{crs}' must not have leading or trailing whitespace"
         ))
     );
-    let (authority, code) = srid.split_once(':').ok_or_else(|| {
-        Error::invalid_geo_params(format!("SRID '{srid}' must be in 'AUTHORITY:CODE' format"))
+    let (authority, code) = crs.split_once(':').ok_or_else(|| {
+        Error::invalid_geo_params(format!("CRS '{crs}' must be in 'AUTHORITY:CODE' format"))
     })?;
     require!(
         !authority.is_empty(),
         Error::invalid_geo_params(format!(
-            "SRID '{srid}' must have an authority before the colon"
+            "CRS '{crs}' must have an authority before the colon"
         ))
     );
     require!(
         !code.is_empty(),
-        Error::invalid_geo_params(format!("SRID '{srid}' must have a code after the colon"))
+        Error::invalid_geo_params(format!("CRS '{crs}' must have a code after the colon"))
     );
     Ok(())
 }
@@ -1842,53 +1842,53 @@ impl std::str::FromStr for EdgeInterpolationAlgorithm {
     }
 }
 
-/// A geometry column type with an associated spatial reference identifier (SRID)
+/// A geometry column type with an associated coordinate reference system (CRS)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeometryType {
-    srid: String,
+    crs: String,
 }
 
 impl GeometryType {
-    /// Constructs a GeometryType from the given SRID, or returns an error if the SRID is
+    /// Constructs a GeometryType from the given CRS, or returns an error if the CRS is
     /// not in AUTHORITY:CODE form.
-    pub fn try_new(srid: &str) -> DeltaResult<Self> {
-        validate_srid(srid)?;
+    pub fn try_new(crs: &str) -> DeltaResult<Self> {
+        validate_crs(crs)?;
         Ok(Self {
-            srid: srid.to_string(),
+            crs: crs.to_string(),
         })
     }
 
-    pub fn srid(&self) -> &str {
-        &self.srid
+    pub fn crs(&self) -> &str {
+        &self.crs
     }
 }
 
 impl Display for GeometryType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "geometry({})", self.srid)
+        write!(f, "geometry({})", self.crs)
     }
 }
 
-/// Geography column type with an associated SRID and edge interpolation algorithm.
+/// Geography column type with an associated CRS and edge interpolation algorithm.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeographyType {
-    srid: String,
+    crs: String,
     algorithm: EdgeInterpolationAlgorithm,
 }
 
 impl GeographyType {
-    /// Constructs a GeographyType from the given SRID and edge interpolation algorithm, or
-    /// returns an error if the SRID is not in AUTHORITY:CODE form.
-    pub fn try_new(srid: &str, algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
-        validate_srid(srid)?;
+    /// Constructs a GeographyType from the given CRS and edge interpolation algorithm, or
+    /// returns an error if the CRS is not in AUTHORITY:CODE form.
+    pub fn try_new(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
+        validate_crs(crs)?;
         Ok(Self {
-            srid: srid.to_string(),
+            crs: crs.to_string(),
             algorithm,
         })
     }
 
-    pub fn srid(&self) -> &str {
-        &self.srid
+    pub fn crs(&self) -> &str {
+        &self.crs
     }
 
     pub fn algorithm(&self) -> &EdgeInterpolationAlgorithm {
@@ -1898,7 +1898,7 @@ impl GeographyType {
 
 impl Display for GeographyType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "geography({}, {})", self.srid, self.algorithm)
+        write!(f, "geography({}, {})", self.crs, self.algorithm)
     }
 }
 
@@ -2153,8 +2153,8 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .map_err(serde::de::Error::custom)
             }
             geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
-                let srid = &geo_str[9..geo_str.len() - 1];
-                GeometryType::try_new(srid.trim())
+                let crs = &geo_str[9..geo_str.len() - 1];
+                GeometryType::try_new(crs.trim())
                     .map(Box::new)
                     .map(PrimitiveType::Geometry)
                     .map_err(serde::de::Error::custom)
@@ -2166,10 +2166,10 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                 // TODO: reevaluate whether accepting padded input like
                 // geography(  EPSG:4326 ,  vincenty  ) is desired.
                 match inner.split_once(',') {
-                    Some((srid, algo_str)) => {
+                    Some((crs, algo_str)) => {
                         let algorithm: EdgeInterpolationAlgorithm =
                             algo_str.trim().parse().map_err(serde::de::Error::custom)?;
-                        GeographyType::try_new(srid.trim(), algorithm)
+                        GeographyType::try_new(crs.trim(), algorithm)
                             .map(Box::new)
                             .map(PrimitiveType::Geography)
                             .map_err(serde::de::Error::custom)
@@ -2979,8 +2979,8 @@ mod tests {
         );
     }
 
-    fn geography(srid: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
-        PrimitiveType::Geography(Box::new(GeographyType::try_new(srid, algorithm).unwrap()))
+    fn geography(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
+        PrimitiveType::Geography(Box::new(GeographyType::try_new(crs, algorithm).unwrap()))
     }
 
     fn geo_field_json(type_str: &str) -> String {
@@ -3064,10 +3064,10 @@ mod tests {
     }
 
     #[rstest]
-    fn test_geo_try_new_rejects_invalid_srid(
+    fn test_geo_try_new_rejects_invalid_crs(
         #[values(
             "foo",
-            "srid:",
+            "authority:",
             ":",
             "",
             ":CRS84",
@@ -3075,16 +3075,16 @@ mod tests {
             "EPSG:4326 ",
             " EPSG:4326 "
         )]
-        srid: &str,
+        crs: &str,
     ) {
         let geometry_err =
-            GeometryType::try_new(srid).expect_err(&format!("expected '{srid}' to be rejected"));
-        let geography_err = GeographyType::try_new(srid, EdgeInterpolationAlgorithm::Spherical)
-            .expect_err(&format!("expected '{srid}' to be rejected"));
+            GeometryType::try_new(crs).expect_err(&format!("expected '{crs}' to be rejected"));
+        let geography_err = GeographyType::try_new(crs, EdgeInterpolationAlgorithm::Spherical)
+            .expect_err(&format!("expected '{crs}' to be rejected"));
         for err in [geometry_err, geography_err] {
             assert!(
-                err.to_string().contains("SRID"),
-                "expected SRID error for '{srid}', got: {err}"
+                err.to_string().contains("CRS"),
+                "expected CRS error for '{crs}', got: {err}"
             );
         }
     }

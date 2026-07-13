@@ -346,7 +346,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             }
             DataType::Primitive(PrimitiveType::Geometry(_))
             | DataType::Primitive(PrimitiveType::Geography(_)) => {
-                // TODO(#2914): add visit_geometry / visit_geography callbacks carrying the SRID;
+                // TODO(#2914): add visit_geometry / visit_geography callbacks carrying the CRS;
                 // skipping silently drops the column
                 tracing::warn!("Skipping unsupported geo field '{name}' in FFI schema visit");
             }
