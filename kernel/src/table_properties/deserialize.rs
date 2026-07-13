@@ -123,7 +123,13 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
 /// Examples:
 /// * `delta.constraints.foo` -> `foo`
 /// * `DELTA.CONSTRAINTS.foo` -> `DELTA.CONSTRAINTS.foo`
-/// * `delta.constraints.` -> `` (empty name, matching Delta-Spark)
+/// * `delta.constraints.` -> `` (empty name)
+///
+/// The bare prefix yields an empty name rather than `None`: Delta-Spark's `getCheckConstraints`
+/// strips the prefix without rejecting an empty result, so we keep the same key set on read. Spark
+/// does not otherwise validate or test empty names, and its `ADD CONSTRAINT` grammar makes them
+/// hard to create, so this is a faithfully-mirrored edge case, not a specified behavior.
+// TODO(#2896): revisit if CHECK-constraint enforcement needs to reject empty names explicitly.
 fn strip_constraint_prefix(key: &str) -> Option<&str> {
     let (prefix, name) = key.split_at_checked(CHECK_CONSTRAINT_PREFIX.len())?;
     if !prefix.eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX) {
