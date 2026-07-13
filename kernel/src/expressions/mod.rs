@@ -7,6 +7,8 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
+#[doc(hidden)]
+pub use self::column_names::__require_valid_simple_column_segment;
 pub use self::column_names::{
     col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
     joined_column_name, ColumnName,
@@ -26,7 +28,10 @@ mod column_names;
 pub(crate) mod literal_expression_transform;
 pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
-#[cfg(feature = "column-defaults-in-dev")]
+#[cfg(any(
+    feature = "column-defaults-in-dev",
+    feature = "check-constraints-in-dev"
+))]
 mod sql;
 #[cfg(feature = "column-defaults-in-dev")]
 pub(crate) use self::sql::parse_sql;

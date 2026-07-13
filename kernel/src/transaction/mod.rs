@@ -21,7 +21,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
-    col, lit, ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
+    col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch,
+    ExpressionStructPatchBuilder, Scalar,
 };
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
@@ -1369,7 +1370,7 @@ impl<S> Transaction<S> {
                     .table_root()
                     .join("_delta_log/")?;
                 let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
-                let crc = crc_delta.into_crc_for_version_zero().ok_or_else(|| {
+                let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
                     Error::internal_error("CREATE TABLE CRC delta is missing protocol or metadata")
                 })?;
                 let stats = PostCommitStats {
@@ -1512,7 +1513,7 @@ impl<S> Transaction<S> {
         // then drops the stats_parsed column.
         let base_eval = Arc::new(make_eval(false)?);
         let stats_parsed_eval = Arc::new(make_eval(true)?);
-        let stats_parsed_col = ColumnName::new([STATS_PARSED_NAME]);
+        let stats_parsed_col = column_name!(STATS_PARSED_NAME);
 
         Ok(remove_files_metadata.map(move |file_metadata_batch| {
             let data = file_metadata_batch.data();

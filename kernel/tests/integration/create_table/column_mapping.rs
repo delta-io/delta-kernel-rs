@@ -278,6 +278,39 @@ fn test_column_mapping_invalid_mode_rejected() {
         .contains("Invalid column mapping mode"));
 }
 
+/// CREATE TABLE with column mapping disabled must reject an input schema that already carries
+/// `delta.columnMapping.*` annotations, so kernel never originates a table in that shape. Reads
+/// tolerate such residual annotations, but CREATE / ALTER stay strict. Tracked for future
+/// tolerance in https://github.com/delta-io/delta-kernel-rs/issues/2885.
+#[test]
+fn test_create_table_rejects_stale_column_mapping_when_disabled() {
+    let (_temp_dir, table_path, engine) = test_table_setup().unwrap();
+
+    let schema = Arc::new(
+        StructType::try_new(vec![
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::INTEGER).add_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(2)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col-2f8a".to_string()),
+                ),
+            ]),
+        ])
+        .unwrap(),
+    );
+
+    // No column mapping mode set -> mode resolves to None -> the stale annotation is rejected.
+    let result = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Column mapping is not enabled but field 'value'"));
+}
+
 /// Test cases for clustering columns with column mapping enabled.
 /// Each case specifies: (logical_column_names, description)
 #[rstest::rstest]
