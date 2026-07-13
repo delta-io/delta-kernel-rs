@@ -211,8 +211,15 @@ mod tests {
     use rstest::rstest;
 
     use super::super::parse_sql_simple_predicate;
-    use crate::expressions::{Expression, Predicate, Scalar};
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::expressions::{DecimalData, Expression, Predicate, Scalar};
+    use crate::schema::{DataType, DecimalType, StructField, StructType};
+
+    fn decimal_scalar(unscaled: i128, precision: u8, scale: u8) -> Scalar {
+        Scalar::Decimal(
+            DecimalData::try_new(unscaled, DecimalType::try_new(precision, scale).unwrap())
+                .unwrap(),
+        )
+    }
 
     fn schema() -> StructType {
         StructType::new_unchecked([
@@ -228,6 +235,7 @@ mod tests {
             StructField::nullable("data", DataType::BINARY),
             StructField::nullable("ts", DataType::TIMESTAMP),
             StructField::nullable("tsn", DataType::TIMESTAMP_NTZ),
+            StructField::nullable("cost", DataType::decimal(10, 2).unwrap()),
             StructField::nullable(
                 "nested",
                 DataType::try_struct_type([StructField::nullable("inner", DataType::LONG)])
@@ -255,6 +263,10 @@ mod tests {
     #[case::eq_double("amount == 0", Predicate::eq(col("amount"), Expression::literal(0i64)))]
     #[case::ne_bang("amount != 0", Predicate::ne(col("amount"), Expression::literal(0i64)))]
     #[case::ne_angle("amount <> 0", Predicate::ne(col("amount"), Expression::literal(0i64)))]
+    // Spark's `!>`/`!<` aliases tokenize to `<=`/`>=`; drive them end-to-end so the alias survives
+    // parse and lowering, not just tokenization.
+    #[case::not_gt_alias("amount !> 0", Predicate::le(col("amount"), Expression::literal(0i64)))]
+    #[case::not_lt_alias("amount !< 0", Predicate::ge(col("amount"), Expression::literal(0i64)))]
     // Whitespace between tokens is optional.
     #[case::no_whitespace("amount>0", Predicate::gt(col("amount"), Expression::literal(0i64)))]
     // A literal is typed from the column on the other side: `price` is INTEGER, not the default
@@ -262,6 +274,13 @@ mod tests {
     #[case::literal_typed_from_column(
         "price <= 10",
         Predicate::le(col("price"), Expression::literal(10i32))
+    )]
+    // A DECIMAL literal whose scale matches the column lowers; `parse_scalar` requires an exact
+    // scale match, so the literal must be written with the column's scale (`10.00`, not `10`). The
+    // scale-mismatch case is rejected below.
+    #[case::decimal_matching_scale(
+        "cost <= 10.00",
+        Predicate::le(col("cost"), Expression::literal(decimal_scalar(1000, 10, 2)))
     )]
     // Literal forms across the primitive type matrix, each typed from its column. Exercises the
     // tokenizer's bareword (`TRUE`), fractional-number, typed-literal (`DATE '...'`), and binary
@@ -426,6 +445,11 @@ mod tests {
     #[case::string_literal_for_numeric_column("amount = 'foo'")]
     #[case::quoted_number_for_numeric_column("amount = '10'")]
     #[case::literal_out_of_range_for_column("price = 9999999999")]
+    // A DECIMAL literal must match the column's scale exactly (`parse_scalar` does not pad), so an
+    // integer or wrong-scale literal against a DECIMAL(10,2) column is rejected where Spark would
+    // read `0` as `0.00`. Left to the connector (see the `sql` module doc). `cost <= 10.00` lowers.
+    #[case::decimal_integer_literal_scale_mismatch("cost >= 0")]
+    #[case::decimal_wrong_scale_literal("cost >= 0.5")]
     // A FLOAT column against a DECIMAL/DOUBLE literal (a `.`/exponent, or an integer beyond i64) is
     // rejected: Spark widens the column to f64 while kernel compares at f32, disagreeing silently
     // for an f32-inexact literal. The exponent and `>i64` cases are rejected conservatively even
