@@ -121,6 +121,10 @@ declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc
 # work. TODO(#2630): remove once full column-defaults support ships.
 column-defaults-in-dev = []
 
+# Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
+# work: the SQL predicate parser and, later, `checkConstraints` write enforcement. Remove once
+# full check-constraints support ships.
+check-constraints-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
 # (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
 adaptive-metadata-in-dev = []
