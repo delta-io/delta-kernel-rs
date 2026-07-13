@@ -1,4 +1,4 @@
-//! A tokenizer for a small subset of SQL.
+//! A tokenizer for a subset of SQL.
 //!
 //! Splits a SQL string into [`Token`]s; what the tokens mean is up to the caller. The token set is
 //! intentionally minimal and grows with the grammar the parser supports. Literal tokens keep their
