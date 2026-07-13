@@ -291,12 +291,12 @@ fn max_non_null_by(
     key: &ColumnName,
     output_type: &ArrowDataType,
 ) -> DeltaResult<ArrayRef> {
-    let value = single_column(value)?;
-    let key = single_column(key)?;
+    let value = ensure_column_is_top_level(value)?;
+    let key = ensure_column_is_top_level(key)?;
     let mut best: Option<(ArrayRef, usize, i64)> = None;
     for batch in input {
-        let values = column(batch, value)?;
-        let keys = column(batch, key)?;
+        let values = get_column_from_batch(batch, value)?;
+        let keys = get_column_from_batch(batch, key)?;
         let keys = keys
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -319,7 +319,7 @@ fn max_non_null_by(
 }
 
 /// The single path segment of a top-level column, erroring on nested columns (unsupported here).
-fn single_column(name: &ColumnName) -> DeltaResult<&str> {
+fn ensure_column_is_top_level(name: &ColumnName) -> DeltaResult<&str> {
     match name.path() {
         [segment] => Ok(segment.as_str()),
         _ => Err(Error::generic(format!(
@@ -329,7 +329,7 @@ fn single_column(name: &ColumnName) -> DeltaResult<&str> {
 }
 
 /// Looks up `name` in `batch`, erroring if absent.
-fn column<'a>(batch: &'a RecordBatch, name: &str) -> DeltaResult<&'a ArrayRef> {
+fn get_column_from_batch<'a>(batch: &'a RecordBatch, name: &str) -> DeltaResult<&'a ArrayRef> {
     batch
         .column_by_name(name)
         .ok_or_else(|| Error::generic(format!("column `{name}` not found")))

@@ -150,6 +150,11 @@ impl LogSegment {
 
         let commit_files = self.commit_cover_version_tagged_scan_files()?;
         let (json_checkpoint, parquet_checkpoint) = self.checkpoint_version_tagged_scan_files()?;
+        // A log segment has at most one checkpoint format, so at most one of the checkpoint scans is
+        // non-empty (and both are when there is no checkpoint at all). We hand every scan to
+        // `union_all` unconditionally and rely on `PlanBuilder`'s dead-code elimination: an empty
+        // file set builds to the absent relation (see `PlanBuilder::scan_source`), which
+        // `union_all` drops from the union. Do not guard these branches manually.
         let plan = PlanBuilder::union_all([
             PlanBuilder::scan_json(commit_files, &["version"], Arc::clone(&versioned_schema))?,
             PlanBuilder::scan_json(json_checkpoint, &["version"], Arc::clone(&versioned_schema))?,
