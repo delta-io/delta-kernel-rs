@@ -8,29 +8,6 @@ use delta_kernel::schema::Schema;
 use serde::Deserialize;
 use url::Url;
 
-/// ReadConfig represents a specific configuration for a read operation
-/// A config represents configurations for a specific benchmark that aren't specified in the spec
-/// JSON file
-#[derive(Clone, Debug)]
-pub struct ReadConfig {
-    pub name: String,
-    pub parallel_scan: ParallelScan,
-}
-
-/// Provides a default set of read configs for a given table, read spec, and operation
-pub fn default_read_configs() -> Vec<ReadConfig> {
-    vec![ReadConfig {
-        name: "serial".into(),
-        parallel_scan: ParallelScan::Disabled,
-    }]
-}
-
-#[derive(Clone, Debug)]
-pub enum ParallelScan {
-    Disabled,
-    Enabled { num_threads: usize },
-}
-
 /// Info needed to access a UC-managed table via credential vending.
 /// This covers both catalog-managed and non-catalog-managed UC tables.
 #[derive(Clone, Debug, Deserialize)]
@@ -44,8 +21,7 @@ pub struct CatalogInfo {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
-    /// Table name is a short identifier for the table (part of the final benchmark name), e.g.
-    /// 100Adds0Chkpts
+    /// Human-readable label used in benchmark output.
     pub name: String,
     /// Human-readable description of the table. Use this to capture context that the name alone
     /// doesn't convey (e.g. "A table with 1 commit with 1M add actions. This includes a commit
@@ -87,6 +63,10 @@ pub struct TableInfo {
     /// Path to the directory containing the `tableInfo.json` file
     #[serde(skip, default)]
     pub table_info_dir: PathBuf,
+    /// Basename of [`Self::table_info_dir`], used as the registry table key. Populated by
+    /// [`Self::from_json_path`]; empty for a `TableInfo` deserialized without directory context.
+    #[serde(skip, default)]
+    pub dir_name: String,
 }
 
 impl TableInfo {
@@ -114,8 +94,12 @@ impl TableInfo {
                 "catalog_info and table_path are mutually exclusive",
             )));
         }
-        // Stores the parent directory of the `tableInfo.json` file
+        // Stores the parent directory of the `tableInfo.json` file and its basename, which is the
+        // table's registry key (see `dir_name`).
         if let Some(parent) = path.as_ref().parent() {
+            if let Some(name) = parent.file_name().and_then(|n| n.to_str()) {
+                table_info.dir_name = name.to_string();
+            }
             table_info.table_info_dir = parent.to_path_buf();
         }
         Ok(table_info)
@@ -548,5 +532,33 @@ mod tests {
     fn test_deserialize_spec_errors(#[case] json: &str, #[case] expected_msg: &str) {
         let error = serde_json::from_str::<Spec>(json).unwrap_err();
         assert!(error.to_string().contains(expected_msg));
+    }
+
+    #[test]
+    fn from_json_path_derives_dir_name_from_directory_not_name_field() {
+        // The registry key is the directory basename, not the JSON `name` field.
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("dirBasename");
+        std::fs::create_dir(&table_dir).unwrap();
+        let json = r#"{
+            "name": "humanLabel", "description": "d", "tablePath": "s3://b/t",
+            "schema": {"type": "struct", "fields": []},
+            "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+            "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+            "properties": {}, "dataLayout": {}, "tags": []
+        }"#;
+        std::fs::write(table_dir.join("tableInfo.json"), json).unwrap();
+
+        let table_info = TableInfo::from_json_path(table_dir.join("tableInfo.json")).unwrap();
+        assert_eq!(table_info.dir_name, "dirBasename");
+        assert_eq!(table_info.name, "humanLabel");
+    }
+
+    #[test]
+    fn dir_name_is_empty_without_directory_context() {
+        // A `TableInfo` deserialized directly (no `from_json_path`) has no directory, so `dir_name`
+        // is the empty default -- registry callers must route through `from_json_path`.
+        let info = make_table_info(&[]);
+        assert_eq!(info.dir_name, "");
     }
 }

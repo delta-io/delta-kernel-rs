@@ -1,15 +1,21 @@
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use delta_kernel_benchmarks::registry::BenchRegistry;
 use delta_kernel_benchmarks::runners::{
-    create_read_runner, SnapshotConstructionRunner, WorkloadRunner,
+    benchmark_name, configured_benchmark_name, create_read_runner, SnapshotConstructionRunner,
+    WorkloadRunner,
 };
 use delta_kernel_benchmarks::utils::load_all_workloads;
-use delta_kernel_workloads::models::{
-    default_read_configs, ParallelScan, ReadConfig, ReadOperation, Spec,
-};
+use delta_kernel_workloads::models::{ReadOperation, Spec};
 use test_utils::CountingReporter;
+
+// Checked-in registry mapping each benchmark to its harness configs. Lives under the crate root
+// (not the gitignored, downloaded `workloads/` dir), so it is loaded relative to
+// CARGO_MANIFEST_DIR.
+const REGISTRY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench-registry.json");
 
 // Loads all workloads and sets up a shared runtime, then registers each as a top-level benchmark.
 // For each workload, builds a runner that encapsulates the state (table info, engine, config, etc.)
@@ -22,20 +28,31 @@ fn workload_benchmarks(c: &mut Criterion) {
         Err(e) => panic!("Failed to load workloads: {e}"),
     };
 
+    let registry = BenchRegistry::load_from_path(Path::new(REGISTRY_PATH))
+        .expect("Failed to load bench-registry.json");
+
     let reporter = Arc::new(CountingReporter::new());
     let runtime = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
 
     for workload in &workloads {
+        let table_key = &workload.table_info.dir_name;
+        let case_name = &workload.case_name;
         match &workload.spec {
             Spec::Read(read_spec) => {
+                let configs = registry.read_configs(table_key, case_name);
                 for operation in [ReadOperation::ReadMetadata] {
-                    for config in build_read_configs(&workload.table_info.name) {
-                        let runner = create_read_runner(
+                    for config in &configs {
+                        let name = configured_benchmark_name(
                             &workload.table_info,
-                            &workload.case_name,
+                            case_name,
+                            &config.name,
+                        );
+                        let runner = create_read_runner(
+                            name,
                             read_spec,
                             operation,
-                            config,
+                            config.clone(),
+                            &workload.table_info,
                             runtime.clone(),
                         )
                         .expect("Failed to create read runner");
@@ -44,10 +61,11 @@ fn workload_benchmarks(c: &mut Criterion) {
                 }
             }
             Spec::SnapshotConstruction(snapshot_construction_spec) => {
+                let name = benchmark_name(&workload.table_info, case_name);
                 let runner = SnapshotConstructionRunner::setup(
-                    &workload.table_info,
-                    &workload.case_name,
+                    name,
                     snapshot_construction_spec,
+                    &workload.table_info,
                     runtime.clone(),
                 )
                 .expect("Failed to create snapshot construction runner");
@@ -72,20 +90,6 @@ fn run_benchmark(c: &mut Criterion, runner: &dyn WorkloadRunner, reporter: &Coun
         runner.execute().expect("IO profiling iteration failed");
         reporter.print_summary(runner.name());
     }
-}
-
-fn build_read_configs(table_name: &str) -> Vec<ReadConfig> {
-    // Choose which benchmark configurations to run for a given table
-    // TODO: This function will take in table info to choose the appropriate configs for a given
-    // table
-    let mut configs = default_read_configs();
-    if table_name.contains("V2Chkpt") {
-        configs.push(ReadConfig {
-            name: "parallel2".into(),
-            parallel_scan: ParallelScan::Enabled { num_threads: 2 },
-        });
-    }
-    configs
 }
 
 criterion_group!(benches, workload_benchmarks);

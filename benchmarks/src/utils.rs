@@ -114,12 +114,21 @@ fn load_specs_from_table(
         let delta_dir = table_dir.join(DELTA_DIR_NAME);
         if !delta_dir.is_dir() {
             return Err(format!(
-                "Table data not found for '{}'. Expected a 'delta' directory in {}",
-                table_info.name,
+                "Table data not found. Expected a 'delta' directory in {}",
                 table_dir.display()
             )
             .into());
         }
+    }
+
+    // `from_json_path` derives the registry key (`TableInfo::dir_name`) from the directory
+    // basename; a table whose directory has no usable basename cannot be registered.
+    if table_info.dir_name.is_empty() {
+        return Err(format!(
+            "could not derive table name from directory {}",
+            table_dir.display()
+        )
+        .into());
     }
 
     let spec_files = find_spec_files(&specs_dir)?;
@@ -199,5 +208,38 @@ mod tests {
         assert_eq!(get_required_tags().unwrap(), vec!["ci", "checkpoints"]);
 
         std::env::remove_var(BENCH_TAGS_ENV_VAR);
+    }
+
+    #[test]
+    fn load_specs_from_table_uses_directory_basename_not_table_info_name() {
+        // A remote `tablePath` skips the local `delta/` requirement, so only `tableInfo.json` and
+        // `specs/` are needed.
+        let root = tempfile::tempdir().unwrap();
+        let table_dir = root.path().join("dirBasename");
+        std::fs::create_dir_all(table_dir.join(SPECS_DIR_NAME)).unwrap();
+        std::fs::write(
+            table_dir.join(TABLE_INFO_FILE_NAME),
+            r#"{
+                "name": "humanLabel", "description": "d", "tablePath": "s3://b/t",
+                "schema": {"type": "struct", "fields": []},
+                "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+                "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+                "properties": {}, "dataLayout": {}, "tags": []
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            table_dir
+                .join(SPECS_DIR_NAME)
+                .join("readMetadataLatest.json"),
+            r#"{"type": "read"}"#,
+        )
+        .unwrap();
+
+        let workloads = load_specs_from_table(&table_dir, None).unwrap();
+        assert_eq!(workloads.len(), 1);
+        assert_eq!(workloads[0].table_info.dir_name, "dirBasename");
+        assert_eq!(workloads[0].table_info.name, "humanLabel");
+        assert_eq!(workloads[0].case_name, "readMetadataLatest");
     }
 }
