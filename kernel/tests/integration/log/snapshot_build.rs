@@ -87,7 +87,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
         .unwrap_post_commit_snapshot();
 
     // The create-table snapshot is built as latest (version 0 is necessarily the latest).
-    assert!(create_snapshot.built_as_latest());
+    assert!(create_snapshot.is_built_as_latest());
     create_snapshot.write_checksum(engine.as_ref())?;
 
     let mut snap = maybe_attach_max_catalog_version(Snapshot::builder_for(table_path), 0, kind)
@@ -120,27 +120,27 @@ async fn built_as_latest_is_inherited_by_derived_snapshots(
     // A build with no time-travel version is latest; time-travel to the catalog's latest ratified
     // version is also considered built as latest.
     let base_is_latest = !base_snap_time_travel_to_latest || kind == TableKind::CatalogManaged;
-    assert_eq!(base.built_as_latest(), base_is_latest);
+    assert_eq!(base.is_built_as_latest(), base_is_latest);
 
     // checkpoint and write_checksum inherit the base's flag.
     let (ckpt_result, after_checkpoint) = base.checkpoint(engine.as_ref(), None)?;
     assert_eq!(ckpt_result, CheckpointWriteResult::Written);
-    assert_eq!(after_checkpoint.built_as_latest(), base_is_latest);
+    assert_eq!(after_checkpoint.is_built_as_latest(), base_is_latest);
 
     let (crc_result, after_checksum) = after_checkpoint.write_checksum(engine.as_ref())?;
     assert_eq!(crc_result, ChecksumWriteResult::Written);
-    assert_eq!(after_checksum.built_as_latest(), base_is_latest);
+    assert_eq!(after_checksum.is_built_as_latest(), base_is_latest);
 
     // publish() (catalog-managed only) also inherits the base's flag.
     if kind == TableKind::CatalogManaged {
         let published = base.publish(engine.as_ref(), &TestCatalogCommitter)?;
-        assert_eq!(published.built_as_latest(), base_is_latest);
+        assert_eq!(published.is_built_as_latest(), base_is_latest);
     }
 
     // A post-commit snapshot is latest.
     let post_commit = append_row(base, &engine, kind, 4).await?;
     assert_eq!(post_commit.version(), 4);
-    assert!(post_commit.built_as_latest());
+    assert!(post_commit.is_built_as_latest());
 
     Ok(())
 }
@@ -169,7 +169,7 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     );
     // Time travel to the catalog's latest version is also considered built as latest.
     let base_is_latest = time_travel_version.is_none() || pins_catalog_latest;
-    assert_eq!(base.built_as_latest(), base_is_latest);
+    assert_eq!(base.is_built_as_latest(), base_is_latest);
 
     // Incremental build without an explicit version is latest.
     let refreshed = maybe_attach_max_catalog_version(
@@ -179,7 +179,7 @@ async fn built_as_latest_on_fresh_and_incremental_build(
     )
     .build(engine.as_ref())?;
     assert_eq!(refreshed.version(), LATEST_VERSION);
-    assert!(refreshed.built_as_latest());
+    assert!(refreshed.is_built_as_latest());
 
     // Incremental build time-travelling to LATEST_VERSION. `pinned` is built as latest iff either:
     // - the base was already built as latest(and we are traveling to the same version), or
@@ -190,7 +190,7 @@ async fn built_as_latest_on_fresh_and_incremental_build(
             .build(engine.as_ref())?;
     assert_eq!(pinned.version(), LATEST_VERSION);
     assert_eq!(
-        pinned.built_as_latest(),
+        pinned.is_built_as_latest(),
         base_is_latest || kind == TableKind::CatalogManaged
     );
 

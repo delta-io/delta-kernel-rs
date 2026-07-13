@@ -321,17 +321,17 @@ impl Snapshot {
         self.table_configuration().version()
     }
 
-    /// Whether this snapshot was confirmed to be the latest version when it was built.
+    /// Whether this snapshot was at the latest table version when it was built.
     ///
-    /// This is best-effort: `true` means the build could confirm this was the newest version. That
-    /// holds for a build (fresh or incremental) with no time-travel version, a build (fresh or
-    /// incremental) at the catalog's ratified latest version, and a post-commit snapshot. It is not
-    /// a liveness guarantee: a concurrent writer may commit a newer version immediately after, so a
-    /// `true` snapshot can already be stale.
+    /// This is best-effort: `true` when the build knows this was the newest version. That holds for
+    /// a build (fresh or incremental) with no time-travel version, a build (fresh or incremental)
+    /// at the catalog's ratified latest version, and a post-commit snapshot. It is not a
+    /// liveness guarantee: another writer may commit a newer version afterward, so a `true`
+    /// snapshot can already be stale.
     ///
     /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
     /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.
-    pub fn built_as_latest(&self) -> bool {
+    pub fn is_built_as_latest(&self) -> bool {
         self.built_as_latest
     }
 

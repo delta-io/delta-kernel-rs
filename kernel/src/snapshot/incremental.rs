@@ -352,15 +352,15 @@ impl Snapshot {
         existing: &Arc<Snapshot>,
         built_as_latest: bool,
     ) -> DeltaResult<Arc<Snapshot>> {
-        let built_as_latest = existing.built_as_latest || built_as_latest;
-        if existing.built_as_latest == built_as_latest {
+        // Promote only false -> true; every other case reuses the Arc unchanged.
+        if existing.built_as_latest || !built_as_latest {
             return Ok(existing.clone());
         }
         Ok(Arc::new(Snapshot::new_with_crc(
             existing.log_segment.clone(),
             existing.table_configuration.clone(),
             existing.crc.clone(),
-            built_as_latest,
+            true, // reached only when the flag flips false -> true
         )?))
     }
 
@@ -575,7 +575,7 @@ mod tests {
         )?;
         assert_eq!(result, base_snapshot);
         // `PartialEq` ignores `built_as_latest`, so assert it explicitly.
-        assert!(result.built_as_latest());
+        assert!(result.is_built_as_latest());
 
         Ok(())
     }
