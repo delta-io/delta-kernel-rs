@@ -82,7 +82,7 @@ impl Snapshot {
     ///
     /// [`SnapshotBuilder::at_version`]: crate::snapshot::SnapshotBuilder::at_version
     /// [`SnapshotBuilder::with_max_catalog_version`]: crate::snapshot::SnapshotBuilder::with_max_catalog_version
-    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, target_version))]
+    #[instrument(err, fields(version, operation_id = %metric_context.operation_id, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip_all)]
     pub(super) fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,

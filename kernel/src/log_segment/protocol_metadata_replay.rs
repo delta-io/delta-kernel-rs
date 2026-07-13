@@ -24,7 +24,7 @@ impl LogSegment {
     /// snapshot creation where both Protocol and Metadata must exist.
     ///
     /// Reports metrics: `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure`.
-    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, crc))]
+    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip_all)]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
