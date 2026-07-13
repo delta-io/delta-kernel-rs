@@ -33,6 +33,7 @@ pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod rest_store;
 pub mod stats;
 pub mod storage;
 

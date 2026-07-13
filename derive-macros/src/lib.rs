@@ -1,9 +1,11 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments,
-    Type, Visibility,
+    parse_macro_input, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Fields, Item, Lit,
+    Meta, PathArguments, Token, Type, Visibility,
 };
 
 mod schema_macro;
@@ -32,24 +34,80 @@ pub fn schema_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     schema_macro::parse_schema(input, false, |block| quote!(::std::sync::Arc::new(#block)))
 }
 
-/// Parses a dot-delimited column name into an array of field names. See
-/// `delta_kernel::expressions::column_name::column_name` macro for details.
+// `LazyLock<SchemaRef>`-wrapped `schema!`; see `delta_kernel::schema::lazy_schema_ref`.
+#[doc(hidden)]
 #[proc_macro]
-pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let is_valid = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
-    let err = match syn::parse(input) {
-        Ok(syn::Lit::Str(name)) => match name.value().chars().find(|c| !is_valid(*c)) {
-            Some(bad_char) => Error::new(name.span(), format!("Invalid character: {bad_char:?}")),
-            _ => {
-                let path = name.value();
-                let path = path.split('.').map(proc_macro2::Literal::string);
-                return quote_spanned! { name.span() => [#(#path),*] }.into();
+pub fn lazy_schema_ref(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    schema_macro::parse_schema(
+        input,
+        false,
+        |block| quote!(::std::sync::LazyLock::new(|| ::std::sync::Arc::new(#block))),
+    )
+}
+
+/// Builds `&[&str]` from the arguments to `column_name!`. Each **string-literal** argument is a
+/// dot-separated path, split into individual segments; every other (constant) argument is taken as
+/// a single segment, validated at const-eval time. All segments must match `[a-zA-Z0-9_]+`.
+#[proc_macro]
+pub fn column_name_segments(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    column_name_segments_impl(input.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn column_name_segments_impl(input: TokenStream) -> Result<TokenStream, Error> {
+    // `column_name!` requires at least one argument, so no empty check is needed here.
+    let mut emitted = Vec::new();
+    for expr in Punctuated::<Expr, Token![,]>::parse_terminated.parse2(input)? {
+        // Fragment-forwarding macros (col!, column_expr!, joined_column_name!, ...) capture with
+        // `:literal`/`:expr` and re-emit, which wraps the argument in an invisible (none-delimited)
+        // group. Peel away those groups to recover an underlying string literal.
+        let mut inner = &expr;
+        while let Expr::Group(group) = inner {
+            inner = &group.expr;
+        }
+        match inner {
+            // A string literal is a dot-separated path: split it and validate each segment now.
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(lit_str),
+                ..
+            }) => {
+                for segment in lit_str.value().split('.') {
+                    validate_single_segment(segment, lit_str.span())?;
+                    let literal = proc_macro2::Literal::string(segment);
+                    emitted.push(quote_spanned! { lit_str.span() => #literal });
+                }
             }
-        },
-        Ok(lit) => Error::new(lit.span(), "Expected a string literal"),
-        Err(err) => err,
-    };
-    err.into_compile_error().into()
+            // A string constant's value isn't visible until const-eval (after this macro expands),
+            // so wrap the value in a const fn validator with failure as a compile-time panic.
+            _ => emitted.push(quote_spanned! { expr.span() =>
+                match ::delta_kernel::expressions::__require_valid_simple_column_segment(#expr) {
+                    Some(segment) => segment,
+                    None => panic!("String constants passed to column_name! must be simple names \
+                                    matching [a-zA-Z0-9_]+; use a string literal for dot-separated \
+                                    paths, or ColumnName::new() to disambiguate"),
+                }
+            }),
+        }
+    }
+
+    Ok(quote! { &[ #(#emitted),* ] })
+}
+
+fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
+    if segment.is_empty() {
+        return Err(Error::new(span, "empty column name segment"));
+    }
+    if let Some(bad) = segment
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
+    {
+        return Err(Error::new(
+            span,
+            format!("invalid character {bad:?} in column name segment {segment:?}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Derive a `delta_kernel::schemas::ToSchema` implementation for the annotated struct. The actual

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel::schema::MetadataColumnSpec;
+use delta_kernel::snapshot::ChecksumWriteResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use rstest::rstest;
 use rstest_reuse::apply;
@@ -69,10 +70,37 @@ fn test_cross_product_read_write(
             snap.schema()
                 .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
         );
-        let scan = snap.scan_builder().with_schema(scan_schema).build()?;
-        let batches = read_scan(&scan, engine)?;
+        let scan = snap
+            .clone()
+            .scan_builder()
+            .with_schema(scan_schema)
+            .build()?;
+        let batches = read_scan(&scan, engine.clone())?;
         assert_row_ids_unique(&batches);
     }
 
+    write_and_assert_checksum(&snap, &log_state, expected_version, engine.as_ref())?;
+
+    Ok(())
+}
+
+/// Write a CRC for `snap` and assert the exact outcome. A CRC can be written for virtually any
+/// table state; the only cases that block it are a missing remove `size` or a non-incremental
+/// operation (e.g. ANALYZE STATS) in the replayed commits, which force `Indeterminate` file
+/// stats. The sweep exercises neither, so the write succeeds unless a CRC already exists at this
+/// version, which is exactly known from the sweep.
+fn write_and_assert_checksum(
+    snap: &delta_kernel::snapshot::SnapshotRef,
+    log_state: &LogState,
+    version: u64,
+    engine: &dyn Engine,
+) -> DeltaResult<()> {
+    let expected_result = if log_state.crcs_at().contains(&version) {
+        ChecksumWriteResult::AlreadyExists
+    } else {
+        ChecksumWriteResult::Written
+    };
+    let (result, _) = snap.write_checksum(engine)?;
+    assert_eq!(result, expected_result);
     Ok(())
 }

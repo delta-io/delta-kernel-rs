@@ -7,6 +7,8 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
+#[doc(hidden)]
+pub use self::column_names::__require_valid_simple_column_segment;
 pub use self::column_names::{
     col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
     joined_column_name, ColumnName,
@@ -26,7 +28,10 @@ mod column_names;
 pub(crate) mod literal_expression_transform;
 pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
-#[cfg(feature = "column-defaults-in-dev")]
+#[cfg(any(
+    feature = "column-defaults-in-dev",
+    feature = "check-constraints-in-dev"
+))]
 mod sql;
 #[cfg(feature = "column-defaults-in-dev")]
 pub(crate) use self::sql::parse_sql;
@@ -410,8 +415,8 @@ pub enum Expression {
     Unknown(String),
     /// Parse a JSON string expression into a struct with the given schema.
     ParseJson(ParseJsonExpression),
-    /// Extract keys from a `Map<String, String>` and parse values into a typed struct using
-    /// Delta's partition value serialization rules.
+    /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
+    /// [`MapToStructExpression`] for how values are parsed.
     MapToStruct(MapToStructExpression),
 }
 
@@ -538,8 +543,9 @@ impl ParseJsonExpression {
 /// Transforms a `Map<String, String>` column into a struct whose schema is provided by the
 /// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
 /// the output struct column: a `key` -> `value` mapping in the map means the struct field named
-/// `key` receives `value`, parsed into the field's target type using Delta's partition value
-/// serialization rules ([`PrimitiveType::parse_scalar`]).
+/// `key` receives `value`, parsed into the field's target type via [`PrimitiveType::parse_scalar`].
+/// An empty-string value is the exception (aligning with Spark): it casts to itself for string, to
+/// empty bytes for binary, and to null for every other type.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -737,9 +743,10 @@ impl Expression {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
 
-    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct using
-    /// Delta's partition value serialization rules. The output struct schema is determined by the
-    /// evaluator's `result_type`.
+    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct. The output
+    /// struct schema is determined by the evaluator's `result_type`. An empty-string value is the
+    /// exception (aligning with Spark): it casts to itself for string, to empty bytes for binary,
+    /// and to null for every other type. See [`MapToStructExpression`] for the full contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
     }

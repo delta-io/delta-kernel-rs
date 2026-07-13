@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -18,6 +19,7 @@ pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
+    StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
@@ -42,6 +44,11 @@ pub(crate) mod void_utils;
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
+/// Sugar for `LazyLock::new(|| `[`schema_ref!`](schema_ref)` { ... })`, yielding a lazy
+/// [`SchemaRef`].
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::lazy_schema_ref;
 /// Builds a [`StructType`] from a JSON-shaped description that freely mixes literal structure
 /// with interpolated runtime values, in the spirit of [`serde_json::json!`].
 ///
@@ -129,6 +136,33 @@ pub(crate) use delta_kernel_derive::schema_ref;
 #[internal_api]
 #[doc(inline)]
 pub(crate) use delta_kernel_derive::try_schema;
+
+/// Converts field interpolation inputs in [`schema!`] and [`try_schema!`] to [`StructField`].
+#[internal_api]
+pub(crate) trait ToSchemaField {
+    fn to_schema_field(self) -> StructField;
+}
+
+impl ToSchemaField for StructField {
+    fn to_schema_field(self) -> StructField {
+        self
+    }
+}
+
+impl ToSchemaField for &StructField {
+    fn to_schema_field(self) -> StructField {
+        self.clone()
+    }
+}
+
+impl<T> ToSchemaField for &T
+where
+    T: Deref<Target = StructField>,
+{
+    fn to_schema_field(self) -> StructField {
+        self.deref().clone()
+    }
+}
 
 /// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
 /// fields, lowered into an output [`StructType`] directly from an input schema via
@@ -595,8 +629,8 @@ impl StructField {
     /// metadata if present, otherwise returns the logical name.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// [`crate::table_configuration::TableConfiguration::try_new`]. In `None` mode a stale
+    /// annotation may still be present (it is ignored, and the logical name is returned).
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
         match column_mapping_mode {
@@ -688,8 +722,11 @@ impl StructField {
     /// Otherwise, the field's logical name is used.
     ///
     /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
-    /// missing when column mapping is enabled, present when disabled, or wrong type), or if a
-    /// metadata column is encountered (metadata columns should not participate in column mapping).
+    /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
+    /// encountered (metadata columns should not participate in column mapping). When column
+    /// mapping is disabled, a stale annotation is tolerated (resolved by logical name and dropped
+    /// from the physical metadata); CREATE / ALTER reject it via a separate strict validation pass
+    /// instead.
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]
@@ -713,8 +750,8 @@ impl StructField {
     /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
     ///
     /// NOTE: Caller affirms that `self` was already validated by
-    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`], to ensure that
-    /// annotations are always and only present when column mapping mode is enabled.
+    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`]. In `None` mode a
+    /// stale annotation may be present; this drops the column-mapping keys regardless.
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
@@ -2275,6 +2312,29 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
+/// What a [`MakePhysical`] walk does with each field. The two modes bundle the physical-rewrite
+/// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
+/// a mapping-disabled table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MakePhysicalMode {
+    /// Rewrite each field to its physical name + metadata (the read/build path). A stale
+    /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
+    /// physical metadata.
+    Rewrite,
+    /// Validate annotations only, without rewriting (the strict write-path check). A stale
+    /// annotation in `None` mode is rejected.
+    ValidateStrict,
+}
+
+impl MakePhysicalMode {
+    fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
+        match self {
+            Self::Rewrite => StaleAnnotationPolicy::Ignore,
+            Self::ValidateStrict => StaleAnnotationPolicy::Reject,
+        }
+    }
+}
+
 pub(crate) struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
@@ -2287,9 +2347,9 @@ pub(crate) struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
-    /// When `true`, skips the physical-name + metadata rewrite, only validates the column
-    /// mapping annotations.
-    validation_only: bool,
+    /// Whether this walk rewrites fields to physical form or only validates (see
+    /// [`MakePhysicalMode`]).
+    mode: MakePhysicalMode,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -2298,17 +2358,18 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
-            validation_only: false,
+            mode: MakePhysicalMode::Rewrite,
         }
     }
 
-    /// Walks `schema` and validates its column-mapping annotations.
+    /// Walks `schema` and validates its column-mapping annotations, rejecting stale annotations
+    /// left over on a column-mapping-disabled table.
     pub(crate) fn validate_schema_column_mapping(
         mode: ColumnMappingMode,
         schema: &'a StructType,
     ) -> DeltaResult<()> {
         let mut walker = Self {
-            validation_only: true,
+            mode: MakePhysicalMode::ValidateStrict,
             ..Self::new(mode)
         };
         walker.transform_struct(schema).map(|_| ())
@@ -2351,6 +2412,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
             field,
             self.column_mapping_mode,
+            self.mode.stale_annotation_policy(),
             &self.logical_path,
             Some(&mut self.seen_ids),
             self.sibling_names_stack.last_mut(),
@@ -2362,7 +2424,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
         self.transform_inner(field.name(), |this| {
             let field = this.recurse_into_struct_field(field)?;
-            if this.validation_only {
+            if this.mode == MakePhysicalMode::ValidateStrict {
                 return Ok(field);
             }
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
@@ -2801,10 +2863,40 @@ mod tests {
     }
 
     #[test]
-    fn test_make_physical_rejects_annotated_fields_when_column_mapping_disabled() {
+    fn test_make_physical_tolerates_stale_annotations_when_column_mapping_disabled() {
+        // A table can carry `delta.columnMapping.*` annotations after mapping was enabled and then
+        // disabled. They are inert while mapping is off, so `make_physical` (the read path)
+        // tolerates them: the field keeps its logical name and the CM keys are dropped from the
+        // physical metadata, leaving a schema indistinguishable from a table that never had them.
         let data = example_schema_metadata();
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert!(field.make_physical(ColumnMappingMode::None).is_err());
+        let physical = field.make_physical(ColumnMappingMode::None).unwrap();
+
+        assert_eq!(physical.name, "e");
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        // Non-column-mapping metadata is untouched.
+        assert!(physical.metadata.contains_key("delta.identity.start"));
+
+        // The nested leaf `d` is likewise tolerated: logical name kept, CM keys dropped.
+        let DataType::Array(atype) = &physical.data_type else {
+            panic!("Expected an Array");
+        };
+        let DataType::Struct(stype) = atype.element_type() else {
+            panic!("Expected a Struct");
+        };
+        let leaf = stype.fields().next().unwrap();
+        assert_eq!(leaf.name, "d");
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
     }
 
     #[test]

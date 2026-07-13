@@ -130,7 +130,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;
@@ -148,11 +147,12 @@ mod tests {
     };
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
-    use crate::scan::StatsOptions;
+    use crate::scan::{ScanBuilder, StatsOptions};
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
+    use crate::utils::FoldWithOption as _;
     use crate::{PredicateRef, SnapshotRef};
 
     // ============================================================
@@ -386,11 +386,11 @@ mod tests {
         snapshot: &SnapshotRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<Vec<String>> {
-        let mut builder = snapshot.clone().scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        let scan = builder.build()?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .build()?;
         let mut scan_metadata_iter = scan.scan_metadata(engine)?;
 
         let mut paths = scan_metadata_iter.try_fold(Vec::new(), |acc, metadata_res| {
@@ -413,11 +413,11 @@ mod tests {
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
 
-        let mut builder = snapshot.scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        let scan = builder.build()?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
         let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {

@@ -23,6 +23,7 @@
 - [Advanced Reads with scan_metadata()](./reading/scan_metadata.md)
 - [Distributed Log Replay](./reading/parallel_scan_metadata.md)
 - [Time Travel and Snapshot Management](./reading/time_travel.md)
+- [Incremental Scans](./reading/incremental_scan.md)
 - [Reading Change Data Feed](./reading/change_data_feed.md)
 
 # Writing Tables

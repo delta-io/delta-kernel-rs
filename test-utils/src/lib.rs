@@ -168,7 +168,7 @@ pub use counting_reporter::{
     CapturingReporter, CountingReporter, RelaxedCounter,
 };
 use delta_kernel::actions::{
-    get_log_add_schema, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
+    LOG_ADD_SCHEMA, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS,
 };
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
@@ -367,29 +367,29 @@ pub fn record_batch_to_bytes_with_props(
 
 /// Anything that implements `IntoArray` can turn itself into a reference to an arrow array
 pub trait IntoArray {
-    fn into_array(self) -> ArrayRef;
+    fn into_arrow_array(self) -> ArrayRef;
 }
 
 impl IntoArray for Vec<i32> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(Int32Array::from(self))
     }
 }
 
 impl IntoArray for Vec<i64> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(Int64Array::from(self))
     }
 }
 
 impl IntoArray for Vec<bool> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(BooleanArray::from(self))
     }
 }
 
 impl IntoArray for Vec<&'static str> {
-    fn into_array(self) -> ArrayRef {
+    fn into_arrow_array(self) -> ArrayRef {
         Arc::new(StringArray::from(self))
     }
 }
@@ -408,8 +408,8 @@ where
 /// respectively
 pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
     generate_batch(vec![
-        ("id", vec![1, 2, 3].into_array()),
-        ("val", vec!["a", "b", "c"].into_array()),
+        ("id", vec![1, 2, 3].into_arrow_array()),
+        ("val", vec!["a", "b", "c"].into_arrow_array()),
     ])
 }
 
@@ -1380,7 +1380,7 @@ pub fn read_add_infos(
     snapshot: &Snapshot,
     engine: &impl Engine,
 ) -> Result<Vec<AddInfo>, Box<dyn std::error::Error>> {
-    let schema = get_log_add_schema().clone();
+    let schema = LOG_ADD_SCHEMA.clone();
     let batches = snapshot.log_segment().read_actions(engine, schema)?;
     let mut actions = Vec::new();
     for batch_result in batches {

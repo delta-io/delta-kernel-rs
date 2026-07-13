@@ -1,6 +1,6 @@
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
-use crate::actions::{get_log_txn_schema, SetTransaction};
+use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine, RowVisitor as _};
@@ -86,8 +86,7 @@ fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-    let txn_schema = get_log_txn_schema();
-    log_segment.read_actions(engine, txn_schema.clone())
+    log_segment.read_actions(engine, LOG_TXN_SCHEMA.clone())
 }
 
 #[cfg(test)]

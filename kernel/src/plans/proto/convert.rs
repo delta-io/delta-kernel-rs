@@ -1,6 +1,10 @@
 //! Conversions from the kernel plan IR into the prost-generated proto wire types.
 
-use super::plan::agg_fn as proto_agg_fn;
+use super::plan::agg as proto_agg;
+use super::schema::data_type::Kind as DataTypeKind;
+use super::schema::metadata_value::Value as MetadataValueKind;
+use super::schema::primitive_type::Kind as PrimitiveTypeKind;
+use super::schema::SimplePrimitiveType as Simple;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -12,8 +16,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, AggFn, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Max, MaxNonNullBy, Min,
-    MinNonNullBy, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -21,11 +25,11 @@ use crate::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
-use crate::{FileMeta, FileSlice};
+use crate::{DeltaResult, Error, FileMeta, FileSlice};
 
 // === Helpers ===
 
-/// Converts each element of `items` via [`From`].
+/// Converts each element of `items` into proto via [`From`].
 fn convert_vec<'a, T, U>(items: &'a [T]) -> Vec<U>
 where
     U: From<&'a T>,
@@ -41,7 +45,7 @@ where
     items.iter().map(|e| e.as_ref().into()).collect()
 }
 
-// === Operation / IoOperation ===
+// === Operation / IoOperation to Proto ===
 
 impl From<&Operation> for proto_op::Operation {
     fn from(op: &Operation) -> Self {
@@ -111,7 +115,7 @@ impl From<&FileMeta> for proto_plan::FileMeta {
     }
 }
 
-// === Plan / nodes ===
+// === Plan / nodes to Proto ===
 
 impl From<&Plan> for proto_plan::Plan {
     fn from(plan: &Plan) -> Self {
@@ -245,36 +249,27 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
-        proto_plan::Agg {
-            func: Some((&agg.func).into()),
-            alias: agg.alias.clone(),
-        }
-    }
-}
-
-impl From<&AggFn> for proto_plan::AggFn {
-    fn from(func: &AggFn) -> Self {
-        let func = match func {
-            AggFn::Min(Min { value }) => proto_agg_fn::Func::Min(proto_plan::MinAgg {
+        let func = match agg {
+            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            AggFn::Max(Max { value }) => proto_agg_fn::Func::Max(proto_plan::MaxAgg {
+            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            AggFn::MinNonNullBy(MinNonNullBy { value, key }) => {
-                proto_agg_fn::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
+            Agg::MinNonNullBy { value, key } => {
+                proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),
                 })
             }
-            AggFn::MaxNonNullBy(MaxNonNullBy { value, key }) => {
-                proto_agg_fn::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
+            Agg::MaxNonNullBy { value, key } => {
+                proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
                     value: Some(value.into()),
                     key: Some(key.into()),
                 })
             }
         };
-        proto_plan::AggFn { func: Some(func) }
+        proto_plan::Agg { func: Some(func) }
     }
 }
 
@@ -297,7 +292,7 @@ impl From<FileType> for proto_plan::FileType {
     }
 }
 
-// === Expressions ===
+// === Expressions to Proto ===
 
 impl From<&Expression> for proto_expr::Expression {
     fn from(expr: &Expression) -> Self {
@@ -529,7 +524,7 @@ impl From<JunctionPredicateOp> for proto_expr::JunctionPredicateOp {
     }
 }
 
-// === Scalars ===
+// === Scalars to Proto ===
 
 impl From<&Scalar> for proto_expr::Scalar {
     fn from(scalar: &Scalar) -> Self {
@@ -601,18 +596,17 @@ impl From<&MapData> for proto_expr::MapData {
     }
 }
 
-// === Schema ===
+// === Schema to Proto ===
 
 impl From<&DataType> for proto_schema::DataType {
     fn from(data_type: &DataType) -> Self {
-        use proto_schema::data_type::Kind;
         let kind = match data_type {
-            DataType::Primitive(primitive) => Kind::Primitive(primitive.into()),
-            DataType::Array(array) => Kind::Array(Box::new(array.as_ref().into())),
-            DataType::Struct(struct_type) => Kind::Struct(struct_type.as_ref().into()),
-            DataType::Map(map) => Kind::Map(Box::new(map.as_ref().into())),
+            DataType::Primitive(primitive) => DataTypeKind::Primitive(primitive.into()),
+            DataType::Array(array) => DataTypeKind::Array(Box::new(array.as_ref().into())),
+            DataType::Struct(struct_type) => DataTypeKind::Struct(struct_type.as_ref().into()),
+            DataType::Map(map) => DataTypeKind::Map(Box::new(map.as_ref().into())),
             // The proto `VariantType` is intentionally empty: variants are opaque on the wire.
-            DataType::Variant(_) => Kind::Variant(proto_schema::VariantType {}),
+            DataType::Variant(_) => DataTypeKind::Variant(proto_schema::VariantType {}),
         };
         proto_schema::DataType { kind: Some(kind) }
     }
@@ -620,25 +614,27 @@ impl From<&DataType> for proto_schema::DataType {
 
 impl From<&PrimitiveType> for proto_schema::PrimitiveType {
     fn from(primitive: &PrimitiveType) -> Self {
-        use proto_schema::primitive_type::Kind;
-        use proto_schema::SimplePrimitiveType as Simple;
         let kind = match primitive {
-            PrimitiveType::String => Kind::Simple(Simple::String as i32),
-            PrimitiveType::Long => Kind::Simple(Simple::Long as i32),
-            PrimitiveType::Integer => Kind::Simple(Simple::Integer as i32),
-            PrimitiveType::Short => Kind::Simple(Simple::Short as i32),
-            PrimitiveType::Byte => Kind::Simple(Simple::Byte as i32),
-            PrimitiveType::Float => Kind::Simple(Simple::Float as i32),
-            PrimitiveType::Double => Kind::Simple(Simple::Double as i32),
-            PrimitiveType::Boolean => Kind::Simple(Simple::Boolean as i32),
-            PrimitiveType::Binary => Kind::Simple(Simple::Binary as i32),
-            PrimitiveType::Date => Kind::Simple(Simple::Date as i32),
-            PrimitiveType::Timestamp => Kind::Simple(Simple::Timestamp as i32),
-            PrimitiveType::TimestampNtz => Kind::Simple(Simple::TimestampNtz as i32),
-            PrimitiveType::Decimal(decimal) => Kind::Decimal((*decimal).into()),
-            PrimitiveType::Void => Kind::Simple(Simple::Void as i32),
-            PrimitiveType::IntervalYearMonth => Kind::Simple(Simple::IntervalYearMonth as i32),
-            PrimitiveType::IntervalDayTime => Kind::Simple(Simple::IntervalDayTime as i32),
+            PrimitiveType::String => PrimitiveTypeKind::Simple(Simple::String as i32),
+            PrimitiveType::Long => PrimitiveTypeKind::Simple(Simple::Long as i32),
+            PrimitiveType::Integer => PrimitiveTypeKind::Simple(Simple::Integer as i32),
+            PrimitiveType::Short => PrimitiveTypeKind::Simple(Simple::Short as i32),
+            PrimitiveType::Byte => PrimitiveTypeKind::Simple(Simple::Byte as i32),
+            PrimitiveType::Float => PrimitiveTypeKind::Simple(Simple::Float as i32),
+            PrimitiveType::Double => PrimitiveTypeKind::Simple(Simple::Double as i32),
+            PrimitiveType::Boolean => PrimitiveTypeKind::Simple(Simple::Boolean as i32),
+            PrimitiveType::Binary => PrimitiveTypeKind::Simple(Simple::Binary as i32),
+            PrimitiveType::Date => PrimitiveTypeKind::Simple(Simple::Date as i32),
+            PrimitiveType::Timestamp => PrimitiveTypeKind::Simple(Simple::Timestamp as i32),
+            PrimitiveType::TimestampNtz => PrimitiveTypeKind::Simple(Simple::TimestampNtz as i32),
+            PrimitiveType::Decimal(decimal) => PrimitiveTypeKind::Decimal((*decimal).into()),
+            PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
+            PrimitiveType::IntervalYearMonth => {
+                PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
+            }
+            PrimitiveType::IntervalDayTime => {
+                PrimitiveTypeKind::Simple(Simple::IntervalDayTime as i32)
+            }
         };
         proto_schema::PrimitiveType { kind: Some(kind) }
     }
@@ -698,14 +694,166 @@ impl From<&StructField> for proto_schema::StructField {
 
 impl From<&MetadataValue> for proto_schema::MetadataValue {
     fn from(metadata: &MetadataValue) -> Self {
-        use proto_schema::metadata_value::Value;
         let value = match metadata {
-            MetadataValue::Number(n) => Value::Number(*n),
-            MetadataValue::String(s) => Value::String(s.clone()),
-            MetadataValue::Boolean(b) => Value::Boolean(*b),
-            MetadataValue::Other(json) => Value::OtherJson(json.to_string()),
+            MetadataValue::Number(n) => MetadataValueKind::Number(*n),
+            MetadataValue::String(s) => MetadataValueKind::String(s.clone()),
+            MetadataValue::Boolean(b) => MetadataValueKind::Boolean(*b),
+            MetadataValue::Other(json) => MetadataValueKind::OtherJson(json.to_string()),
         };
         proto_schema::MetadataValue { value: Some(value) }
+    }
+}
+
+// === Schema from Proto ===
+
+impl TryFrom<proto_schema::StructType> for StructType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::StructType) -> DeltaResult<Self> {
+        let fields = proto
+            .fields
+            .into_iter()
+            .map(StructField::try_from)
+            .collect::<DeltaResult<Vec<_>>>()?;
+        StructType::try_new(fields)
+    }
+}
+
+impl TryFrom<proto_schema::StructField> for StructField {
+    type Error = Error;
+
+    fn try_from(proto: proto_schema::StructField) -> DeltaResult<Self> {
+        let data_type = proto
+            .data_type
+            .ok_or_else(|| Error::schema("StructField proto missing data_type"))?;
+        let metadata = proto
+            .metadata
+            .into_iter()
+            .map(|(key, value)| Ok::<_, Error>((key, MetadataValue::try_from(value)?)))
+            .collect::<DeltaResult<std::collections::HashMap<_, _>>>()?;
+        Ok(StructField {
+            name: proto.name,
+            data_type: DataType::try_from(data_type)?,
+            nullable: proto.nullable,
+            metadata,
+        })
+    }
+}
+
+impl TryFrom<proto_schema::DataType> for DataType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::DataType) -> DeltaResult<Self> {
+        let kind = proto
+            .kind
+            .ok_or_else(|| Error::schema("DataType proto missing kind"))?;
+        let data_type = match kind {
+            DataTypeKind::Primitive(primitive) => DataType::Primitive(primitive.try_into()?),
+            DataTypeKind::Array(array) => DataType::Array(Box::new((*array).try_into()?)),
+            DataTypeKind::Struct(struct_type) => {
+                DataType::Struct(Box::new(struct_type.try_into()?))
+            }
+            DataTypeKind::Map(map) => DataType::Map(Box::new((*map).try_into()?)),
+            // Kernel does not support shredded variants, so always decode as unshredded.
+            DataTypeKind::Variant(_) => DataType::unshredded_variant(),
+        };
+        Ok(data_type)
+    }
+}
+
+impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::PrimitiveType) -> DeltaResult<Self> {
+        let kind = proto
+            .kind
+            .ok_or_else(|| Error::schema("PrimitiveType proto missing kind"))?;
+        let primitive = match kind {
+            PrimitiveTypeKind::Simple(simple) => {
+                let simple = Simple::try_from(simple).map_err(|_| {
+                    Error::schema(format!("unknown SimplePrimitiveType value: {simple}"))
+                })?;
+                match simple {
+                    Simple::String => PrimitiveType::String,
+                    Simple::Long => PrimitiveType::Long,
+                    Simple::Integer => PrimitiveType::Integer,
+                    Simple::Short => PrimitiveType::Short,
+                    Simple::Byte => PrimitiveType::Byte,
+                    Simple::Float => PrimitiveType::Float,
+                    Simple::Double => PrimitiveType::Double,
+                    Simple::Boolean => PrimitiveType::Boolean,
+                    Simple::Binary => PrimitiveType::Binary,
+                    Simple::Date => PrimitiveType::Date,
+                    Simple::Timestamp => PrimitiveType::Timestamp,
+                    Simple::TimestampNtz => PrimitiveType::TimestampNtz,
+                    Simple::Void => PrimitiveType::Void,
+                    Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth,
+                    Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
+                    Simple::Unspecified => {
+                        return Err(Error::schema("SimplePrimitiveType is unspecified"))
+                    }
+                }
+            }
+            PrimitiveTypeKind::Decimal(decimal) => PrimitiveType::Decimal(decimal.try_into()?),
+        };
+        Ok(primitive)
+    }
+}
+
+impl TryFrom<proto_schema::DecimalType> for DecimalType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::DecimalType) -> DeltaResult<Self> {
+        let precision = u8::try_from(proto.precision).map_err(|_| {
+            Error::invalid_decimal(format!("precision out of range: {}", proto.precision))
+        })?;
+        let scale = u8::try_from(proto.scale)
+            .map_err(|_| Error::invalid_decimal(format!("scale out of range: {}", proto.scale)))?;
+        DecimalType::try_new(precision, scale)
+    }
+}
+
+impl TryFrom<proto_schema::ArrayType> for ArrayType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::ArrayType) -> DeltaResult<Self> {
+        let element_type = proto
+            .element_type
+            .ok_or_else(|| Error::schema("ArrayType proto missing element_type"))?;
+        Ok(ArrayType::new(
+            DataType::try_from(*element_type)?,
+            proto.contains_null,
+        ))
+    }
+}
+
+impl TryFrom<proto_schema::MapType> for MapType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::MapType) -> DeltaResult<Self> {
+        let key_type = proto
+            .key_type
+            .ok_or_else(|| Error::schema("MapType proto missing key_type"))?;
+        let value_type = proto
+            .value_type
+            .ok_or_else(|| Error::schema("MapType proto missing value_type"))?;
+        Ok(MapType::new(
+            DataType::try_from(*key_type)?,
+            DataType::try_from(*value_type)?,
+            proto.value_contains_null,
+        ))
+    }
+}
+
+impl TryFrom<proto_schema::MetadataValue> for MetadataValue {
+    type Error = Error;
+    fn try_from(proto: proto_schema::MetadataValue) -> DeltaResult<Self> {
+        let value = proto
+            .value
+            .ok_or_else(|| Error::schema("MetadataValue proto missing value"))?;
+        let metadata = match value {
+            MetadataValueKind::Number(n) => MetadataValue::Number(n),
+            MetadataValueKind::String(s) => MetadataValue::String(s),
+            MetadataValueKind::Boolean(b) => MetadataValue::Boolean(b),
+            MetadataValueKind::OtherJson(json) => {
+                MetadataValue::Other(serde_json::from_str(&json)?)
+            }
+        };
+        Ok(metadata)
     }
 }
 
@@ -1203,13 +1351,12 @@ mod tests {
     fn from_aggregate() {
         let node = Aggregate {
             group_by: vec![ColumnName::new(["g"])],
-            aggs: vec![Agg::max(ColumnName::new(["a"])).with_alias("a_max")],
+            aggs: vec![Agg::max(ColumnName::new(["a"]))],
             schema: sample_schema(),
         };
         let proto = proto_plan::AggregateNode::from(&node);
         assert_eq!(proto.group_by.len(), 1);
         assert_eq!(proto.aggs.len(), 1);
-        assert_eq!(proto.aggs[0].alias.as_deref(), Some("a_max"));
         assert!(proto.aggs[0].func.is_some());
         assert!(proto.schema.is_some());
     }
@@ -1219,17 +1366,16 @@ mod tests {
     #[case(Agg::max(ColumnName::new(["a"])), "max")]
     #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
     #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
-    fn from_agg_fn(#[case] agg: Agg, #[case] expected: &str) {
-        use proto_plan::agg_fn::Func;
+    fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
+        use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
-        let kind = match proto.func.unwrap().func.unwrap() {
+        let kind = match proto.func.unwrap() {
             Func::Min(_) => "min",
             Func::Max(_) => "max",
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };
         assert_eq!(kind, expected);
-        assert_eq!(proto.alias, None);
     }
 
     #[rstest]
@@ -1851,5 +1997,202 @@ mod tests {
             proto_schema::MetadataValue::from(&metadata).value.unwrap(),
             expected
         );
+    }
+
+    // === Schema decode (proto -> kernel) ===
+
+    /// Round-trips a [`DataType`] through its proto form and back, asserting it is unchanged.
+    fn assert_data_type_round_trips(data_type: DataType) {
+        let decoded = DataType::try_from(proto_schema::DataType::from(&data_type));
+        assert_eq!(decoded.expect("decode succeeds"), data_type);
+    }
+
+    /// Round-trips a [`StructType`] through its proto form and back, asserting it is unchanged.
+    fn assert_schema_round_trips(schema: StructType) {
+        let decoded = StructType::try_from(proto_schema::StructType::from(&schema));
+        assert_eq!(decoded.expect("decode succeeds"), schema);
+    }
+
+    #[rstest]
+    fn round_trip_primitive(
+        #[values(
+            PrimitiveType::String,
+            PrimitiveType::Long,
+            PrimitiveType::Integer,
+            PrimitiveType::Short,
+            PrimitiveType::Byte,
+            PrimitiveType::Float,
+            PrimitiveType::Double,
+            PrimitiveType::Boolean,
+            PrimitiveType::Binary,
+            PrimitiveType::Date,
+            PrimitiveType::Timestamp,
+            PrimitiveType::TimestampNtz,
+            PrimitiveType::Void,
+            PrimitiveType::IntervalYearMonth,
+            PrimitiveType::IntervalDayTime
+        )]
+        primitive: PrimitiveType,
+    ) {
+        assert_data_type_round_trips(DataType::Primitive(primitive));
+    }
+
+    #[rstest]
+    #[case(1, 0)]
+    #[case(10, 2)]
+    #[case(38, 0)]
+    #[case(38, 38)]
+    fn round_trip_decimal(#[case] precision: u8, #[case] scale: u8) {
+        assert_data_type_round_trips(DataType::Primitive(
+            PrimitiveType::decimal(precision, scale).unwrap(),
+        ));
+    }
+
+    #[rstest]
+    #[case(DataType::from(ArrayType::new(DataType::INTEGER, true)))]
+    #[case(DataType::from(ArrayType::new(DataType::STRING, false)))]
+    #[case(DataType::from(MapType::new(DataType::STRING, DataType::LONG, true)))]
+    #[case(DataType::from(MapType::new(DataType::INTEGER, DataType::BOOLEAN, false)))]
+    #[case(DataType::from(ArrayType::new(
+        MapType::new(DataType::STRING, DataType::LONG, true),
+        true
+    )))]
+    #[case(DataType::from(StructType::try_new(vec![
+        StructField::nullable("a", DataType::INTEGER),
+        StructField::not_null("b", DataType::STRING),
+    ]).unwrap()))]
+    fn round_trip_composite(#[case] data_type: DataType) {
+        assert_data_type_round_trips(data_type);
+    }
+
+    #[rstest]
+    #[case(MetadataValue::Number(7))]
+    #[case(MetadataValue::String("hello".to_string()))]
+    #[case(MetadataValue::Boolean(true))]
+    #[case(MetadataValue::Other(serde_json::json!({"nested": [1, 2, 3]})))]
+    fn round_trip_field_metadata(#[case] value: MetadataValue) {
+        let field = StructField::nullable("f", DataType::INTEGER).with_metadata([("k", value)]);
+        let decoded = StructField::try_from(proto_schema::StructField::from(&field));
+        assert_eq!(decoded.expect("decode succeeds"), field);
+    }
+
+    #[test]
+    fn round_trip_full_schema() {
+        let schema = StructType::try_new(vec![
+            StructField::nullable("id", DataType::LONG)
+                .with_metadata([("k", MetadataValue::Number(7))]),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("scores", ArrayType::new(DataType::INTEGER, true)),
+            StructField::nullable(
+                "attrs",
+                MapType::new(DataType::STRING, DataType::LONG, true),
+            ),
+            StructField::nullable(
+                "price",
+                DataType::Primitive(PrimitiveType::decimal(10, 2).unwrap()),
+            ),
+            StructField::nullable(
+                "nested",
+                StructType::try_new(vec![StructField::not_null("inner", DataType::BOOLEAN)])
+                    .unwrap(),
+            ),
+        ])
+        .unwrap();
+        assert_schema_round_trips(schema);
+    }
+
+    /// The proto `VariantType` is currently opaque, so any variant (even a shredded one)
+    /// decodes to the canonical unshredded form rather than round-tripping its inner struct.
+    #[test]
+    fn variant_decodes_to_unshredded() {
+        let shredded = DataType::Variant(Box::new(
+            StructType::try_new(vec![
+                StructField::not_null("metadata", DataType::BINARY),
+                StructField::not_null("value", DataType::BINARY),
+                StructField::nullable("typed_value", DataType::INTEGER),
+            ])
+            .unwrap(),
+        ));
+        let decoded = DataType::try_from(proto_schema::DataType::from(&shredded));
+        assert_eq!(
+            decoded.expect("decode succeeds"),
+            DataType::unshredded_variant()
+        );
+    }
+
+    // Builds a proto `DataType::Primitive` with the given (possibly malformed) primitive kind.
+    fn primitive_data_type(
+        kind: Option<proto_schema::primitive_type::Kind>,
+    ) -> proto_schema::DataType {
+        proto_schema::DataType {
+            kind: Some(proto_schema::data_type::Kind::Primitive(
+                proto_schema::PrimitiveType { kind },
+            )),
+        }
+    }
+
+    fn simple_primitive_data_type(value: i32) -> proto_schema::DataType {
+        primitive_data_type(Some(proto_schema::primitive_type::Kind::Simple(value)))
+    }
+
+    fn decimal_data_type(precision: u32, scale: u32) -> proto_schema::DataType {
+        primitive_data_type(Some(proto_schema::primitive_type::Kind::Decimal(
+            proto_schema::DecimalType { precision, scale },
+        )))
+    }
+
+    #[rstest]
+    #[case::missing_data_type_kind(proto_schema::DataType { kind: None })]
+    #[case::missing_primitive_kind(primitive_data_type(None))]
+    #[case::unspecified_primitive(simple_primitive_data_type(
+        proto_schema::SimplePrimitiveType::Unspecified as i32
+    ))]
+    #[case::unknown_primitive(simple_primitive_data_type(9999))]
+    #[case::decimal_zero_precision(decimal_data_type(0, 0))]
+    #[case::decimal_precision_too_large(decimal_data_type(39, 0))]
+    #[case::decimal_scale_exceeds_precision(decimal_data_type(5, 6))]
+    #[case::decimal_precision_out_of_u8_range(decimal_data_type(256, 0))]
+    #[case::array_missing_element_type(proto_schema::DataType {
+        kind: Some(proto_schema::data_type::Kind::Array(Box::new(proto_schema::ArrayType {
+            element_type: None,
+            contains_null: true,
+        }))),
+    })]
+    #[case::map_missing_key_type(proto_schema::DataType {
+        kind: Some(proto_schema::data_type::Kind::Map(Box::new(proto_schema::MapType {
+            key_type: None,
+            value_type: Some(Box::new(proto_schema::DataType::from(&DataType::STRING))),
+            value_contains_null: true,
+        }))),
+    })]
+    #[case::map_missing_value_type(proto_schema::DataType {
+        kind: Some(proto_schema::data_type::Kind::Map(Box::new(proto_schema::MapType {
+            key_type: Some(Box::new(proto_schema::DataType::from(&DataType::STRING))),
+            value_type: None,
+            value_contains_null: true,
+        }))),
+    })]
+    fn data_type_decode_rejects_invalid(#[case] proto: proto_schema::DataType) {
+        assert!(DataType::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn struct_field_decode_rejects_missing_data_type() {
+        let proto = proto_schema::StructField {
+            name: "f".to_string(),
+            data_type: None,
+            nullable: true,
+            metadata: Default::default(),
+        };
+        assert!(StructField::try_from(proto).is_err());
+    }
+
+    #[rstest]
+    #[case::missing_value(proto_schema::MetadataValue { value: None })]
+    #[case::invalid_other_json(proto_schema::MetadataValue {
+        value: Some(proto_schema::metadata_value::Value::OtherJson("not json".to_string())),
+    })]
+    fn metadata_value_decode_rejects_invalid(#[case] proto: proto_schema::MetadataValue) {
+        assert!(MetadataValue::try_from(proto).is_err());
     }
 }

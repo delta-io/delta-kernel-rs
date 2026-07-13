@@ -9,7 +9,7 @@ use tracing::instrument;
 
 use super::LogSegment;
 use crate::actions::visitors::DomainMetadataVisitor;
-use crate::actions::{get_log_domain_metadata_schema, DomainMetadata};
+use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, RowVisitor as _};
 
@@ -54,8 +54,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_log_domain_metadata_schema();
-        self.read_actions(engine, schema.clone())
+        self.read_actions(engine, LOG_DOMAIN_METADATA_SCHEMA.clone())
     }
 }
 

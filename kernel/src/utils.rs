@@ -144,6 +144,26 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
+/// Extension trait for folding zero or one value from an [`Option`] into a base value.
+#[internal_api]
+pub(crate) trait FoldWithOption: Sized {
+    /// Applies an optional fold operation `f` to `self` if `opt` is [`Some`]; otherwise returns
+    /// `self`.
+    ///
+    /// Similar to `opt.iter().fold(self, |acc, value| f(acc, value))`, but accepting `FnOnce`
+    /// instead of requiring `FnMut`, and with the base value as receiver instead of the option.
+    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self;
+}
+
+impl<T: Sized> FoldWithOption for T {
+    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self {
+        match opt {
+            Some(value) => f(self, value),
+            None => self,
+        }
+    }
+}
+
 /// Extension trait for adding completion callbacks to iterators.
 pub(crate) trait IteratorExt: Iterator + Sized {
     /// Wraps this iterator to call a closure when fully exhausted.
@@ -227,10 +247,28 @@ pub(crate) mod test_utils {
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::path::ParsedLogPath;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
-    use crate::{DeltaResult, Engine, EngineData, Error, Snapshot, SnapshotRef};
+    use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef};
+
+    /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
+    /// synthetic log-file listings in tests.
+    pub(crate) fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+        create_log_path_with_size(path, 0)
+    }
+
+    /// [`create_log_path`] with an explicit file size.
+    pub(crate) fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
+        ParsedLogPath::try_from(FileMeta {
+            location: Url::parse(path).expect("Invalid file URL"),
+            last_modified: 0,
+            size,
+        })
+        .unwrap()
+        .unwrap()
+    }
 
     /// A metrics reporter that captures all events for test assertions.
     #[derive(Debug, Default)]
