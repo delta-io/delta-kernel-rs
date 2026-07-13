@@ -538,6 +538,17 @@ impl TableConfiguration {
         &self.table_properties
     }
 
+    /// Parses this table's CHECK constraints against its logical schema. Uncached -- the single
+    /// place that knows constraints resolve against the logical schema; the
+    /// `Snapshot`/`Transaction` entry points wrap this in their own `OnceLock` caches.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(crate) fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
+        crate::check_constraints::constraints_from_properties(
+            &self.table_properties().check_constraints,
+            self.logical_schema(),
+        )
+    }
+
     /// Whether this table is catalog-managed (has the CatalogManaged or CatalogOwnedPreview
     /// table feature).
     #[internal_api]

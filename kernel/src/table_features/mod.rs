@@ -322,10 +322,14 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2896): drop the gate once check-constraints is fully supported.
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 3)),
     feature_requirements: &[],
+    #[cfg(feature = "check-constraints-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "check-constraints-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };

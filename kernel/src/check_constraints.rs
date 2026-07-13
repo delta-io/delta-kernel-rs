@@ -26,9 +26,6 @@
 //! [`raw_sql`](CheckConstraint::raw_sql) otherwise. The one set-level signal kernel provides is
 //! [`CheckConstraints::is_kernel_parsable`] (was every constraint parsed?).
 
-// TODO(#2896): remove this allow once check-constraint discovery/enforcement wires up a caller.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -99,7 +96,8 @@ enum ConstraintSupport {
     /// The expression is outside the subset kernel's constraint parser supports; the payload is
     /// the parser's reason (e.g. an unresolved column vs. unsupported grammar), preserved so a
     /// fail-closed error can explain which applies.
-    Unsupported(String),
+    // TODO(#2896): the reason is surfaced by the validator's fail-closed error (later work).
+    Unsupported(#[allow(dead_code)] String),
 }
 
 /// One CHECK constraint: its name, the raw SQL stored under `delta.constraints.<name>`, and the
@@ -110,7 +108,9 @@ pub struct CheckConstraint {
     raw_sql: String,
     support: ConstraintSupport,
     // The logical schema the predicate was resolved against; batches validated against this
-    // constraint must conform to it. Read by the validator (added in later work).
+    // constraint must conform to it.
+    // TODO(#2896): consumed by the validator (later work); dead until then.
+    #[allow(dead_code)]
     schema: SchemaRef,
 }
 

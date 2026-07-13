@@ -628,8 +628,34 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    create_table_with_configuration(
+        store,
+        table_path,
+        schema,
+        partition_columns,
+        use_37_protocol,
+        reader_features,
+        writer_features,
+        HashMap::new(),
+    )
+    .await
+}
+
+/// Same as [`create_table`], additionally merging `extra_configuration` into the table's
+/// metadata configuration (e.g. `delta.constraints.<name>` entries for CHECK constraints).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_table_with_configuration(
+    store: Arc<DynObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
     mut reader_features: Vec<&str>,
     mut writer_features: Vec<&str>,
+    extra_configuration: HashMap<String, String>,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
 
@@ -721,6 +747,9 @@ pub async fn create_table(
         }
         if reader_features.contains(&"catalogManaged") {
             config.insert("io.unitycatalog.tableId".to_string(), json!(table_id));
+        }
+        for (key, value) in extra_configuration {
+            config.insert(key, json!(value));
         }
 
         config

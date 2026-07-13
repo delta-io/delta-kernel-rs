@@ -81,6 +81,10 @@ pub struct Snapshot {
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
+    /// Parsed CHECK constraints, cached lazily on first access (see
+    /// [`Snapshot::check_constraints`]).
+    #[cfg(feature = "check-constraints-in-dev")]
+    parsed_check_constraints: std::sync::OnceLock<crate::check_constraints::CheckConstraints>,
 }
 
 impl PartialEq for Snapshot {
@@ -184,6 +188,8 @@ impl Snapshot {
             table_configuration,
             crc,
             built_as_latest,
+            #[cfg(feature = "check-constraints-in-dev")]
+            parsed_check_constraints: std::sync::OnceLock::new(),
         })
     }
 
@@ -341,6 +347,25 @@ impl Snapshot {
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {
         self.table_configuration.logical_schema()
+    }
+
+    /// The table's CHECK constraints, each parsed against the logical schema when kernel supports
+    /// the expression. Returns an empty collection for tables without constraints.
+    ///
+    /// Unlike [`Transaction::check_constraints`], this is **discovery only** -- a snapshot is a
+    /// read-only view, so calling it neither acknowledges anything nor arms any commit gate. A
+    /// data-adding commit still requires [`Transaction::check_constraints`] to acknowledge, or its
+    /// commit gate fails closed.
+    ///
+    /// The set is parsed on first call and cached for the snapshot's lifetime (sound because a
+    /// snapshot's table version, and thus its constraints, never change).
+    ///
+    /// [`Transaction::check_constraints`]: crate::transaction::Transaction::check_constraints
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
+        self.parsed_check_constraints
+            .get_or_init(|| self.table_configuration().check_constraints())
+            .clone()
     }
 
     /// Estimated owned heap size in bytes for this snapshot. Best-effort estimate

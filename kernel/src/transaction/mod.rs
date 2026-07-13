@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
+#[cfg(feature = "check-constraints-in-dev")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "check-constraints-in-dev")]
+use std::sync::OnceLock;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -242,6 +246,16 @@ pub struct Transaction<S = ExistingTable> {
     data_change: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
+    // Whether the connector has acknowledged that it understands and enforces this table's CHECK
+    // constraints, recorded when `Transaction::check_constraints` is called. Interior-mutable
+    // (`AtomicBool`) because acknowledgment flows through a `&self` accessor; read at commit time.
+    #[cfg(feature = "check-constraints-in-dev")]
+    check_constraints_acknowledged: AtomicBool,
+    // Parsed CHECK constraints, cached on first use by discovery (`check_constraints()`) so a
+    // transaction parses its constraint set at most once. Sound because the set is invariant for
+    // the transaction's lifetime (ALTER TABLE cannot add, remove, or modify constraints).
+    #[cfg(feature = "check-constraints-in-dev")]
+    parsed_check_constraints: OnceLock<crate::check_constraints::CheckConstraints>,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
@@ -383,11 +397,16 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
 
-        // Validate that the schema supports data writes when files are being added.
-        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
-        // Reads and metadata-only commits are always allowed.
+        // Checks that apply only when a commit adds rows -- reads, metadata-only, remove-only, and
+        // set-transaction-only commits (e.g. ALTER TABLE) skip them.
         if !self.add_files_metadata.is_empty() {
+            // Void-in-array/map, all-void structs, and all-void tables cannot produce valid
+            // Parquet.
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
+            // CHECK constraints apply only to added rows, so this is where they must be
+            // acknowledged.
+            #[cfg(feature = "check-constraints-in-dev")]
+            self.ensure_check_constraints_acknowledged()?;
         }
 
         // CDF check only applies to existing tables (not create table)
@@ -597,6 +616,68 @@ impl<S> Transaction<S> {
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
         self
+    }
+
+    /// The table's CHECK constraints, each parsed against the logical schema when kernel
+    /// supports the expression. Returns an empty collection for tables without constraints.
+    ///
+    /// **Calling this method is the connector's acknowledgment that it understands and will
+    /// enforce the table's CHECK constraints.** A data-adding commit to a table that has CHECK
+    /// constraints fails unless this method was called (see [`Self::commit`]); this is how kernel
+    /// keeps a connector unaware of the feature from silently committing violating data.
+    ///
+    /// Kernel does not say which constraints are the connector's to enforce -- it reports, per
+    /// constraint, the parsed [`predicate`](crate::check_constraints::CheckConstraint::predicate)
+    /// (when kernel could parse it) and the always-present
+    /// [`raw_sql`](crate::check_constraints::CheckConstraint::raw_sql). The connector iterates the
+    /// set and decides per constraint;
+    /// [`is_kernel_parsable`](crate::check_constraints::CheckConstraints::is_kernel_parsable)
+    /// answers the set-level "did kernel parse them all?" for connectors that want to fail fast
+    /// when they cannot self-enforce raw SQL.
+    ///
+    /// ```ignore
+    /// let constraints = txn.check_constraints();
+    /// for constraint in constraints.iter() {
+    ///     match constraint.predicate() {
+    ///         // Kernel parsed it: evaluate the predicate over the full logical batch BEFORE
+    ///         // partitioning (partition columns are present as ordinary data).
+    ///         Some(predicate) => evaluate_predicate(predicate, &batch)?,
+    ///         // Kernel could not parse it: enforce the raw SQL with your own engine (or fail).
+    ///         None => my_sql_engine.enforce(constraint.raw_sql(), &batch)?,
+    ///     }
+    /// }
+    /// ```
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
+        self.check_constraints_acknowledged
+            .store(true, Ordering::Relaxed);
+        self.parsed_check_constraints().clone()
+    }
+
+    /// The table's parsed CHECK constraints, parsed once and cached -- the non-acknowledging
+    /// counterpart of [`Self::check_constraints`], which delegates here after recording the
+    /// acknowledgment. Caching is sound because the set is invariant for the transaction's lifetime
+    /// (ALTER TABLE cannot add, remove, or modify constraints).
+    #[cfg(feature = "check-constraints-in-dev")]
+    fn parsed_check_constraints(&self) -> &crate::check_constraints::CheckConstraints {
+        self.parsed_check_constraints
+            .get_or_init(|| self.effective_table_config.check_constraints())
+    }
+
+    /// Fails writes to tables with CHECK constraints unless the connector acknowledged them by
+    /// calling [`Self::check_constraints`].
+    #[cfg(feature = "check-constraints-in-dev")]
+    fn ensure_check_constraints_acknowledged(&self) -> DeltaResult<()> {
+        if !self.check_constraints_acknowledged.load(Ordering::Relaxed)
+            && !self.parsed_check_constraints().is_empty()
+        {
+            return Err(Error::unsupported(
+                "table has CHECK constraints (delta.constraints.*); the connector must enforce \
+                 them on every batch it writes and acknowledge this by calling \
+                 Transaction::check_constraints()",
+            ));
+        }
+        Ok(())
     }
 
     /// Attach an opaque, caller-supplied correlation id for joining this transaction's commit

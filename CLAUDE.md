@@ -74,6 +74,12 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
+- `check-constraints-in-dev` -- CHECK constraints support (experimental, in development). Gates
+  `KernelSupport::Supported` for the `checkConstraints` writer feature (writes to tables listing it
+  are blocked with the cargo feature off), the CHECK-constraint discovery module (`check_constraints`,
+  the SQL predicate parser), and the commit-time acknowledgment gate (a data-adding commit to a
+  constrained table must call `Transaction::check_constraints`); constraint enforcement lands later.
+  Reading `delta.constraints.*` properties into `TableProperties` is always compiled.
 - `adaptive-metadata-in-dev` -- adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
