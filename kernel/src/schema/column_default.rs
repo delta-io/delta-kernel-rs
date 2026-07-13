@@ -113,6 +113,8 @@ impl<'a> ColumnDefault<'a> {
 /// a `CURRENT_DEFAULT`, descending through nested structs, arrays, and maps (see the nesting
 /// invariant in the module docs). Each default is paired with a human-readable path.
 ///
+/// The path is a dot-joined string intended only for error messages.
+///
 /// # Errors
 ///
 /// Propagates any error from

@@ -57,8 +57,8 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 /// Validates IcebergCompatV3 column defaults and logs warnings kernel cannot verify.
 ///
 /// The IcebergCompatV3 spec requires column defaults to be literals. Kernel warns when its parser
-/// cannot verify that requirement. This warning can be a false positive because a connector's
-/// parser may be able to parse the corresponding expression.
+/// cannot verify that requirement. This warning can be a false positive when the expression is a
+/// literal that kernel's parser cannot parse.
 ///
 /// This condition remains a warning because the table has already passed metadata validation and
 /// rejecting a DML transaction could block valid tables based on kernel parser limitations. The
