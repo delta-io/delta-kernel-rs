@@ -78,6 +78,9 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
   listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
   carrier type and the SQL literal parser (`parse_sql`).
+- `check-constraints-in-dev` -- CHECK constraints support (experimental, in development). Gates the
+  in-progress CHECK-constraint SQL parsing and, later, `checkConstraints` write enforcement.
+  Reading `delta.constraints.*` properties into `TableProperties` is always compiled.
 - `adaptive-metadata-in-dev` -- adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked

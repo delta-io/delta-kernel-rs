@@ -104,36 +104,36 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
-        // A `delta.constraints.<name>` key records a CHECK constraint; see
-        // `strip_constraint_prefix`.
-        #[cfg(feature = "check-constraints-in-dev")]
+        // A `delta.constraints.<name>` key records a CHECK constraint; any other unrecognized key
+        // falls through to `unknown_properties`. See `strip_constraint_prefix`.
         _ => {
             let name = strip_constraint_prefix(k)?;
             props
                 .check_constraints
                 .insert(name.to_string(), v.to_string());
         }
-        #[cfg(not(feature = "check-constraints-in-dev"))]
-        _ => return None,
     }
     Some(())
 }
 
-/// If `key` is a CHECK-constraint configuration key (`delta.constraints.<name>`), returns the
-/// constraint name, matching Delta-Spark's keying: the prefix is recognized case-insensitively (so
-/// kernel discovers every constraint Spark does), but stripped case-sensitively. A key whose prefix
-/// is not the exact lowercase `delta.constraints.` therefore keeps it as part of the name
-/// (`DELTA.CONSTRAINTS.foo` -> `DELTA.CONSTRAINTS.foo`), exactly as Spark's `stripPrefix` does --
-/// so two keys differing only in prefix case yield distinct names and never collide.
+/// Returns the check-constraint name for a `delta.constraints.<name>` key. The prefix is matched
+/// case-insensitively but stripped case-sensitively, so two keys differing only in prefix case
+/// yield distinct names and never collide. Returns `None` for any non-constraint key.
 ///
-/// Returns `None` for the exact bare prefix `delta.constraints.` (empty name).
-#[cfg(feature = "check-constraints-in-dev")]
+/// Examples:
+/// * `delta.constraints.foo` -> `foo`
+/// * `DELTA.CONSTRAINTS.foo` -> `DELTA.CONSTRAINTS.foo`
+/// * `delta.constraints.` -> `` (empty name, matching Delta-Spark)
 fn strip_constraint_prefix(key: &str) -> Option<&str> {
-    let prefix = key.get(..CHECK_CONSTRAINT_PREFIX.len())?;
-    prefix
-        .eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX)
-        .then(|| key.strip_prefix(CHECK_CONSTRAINT_PREFIX).unwrap_or(key))
-        .filter(|name| !name.is_empty())
+    let (prefix, name) = key.split_at_checked(CHECK_CONSTRAINT_PREFIX.len())?;
+    if !prefix.eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX) {
+        return None;
+    }
+    Some(if prefix == CHECK_CONSTRAINT_PREFIX {
+        name
+    } else {
+        key
+    })
 }
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
