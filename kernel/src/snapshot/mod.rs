@@ -189,6 +189,56 @@ impl Snapshot {
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
     ) -> DeltaResult<Self> {
+        // Steps 1 and 2 together resolve the snapshot's Protocol and Metadata (and, on the CRC
+        // branches, the rest of the cached state). Time and classify the whole resolution so the
+        // `ProtocolMetadataLoad` metric fires uniformly across CRC-served and log-replay branches.
+        let pm_load_start = std::time::Instant::now();
+        let resolved =
+            Self::resolve_fresh_protocol_metadata(&log_segment, engine, incremental_replay);
+        let (metadata, protocol, crc_at_version, pm_source, pm_work) = match resolved {
+            Ok(v) => v,
+            Err(e) => {
+                crate::metrics::emit_protocol_metadata_load_failure(&metric_context);
+                return Err(e);
+            }
+        };
+        crate::metrics::emit_protocol_metadata_load(
+            &metric_context,
+            pm_source,
+            pm_work.num_commits,
+            pm_work.bytes,
+            pm_load_start.elapsed(),
+        );
+
+        let table_configuration =
+            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+
+        tracing::Span::current().record("version", table_configuration.version());
+
+        Self::new_with_crc(log_segment, table_configuration, crc_at_version)
+    }
+
+    /// Resolve Protocol and Metadata for a fresh snapshot load, classifying where they came from
+    /// (for the `ProtocolMetadataLoad` metric) and measuring the replay work.
+    ///
+    /// Returns the resolved P&M, the CRC at the target version (if one was available or built),
+    /// the [`ProtocolMetadataSource`] classification, and the replay-work denominators.
+    ///
+    /// [`ProtocolMetadataSource`]: crate::metrics::ProtocolMetadataSource
+    #[allow(clippy::type_complexity)]
+    fn resolve_fresh_protocol_metadata(
+        log_segment: &LogSegment,
+        engine: &dyn Engine,
+        incremental_replay: IncrementalReplay,
+    ) -> DeltaResult<(
+        crate::actions::Metadata,
+        crate::actions::Protocol,
+        Option<Arc<Crc>>,
+        crate::metrics::ProtocolMetadataSource,
+        crate::log_segment::PmReplayWork,
+    )> {
+        use crate::metrics::ProtocolMetadataSource;
+
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
         let base_crc = log_segment.read_latest_crc(engine);
@@ -199,22 +249,40 @@ impl Snapshot {
         )?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
-        //         first commit.
-        // TODO(#2677): emit an `IncrementalCrcLoad` metric on the CRC branch; the
-        //              `ProtocolMetadataLoaded` span only fires on the replay branch below.
-        let (metadata, protocol) = match crc_at_version.as_deref() {
-            Some(c) => (c.metadata.clone(), c.protocol.clone()),
-            None => {
-                log_segment.read_protocol_metadata(engine, base_crc.as_ref(), metric_context)?
-            }
+        //         first commit. Classify the source and compute the replay denominators.
+        if let Some(crc) = crc_at_version.as_deref() {
+            // A CRC resolved at the target version. Distinguish an already-at-target CRC from one
+            // advanced by reverse replay: the base CRC's version tells us which.
+            let source = match base_crc.as_deref() {
+                Some(base) if base.version == log_segment.end_version => {
+                    ProtocolMetadataSource::CrcAtTarget
+                }
+                _ => ProtocolMetadataSource::CrcAdvancedByReplay,
+            };
+            // CRC-served P&M does no P&M-specific replay work.
+            let work = crate::log_segment::PmReplayWork::default();
+            return Ok((
+                crc.metadata.clone(),
+                crc.protocol.clone(),
+                crc_at_version,
+                source,
+                work,
+            ));
+        }
+
+        // No CRC at target: forward P&M log replay, optionally seeded by an earlier base CRC.
+        let (source, work) = match base_crc.as_deref() {
+            Some(base) if base.version < log_segment.end_version => (
+                ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+                log_segment.pm_replay_work(Some(base.version), /* include_checkpoint */ false),
+            ),
+            _ => (
+                ProtocolMetadataSource::FullReplay,
+                log_segment.pm_replay_work(None, /* include_checkpoint */ true),
+            ),
         };
-
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-
-        tracing::Span::current().record("version", table_configuration.version());
-
-        Self::new_with_crc(log_segment, table_configuration, crc_at_version)
+        let (metadata, protocol) = log_segment.read_protocol_metadata(engine, base_crc.as_ref())?;
+        Ok((metadata, protocol, crc_at_version, source, work))
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.

@@ -312,6 +312,8 @@ impl MetricEvent {
                 num_compaction_files,
                 has_latest_crc_file,
                 duration,
+                // Not yet exposed over FFI (prototype); see snapshot_metrics_consistency_v0.
+                load_purpose: _,
             }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -326,6 +328,7 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_purpose: _,
             }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -336,6 +339,10 @@ impl MetricEvent {
                 correlation_id,
                 table_type,
                 duration,
+                // Not yet exposed over FFI (prototype); see snapshot_metrics_consistency_v0.
+                source: _,
+                num_commits_replayed_for_pm: _,
+                bytes_read_for_pm: _,
             }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -357,6 +364,8 @@ impl MetricEvent {
                 table_type,
                 version,
                 duration,
+                // Not yet exposed over FFI (prototype); see snapshot_metrics_consistency_v0.
+                load_type: _,
             }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -368,6 +377,7 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_type: _,
             }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -691,6 +701,7 @@ mod tests {
             num_compaction_files: 2,
             has_latest_crc_file: true,
             duration: Duration::from_nanos(61),
+            load_purpose: kernel::LogSegmentLoadPurpose::Snapshot,
         });
         with_ffi_event(&event, |ffi| {
             let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {
@@ -720,6 +731,7 @@ mod tests {
             num_compaction_files: 0,
             has_latest_crc_file: false,
             duration: Duration::from_nanos(0),
+            load_purpose: kernel::LogSegmentLoadPurpose::IncrementalSnapshot,
         });
         with_ffi_event(&event, |ffi| {
             let MetricEvent::LogSegmentLoadSuccess(e) = ffi else {

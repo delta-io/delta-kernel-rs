@@ -11,8 +11,6 @@ use super::LogSegment;
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
-use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
-use crate::metrics::SnapshotLoadMetricContext;
 use crate::schema::schema_ref;
 use crate::{DeltaResult, Engine, Error};
 
@@ -23,13 +21,13 @@ impl LogSegment {
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
     ///
-    /// Reports metrics: `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure`.
-    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, crc))]
+    /// The `ProtocolMetadataLoad` metric is emitted by the snapshot layer (which owns the source
+    /// classification), not here, so it fires uniformly across the CRC-served and log-replay
+    /// branches on both the fresh and incremental paths.
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-        metric_context: SnapshotLoadMetricContext,
     ) -> DeltaResult<(Metadata, Protocol)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p)) => Ok((m, p)),
@@ -130,6 +128,42 @@ impl LogSegment {
         };
         self.read_actions(engine, schema)
     }
+
+    /// The work a P&M replay over commits `> lo_exclusive` covers: the number of commit files and
+    /// their summed on-disk bytes. When `include_checkpoint` is set (a full replay with no seeding
+    /// CRC), the checkpoint parts' bytes and counts are added, since the replay reads the
+    /// checkpoint too.
+    ///
+    /// These are the normalization denominators for [`ProtocolMetadataLoadSuccess`]. Bytes are an
+    /// upper bound on bytes actually decoded: row-group skipping and early termination can skip
+    /// data, and sidecars (not listed in the segment) are excluded.
+    pub(crate) fn pm_replay_work(
+        &self,
+        lo_exclusive: Option<crate::Version>,
+        include_checkpoint: bool,
+    ) -> PmReplayWork {
+        let above_lo = |v: crate::Version| lo_exclusive.is_none_or(|lo| lo < v);
+        let mut work = PmReplayWork::default();
+        for commit in &self.listed.ascending_commit_files {
+            if above_lo(commit.version) {
+                work.num_commits += 1;
+                work.bytes += commit.location.size;
+            }
+        }
+        if include_checkpoint {
+            for part in &self.listed.checkpoint_parts {
+                work.bytes += part.location.size;
+            }
+        }
+        work
+    }
+}
+
+/// Commit count and on-disk byte volume a P&M replay covered. See [`LogSegment::pm_replay_work`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PmReplayWork {
+    pub(crate) num_commits: u64,
+    pub(crate) bytes: u64,
 }
 
 #[cfg(test)]

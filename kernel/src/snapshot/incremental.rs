@@ -8,9 +8,12 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
-use crate::log_segment::LogSegment;
+use crate::log_segment::{LogSegment, PmReplayWork};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::{
+    emit_log_segment_load, emit_protocol_metadata_load, emit_protocol_metadata_load_failure,
+    LogSegmentLoadPurpose, ProtocolMetadataSource, SnapshotLoadMetricContext,
+};
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -117,6 +120,11 @@ impl Snapshot {
         // Start listing just after the previous segment's checkpoint, if any.
         let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
+        // The incremental path lists and assembles the segment inline (not via
+        // `LogSegment::for_snapshot`), so it emits its own `LogSegmentLoad` metric with
+        // `load_purpose = incremental_snapshot`.
+        let segment_load_start = std::time::Instant::now();
+
         // Check for new commits (and CRC)
         let new_listed_files = LogSegmentFiles::list(
             storage.as_ref(),
@@ -177,6 +185,14 @@ impl Snapshot {
                 // of the listing, so a full rebuild is required. The existing snapshot's CRC
                 // is older than the new checkpoint and cannot apply, but a fresh on-disk CRC
                 // at or above the new checkpoint still advances per `incremental_replay`.
+                //
+                // Emit the segment-load metric for the incremental listing; the delegated
+                // `try_new_from_log_segment` emits the `ProtocolMetadataLoad` metric.
+                Self::emit_incremental_segment_load(
+                    &metric_context,
+                    &new_log_segment,
+                    segment_load_start.elapsed(),
+                );
                 let snapshot = Self::try_new_from_log_segment(
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
@@ -290,26 +306,51 @@ impl Snapshot {
             new_checkpoint_hint,
         )?;
 
+        // Emit the segment-load metric for the incremental listing now that the combined segment
+        // is assembled.
+        Self::emit_incremental_segment_load(
+            &metric_context,
+            &combined_log_segment,
+            segment_load_start.elapsed(),
+        );
+
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
-        // `incremental_replay`.
+        // `incremental_replay`. The CRC advance is a reverse replay whose cost belongs to the P&M
+        // resolution it feeds, so the `ProtocolMetadataLoad` timer wraps it (matching the fresh
+        // path, whose timer also spans the CRC build). A failure here emits the P&M failure
+        // counterpart before propagating, so the metric fires on every exit.
+        let pm_load_start = std::time::Instant::now();
         let base_crc = combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.crc());
-        let crc_at_version = combined_log_segment.try_build_crc_within_budget(
+        let crc_at_version = match combined_log_segment.try_build_crc_within_budget(
             engine,
             base_crc.as_ref(),
             incremental_replay,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                emit_protocol_metadata_load_failure(&metric_context);
+                return Err(e);
+            }
+        };
 
+        // Resolve P&M, classifying where it came from for the `ProtocolMetadataLoad` metric.
         let existing_table_config = existing_snapshot.table_configuration();
-        let (new_metadata, new_protocol) = match &crc_at_version {
+        let (new_metadata, new_protocol, pm_source, pm_work) = match &crc_at_version {
             Some(crc) => {
-                // If we were able to build a new CRC, then re-use it for TableConfiguration
-                // creation.
+                // A CRC resolved at the target version supplied P&M. Distinguish already-at-target
+                // from advanced-by-replay via the base CRC version.
+                let source = match base_crc.as_deref() {
+                    Some(base) if base.version == new_end_version => {
+                        ProtocolMetadataSource::CrcAtTarget
+                    }
+                    _ => ProtocolMetadataSource::CrcAdvancedByReplay,
+                };
                 let new_metadata = (crc.metadata != *existing_table_config.metadata())
                     .then(|| crc.metadata.clone());
                 let new_protocol = (crc.protocol != *existing_table_config.protocol())
                     .then(|| crc.protocol.clone());
-                (new_metadata, new_protocol)
+                (new_metadata, new_protocol, source, PmReplayWork::default())
             }
             None => {
                 // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
@@ -319,11 +360,34 @@ impl Snapshot {
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
-                combined_log_segment
-                    .segment_after_version(existing_snapshot_version)
-                    .read_protocol_metadata_opt(engine, newer_base)?
+                let pruned = combined_log_segment.segment_after_version(existing_snapshot_version);
+                let work = pruned.pm_replay_work(None, /* include_checkpoint */ false);
+                let (new_metadata, new_protocol) =
+                    match pruned.read_protocol_metadata_opt(engine, newer_base) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            emit_protocol_metadata_load_failure(&metric_context);
+                            return Err(e);
+                        }
+                    };
+                // A newer base CRC seeds the pruned replay; otherwise the existing snapshot's P&M
+                // is the baseline and the new commits are only checked for P&M changes.
+                let source = if newer_base.is_some() {
+                    ProtocolMetadataSource::CrcSeededPmOnlyReplay
+                } else {
+                    ProtocolMetadataSource::InheritedFromExisting
+                };
+                (new_metadata, new_protocol, source, work)
             }
         };
+        emit_protocol_metadata_load(
+            &metric_context,
+            pm_source,
+            pm_work.num_commits,
+            pm_work.bytes,
+            pm_load_start.elapsed(),
+        );
+
         let table_configuration = TableConfiguration::try_new_from(
             existing_table_config,
             new_metadata,
@@ -337,6 +401,24 @@ impl Snapshot {
             table_configuration,
             crc_at_version,
         )?))
+    }
+
+    /// Emit a `LogSegmentLoad` metric for the incremental snapshot path, which assembles its
+    /// segment inline rather than via the instrumented `LogSegment::for_snapshot`.
+    fn emit_incremental_segment_load(
+        metric_context: &SnapshotLoadMetricContext,
+        segment: &LogSegment,
+        duration: std::time::Duration,
+    ) {
+        emit_log_segment_load(
+            metric_context,
+            LogSegmentLoadPurpose::IncrementalSnapshot,
+            segment.listed.ascending_commit_files.len() as u64,
+            segment.listed.checkpoint_parts.len() as u64,
+            segment.listed.ascending_compaction_files.len() as u64,
+            segment.listed.latest_crc_file.is_some(),
+            duration,
+        );
     }
 
     // ============================================================================
@@ -1245,6 +1327,125 @@ mod tests {
             Some(1)
         );
 
+        Ok(())
+    }
+
+    // A fresh build that finds a CRC already at the target version serves P&M straight from it,
+    // with no replay. Before this work that branch emitted no ProtocolMetadataLoad at all
+    // (#2677); now it emits one classified as crc_at_target with zero replay denominators.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_build_with_crc_at_target_emits_crc_at_target_source() -> DeltaResult<()> {
+        use crate::metrics::{MetricEvent, ProtocolMetadataSource};
+        use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 3).await?;
+        // Plant a CRC at the latest version (2) so a default (Disabled) fresh build serves P&M
+        // from it without any replay.
+        ctx.store
+            .put(
+                &delta_path_for_version(2, "crc"),
+                make_test_crc_json(300, 3).to_string().into(),
+            )
+            .await?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let snapshot = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot.version(), 2);
+        assert_eq!(snapshot.crc().map(|c| c.version), Some(2));
+
+        let pm = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("expected ProtocolMetadataLoadSuccess even on the CRC-served branch");
+        assert_eq!(pm.source, ProtocolMetadataSource::CrcAtTarget);
+        assert_eq!(pm.num_commits_replayed_for_pm, 0);
+        assert_eq!(pm.bytes_read_for_pm, 0);
+        Ok(())
+    }
+
+    // A fresh build whose only CRC is stale (older than the target) advances it by reverse replay
+    // when the budget permits (Unlimited), classified as crc_advanced_by_replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_build_with_stale_crc_and_unlimited_budget_emits_crc_advanced_by_replay(
+    ) -> DeltaResult<()> {
+        use crate::metrics::{MetricEvent, ProtocolMetadataSource};
+        use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+        // CRC at v1, target latest (v3): stale by 2 commits.
+        ctx.store
+            .put(
+                &delta_path_for_version(1, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let snapshot = Snapshot::builder_for(ctx.url.as_str())
+            .with_incremental_crc_replay(IncrementalReplay::Unlimited)
+            .build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot.crc().map(|c| c.version), Some(3));
+
+        let pm = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("expected ProtocolMetadataLoadSuccess");
+        assert_eq!(pm.source, ProtocolMetadataSource::CrcAdvancedByReplay);
+        Ok(())
+    }
+
+    // A fresh build with a stale CRC but no advance budget (Disabled) falls back to a forward
+    // P&M-only replay seeded by that CRC, classified as crc_seeded_pm_only_replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_build_with_stale_crc_and_disabled_budget_emits_crc_seeded_pm_only_replay(
+    ) -> DeltaResult<()> {
+        use crate::metrics::{MetricEvent, ProtocolMetadataSource};
+        use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
+        // CRC at v1; a P&M change (protocol upgrade) lands at v2, above the CRC.
+        commit(ctx.url.as_str(), &ctx.store, 2, vec![protocol_action(2, 5)]).await;
+        ctx.store
+            .put(
+                &delta_path_for_version(1, "crc"),
+                make_test_crc_json(200, 2).to_string().into(),
+            )
+            .await?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        // Disabled (the default) never advances a stale CRC, so P&M falls back to a seeded replay.
+        let snapshot = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref())?;
+        assert_eq!(snapshot.crc().map(|c| c.version), None);
+
+        let pm = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(s),
+                _ => None,
+            })
+            .expect("expected ProtocolMetadataLoadSuccess");
+        assert_eq!(pm.source, ProtocolMetadataSource::CrcSeededPmOnlyReplay);
+        // The seeded replay covers commits above the CRC (v2, v3), so its denominators are nonzero.
+        assert!(pm.num_commits_replayed_for_pm > 0);
+        assert!(pm.bytes_read_for_pm > 0);
         Ok(())
     }
 
