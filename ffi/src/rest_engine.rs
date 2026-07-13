@@ -6,13 +6,8 @@
 //!
 //! TLS, retries, and static auth use [`set_builder_option`](crate::set_builder_option) with the
 //! `REST_BUILDER_OPTION_*` keys below. Pass a [`CAuthHeaderCallback`] when headers expire; with
-//! `callback = NULL`, set static headers via `header.<Name>` options instead. When using a
-//! callback, fill each header name/value with
-//! [`allocate_kernel_string`](crate::allocate_kernel_string); the kernel takes ownership of those
-//! handles when the callback returns.
-//!
-//! When `callback` is non-null, `context` must remain valid for the engine lifetime and be safe
-//! to invoke from any thread.
+//! `callback = NULL`, set static headers via `header.<Name>` options instead. See
+//! [`CAuthHeaderCallback`] for the callback contract.
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -23,19 +18,17 @@ use std::time::Duration;
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_default_engine::rest_store::{
-    build_rest_client, headers_from_pairs, AuthHeaderProvider, RefreshingHeaderProvider,
+    build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
     RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
 };
 use url::Url;
 
 use crate::error::AllocateErrorFn;
 use crate::handle::Handle;
-use crate::{
-    ExclusiveRustString, KernelStringSlice, NullableCvoid, OptionalValue, TryFromStringSlice,
-};
+use crate::{ExclusiveRustString, KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
 /// Max `(name, value)` pairs in a [`CAuthHeaders`] struct.
-pub const AUTH_MAX_HEADERS: usize = 8;
+pub const AUTH_MAX_NUM_HEADERS: usize = 8;
 
 // === `set_builder_option` keys for REST engines ===
 //
@@ -96,8 +89,8 @@ pub static REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS_KEY: [u8; 24] =
 /// [`set_builder_rest_object_store`](crate::set_builder_rest_object_store).
 ///
 /// Each [`KernelStringSlice`] must remain valid for the duration of that call; the kernel copies
-/// the strings into the built engine. Prefix fields may be empty. `entry_strip_prefix` uses
-/// [`OptionalValue::None`] when unset.
+/// the strings into the built engine. Optional fields (the prefixes and `entry_strip_prefix`) may
+/// be empty, which the kernel treats as unset.
 #[repr(C)]
 pub struct CRestEndpointConfig {
     pub files_prefix: KernelStringSlice,
@@ -112,7 +105,7 @@ pub struct CRestEndpointConfig {
     pub entry_size_field: KernelStringSlice,
     pub entry_is_directory_field: KernelStringSlice,
     pub entry_last_modified_field: KernelStringSlice,
-    pub entry_strip_prefix: OptionalValue<KernelStringSlice>,
+    pub entry_strip_prefix: KernelStringSlice,
 }
 
 /// One HTTP header name/value pair produced by a [`CAuthHeaderCallback`].
@@ -132,7 +125,7 @@ pub struct CAuthHeaderPair {
 #[repr(C)]
 pub struct CAuthHeaders {
     pub count: u32,
-    pub headers: [CAuthHeaderPair; AUTH_MAX_HEADERS],
+    pub headers: [CAuthHeaderPair; AUTH_MAX_NUM_HEADERS],
     /// How long (in milliseconds) the headers stay valid. `0` means refresh on every request.
     pub ttl_ms: u64,
 }
@@ -175,9 +168,6 @@ pub(crate) struct FfiAuthHeaderProvider {
 unsafe impl Send for FfiAuthHeaderProvider {}
 unsafe impl Sync for FfiAuthHeaderProvider {}
 
-type AuthHeaderPairs = Vec<(String, String)>;
-type CollectedAuthHeaders = (AuthHeaderPairs, Option<u64>);
-
 impl FfiAuthHeaderProvider {
     pub(crate) fn new(
         callback: CAuthHeaderCallback,
@@ -191,18 +181,18 @@ impl FfiAuthHeaderProvider {
         }
     }
 
-    fn collect(&self) -> DeltaResult<CollectedAuthHeaders> {
+    fn collect(&self) -> DeltaResult<(HeaderMap, Option<Duration>)> {
         let mut headers = MaybeUninit::<CAuthHeaders>::uninit();
         let out = headers.as_mut_ptr();
-        // SAFETY: `out` is valid for writes until `headers` is forgotten. The callback initializes
-        // `headers[0..count]`; only those slots are read below.
+        // SAFETY: `out` is valid for writes here. The callback initializes `headers[0..count]`;
+        // only those slots are read below.
         unsafe {
             (*out).count = 0;
             (*out).ttl_ms = 0;
             (self.callback)(self.context, out, self.allocate_error);
-            let ttl_ms = ttl_ms_from_c((*out).ttl_ms);
+            let ttl = ((*out).ttl_ms != 0).then(|| Duration::from_millis((*out).ttl_ms));
             let pairs = take_auth_pairs_from_c(out)?;
-            Ok((pairs, ttl_ms))
+            Ok((headers_from_pairs(pairs)?, ttl))
         }
     }
 }
@@ -220,44 +210,31 @@ pub(crate) fn rest_builder_state_from_ffi(
     })
 }
 
-fn take_string_handle(handle: Handle<ExclusiveRustString>) -> DeltaResult<String> {
-    // SAFETY: each handle is moved out of `CAuthHeaders` exactly once.
-    Ok(*unsafe { handle.into_inner() })
-}
-
 /// Take ownership of initialized `(name, value)` handles in `headers[0..count]`.
 ///
 /// # Safety
 ///
-/// `(*headers).count` must not exceed [`AUTH_MAX_HEADERS`], and every slot in
+/// `(*headers).count` must not exceed [`AUTH_MAX_NUM_HEADERS`], and every slot in
 /// `headers[0..count]` must hold handles produced by
 /// [`allocate_kernel_string`](crate::allocate_kernel_string). Padding slots are never read or
 /// dropped.
 unsafe fn take_auth_pairs_from_c(headers: *mut CAuthHeaders) -> DeltaResult<Vec<(String, String)>> {
     let count = (*headers).count as usize;
-    if count > AUTH_MAX_HEADERS {
+    if count > AUTH_MAX_NUM_HEADERS {
         return Err(Error::generic(format!(
-            "auth header count {count} exceeds max {AUTH_MAX_HEADERS}"
+            "auth header count {count} exceeds max {AUTH_MAX_NUM_HEADERS}"
         )));
     }
 
     let mut pairs = Vec::with_capacity(count);
     for i in 0..count {
         let slot = ptr::read(ptr::addr_of_mut!((*headers).headers[i]));
-        pairs.push((
-            take_string_handle(slot.name)?,
-            take_string_handle(slot.value)?,
-        ));
+        // SAFETY: each handle is moved out of `CAuthHeaders` exactly once.
+        let name = *slot.name.into_inner();
+        let value = *slot.value.into_inner();
+        pairs.push((name, value));
     }
     Ok(pairs)
-}
-
-fn ttl_ms_from_c(ttl_ms: u64) -> Option<u64> {
-    if ttl_ms == 0 {
-        None
-    } else {
-        Some(ttl_ms)
-    }
 }
 
 /// Copy a [`CRestEndpointConfig`] into an owned [`RestEndpointConfig`].
@@ -286,7 +263,10 @@ pub(crate) fn rest_endpoint_config_from_c(
             &config.entry_last_modified_field,
             "entry_last_modified_field",
         )?,
-        entry_strip_prefix: copy_optional_entry_strip_prefix(&config.entry_strip_prefix)?,
+        entry_strip_prefix: {
+            let prefix = copy_optional_string(&config.entry_strip_prefix)?;
+            (!prefix.is_empty()).then_some(prefix)
+        },
     })
 }
 
@@ -303,22 +283,6 @@ fn copy_required_string(slice: &KernelStringSlice, field: &str) -> DeltaResult<S
     Ok(value)
 }
 
-fn copy_optional_entry_strip_prefix(
-    prefix: &OptionalValue<KernelStringSlice>,
-) -> DeltaResult<Option<String>> {
-    match prefix {
-        OptionalValue::None => Ok(None),
-        OptionalValue::Some(slice) => {
-            let value = copy_optional_string(slice)?;
-            if value.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(value))
-            }
-        }
-    }
-}
-
 /// Build a [`RestObjectStore`] from an engine builder's URL, options, and REST state.
 pub(crate) fn build_rest_object_store(
     base_url: &Url,
@@ -331,15 +295,10 @@ pub(crate) fn build_rest_object_store(
         Some(cb) => {
             let provider = cb;
             Arc::new(RefreshingHeaderProvider::new(move || {
-                let (pairs, ttl_ms) =
-                    provider.collect().map_err(|e| ObjectStoreError::Generic {
-                        store: "RestObjectStore",
-                        source: e.into(),
-                    })?;
-                Ok((
-                    headers_from_pairs(pairs)?,
-                    ttl_ms.map(Duration::from_millis),
-                ))
+                provider.collect().map_err(|e| ObjectStoreError::Generic {
+                    store: "RestObjectStore",
+                    source: e.into(),
+                })
             }))
         }
         None => {
@@ -467,7 +426,7 @@ mod tests {
             entry_size_field: kernel_string_slice!(size),
             entry_is_directory_field: kernel_string_slice!(is_directory),
             entry_last_modified_field: kernel_string_slice!(last_modified),
-            entry_strip_prefix: OptionalValue::None,
+            entry_strip_prefix: kernel_string_slice!(EMPTY),
         }
     }
 
@@ -566,7 +525,7 @@ mod tests {
     fn auth_pairs_from_c_rejects_excess_count() {
         let mut storage = MaybeUninit::<CAuthHeaders>::uninit();
         unsafe {
-            (*storage.as_mut_ptr()).count = (AUTH_MAX_HEADERS + 1) as u32;
+            (*storage.as_mut_ptr()).count = (AUTH_MAX_NUM_HEADERS + 1) as u32;
         }
         assert!(unsafe { take_auth_pairs_from_c(storage.as_mut_ptr()).is_err() });
     }
@@ -585,12 +544,10 @@ mod tests {
             context: None,
             allocate_error: test_allocate_error(),
         };
-        let (pairs, ttl_ms) = provider.collect().unwrap();
-        assert_eq!(
-            pairs,
-            vec![("authorization".to_string(), "Bearer t".to_string())]
-        );
-        assert_eq!(ttl_ms, Some(60_000));
+        let (headers, ttl) = provider.collect().unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer t");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(ttl, Some(Duration::from_millis(60_000)));
     }
 
     #[test]
@@ -622,7 +579,7 @@ mod tests {
         let prefix = "/TablesById/u";
         let mut config = test_c_rest_endpoint_config();
         config.files_prefix = kernel_string_slice!(prefix);
-        config.entry_strip_prefix = OptionalValue::Some(kernel_string_slice!(prefix));
+        config.entry_strip_prefix = kernel_string_slice!(prefix);
         let rest = rest_builder_state_from_ffi(&config, None, None, test_allocate_error()).unwrap();
 
         let mut options = HashMap::new();

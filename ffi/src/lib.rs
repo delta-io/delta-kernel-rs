@@ -760,21 +760,28 @@ pub unsafe extern "C" fn set_builder_rest_object_store(
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
 ) -> ExternResult<bool> {
-    let allocate_error = builder.allocate_fn;
-    let result = (|| {
-        let endpoint_config = endpoint_config
-            .as_ref()
-            .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
-        builder.object_store_backend =
-            ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
-                endpoint_config,
-                callback,
-                context,
-                builder.allocate_fn,
-            )?));
-        Ok(true)
-    })();
-    result.into_extern_result(&allocate_error)
+    set_builder_rest_object_store_impl(builder, endpoint_config, callback, context)
+        .into_extern_result(&builder.allocate_fn)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn set_builder_rest_object_store_impl(
+    builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
+    callback: Option<rest_engine::CAuthHeaderCallback>,
+    context: NullableCvoid,
+) -> DeltaResult<bool> {
+    // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
+    let endpoint_config = unsafe { endpoint_config.as_ref() }
+        .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
+    builder.object_store_backend =
+        ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
+            endpoint_config,
+            callback,
+            context,
+            builder.allocate_fn,
+        )?));
+    Ok(true)
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no

@@ -31,6 +31,8 @@ pub use auth::{
 };
 pub use client::{build_rest_client, RestClientOptions};
 pub use config::RestEndpointConfig;
+// Re-exported so callers can name the header type in `AuthHeaderProvider`'s public API.
+pub use reqwest::header::HeaderMap;
 pub use store::RestObjectStore;
 
 /// Build a generic [`ObjectStoreError`] from a source error or message.
