@@ -26,9 +26,11 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 #[cfg(feature = "column-defaults-in-dev")]
-mod column_default;
+pub(crate) mod column_default;
 #[cfg(feature = "column-defaults-in-dev")]
 pub use column_default::ColumnDefault;
+#[cfg(feature = "column-defaults-in-dev")]
+pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -522,9 +524,9 @@ impl StructField {
     ///
     /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
     /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
-    /// - `Err(_)` -- present but malformed: either not a [`MetadataValue::String`] (the protocol
-    ///   defines `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected
-    ///   by [`ColumnDefault`] (e.g. a non-NULL default on a non-primitive type).
+    /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
+    ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
+    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
     #[cfg(feature = "column-defaults-in-dev")]
     pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
@@ -4242,14 +4244,7 @@ mod tests {
     #[cfg(feature = "column-defaults-in-dev")]
     mod column_default_method {
         use super::*;
-
-        /// A nullable field named `c` carrying `raw_sql` as its `CURRENT_DEFAULT`.
-        fn field_with_default(data_type: DataType, raw_sql: &str) -> StructField {
-            StructField::nullable("c", data_type).add_metadata([(
-                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-                MetadataValue::String(raw_sql.to_string()),
-            )])
-        }
+        use crate::schema::column_default::field_with_default;
 
         #[test]
         fn returns_none_when_no_current_default() {
@@ -4280,7 +4275,7 @@ mod tests {
             #[case] raw_sql: &str,
             #[case] parsable: bool,
         ) {
-            let field = field_with_default(data_type.clone(), raw_sql);
+            let field = field_with_default("c", data_type.clone(), raw_sql);
             let column_default = field
                 .column_default()
                 .unwrap()
@@ -4290,15 +4285,35 @@ mod tests {
             assert_eq!(column_default.to_scalar().unwrap().is_some(), parsable);
         }
 
+        #[rstest]
+        #[case::array(DataType::from(ArrayType::new(DataType::INTEGER, true)), "ARRAY(1)")]
+        #[case::map(
+            DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            "MAP('a', 1)"
+        )]
+        fn non_null_default_on_container_is_tolerated(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+        ) {
+            let field = field_with_default("c", data_type.clone(), raw_sql);
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            // Kernel cannot parse a non-primitive default, so it surfaces via raw SQL.
+            assert_eq!(column_default.raw_sql(), raw_sql);
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap(), None);
+        }
+
         #[test]
-        fn non_null_default_on_non_primitive_errors() {
-            let data_type = DataType::from(ArrayType::new(DataType::INTEGER, true));
-            let field = field_with_default(data_type, "ARRAY(1)");
+        fn non_null_default_on_variant_errors() {
+            let field = field_with_default("v", DataType::unshredded_variant(), "1");
             let err = field
                 .column_default()
-                .expect_err("non-NULL default on a non-primitive type must error")
+                .expect_err("a non-NULL default on a Variant column must error")
                 .to_string();
-            assert!(err.contains("not supported"), "got: {err}");
+            assert!(err.contains("Variant"), "got: {err}");
         }
     }
 

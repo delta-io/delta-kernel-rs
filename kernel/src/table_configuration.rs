@@ -21,6 +21,8 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
+#[cfg(feature = "column-defaults-in-dev")]
+use crate::schema::validate_column_defaults_metadata;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
@@ -217,12 +219,11 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
+        // default on a Variant column).
+        #[cfg(feature = "column-defaults-in-dev")]
+        validate_column_defaults_metadata(&table_config.logical_schema)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
-
-        // TODO(#2630): Validate column-default metadata here so a table that declares a
-        // `CURRENT_DEFAULT` without the `allowColumnDefaults` feature, or with malformed default
-        // metadata, is rejected eagerly as corrupted rather than lazily in
-        // `Transaction::column_defaults`.
 
         Ok(table_config)
     }

@@ -13,6 +13,8 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+#[cfg(feature = "column-defaults-in-dev")]
+pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
@@ -442,7 +444,6 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// Attention in the future:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
 ///   tables.
-/// - Column defaults: when supported, only literal expressions are allowed.
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
 ///   always use INT64; INT96 is forbidden.
