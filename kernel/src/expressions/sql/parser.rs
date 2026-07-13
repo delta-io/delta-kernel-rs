@@ -235,8 +235,6 @@ mod tests {
     #[case::dangling_dot(vec![ident("a"), Token::Dot, Token::Gt, Token::Literal("0".into())])]
     #[case::operator_first(vec![Token::Gt, Token::Literal("0".into())])]
     #[case::empty(vec![])]
-    // A junction keyword has no place in a single comparison: the parser rejects it wherever it
-    // appears (as an operand, or trailing after a complete comparison).
     #[case::keyword_operand(vec![ident("a"), Token::Gt, Token::Keyword(Keyword::And)])]
     #[case::keyword_junction(vec![
         ident("a"), Token::Gt, Token::Literal("0".into()),
