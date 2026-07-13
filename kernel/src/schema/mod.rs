@@ -2072,6 +2072,11 @@ impl PrimitiveType {
     pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
         self == target || self.can_widen_to(target) || self.is_checkpoint_cast_compatible(target)
     }
+
+    /// Returns `true` if this primitive type can be used as a partition column.
+    pub(crate) fn is_partition_col(&self) -> bool {
+        !matches!(self, Self::Geometry(_) | Self::Geography(_))
+    }
 }
 
 fn serialize_decimal<S: serde::Serializer>(
