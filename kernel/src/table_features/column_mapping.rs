@@ -118,8 +118,9 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 ///
 /// A table can carry residual annotations while mapping is off. They are inert -- physical names
 /// resolve to logical names -- so reads tolerate them (matching delta-spark, which ignores them in
-/// `NoMapping` mode), while CREATE / ALTER reject them so kernel never persists a table in that
-/// shape.
+/// `NoMapping` mode). CREATE / ALTER strip the annotations a write newly introduces (so kernel
+/// never *originates* a table in that shape), but leave residual ones already on the table in
+/// place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StaleAnnotationPolicy {
     /// Ignore a stale annotation and resolve the field by its logical name.
@@ -754,11 +755,18 @@ pub(crate) fn schema_has_column_mapping_metadata(schema: &StructType) -> bool {
     impl<'a> SchemaTransform<'a> for HasCmMetadata {
         transform_output_type!(|'a, T| ());
         fn transform_struct_field(&mut self, field: &'a StructField) {
+            // Once a match is found the answer can't change, so skip the per-field key scan (and
+            // recursion) for the rest of the walk. The `SchemaTransform` trait has no early-exit
+            // hook, so nodes are still visited; this just short-circuits the work at each.
+            if self.0 {
+                return;
+            }
             if COLUMN_MAPPING_METADATA_KEYS
                 .iter()
                 .any(|key| field.metadata.contains_key(key.as_ref()))
             {
                 self.0 = true;
+                return;
             }
             self.recurse_into_struct_field(field)
         }
@@ -1138,42 +1146,42 @@ mod tests {
             .expect_err("missing annotation on struct field inside map value");
     }
 
+    /// Every key in `COLUMN_MAPPING_METADATA_KEYS` counts as column-mapping metadata, whether it
+    /// sits on a top-level field or a nested struct leaf.
+    #[rstest::rstest]
+    fn test_schema_has_column_mapping_metadata_detects_each_key(
+        #[values(
+            ColumnMetadataKey::ColumnMappingId,
+            ColumnMetadataKey::ColumnMappingPhysicalName,
+            ColumnMetadataKey::ColumnMappingNestedIds,
+            ColumnMetadataKey::ParquetFieldId,
+            ColumnMetadataKey::ParquetFieldNestedIds
+        )]
+        key: ColumnMetadataKey,
+    ) {
+        // Top-level field carrying only this key.
+        let top_level = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
+            .add_metadata([(key.as_ref(), MetadataValue::Number(1))])]);
+        assert!(schema_has_column_mapping_metadata(&top_level));
+
+        // Same key on a nested struct leaf (clean top level).
+        let nested = StructType::new_unchecked([StructField::nullable(
+            "outer",
+            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)
+                .add_metadata([(key.as_ref(), MetadataValue::Number(1))])]),
+        )]);
+        assert!(schema_has_column_mapping_metadata(&nested));
+    }
+
     #[test]
-    fn test_schema_has_column_mapping_metadata() {
+    fn test_schema_has_column_mapping_metadata_edge_cases() {
         // Clean schema -> false.
         let clean = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
         assert!(!schema_has_column_mapping_metadata(&clean));
 
-        // id-only, physicalName-only -> true.
-        let id_only = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
-            .add_metadata([(
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::Number(1),
-            )])]);
-        assert!(schema_has_column_mapping_metadata(&id_only));
-        let name_only = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
-            .add_metadata([(
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::String("col-a".to_string()),
-            )])]);
-        assert!(schema_has_column_mapping_metadata(&name_only));
-
-        // Annotation on a nested struct leaf (clean top level) -> true.
-        let nested = StructType::new_unchecked([StructField::nullable(
-            "outer",
-            StructType::new_unchecked([make_cm_field("leaf", 2, DataType::INTEGER)]),
-        )]);
-        assert!(schema_has_column_mapping_metadata(&nested));
-
-        // Detection is by key presence, not value type: a `parquet.field.id`-only field and a
-        // wrong-typed id both count (they must, so the stripper -- which removes by presence --
-        // never leaves a key the detector deemed absent).
-        let pq_only = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
-            .add_metadata([(
-                ColumnMetadataKey::ParquetFieldId.as_ref(),
-                MetadataValue::Number(5),
-            )])]);
-        assert!(schema_has_column_mapping_metadata(&pq_only));
+        // Detection is by key presence, not value type: a wrong-typed id still counts (it must, so
+        // the stripper -- which removes by presence -- never leaves a key the detector deemed
+        // absent).
         let wrong_typed =
             StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
                 .add_metadata([(

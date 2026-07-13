@@ -899,11 +899,9 @@ impl CreateTableTransactionBuilder {
         // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
 
-        // Only in `None` mode: a new table has no prior schema, so any `delta.columnMapping.*`
-        // annotation the caller supplied is newly introduced -- strip it rather than persist a
-        // self-inconsistent table. The annotations are inert in `None` mode, so this does not
-        // affect data-layout or feature-enablement decisions below. CREATE passes `None` as
-        // the prior schema (see `strip_stray_column_mapping_metadata`).
+        // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
+        // any annotation the caller supplied is newly introduced (see
+        // `strip_stray_column_mapping_metadata`).
         if column_mapping_mode == ColumnMappingMode::None {
             if let Some(stripped) = strip_stray_column_mapping_metadata(None, &effective_schema) {
                 effective_schema = Arc::new(stripped);

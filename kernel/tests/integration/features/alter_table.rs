@@ -13,6 +13,7 @@ use delta_kernel::schema::{
     StructType,
 };
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
@@ -805,35 +806,48 @@ async fn chain_add_column_and_set_nullable(
     Ok(())
 }
 
-fn field_with_stray_cm_id(name: &str, ty: DataType) -> StructField {
+fn field_with_stray_key(name: &str, key: &ColumnMetadataKey, ty: DataType) -> StructField {
     let mut f = StructField::nullable(name, ty);
-    f.metadata.insert(
-        ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-        MetadataValue::Number(99),
-    );
+    f.metadata
+        .insert(key.as_ref().to_string(), MetadataValue::Number(99));
     f
 }
 
 /// On a clean non-CM table, an ALTER that adds a column carrying stray CM metadata has that
 /// metadata stripped (the commit introduces it into a previously-clean table), rather than
-/// rejected -- matching delta-spark. Covers a top-level annotation and one nested in a struct.
+/// rejected -- matching delta-spark. Parametrized over each detected key and over placement
+/// (top-level vs nested in a struct).
 #[rstest]
-#[case::top_level(field_with_stray_cm_id("tainted", DataType::STRING), &["tainted"])]
-#[case::nested_in_struct(
-    StructField::nullable(
-        "outer",
-        StructType::try_new(vec![field_with_stray_cm_id("inner", DataType::STRING)]).unwrap(),
-    ),
-    &["outer", "inner"],
-)]
+#[case::top_level(false)]
+#[case::nested_in_struct(true)]
 #[tokio::test]
 async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
-    #[case] field: StructField,
-    #[case] stripped_path: &[&str],
+    #[case] nested: bool,
+    #[values(
+        ColumnMetadataKey::ColumnMappingId,
+        ColumnMetadataKey::ColumnMappingPhysicalName,
+        ColumnMetadataKey::ColumnMappingNestedIds,
+        ColumnMetadataKey::ParquetFieldId,
+        ColumnMetadataKey::ParquetFieldNestedIds
+    )]
+    key: ColumnMetadataKey,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let (field, stripped_path): (StructField, Vec<String>) = if nested {
+        let outer = StructField::nullable(
+            "outer",
+            StructType::try_new(vec![field_with_stray_key("inner", &key, DataType::STRING)])?,
+        );
+        (outer, vec!["outer".to_string(), "inner".to_string()])
+    } else {
+        (
+            field_with_stray_key("tainted", &key, DataType::STRING),
+            vec!["tainted".to_string()],
+        )
+    };
 
     snapshot
         .alter_table()
@@ -845,14 +859,51 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     // Reload from disk so we assert on the persisted schemaString, not the in-memory config.
     let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     let reloaded_schema = reloaded.schema();
-    let path: Vec<String> = stripped_path.iter().map(|s| s.to_string()).collect();
-    let leaf = reloaded_schema.field_at_path(&path);
+    let leaf = reloaded_schema.field_at_path(&stripped_path);
     assert!(
-        leaf.column_mapping_id().is_none()
-            && leaf
-                .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-                .is_none(),
-        "stray column-mapping metadata at {stripped_path:?} should be stripped"
+        leaf.get_config_value(&key).is_none(),
+        "stray {} at {stripped_path:?} should be stripped",
+        key.as_ref()
+    );
+    Ok(())
+}
+
+/// The ALTER strip is `None`-mode-only. Adding a column with pre-populated column-mapping metadata
+/// preserves it when mapping is enabled (`id` / `name`, delta-spark's
+/// `assignColumnIdAndPhysicalName` keeps existing ids) and strips it only in `None` mode.
+#[rstest]
+#[case::none(ColumnMappingMode::None, &[], false)]
+#[case::id(ColumnMappingMode::Id, &[("delta.columnMapping.mode", "id")], true)]
+#[case::name(ColumnMappingMode::Name, &[("delta.columnMapping.mode", "name")], true)]
+#[tokio::test]
+async fn add_column_strip_is_none_mode_only(
+    #[case] expected_mode: ColumnMappingMode,
+    #[case] properties: &[(&str, &str)],
+    #[case] annotation_kept: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
+    assert_eq!(
+        snapshot.table_configuration().column_mapping_mode(),
+        expected_mode
+    );
+
+    // A well-formed id+physicalName pair so enabled modes have valid metadata to preserve.
+    let field = fixtures::cm_field("added", 99, "phys-added", DataType::STRING);
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let added = reloaded.schema().field("added").unwrap().clone();
+    assert_eq!(
+        added.column_mapping_id().is_some(),
+        annotation_kept,
+        "column mapping id under {expected_mode:?} mode"
     );
     Ok(())
 }
@@ -1112,15 +1163,18 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
 /// A mapping-disabled table that already carries residual `delta.columnMapping.*` annotations is
 /// left untouched by an ALTER: the pre-existing annotation on `value` survives, and whatever the
 /// added column carries is persisted verbatim -- kernel strips only annotations a commit newly
-/// introduces into a *clean* table, so an already-dirty table is never rewritten (delta-spark's
-/// `addsColumnMappingMetadata` is false here). The clean-table strip is covered by
+/// introduces into a *clean* table, so an already-dirty table is never rewritten (matching
+/// delta-spark). The clean-table strip is covered by
 /// `add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped`.
 ///
 /// Cases: adding a clean column (stays clean) and adding a stray-annotated column (annotation
 /// left in place, not stripped).
 #[rstest]
 #[case::clean_column(StructField::nullable("added", DataType::STRING), None)]
-#[case::introduced_stray(field_with_stray_cm_id("added", DataType::STRING), Some(99))]
+#[case::introduced_stray(
+    field_with_stray_key("added", &ColumnMetadataKey::ColumnMappingId, DataType::STRING),
+    Some(99)
+)]
 #[tokio::test]
 async fn add_column_on_stale_table_leaves_schema_untouched(
     #[case] added_field: StructField,

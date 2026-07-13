@@ -278,35 +278,72 @@ fn test_column_mapping_invalid_mode_rejected() {
         .contains("Invalid column mapping mode"));
 }
 
-/// CREATE TABLE with column mapping disabled strips any `delta.columnMapping.*` annotations the
-/// input schema carries: a new table has no prior schema, so the annotations are newly introduced
-/// and dropped (matching delta-spark's `dropColumnMappingMetadata`), leaving a clean persisted
-/// schema rather than a self-inconsistent table.
-#[test]
-fn test_create_table_strips_stale_column_mapping_when_disabled() -> DeltaResult<()> {
+/// CREATE TABLE with column mapping disabled strips every column-mapping annotation the input
+/// schema carries: a new table has no prior schema, so the annotations are newly introduced and
+/// dropped (matching delta-spark's `dropColumnMappingMetadata`), leaving a clean persisted schema
+/// rather than a self-inconsistent table. Parametrized over each detected key.
+#[rstest::rstest]
+fn test_create_table_strips_stale_column_mapping_when_disabled(
+    #[values(
+        ColumnMetadataKey::ColumnMappingId,
+        ColumnMetadataKey::ColumnMappingPhysicalName,
+        ColumnMetadataKey::ColumnMappingNestedIds,
+        ColumnMetadataKey::ParquetFieldId,
+        ColumnMetadataKey::ParquetFieldNestedIds
+    )]
+    key: ColumnMetadataKey,
+) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::INTEGER).add_metadata([
-            ("delta.columnMapping.id", MetadataValue::Number(2)),
-            (
-                "delta.columnMapping.physicalName",
-                MetadataValue::String("col-2f8a".to_string()),
-            ),
-        ]),
+        StructField::nullable("value", DataType::INTEGER)
+            .add_metadata([(key.as_ref(), MetadataValue::Number(2))]),
     ])?);
 
-    // No column mapping mode set -> mode resolves to None -> the stale annotations are stripped.
+    // No column mapping mode set -> mode resolves to None -> the stray annotation is stripped.
     let snapshot = create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), &[])?;
 
     // Mode is None and the persisted schema carries no residual column-mapping metadata.
     assert_column_mapping_config(&snapshot, ColumnMappingMode::None);
     let value = snapshot.schema().field("value").unwrap().clone();
-    assert!(value.column_mapping_id().is_none());
-    assert!(value
-        .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-        .is_none());
+    assert!(
+        value.get_config_value(&key).is_none(),
+        "stray {} should be stripped in None mode",
+        key.as_ref()
+    );
+    Ok(())
+}
+
+/// The strip is `None`-mode-only. With column mapping enabled (`id` / `name`) a field's
+/// pre-populated annotations are preserved (delta-spark's `assignColumnIdAndPhysicalName` keeps
+/// existing ids); only `None` mode drops them.
+#[rstest::rstest]
+#[case::none(ColumnMappingMode::None, &[], false)]
+#[case::id(ColumnMappingMode::Id, &[("delta.columnMapping.mode", "id")], true)]
+#[case::name(ColumnMappingMode::Name, &[("delta.columnMapping.mode", "name")], true)]
+fn test_create_table_column_mapping_strip_is_none_mode_only(
+    #[case] expected_mode: ColumnMappingMode,
+    #[case] properties: &[(&str, &str)],
+    #[case] annotation_kept: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        fixtures::cm_field("value", 2, "col-2f8a", DataType::INTEGER),
+    ])?);
+
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, schema, engine.as_ref(), properties)?;
+
+    assert_column_mapping_config(&snapshot, expected_mode);
+    let value = snapshot.schema().field("value").unwrap().clone();
+    assert_eq!(
+        value.column_mapping_id().is_some(),
+        annotation_kept,
+        "column mapping id under {expected_mode:?} mode"
+    );
     Ok(())
 }
 

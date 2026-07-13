@@ -180,10 +180,12 @@ impl AlterTableTransactionBuilder<Modifying> {
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
         let column_mapping_mode = table_config.column_mapping_mode();
         let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
-        // Capture the pre-alter schema so the strip below can tell whether the ALTER is
-        // *introducing* column-mapping annotations into a previously-clean table (strip) versus
-        // evolving a table that already carried residual ones (leave in place).
-        let current_schema = schema.clone();
+        // Pre-alter schema, so the strip below can tell introduced-vs-residual annotations apart.
+        // Only cloned in `None` mode (the sole mode where the strip fires);
+        // `apply_schema_operations` consumes `schema` by value, so the clone must happen
+        // before the move.
+        let current_schema =
+            (column_mapping_mode == ColumnMappingMode::None).then(|| schema.clone());
         let SchemaEvolutionResult {
             schema: evolved_schema,
             new_max_column_id,
@@ -197,11 +199,10 @@ impl AlterTableTransactionBuilder<Modifying> {
         // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
         // that was clean before it, strip them; residual annotations already present on the
         // table are left in place (see `strip_stray_column_mapping_metadata`).
-        let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
-            strip_stray_column_mapping_metadata(Some(&current_schema), &evolved_schema)
-                .map_or(evolved_schema, Arc::new)
-        } else {
-            evolved_schema
+        let evolved_schema = match current_schema {
+            Some(current) => strip_stray_column_mapping_metadata(Some(&current), &evolved_schema)
+                .map_or(evolved_schema, Arc::new),
+            None => evolved_schema,
         };
 
         let evolved_metadata = table_config
