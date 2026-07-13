@@ -99,7 +99,6 @@ impl Scalar {
                 // timezone was already set at builder construction time
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
-            // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
             IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, *val),
             IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),

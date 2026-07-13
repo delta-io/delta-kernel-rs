@@ -588,9 +588,6 @@ fn visit_expression_scalar(
                 scale
             )
         }
-        // Intervals have no dedicated FFI literal callback; emit them as their physical
-        // integer (i32 months / i64 microseconds), consistent with the Arrow Int32/Int64
-        // mapping. The interval semantics travel via the schema, not the literal.
         Scalar::IntervalYearMonth(val) => call!(visitor, visit_literal_int, sibling_list_id, *val),
         Scalar::IntervalDayTime(val) => call!(visitor, visit_literal_long, sibling_list_id, *val),
         Scalar::Struct(struct_data) => {
