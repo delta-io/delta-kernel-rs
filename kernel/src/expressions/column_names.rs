@@ -345,6 +345,7 @@ fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
 /// name. The caller must have already consumed the opening backtick. Shared with the
 /// check-constraint tokenizer ([`crate::expressions::sql`]) so backtick-quoted column references
 /// parse identically.
+/// Examples: `col` -> col;  `ab `` -> ``ab``. Returns an error if there is no closing backtick.
 pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     let mut name = String::new();
     loop {
