@@ -16,17 +16,16 @@ pub mod json;
 pub mod parquet;
 pub mod storage;
 
+use delta_kernel::plans::PlanExecutor;
+use delta_kernel::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 use json::PlanBasedJsonHandler;
 use parquet::PlanBasedParquetHandler;
 use storage::PlanBasedStorageHandler;
 
-use crate::plans::PlanExecutor;
-use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-
 /// An [`Engine`] that routes operations through a [`PlanExecutor`].
 ///
 /// Storage, JSON file reads, and Parquet file reads are converted into
-/// [`Operation`](crate::plans::Operation)s and delegated to the plan executor.
+/// [`Operation`](delta_kernel::plans::Operation)s and delegated to the plan executor.
 ///
 /// EvaluationHandler capabilities are not supported under plan execution,
 /// so the engine must provide an EvaluationHandler as well.

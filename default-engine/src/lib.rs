@@ -37,6 +37,12 @@ pub mod rest_store;
 pub mod stats;
 pub mod storage;
 
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
+
+#[cfg(feature = "declarative-plans")]
+pub use plans::PlanBasedEngine;
+
 /// Converts a Stream-producing future to a synchronous iterator.
 ///
 /// This method performs the initial blocking call to extract the stream from the future, and each

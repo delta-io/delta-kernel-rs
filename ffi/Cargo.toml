@@ -65,8 +65,14 @@ default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_def
 #
 # Requires `arrow` because iterators returned from plan execution use Arrow to pass along data
 # batches, and requires `default-engine-base` because the `PlanBasedEngine` FFI constructor pairs
-# the plan executor with `ArrowEvaluationHandler`
-declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "default-engine-base"]
+# the plan executor with `ArrowEvaluationHandler`.
+declarative-plans = [
+  "delta_kernel/declarative-plans",
+  "dep:prost",
+  "arrow",
+  "default-engine-base",
+  "delta_kernel_default_engine/declarative-plans",
+]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []

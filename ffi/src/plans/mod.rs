@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
-use delta_kernel::engine::plans::PlanBasedEngine;
 use delta_kernel::{Engine, EvaluationHandler, PlanExecutor};
+use delta_kernel_default_engine::plans::PlanBasedEngine;
 
 use crate::handle::Handle;
 use crate::plans::executor::{CExecuteOpFn, FfiPlanExecutor, SharedPlanExecutor};

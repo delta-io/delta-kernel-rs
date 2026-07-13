@@ -40,6 +40,7 @@ arrow-59 = ["delta_kernel/arrow-59"]
 arrow-58 = ["delta_kernel/arrow-58"]
 native-tls = ["reqwest/native-tls"]
 rustls = ["reqwest/rustls"]
+declarative-plans = ["delta_kernel/declarative-plans"]
 
 [dev-dependencies]
 delta_kernel_default_engine_test_utils = { path = "./test-utils" }
