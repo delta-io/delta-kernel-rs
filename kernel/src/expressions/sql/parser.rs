@@ -1,6 +1,6 @@
 //! Parser for a single CHECK-constraint comparison.
 //!
-//! Consumes the [`Token`] stream from [`super::token`] and produces a [`Comparison`] -- exactly one
+//! Consumes the [`Token`] stream from [`super::token`] and produces a [`Comparison`] - exactly one
 //! `operand <op> operand`. Junctions (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are out
 //! of this grammar and surface as errors, which the caller treats as "not kernel-parsable".
 //! Lowering ([`super::lower`]) resolves the operands against the table schema.
