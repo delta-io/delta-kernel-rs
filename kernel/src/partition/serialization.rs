@@ -94,7 +94,7 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
         // Intervals serialize as Spark ANSI interval literal strings (e.g.
-        // `INTERVAL '1-0' YEAR TO MONTH`), matching how DBR stores interval partition values.
+        // `INTERVAL '1-0' YEAR TO MONTH`).
         // Inverse of `PrimitiveType::parse_scalar`.
         Scalar::IntervalYearMonth(months) => Ok(Some(format_year_month_interval(*months))),
         Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),

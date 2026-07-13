@@ -184,42 +184,11 @@ async fn test_write_partitioned_interval_roundtrip(
     // The partition value round-trips: scan materializes `period` back as its physical integer.
     let sorted = read_sorted(&snapshot, engine)?;
     assert_eq!(
-        sorted
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .value(0),
+        get_column!(&sorted, "value", Int32Array).value(0),
         7,
         "value column"
     );
-    match partition_value {
-        Scalar::IntervalYearMonth(months) => {
-            assert_eq!(
-                sorted
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .unwrap()
-                    .value(0),
-                months,
-                "period column (months)"
-            );
-        }
-        Scalar::IntervalDayTime(micros) => {
-            assert_eq!(
-                sorted
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .value(0),
-                micros,
-                "period column (microseconds)"
-            );
-        }
-        _ => unreachable!("test cases only pass interval partition values"),
-    }
+    assert_interval_value(&sorted, "period", &partition_value);
 
     Ok(())
 }

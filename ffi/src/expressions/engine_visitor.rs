@@ -588,8 +588,12 @@ fn visit_expression_scalar(
                 scale
             )
         }
-        Scalar::IntervalYearMonth(val) => call!(visitor, visit_literal_int, sibling_list_id, *val),
-        Scalar::IntervalDayTime(val) => call!(visitor, visit_literal_long, sibling_list_id, *val),
+        Scalar::IntervalYearMonth(_) => {
+            visit_unknown(visitor, sibling_list_id, "interval_year_month_literal")
+        }
+        Scalar::IntervalDayTime(_) => {
+            visit_unknown(visitor, sibling_list_id, "interval_day_time_literal")
+        }
         Scalar::Struct(struct_data) => {
             visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
         }

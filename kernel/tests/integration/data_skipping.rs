@@ -667,6 +667,80 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     Ok(())
 }
 
+#[cfg(feature = "interval-type-in-dev")]
+fn commit_with_interval_partitioned_adds(version: u64, values: &[(&str, &str)]) -> String {
+    let mut lines = vec![format!(
+        r#"{{"commitInfo":{{"timestamp":1700000000000,"operation":"WRITE","version":{version}}}}}"#
+    )];
+    for (path, period) in values {
+        lines.push(format!(
+            r#"{{"add":{{"path":"{path}","size":1024,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{{"period":"{period}"}}}}}}"#
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg(feature = "interval-type-in-dev")]
+#[rstest]
+#[case::year_month(
+    DataType::INTERVAL_YEAR_MONTH,
+    Scalar::IntervalYearMonth(12),
+    "INTERVAL '1-0' YEAR TO MONTH",
+    "INTERVAL '2-0' YEAR TO MONTH"
+)]
+#[case::day_time(
+    DataType::INTERVAL_DAY_TIME,
+    Scalar::IntervalDayTime(3_600_000_000),
+    "INTERVAL '0 01:00:00.000000' DAY TO SECOND",
+    "INTERVAL '0 02:00:00.000000' DAY TO SECOND"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interval_partition_values_do_not_prune_files(
+    #[case] interval: DataType,
+    #[case] predicate_value: Scalar,
+    #[case] first_value: &str,
+    #[case] second_value: &str,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("period", interval),
+        StructField::nullable("v", DataType::LONG),
+    ])?);
+    create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["period"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        commit_with_interval_partitioned_adds(
+            1,
+            &[
+                ("file_A.parquet", first_value),
+                ("file_B.parquet", second_value),
+            ],
+        ),
+    )
+    .await?;
+
+    let predicate = Arc::new(Pred::eq(
+        column_expr!("period"),
+        Expr::literal(predicate_value),
+    ));
+    assert_eq!(
+        surviving_files(&table_path, engine, predicate, use_parallel)?,
+        2
+    );
+    Ok(())
+}
+
 // === All-null file pruning across log-replay sources ===
 //
 // A file whose queried column is entirely NULL can never satisfy a null-intolerant comparison

@@ -2107,23 +2107,58 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
-fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
-    match s {
-        "interval year" | "interval month" | "interval year to month" => {
-            Some(PrimitiveType::IntervalYearMonth)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntervalField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntervalFieldRange {
+    pub(crate) start: IntervalField,
+    pub(crate) end: IntervalField,
+}
+
+impl IntervalFieldRange {
+    fn primitive_type(self) -> PrimitiveType {
+        match self.start {
+            IntervalField::Year | IntervalField::Month => PrimitiveType::IntervalYearMonth,
+            IntervalField::Day
+            | IntervalField::Hour
+            | IntervalField::Minute
+            | IntervalField::Second => PrimitiveType::IntervalDayTime,
         }
-        "interval day"
-        | "interval hour"
-        | "interval minute"
-        | "interval second"
-        | "interval day to hour"
-        | "interval day to minute"
-        | "interval day to second"
-        | "interval hour to minute"
-        | "interval hour to second"
-        | "interval minute to second" => Some(PrimitiveType::IntervalDayTime),
-        _ => None,
     }
+}
+
+pub(crate) fn parse_interval_type(s: &str) -> Option<IntervalFieldRange> {
+    use IntervalField::*;
+
+    let (start, end) = match s {
+        "interval year" => (Year, Year),
+        "interval month" => (Month, Month),
+        "interval year to month" => (Year, Month),
+        "interval day" => (Day, Day),
+        "interval hour" => (Hour, Hour),
+        "interval minute" => (Minute, Minute),
+        "interval second" => (Second, Second),
+        "interval day to hour" => (Day, Hour),
+        "interval day to minute" => (Day, Minute),
+        "interval day to second" => (Day, Second),
+        "interval hour to minute" => (Hour, Minute),
+        "interval hour to second" => (Hour, Second),
+        "interval minute to second" => (Minute, Second),
+        _ => return None,
+    };
+    Some(IntervalFieldRange { start, end })
+}
+
+fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
+    parse_interval_type(s).map(IntervalFieldRange::primitive_type)
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
