@@ -18,8 +18,18 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  detect_changes:
+    uses: ./.github/workflows/detect-changes.yml
+
+  # Single job, so a docs-only skip reports "skipped" and satisfies its own required check
+  # directly; no aggregator needed (unlike build.yml's matrix jobs). The guard is
+  # `docs_only != 'true'` under `always()`, not `== 'false'`, so a failed detect_changes
+  # (output empty, not 'true') runs the examples rather than silently skipping a required
+  # check. See .github/CLAUDE.md.
   run-examples:
     runs-on: ubuntu-latest
+    needs: detect_changes
+    if: always() && needs.detect_changes.outputs.docs_only != 'true'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install minimal stable
