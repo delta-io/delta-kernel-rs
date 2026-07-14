@@ -26,12 +26,10 @@
      `arrow-59`; transitive Arrow 59 changes may surface.
 5. Added delete functionality to StorageHandler ([#2823])
    - The `StorageHandler` trait gains a required `fn delete(&self, path: &Url) -> DeltaResult<()>`
-     (no default impl). Implement it on your handler; it must be idempotent (missing path returns
-     `Ok(())`).
+     (no default impl). Implement it on your storage handler.
 6. Make default engine read I/O concurrency configurable ([#2813])
    - `DefaultParquetHandler::with_readahead` is removed; `with_buffer_size` / `with_batch_size`
-     (both handlers) now take `NonZero<usize>`. Replace `with_readahead(n)` with
-     `with_buffer_size(NonZero::new(n).unwrap())` and wrap existing size args in `NonZero::new`.
+     (both handlers) now take `NonZero<usize>`. Wrap existing size args in json handler with `NonZero::new`.
 7. Improve the column_name! macro and friends ([#2891])
    - The internal re-exported proc macro `delta_kernel_derive::parse_column_name` is renamed to
      `column_name_segments`. The user-facing macros (`column_name!`, `col!`, ...) are unchanged;
