@@ -32,9 +32,9 @@
      (both handlers) now take `NonZero<usize>`. Wrap existing size args in json handler with `NonZero::new`.
 7. Improve the column_name! macro and friends ([#2891])
    - The internal re-exported proc macro `delta_kernel_derive::parse_column_name` is renamed to
-     `column_name_segments`. Additionally, column_name! now requires at least one argument and rejects empty path segments. 
-     Previously accepted empty/zero-segment invocations now fail to compile. 
-     column_name! also gains multi-argument / string-constant support.
+     `column_name_segments`. Additionally, `column_name!` now requires at least one argument 
+     and rejects empty path segments. Previously accepted empty/zero-segment invocations now 
+     fail to compile. `column_name!` also gains multi-argument / string-constant support.
 
 ### 🚀 Features / new APIs
 
