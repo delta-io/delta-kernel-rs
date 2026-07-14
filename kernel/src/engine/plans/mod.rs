@@ -28,8 +28,8 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// Storage, JSON file reads, and Parquet file reads are converted into
 /// [`Operation`](crate::plans::Operation)s and delegated to the plan executor.
 ///
-/// EvaluationHandler capabilities are not supported under plan execution, so the engine is always
-/// constructed with an [`EvaluationHandler`].
+/// Operations not yet implemented on the plan-execution path (e.g. `write_json_file`,
+/// `write_parquet_file`) and evaluation are delegated to the required `fallback` [`Engine`].
 pub struct PlanBasedEngine {
     executor: Arc<dyn PlanExecutor>,
     evaluation: Arc<dyn EvaluationHandler>,
@@ -39,37 +39,21 @@ pub struct PlanBasedEngine {
 }
 
 impl PlanBasedEngine {
-    /// Construct a `PlanBasedEngine` with no fallback engine.
-    ///
-    /// Not-yet-implemented operations return an unsupported error.
-    /// Use [`PlanBasedEngine::with_fallback`] to delegate them to another engine instead.
-    pub fn new(
-        evaluation_handler: Arc<dyn EvaluationHandler>,
-        plan_executor: Arc<dyn PlanExecutor>,
-    ) -> Self {
-        Self {
-            evaluation: evaluation_handler,
-            storage: Arc::new(PlanBasedStorageHandler::new(plan_executor.clone())),
-            json: Arc::new(PlanBasedJsonHandler::new(plan_executor.clone())),
-            parquet: Arc::new(PlanBasedParquetHandler::new(plan_executor.clone())),
-            executor: plan_executor,
-        }
-    }
-
-    /// Construct a `PlanBasedEngine` that delegates not-yet-implemented operations to `fallback`.
+    /// Construct a `PlanBasedEngine` backed by `plan_executor`, delegating operations not yet
+    /// implemented on the plan-execution path to `fallback`.
     ///
     /// The fallback's [`EvaluationHandler`] is used for evaluation, and each plan-based handler
     /// falls back to the fallback's corresponding handler for operations the plan-execution path
     /// does not yet implement.
-    pub fn with_fallback(fallback: Arc<dyn Engine>, plan_executor: Arc<dyn PlanExecutor>) -> Self {
+    pub fn new(fallback: Arc<dyn Engine>, plan_executor: Arc<dyn PlanExecutor>) -> Self {
         Self {
             evaluation: fallback.evaluation_handler(),
             storage: Arc::new(PlanBasedStorageHandler::new(plan_executor.clone())),
-            json: Arc::new(PlanBasedJsonHandler::with_fallback(
+            json: Arc::new(PlanBasedJsonHandler::new(
                 plan_executor.clone(),
                 fallback.json_handler(),
             )),
-            parquet: Arc::new(PlanBasedParquetHandler::with_fallback(
+            parquet: Arc::new(PlanBasedParquetHandler::new(
                 plan_executor.clone(),
                 fallback.parquet_handler(),
             )),

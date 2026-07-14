@@ -2,42 +2,32 @@
 
 use std::sync::Arc;
 
+use tracing::debug;
 use url::Url;
 
 use crate::engine::arrow_utils;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta,
     FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
 ///
-/// Operations not yet implemented on the plan-execution path delegate to `fallback` when present,
-/// and otherwise return an unsupported error.
+/// Operations not yet implemented on the plan-execution path delegate to the required `fallback`
+/// handler.
 pub struct PlanBasedJsonHandler {
     executor: Arc<dyn PlanExecutor>,
-    fallback: Option<Arc<dyn JsonHandler>>,
+    fallback: Arc<dyn JsonHandler>,
 }
 
 impl PlanBasedJsonHandler {
-    /// Construct a handler with no fallback.
-    pub fn new(plan_executor: Arc<dyn PlanExecutor>) -> Self {
-        Self {
-            executor: plan_executor,
-            fallback: None,
-        }
-    }
-
     /// Construct a handler that delegates not-yet-implemented operations to `fallback`.
-    pub fn with_fallback(
-        plan_executor: Arc<dyn PlanExecutor>,
-        fallback: Arc<dyn JsonHandler>,
-    ) -> Self {
+    pub fn new(plan_executor: Arc<dyn PlanExecutor>, fallback: Arc<dyn JsonHandler>) -> Self {
         Self {
             executor: plan_executor,
-            fallback: Some(fallback),
+            fallback,
         }
     }
 }
@@ -71,12 +61,8 @@ impl JsonHandler for PlanBasedJsonHandler {
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()> {
-        match &self.fallback {
-            Some(fallback) => fallback.write_json_file(path, data, overwrite),
-            None => Err(Error::unsupported(
-                "PlanBasedJsonHandler does not support write_json_file yet",
-            )),
-        }
+        debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
+        self.fallback.write_json_file(path, data, overwrite)
     }
 }
 
@@ -100,16 +86,12 @@ mod tests {
     use crate::engine_data::FilteredEngineData;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::{
-        DeltaResult, Engine as _, EngineData, Error, FileDataReadResultIterator, FileMeta,
+        DeltaResult, Engine as _, EngineData, FileDataReadResultIterator, FileMeta,
         JsonHandler as _, ParquetHandler as _,
     };
 
     fn make_handler() -> PlanBasedJsonHandler {
-        PlanBasedJsonHandler::new(Arc::new(SyncPlanExecutor::new()))
-    }
-
-    fn make_handler_with_fallback() -> PlanBasedJsonHandler {
-        PlanBasedJsonHandler::with_fallback(
+        PlanBasedJsonHandler::new(
             Arc::new(SyncPlanExecutor::new()),
             SyncEngine::new().json_handler(),
         )
@@ -125,19 +107,6 @@ mod tests {
     }
 
     #[test]
-    fn test_write_json_file_without_fallback_is_unsupported() {
-        let dir = tempdir().unwrap();
-        let url = Url::from_file_path(dir.path().join("out.json")).unwrap();
-        let filtered = Ok(FilteredEngineData::with_all_rows_selected(
-            single_column_data(vec!["a"]),
-        ));
-        let err = make_handler()
-            .write_json_file(&url, Box::new(std::iter::once(filtered)), false)
-            .unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
-    }
-
-    #[test]
     fn test_write_json_file_delegates_to_fallback() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("out.json");
@@ -145,7 +114,7 @@ mod tests {
         let filtered = Ok(FilteredEngineData::with_all_rows_selected(
             single_column_data(vec!["a", "b"]),
         ));
-        make_handler_with_fallback()
+        make_handler()
             .write_json_file(&url, Box::new(std::iter::once(filtered)), false)
             .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -153,7 +122,10 @@ mod tests {
     }
 
     fn make_parquet_handler() -> PlanBasedParquetHandler {
-        PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedParquetHandler::new(
+            Arc::new(SyncPlanExecutor::new()),
+            SyncEngine::new().parquet_handler(),
+        )
     }
 
     fn temp_json_file(lines: &[&str]) -> (NamedTempFile, FileMeta) {
