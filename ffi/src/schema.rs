@@ -380,6 +380,7 @@ mod tests {
     use delta_kernel::schema::{ArrayType, StructField};
 
     use super::*;
+    use crate::TryFromStringSlice;
 
     #[derive(Debug, PartialEq, Eq)]
     struct VisitedField {
@@ -401,16 +402,6 @@ mod tests {
         list_id
     }
 
-    fn field_name(name: KernelStringSlice) -> String {
-        unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                name.ptr as *const u8,
-                name.len,
-            ))
-            .to_string()
-        }
-    }
-
     fn add_field(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -421,66 +412,38 @@ mod tests {
     ) {
         let builder = unsafe { &mut *(data as *mut TestSchemaBuilder) };
         builder.lists[sibling_list_id].push(VisitedField {
-            name: field_name(name),
+            name: unsafe { String::try_from_slice(&name) }.unwrap(),
             data_type,
             is_nullable,
             children,
         });
     }
 
-    extern "C" fn visit_struct(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        name: KernelStringSlice,
-        is_nullable: bool,
-        _metadata: &CStringMap,
-        child_list_id: usize,
-    ) {
-        add_field(
-            data,
-            sibling_list_id,
-            name,
-            is_nullable,
-            "struct",
-            Some(child_list_id),
-        );
+    macro_rules! visit_nested_type {
+        ($fn_name:ident, $type_name:expr) => {
+            extern "C" fn $fn_name(
+                data: *mut c_void,
+                sibling_list_id: usize,
+                name: KernelStringSlice,
+                is_nullable: bool,
+                _metadata: &CStringMap,
+                child_list_id: usize,
+            ) {
+                add_field(
+                    data,
+                    sibling_list_id,
+                    name,
+                    is_nullable,
+                    $type_name,
+                    Some(child_list_id),
+                );
+            }
+        };
     }
 
-    extern "C" fn visit_array(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        name: KernelStringSlice,
-        is_nullable: bool,
-        _metadata: &CStringMap,
-        child_list_id: usize,
-    ) {
-        add_field(
-            data,
-            sibling_list_id,
-            name,
-            is_nullable,
-            "array",
-            Some(child_list_id),
-        );
-    }
-
-    extern "C" fn visit_map(
-        data: *mut c_void,
-        sibling_list_id: usize,
-        name: KernelStringSlice,
-        is_nullable: bool,
-        _metadata: &CStringMap,
-        child_list_id: usize,
-    ) {
-        add_field(
-            data,
-            sibling_list_id,
-            name,
-            is_nullable,
-            "map",
-            Some(child_list_id),
-        );
-    }
+    visit_nested_type!(visit_struct, "struct");
+    visit_nested_type!(visit_array, "array");
+    visit_nested_type!(visit_map, "map");
 
     extern "C" fn visit_decimal(
         data: *mut c_void,
