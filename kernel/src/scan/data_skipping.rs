@@ -504,7 +504,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             None
         } else {
             Some(Expr::from(
-                ColumnName::new(["stats_parsed", MIN_VALUES]).join(col),
+                column_name!("stats_parsed", MIN_VALUES).join(col),
             ))
         }
     }
@@ -519,7 +519,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             None
         } else {
             Some(Expr::from(
-                ColumnName::new(["stats_parsed", MAX_VALUES]).join(col),
+                column_name!("stats_parsed", MAX_VALUES).join(col),
             ))
         }
     }
@@ -557,7 +557,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 
     /// Retrieves the row count statistic.
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(Expr::from(ColumnName::new(["stats_parsed", NUM_RECORDS])))
+        Some(column_expr!("stats_parsed", NUM_RECORDS))
     }
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
@@ -684,7 +684,7 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         {
             return None;
         }
-        Some(Expr::from(ColumnName::new([MIN_VALUES]).join(col)))
+        Some(Expr::from(column_name!(MIN_VALUES).join(col)))
     }
 
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
@@ -705,7 +705,7 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     }
 
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(Expr::from(ColumnName::new([NUM_RECORDS])))
+        Some(column_expr!(NUM_RECORDS))
     }
 
     /// Compares a column's max stat against a literal value, adjusting for timestamp

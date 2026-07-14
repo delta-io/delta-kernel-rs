@@ -884,9 +884,9 @@ mod test {
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
-        TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-        ROW_TRACKING_SUSPENDED,
+        TableProperties, COLUMN_MAPPING_MODE, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
+        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+        ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -2540,6 +2540,121 @@ mod test {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
         }
+    }
+
+    // `validate_feature_requirements` reads only `feature_requirements`, which is compiled
+    // regardless of the `adaptive-metadata-in-dev` gate, so these cases run in the default build.
+    // See the adaptiveMetadata RFC (delta-io/delta#6978) for the enablement rules being checked.
+    #[rstest]
+    #[case::all_satisfied(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        None
+    )]
+    // Column mapping enabled but in `name` mode -> the `id`-mode Custom check fires.
+    #[case::cm_name_mode_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Name),
+        all_adaptive_metadata_deps(),
+        Some("column mapping in 'id' mode")
+    )]
+    // Column mapping feature absent entirely -> the `Enabled(ColumnMapping)` arm fires first.
+    #[case::column_mapping_not_supported(
+        all_adaptive_metadata_props(),
+        None,
+        adaptive_metadata_deps_without(TableFeature::ColumnMapping),
+        Some("requires 'columnMapping' to be enabled")
+    )]
+    #[case::row_tracking_not_enabled(
+        adaptive_metadata_props_without(ENABLE_ROW_TRACKING),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'rowTracking' to be enabled")
+    )]
+    #[case::domain_metadata_not_supported(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        adaptive_metadata_deps_without(TableFeature::DomainMetadata),
+        Some("requires 'domainMetadata' to be enabled")
+    )]
+    #[case::deletion_vectors_not_enabled(
+        adaptive_metadata_props_without(ENABLE_DELETION_VECTORS),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'deletionVectors' to be enabled")
+    )]
+    #[case::in_commit_timestamp_not_enabled(
+        adaptive_metadata_props_without(ENABLE_IN_COMMIT_TIMESTAMPS),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'inCommitTimestamp' to be enabled")
+    )]
+    fn test_adaptive_metadata_feature_requirements(
+        #[case] props: Vec<(&str, &str)>,
+        #[case] cm_mode: Option<ColumnMappingMode>,
+        #[case] deps: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        // Reader+writer features (adaptiveMetadata-preview itself, columnMapping, deletionVectors)
+        // must appear in both protocol lists to count as supported.
+        let reader_features: Vec<TableFeature> =
+            std::iter::once(TableFeature::AdaptiveMetadataPreview)
+                .chain(
+                    deps.iter()
+                        .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+                        .cloned(),
+                )
+                .collect();
+        let writer_features: Vec<TableFeature> =
+            std::iter::once(TableFeature::AdaptiveMetadataPreview)
+                .chain(deps.iter().cloned())
+                .collect();
+        let config =
+            create_mock_table_config_with_cm(&props, cm_mode, &reader_features, &writer_features);
+        let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
+    /// The table properties that enable adaptiveMetadata-preview's property-gated dependencies.
+    fn all_adaptive_metadata_props() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (ENABLE_ROW_TRACKING, "true"),
+            (ENABLE_DELETION_VECTORS, "true"),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+        ]
+    }
+
+    /// The adaptiveMetadata-preview enabling properties with `excluded` removed, to drive the
+    /// "dependency not enabled" requirement checks.
+    fn adaptive_metadata_props_without(excluded: &str) -> Vec<(&'static str, &'static str)> {
+        all_adaptive_metadata_props()
+            .into_iter()
+            .filter(|(k, _)| *k != excluded)
+            .collect()
+    }
+
+    /// The full set of adaptiveMetadata-preview dependency features.
+    fn all_adaptive_metadata_deps() -> Vec<TableFeature> {
+        vec![
+            TableFeature::ColumnMapping,
+            TableFeature::DeletionVectors,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+            TableFeature::InCommitTimestamp,
+        ]
+    }
+
+    /// The adaptiveMetadata-preview dependencies with `excluded` removed, to drive the
+    /// "dependency not supported" requirement checks.
+    fn adaptive_metadata_deps_without(excluded: TableFeature) -> Vec<TableFeature> {
+        all_adaptive_metadata_deps()
+            .into_iter()
+            .filter(|f| *f != excluded)
+            .collect()
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.

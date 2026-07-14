@@ -254,7 +254,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
 
     fn size_batch(sizes: Vec<i64>) -> Box<dyn EngineData> {
-        let batch = generate_batch(vec![("size", sizes.into_array())]).unwrap();
+        let batch = generate_batch(vec![("size", sizes.into_arrow_array())]).unwrap();
         Box::new(ArrowEngineData::new(batch))
     }
 

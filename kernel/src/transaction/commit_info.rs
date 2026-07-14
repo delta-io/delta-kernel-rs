@@ -138,6 +138,7 @@ mod tests {
     use crate::schema::{Schema, SchemaRef, StructField, StructType, ToSchema};
     use crate::transaction::Transaction;
     use crate::utils::test_utils::load_test_table;
+    use crate::utils::FoldWithOption as _;
     use crate::{DeltaResult, Engine, EngineData};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
@@ -231,12 +232,12 @@ mod tests {
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut txn = snapshot
+        let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string());
-        if let Some((engine_commit_info_data, engine_commit_info_schema)) = engine_commit_info {
-            txn = txn.with_commit_info(engine_commit_info_data, engine_commit_info_schema);
-        }
+            .with_operation("WRITE".to_string())
+            .fold_with(engine_commit_info, |txn, (data, schema)| {
+                txn.with_commit_info(data, schema)
+            });
         Ok((engine, txn))
     }
 

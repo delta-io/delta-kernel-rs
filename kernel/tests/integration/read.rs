@@ -241,8 +241,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
     let batch1 = make_top_level_fields_nullable(&generate_simple_batch()?);
     let batch2 = make_top_level_fields_nullable(&generate_batch(vec![
-        ("id", vec![5, 7].into_array()),
-        ("val", vec!["e", "g"].into_array()),
+        ("id", vec![5, 7].into_arrow_array()),
+        ("val", vec!["e", "g"].into_arrow_array()),
     ])?);
     let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
     let file_size2 = record_batch_to_bytes(&batch2).len() as u64;
@@ -1053,7 +1053,7 @@ async fn test_partition_pruning_with_column_mapping(
     #[case] select_cols: Option<Vec<&'static str>>,
     #[case] expected_files: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_array())])?;
+    let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
     let table_root = "memory:///";
@@ -1434,7 +1434,7 @@ fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std::error::Error>> {
     // Test for https://github.com/delta-io/delta-kernel-rs/issues/698
-    let batch = generate_batch(vec![("val", vec!["a", "b", "c"].into_array())])?;
+    let batch = generate_batch(vec![("val", vec!["a", "b", "c"].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
     let table_root = "memory:///";
@@ -1485,8 +1485,8 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
 #[tokio::test]
 async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn std::error::Error>>
 {
-    let batch_1 = generate_batch(vec![("val", vec!["a", "b", "c"].into_array())])?;
-    let batch_2 = generate_batch(vec![("val", vec!["d", "e", "f"].into_array())])?;
+    let batch_1 = generate_batch(vec![("val", vec!["a", "b", "c"].into_arrow_array())])?;
+    let batch_2 = generate_batch(vec![("val", vec!["d", "e", "f"].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
     let table_root = "memory:///";
@@ -1755,16 +1755,16 @@ fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Error>> {
     // Setup up an in-memory table with different numbers of rows in each file
     let batch1 = generate_batch(vec![
-        ("id", vec![1i32, 2, 3, 4, 5].into_array()),
-        ("value", vec!["a", "b", "c", "d", "e"].into_array()),
+        ("id", vec![1i32, 2, 3, 4, 5].into_arrow_array()),
+        ("value", vec!["a", "b", "c", "d", "e"].into_arrow_array()),
     ])?;
     let batch2 = generate_batch(vec![
-        ("id", vec![10i32, 20, 30].into_array()),
-        ("value", vec!["x", "y", "z"].into_array()),
+        ("id", vec![10i32, 20, 30].into_arrow_array()),
+        ("value", vec!["x", "y", "z"].into_arrow_array()),
     ])?;
     let batch3 = generate_batch(vec![
-        ("id", vec![100i32, 200, 300, 400].into_array()),
-        ("value", vec!["p", "q", "r", "s"].into_array()),
+        ("id", vec![100i32, 200, 300, 400].into_arrow_array()),
+        ("value", vec!["p", "q", "r", "s"].into_arrow_array()),
     ])?;
 
     let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
@@ -1858,12 +1858,12 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
 
     // Set up an in-memory table with multiple data files
     let batch1 = generate_batch(vec![
-        ("id", vec![1i32, 2, 3].into_array()),
-        ("value", vec!["a", "b", "c"].into_array()),
+        ("id", vec![1i32, 2, 3].into_arrow_array()),
+        ("value", vec!["a", "b", "c"].into_arrow_array()),
     ])?;
     let batch2 = generate_batch(vec![
-        ("id", vec![10i32, 20].into_array()),
-        ("value", vec!["x", "y"].into_array()),
+        ("id", vec![10i32, 20].into_arrow_array()),
+        ("value", vec!["x", "y"].into_arrow_array()),
     ])?;
 
     let file_size1 = record_batch_to_bytes(&batch1).len() as u64;
@@ -2494,7 +2494,7 @@ async fn timestamp_max_stat_truncation_does_not_over_prune(
 #[tokio::test]
 async fn read_table_with_void_column() -> Result<(), Box<dyn std::error::Error>> {
     // Parquet batch has only the non-void column (parquet cannot represent void)
-    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
     let actions = [
@@ -2580,7 +2580,7 @@ fn timestamp_truncation_real_table_gt() -> Result<(), Box<dyn std::error::Error>
 #[tokio::test]
 async fn explicit_projection_with_void_column_returns_nulls(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
     let actions = [
@@ -2842,7 +2842,7 @@ async fn scan_with_void_schema(
 ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![(
         "id",
-        (1..=num_rows).collect::<Vec<_>>().into_array(),
+        (1..=num_rows).collect::<Vec<_>>().into_arrow_array(),
     )])?;
 
     let storage = Arc::new(InMemory::new());
@@ -3012,7 +3012,7 @@ async fn read_all_void_table() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn read_table_with_void_partition_column() -> Result<(), Box<dyn std::error::Error>> {
     // Parquet file has only the non-partition, non-void column
-    let batch = generate_batch(vec![("id", vec![1, 2].into_array())])?;
+    let batch = generate_batch(vec![("id", vec![1, 2].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
     let actions = [
@@ -3057,7 +3057,7 @@ async fn read_table_with_void_partition_column() -> Result<(), Box<dyn std::erro
 // A predicate like `void_col IS NULL` is always true for void columns, so no rows are skipped.
 #[tokio::test]
 async fn read_with_predicate_on_void_column() -> Result<(), Box<dyn std::error::Error>> {
-    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_array())])?;
+    let batch = generate_batch(vec![("id", vec![1, 2, 3].into_arrow_array())])?;
 
     let storage = Arc::new(InMemory::new());
     let actions = [

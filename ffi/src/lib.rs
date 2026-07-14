@@ -18,6 +18,8 @@ use delta_kernel::history_manager::{
     get_earliest_commit as kernel_get_earliest_commit,
     latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
 };
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
@@ -51,6 +53,8 @@ pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
+#[cfg(feature = "default-engine-base")]
+pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
@@ -163,7 +167,7 @@ impl KernelStringSlice {
     }
 }
 
-/// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.
+/// A non-owned slice of raw bytes, intended for arg-passing between kernel and engine.
 ///
 /// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
 /// must not be retained beyond the foreign function call it was passed into.
@@ -311,6 +315,33 @@ fn allocate_kernel_string_impl(
 ) -> DeltaResult<Handle<ExclusiveRustString>> {
     let s = unsafe { String::try_from_slice(&kernel_str) }?;
     Ok(Box::new(s).into())
+}
+
+/// A kernel-allocated type representing an owned byte buffer. This can be obtained by
+/// calling [`allocate_kernel_bytes`] with a [`KernelBytesSlice`]. Kernel takes ownership of the
+/// handle when it consumes the bytes and the engine must not use the handle afterwards.
+#[cfg(feature = "declarative-plans")]
+#[handle_descriptor(target=Vec<u8>, mutable=true, sized=true)]
+pub struct ExclusiveRustBytes;
+
+/// Allow engines to create an opaque pointer to [`ExclusiveRustBytes`] by copying the provided
+/// `bytes` into kernel-owned memory.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid [`KernelBytesSlice`] whose pointer references at least
+/// `len` readable bytes. The slice only needs to remain valid until after this call returns.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn allocate_kernel_bytes(
+    bytes: KernelBytesSlice,
+) -> Handle<ExclusiveRustBytes> {
+    let copied = if bytes.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec()
+    };
+    Box::new(copied).into()
 }
 
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
@@ -542,12 +573,29 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
     delta_kernel::try_parse_uri(path)
 }
 
-/// A builder that allows setting options on the `Engine` before actually building it
+/// How [`EngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
+/// build time.
+#[cfg(feature = "default-engine-base")]
+#[derive(Default)]
+pub(crate) enum ObjectStoreBackend {
+    /// `url` and [`set_builder_option`] keys are passed to [`store_from_url_opts`].
+    #[default]
+    UrlScheme,
+    /// REST file API; configured via [`set_builder_rest_object_store`].
+    Rest(Box<rest_engine::RestBuilderState>),
+}
+
+/// A builder that allows setting options on the `Engine` before actually building it.
+///
+/// For a normal object store backend, `url` is the table storage location (`s3://…`, `file://…`).
+/// For REST, call [`set_builder_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
+/// and set `url` to the REST service base URL; see [`rest_engine`] for TLS and auth options.
 #[cfg(feature = "default-engine-base")]
 pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
+    object_store_backend: ObjectStoreBackend,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
@@ -557,8 +605,8 @@ pub struct EngineBuilder {
 }
 
 #[cfg(feature = "default-engine-base")]
-#[derive(Default)]
-struct IoConcurrencyConfig {
+#[derive(Default, Clone)]
+pub(crate) struct IoConcurrencyConfig {
     /// Maximum number of files read concurrently (file-level readahead depth). `None` uses the
     /// engine default.
     buffer_size: Option<NonZero<usize>>,
@@ -567,7 +615,8 @@ struct IoConcurrencyConfig {
 }
 
 #[cfg(feature = "default-engine-base")]
-struct MultithreadedExecutorConfig {
+#[derive(Clone)]
+pub(crate) struct MultithreadedExecutorConfig {
     /// Number of worker threads for the tokio runtime. `None` uses Tokio's default.
     worker_threads: Option<usize>,
     /// Maximum number of threads for blocking operations. `None` uses Tokio's default.
@@ -606,6 +655,7 @@ fn get_engine_builder_impl(
         url: url?,
         allocate_fn,
         options: HashMap::default(),
+        object_store_backend: ObjectStoreBackend::default(),
         multithreaded_executor_config: None,
         io_config: IoConcurrencyConfig::default(),
     });
@@ -695,6 +745,45 @@ pub unsafe extern "C" fn set_builder_with_io_concurrency(
     };
 }
 
+/// Select a REST-backed object store. See [`rest_engine`] for setup, option keys, and callbacks.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and a non-null `endpoint_config`. When `callback` is
+/// non-null, `context` must remain valid for the engine lifetime and the callback must be safe to
+/// invoke from any thread concurrently (see [`rest_engine::CAuthHeaderCallback`]).
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_rest_object_store(
+    builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
+    callback: Option<rest_engine::CAuthHeaderCallback>,
+    context: NullableCvoid,
+) -> ExternResult<bool> {
+    set_builder_rest_object_store_impl(builder, endpoint_config, callback, context)
+        .into_extern_result(&builder.allocate_fn)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn set_builder_rest_object_store_impl(
+    builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
+    callback: Option<rest_engine::CAuthHeaderCallback>,
+    context: NullableCvoid,
+) -> DeltaResult<bool> {
+    // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
+    let endpoint_config = unsafe { endpoint_config.as_ref() }
+        .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
+    builder.object_store_backend =
+        ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
+            endpoint_config,
+            callback,
+            context,
+            builder.allocate_fn,
+        )?));
+    Ok(true)
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -712,6 +801,7 @@ pub unsafe extern "C" fn builder_build(
     get_default_engine_impl(
         builder_box.url,
         builder_box.options,
+        builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
         builder_box.allocate_fn,
@@ -741,6 +831,7 @@ fn get_default_default_engine_impl(
     get_default_engine_impl(
         url?,
         Default::default(),
+        ObjectStoreBackend::default(),
         None,
         IoConcurrencyConfig::default(),
         allocate_error,
@@ -770,14 +861,32 @@ fn engine_to_handle(
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
+    object_store_backend: ObjectStoreBackend,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
-    use delta_kernel_default_engine::DefaultEngineBuilder;
 
-    let store = store_from_url_opts(&url, options)?;
+    let store = match object_store_backend {
+        ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
+        ObjectStoreBackend::Rest(rest) => {
+            rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
+        }
+    };
+    build_engine_from_store(store, executor_config, io_config, allocate_error)
+}
+
+/// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
+/// tuning. Shared by the URL-scheme and REST engine builder paths.
+#[cfg(feature = "default-engine-base")]
+pub(crate) fn build_engine_from_store(
+    store: Arc<dyn ObjectStore>,
+    executor_config: Option<MultithreadedExecutorConfig>,
+    io_config: IoConcurrencyConfig,
+    allocate_error: AllocateErrorFn,
+) -> DeltaResult<Handle<SharedExternEngine>> {
+    use delta_kernel_default_engine::DefaultEngineBuilder;
 
     // The builder is generic over the executor type, so apply the shared I/O config via a generic
     // helper to both branches without naming the concrete builder type.

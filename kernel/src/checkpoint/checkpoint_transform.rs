@@ -20,6 +20,7 @@ use crate::expressions::{col, Expression, ExpressionRef, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Error};
 
 pub(crate) const STATS_FIELD: &str = "stats";
@@ -159,17 +160,18 @@ pub(crate) fn build_checkpoint_read_schema(
                 "partitionValues_parsed field already exists in Add schema",
             ));
         }
-        let mut patch = SchemaStructPatchBuilder::new().insert_after(
-            STATS_FIELD,
-            StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
-        );
-        if let Some(pv_schema) = partition_schema {
-            patch = patch.insert_after(
-                PARTITION_VALUES_FIELD,
-                StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
-            );
-        }
-        patch.build(add_struct)
+        SchemaStructPatchBuilder::new()
+            .insert_after(
+                STATS_FIELD,
+                StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
+            )
+            .fold_with(partition_schema, |patch, pv_schema| {
+                patch.insert_after(
+                    PARTITION_VALUES_FIELD,
+                    StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
+                )
+            })
+            .build(add_struct)
     })
 }
 
