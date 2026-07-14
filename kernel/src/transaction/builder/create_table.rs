@@ -246,8 +246,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values must be
-///    representable as directory-path strings)
+/// 4. Of a primitive type which is not Geospatial type. (Struct, Array, Map are rejected because
+///    partition values must be representable as directory-path strings)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -284,12 +284,14 @@ fn validate_partition_columns(
             Error::generic(format!("Partition column '{col}' not found in schema"))
         })?;
 
-        if !matches!(field.data_type(), DataType::Primitive(_)) {
-            return Err(Error::generic(format!(
-                "Partition column '{col}' has non-primitive type '{}'. \
-                 Partition columns must have primitive types.",
-                field.data_type()
-            )));
+        match field.data_type() {
+            DataType::Primitive(p) if p.is_partition_col() => {}
+            data_type => {
+                return Err(Error::generic(format!(
+                    "Partition column '{col}' has unsupported type '{data_type}'. \
+                     Partition column must be a primitive, non-geospatial type.",
+                )));
+            }
         }
     }
     Ok(())
@@ -979,7 +981,8 @@ mod tests {
     use crate::expressions::ColumnName;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     use crate::schema::{
-        schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema_ref, ColumnMetadataKey, DataType, EdgeInterpolationAlgorithm, GeographyType,
+        GeometryType, MetadataValue, PrimitiveType, StructField, StructType,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
@@ -1646,23 +1649,41 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("non-primitive type"));
+            .contains("has unsupported type"));
     }
 
     #[rstest::rstest]
-    #[case::integer(DataType::INTEGER)]
-    #[case::string(DataType::STRING)]
-    #[case::date(DataType::DATE)]
-    #[case::timestamp(DataType::TIMESTAMP)]
-    #[case::boolean(DataType::BOOLEAN)]
-    #[case::long(DataType::LONG)]
-    fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
+    #[case::integer(DataType::INTEGER, true)]
+    #[case::string(DataType::STRING, true)]
+    #[case::date(DataType::DATE, true)]
+    #[case::timestamp(DataType::TIMESTAMP, true)]
+    #[case::boolean(DataType::BOOLEAN, true)]
+    #[case::long(DataType::LONG, true)]
+    #[case::geometry(
+        DataType::Primitive(PrimitiveType::Geometry(Box::new(GeometryType::try_new(
+            "OGC:CRS84"
+        ).unwrap()))),
+        false
+    )]
+    #[case::geography(
+        DataType::Primitive(PrimitiveType::Geography(Box::new(GeographyType::try_new(
+            "OGC:CRS84", EdgeInterpolationAlgorithm::Thomas
+        ).unwrap()))),
+        false
+    )]
+    fn test_validate_partition_columns_primitive_types(
+        #[case] data_type: DataType,
+        #[case] expected_value: bool,
+    ) {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("col", data_type, false),
         ]);
         let columns = vec![ColumnName::new(["col"])];
-        assert!(validate_partition_columns(&schema, &columns).is_ok());
+        assert_eq!(
+            validate_partition_columns(&schema, &columns).is_ok(),
+            expected_value
+        );
     }
 
     #[test]

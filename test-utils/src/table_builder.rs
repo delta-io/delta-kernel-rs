@@ -1838,6 +1838,9 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
             PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
                 panic!("interval types are not supported as partition values")
             }
+            PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                panic!("Geometry/Geography are not valid partition column types")
+            }
         },
         other => panic!("partition columns must be primitive types, got: {other:?}"),
     }

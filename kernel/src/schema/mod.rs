@@ -1780,6 +1780,130 @@ fn default_true() -> bool {
     true
 }
 
+/// Validates that a CRS is in AUTHORITY:CODE form: contains a colon, has non-empty text
+/// before and after it, and has no leading or trailing whitespace. Validating the value
+/// against the full set of recognized CRSes is future work.
+fn validate_crs(crs: &str) -> DeltaResult<()> {
+    require!(
+        crs == crs.trim(),
+        Error::invalid_geo_params(format!(
+            "CRS '{crs}' must not have leading or trailing whitespace"
+        ))
+    );
+    let (authority, code) = crs.split_once(':').ok_or_else(|| {
+        Error::invalid_geo_params(format!("CRS '{crs}' must be in 'AUTHORITY:CODE' format"))
+    })?;
+    require!(
+        !authority.is_empty(),
+        Error::invalid_geo_params(format!(
+            "CRS '{crs}' must have an authority before the colon"
+        ))
+    );
+    require!(
+        !code.is_empty(),
+        Error::invalid_geo_params(format!("CRS '{crs}' must have a code after the colon"))
+    );
+    Ok(())
+}
+
+/// Algorithm used to interpolate edges between two vertices of a geography path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeInterpolationAlgorithm {
+    Spherical,
+    Vincenty,
+    Thomas,
+    Andoyer,
+    Karney,
+}
+
+impl Display for EdgeInterpolationAlgorithm {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spherical => write!(f, "spherical"),
+            Self::Vincenty => write!(f, "vincenty"),
+            Self::Thomas => write!(f, "thomas"),
+            Self::Andoyer => write!(f, "andoyer"),
+            Self::Karney => write!(f, "karney"),
+        }
+    }
+}
+
+impl std::str::FromStr for EdgeInterpolationAlgorithm {
+    type Err = Error;
+    fn from_str(s: &str) -> DeltaResult<Self> {
+        match s.trim() {
+            "spherical" => Ok(Self::Spherical),
+            "vincenty" => Ok(Self::Vincenty),
+            "thomas" => Ok(Self::Thomas),
+            "andoyer" => Ok(Self::Andoyer),
+            "karney" => Ok(Self::Karney),
+            other => Err(Error::generic(format!(
+                "Unknown edge interpolation algorithm: '{other}'"
+            ))),
+        }
+    }
+}
+
+/// A geometry column type with an associated coordinate reference system (CRS)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeometryType {
+    crs: String,
+}
+
+impl GeometryType {
+    /// Constructs a GeometryType from the given CRS, or returns an error if the CRS is
+    /// not in AUTHORITY:CODE form.
+    pub fn try_new(crs: &str) -> DeltaResult<Self> {
+        validate_crs(crs)?;
+        Ok(Self {
+            crs: crs.to_string(),
+        })
+    }
+
+    pub fn crs(&self) -> &str {
+        &self.crs
+    }
+}
+
+impl Display for GeometryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geometry({})", self.crs)
+    }
+}
+
+/// Geography column type with an associated CRS and edge interpolation algorithm.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeographyType {
+    crs: String,
+    algorithm: EdgeInterpolationAlgorithm,
+}
+
+impl GeographyType {
+    /// Constructs a GeographyType from the given CRS and edge interpolation algorithm, or
+    /// returns an error if the CRS is not in AUTHORITY:CODE form.
+    pub fn try_new(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
+        validate_crs(crs)?;
+        Ok(Self {
+            crs: crs.to_string(),
+            algorithm,
+        })
+    }
+
+    pub fn crs(&self) -> &str {
+        &self.crs
+    }
+
+    pub fn algorithm(&self) -> &EdgeInterpolationAlgorithm {
+        &self.algorithm
+    }
+}
+
+impl Display for GeographyType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geography({}, {})", self.crs, self.algorithm)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DecimalType {
     precision: u8,
@@ -1852,6 +1976,19 @@ pub enum PrimitiveType {
     IntervalDayTime,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
+    /// Geometry column: WKB-encoded values carrying a coordinate reference system (CRS).
+    /// The serde form is the `schemaString` type name `geometry(<crs>)`, spelled with
+    /// parentheses unlike the single-word siblings, so the mapping is not self-evident.
+    /// Kernel represents the type in schemas but does not yet support engine operations on
+    /// it (arrow conversion, scalar parsing, stats).
+    #[serde(serialize_with = "serialize_geometry", untagged)]
+    Geometry(Box<GeometryType>),
+    /// Geography column: WKB-encoded values carrying a CRS and an edge interpolation
+    /// algorithm. As with [`PrimitiveType::Geometry`], the serde form is the multi-part
+    /// `schemaString` type name `geography(<crs>, <algorithm>)`, and engines do not yet
+    /// operate on the type.
+    #[serde(serialize_with = "serialize_geography", untagged)]
+    Geography(Box<GeographyType>),
 }
 
 impl PrimitiveType {
@@ -1917,6 +2054,11 @@ impl PrimitiveType {
     pub(crate) fn is_stats_type_compatible_with(&self, target: &Self) -> bool {
         self == target || self.can_widen_to(target) || self.is_checkpoint_cast_compatible(target)
     }
+
+    /// Returns `true` if this primitive type can be used as a partition column.
+    pub(crate) fn is_partition_col(&self) -> bool {
+        !matches!(self, Self::Geometry(_) | Self::Geography(_))
+    }
 }
 
 fn serialize_decimal<S: serde::Serializer>(
@@ -1924,6 +2066,20 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
+}
+
+fn serialize_geometry<S: serde::Serializer>(
+    gtype: &GeometryType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&gtype.to_string())
+}
+
+fn serialize_geography<S: serde::Serializer>(
+    gtype: &GeographyType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&gtype.to_string())
 }
 
 fn serialize_variant<S: serde::Serializer>(
@@ -2007,6 +2163,34 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .map(PrimitiveType::Decimal)
                     .map_err(serde::de::Error::custom)
             }
+            geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
+                let crs = &geo_str[9..geo_str.len() - 1];
+                GeometryType::try_new(crs.trim())
+                    .map(Box::new)
+                    .map(PrimitiveType::Geometry)
+                    .map_err(serde::de::Error::custom)
+            }
+            geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
+                let inner = &geo_str[10..geo_str.len() - 1];
+                // Kernel accepts only the canonical serialized form that every writer emits:
+                //   geography(<crs>, <algorithm>)
+                // TODO: reevaluate whether accepting padded input like
+                // geography(  EPSG:4326 ,  vincenty  ) is desired.
+                match inner.split_once(',') {
+                    Some((crs, algo_str)) => {
+                        let algorithm: EdgeInterpolationAlgorithm =
+                            algo_str.trim().parse().map_err(serde::de::Error::custom)?;
+                        GeographyType::try_new(crs.trim(), algorithm)
+                            .map(Box::new)
+                            .map(PrimitiveType::Geography)
+                            .map_err(serde::de::Error::custom)
+                    }
+                    None => Err(serde::de::Error::custom(format!(
+                        "Invalid geography type '{geo_str}': expected \
+                         'geography(<crs>, <algorithm>)'"
+                    ))),
+                }
+            }
             unsupported => Err(serde::de::Error::custom(format!(
                 "Unsupported Delta table type: '{unsupported}'"
             ))),
@@ -2035,6 +2219,8 @@ impl Display for PrimitiveType {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
             PrimitiveType::Void => write!(f, "void"),
+            PrimitiveType::Geometry(t) => write!(f, "{t}"),
+            PrimitiveType::Geography(t) => write!(f, "{t}"),
         }
     }
 }
@@ -2066,6 +2252,26 @@ impl From<DecimalType> for PrimitiveType {
 impl From<DecimalType> for DataType {
     fn from(dtype: DecimalType) -> Self {
         PrimitiveType::from(dtype).into()
+    }
+}
+impl From<GeometryType> for PrimitiveType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::Geometry(Box::new(gtype))
+    }
+}
+impl From<GeometryType> for DataType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::from(gtype).into()
+    }
+}
+impl From<GeographyType> for PrimitiveType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::Geography(Box::new(gtype))
+    }
+}
+impl From<GeographyType> for DataType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::from(gtype).into()
     }
 }
 impl From<PrimitiveType> for DataType {
@@ -2453,6 +2659,116 @@ mod tests {
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };
+
+    fn geography(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
+        PrimitiveType::Geography(Box::new(GeographyType::try_new(crs, algorithm).unwrap()))
+    }
+
+    fn geo_field_json(type_str: &str) -> String {
+        format!(r#"{{"name":"g","type":"{type_str}","nullable":true,"metadata":{{}}}}"#)
+    }
+
+    #[rstest]
+    #[case(
+        "geometry(EPSG:4326)",
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())),
+        "geometry(EPSG:4326)"
+    )]
+    #[case(
+        "geography(EPSG:4326, spherical)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        "geography(EPSG:4326, spherical)"
+    )]
+    #[case(
+        "geography(EPSG:4326, vincenty)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty),
+        "geography(EPSG:4326, vincenty)"
+    )]
+    #[case(
+        "geography(EPSG:4326, thomas)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Thomas),
+        "geography(EPSG:4326, thomas)"
+    )]
+    #[case(
+        "geography(EPSG:4326, andoyer)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Andoyer),
+        "geography(EPSG:4326, andoyer)"
+    )]
+    #[case(
+        "geography(EPSG:4326, karney)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
+        "geography(EPSG:4326, karney)"
+    )]
+    #[case(
+        "geography( EPSG:4326 , karney  )",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
+        "geography(EPSG:4326, karney)"
+    )]
+    fn test_geo_deserialize_succeed(
+        #[case] type_str: &str,
+        #[case] expected: PrimitiveType,
+        #[case] canonical: &str,
+    ) {
+        let field: StructField = serde_json::from_str(&geo_field_json(type_str)).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(expected.clone()));
+
+        assert_eq!(expected.to_string(), canonical);
+        let roundtrip: StructField = serde_json::from_str(&geo_field_json(canonical)).unwrap();
+        assert_eq!(roundtrip.data_type, DataType::Primitive(expected));
+    }
+
+    #[rstest]
+    #[case(
+        "geography(EPSG:4326, unknown_algo)",
+        "Unknown edge interpolation algorithm"
+    )]
+    #[case("geography(EPSG:4326,)", "Unknown edge interpolation algorithm")]
+    #[case("geometry(EPSG:4326", "Unsupported Delta table type")]
+    #[case("geographyz", "Unsupported Delta table type")]
+    #[case("geometry", "Unsupported Delta table type")]
+    #[case("geography", "Unsupported Delta table type")]
+    #[case("geometry()", "must be in 'AUTHORITY:CODE' format")]
+    #[case("geography(, vincenty)", "must be in 'AUTHORITY:CODE' format")]
+    #[case("geography(EPSG:4326)", "expected 'geography(<crs>, <algorithm>)'")]
+    #[case("geography(vincenty)", "expected 'geography(<crs>, <algorithm>)'")]
+    #[case(
+        "geography(EPSG:4326, vincenty, karney)",
+        "Unknown edge interpolation algorithm"
+    )]
+    fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
+        let result: Result<StructField, _> = serde_json::from_str(&geo_field_json(invalid_type));
+        let err = result.expect_err(&format!("expected '{invalid_type}' to be rejected"));
+        assert!(
+            err.to_string().contains(expected_error),
+            "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[rstest]
+    fn test_geo_try_new_rejects_invalid_crs(
+        #[values(
+            "foo",
+            "authority:",
+            ":",
+            "",
+            ":CRS84",
+            " EPSG:4326",
+            "EPSG:4326 ",
+            " EPSG:4326 "
+        )]
+        crs: &str,
+    ) {
+        let geometry_err =
+            GeometryType::try_new(crs).expect_err(&format!("expected '{crs}' to be rejected"));
+        let geography_err = GeographyType::try_new(crs, EdgeInterpolationAlgorithm::Spherical)
+            .expect_err(&format!("expected '{crs}' to be rejected"));
+        for err in [geometry_err, geography_err] {
+            assert!(
+                err.to_string().contains("CRS"),
+                "expected CRS error for '{crs}', got: {err}"
+            );
+        }
+    }
 
     fn example_schema_metadata() -> &'static str {
         r#"

@@ -379,6 +379,11 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 /// meaningful. When `nullCount` stats are present for a void column, `eval_pred_is_null` can
 /// use them for `IS NULL` / `IS NOT NULL` file skipping.
 ///
+/// Geometry and Geography are excluded here even though the Delta protocol lists them as
+/// skipping-eligible: kernel does not yet parse or compare geo min/max stats (`parse_scalar`
+/// errors on geo), so claiming eligibility would emit predicate refs to stats kernel can't
+/// evaluate. Add them back once geo stats parsing and comparison are implemented.
+///
 /// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
 pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
@@ -399,9 +404,20 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
-    use crate::schema::ArrayType;
+    use crate::schema::{ArrayType, EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::TableProperties;
+
+    #[rstest]
+    #[case(PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())))]
+    #[case(PrimitiveType::Geography(Box::new(
+        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap()
+    )))]
+    fn test_geo_types_are_not_skipping_eligible(#[case] ptype: PrimitiveType) {
+        assert!(!is_skipping_eligible_datatype(&ptype));
+    }
 
     fn stats_config_from_table_properties(properties: &TableProperties) -> StatsConfig<'_> {
         StatsConfig {

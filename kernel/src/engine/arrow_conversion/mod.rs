@@ -371,6 +371,13 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
                     PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
+                    // Geometry/Geography are not yet supported by the default engine. They are
+                    // representable in a kernel schema but no engine operation materializes them.
+                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                        Err(ArrowError::SchemaError(format!(
+                            "Geo types are not yet supported in the default engine: {p}"
+                        )))
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -659,7 +666,8 @@ mod tests {
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, EdgeInterpolationAlgorithm, GeographyType,
+        GeometryType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
     };
     use crate::transforms::{transform_output_type, SchemaTransform};
     use crate::utils::test_utils::{
@@ -667,6 +675,19 @@ mod tests {
         complex_nested_with_field_ids,
     };
     use crate::DeltaResult;
+
+    #[rstest]
+    #[case(DataType::Primitive(PrimitiveType::Geometry(Box::new(
+        GeometryType::try_new("EPSG:4326").unwrap()
+    ))))]
+    #[case(DataType::Primitive(PrimitiveType::Geography(Box::new(
+        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap()
+    ))))]
+    fn test_geo_type_arrow_conversion_unsupported(#[case] dt: DataType) {
+        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        let err = result.unwrap_err();
+        assert!(matches!(err, ArrowError::SchemaError(_)), "got: {err:?}");
+    }
 
     #[test]
     fn test_metadata_string_conversion() -> DeltaResult<()> {

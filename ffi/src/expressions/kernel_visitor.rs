@@ -516,6 +516,14 @@ impl NullTypeTag {
                 // case, so this arm is a defensive fallback rather than part of the normal
                 // void-column path.
                 PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
+                // Geometry/Geography carry a CRS string (and for Geography, an edge
+                // algorithm) that cannot fit in the (tag, u8, u8) payload. Like intervals
+                // above, they fall back to the sentinel so a reconstruction attempt errors
+                // rather than silently mistyping the null; the CRS is not recoverable from
+                // the tag. See #2914 for adding real geo FFI support.
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                    (Self::NonPrimitive, 0, 0)
+                }
             },
             _ => (Self::NonPrimitive, 0, 0),
         }

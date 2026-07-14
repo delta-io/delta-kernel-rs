@@ -191,6 +191,8 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
             format!("Interval types are not supported for stats validation: {dt}"),
         )),
         &DataType::VOID
+        | DataType::Primitive(PrimitiveType::Geometry(_))
+        | DataType::Primitive(PrimitiveType::Geography(_))
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -228,6 +230,8 @@ fn is_stat_present<'b>(
             format!("Interval types are not supported for stats presence check: {data_type}"),
         )),
         &DataType::VOID
+        | DataType::Primitive(PrimitiveType::Geometry(_))
+        | DataType::Primitive(PrimitiveType::Geography(_))
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -337,5 +341,24 @@ impl RowVisitor for NumRecordsValidator<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+
+    #[rstest]
+    #[case(DataType::Primitive(PrimitiveType::Geometry(Box::new(
+        GeometryType::try_new("EPSG:4326").unwrap()
+    ))))]
+    #[case(DataType::Primitive(PrimitiveType::Geography(Box::new(
+        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap()
+    ))))]
+    fn test_geo_types_unsupported_for_stats(#[case] dt: DataType) {
+        assert!(column_types_for(&dt).is_err());
     }
 }
