@@ -3,30 +3,35 @@
 //! This module contains the methods that perform a lightweight log replay to extract the latest
 //! Protocol and Metadata actions from a [`LogSegment`].
 
-use tracing::{info, instrument, warn};
+use std::sync::Arc;
+
+use tracing::{info, instrument};
 
 use super::LogSegment;
-use crate::actions::{get_commit_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::crc::{CrcLoadResult, LazyCrc};
+use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
+use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
-use crate::metrics::MetricId;
+use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
+use crate::metrics::SnapshotLoadMetricContext;
+use crate::schema::schema_ref;
 use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
     /// Returns an error if either is missing.
     ///
-    /// This is the checked variant of [`Self::read_protocol_metadata_unchecked`], used for
-    /// fresh snapshot creation where both Protocol and Metadata must exist.
-    // Span name must match `SEGMENT_READ_METADATA_SPAN` in `metrics::reporter`.
-    #[instrument(name = "segment.read_metadata", fields(report, operation_id = %operation_id), skip(engine))]
+    /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
+    /// snapshot creation where both Protocol and Metadata must exist.
+    ///
+    /// Reports metrics: `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure`.
+    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, crc))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
-        lazy_crc: &LazyCrc,
-        operation_id: MetricId,
+        crc: Option<&Arc<Crc>>,
+        metric_context: SnapshotLoadMetricContext,
     ) -> DeltaResult<(Metadata, Protocol)> {
-        match self.read_protocol_metadata_opt(engine, lazy_crc)? {
+        match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p)) => Ok((m, p)),
             (None, Some(_)) => Err(Error::MissingMetadata),
             (Some(_), None) => Err(Error::MissingProtocol),
@@ -37,30 +42,22 @@ impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
     /// Returns `None` for either if not found.
     ///
-    /// This is the unchecked variant of [`Self::read_protocol_metadata_checked`], used for
-    /// incremental snapshot updates where the caller can fall back to an existing snapshot's
-    /// Protocol and Metadata.
+    /// This is the unchecked variant of [`Self::read_protocol_metadata`], used for incremental
+    /// snapshot updates where the caller can fall back to an existing snapshot's Protocol and
+    /// Metadata.
     ///
-    /// The `lazy_crc` parameter allows the CRC to be loaded at most once and shared for
-    /// future use (domain metadata, in-commit timestamp, etc.).
+    /// The `crc` parameter is the CRC eagerly resolved by the caller; it is used to
+    /// short-circuit or seed the replay.
     #[instrument(name = "log_seg.load_p_m", skip_all, err)]
     pub(crate) fn read_protocol_metadata_opt(
         &self,
         engine: &dyn Engine,
-        lazy_crc: &LazyCrc,
+        crc: Option<&Arc<Crc>>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let crc_version = lazy_crc.crc_version();
-
         // Case 1: If CRC at target version, use it directly and exit early.
-        if crc_version == Some(self.end_version) {
-            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
-                info!("P&M from CRC at target version {}", self.end_version);
-                return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
-            }
-            warn!(
-                "CRC at target version {} failed to load, falling back to log replay",
-                self.end_version
-            );
+        if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
+            info!("P&M from CRC at target version {}", self.end_version);
+            return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
         }
 
         // We didn't return above, so we need to do log replay to find P&M.
@@ -69,58 +66,44 @@ impl LogSegment {
         //         commits *after* the CRC version.
         //   (a) If we find new P&M in the pruned replay, return it.
         //   (b) If we don't find new P&M, fall back to the CRC.
-        //   (c) If the CRC also fails, fall back to replaying the remaining segment
-        //       (checkpoint + commits up through the CRC version).
         //
-        // Case 3: CRC at target version failed to load => Full P&M log replay.
-        //
-        // Case 4: No CRC exists at all => Full P&M log replay.
+        // Case 3: No CRC exists => Full P&M log replay.
 
-        if let Some(crc_v) = crc_version.filter(|&v| v < self.end_version) {
+        if let Some(crc) = crc.filter(|c| c.version < self.end_version) {
             // Case 2(a): Replay only commits after CRC version
-            info!("Pruning log segment to commits after CRC version {}", crc_v);
-            let pruned = self.segment_after_crc(crc_v);
-            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine, None, None)?;
+            info!(
+                "Pruning log segment to commits after CRC version {}",
+                crc.version
+            );
+            let pruned = self.segment_after_version(crc.version);
+            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine)?;
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
                 return Ok((metadata_opt, protocol_opt));
             }
 
-            // Case 2(b): P&M incomplete from pruned replay, try CRC.
+            // Case 2(b): P&M incomplete from pruned replay, use the CRC.
             // Use `or_else` so any newer P or M found in the pruned replay takes priority
             // over the (older) CRC values.
-            if let CrcLoadResult::Loaded(crc) = lazy_crc.get_or_load(engine) {
-                info!("P&M fallback to CRC (no P&M changes after CRC version)");
-                return Ok((
-                    metadata_opt.or_else(|| Some(crc.metadata.clone())),
-                    protocol_opt.or_else(|| Some(crc.protocol.clone())),
-                ));
-            }
-
-            // Case 2(c): CRC failed to load. Replay the remaining segment (checkpoint +
-            // commits up through CRC version), carrying forward any partial results from the
-            // pruned replay above.
-            warn!(
-                "CRC at version {} failed to load, replaying remaining segment",
-                crc_v
-            );
-            let remaining = self.segment_through_crc(crc_v);
-            return remaining.replay_for_pm(engine, metadata_opt, protocol_opt);
+            info!("P&M fallback to CRC (no P&M changes after CRC version)");
+            return Ok((
+                metadata_opt.or_else(|| Some(crc.metadata.clone())),
+                protocol_opt.or_else(|| Some(crc.protocol.clone())),
+            ));
         }
 
-        // Case 3 / Case 4: Full P&M log replay.
-        self.replay_for_pm(engine, None, None)
+        // Case 3: Full P&M log replay.
+        self.replay_for_pm(engine)
     }
 
-    /// Replays the log segment for Protocol and Metadata, merging with any already-found values.
-    /// Stops early once both are found.
+    /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
-        mut metadata_opt: Option<Metadata>,
-        mut protocol_opt: Option<Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
         for actions_batch in self.read_pm_batches(engine)? {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
@@ -141,7 +124,10 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let schema = get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
+        let schema = schema_ref! {
+            (&PROTOCOL_FIELD),
+            (&METADATA_FIELD),
+        };
         self.read_actions(engine, schema)
     }
 }

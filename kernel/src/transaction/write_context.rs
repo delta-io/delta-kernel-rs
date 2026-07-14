@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use rand::Rng;
@@ -13,19 +14,27 @@ use crate::{DeltaResult, Error};
 
 /// Table-wide write state shared across all [`WriteContext`] instances created by a
 /// [`Transaction`]. Holds the target directory, schemas, column mapping mode, stats columns,
-/// and logical partition column names.
+/// logical partition column names, and randomized-prefix configuration.
 ///
 /// [`Transaction`]: super::Transaction
 #[derive(Debug)]
 pub(super) struct SharedWriteState {
     pub(super) table_root: Url,
+    /// Logical schema of the data to write: the table schema minus partition columns.
     pub(super) logical_schema: SchemaRef,
     pub(super) physical_schema: SchemaRef,
-    pub(super) logical_to_physical: ExpressionRef,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
+    /// Resolved value of the `delta.randomizeFilePrefixes` table property. When true,
+    /// [`WriteContext::write_dir`] emits a random alphanumeric prefix regardless of column
+    /// mapping mode.
+    pub(super) randomize_file_prefixes: bool,
+    /// Resolved value of the `delta.randomPrefixLength` table property. Drives the length
+    /// of the random prefix in [`WriteContext::write_dir`] for both the column mapping and
+    /// `randomizeFilePrefixes` paths.
+    pub(super) random_prefix_length: NonZero<usize>,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by
@@ -37,9 +46,9 @@ pub(super) struct SharedWriteState {
 /// (serialized partition values with physical column names as keys). How you use a
 /// `WriteContext` depends on your engine:
 ///
-/// - **`DefaultEngine` consumers**: pass this to [`DefaultEngine::write_parquet`], which handles
+/// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet`, which handles
 ///   everything (transform, write, partition metadata).
-/// - **Arrow-based custom engines**: write parquet yourself, then call [`build_add_file_metadata`]
+/// - **Arrow-based custom engines**: write parquet yourself, then call `build_add_file_metadata`
 ///   with the resulting `DataFileMetadata` and this `WriteContext` to produce the Add action
 ///   `EngineData` for [`Transaction::add_files`].
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
@@ -47,13 +56,14 @@ pub(super) struct SharedWriteState {
 ///
 /// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
 /// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
-/// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
-/// [`build_add_file_metadata`]: crate::engine::default::build_add_file_metadata
 /// [`Transaction::add_files`]: super::Transaction::add_files
 /// [`physical_partition_values`]: WriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct WriteContext {
     pub(super) shared: Arc<SharedWriteState>,
+    /// Transforms logical data to physical data for writing. The logical data must not contain
+    /// any partition columns. The expression injects the partition columns when needed.
+    pub(super) logical_to_physical: ExpressionRef,
     /// Physical column name -> serialized value (`None` = null partition value).
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
     /// `shared.logical_partition_columns`, not from this map.
@@ -99,57 +109,58 @@ impl WriteContext {
     ///    file, pass the full (still-encoded) file URL — this URL plus the generated filename — to
     ///    [`WriteContext::resolve_file_path`] to produce `add.path`. `make_relative` preserves the
     ///    URI-encoded form, which is what the Delta protocol requires. Arrow-based engines can use
-    ///    [`build_add_file_metadata`] which handles this step.
+    ///    `build_add_file_metadata` which handles this step.
     ///
-    /// [`DefaultEngine::write_parquet`] handles both steps automatically via `object_store`
-    /// and [`build_add_file_metadata`].
+    /// `DefaultEngine::write_parquet` handles both steps automatically via `object_store`
+    /// and `build_add_file_metadata`.
     ///
     /// # Layout
     ///
+    /// A random alphanumeric prefix is emitted whenever column mapping is on or the
+    /// `delta.randomizeFilePrefixes` table property is true. The prefix length is
+    /// controlled by `delta.randomPrefixLength`. When a random prefix is used on a
+    /// partitioned table, Hive-style path components are suppressed; the partition
+    /// values are still recorded in `add.partitionValues`.
+    ///
     /// ```text
-    ///              | CM OFF                              | CM ON
-    /// -------------|-------------------------------------|-------------------------------
-    /// Unpartitioned| <table_root>/<uuid>.parquet         | <table_root>/<2char>/<uuid>.parquet
-    /// Partitioned  | <table_root>/col=val/.../<uuid>.pq  | <table_root>/<2char>/<uuid>.parquet
+    ///                            | randomize=false                     | randomize=true
+    /// ---------------------------|-------------------------------------|--------------------------------
+    /// CM=None,  unpartitioned    | <table_root>/<uuid>.parquet         | <table_root>/<prefix>/<uuid>.parquet
+    /// CM=None,  partitioned      | <table_root>/col=val/.../<uuid>.pq  | <table_root>/<prefix>/<uuid>.parquet
+    /// CM=Id/Name, any            | <table_root>/<prefix>/<uuid>.parquet| <table_root>/<prefix>/<uuid>.parquet
     /// ```
     ///
-    /// CM ON uses a random 2-char alphanumeric prefix (matching Delta-Spark's
-    /// `getRandomPrefix`) to avoid S3 hotspots. Each call generates a fresh prefix,
-    /// matching Delta-Spark's per-file behavior.
-    ///
-    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
-    /// [`build_add_file_metadata`]: crate::engine::default::build_add_file_metadata
-    // TODO(#2357): respect `delta.randomizeFilePrefixes` and `delta.randomPrefixLength`
-    // table properties. Currently random prefixes are only used when column mapping is on.
+    /// Each call generates a fresh prefix. The alphanumeric charset is RFC 3986
+    /// unreserved, so the prefix is URI-safe at any length.
     // TODO(#2436): revisit this API shape. Returning a `Url` forces callers to URI-decode
     // before filesystem writes and keep it encoded for `add.path`, which is unintuitive.
     pub fn write_dir(&self) -> Url {
         let mut url = self.shared.table_root.clone();
-        match self.shared.column_mapping_mode {
-            ColumnMappingMode::None => {
-                // URI-encode on top of Hive-escaping because the fn-level contract (see
-                // doc above) requires callers to URI-decode once before using the URL as
-                // a filesystem path. That decode recovers the Hive-escaped form, which
-                // is the on-disk layout Delta-Spark and kernel-java produce.
-                if !self.shared.logical_partition_columns.is_empty() {
-                    let hive_escaped = self.hive_partition_path_suffix();
-                    let uri_encoded = uri_encode_path(&hive_escaped);
-                    url.set_path(&format!("{}{}", url.path(), uri_encoded));
-                }
-            }
-            ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                // Column mapping on: the random 2-char alphanumeric prefix contains only
-                // ASCII letters/digits (all RFC 3986 unreserved chars), so no URI encoding
-                // is needed — the string is already URI-safe as-is.
-                let prefix = random_alphanumeric_prefix();
-                url.set_path(&format!("{}{}/", url.path(), prefix));
-            }
+        // A random prefix is used when column mapping is on (to avoid leaking physical
+        // UUID column names into paths) or when `delta.randomizeFilePrefixes` is set (to
+        // avoid S3 hotspots). When a random prefix is used, the Hive-style partition path
+        // is suppressed; partition values are recorded in `add.partitionValues` instead.
+        let should_prefix = self.shared.column_mapping_mode != ColumnMappingMode::None
+            || self.shared.randomize_file_prefixes;
+        if should_prefix {
+            // The alphanumeric charset is RFC 3986 unreserved, so the prefix is URI-safe
+            // as-is and needs no further encoding.
+            let prefix = random_alphanumeric_prefix(self.shared.random_prefix_length);
+            url.set_path(&format!("{}{}/", url.path(), prefix));
+        } else if !self.shared.logical_partition_columns.is_empty() {
+            // CM=None, no randomization: emit a Hive-style partition path. URI-encode on
+            // top of Hive-escaping because the fn-level contract (see doc above) requires
+            // callers to URI-decode once before using the URL as a filesystem path. That
+            // decode recovers the Hive-escaped form, which is the on-disk layout
+            // Delta-Spark and kernel-java produce.
+            let hive_escaped = self.hive_partition_path_suffix();
+            let uri_encoded = uri_encode_path(&hive_escaped);
+            url.set_path(&format!("{}{}", url.path(), uri_encoded));
         }
         url
     }
 
-    /// Returns the logical (user-facing) table schema. Connectors use this to determine
-    /// the schema of data to write.
+    /// Returns the schema which connectors' logical data should conform to.
     pub fn logical_schema(&self) -> &SchemaRef {
         &self.shared.logical_schema
     }
@@ -162,7 +173,7 @@ impl WriteContext {
 
     /// Returns the expression that transforms logical data to physical data for writing.
     pub fn logical_to_physical(&self) -> ExpressionRef {
-        self.shared.logical_to_physical.clone()
+        self.logical_to_physical.clone()
     }
 
     /// The [`ColumnMappingMode`] for this table.
@@ -213,7 +224,7 @@ impl WriteContext {
     /// Computes the relative `add.path` value for the Delta log from a file's absolute URL.
     ///
     /// Custom engines that write parquet files themselves (bypassing
-    /// [`DefaultEngine::write_parquet`]) should call this after writing each file to produce
+    /// `DefaultEngine::write_parquet`) should call this after writing each file to produce
     /// the path for their Add action metadata.
     ///
     /// # Examples
@@ -223,8 +234,6 @@ impl WriteContext {
     /// - `s3://bucket/table/year=2024/abc.parquet` -> `"year=2024/abc.parquet"`
     ///
     /// Returns an error if the file is not under the table root.
-    ///
-    /// [`DefaultEngine::write_parquet`]: crate::engine::default::DefaultEngine::write_parquet
     pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {
         let relative = self
             .shared
@@ -270,13 +279,13 @@ impl WriteContext {
     }
 }
 
-/// Generates a random 2-character alphanumeric prefix for partition directory paths, matching
-/// Delta-Spark's `Utils.getRandomPrefix` (`Random.alphanumeric.take(2)`). Used when column mapping
-/// is enabled to avoid S3 hotspots and prevent leaking physical UUID column names into paths.
-fn random_alphanumeric_prefix() -> String {
+/// Generates a random alphanumeric prefix of the given length for data file directory paths.
+/// Used to avoid S3 hotspots and to keep physical UUID column names out of paths when column
+/// mapping is enabled.
+fn random_alphanumeric_prefix(len: NonZero<usize>) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
-    (0..2)
+    (0..len.get())
         .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
         .collect()
 }
@@ -290,28 +299,30 @@ mod tests {
 
     use super::*;
     use crate::expressions::Expression;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema_ref;
 
     fn make_write_context(
         cm_mode: ColumnMappingMode,
         partition_columns: Vec<String>,
         partition_values: HashMap<String, Option<String>>,
+        randomize_file_prefixes: bool,
+        random_prefix_length: usize,
     ) -> WriteContext {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let shared = Arc::new(SharedWriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             logical_schema: schema.clone(),
             physical_schema: schema.clone(),
-            logical_to_physical: Arc::new(Expression::literal(true)),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
+            randomize_file_prefixes,
+            random_prefix_length: NonZero::new(random_prefix_length)
+                .expect("test prefix length must be > 0"),
         });
         WriteContext {
             shared,
+            logical_to_physical: Arc::new(Expression::literal(true)),
             physical_partition_values: partition_values,
         }
     }
@@ -338,7 +349,7 @@ mod tests {
         } else {
             (vec![], HashMap::new())
         };
-        let wc = make_write_context(cm_mode, cols, pvs);
+        let wc = make_write_context(cm_mode, cols, pvs, false, 2);
         let path = wc.write_dir().path().to_string();
 
         match cm_mode {
@@ -380,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_write_dir_cm_on_generates_different_prefixes_per_call() {
-        let wc = make_write_context(ColumnMappingMode::Name, vec![], HashMap::new());
+        let wc = make_write_context(ColumnMappingMode::Name, vec![], HashMap::new(), false, 2);
         let dirs: Vec<String> = (0..20).map(|_| wc.write_dir().path().to_string()).collect();
         let unique: HashSet<_> = dirs.iter().collect();
         assert!(
@@ -395,6 +406,8 @@ mod tests {
             ColumnMappingMode::None,
             vec!["region".into()],
             HashMap::from([("region".into(), None)]),
+            false,
+            2,
         );
         let path = wc.write_dir().path().to_string();
         assert!(
@@ -420,6 +433,8 @@ mod tests {
             ColumnMappingMode::None,
             vec![col.into()],
             HashMap::from([(col.into(), Some(value.into()))]),
+            false,
+            2,
         );
         assert_eq!(wc.write_dir().path(), expected_path);
     }
@@ -431,7 +446,7 @@ mod tests {
     #[case::name_mode(ColumnMappingMode::Name)]
     #[case::id_mode(ColumnMappingMode::Id)]
     fn test_write_dir_cm_on_prefix_is_uri_safe(#[case] cm_mode: ColumnMappingMode) {
-        let wc = make_write_context(cm_mode, vec!["p".into()], HashMap::new());
+        let wc = make_write_context(cm_mode, vec!["p".into()], HashMap::new(), false, 2);
         let path = wc.write_dir().path().to_string();
         assert!(
             !path.contains('%'),
@@ -448,16 +463,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_random_alphanumeric_prefix_format() {
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(8)]
+    #[case(32)]
+    fn test_random_alphanumeric_prefix_format(#[case] len: usize) {
+        let nz_len = NonZero::new(len).unwrap();
         for _ in 0..100 {
-            let prefix = random_alphanumeric_prefix();
-            assert_eq!(prefix.len(), 2, "prefix should be exactly 2 chars");
+            let prefix = random_alphanumeric_prefix(nz_len);
+            assert_eq!(prefix.len(), len, "prefix should be exactly {len} chars");
             assert!(
                 prefix.chars().all(|c| c.is_ascii_alphanumeric()),
                 "prefix should be alphanumeric, got: {prefix}"
             );
         }
+    }
+
+    /// When CM is off and `randomizeFilePrefixes=true`, the random prefix replaces the
+    /// Hive-style path on disk for partitioned tables. Combined with the existing CM-on
+    /// behavior, this covers the full matrix described in the `write_dir` doc comment.
+    #[rstest]
+    fn test_write_dir_with_randomize_property(
+        #[values(
+            ColumnMappingMode::None,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::Id
+        )]
+        cm_mode: ColumnMappingMode,
+        #[values(true, false)] randomize: bool,
+        #[values(true, false)] is_partitioned: bool,
+    ) {
+        let (cols, pvs) = if is_partitioned {
+            (
+                vec!["year".into()],
+                HashMap::from([("year".into(), Some("2024".into()))]),
+            )
+        } else {
+            (vec![], HashMap::new())
+        };
+        let wc = make_write_context(cm_mode, cols, pvs, randomize, 2);
+        let path = wc.write_dir().path().to_string();
+
+        let should_prefix = cm_mode != ColumnMappingMode::None || randomize;
+        if should_prefix {
+            assert!(
+                !path.contains("year="),
+                "random prefix should suppress Hive dirs, got: {path}"
+            );
+            let prefix = path
+                .strip_prefix("/table/")
+                .unwrap()
+                .strip_suffix('/')
+                .unwrap();
+            assert_eq!(prefix.len(), 2, "expected 2-char prefix, got: {prefix}");
+            assert!(
+                prefix.chars().all(|c| c.is_ascii_alphanumeric()),
+                "prefix should be alphanumeric, got: {prefix}"
+            );
+        } else if is_partitioned {
+            assert_eq!(path, "/table/year=2024/");
+        } else {
+            assert_eq!(path, "/table/");
+        }
+    }
+
+    /// `randomPrefixLength` controls the prefix length for both the column-mapping path
+    /// and the `randomizeFilePrefixes` path.
+    #[rstest]
+    #[case::cm_on_default(ColumnMappingMode::Name, false, 2)]
+    #[case::cm_on_short(ColumnMappingMode::Name, false, 1)]
+    #[case::cm_on_long(ColumnMappingMode::Name, false, 16)]
+    #[case::randomize_short(ColumnMappingMode::None, true, 1)]
+    #[case::randomize_default(ColumnMappingMode::None, true, 2)]
+    #[case::randomize_long(ColumnMappingMode::None, true, 16)]
+    fn test_write_dir_random_prefix_length_property(
+        #[case] cm_mode: ColumnMappingMode,
+        #[case] randomize: bool,
+        #[case] prefix_len: usize,
+    ) {
+        let wc = make_write_context(cm_mode, vec![], HashMap::new(), randomize, prefix_len);
+        let path = wc.write_dir().path().to_string();
+        let prefix = path
+            .strip_prefix("/table/")
+            .unwrap()
+            .strip_suffix('/')
+            .unwrap();
+        assert_eq!(
+            prefix.len(),
+            prefix_len,
+            "expected {prefix_len}-char prefix, got: {prefix:?}"
+        );
+        assert!(
+            prefix.chars().all(|c| c.is_ascii_alphanumeric()),
+            "prefix should be alphanumeric, got: {prefix}"
+        );
+    }
+
+    /// When CM is off and a partitioned table has `randomizeFilePrefixes=true`, the random
+    /// prefix replaces the Hive-style path on disk. Partition values are still recorded in
+    /// `add.partitionValues`; this test only checks the on-disk layout.
+    #[test]
+    fn test_write_dir_cm_off_randomize_suppresses_hive() {
+        let wc = make_write_context(
+            ColumnMappingMode::None,
+            vec!["year".into(), "month".into()],
+            HashMap::from([
+                ("year".into(), Some("2024".into())),
+                ("month".into(), Some("03".into())),
+            ]),
+            true,
+            2,
+        );
+        let path = wc.write_dir().path().to_string();
+        assert!(
+            !path.contains('='),
+            "randomize=true should suppress Hive dirs, got: {path}"
+        );
+        let prefix = path
+            .strip_prefix("/table/")
+            .unwrap()
+            .strip_suffix('/')
+            .unwrap();
+        assert_eq!(prefix.len(), 2);
     }
 
     // === resolve_file_path tests ===
@@ -485,7 +613,7 @@ mod tests {
     #[case::error_outside_table_root("s3://bucket/other/abc.parquet", Err(()))]
     #[test]
     fn test_resolve_file_path(#[case] file_url: &str, #[case] expected: Result<&str, ()>) {
-        let wc = make_write_context(ColumnMappingMode::None, vec![], HashMap::new());
+        let wc = make_write_context(ColumnMappingMode::None, vec![], HashMap::new(), false, 2);
         let file = Url::parse(file_url).unwrap();
         match expected {
             Ok(exp) => assert_eq!(wc.resolve_file_path(&file).unwrap(), exp),

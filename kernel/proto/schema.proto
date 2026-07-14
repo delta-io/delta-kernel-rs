@@ -1,0 +1,88 @@
+// Proto mirror of `kernel/src/schema/mod.rs` 
+
+syntax = "proto3";
+
+package delta.kernel.schema;
+
+// Java package for generated bindings. Ignored by prost (Rust codegen).
+option java_package = "io.delta.kernel.proto.schema";
+
+// ============================================================================
+// Primitive types
+// ============================================================================
+
+enum SimplePrimitiveType {
+  SIMPLE_PRIMITIVE_TYPE_UNSPECIFIED = 0;
+  SIMPLE_PRIMITIVE_TYPE_STRING = 1;
+  SIMPLE_PRIMITIVE_TYPE_LONG = 2;
+  SIMPLE_PRIMITIVE_TYPE_INTEGER = 3;
+  SIMPLE_PRIMITIVE_TYPE_SHORT = 4;
+  SIMPLE_PRIMITIVE_TYPE_BYTE = 5;
+  SIMPLE_PRIMITIVE_TYPE_FLOAT = 6;
+  SIMPLE_PRIMITIVE_TYPE_DOUBLE = 7;
+  SIMPLE_PRIMITIVE_TYPE_BOOLEAN = 8;
+  SIMPLE_PRIMITIVE_TYPE_BINARY = 9;
+  SIMPLE_PRIMITIVE_TYPE_DATE = 10;
+  SIMPLE_PRIMITIVE_TYPE_TIMESTAMP = 11;
+  SIMPLE_PRIMITIVE_TYPE_TIMESTAMP_NTZ = 12;
+  SIMPLE_PRIMITIVE_TYPE_VOID = 13;
+  SIMPLE_PRIMITIVE_TYPE_INTERVAL_YEAR_MONTH = 14;
+  SIMPLE_PRIMITIVE_TYPE_INTERVAL_DAY_TIME = 15;
+}
+
+// Rust uses `u8` (precision in [1,38], scale in [0,precision]); widened to uint32 because
+// proto has no smaller integer type, so consumers must validate the range.
+message DecimalType {
+  uint32 precision = 1;
+  uint32 scale = 2;
+}
+
+message PrimitiveType {
+  oneof kind {
+    SimplePrimitiveType simple = 1;
+    DecimalType decimal = 2;
+  }
+}
+
+message ArrayType {
+  DataType element_type = 1;
+  bool contains_null = 2;
+}
+
+message MapType {
+  DataType key_type = 1;
+  DataType value_type = 2;
+  bool value_contains_null = 3;
+}
+
+message StructType {
+  repeated StructField fields = 1;
+}
+
+message VariantType {}
+
+message MetadataValue {
+  oneof value {
+    int64 number = 1;
+    string string = 2;
+    bool boolean = 3;
+    string other_json = 4;
+  }
+}
+
+message StructField {
+  string name = 1;
+  DataType data_type = 2;
+  bool nullable = 3;
+  map<string, MetadataValue> metadata = 4;
+}
+
+message DataType {
+  oneof kind {
+    PrimitiveType primitive = 1;
+    ArrayType array = 2;
+    StructType struct = 3;
+    MapType map = 4;
+    VariantType variant = 5;
+  }
+}

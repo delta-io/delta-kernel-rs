@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -11,7 +12,7 @@ use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::CheckpointReadInfo;
-use crate::scan::log_replay::scan_action_iter;
+use crate::scan::log_replay::{scan_action_iter, ScanPartitionValuesOptions, ScanStatsOptions};
 use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
 use crate::schema::{LogicalSchema, SchemaRef, StructType};
@@ -36,7 +37,7 @@ pub(crate) fn sidecar_batch_with_given_paths_and_sizes(
     paths_and_sizes: Vec<(&str, u64)>,
     output_schema: SchemaRef,
 ) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
+    let handler = SyncJsonHandler::new(None);
 
     let mut json_strings: Vec<String> = paths_and_sizes
         .iter()
@@ -64,7 +65,7 @@ pub(crate) fn sidecar_batch_with_given_paths_and_sizes(
 // Generates a batch with an add action.
 // The schema is provided as null columns affect equality checks.
 pub(crate) fn add_batch_simple(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
+    let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![
         r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
         r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
@@ -79,7 +80,7 @@ pub(crate) fn add_batch_simple(output_schema: SchemaRef) -> Box<ArrowEngineData>
 // Generates a batch with an add action.
 // The schema is provided as null columns affect equality checks.
 pub(crate) fn add_batch_for_row_id(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
+    let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![
         r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","baseRowId": 42, "tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
         r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableRowTracking": "true", "delta.rowTracking.materializedRowIdColumnName":"row_id_col"},"createdTime":1677811175819}}"#,
@@ -93,7 +94,7 @@ pub(crate) fn add_batch_for_row_id(output_schema: SchemaRef) -> Box<ArrowEngineD
 
 // An add batch with a removed file parsed with the schema provided
 pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
+    let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![
         r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
         r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -113,7 +114,7 @@ pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngine
 pub(crate) fn add_batch_with_remove_and_partition(
     output_schema: SchemaRef,
 ) -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
+    let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![
         r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{"date":"2017-12-10"},"size":635}}"#,
         r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{"date":"2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0}}"}}"#,
@@ -129,7 +130,7 @@ pub(crate) fn add_batch_with_remove_and_partition(
 
 // add batch with a `date` partition col
 pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
-    let handler = SyncJsonHandler {};
+    let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![
         r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues": {"date": "2017-12-11"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -167,6 +168,9 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         transform_spec,
         physical_stats_schema: None,
         physical_partition_schema: None,
+        physical_stats_columns: HashSet::new(),
+        is_catalog_managed: false,
+        skip_row_transforms: false,
     });
     let checkpoint_info = CheckpointReadInfo::without_stats_parsed();
     let (iter, _metrics) = scan_action_iter(
@@ -176,7 +180,8 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
             .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
         state_info,
         checkpoint_info,
-        false,
+        ScanStatsOptions::default(),
+        ScanPartitionValuesOptions::default(),
     )
     .unwrap();
     let mut batch_count = 0;

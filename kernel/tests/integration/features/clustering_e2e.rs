@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::ColumnName;
@@ -66,18 +67,21 @@ async fn test_clustered_table_write_and_checkpoint(
 
     // First write: 3 rows
     let batch = generate_batch(vec![
-        ("id", vec![1, 2, 3].into_array()),
-        ("name", vec!["alice", "bob", "charlie"].into_array()),
-        ("city", vec!["seattle", "portland", "seattle"].into_array()),
+        ("id", vec![1, 2, 3].into_arrow_array()),
+        ("name", vec!["alice", "bob", "charlie"].into_arrow_array()),
+        (
+            "city",
+            vec!["seattle", "portland", "seattle"].into_arrow_array(),
+        ),
     ])?;
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     assert_eq!(snapshot.version(), 1);
 
     // Second write: 2 more rows
     let batch = generate_batch(vec![
-        ("id", vec![4, 5].into_array()),
-        ("name", vec!["dave", "eve"].into_array()),
-        ("city", vec!["austin", "portland"].into_array()),
+        ("id", vec![4, 5].into_arrow_array()),
+        ("name", vec!["dave", "eve"].into_arrow_array()),
+        ("city", vec!["austin", "portland"].into_arrow_array()),
     ])?;
     let snapshot = write_batch_to_table(&snapshot, engine.as_ref(), batch, HashMap::new()).await?;
     assert_eq!(snapshot.version(), 2);
@@ -90,11 +94,11 @@ async fn test_clustered_table_write_and_checkpoint(
         for col in &expected_clustering {
             let col_name = col.to_string();
             assert!(
-                stats["minValues"].get(&col_name).is_some(),
+                stats[MIN_VALUES].get(&col_name).is_some(),
                 "Stats should include minValues for clustering column '{col_name}'"
             );
             assert!(
-                stats["maxValues"].get(&col_name).is_some(),
+                stats[MAX_VALUES].get(&col_name).is_some(),
                 "Stats should include maxValues for clustering column '{col_name}'"
             );
         }
@@ -126,11 +130,11 @@ async fn test_clustered_table_write_and_checkpoint(
         for col in &expected_clustering {
             let col_name = col.to_string();
             assert!(
-                stats["minValues"].get(&col_name).is_some(),
+                stats[MIN_VALUES].get(&col_name).is_some(),
                 "Stats should include minValues for clustering column '{col_name}' after checkpoint"
             );
             assert!(
-                stats["maxValues"].get(&col_name).is_some(),
+                stats[MAX_VALUES].get(&col_name).is_some(),
                 "Stats should include maxValues for clustering column '{col_name}' after checkpoint"
             );
         }
@@ -142,8 +146,8 @@ async fn test_clustered_table_write_and_checkpoint(
 /// Regression test: writing a batch where a clustering column has ALL null values should succeed.
 ///
 /// `collect_stats` emits null-valued min/max entries for all-null columns, allowing
-/// `StatsVerifier` to find the field and confirm `nullCount == numRecords`. The JSON serializer
-/// omits null fields on disk, matching Spark's `ignoreNullFields` behavior.
+/// `StatsColumnVerifier` to find the field and confirm `nullCount == numRecords`. The JSON
+/// serializer omits null fields on disk, matching Spark's `ignoreNullFields` behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_clustered_table_write_all_null_clustering_column() {
     let (_temp_dir, table_path, engine) = test_table_setup_mt().unwrap();
@@ -178,7 +182,7 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     // This should succeed -- all-null clustering columns are valid.
     let all_null_region: ArrayRef = Arc::new(Int32Array::from(vec![None, None, None]));
     let batch = generate_batch(vec![
-        ("category", vec!["a", "b", "c"].into_array()),
+        ("category", vec!["a", "b", "c"].into_arrow_array()),
         ("region_id", all_null_region),
     ])
     .unwrap();
@@ -200,14 +204,14 @@ async fn test_clustered_table_write_all_null_clustering_column() {
     let add_infos = read_add_infos(&snapshot, engine.as_ref()).unwrap();
     assert_eq!(add_infos.len(), 1);
     let stats = add_infos[0].stats.as_ref().expect("should have stats");
-    assert_eq!(stats["numRecords"], 3);
-    assert_eq!(stats["nullCount"]["region_id"], 3);
+    assert_eq!(stats[NUM_RECORDS], 3);
+    assert_eq!(stats[NULL_COUNT]["region_id"], 3);
     assert!(
-        stats["minValues"].get("region_id").is_none(),
+        stats[MIN_VALUES].get("region_id").is_none(),
         "JSON minValues should omit region_id when all values are null"
     );
     assert!(
-        stats["maxValues"].get("region_id").is_none(),
+        stats[MAX_VALUES].get("region_id").is_none(),
         "JSON maxValues should omit region_id when all values are null"
     );
 }

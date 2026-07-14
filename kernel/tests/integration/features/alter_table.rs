@@ -7,10 +7,7 @@ use delta_kernel::arrow::array::{Array, Int32Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
-use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
     StructType,
@@ -21,8 +18,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
+    add_commit, column_mapping_fixtures as fixtures, create_table_and_load_snapshot,
+    engine_store_setup, test_table_setup, test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -39,13 +36,16 @@ fn committer() -> Box<FileSystemCommitter> {
     Box::new(FileSystemCommitter::new())
 }
 
-fn max_column_id(snap: &Snapshot) -> i64 {
+/// Reads `delta.columnMapping.maxColumnId` from the snapshot's metadata. Returns
+/// `None` when the property is absent (e.g. non-CM tables) so callers can compare it
+/// directly against `cm_mode.map(...)`-style expectations. CM-only callers should
+/// `.expect(...)` at the use site to surface the protocol violation explicitly.
+fn max_column_id(snap: &Snapshot) -> Option<i64> {
     snap.table_configuration()
         .metadata()
         .configuration()
         .get("delta.columnMapping.maxColumnId")
         .and_then(|v| v.parse().ok())
-        .expect("maxColumnId should be set and parseable on a CM table")
 }
 
 // ============================================================================
@@ -68,7 +68,8 @@ async fn add_columns_lifecycle(
         .unwrap_or_default();
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
-    let original_max_id = cm_mode.map(|_| max_column_id(&snapshot));
+    let original_max_id =
+        cm_mode.map(|_| max_column_id(&snapshot).expect("CM table must have maxColumnId"));
 
     // Write two rows with only the original columns populated.
     let batch = RecordBatch::try_new(
@@ -131,7 +132,7 @@ async fn add_columns_lifecycle(
                 other => panic!("expected String, got {other:?}"),
             }
         }
-        assert!(max_column_id(&reloaded) > orig);
+        assert!(max_column_id(&reloaded).expect("CM table must have maxColumnId") > orig);
     } else {
         assert!(reloaded
             .table_configuration()
@@ -214,12 +215,11 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "items",
         ArrayType::new(
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![
-                    StructField::nullable("a", DataType::STRING),
-                    StructField::nullable("b", DataType::INTEGER),
-                ]).unwrap(),
-            )),
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
             true,
         ),
     ),
@@ -230,12 +230,11 @@ async fn add_columns_lifecycle(
         "by_id",
         MapType::new(
             DataType::STRING,
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![
-                    StructField::nullable("a", DataType::STRING),
-                    StructField::nullable("b", DataType::INTEGER),
-                ]).unwrap(),
-            )),
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
             true,
         ),
     ),
@@ -245,12 +244,11 @@ async fn add_columns_lifecycle(
     StructField::nullable(
         "lookup",
         MapType::new(
-            DataType::Struct(Box::new(
-                StructType::try_new(vec![
-                    StructField::nullable("a", DataType::STRING),
-                    StructField::nullable("b", DataType::INTEGER),
-                ]).unwrap(),
-            )),
+            StructType::try_new(vec![
+                StructField::nullable("a", DataType::STRING),
+                StructField::nullable("b", DataType::INTEGER),
+            ])
+            .unwrap(),
             DataType::INTEGER,
             true,
         ),
@@ -269,7 +267,8 @@ async fn add_complex_type_column(
         .unwrap_or_default();
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &properties)?;
-    let original_max_id = cm_mode.map(|_| max_column_id(&snapshot));
+    let original_max_id =
+        cm_mode.map(|_| max_column_id(&snapshot).expect("CM table must have maxColumnId"));
 
     let field_name = field.name().to_string();
     let expected_type = field.data_type().clone();
@@ -298,7 +297,7 @@ async fn add_complex_type_column(
             "all assigned IDs must exceed original max"
         );
         assert_eq!(
-            max_column_id(&reloaded),
+            max_column_id(&reloaded).expect("CM table must have maxColumnId"),
             ids.iter().copied().max().unwrap(),
             "table maxColumnId must equal the largest assigned ID",
         );
@@ -426,6 +425,110 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
         .downcast_ref::<Int32Array>()
         .expect("b is int");
     assert_eq!(b_col.value(0), 100);
+
+    Ok(())
+}
+
+/// Empty-schema tables are valid intermediate state, so they need to behave normally
+/// once a column is added. This test runs the full lifecycle (create empty, ALTER ADD
+/// COLUMN, write rows, scan them back, time-travel to v0) across all column-mapping
+/// modes so the CM bookkeeping (maxColumnId, column-mapping id, physical name) is
+/// exercised on a schema that started empty rather than being created with columns
+/// up front.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_create_then_add_column(
+    #[values(None, Some("name"), Some("id"))] cm_mode: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let properties: Vec<(&str, &str)> = cm_mode
+        .map(|m| vec![("delta.columnMapping.mode", m)])
+        .unwrap_or_default();
+
+    let empty_schema = Arc::new(StructType::try_new(vec![])?);
+    let v0 =
+        create_table_and_load_snapshot(&table_path, empty_schema, engine.as_ref(), &properties)?;
+    assert_eq!(v0.version(), 0);
+    assert_eq!(v0.schema().num_fields(), 0);
+    assert_eq!(max_column_id(&v0), cm_mode.map(|_| 0));
+
+    // Scans and blind appends against the empty-schema snapshot are blocked with
+    // friendly errors that point users at ALTER TABLE ADD COLUMN.
+    let scan_err = v0
+        .clone()
+        .scan_builder()
+        .build()
+        .expect_err("scan_builder().build() must reject empty-schema snapshots");
+    assert!(
+        scan_err.to_string().contains("empty schema")
+            && scan_err.to_string().contains("ALTER TABLE ADD COLUMN"),
+        "scan error must point at ALTER TABLE ADD COLUMN, got: {scan_err}"
+    );
+    let write_err = v0
+        .clone()
+        .transaction(committer(), engine.as_ref())?
+        .with_engine_info("EmptySchemaApp/0.1.0")
+        .unpartitioned_write_context()
+        .expect_err("unpartitioned_write_context() must reject empty-schema snapshots");
+    assert!(
+        write_err.to_string().contains("empty schema")
+            && write_err.to_string().contains("alter_table"),
+        "write_context error must point at alter_table, got: {write_err}"
+    );
+
+    v0.alter_table()
+        .add_column(StructField::nullable("id", DataType::INTEGER))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let v1 = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(v1.version(), 1);
+    let schema = v1.schema();
+    assert_eq!(schema.num_fields(), 1);
+    let id_field = schema.field("id").expect("added field should exist");
+    assert_eq!(id_field.data_type(), &DataType::INTEGER);
+    assert!(id_field.is_nullable());
+    assert_eq!(max_column_id(&v1), cm_mode.map(|_| 1));
+    assert_eq!(id_field.column_mapping_id(), cm_mode.map(|_| 1i64));
+    assert_eq!(
+        id_field
+            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
+            .is_some(),
+        cm_mode.is_some(),
+        "physical name presence must track column-mapping enablement",
+    );
+
+    // Write rows through the freshly-added column and confirm the read path round-trips
+    // them. Under CM this also exercises the physical-name plumbing for a column whose
+    // schema started empty.
+    let arrow_schema = v1.schema().as_ref().try_into_arrow().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(99)]))],
+    )
+    .unwrap();
+    let v2 = write_batch_to_table(&v1, engine.as_ref(), batch, HashMap::new())
+        .await
+        .map_err(|e| delta_kernel::Error::generic(format!("write_batch_to_table failed: {e}")))?;
+    assert_eq!(v2.version(), 2);
+
+    let scan = v2.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "post-ALTER write should yield 3 rows on read"
+    );
+
+    // The empty-schema snapshot must still be loadable via time-travel after later
+    // commits introduce a column and data files; pins the contract that the v0 history
+    // survives schema evolution.
+    let v0_after = Snapshot::builder_for(&table_path)
+        .at_version(0)
+        .build(engine.as_ref())?;
+    assert_eq!(v0_after.version(), 0);
+    assert_eq!(v0_after.schema().num_fields(), 0);
 
     Ok(())
 }
@@ -645,7 +748,8 @@ async fn chain_add_column_and_set_nullable(
             .column_mapping_id()
             .expect("existing field should already have a column mapping ID")
     });
-    let original_max_id = cm_mode.map(|_| max_column_id(&snapshot));
+    let original_max_id =
+        cm_mode.map(|_| max_column_id(&snapshot).expect("CM table must have maxColumnId"));
 
     // Two alter+checkpoint cycles: (add email + nullable id), (add age + nullable name).
     let v1 = snapshot
@@ -693,7 +797,7 @@ async fn chain_add_column_and_set_nullable(
             .expect("existing id column mapping");
         assert_eq!(id_after, orig_id, "existing id CM id must not change");
         assert!(
-            max_column_id(&reloaded) > orig_max,
+            max_column_id(&reloaded).expect("CM table must have maxColumnId") > orig_max,
             "chained add_column must bump maxColumnId"
         );
     }
@@ -740,79 +844,15 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
-    let storage = Arc::new(InMemory::new());
-    let table_root = "memory:///";
-    let engine =
-        Arc::new(DefaultEngineBuilder::<TokioBackgroundExecutor>::new(storage.clone()).build());
-
-    // Create table doesn't support IcebergCompatV3 yet, so this test hand-crafts a V0 commit.
-    // The commit enables V3, column mapping, and row tracking. The schema contains one `id`
-    // column with the column-mapping metadata required when CM mode is set.
-    let schema = StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)
-        .with_metadata([
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref(),
-                MetadataValue::from(1),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                MetadataValue::from("col-1"),
-            ),
-        ])])?;
-    let schema_string = serde_json::to_string(&schema)?;
-    let commit = [
-        serde_json::json!({
-            "commitInfo": {
-                "timestamp": 1587968586154_i64,
-                "operation": "CREATE TABLE",
-                "operationParameters": {},
-                "isBlindAppend": true,
-            }
-        }),
-        serde_json::json!({
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": ["columnMapping"],
-                "writerFeatures": [
-                    "icebergCompatV3",
-                    "columnMapping",
-                    "rowTracking",
-                    "domainMetadata",
-                ],
-            }
-        }),
-        serde_json::json!({
-            "metaData": {
-                "id": "deadbeef-1234-5678-abcd-000000000000",
-                "format": {
-                    "provider": "parquet",
-                    "options": {},
-                },
-                "schemaString": schema_string,
-                "partitionColumns": [],
-                "configuration": {
-                    "delta.enableIcebergCompatV3": "true",
-                    "delta.columnMapping.mode": "name",
-                    "delta.enableRowTracking": "true",
-                    "delta.rowTracking.materializedRowIdColumnName": "_row_id",
-                    "delta.rowTracking.materializedRowCommitVersionColumnName":
-                        "_row_commit_version",
-                    "delta.columnMapping.maxColumnId": "1",
-                },
-                "createdTime": 1234567890000_i64,
-            }
-        }),
-    ]
-    .into_iter()
-    .map(|action| serde_json::to_string(&action))
-    .collect::<Result<Vec<_>, _>>()?
-    .join("\n");
-    add_commit(table_root, storage.as_ref(), 0, commit.to_string()).await?;
-
-    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.enableIcebergCompatV3", "true")],
+    )?;
 
     let msg = snapshot
         .alter_table()
@@ -825,5 +865,282 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         "unexpected error: {msg}",
     );
 
+    Ok(())
+}
+
+// ============================================================================
+// ALTER TABLE ADD COLUMN preserves / fills pre-populated column mapping metadata
+// (delta-spark parity per `DeltaColumnMapping.assignColumnIdAndPhysicalName`).
+// See https://github.com/delta-io/delta-kernel-rs/issues/2377.
+// ============================================================================
+
+fn cm_id_for_field(field: &StructField) -> i64 {
+    field
+        .column_mapping_id()
+        .expect("field must have a column mapping id")
+}
+
+fn physical_name_for_field(field: &StructField) -> &str {
+    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+        Some(MetadataValue::String(s)) => s.as_str(),
+        other => panic!("expected physicalName string, got {other:?}"),
+    }
+}
+
+/// ADD COLUMN with both `delta.columnMapping.id` and `delta.columnMapping.physicalName`
+/// pre-populated: the connector-supplied metadata is preserved verbatim. `maxColumnId`
+/// advances to the supplied id when it exceeds the existing max.
+#[rstest]
+#[tokio::test]
+async fn add_column_preserves_complete_cm_metadata(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
+
+    // Supplied id is well above the table's max so we can verify maxColumnId follows it.
+    let supplied_id = original_max + 100;
+    let field = fixtures::cm_field(
+        "preserved",
+        supplied_id,
+        "user-supplied-physical",
+        DataType::STRING,
+    );
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("preserved").unwrap();
+    assert_eq!(cm_id_for_field(added), supplied_id);
+    assert_eq!(physical_name_for_field(added), "user-supplied-physical");
+    assert_eq!(
+        max_column_id(&reloaded).expect("CM table must have maxColumnId"),
+        supplied_id
+    );
+    Ok(())
+}
+
+/// ADD COLUMN with only `delta.columnMapping.physicalName` supplied: kernel allocates
+/// `id = old maxColumnId + 1`, preserves the user-provided physical name, and bumps
+/// `maxColumnId` to the new id.
+#[rstest]
+#[tokio::test]
+async fn add_column_with_only_physical_name_allocates_id(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
+
+    let field =
+        fixtures::cm_field_physical_name_only("named_only", "phys-named-only", DataType::STRING);
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("named_only").unwrap();
+    assert_eq!(cm_id_for_field(added), original_max + 1);
+    assert_eq!(physical_name_for_field(added), "phys-named-only");
+    assert_eq!(
+        max_column_id(&reloaded).expect("CM table must have maxColumnId"),
+        original_max + 1
+    );
+    Ok(())
+}
+
+/// ADD COLUMN with only `delta.columnMapping.id` supplied: id is preserved, missing
+/// `physicalName` is filled with `col-<uuid>`.
+#[rstest]
+#[tokio::test]
+async fn add_column_with_only_id_fills_physical_name(
+    #[values("name", "id")] cm_mode: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", cm_mode)],
+    )?;
+    let original_max = max_column_id(&snapshot).expect("CM table must have maxColumnId");
+    let supplied_id = original_max + 7;
+
+    let field = fixtures::cm_field_id_only("id_only", supplied_id, DataType::STRING);
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("id_only").unwrap();
+    assert_eq!(cm_id_for_field(added), supplied_id);
+    assert!(
+        physical_name_for_field(added).starts_with("col-"),
+        "physical name should be filled with col-<uuid>, got {}",
+        physical_name_for_field(added)
+    );
+    assert_eq!(
+        max_column_id(&reloaded).expect("CM table must have maxColumnId"),
+        supplied_id
+    );
+    Ok(())
+}
+
+/// ADD COLUMN where the supplied `id` is *less than* the existing `maxColumnId` but does
+/// not collide with any existing field's id: succeeds, with the supplied id preserved
+/// verbatim and `maxColumnId` unchanged. Matches delta-spark; diverges from the Java Kernel
+/// proposal in https://github.com/delta-io/delta/pull/4520, which would reject this.
+#[tokio::test]
+async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    // Pre-populate the table with sparse ids (1, 100) using the create-table preserve path.
+    let schema = Arc::new(StructType::try_new(vec![
+        fixtures::cm_field("a", 1, "phys-a", DataType::INTEGER),
+        fixtures::cm_field("b", 100, "phys-b", DataType::STRING),
+    ])?);
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        schema,
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+    assert_eq!(
+        max_column_id(&snapshot).expect("CM table must have maxColumnId"),
+        100
+    );
+
+    // Now add a new column with id=50, which is well below maxColumnId=100 and not used.
+    let field = fixtures::cm_field("inserted_below_max", 50, "phys-inserted", DataType::STRING);
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let schema = reloaded.schema();
+    let added = schema.field("inserted_below_max").unwrap();
+    assert_eq!(cm_id_for_field(added), 50);
+    assert_eq!(physical_name_for_field(added), "phys-inserted");
+    // maxColumnId stays at 100 because the supplied id (50) didn't exceed it.
+    assert_eq!(
+        max_column_id(&reloaded).expect("CM table must have maxColumnId"),
+        100
+    );
+    Ok(())
+}
+
+/// ADD COLUMN where the supplied `id` collides with an existing field's id: fails. The
+/// duplicate-id check happens when the alter builder constructs the new
+/// `TableConfiguration` via `make_physical`.
+#[tokio::test]
+async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot = create_table_and_load_snapshot(
+        &table_path,
+        simple_schema(),
+        engine.as_ref(),
+        &[("delta.columnMapping.mode", "name")],
+    )?;
+
+    // Pick an id that already exists in the simple_schema (1, 2 typically).
+    let existing_id = snapshot
+        .schema()
+        .field("id")
+        .unwrap()
+        .column_mapping_id()
+        .expect("simple_schema 'id' must have a CM id under name mode");
+
+    let field = fixtures::cm_field("colliding", existing_id, "phys-colliding", DataType::STRING);
+
+    let err = snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Duplicate column mapping ID") && err.contains(&existing_id.to_string()),
+        "expected duplicate-id error naming id {existing_id}, got: {err}"
+    );
+    Ok(())
+}
+
+/// A mapping-disabled table carrying residual `delta.columnMapping.*` annotations reads fine
+/// (`StructField::make_physical` tolerates them), but ALTER is still rejected: the strict check
+/// validates the whole evolved schema, so a stale annotation on an untouched column fails even
+/// when the ALTER only adds a clean column. delta-spark tolerates this; closing the gap is tracked
+/// in https://github.com/delta-io/delta-kernel-rs/issues/2885. This test pins the current strict
+/// behavior until then.
+#[tokio::test]
+async fn add_column_rejected_when_table_has_stale_column_mapping() -> DeltaResult<()> {
+    let (store, engine, table_url) = engine_store_setup("alter_stale_cm", None);
+
+    // `value` carries a stale physicalName + id; protocol omits columnMapping and no mode is set
+    // (resolves to None) -- the enable-then-disable artifact.
+    let stale_schema = StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::INTEGER).add_metadata([
+            ("delta.columnMapping.id", MetadataValue::Number(2)),
+            (
+                "delta.columnMapping.physicalName",
+                MetadataValue::String("col-2f8a".to_string()),
+            ),
+        ]),
+    ])?;
+    let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
+    // v0 written directly to bypass create_table validation (which rejects stale annotations).
+    let v0 = format!(
+        r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}
+{{"metaData":{{"id":"alter-stale-cm","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}
+"#
+    );
+    add_commit(table_url.as_str(), store.as_ref(), 0, v0)
+        .await
+        .unwrap();
+
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+    // Adding a brand-new clean column still fails, and the error names the untouched stale field.
+    let err = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("region", DataType::STRING))
+        .build(&engine, committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Column mapping is not enabled but field 'value'"),
+        "expected the ALTER to be rejected naming the untouched stale field, got: {err}"
+    );
     Ok(())
 }

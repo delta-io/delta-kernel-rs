@@ -10,18 +10,17 @@ use tracing::info;
 
 use crate::actions::visitors::{visit_deletion_vector_at, InCommitTimestampVisitor};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    Metadata, Protocol, ADD_FIELD, CDC_FIELD, COMMIT_INFO_NAME, LOG_ADD_SCHEMA, METADATA_FIELD,
+    PROTOCOL_FIELD, REMOVE_FIELD,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, column_expr_ref, column_name, ColumnName, Expression};
+use crate::expressions::{
+    column_expr, column_expr_ref, column_name, ColumnName, Expression, Predicate,
+};
 use crate::path::{AsUrl, ParsedLogPath};
-use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{
-    ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema as _,
-};
+use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
@@ -58,25 +57,46 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    // Stats-eligible columns for the DataSkippingFilter below. Roughly parallels the scan
+    // path's `StateInfo::physical_stats_columns`. Clustering columns are deliberately not
+    // passed here, for the same reason the scan path leaves them out (see #2588):
+    // loading clustering domain metadata on the table-changes path would add an unbounded
+    // log replay to setup. If #2588 lands a writer-side fix that keeps
+    // `dataSkippingStatsColumns` in sync with clustering, both call sites stay simple.
+    let physical_stats_columns = start_table_configuration.physical_stats_columns_set(None);
+
     let filter = physical_predicate
-        .and_then(|(predicate, ref_schema)| {
-            let stats_schema = build_stats_schema(&ref_schema)?;
+        .and_then(|(predicate, _ref_schema)| {
+            // Build the stats schema via the same path the scan side uses
+            // (`build_expected_stats_schemas`), so the read-side shape matches the write-side
+            // exactly. Predicate refs become the `requested_physical_columns` filter; refs
+            // outside `physical_stats_columns` fold to NULL via `DataSkippingFilter`'s gate.
+            let predicate_refs: Vec<ColumnName> =
+                predicate.references().into_iter().cloned().collect();
+            let physical_stats_schema = start_table_configuration
+                .build_expected_stats_schemas(None, Some(&predicate_refs))
+                .ok()?
+                .physical;
 
             // Parse JSON stats from the raw action batch's `add.stats` column. Unlike the scan
             // path (which transforms first and reads pre-parsed stats), table_changes must
             // resolve deletion vector pairs before filtering, so it operates on raw batches.
             let stats_expr = Arc::new(Expression::parse_json(
                 column_expr!("add.stats"),
-                stats_schema.clone(),
+                physical_stats_schema.clone(),
             ));
             DataSkippingFilter::new(
                 engine.as_ref(),
                 Some(predicate),
-                Some(&stats_schema),
+                Some(&physical_stats_schema),
                 stats_expr,
                 None, // no partition columns for table changes (partition_expr unused)
                 column_expr_ref!("partitionValues_parsed"),
-                get_log_add_schema().clone(),
+                // Raw action batches keep the nested layout, so Add rows are
+                // `add.path IS NOT NULL`.
+                Arc::new(Predicate::is_not_null(column_expr!("add.path")).into()),
+                LOG_ADD_SCHEMA.clone(),
+                &physical_stats_columns,
                 None, // Table changes doesn't use metrics yet
             )
         })
@@ -350,7 +370,7 @@ impl LogReplayScanner {
             .try_into()
             .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            get_log_add_schema().clone(),
+            LOG_ADD_SCHEMA.clone(),
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
             cdf_scan_row_schema().into(),
         )?;
@@ -388,22 +408,17 @@ struct PreparePhaseVisitor<'a> {
     remove_dvs: &'a mut HashMap<String, DvInfo>,
 }
 impl PreparePhaseVisitor<'_> {
-    fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable(ADD_NAME, Add::to_schema()),
-            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-            StructField::nullable(CDC_NAME, Cdc::to_schema()),
-            StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-            StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-            StructField::nullable(
-                COMMIT_INFO_NAME,
-                StructType::new_unchecked([StructField::new(
-                    "inCommitTimestamp",
-                    DataType::LONG,
-                    true,
-                )]),
-            ),
-        ]))
+    fn schema() -> SchemaRef {
+        schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+            (&CDC_FIELD),
+            (&METADATA_FIELD),
+            (&PROTOCOL_FIELD),
+            nullable COMMIT_INFO_NAME: {
+                nullable "inCommitTimestamp": LONG,
+            },
+        }
     }
 }
 
@@ -483,12 +498,12 @@ impl<'a> FileActionSelectionVisitor<'a> {
             remove_dvs,
         }
     }
-    fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable(CDC_NAME, Cdc::to_schema()),
-            StructField::nullable(ADD_NAME, Add::to_schema()),
-            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        ]))
+    fn schema() -> SchemaRef {
+        schema_ref! {
+            (&CDC_FIELD),
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+        }
     }
 }
 

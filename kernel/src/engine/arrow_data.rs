@@ -22,6 +22,7 @@ pub use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
@@ -292,6 +293,14 @@ impl EngineData for ArrowEngineData {
         self: Box<Self>,
         mut selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        require!(
+            selection_vector.len() <= self.len(),
+            Error::InvalidSelectionVector(format!(
+                "Selection vector is larger than data length: {} > {}",
+                selection_vector.len(),
+                self.len()
+            ))
+        );
         selection_vector.resize(self.len(), true);
         let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
         Ok(Box::new(Self::new(filtered)))
@@ -528,7 +537,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{extract_record_batch, ArrowEngineData};
-    use crate::actions::{get_commit_schema, Metadata, Protocol};
+    use crate::actions::{get_commit_schema, Metadata, Protocol, LOG_PROTOCOL_SCHEMA};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
@@ -542,7 +551,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
     use crate::expressions::ArrayData;
-    use crate::schema::{ArrayType, ColumnName, DataType, StructField, StructType};
+    use crate::schema::{schema_ref, ArrayType, ColumnName, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
@@ -574,7 +583,7 @@ mod tests {
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]
         .into();
-        let output_schema = get_commit_schema().project(&["protocol"])?;
+        let output_schema = LOG_PROTOCOL_SCHEMA.clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -676,11 +685,7 @@ mod tests {
             vec![25, 30, 35],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
-            "age",
-            DataType::INTEGER,
-            true,
-        )]));
+        let new_schema = schema_ref! { nullable "age": INTEGER };
 
         let result = arrow_data.append_columns(new_schema, new_columns);
         assert_result_error_with_message(
@@ -741,11 +746,7 @@ mod tests {
             ArrayType::new(DataType::STRING, true),
             Vec::<Option<String>>::new(),
         )?];
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
-            "name",
-            DataType::STRING,
-            true,
-        )]));
+        let new_schema = schema_ref! { nullable "name": STRING };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -898,11 +899,7 @@ mod tests {
             vec![true, false, true],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
-            "active",
-            DataType::BOOLEAN,
-            false,
-        )]));
+        let new_schema = schema_ref! { not_null "active": BOOLEAN };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -1767,5 +1764,23 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_apply_selection_vector_shorter_than_data_keeps_trailing_rows() -> DeltaResult<()> {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b", "c"]));
+        let filtered = data.apply_selection_vector(vec![false])?;
+        let batch = extract_record_batch(filtered.as_ref())?;
+        let column = batch.column(0).as_string::<i32>();
+        let values: Vec<_> = column.iter().flatten().collect();
+        assert_eq!(values, ["b", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_selection_vector_longer_than_data_returns_error() {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b"]));
+        let result = data.apply_selection_vector(vec![true, true, true]);
+        assert_result_error_with_message(result, "Selection vector is larger than data length");
     }
 }

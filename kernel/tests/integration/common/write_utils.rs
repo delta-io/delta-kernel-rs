@@ -6,27 +6,36 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+use delta_kernel::actions::deletion_vector_writer::{
+    KernelDeletionVector, StreamingDeletionVectorWriter,
+};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction, WriteContext};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
-use test_utils::{create_add_files_metadata, create_table, engine_store_setup};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::{
+    begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
+    load_and_begin_transaction,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -69,6 +78,18 @@ pub fn load_existing_single_file_checkpoint_path(
     panic!("checkpoint parquet file not found for version {version} in {log_dir:?}");
 }
 
+/// Open a parquet file and return its root schema.
+pub fn read_parquet_root_schema(parquet_file: &std::path::Path) -> ParquetType {
+    let file = std::fs::File::open(parquet_file).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .clone()
+}
+
 /// Returns the native parquet `field_id` for a field at the given physical path in a parquet file,
 /// or `None` if the field has no `field_id` set.
 ///
@@ -77,15 +98,7 @@ pub fn get_parquet_field_id(
     parquet_file: &std::path::Path,
     physical_path: &[String],
 ) -> Option<i32> {
-    let file = std::fs::File::open(parquet_file).unwrap();
-    let reader = SerializedFileReader::new(file).unwrap();
-    let root = reader
-        .metadata()
-        .file_metadata()
-        .schema_descr()
-        .root_schema()
-        .clone();
-
+    let root = read_parquet_root_schema(parquet_file);
     let mut current = &root;
     for name in physical_path {
         current = current
@@ -97,6 +110,30 @@ pub fn get_parquet_field_id(
 
     let info = current.get_basic_info();
     info.has_id().then(|| info.id())
+}
+
+/// Recursively walks a parquet schema tree and returns a map from each node's absolute
+/// dot-separated path to its `field_id`. Top-level fields appear under their bare name.
+pub fn collect_all_parquet_field_ids(parquet_file: &std::path::Path) -> HashMap<String, i64> {
+    fn walk(t: &ParquetType, path: &str, out: &mut HashMap<String, i64>) {
+        let info = t.get_basic_info();
+        if info.has_id() {
+            out.insert(path.to_string(), info.id() as i64);
+        }
+        if let ParquetType::GroupType { fields, .. } = t {
+            for f in fields {
+                walk(f, &format!("{path}.{}", f.name()), out);
+            }
+        }
+    }
+
+    let mut ids = HashMap::new();
+    if let ParquetType::GroupType { fields, .. } = &read_parquet_root_schema(parquet_file) {
+        for f in fields {
+            walk(f, f.name(), &mut ids);
+        }
+    }
+    ids
 }
 
 /// Validate that `commitInfo["txnId"]` is a valid UUID.
@@ -174,10 +211,7 @@ pub async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let committer = Box::new(FileSystemCommitter::new());
-    let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
+    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), engine.as_ref())?
         .with_data_change(true);
 
     // create two new arrow record batches to append
@@ -319,11 +353,11 @@ pub fn assert_min_max_stats(
     expected_max: impl Into<serde_json::Value>,
 ) {
     assert_eq!(
-        *resolve_json_path(&stats["minValues"], physical_path),
+        *resolve_json_path(&stats[MIN_VALUES], physical_path),
         expected_min.into()
     );
     assert_eq!(
-        *resolve_json_path(&stats["maxValues"], physical_path),
+        *resolve_json_path(&stats[MAX_VALUES], physical_path),
         expected_max.into()
     );
 }
@@ -359,9 +393,7 @@ pub async fn create_dv_table_with_files(
 
     // Write files
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("WRITE".to_string())
         .with_data_change(true);
@@ -369,7 +401,7 @@ pub async fn create_dv_table_with_files(
     let add_files_schema = txn.add_files_schema();
 
     // Build metadata for all files at once
-    let files: Vec<(&str, i64, i64, i64)> = file_paths
+    let files: Vec<(&str, i64, i64, Option<i64>)> = file_paths
         .iter()
         .enumerate()
         .map(|(i, &path)| {
@@ -377,7 +409,7 @@ pub async fn create_dv_table_with_files(
                 path,
                 1024 + i as i64 * 100, // size
                 1000000 + i as i64,    // mod_time
-                3,                     // num_records
+                Some(3),               // num_records
             )
         })
         .collect();
@@ -402,4 +434,34 @@ pub fn get_scan_files(
         .into_iter()
         .map(|sm| sm.scan_files)
         .collect())
+}
+
+/// Serialize a deletion vector, write it to the object store, and return its descriptor.
+pub async fn write_deletion_vector_to_store(
+    store: &Arc<dyn ObjectStore>,
+    write_context: &WriteContext,
+    dv: KernelDeletionVector,
+    prefix: &str,
+) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {
+    let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
+    let dv_object_path = Path::parse(dv_path.absolute_path()?.path())?;
+
+    let mut dv_buffer = Vec::new();
+    let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_buffer);
+    let dv_write_result = dv_writer.write_deletion_vector(dv)?;
+    dv_writer.finalize()?;
+
+    ObjectStoreExt::put(store, &dv_object_path, dv_buffer.into()).await?;
+
+    Ok(dv_write_result.to_descriptor(&dv_path))
+}
+
+/// Begin a transaction set up for deletion vector updates.
+pub fn create_dv_update_transaction(
+    table_url: &Url,
+    engine: &dyn Engine,
+) -> Result<Transaction, Box<dyn std::error::Error>> {
+    Ok(load_and_begin_transaction(table_url.clone(), engine)?
+        .with_engine_info("test engine")
+        .with_operation("DELETE".to_string()))
 }

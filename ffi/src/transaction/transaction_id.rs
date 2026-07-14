@@ -86,7 +86,7 @@ mod tests {
     use crate::ffi_test_utils::ok_or_panic;
     use crate::kernel_string_slice;
     use crate::tests::get_default_engine;
-    use crate::transaction::{commit, transaction};
+    use crate::transaction::{commit, free_committed_transaction, transaction};
 
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
@@ -137,7 +137,9 @@ mod tests {
             });
 
             // commit!
-            ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
+            let committed =
+                ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
+            unsafe { free_committed_transaction(committed) };
 
             let snapshot: Arc<Snapshot> = Snapshot::builder_for(table_url.clone())
                 .at_version(1)

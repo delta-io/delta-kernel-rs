@@ -6,12 +6,13 @@ use std::sync::Arc;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::transaction::create_table::create_table as create_table_txn;
 use delta_kernel::Snapshot;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    create_table_and_load_snapshot, read_add_infos, test_table_setup, write_batch_to_table,
+    begin_transaction, create_table_and_load_snapshot, read_add_infos, test_table_setup,
+    write_batch_to_table,
 };
 use url::Url;
 
@@ -23,10 +24,7 @@ async fn write_batch_to_table_simple(
     engine: &DefaultEngine<TokioBackgroundExecutor>,
     data: RecordBatch,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
-        .with_engine_info("test");
+    let mut txn = begin_transaction(snapshot.clone(), engine)?.with_engine_info("test");
     let write_context = txn.unpartitioned_write_context()?;
     let add_meta = engine
         .write_parquet(&ArrowEngineData::new(data), &write_context)
@@ -76,10 +74,7 @@ async fn test_multiple_files_in_commit_all_use_relative_paths(
     let snapshot =
         create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
 
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_engine_info("test");
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?.with_engine_info("test");
     let write_context = txn.unpartitioned_write_context().unwrap();
     for values in [vec![1, 2], vec![3, 4]] {
         let add_meta = engine

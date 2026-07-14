@@ -43,7 +43,7 @@ pub(crate) fn validate_variant_type_feature_support(tc: &TableConfiguration) -> 
 #[cfg(test)]
 mod tests {
     use crate::actions::Protocol;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema, DataType, StructField};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::{
         assert_result_error_with_message, assert_schema_feature_validation,
@@ -73,26 +73,18 @@ mod tests {
 
     #[test]
     fn test_variant_feature_validation() {
-        let schema_with = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ]);
-        let schema_without = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
-        let nested_schema_with = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
-                    "inner_v",
-                    DataType::unshredded_variant(),
-                    true,
-                )]))),
-                true,
-            ),
-        ]);
+        let schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "v": (DataType::unshredded_variant()),
+        };
+        let schema_without = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let nested_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_v": (DataType::unshredded_variant()) },
+        };
         let protocol_without =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
         let err_msg = "Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features";

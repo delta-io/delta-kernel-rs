@@ -54,7 +54,7 @@
 //! let snapshot = Snapshot::builder_for(url).build(engine)?;
 //!
 //! // Create a checkpoint writer from the snapshot
-//! let writer = snapshot.create_checkpoint_writer()?;
+//! let writer = snapshot.create_checkpoint_writer(engine)?;
 //!
 //! // Get the checkpoint path and data
 //! let checkpoint_path = writer.checkpoint_path()?;
@@ -99,7 +99,7 @@
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 //! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 //! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tracing::info;
 use url::Url;
@@ -111,29 +111,35 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
-    CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
+    REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{Expression, Scalar, StructData, Transform};
+use crate::expressions::{
+    lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar, StructData,
+};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta, Version,
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, EvaluationHandlerExtension,
+    FileMeta, Version,
 };
 
+#[cfg(feature = "declarative-plans")]
+mod checkpoint_shape;
 mod checkpoint_transform;
 mod sidecar;
 
+#[cfg(feature = "declarative-plans")]
+#[allow(unused_imports)]
+pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
-    build_checkpoint_output_schema, build_checkpoint_read_schema, build_checkpoint_transform,
-    StatsTransformConfig,
+    build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };
 use sidecar::{create_sidecar_action_batch, SidecarSplitter, SingleSidecarDataIterator};
 #[cfg(test)]
@@ -308,21 +314,21 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 /// Action fields shared by V1 and V2 checkpoint schemas.
-fn base_checkpoint_action_fields() -> Vec<StructField> {
-    vec![
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
+    [
+        &ADD_FIELD,
+        &REMOVE_FIELD,
+        &METADATA_FIELD,
+        &PROTOCOL_FIELD,
+        &SET_TRANSACTION_FIELD,
+        &DOMAIN_METADATA_FIELD,
+        &SIDECAR_FIELD,
     ]
 }
 
 /// Schema for V1 checkpoints (without checkpointMetadata action)
 static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(StructType::new_unchecked(base_checkpoint_action_fields())));
+    lazy_schema_ref! { ..(base_checkpoint_action_fields()) };
 
 /// Schema for the checkpointMetadata field in V2 checkpoints.
 /// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
@@ -335,11 +341,10 @@ fn checkpoint_metadata_field() -> StructField {
 }
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action)
-static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields = base_checkpoint_action_fields();
-    fields.push(checkpoint_metadata_field());
-    Arc::new(StructType::new_unchecked(fields))
-});
+static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(base_checkpoint_action_fields()),
+    (checkpoint_metadata_field()),
+};
 
 /// Orchestrates the process of creating a checkpoint for a table.
 ///
@@ -363,8 +368,10 @@ pub struct CheckpointWriter {
     /// field here to avoid multiple type conversions.
     version: i64,
 
-    /// Cached checkpoint output schema.
-    checkpoint_output_schema: OnceLock<SchemaRef>,
+    is_v2: bool,
+    read_schema: SchemaRef,
+    output_schema: SchemaRef,
+    transform_expr: ExpressionRef,
 }
 
 impl RetentionCalculator for CheckpointWriter {
@@ -375,7 +382,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: SnapshotRef) -> DeltaResult<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
         let version = i64::try_from(snapshot.version()).map_err(|e| {
             Error::CheckpointWrite(format!(
                 "Failed to convert checkpoint version from u64 {} to i64: {}",
@@ -388,29 +395,27 @@ impl CheckpointWriter {
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
 
+        let schema_context = Self::checkpoint_schema_context(&snapshot, engine)?;
+        let read_schema = build_checkpoint_read_schema(
+            &schema_context.checkpoint_base_schema,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_deref(),
+        )?;
+        let (output_schema, transform_expr) = build_checkpoint_transform(
+            &schema_context.stats_config,
+            &read_schema,
+            &schema_context.stats_schema,
+            schema_context.partition_schema.as_ref(),
+        )?;
+
         Ok(Self {
             snapshot,
             version,
-            checkpoint_output_schema: OnceLock::new(),
+            is_v2: schema_context.is_v2,
+            read_schema,
+            output_schema,
+            transform_expr,
         })
-    }
-    /// Returns the cached output schema, initializing it with `f` on first call.
-    ///
-    /// `OnceLock::get_or_try_init` is unstable, so we use a custom implementation.
-    /// (tracking issue: <https://github.com/rust-lang/rust/issues/109737>).
-    fn get_or_init_output_schema(
-        &self,
-        f: impl FnOnce() -> DeltaResult<SchemaRef>,
-    ) -> DeltaResult<SchemaRef> {
-        if let Some(schema) = self.checkpoint_output_schema.get() {
-            return Ok(schema.clone());
-        }
-        let schema = f()?;
-        let _ = self.checkpoint_output_schema.set(schema);
-        self.checkpoint_output_schema
-            .get()
-            .cloned()
-            .ok_or_else(|| Error::internal_error("OnceLock should be initialized"))
     }
 
     /// Returns the URL where the checkpoint file should be written.
@@ -468,29 +473,11 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<ActionReconciliationIterator> {
-        let schema_context = self.checkpoint_schema_context(engine)?;
-
-        // The read schema and output schema differ because the transform needs access to
-        // both stats formats as input, but may only write one format as output.
-        //
-        // read_schema: Always includes both `stats` and `stats_parsed` fields in the Add
-        // action, so COALESCE expressions can read from either source. For commit files,
-        // `stats_parsed` doesn't exist and is read as nulls. For partitioned tables,
-        // `partitionValues_parsed` is also included.
-        //
-        // output_schema: Only includes the stats fields that the table config requests
-        // (e.g., only `stats` if writeStatsAsJson=true and writeStatsAsStruct=false).
-        let read_schema = build_checkpoint_read_schema(
-            &schema_context.checkpoint_base_schema,
-            &schema_context.stats_schema,
-            schema_context.partition_schema.as_deref(),
-        )?;
-
         // Read actions from log segment
         let actions = self
             .snapshot
             .log_segment()
-            .read_actions(engine, read_schema.clone())?;
+            .read_actions(engine, self.read_schema.clone())?;
 
         // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
@@ -499,26 +486,12 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        let output_schema = self.get_or_init_output_schema(|| {
-            build_checkpoint_output_schema(
-                &schema_context.stats_config,
-                &schema_context.checkpoint_base_schema,
-                &schema_context.stats_schema,
-                schema_context.partition_schema.as_deref(),
-            )
-        })?;
-
-        // Build transform expression and create expression evaluator.
+        // Create the expression evaluator for the checkpoint transform.
         // The transform is applied to reconciled action batches only (not checkpoint metadata).
-        let transform_expr = build_checkpoint_transform(
-            &schema_context.stats_config,
-            &schema_context.stats_schema,
-            schema_context.partition_schema.as_ref(),
-        );
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
-            read_schema,
-            transform_expr,
-            output_schema.clone().into(),
+            self.read_schema.clone(),
+            self.transform_expr.clone(),
+            self.output_schema.clone().into(),
         )?;
 
         // Apply stats transform to each reconciled batch
@@ -536,9 +509,9 @@ impl CheckpointWriter {
         // For V2 checkpoints, chain the checkpoint metadata batch after the transformed
         // action stream. The metadata batch is created with the output schema directly,
         // bypassing the stats transform (it has no add actions to transform).
-        let checkpoint_metadata = schema_context
+        let checkpoint_metadata = self
             .is_v2
-            .then(|| self.create_checkpoint_metadata_batch(engine, &output_schema));
+            .then(|| self.create_checkpoint_metadata_batch(engine, &self.output_schema));
 
         Ok(ActionReconciliationIterator::new(Box::new(
             transformed.chain(checkpoint_metadata),
@@ -606,22 +579,13 @@ impl CheckpointWriter {
         engine: &dyn Engine,
         file_actions_per_sidecar_hint: usize,
     ) -> DeltaResult<WrittenCheckpointInfo> {
-        let output_schema = self.get_or_init_output_schema(|| {
-            let ctx = self.checkpoint_schema_context(engine)?;
-            build_checkpoint_output_schema(
-                &ctx.stats_config,
-                &ctx.checkpoint_base_schema,
-                &ctx.stats_schema,
-                ctx.partition_schema.as_deref(),
-            )
-        })?;
         let data_iter = self.checkpoint_data(engine)?;
         let iter_state = data_iter.state();
 
         let splitter = SidecarSplitter::new_mut_shared(
             data_iter,
             engine.evaluation_handler().as_ref(),
-            output_schema.clone(),
+            self.output_schema.clone(),
         )?;
 
         // Write sidecar files
@@ -658,11 +622,12 @@ impl CheckpointWriter {
         // the `sidecar` column, e.g. `sidecar: { path: "<sidecar_filename>.parquet", sizeInBytes:
         // <size>, modificationTime: <time>, tags: null }`, with all other action columns
         // left null.
-        let sidecar_batch = create_sidecar_action_batch(engine, &output_schema, &sidecar_metas)?;
+        let sidecar_batch =
+            create_sidecar_action_batch(engine, &self.output_schema, &sidecar_metas)?;
 
         // Write main checkpoint file: non-file actions + sidecar references
         let checkpoint_path = self.checkpoint_path()?;
-        let main_data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        let main_data: DeltaResultIteratorStatic<Box<dyn EngineData>> =
             Box::new(non_file_batches.into_iter().chain(sidecar_batch).map(Ok));
         engine
             .parquet_handler()
@@ -740,15 +705,13 @@ impl CheckpointWriter {
             vec![Scalar::from(self.version)],
         )?);
 
-        // Use a Transform to set just the checkpointMetadata field, keeping others null
-        let transform = Transform::new_top_level().with_replaced_field(
-            CHECKPOINT_METADATA_NAME,
-            Arc::new(Expression::literal(checkpoint_metadata_value)),
-        );
+        // Use a struct patch to set just the checkpointMetadata field, keeping others null
+        let patch = ExpressionStructPatchBuilder::new()
+            .replace(CHECKPOINT_METADATA_NAME, lit(checkpoint_metadata_value));
 
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             schema.clone(),
-            Arc::new(Expression::transform(transform)),
+            Arc::new(Expression::struct_patch(patch)?),
             schema.clone().into(),
         )?;
 
@@ -765,11 +728,11 @@ impl CheckpointWriter {
 
     /// Helper for computing the checkpoint schema context from the snapshot and engine.
     fn checkpoint_schema_context(
-        &self,
+        snapshot: &SnapshotRef,
         engine: &dyn Engine,
     ) -> DeltaResult<CheckpointSchemaContext> {
-        let tc = self.snapshot.table_configuration();
-        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+        let tc = snapshot.table_configuration();
+        let config = StatsTransformConfig::from_table_properties(snapshot.table_properties());
 
         // Select schema based on V2 checkpoint support
         let is_v2 = tc.is_feature_supported(&TableFeature::V2Checkpoint);
@@ -780,7 +743,7 @@ impl CheckpointWriter {
         };
 
         // Get clustering columns so they are always included in stats per the Delta protocol.
-        let physical_clustering_columns = self.snapshot.get_physical_clustering_columns(engine)?;
+        let physical_clustering_columns = snapshot.get_physical_clustering_columns(engine)?;
 
         // Get stats schema from table configuration.
         // This already excludes partition columns and applies column mapping.

@@ -2,13 +2,19 @@
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
+// Crate-visible alias so kernel code avoids the deprecated `pub` re-export above.
+pub(crate) use column_mapping::validate_schema_column_mapping as validate_schema_column_mapping_strict;
 pub use column_mapping::ColumnMappingMode;
+#[internal_api]
+pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
-    assign_column_mapping_metadata, column_mapping_mode, find_max_column_id_in_schema,
-    get_column_mapping_mode_from_properties, get_field_column_mapping_info,
-    physical_to_logical_column_name, try_assign_field_column_mapping,
+    column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
+    validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -21,9 +27,11 @@ use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use crate::table_properties::TableProperties;
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+mod iceberg_compat;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -62,7 +70,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 /// - **WriterOnly** (applies only to writers).
 /// There are no ReaderOnly features. See `TableFeature::feature_type` for the category of each.
 ///
-/// The kernel currently supports all reader features except `V2Checkpoint`.
+/// The kernel currently supports all reader features.
 #[derive(
     Serialize,
     Deserialize,
@@ -76,11 +84,7 @@ pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
     EnumCount,
     Hash,
 )]
-#[strum(
-    serialize_all = "camelCase",
-    parse_err_fn = xxx__not_needed__default_variant_means_parsing_is_infallible__xxx,
-    parse_err_ty = Infallible // ignored, sadly: https://github.com/Peternator7/strum/issues/430
-)]
+#[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 #[derive(EnumIter)]
@@ -121,6 +125,11 @@ pub(crate) enum TableFeature {
     ClusteredTable,
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
+    /// Column Default Values.
+    ///
+    /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
+    /// the `column-defaults-in-dev` cargo feature.
+    AllowColumnDefaults,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -154,9 +163,16 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantType-preview")]
     #[serde(rename = "variantType-preview")]
     VariantTypePreview,
+    VariantShredding,
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    /// Iceberg V4 adaptive metadata tree as the table's native content metadata format.
+    ///
+    /// TODO(#2866): gated by the `adaptive-metadata-in-dev` cargo feature until fully supported.
+    #[strum(serialize = "adaptiveMetadata-preview")]
+    #[serde(rename = "adaptiveMetadata-preview")]
+    AdaptiveMetadataPreview,
 
     #[serde(untagged)]
     #[strum(default)]
@@ -237,10 +253,7 @@ pub(crate) enum FeatureRequirement {
     NotSupported(TableFeature),
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
-    /// Custom validation logic. Currently unused, but already integrated into the
-    /// validation pipeline(`TableConfiguration::validate_feature_requirements`), so kept for
-    /// future use.
-    #[allow(dead_code)]
+    /// Custom validation logic run against the protocol and table properties.
     Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
 
@@ -346,6 +359,16 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+// TODO(#2538): Currently we reject `Transaction::commit` when it contains staged remove-file
+// actions on RowTracking-supported (and not-suspended) tables because
+//   1. kernel does not yet materialize stable row IDs / commit versions on write, which blocks COW
+//      rewrites,
+//   2. kernel does not yet validate if remove actions correctly reserved row IDs / commit versions.
+// Unblock after both 1 and 2 are supported.
+//
+// TODO: When kernel writes the materialized `row_id` / `row_commit_version` columns, they must
+// use the reserved parquet field IDs defined by the protocol on IcebergCompatV3 tables, not
+// auto-assigned IDs.
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -416,6 +439,18 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// TODO: Implement the write-side requirements for IcebergCompatV3.
 /// TODO: Support ALTER TABLE on tables with IcebergCompatV3 enabled.
 ///
+/// Attention in the future:
+/// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
+///   tables.
+/// - Column defaults: when supported, only literal expressions are allowed.
+/// - REPLACE TABLE: when supported, partition columns must not change across the replace.
+/// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
+///   always use INT64; INT96 is forbidden.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
+///   disable IcebergCompatV3 on an existing table.
+/// - Void type: when delta-spark supports VOID type on icebergCompatV3 tables, add it to V3's type
+///   allowlist (`is_v3_supported_type` in `iceberg_compat::v3`).
+///
 /// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/2492>
 static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
@@ -431,7 +466,7 @@ static ICEBERG_COMPAT_V3_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV2),
     ],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v3 == Some(true)
     }),
@@ -453,10 +488,22 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2630): drop the gate once column-defaults is fully supported.
+static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "column-defaults-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "column-defaults-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
@@ -469,7 +516,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
-    feature_requirements: &[],
+    feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
     kernel_support: KernelSupport::Custom(|_, _, op| match op {
         Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
@@ -494,8 +541,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    // We support writing to tables with DeletionVectors enabled, but we never write DV files
-    // ourselves (no DML). The kernel only performs append operations.
+    // The kernel can read DV-bearing tables and install connector-authored DV descriptors via
+    // `Transaction::update_deletion_vectors`, including through the FFI
+    // `transaction_update_deletion_vectors` path.
     kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
@@ -510,6 +558,9 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+/// TODO: When type widening is supported on writes, restrict the allowed
+/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
+/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -523,6 +574,9 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
+/// TODO: When type widening is supported on writes, restrict the allowed
+/// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg
+/// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -568,11 +622,48 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+static VARIANT_SHREDDING_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+// Dependencies per the adaptiveMetadata RFC (delta-io/delta#6978) "Table Feature Enablement"
+// section. Enforcement is covered by `test_adaptive_metadata_feature_requirements`.
+// TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
+static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[
+        FeatureRequirement::Enabled(TableFeature::ColumnMapping),
+        FeatureRequirement::Custom(|_protocol, properties| {
+            require!(
+                properties.column_mapping_mode == Some(ColumnMappingMode::Id),
+                Error::invalid_protocol(
+                    "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
+                )
+            );
+            Ok(())
+        }),
+        FeatureRequirement::Enabled(TableFeature::RowTracking),
+        FeatureRequirement::Enabled(TableFeature::DomainMetadata),
+        FeatureRequirement::Enabled(TableFeature::DeletionVectors),
+        FeatureRequirement::Enabled(TableFeature::InCommitTimestamp),
+    ],
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -606,7 +697,9 @@ impl TableFeature {
             | TableFeature::VacuumProtocolCheck
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
-            | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
+            | TableFeature::VariantShredding
+            | TableFeature::VariantShreddingPreview
+            | TableFeature::AdaptiveMetadataPreview => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -621,6 +714,7 @@ impl TableFeature {
             | TableFeature::IcebergCompatV3
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
+            TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -656,6 +750,7 @@ impl TableFeature {
             TableFeature::IcebergCompatV3 => &ICEBERG_COMPAT_V3_INFO,
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
+            TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -669,7 +764,9 @@ impl TableFeature {
             TableFeature::VacuumProtocolCheck => &VACUUM_PROTOCOL_CHECK_INFO,
             TableFeature::VariantType => &VARIANT_TYPE_INFO,
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
+            TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
+            TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
             TableFeature::Unknown(_) => &UNKNOWN_FEATURE_INFO,
@@ -696,38 +793,15 @@ impl TableFeature {
     }
 }
 
-/// Like `Into<TableFeature>`, but avoids collisions between strum's derived `EnumString` and the
-/// blanket impl `TryFrom<&str>` that `From<&str> for TableFeature` would trigger.
-///
-/// Parsing is infallible: the `Unknown` default variant catches any unrecognized feature name. If
-/// https://github.com/Peternator7/strum/pull/432 merges, use impl From for TableFeature instead.
-pub(crate) trait IntoTableFeature {
-    fn into_table_feature(self) -> TableFeature;
-}
-
-impl IntoTableFeature for TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self
+impl From<String> for TableFeature {
+    fn from(value: String) -> Self {
+        value.as_str().into()
     }
 }
 
-impl IntoTableFeature for &TableFeature {
-    fn into_table_feature(self) -> TableFeature {
-        self.clone()
-    }
-}
-
-/// Parsing is infallible thanks to `TableFeature::Unknown` default variant
-impl IntoTableFeature for &str {
-    fn into_table_feature(self) -> TableFeature {
-        #[allow(clippy::unwrap_used)] // infallible, see strum parse_err_fn
-        self.parse().unwrap()
-    }
-}
-
-impl IntoTableFeature for String {
-    fn into_table_feature(self) -> TableFeature {
-        self.as_str().into_table_feature()
+impl From<&TableFeature> for TableFeature {
+    fn from(value: &TableFeature) -> Self {
+        value.clone()
     }
 }
 
@@ -737,8 +811,119 @@ pub(crate) fn format_features(features: &[TableFeature]) -> String {
     format!("[{}]", feature_strings.join(", "))
 }
 
+/// Extract the reader features enabled for `protocol`. For `min_reader_version == 3` returns the
+/// explicit `reader_features` list; for `1..=2` returns the legacy-inferred features.
+pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableFeature> {
+    match protocol.min_reader_version() {
+        TABLE_FEATURES_MIN_READER_VERSION => protocol
+            .reader_features()
+            .map(|f| f.to_vec())
+            .unwrap_or_default(),
+        v if (1..=2).contains(&v) => LEGACY_READER_FEATURES
+            .iter()
+            .filter(|f| f.is_valid_for_legacy_reader(v))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
+pub(crate) fn add_feature_to_lists(
+    feature: TableFeature,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    match feature.feature_type() {
+        FeatureType::ReaderWriter => {
+            if !reader_features.contains(&feature) {
+                reader_features.push(feature.clone());
+            }
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+        FeatureType::WriterOnly | FeatureType::Unknown => {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+    }
+}
+
+/// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
+/// satisfied by `table_properties`, appending it to `reader_features`/`writer_features`
+/// (deduplicated). Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they need
+/// no property-driven enablement. `RowTracking` additionally pulls in its `DomainMetadata`
+/// dependency.
+pub(crate) fn auto_enable_property_driven_features(
+    allowed_table_features: &[TableFeature],
+    table_properties: &TableProperties,
+    reader_features: &mut Vec<TableFeature>,
+    writer_features: &mut Vec<TableFeature>,
+) {
+    for table_feature in allowed_table_features {
+        if let EnablementCheck::EnabledIf(check) = table_feature.info().enablement_check {
+            if check(table_properties) {
+                add_feature_to_lists(table_feature.clone(), reader_features, writer_features);
+                if *table_feature == TableFeature::RowTracking {
+                    add_feature_to_lists(
+                        TableFeature::DomainMetadata,
+                        reader_features,
+                        writer_features,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Enforce that `protocol.min_reader_version()` lies within
+/// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
+/// [`Error::InvalidProtocol`]; above the maximum yields [`Error::Unsupported`].
+pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
+    require!(
+        protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
+        Error::InvalidProtocol(format!(
+            "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
+            protocol.min_reader_version()
+        ))
+    );
+    if protocol.min_reader_version() > MAX_VALID_READER_VERSION {
+        return Err(Error::unsupported(format!(
+            "Unsupported minimum reader version {}",
+            protocol.min_reader_version()
+        )));
+    }
+    Ok(())
+}
+
+/// Protocol-level check that the kernel can read tables governed by `protocol`.
+///
+/// Unlike `TableConfiguration::ensure_operation_supported`, this does not require a
+/// `Metadata` action or any table properties.
+pub(crate) fn ensure_table_can_be_read(protocol: &Protocol) -> DeltaResult<()> {
+    check_reader_version_range(protocol)?;
+
+    for feature in extract_enabled_reader_features(protocol) {
+        match feature.info().kernel_support {
+            KernelSupport::Supported => {}
+            KernelSupport::NotSupported => {
+                return Err(Error::unsupported(format!(
+                    "Feature '{feature}' is not supported by kernel",
+                )));
+            }
+            KernelSupport::Custom(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -775,6 +960,92 @@ mod tests {
         assert_eq!(&typed_writer, mixed_writer);
     }
 
+    /// Expected outcome of `ensure_table_can_be_read` for a given protocol: either readable,
+    /// or an error of a specific variant.
+    enum ExpectRead {
+        Ok,
+        InvalidProtocol,
+        Unsupported,
+    }
+
+    #[rstest]
+    #[case::reader_version_below_minimum(
+        Protocol::new_unchecked(0, 1, None, None),
+        ExpectRead::InvalidProtocol
+    )]
+    #[case::reader_version_above_maximum(
+        Protocol::new_unchecked(99, 1, None, None),
+        ExpectRead::Unsupported
+    )]
+    #[case::legacy_reader_v1(Protocol::try_new_legacy(1, 1).unwrap(), ExpectRead::Ok)]
+    #[case::legacy_reader_v2(Protocol::try_new_legacy(2, 5).unwrap(), ExpectRead::Ok)]
+    #[case::v3_empty_reader_features(
+        Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![])),
+        ExpectRead::Ok
+    )]
+    #[case::supported_explicit_feature(
+        Protocol::try_new_modern(
+            [TableFeature::DeletionVectors],
+            [TableFeature::DeletionVectors],
+        )
+        .unwrap(),
+        ExpectRead::Ok
+    )]
+    #[case::unknown_reader_feature(
+        Protocol::try_new_modern(
+            [TableFeature::unknown("notARealFeature")],
+            [TableFeature::unknown("notARealFeature")],
+        )
+        .unwrap(),
+        ExpectRead::Unsupported
+    )]
+    #[case::custom_support_feature(
+        Protocol::try_new_modern(
+            [TableFeature::CatalogManaged],
+            [TableFeature::CatalogManaged],
+        )
+        .unwrap(),
+        ExpectRead::Ok
+    )]
+    // adaptiveMetadata-preview is gated by the `adaptive-metadata-in-dev` cargo feature: readable
+    // only when the flag is on, otherwise rejected as unsupported.
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case::adaptive_metadata_supported(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Ok
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "adaptive-metadata-in-dev"),
+        case::adaptive_metadata_gated_off(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Unsupported
+        )
+    )]
+    fn validate_protocol_for_read(#[case] protocol: Protocol, #[case] expected: ExpectRead) {
+        let result = ensure_table_can_be_read(&protocol);
+        match expected {
+            ExpectRead::Ok => result.expect("protocol must be readable"),
+            ExpectRead::InvalidProtocol => assert!(
+                matches!(result, Err(Error::InvalidProtocol(_))),
+                "expected InvalidProtocol, got: {result:?}"
+            ),
+            ExpectRead::Unsupported => assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "expected Unsupported, got: {result:?}"
+            ),
+        }
+    }
+
     #[test]
     fn test_roundtrip_table_features() {
         use strum::IntoEnumIterator as _;
@@ -806,13 +1077,16 @@ mod tests {
                 TableFeature::VacuumProtocolCheck => "vacuumProtocolCheck",
                 TableFeature::VariantType => "variantType",
                 TableFeature::VariantTypePreview => "variantType-preview",
+                TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
+                TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 
             // strum
             assert_eq!(feature.to_string(), expected);
-            assert_eq!(feature, expected.into_table_feature());
+            assert_eq!(feature, TableFeature::from(expected));
 
             // json
             let serialized = serde_json::to_string(&feature).unwrap();

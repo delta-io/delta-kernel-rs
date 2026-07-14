@@ -2,9 +2,10 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    MapToStructExpression, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate,
-    Scalar, Transform, UnaryExpression, UnaryPredicate, VariadicExpression,
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef,
+    ExpressionStructPatch, JunctionPredicate, MapToStructExpression, OpaqueExpression,
+    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression, UnaryPredicate,
+    VariadicExpression,
 };
 use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
@@ -110,11 +111,14 @@ pub trait ExpressionTransform<'a> {
         Carrier::from_inner(Cow::Borrowed(name))
     }
 
-    /// Called for each transform expression encountered during the traversal (leaf).
+    /// Called for each struct patch expression encountered during the traversal (leaf).
     ///
     /// The provided implementation does _NOT_ recurse into its children.
-    fn transform_expr_transform(&mut self, transform: &'a Transform) -> Self::Output<Transform> {
-        Carrier::from_inner(Cow::Borrowed(transform))
+    fn transform_expr_struct_patch(
+        &mut self,
+        patch: &'a ExpressionStructPatch,
+    ) -> Self::Output<ExpressionStructPatch> {
+        Carrier::from_inner(Cow::Borrowed(patch))
     }
 
     /// Called for each parse-json expression encountered during the traversal. The provided
@@ -230,9 +234,9 @@ pub trait ExpressionTransform<'a> {
                 let map_owned = |exprs| Expression::Struct(exprs, nullability.clone());
                 map_owned_or_else(expr, self.transform_expr_struct(s), map_owned)
             }
-            Expression::Transform(t) => {
-                let child = self.transform_expr_transform(t);
-                map_owned_or_else(expr, child, Expression::Transform)
+            Expression::StructPatch(t) => {
+                let child = self.transform_expr_struct_patch(t);
+                map_owned_or_else(expr, child, Expression::StructPatch)
             }
             Expression::Unary(u) => {
                 let child = self.transform_expr_unary(u);

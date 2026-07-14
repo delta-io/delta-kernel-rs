@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.22.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.25.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -50,8 +50,9 @@ rand = "0.9"
 roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
+prost = { version = "0.13", optional = true }
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = "0.3"
 url = "2"
@@ -59,28 +60,11 @@ uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 
 # optional deps
-futures = { version = "0.3", optional = true }
-# Used for fetching direct urls (like pre-signed urls). We disable `default-tls` to avoid
-# pulling in a second rustls crypto provider that conflicts with transitive deps (see
-# feature-tests for a regression test). Each default-engine-* feature selects its TLS backend.
-reqwest = { version = "0.13", default-features = false, optional = true, features = ["charset", "http2", "system-proxy"] }
-# optionally used with default engine (though not required)
-tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
+# `reqwest` is only needed for the gated `Error::Reqwest` variant; the actual HTTP client
+# lives in the `delta_kernel_default_engine` crate now.
+reqwest = { version = "0.13", default-features = false, optional = true }
 # both arrow versions below are optional and require object_store
-object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
-object_store_13 = { package = "object_store", version = "0.13.1", optional = true, features = ["aws", "azure", "gcp", "http"] }
-
-# arrow 57
-[dependencies.arrow_57]
-package = "arrow"
-version = "57"
-features = ["chrono-tz", "ffi", "json"]
-optional = true
-[dependencies.parquet_57]
-package = "parquet"
-version = "57"
-features = ["async", "object_store"]
-optional = true
+object_store_13 = { package = "object_store", version = "0.13.2", optional = true, features = ["aws", "azure", "gcp", "http"] }
 
 # arrow 58
 [dependencies.arrow_58]
@@ -94,52 +78,82 @@ version = "58"
 features = ["async", "object_store"]
 optional = true
 
+# arrow 59
+[dependencies.arrow_59]
+package = "arrow"
+version = "59"
+features = ["chrono-tz", "ffi", "json"]
+optional = true
+[dependencies.parquet_59]
+package = "parquet"
+version = "59"
+features = ["async", "object_store"]
+optional = true
+
 [features]
 # no default features
 default = []
-# internal-api will make everything marked #[internal_api] public
+# internal-api will make everything marked #[internal_api] public.
 internal-api = []
 # prettyprint enables Arrow pretty-print helpers (test/example oriented).
-prettyprint = ["arrow_57?/prettyprint", "arrow_58?/prettyprint"]
+prettyprint = ["arrow_58?/prettyprint", "arrow_59?/prettyprint"]
 # test-utils exposes test-only constructors for downstream crate tests
 test-utils = ["prettyprint"]
 # integration-test turns on a particularly heavy test for hdfs-object-store
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-58"] # latest arrow version
+arrow = ["arrow-59"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
 arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
+arrow-59 = ["dep:arrow_59", "dep:parquet_59", "dep:object_store_13"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 
 # Schema diffing functionality (experimental)
 schema-diff = []
 
-# this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
-# and default-engine-rustls
+# Declarative plan IR (experimental).
+declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored"]
+
+# Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
+# work. TODO(#2630): remove once full column-defaults support ships.
+column-defaults-in-dev = []
+
+# Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
+# work: the SQL predicate parser and, later, `checkConstraints` write enforcement. Remove once
+# full check-constraints support ships.
+check-constraints-in-dev = []
+# Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
+# (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
+adaptive-metadata-in-dev = []
+
+# Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,
+# ensure_data_types, parquet_row_group_skipping). Used by the delta_kernel_default_engine crate
+# and the SyncEngine. Keeps `reqwest` only for the gated `Error::Reqwest` variant.
 default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
-  "futures",
   "need-arrow",
-  "tokio",
+  "reqwest",
 ]
-# default-engine-native-tls enables reqwest with the native-tls backend. If you want to use
-# rustls instead, use 'default-engine-rustls' which has no native-tls dependency.
-default-engine-native-tls = ["default-engine-base", "reqwest/native-tls"]
-default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
 
 [build-dependencies]
 rustc_version = "0.4.1"
+# Proto codegen, only pulled in / run under the `declarative-plans` feature.
+prost-build = { version = "0.13", optional = true }
+protoc-bin-vendored = { version = "3.2", optional = true }
 
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["test-utils"] }
-# NOTE: test_utils forcibly pulls the default engine and arrow-57. By default it ALSO pulls
-# arrow-58, which takes precedence and would make it impossible to test against arrow-57.
+# NOTE: test_utils forcibly pulls the default engine and arrow-58. By default it ALSO pulls
+# arrow-59, which takes precedence and would make it impossible to test against arrow-58.
 test_utils = { path = "../test-utils", default-features = false }
+# Used by the test-only SyncEngine to drive object_store calls via `futures::executor::block_on`.
+futures = "0.3"
+# Used by integration tests that bridge object_store's async API in test setup.
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
 criterion = "0.5"
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.16.0" }
@@ -154,6 +168,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "fmt",
 ] }
 rstest = "0.23"
+rstest_reuse = "0.7"
 [[bench]]
 name = "metadata_bench"
 harness = false
@@ -169,3 +184,8 @@ harness = false
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+
+# Declare as an example for access to test_utils
+[[example]]
+name = "metrics-tester"
+path = "tests/integration/metrics_main.rs"

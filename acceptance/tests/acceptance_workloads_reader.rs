@@ -165,25 +165,15 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "void/NullType not supported in schema deserialization",
+        "Interval reads not yet supported in the default engine",
         &[
-            "void_001_void_top_level/",
-            "void_002_void_nested_struct/",
-            "void_005_void_schema_evolution/",
-            "void_006_void_multiple_columns/",
-            "void_007_void_with_backticks/",
-        ],
-    ),
-    (
-        "Interval types not supported in schema deserialization",
-        &[
-            "intv_001_interval_ym_basic/",
-            "intv_002_interval_dt_basic/",
-            "intv_003_interval_partitioned/",
-            "intv_004_interval_negative/",
-            "intv_005_interval_mixed/",
-            "intv_boundary_values/",
-            "intv_sub_second/",
+            "intv_001_interval_ym_basic/specs/intv_001_interval_ym_basic_read_all",
+            "intv_002_interval_dt_basic/specs/intv_002_interval_dt_basic_read_all",
+            "intv_003_interval_partitioned/specs/intv_003_interval_partitioned_read_all",
+            "intv_004_interval_negative/specs/intv_004_interval_negative_read_all",
+            "intv_005_interval_mixed/specs/intv_005_interval_mixed_read_all",
+            "intv_boundary_values/specs/intv_boundary_values_read_all",
+            "intv_sub_second/specs/intv_sub_second_read_all",
         ],
     ),
     (
@@ -199,13 +189,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         &[
             "tw_array_element/specs/tw_array_element_read_",
             "tw_map_key_value_widening/specs/tw_map_key_value_widening_read_all",
-        ],
-    ),
-    (
-        "Type widening metadata mismatch in nested struct fields",
-        &[
-            "tw_nested_field/specs/tw_nested_field_read_all",
-            "tw_nested_field/specs/tw_nested_field_read_large_count",
         ],
     ),
     (

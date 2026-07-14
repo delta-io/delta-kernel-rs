@@ -101,7 +101,19 @@ BENCH_TAGS=base,my-feature cargo bench -p delta_kernel_benchmarks
 
 ### Running benchmarking on a PR
 
-To trigger benchmarks on a pull request, post a comment using the following syntax:
+Benchmarks run automatically on every push to a non-draft PR with `BENCH_TAGS=base`, no filter.
+Results are posted as a single PR comment that updates in place on each push, so the latest
+comment always reflects the latest commit. The comment is posted by a companion
+`workflow_run`-triggered workflow ([benchmark-post-comment.yml](../.github/workflows/benchmark-post-comment.yml)),
+so the bench job itself runs with a read-only token even on fork PRs. To bench a draft PR or
+override the tags or filter, post a `/bench` comment as documented below -- it updates the
+same comment that the auto-trigger uses.
+
+The bench job fails if any benchmark is at least 15% slower than the base branch. The result
+comment is still posted so you can see which benchmark regressed. To merge anyway (for an
+expected or noise-driven regression), add the `ignore-benchmark-failure` label to the PR.
+
+To trigger benchmarks on a pull request manually, post a comment using the following syntax:
 
 ```
 /bench [--tags <comma separated list of tags>] [--filter <regex>]
@@ -214,7 +226,7 @@ KERNEL_BENCH_WORKLOAD_DIR=/path/to/my/tables \
 
 ### `TableInfo`
 
-Deserialized from `tableInfo.json`. Captures the table's identity (`name`, `description`), Delta schema and protocol, log statistics (`logInfo`), physical data layout, table properties, and benchmark tags. See [`src/models.rs`](src/models.rs) for field-level documentation.
+Deserialized from `tableInfo.json`. Captures the table's identity (`name`, `description`), Delta schema and protocol, log statistics (`logInfo`), physical data layout, table properties, and benchmark tags. See [`workloads/src/models.rs`](../workloads/src/models.rs) for field-level documentation.
 
 #### Example
 
@@ -270,7 +282,7 @@ With a predicate for data skipping (SQL WHERE clause syntax):
 }
 ```
 
-The `predicate` field accepts a SQL WHERE clause expression that is parsed into a kernel `Predicate` and passed to the scan builder. See [`src/predicate_parser.rs`](src/predicate_parser.rs) for the full list of supported SQL features.
+The `predicate` field accepts a SQL WHERE clause expression that is parsed into a kernel `Predicate` and passed to the scan builder. See [`workloads/src/predicate_parser.rs`](../workloads/src/predicate_parser.rs) for the full list of supported SQL features.
 
 Snapshot construction specs:
 ```json
@@ -302,10 +314,14 @@ Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so t
 
 ## Source Layout
 
+The workload spec data types (`TableInfo`, `Spec`, `Workload`, `ReadConfig`, …) and the SQL
+predicate parser live in the shared [`delta_kernel_workloads`](../workloads/) crate, since they
+are also used by the `acceptance` crate.
+
 | File | Purpose |
 |------|---------|
-| `src/models.rs` | Data types: `TableInfo`, `Spec`, `Workload`, `ReadConfig`, `ReadOperation` |
-| `src/predicate_parser.rs` | SQL WHERE clause to kernel `Predicate` parser |
+| `../workloads/src/models.rs` | Data types: `TableInfo`, `Spec`, `Workload`, `ReadConfig`, `ReadOperation` |
+| `../workloads/src/predicate_parser.rs` | SQL WHERE clause to kernel `Predicate` parser |
 | `src/runners.rs` | `WorkloadRunner` trait and implementations: `ReadMetadataRunner`, `SnapshotConstructionRunner` |
 | `src/utils.rs` | Workload loading: deserializes workloads from the extracted data directory |
 | `benches/workload_bench.rs` | Criterion entry point — loads workloads, builds runners, drives benchmarks |

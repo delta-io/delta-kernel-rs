@@ -16,18 +16,14 @@ const INVALID_PARQUET_CHARS: &[char] = &[' ', ',', ';', '{', '}', '(', ')', '\n'
 /// Validates a schema for CREATE TABLE or ALTER TABLE.
 ///
 /// Performs the following checks:
-/// 1. Schema is non-empty
-/// 2. No duplicate column names (case-insensitive, including nested fields)
-/// 3. Column names contain only valid characters
-/// 4. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
-///    by kernel; see `TableConfiguration::ensure_write_supported`)
+/// 1. No duplicate column names (case-insensitive, including nested fields)
+/// 2. Column names contain only valid characters
+/// 3. Rejects fields with `delta.invariants` metadata (SQL expression invariants are not supported
+///    by kernel)
 pub(crate) fn validate_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<()> {
-    if schema.num_fields() == 0 {
-        return Err(Error::generic("Schema cannot be empty"));
-    }
     let mut validator = SchemaValidator::new(column_mapping_mode);
     // We reuse the SchemaTransform trait for its recursive traversal machinery.
     // The validator never transforms the schema -- it only inspects fields and
@@ -90,9 +86,7 @@ impl<'a> SchemaTransform<'a> for SchemaValidator {
         self.current_path.push(field.name().to_ascii_lowercase());
 
         // Reject `delta.invariants` metadata on any field. Kernel cannot evaluate SQL
-        // expression invariants, so writing to any table with invariants metadata is
-        // blocked by `TableConfiguration::ensure_write_supported`. Reject at create
-        // time with a clearer, path-aware error.
+        // expression invariants, so reject at create time with a clear, path-aware error.
         //
         // Note: unlike `NonNullFieldChecker`, this validator intentionally does NOT
         // skip recursion into variant internals. Variants are not expected to carry
@@ -160,7 +154,8 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+        StructType,
     };
 
     // === Schema builders for test cases ===
@@ -200,80 +195,44 @@ mod tests {
         let inner_b =
             StructType::new_unchecked(vec![StructField::new("CHILD", DataType::STRING, true)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", DataType::Struct(Box::new(inner_a)), false),
-            StructField::new("b", DataType::Struct(Box::new(inner_b)), false),
+            StructField::new("a", inner_a, false),
+            StructField::new("b", inner_b, false),
         ])
     }
 
     fn schema_with_space() -> StructType {
-        StructType::new_unchecked(vec![StructField::new(
-            "my column",
-            DataType::INTEGER,
-            false,
-        )])
+        schema! { not_null "my column": INTEGER }
     }
 
     fn schema_with_semicolon() -> StructType {
-        StructType::new_unchecked(vec![StructField::new("col;name", DataType::INTEGER, false)])
+        schema! { not_null "col;name": INTEGER }
     }
 
     fn schema_with_newline() -> StructType {
-        StructType::new_unchecked(vec![StructField::new(
-            "col\nname",
-            DataType::INTEGER,
-            false,
-        )])
+        schema! { not_null "col\nname": INTEGER }
     }
 
     fn schema_with_empty_name() -> StructType {
-        StructType::new_unchecked(vec![StructField::new("", DataType::INTEGER, false)])
+        schema! { not_null "": INTEGER }
     }
 
     fn schema_nested_bad_char() -> StructType {
-        let inner = StructType::new_unchecked(vec![StructField::new(
-            "bad column",
-            DataType::INTEGER,
-            false,
-        )]);
-        StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-            false,
-        )])
+        schema! { not_null "parent": { not_null "bad column": INTEGER } }
     }
 
     fn schema_array_bad_char() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![StructField::new("bad col", DataType::INTEGER, false)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
-            false,
-        )])
+        schema! { not_null "arr": [ nullable { not_null "bad col": INTEGER } ] }
     }
 
     fn schema_map_bad_char() -> StructType {
-        let inner =
-            StructType::new_unchecked(vec![StructField::new("bad;val", DataType::INTEGER, false)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "m",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
-            false,
-        )])
+        schema! { not_null "m": { STRING => nullable { not_null "bad;val": INTEGER } } }
     }
 
     fn schema_top_level_dup() -> StructType {
         let inner =
             StructType::new_unchecked(vec![StructField::new("x", DataType::INTEGER, false)]);
         StructType::new_unchecked(vec![
-            StructField::new("a", DataType::Struct(Box::new(inner)), false),
+            StructField::new("a", inner, false),
             StructField::new("A", DataType::STRING, true),
         ])
     }
@@ -285,10 +244,7 @@ mod tests {
         ]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             false,
         )])
     }
@@ -328,11 +284,7 @@ mod tests {
     fn schema_nested_invariant() -> StructType {
         let inner =
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
-        StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            DataType::Struct(Box::new(inner)),
-            true,
-        )])
+        StructType::new_unchecked(vec![StructField::new("parent", inner, true)])
     }
 
     fn schema_array_nested_invariant() -> StructType {
@@ -340,10 +292,7 @@ mod tests {
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "arr",
-            DataType::Array(Box::new(ArrayType::new(
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            ArrayType::new(inner, true),
             true,
         )])
     }
@@ -353,11 +302,7 @@ mod tests {
             StructType::new_unchecked(vec![field_with_invariant("child", DataType::INTEGER, true)]);
         StructType::new_unchecked(vec![StructField::new(
             "map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::Struct(Box::new(inner)),
-                true,
-            ))),
+            MapType::new(DataType::STRING, inner, true),
             true,
         )])
     }
@@ -370,6 +315,9 @@ mod tests {
     #[case::special_chars_with_cm(schema_with_special_chars(), ColumnMappingMode::Name)]
     #[case::dot_in_name_with_cm(schema_with_dot(), ColumnMappingMode::Name)]
     #[case::different_struct_children(schema_different_struct_children(), ColumnMappingMode::None)]
+    #[case::empty_no_cm(StructType::new_unchecked(vec![]), ColumnMappingMode::None)]
+    #[case::empty_cm_name(StructType::new_unchecked(vec![]), ColumnMappingMode::Name)]
+    #[case::empty_cm_id(StructType::new_unchecked(vec![]), ColumnMappingMode::Id)]
     fn valid_schema_accepted(#[case] schema: StructType, #[case] cm: ColumnMappingMode) {
         assert!(validate_schema(&schema, cm).is_ok());
     }
@@ -377,7 +325,6 @@ mod tests {
     // === Invalid schemas ===
 
     #[rstest]
-    #[case::empty_schema(StructType::new_unchecked(vec![]), ColumnMappingMode::None, &["cannot be empty"])]
     #[case::space_without_cm(schema_with_space(), ColumnMappingMode::None, &["invalid character"])]
     #[case::semicolon_without_cm(schema_with_semicolon(), ColumnMappingMode::None, &["invalid character"])]
     #[case::newline_with_cm(schema_with_newline(), ColumnMappingMode::Name, &["newline"])]

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use super::void_utils::strip_void_from_schema;
 use super::{
     ArrayType, DataType, MapType, MetadataColumnSpec, PrimitiveType, SchemaRef, SchemaTransform,
     StructField, StructType,
@@ -384,7 +385,8 @@ impl LogicalSchema {
     /// - `include_partition_cols = false`: partition columns excluded (partition values stored only
     ///   in the Add file action's `partitionValues` field, not in data files).
     ///
-    /// Field names use physical column names per the column mapping mode.
+    /// Field names use physical column names per the column mapping mode. Void columns are always
+    /// stripped from the returned schema, since they are never written to Parquet.
     ///
     /// # Errors
     ///
@@ -400,42 +402,10 @@ impl LogicalSchema {
             .filter(|f| include_partition_cols || !self.partition_columns.contains(f.name()))
             .map(|f| f.make_physical(self.column_mapping_mode))
             .collect::<DeltaResult<Vec<_>>>()?;
-        Ok(Arc::new(StructType::new_unchecked(fields)))
-    }
-
-    /// Returns the physical schema for partition columns, or `None` if there are no partition
-    /// columns or none of the partition columns are found in the logical schema.
-    ///
-    /// Field names are physical column names (respecting column mapping mode). All fields are
-    /// nullable because the `partitionValues_parsed` struct can be null for non-Add rows (e.g.
-    /// Remove actions), which requires all leaf fields to allow nulls.
-    pub(crate) fn physical_partition_schema(&self) -> Option<SchemaRef> {
-        if self.partition_columns.is_empty() {
-            return None;
-        }
-        // A partition column missing from the logical schema is silently skipped; it will
-        // not appear in the output and cannot be used for partition pruning.
-        let partition_fields: Vec<StructField> = self
-            .partition_columns
-            .iter()
-            .filter_map(|col_name| {
-                let field = self.schema.field(col_name);
-                if field.is_none() {
-                    debug!("Partition column '{col_name}' not found in logical schema");
-                }
-                field
-            })
-            .map(|field| {
-                StructField::nullable(
-                    field.physical_name(self.column_mapping_mode).to_owned(),
-                    field.data_type().clone(),
-                )
-            })
-            .collect();
-        if partition_fields.is_empty() {
-            return None;
-        }
-        Some(Arc::new(StructType::new_unchecked(partition_fields)))
+        // Void columns are never written to Parquet, so strip them from the write schema.
+        Ok(strip_void_from_schema(Arc::new(StructType::new_unchecked(
+            fields,
+        ))))
     }
 }
 

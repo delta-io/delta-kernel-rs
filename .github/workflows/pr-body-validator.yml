@@ -2,7 +2,9 @@ name: Validate PR Body
 
 on:
   pull_request:
-    types: [opened, edited]
+    # synchronize is required: validate-body is a required check, and required checks must
+    # re-report on every new head SHA or the PR blocks on "Expected, waiting for status".
+    types: [opened, edited, reopened, synchronize]
   merge_group:
 
 jobs:
@@ -12,12 +14,34 @@ jobs:
       - name: Validate PR Body
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          MERGE_GROUP_REF: ${{ github.event.merge_group.head_ref }}
         run: |
+          set -euo pipefail
+
+          # merge_group runs don't have github.event.pull_request, so fetch the body from the PR
+          # referenced by the merge queue ref (refs/heads/gh-readonly-queue/<base>/pr-<NUMBER>-<sha>).
+          if [[ "$EVENT_NAME" == "merge_group" ]]; then
+            PR_NUMBER=$(sed -nE 's/.*\/pr-([0-9]+)-.*/\1/p' <<< "$MERGE_GROUP_REF")
+            if [[ -z "$PR_NUMBER" ]]; then
+              echo "::error::could not parse a PR number from merge_group ref '$MERGE_GROUP_REF'"
+              exit 1
+            fi
+            PR_BODY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq '.body // ""')
+          fi
+
+          echo "Validating body of PR #${PR_NUMBER} (event: ${EVENT_NAME})"
+          echo "::group::PR body being validated"
+          printf '%s\n' "$PR_BODY"
+          echo "::endgroup::"
+
           if LC_ALL=C grep -q '[^[:print:][:space:]]' <<< "$PR_BODY"; then
             echo "PR body contains non-ascii characters. Please remove them."
             exit 1
           else
             echo "PR body contains ascii characters only"
           fi
-

@@ -1,44 +1,38 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ::test_utils::{get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
 
 use super::*;
+use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::arrow::record_batch::RecordBatch;
+use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
 };
+use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::scan::data_skipping::as_checkpoint_skipping_predicate;
+use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    ColumnMetadataKey, DataType, LogicalSchema, PrimitiveType, StructField, StructType,
+    self, schema_ref, ColumnMetadataKey, DataType, LogicalSchema, MetadataColumnSpec,
+    PrimitiveType, StructField, StructType,
 };
 use crate::table_features::ColumnMappingMode;
+use crate::transaction::create_table::create_table;
 use crate::{
-    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, JsonHandler,
-    ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
+    DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
+    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
 };
-
-/// Helper macro to extract a typed column from a RecordBatch or StructArray.
-macro_rules! get_column {
-    ($source:expr, $name:expr, $ty:ty) => {
-        $source
-            .column_by_name($name)
-            .unwrap_or_else(|| panic!("should have column '{}'", $name))
-            .as_any()
-            .downcast_ref::<$ty>()
-            .unwrap_or_else(|| panic!("column '{}' should be {}", $name, stringify!($ty)))
-    };
-}
 
 fn field_names(s: &StructArray) -> Vec<String> {
     s.fields().iter().map(|f| f.name().clone()).collect()
@@ -336,6 +330,264 @@ fn test_physical_predicate_case_insensitive_unknown_column() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
+    let url = "memory:///test_table/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+
+    let schema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("number", DataType::LONG),
+        StructField::nullable("a_float", DataType::FLOAT),
+    ]));
+    create_table(url, schema, "DefaultEngine")
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
+        .build(&engine)
+        .unwrap();
+
+    let projection = snapshot.schema().project(&["a_float"]).unwrap();
+    let predicate = Arc::new(column_expr!("number").gt(Expr::literal(5_i64)));
+
+    let scan = snapshot
+        .scan_builder()
+        .with_schema(projection)
+        .with_predicate(predicate)
+        .build()
+        .expect("build should accept a predicate referencing a non-projection table column");
+
+    assert_eq!(scan.logical_schema().raw_schema().fields().len(), 1);
+}
+
+#[test]
+fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
+    let url = "memory:///test_table/";
+    let store = Arc::new(InMemory::new());
+    let engine = SyncEngine::new_with_store(store);
+
+    let schema = schema_ref! { nullable "id": LONG };
+    create_table(url, schema, "DefaultEngine")
+        .build(&engine, Box::new(FileSystemCommitter::new()))
+        .unwrap()
+        .commit(&engine)
+        .unwrap()
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(url::Url::parse(url).unwrap())
+        .build(&engine)
+        .unwrap();
+
+    // `my_row_index` is computed during the scan, not stored in the table,
+    // so a predicate can't filter on it
+    let projection = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)
+            .unwrap(),
+    );
+    let predicate = Arc::new(column_expr!("my_row_index").gt(Expr::literal(5_i64)));
+
+    let err = snapshot
+        .scan_builder()
+        .with_schema(projection)
+        .with_predicate(predicate)
+        .build()
+        .expect_err("build should reject predicate referencing a projection-only metadata column");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Predicate references unknown column") && msg.contains("my_row_index"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Loads `table`'s v0 snapshot with a [`SyncEngine`], for the `without_row_transforms` tests.
+fn without_transforms_snapshot(table: &str) -> (Arc<SyncEngine>, Arc<Snapshot>) {
+    let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(0)
+        .build(engine.as_ref())
+        .unwrap();
+    (engine, snapshot)
+}
+
+/// A partitioned table and a column-mapped table both build a transform spec.
+/// `without_row_transforms` retains the spec but sets `skip_row_transforms`, so log replay
+/// builds no per-file expressions while the structural transform stays describable.
+#[rstest]
+#[case::partitioned("./tests/data/basic_partitioned/")]
+#[case::column_mapping("./tests/data/partition_cm/name/")]
+fn test_without_row_transforms_retains_spec_and_sets_skip(#[case] table: &str) {
+    let (_engine, snapshot) = without_transforms_snapshot(table);
+
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    assert!(scan.state_info.transform_spec.is_some());
+    assert!(!scan.state_info.skip_row_transforms);
+
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+    assert!(scan.state_info.transform_spec.is_some());
+    assert!(scan.state_info.skip_row_transforms);
+}
+
+/// Under `without_row_transforms`, `scan_metadata` still lists files and surfaces the partition
+/// values a connector needs to reconstruct rows itself, while every per-file transform is `None`.
+/// Deletion vectors are covered by the sibling test.
+#[test]
+fn test_without_row_transforms_scan_metadata_lists_files_with_partition_values() {
+    let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+
+    // (saw a file, saw non-empty partition values)
+    fn collect(acc: &mut (bool, bool), scan_file: ScanFile) {
+        acc.0 = true;
+        acc.1 |= !scan_file.partition_values.is_empty();
+    }
+    let mut acc = (false, false);
+    for metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let metadata = metadata.unwrap();
+        assert!(
+            metadata.scan_file_transforms.iter().all(Option::is_none),
+            "every per-file transform must be None under without_row_transforms"
+        );
+        acc = metadata.visit_scan_files(acc, collect).unwrap();
+    }
+    let (saw_file, saw_partition_values) = acc;
+    assert!(
+        saw_file,
+        "scan_metadata should still list files under without_row_transforms"
+    );
+    assert!(
+        saw_partition_values,
+        "partition values must still be surfaced so the connector can inject them itself"
+    );
+}
+
+/// Column mapping also builds a per-file transform (the physical-to-logical rename). Under
+/// `without_row_transforms`, `scan_metadata` still lists a column-mapped table's files with every
+/// per-file transform `None`, leaving the rename to the connector.
+#[test]
+fn test_without_row_transforms_scan_metadata_lists_files_column_mapping() {
+    let table = "table-with-columnmapping-mode-name";
+    let tempdir = load_test_data("tests/golden_data", table).unwrap();
+    // Golden tables extract to `<name>/delta/` (with a sibling `expected/`).
+    let table_path = tempdir.path().join(table).join("delta");
+    let url = url::Url::from_directory_path(table_path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+
+    let mut saw_file = false;
+    for metadata in scan.scan_metadata(&engine).unwrap() {
+        let metadata = metadata.unwrap();
+        assert!(
+            metadata.scan_file_transforms.iter().all(Option::is_none),
+            "every per-file transform must be None under without_row_transforms"
+        );
+        saw_file = true;
+    }
+    assert!(
+        saw_file,
+        "scan_metadata should list the column-mapped table's files under without_row_transforms"
+    );
+}
+
+#[test]
+fn test_without_row_transforms_rejects_execute() {
+    let (engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+    let err = scan
+        .execute(engine)
+        .err()
+        .expect("execute must error when row transforms are skipped");
+    assert!(
+        err.to_string().contains("without_row_transforms"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
+/// build time regardless of `without_row_transforms`.
+#[rstest]
+fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
+    let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
+    let schema = Arc::new(
+        snapshot
+            .schema()
+            .add_metadata_column("rcv", MetadataColumnSpec::RowCommitVersion)
+            .unwrap(),
+    );
+    let mut builder = snapshot.scan_builder().with_schema(schema);
+    if without_row_transforms {
+        builder = builder.without_row_transforms();
+    }
+    let err = builder
+        .build()
+        .expect_err("row commit version columns are unsupported by scans");
+    assert!(
+        err.to_string()
+            .contains("Row commit versions not supported"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Deletion vectors flow through scan metadata independently of the row transform, so they are
+/// still surfaced under `without_row_transforms` while every per-file transform is `None`.
+#[test]
+fn test_without_row_transforms_scan_metadata_surfaces_deletion_vectors() {
+    // The deletion vector is added at the latest version, so load the full table (not v0).
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .without_row_transforms()
+        .build()
+        .unwrap();
+
+    fn dv_callback(seen: &mut bool, scan_file: ScanFile) {
+        *seen |= scan_file.dv_info.deletion_vector.is_some();
+    }
+    let mut saw_dv = false;
+    for res in scan.scan_metadata(&engine).unwrap() {
+        let scan_metadata = res.unwrap();
+        assert!(
+            scan_metadata
+                .scan_file_transforms
+                .iter()
+                .all(Option::is_none),
+            "every per-file transform must be None under without_row_transforms"
+        );
+        saw_dv = scan_metadata.visit_scan_files(saw_dv, dv_callback).unwrap();
+    }
+    assert!(
+        saw_dv,
+        "deletion vector info should still be surfaced under without_row_transforms"
+    );
+}
+
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
     fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
@@ -502,6 +754,12 @@ fn test_get_partition_value() {
             PrimitiveType::Timestamp,
             Scalar::Timestamp(123456),
         ),
+        (
+            // RFC 3339 with a non-UTC offset: normalized to UTC (1969-12-31T19:00:00Z)
+            "1970-01-01T00:00:00+05:00",
+            PrimitiveType::Timestamp,
+            Scalar::Timestamp(-18000000000),
+        ),
     ];
 
     for (raw, data_type, expected) in &cases {
@@ -659,7 +917,7 @@ fn assert_stats_struct_matches_json(
     }
 }
 
-/// Test that `with_stats_columns(vec![])` outputs parsed stats in scan_metadata batches.
+/// Test that [`StatsOptions::all`] outputs parsed stats in scan_metadata batches.
 /// Uses a table with a checkpoint that contains stats_parsed for e2e verification.
 #[test]
 fn test_scan_metadata_with_stats_columns() {
@@ -672,7 +930,7 @@ fn test_scan_metadata_with_stats_columns() {
 
     let scan = snapshot
         .scan_builder()
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
         .build()
         .unwrap();
 
@@ -711,10 +969,10 @@ fn test_scan_metadata_with_stats_columns() {
 
         // Extract stats_parsed struct array
         let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
-        let num_records = get_column!(stats_parsed, "numRecords", Int64Array);
-        let min_values = get_column!(stats_parsed, "minValues", StructArray);
-        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
-        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
+        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
+        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
+        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
 
         // Extract JSON stats column
         let stats_json = get_column!(filtered_batch, "stats", StringArray);
@@ -729,7 +987,7 @@ fn test_scan_metadata_with_stats_columns() {
                 serde_json::from_str(stats_json.value(i)).expect("stats JSON should be valid");
 
             // Validate numRecords
-            if let Some(json_num) = json_stats.get("numRecords").and_then(|v| v.as_i64()) {
+            if let Some(json_num) = json_stats.get(NUM_RECORDS).and_then(|v| v.as_i64()) {
                 assert_eq!(
                     json_num,
                     num_records.value(i),
@@ -738,14 +996,14 @@ fn test_scan_metadata_with_stats_columns() {
             }
 
             // Validate minValues, maxValues, nullCount
-            if let Some(obj) = json_stats.get("minValues").and_then(|v| v.as_object()) {
-                assert_stats_struct_matches_json(min_values, obj, i, "minValues");
+            if let Some(obj) = json_stats.get(MIN_VALUES).and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(min_values, obj, i, MIN_VALUES);
             }
-            if let Some(obj) = json_stats.get("maxValues").and_then(|v| v.as_object()) {
-                assert_stats_struct_matches_json(max_values, obj, i, "maxValues");
+            if let Some(obj) = json_stats.get(MAX_VALUES).and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(max_values, obj, i, MAX_VALUES);
             }
-            if let Some(obj) = json_stats.get("nullCount").and_then(|v| v.as_object()) {
-                assert_stats_struct_matches_json(null_count, obj, i, "nullCount");
+            if let Some(obj) = json_stats.get(NULL_COUNT).and_then(|v| v.as_object()) {
+                assert_stats_struct_matches_json(null_count, obj, i, NULL_COUNT);
             }
 
             total_num_records += num_records.value(i);
@@ -760,7 +1018,7 @@ fn test_scan_metadata_with_stats_columns() {
     );
 }
 
-/// Test that `include_all_stats_columns` and `with_predicate` can be used together.
+/// Test that [`StatsOptions::all`] and `with_predicate` can be used together.
 /// The scan should output stats_parsed AND perform data skipping via the predicate.
 #[test]
 fn test_scan_metadata_stats_columns_with_predicate() {
@@ -777,7 +1035,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
         .build()
         .expect("Should succeed when using both predicate and stats_columns");
 
@@ -820,7 +1078,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 
         // Verify stats_parsed has data
         let stats_parsed = get_column!(filtered_batch, STATS_PARSED_COL, StructArray);
-        let num_records = get_column!(stats_parsed, "numRecords", Int64Array);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
         for i in 0..filtered_batch.num_rows() {
             if !stats_parsed.is_null(i) {
                 assert!(num_records.value(i) > 0, "numRecords should be positive");
@@ -941,10 +1199,10 @@ impl CheckpointParquetBuilder {
     fn new() -> Self {
         let id_fields = Fields::from(vec![Field::new("id", ArrowDataType::Int64, true)]);
         let stats_fields = Fields::from(vec![
-            Field::new("maxValues", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("minValues", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("nullCount", ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new("numRecords", ArrowDataType::Int64, true),
+            Field::new(MAX_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(MIN_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(NULL_COUNT, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(NUM_RECORDS, ArrowDataType::Int64, true),
         ]);
         let add_fields = Fields::from(vec![Field::new(
             "stats_parsed",
@@ -985,7 +1243,7 @@ impl CheckpointParquetBuilder {
         let stats_parsed = StructArray::from(vec![
             (
                 Arc::new(Field::new(
-                    "maxValues",
+                    MAX_VALUES,
                     ArrowDataType::Struct(self.id_fields.clone()),
                     true,
                 )),
@@ -993,7 +1251,7 @@ impl CheckpointParquetBuilder {
             ),
             (
                 Arc::new(Field::new(
-                    "minValues",
+                    MIN_VALUES,
                     ArrowDataType::Struct(self.id_fields.clone()),
                     true,
                 )),
@@ -1001,14 +1259,14 @@ impl CheckpointParquetBuilder {
             ),
             (
                 Arc::new(Field::new(
-                    "nullCount",
+                    NULL_COUNT,
                     ArrowDataType::Struct(self.id_fields.clone()),
                     true,
                 )),
                 Arc::new(make_id_struct(null_counts)) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+                Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
                 Arc::new(Int64Array::from(num_records.to_vec())) as Arc<dyn Array>,
             ),
         ]);
@@ -1036,7 +1294,8 @@ impl CheckpointParquetBuilder {
 
 /// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
 fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
-    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[])?;
+    let stats = all_referenced_columns(pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[], &stats)?;
     let mut prefixer = PrefixColumns {
         prefix: ColumnName::new(["add", "stats_parsed"]),
     };
@@ -1146,7 +1405,7 @@ fn test_skip_stats_disables_data_skipping() {
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_skip_stats(true)
+        .with_stats(StatsOptions::none())
         .build()
         .unwrap();
 
@@ -1168,46 +1427,42 @@ fn test_skip_stats_disables_data_skipping() {
     assert_eq!(selected_file_count, 6);
 }
 
+/// Calling `with_stats` twice replaces the prior value; the last call wins.
 #[test]
-fn test_skip_stats_after_include_all_stats_columns_wins() {
-    // With StatsOutputMode enum, last call wins. Calling with_skip_stats(true) after
-    // include_all_stats_columns() should result in stats being skipped.
+fn test_with_stats_last_call_wins() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    // First call is `all()` (would emit stats_parsed); last call is `none()` (no output).
     let scan = snapshot
         .scan_builder()
-        .include_all_stats_columns()
-        .with_skip_stats(true)
-        .with_predicate(predicate)
+        .with_stats(StatsOptions::all())
+        .with_stats(StatsOptions::none())
         .build()
         .unwrap();
 
-    // Stats are skipped, so all files should be returned (no data skipping)
-    let scan_metadata_results: Vec<_> = scan
+    for scan_metadata in scan
         .scan_metadata(engine.as_ref())
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    let mut selected_file_count = 0;
-    for scan_metadata in &scan_metadata_results {
-        let selection_vector = scan_metadata.scan_files.selection_vector();
-        selected_file_count += selection_vector
-            .iter()
-            .filter(|&&selected| selected)
-            .count();
+        .unwrap()
+    {
+        let (underlying_data, _) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        assert!(
+            batch.column_by_name("stats_parsed").is_none(),
+            "last call (`none`) should win: no stats_parsed in output"
+        );
     }
-
-    assert_eq!(selected_file_count, 6);
 }
 
 #[test]
-fn test_with_stats_columns_empty_no_stats_output() {
-    // with_stats_columns(vec![]) should produce no stats output
+fn test_default_stats_options_no_struct_output() {
+    // StatsOptions::default() produces no stats_parsed output.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
@@ -1215,7 +1470,7 @@ fn test_with_stats_columns_empty_no_stats_output() {
 
     let scan = snapshot
         .scan_builder()
-        .with_stats_columns(vec![])
+        .with_stats(StatsOptions::default())
         .build()
         .unwrap();
 
@@ -1244,21 +1499,22 @@ fn test_with_stats_columns_empty_no_stats_output() {
     }
 }
 
-/// Test that `with_stats_columns` with specific columns only returns stats for those columns.
-/// Verifies that requesting `vec![col!("id")]` only includes `id` in minValues/maxValues/nullCount.
-#[test]
-fn test_scan_metadata_with_specific_stats_columns() {
+/// Test that requesting a specific column subset (`StructStats::Columns`) only returns
+/// stats for those columns. Covered for both struct-literal construction (json on) and
+/// the [`StatsOptions::struct_columns`] named constructor (json off).
+#[rstest::rstest]
+#[case::with_json(StatsOptions {
+    synthesize_json: true,
+    struct_stats: StructStats::Columns(vec![column_name!("id")]),
+})]
+#[case::struct_columns_ctor(StatsOptions::struct_columns(vec![column_name!("id")]))]
+fn test_scan_metadata_with_specific_stats_columns(#[case] stats: StatsOptions) {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    // Request only "id" column stats
-    let scan = snapshot
-        .scan_builder()
-        .with_stats_columns(vec![column_name!("id")])
-        .build()
-        .unwrap();
+    let scan = snapshot.scan_builder().with_stats(stats).build().unwrap();
 
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
@@ -1280,30 +1536,17 @@ fn test_scan_metadata_with_specific_stats_columns() {
             filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
 
         let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-        let min_values = get_column!(stats_parsed, "minValues", StructArray);
-        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
-        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
+        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
+        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
 
-        // Check minValues/maxValues/nullCount only have "id"
-        assert_eq!(
-            field_names(min_values),
-            vec!["id"],
-            "minValues should only contain 'id'"
-        );
-        assert_eq!(
-            field_names(max_values),
-            vec!["id"],
-            "maxValues should only contain 'id'"
-        );
-        assert_eq!(
-            field_names(null_count),
-            vec!["id"],
-            "nullCount should only contain 'id'"
-        );
+        assert_eq!(field_names(min_values), vec!["id"]);
+        assert_eq!(field_names(max_values), vec!["id"]);
+        assert_eq!(field_names(null_count), vec!["id"]);
     }
 }
 
-/// Test that `with_stats_columns` with multiple specific columns returns stats for all of them.
+/// Test that [`StructStats::Columns`] with multiple specific columns returns stats for all of them.
 #[test]
 fn test_scan_metadata_with_multiple_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -1314,7 +1557,10 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     // Request "id" and "name" column stats (not "age" or "salary")
     let scan = snapshot
         .scan_builder()
-        .with_stats_columns(vec![column_name!("id"), column_name!("name")])
+        .with_stats(StatsOptions {
+            synthesize_json: true,
+            struct_stats: StructStats::Columns(vec![column_name!("id"), column_name!("name")]),
+        })
         .build()
         .unwrap();
 
@@ -1338,9 +1584,9 @@ fn test_scan_metadata_with_multiple_stats_columns() {
             filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
 
         let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-        let min_values = get_column!(stats_parsed, "minValues", StructArray);
-        let max_values = get_column!(stats_parsed, "maxValues", StructArray);
-        let null_count = get_column!(stats_parsed, "nullCount", StructArray);
+        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
+        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
+        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
 
         // Check minValues/maxValues/nullCount have "id" and "name"
         let expected = vec!["id", "name"];
@@ -1372,8 +1618,8 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that `with_stats_columns` with a nonexistent column name produces empty stats for that
-/// column.
+/// Test that [`StructStats::Columns`] with a nonexistent column name produces empty stats for
+/// that column.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -1383,7 +1629,10 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
 
     let scan = snapshot
         .scan_builder()
-        .with_stats_columns(vec![column_name!("nonexistent_column")])
+        .with_stats(StatsOptions {
+            synthesize_json: true,
+            struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
+        })
         .build()
         .unwrap();
 
@@ -1411,7 +1660,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         // Should have numRecords but no minValues/maxValues/nullCount
         // (or they exist but are empty structs)
         assert!(
-            stats_parsed.column_by_name("numRecords").is_some(),
+            stats_parsed.column_by_name(NUM_RECORDS).is_some(),
             "Should still have numRecords"
         );
     }
@@ -1425,21 +1674,21 @@ impl ParquetHandler for EmptyParquetHandler {
     fn read_parquet_files(
         &self,
         _files: &[FileMeta],
-        _schema: crate::schema::SchemaRef,
+        _schema: schema::SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> crate::DeltaResult<FileDataReadResultIterator> {
+    ) -> DeltaResult<FileDataReadResultIterator> {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn read_parquet_footer(&self, _file: &FileMeta) -> crate::DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, _file: &FileMeta) -> DeltaResult<ParquetFooter> {
         unimplemented!()
     }
 
     fn write_parquet_file(
         &self,
         _location: url::Url,
-        _data: Box<dyn Iterator<Item = crate::DeltaResult<Box<dyn EngineData>>> + Send>,
-    ) -> crate::DeltaResult<()> {
+        _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
         unimplemented!()
     }
 }
@@ -1514,18 +1763,19 @@ mod scan_metadata_completed_tests {
     use std::time::Duration;
 
     use rstest::rstest;
-    use tracing_subscriber::util::SubscriberInitExt as _;
 
-    use crate::engine::default::DefaultEngineBuilder;
+    use super::ScanBuilder;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
-    use crate::object_store::local::LocalFileSystem;
-    use crate::utils::test_utils::CapturingReporter;
+    use crate::metrics::MetricEvent;
+    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
 
     fn run_scan(
         table: &str,
         predicate: Option<Arc<Pred>>,
+        correlation_id: Option<&str>,
     ) -> (
         Arc<CapturingReporter>,
         tracing::subscriber::DefaultGuard,
@@ -1534,16 +1784,15 @@ mod scan_metadata_completed_tests {
         let path = std::fs::canonicalize(PathBuf::from(table)).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-        let guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let engine = Arc::new(SyncEngine::new());
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-        let mut builder = snapshot.scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        let scan = builder.build().unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .fold_with(correlation_id, ScanBuilder::with_correlation_id)
+            .build()
+            .unwrap();
         let results: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()
@@ -1556,52 +1805,68 @@ mod scan_metadata_completed_tests {
         reporter
             .events()
             .into_iter()
-            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted { .. }))
+            .find(|e| matches!(e, MetricEvent::ScanMetadataCompleted(_)))
             .expect("expected ScanMetadataCompleted event")
     }
 
     #[rstest]
-    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 0, 0)]
+    #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
         Some(Arc::new(Pred::literal(false))),
         0,
         0,
         0,
+        0,
         0
     )]
-    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 2, 0)]
-    #[case::with_checkpoint("./tests/data/with_checkpoint_no_last_checkpoint/", None, 2, 1, 1, 0)]
+    #[case::with_removes("./tests/data/table-with-cdf/", None, 1, 0, 0, 2, 0)]
+    #[case::with_checkpoint(
+        "./tests/data/with_checkpoint_no_last_checkpoint/",
+        None,
+        2,
+        1,
+        1010,
+        1,
+        0
+    )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
         Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
-        2, 2, 0, 4
+        2, 2, 1502, 0, 4
     )]
     fn test_scan_metrics(
         #[case] table: &str,
         #[case] predicate: Option<Arc<Pred>>,
         #[case] expected_add_seen: u64,
         #[case] expected_active: u64,
+        #[case] expected_active_bytes: u64,
         #[case] expected_removes: u64,
         #[case] expected_filtered: u64,
     ) {
-        let (reporter, _guard, _) = run_scan(table, predicate);
-        let MetricEvent::ScanMetadataCompleted {
-            total_duration,
-            num_add_files_seen,
-            num_active_add_files,
-            num_remove_files_seen,
-            num_predicate_filtered,
-            ..
-        } = get_scan_event(&reporter)
-        else {
+        let (reporter, _guard, _) = run_scan(table, predicate, None);
+        let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
             panic!("expected ScanMetadataCompleted");
         };
-        assert!(total_duration > Duration::ZERO);
-        assert_eq!(num_add_files_seen, expected_add_seen);
-        assert_eq!(num_active_add_files, expected_active);
-        assert_eq!(num_remove_files_seen, expected_removes);
-        assert_eq!(num_predicate_filtered, expected_filtered);
+        assert!(e.duration > Duration::ZERO);
+        assert_eq!(e.num_add_files_seen, expected_add_seen);
+        assert_eq!(e.num_active_add_files, expected_active);
+        assert_eq!(e.active_add_files_bytes, expected_active_bytes);
+        assert_eq!(e.num_remove_files_seen, expected_removes);
+        assert_eq!(e.num_predicate_filtered, expected_filtered);
+    }
+
+    // The parallel-scan paths (both sequential and parallel phase events) are covered by
+    // `parallel_scan_metadata_phases_carry_correlation_id` in `parallel::parallel_phase`.
+    #[rstest]
+    #[case::with_id(Some("scan-req-1"))]
+    #[case::without_id(None)]
+    fn scan_metadata_completed_carries_correlation_id(#[case] correlation_id: Option<&str>) {
+        let (reporter, _guard, _) = run_scan("./tests/data/parsed-stats/", None, correlation_id);
+        let MetricEvent::ScanMetadataCompleted(e) = get_scan_event(&reporter) else {
+            panic!("expected ScanMetadataCompleted");
+        };
+        assert_eq!(e.correlation_id.as_deref(), correlation_id);
     }
 
     #[test]
@@ -1609,10 +1874,8 @@ mod scan_metadata_completed_tests {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(&path).unwrap();
         let reporter = Arc::new(CapturingReporter::default());
-        let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
-        let _guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let engine = Arc::new(SyncEngine::new());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         {
@@ -1623,6 +1886,6 @@ mod scan_metadata_completed_tests {
         assert!(reporter
             .events()
             .iter()
-            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted { .. })));
+            .all(|e| !matches!(e, MetricEvent::ScanMetadataCompleted(_))));
     }
 }

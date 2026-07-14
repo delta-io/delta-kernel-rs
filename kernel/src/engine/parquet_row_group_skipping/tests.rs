@@ -16,6 +16,7 @@ use crate::kernel_predicates::{
 };
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::parquet::arrow::ArrowWriter;
+use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::FileReader;
 use crate::parquet::file::serialized_reader::SerializedFileReader;
@@ -457,6 +458,30 @@ fn test_get_stat_values() {
     );
 }
 
+// Intervals are unsupported for skipping under any footer encoding, so extraction returns None.
+#[test]
+fn test_interval_skipping_unsupported_for_any_footer_stats() {
+    let interval_flba = FixedLenByteArray::from(ByteArray::from(vec![0u8; 12]));
+    let variants = [
+        Statistics::int32(Some(0), Some(1), None, Some(0), false),
+        Statistics::int64(Some(0), Some(1), None, Some(0), false),
+        Statistics::fixed_len_byte_array(
+            Some(interval_flba.clone()),
+            Some(interval_flba),
+            None,
+            Some(0),
+            false,
+        ),
+    ];
+    for dt in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
+        for stats in &variants {
+            // Call the extractor directly: the fixture has no interval column for get_min_stat
+            assert_eq!(extract_min_scalar(&dt, stats), None);
+            assert_eq!(extract_max_scalar(&dt, stats), None);
+        }
+    }
+}
+
 /// Wraps an Int64 leaf array in nested StructArrays matching the given column path.
 ///
 /// For `col_path = &["a", "b"]` and a leaf array `[10, 20]`, produces the Arrow structure:
@@ -518,17 +543,17 @@ fn write_checkpoint_parquet(
     part_values: Option<&[Option<&str>]>,
 ) -> tempfile::NamedTempFile {
     let (min_f, min_a) = build_stat_column(
-        "minValues",
+        MIN_VALUES,
         col_path,
         Arc::new(Int64Array::from(min_values.to_vec())),
     );
     let (max_f, max_a) = build_stat_column(
-        "maxValues",
+        MAX_VALUES,
         col_path,
         Arc::new(Int64Array::from(max_values.to_vec())),
     );
     let (nc_f, nc_a) = build_stat_column(
-        "nullCount",
+        NULL_COUNT,
         col_path,
         Arc::new(Int64Array::from(null_counts.to_vec())),
     );
@@ -1037,17 +1062,17 @@ fn checkpoint_filter_multi_row_group_skipping() {
     // Build schema: add.stats_parsed.{minValues,maxValues,nullCount}.x (INT64)
     let col_field = Arc::new(Field::new("x", ArrowDataType::Int64, true));
     let min_field = Arc::new(Field::new(
-        "minValues",
+        MIN_VALUES,
         ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
         true,
     ));
     let max_field = Arc::new(Field::new(
-        "maxValues",
+        MAX_VALUES,
         ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
         true,
     ));
     let nc_field = Arc::new(Field::new(
-        "nullCount",
+        NULL_COUNT,
         ArrowDataType::Struct(Fields::from(vec![col_field.clone()])),
         true,
     ));

@@ -6,18 +6,19 @@ publish = false
 
 [features]
 default = ["arrow"]
-arrow = ["arrow-58"]
+arrow = ["arrow-59"]
+arrow-59 = ["common/arrow-59"]
 arrow-58 = ["common/arrow-58"]
-arrow-57 = ["common/arrow-57"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 common = { path = "../common", default-features = false }
 delta_kernel = { path = "../../../kernel", features = [
-  "default-engine-rustls",
+  "default-engine-base",
   "internal-api",
 ] }
+delta_kernel_default_engine = { path = "../../../default-engine", features = ["rustls"] }
 env_logger = "0.11.8"
 tokio = { version = "1.0", features = ["full"] }
 url = "2"

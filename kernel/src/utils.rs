@@ -20,6 +20,41 @@ macro_rules! require {
 
 pub(crate) use require;
 
+/// Dual of the `FromIterator` trait, similar to how `Into` is the dual of `From`. It is
+/// automatically implemented for any iterable whose items collect into `T`, and can drastically
+/// simplify type bounds. For example, `CollectInto` allows to write this:
+///
+/// ```
+/// # use delta_kernel::CollectInto;
+/// # struct Foo;
+/// fn foo(arg: impl CollectInto<Foo>) -> Foo {
+///     arg.collect_into()
+/// }
+/// ```
+///
+/// instead of the much more verbose:
+///
+/// ```
+/// # struct Foo;
+/// fn foo<T>(arg: impl IntoIterator<Item = T>) -> Foo
+/// where
+///     Foo: FromIterator<T>,
+/// {
+///     Foo::from_iter(arg)
+/// }
+/// ```
+pub trait CollectInto<T>: IntoIterator + Sized {
+    /// Collects this iterable into a `T`
+    fn collect_into(self) -> T;
+}
+
+// blanket impl
+impl<I: IntoIterator, T: FromIterator<I::Item>> CollectInto<T> for I {
+    fn collect_into(self) -> T {
+        T::from_iter(self)
+    }
+}
+
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.
 #[allow(unused)]
@@ -109,6 +144,26 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
+/// Extension trait for folding zero or one value from an [`Option`] into a base value.
+#[internal_api]
+pub(crate) trait FoldWithOption: Sized {
+    /// Applies an optional fold operation `f` to `self` if `opt` is [`Some`]; otherwise returns
+    /// `self`.
+    ///
+    /// Similar to `opt.iter().fold(self, |acc, value| f(acc, value))`, but accepting `FnOnce`
+    /// instead of requiring `FnMut`, and with the base value as receiver instead of the option.
+    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self;
+}
+
+impl<T: Sized> FoldWithOption for T {
+    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self {
+        match opt {
+            Some(value) => f(self, value),
+            None => self,
+        }
+    }
+}
+
 /// Extension trait for adding completion callbacks to iterators.
 pub(crate) trait IteratorExt: Iterator + Sized {
     /// Wraps this iterator to call a closure when fully exhausted.
@@ -174,25 +229,46 @@ pub(crate) mod test_utils {
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::{delta_path_for_version, load_test_data};
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::util::SubscriberInitExt as _;
     use url::Url;
 
     use crate::actions::{
         get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
     };
-    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::array::{RecordBatch, StringArray, StructArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::committer::FileSystemCommitter;
+    use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
-    use crate::metrics::{MetricEvent, MetricsReporter};
+    use crate::metrics::{MetricEvent, MetricsReporter, WithMetricsReporterLayer as _};
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::path::ParsedLogPath;
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::{CreateTable, Transaction};
-    use crate::{DeltaResult, Engine, EngineData, Error, Snapshot, SnapshotRef};
+    use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, SnapshotRef};
+
+    /// Parses `path` (a full URL string) into a [`ParsedLogPath`] with zero size, for building
+    /// synthetic log-file listings in tests.
+    pub(crate) fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+        create_log_path_with_size(path, 0)
+    }
+
+    /// [`create_log_path`] with an explicit file size.
+    pub(crate) fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
+        ParsedLogPath::try_from(FileMeta {
+            location: Url::parse(path).expect("Invalid file URL"),
+            last_modified: 0,
+            size,
+        })
+        .unwrap()
+        .unwrap()
+    }
 
     /// A metrics reporter that captures all events for test assertions.
     #[derive(Debug, Default)]
@@ -213,6 +289,22 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Kernel-internal twin of [`test_utils::install_thread_local_metrics_reporter`].
+    ///
+    /// Internal tests need their own helper because the trait identity of `MetricsReporter`
+    /// differs across the test_utils <-> kernel path-dep boundary. Both helpers wrap
+    /// [`test_utils::ensure_metrics_compatible_global_subscriber`] + a thread-local
+    /// `set_default` and serve the same purpose: install a metrics-collecting subscriber
+    /// in a way that is robust against tracing callsite-cache poisoning.
+    pub(crate) fn install_thread_local_metrics_reporter(
+        reporter: Arc<dyn MetricsReporter>,
+    ) -> DefaultGuard {
+        test_utils::ensure_metrics_compatible_global_subscriber();
+        tracing_subscriber::registry()
+            .with_metrics_reporter_layer(reporter)
+            .set_default()
+    }
+
     #[derive(Serialize)]
     pub(crate) enum Action {
         #[serde(rename = "add")]
@@ -231,8 +323,8 @@ pub(crate) mod test_utils {
     }
 
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, MetadataValue,
-        PrimitiveType, SchemaRef, StructField, StructType,
+        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType,
+        MetadataValue, SchemaRef, StructField, StructType,
     };
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
@@ -389,90 +481,19 @@ pub(crate) mod test_utils {
         crate::table_configuration::TableConfiguration::try_new(metadata, protocol, table_root, 0)
     }
 
-    /// Helper to get a field from a StructType by name, panicking if not found.
-    pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
-        struct_type
-            .fields()
-            .find(|f| f.name() == name)
-            .unwrap_or_else(|| panic!("Field '{name}' not found"))
-            .clone()
-    }
-
-    /// Validates that a schema has the expected checkpoint structure with top-level action fields
-    /// and proper nested types for add, metaData, and protocol actions.
-    pub(crate) fn validate_checkpoint_schema(schema: &SchemaRef) {
-        // Verify top-level action fields exist and are structs
-        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
-        for field_name in top_level_fields {
-            let field = get_schema_field(schema, field_name);
-            assert!(
-                matches!(field.data_type(), KernelDataType::Struct(_)),
-                "Field '{field_name}' should be a struct type"
-            );
-        }
-
-        // Verify 'add' struct has expected fields with correct types
-        let add_field = get_schema_field(schema, "add");
-        let add_struct = match add_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'add' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(add_struct, "path").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-        assert_eq!(
-            get_schema_field(add_struct, "size").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Long)
-        );
-        assert!(
-            matches!(
-                get_schema_field(add_struct, "partitionValues").data_type(),
-                KernelDataType::Map(_)
-            ),
-            "'partitionValues' should be a map type"
-        );
-
-        // Verify 'metaData' struct has nested 'format' struct
-        let metadata_field = get_schema_field(schema, "metaData");
-        let metadata_struct = match metadata_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'metaData' should be a struct"),
-        };
-        let format_field = get_schema_field(metadata_struct, "format");
-        let format_struct = match format_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'format' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(format_struct, "provider").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::String)
-        );
-
-        // Verify 'protocol' struct has version fields
-        let protocol_field = get_schema_field(schema, "protocol");
-        let protocol_struct = match protocol_field.data_type() {
-            KernelDataType::Struct(s) => s,
-            _ => panic!("'protocol' should be a struct"),
-        };
-        assert_eq!(
-            get_schema_field(protocol_struct, "minReaderVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
-        assert_eq!(
-            get_schema_field(protocol_struct, "minWriterVersion").data_type(),
-            &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
-    }
-
     // ==================== Test schema helpers ====================
     //
     // Reusable test schemas
     // Each variant exists with and without column mapping metadata.
 
-    /// Helper to add column mapping metadata to a [`StructField`].
-    fn with_column_mapping(field: StructField, id: i64, physical_name: &str) -> StructField {
-        field.with_metadata([
+    /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
+    fn cm_field(
+        name: &str,
+        id: i64,
+        physical_name: &str,
+        ty: impl Into<KernelDataType>,
+    ) -> StructField {
+        StructField::nullable(name, ty).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
                 MetadataValue::Number(id),
@@ -484,205 +505,444 @@ pub(crate) mod test_utils {
         ])
     }
 
+    /// Shared fixture for nested field-id propagation tests.
+    pub(crate) struct NestedFieldIdFixture {
+        pub(crate) kernel_schema: StructType,
+        pub(crate) input_arrow_data: StructArray,
+        pub(crate) expected_arrow_schema: ArrowSchema,
+    }
+
+    /// Recursively collect `(field_name, metadata_value)` pairs for the given metadata key
+    /// across all (nested) Arrow fields in `schema`.
+    pub(crate) fn collect_arrow_field_metadata(
+        schema: &ArrowSchema,
+        metadata_key: &str,
+    ) -> Vec<(String, String)> {
+        fn collect_from_fields(
+            fields: &[Arc<Field>],
+            metadata_key: &str,
+            out: &mut Vec<(String, String)>,
+        ) {
+            for field in fields {
+                collect_from_field(field, metadata_key, out);
+            }
+        }
+
+        fn collect_from_field(field: &Field, metadata_key: &str, out: &mut Vec<(String, String)>) {
+            if let Some(value) = field.metadata().get(metadata_key) {
+                out.push((field.name().clone(), value.clone()));
+            }
+
+            match field.data_type() {
+                DataType::Struct(fields) => collect_from_fields(fields, metadata_key, out),
+                DataType::List(entry) | DataType::Map(entry, _) => {
+                    collect_from_field(entry, metadata_key, out)
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        collect_from_fields(schema.fields(), metadata_key, &mut out);
+        out
+    }
+
+    /// Build the kernel schema for `array_in_map: map<int, array<int>>` with caller-provided
+    /// top-level field metadata.
+    pub(crate) fn array_in_map_kernel_schema(
+        metadata: impl IntoIterator<Item = (String, MetadataValue)>,
+    ) -> StructType {
+        let array_in_map = StructField::nullable(
+            "array_in_map",
+            MapType::new(
+                KernelDataType::INTEGER,
+                ArrayType::new(KernelDataType::INTEGER, true),
+                true,
+            ),
+        )
+        .with_metadata(metadata);
+        StructType::try_new(vec![array_in_map]).unwrap()
+    }
+
+    /// Build an [`array_in_map_kernel_schema`] with `parquet.field.id` on the top-level field
+    /// and a nested-ids JSON map (key/value/element) under `nested_ids_meta_key`.
+    pub(crate) fn array_in_map_with_field_ids(nested_ids_meta_key: &str) -> StructType {
+        let nested_ids = MetadataValue::Other(test_utils::nested_ids_json(&[
+            ("array_in_map.key", 100),
+            ("array_in_map.value", 101),
+            ("array_in_map.value.element", 102),
+        ]));
+        array_in_map_kernel_schema([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                MetadataValue::from(1i64),
+            ),
+            (nested_ids_meta_key.to_string(), nested_ids),
+        ])
+    }
+
+    /// Build an empty Arrow `StructArray` matching [`array_in_map_kernel_schema`] with no field-id
+    /// metadata.
+    pub(crate) fn array_in_map_arrow_data_without_field_ids() -> StructArray {
+        let kernel_schema =
+            array_in_map_kernel_schema(std::iter::empty::<(String, MetadataValue)>());
+        let arrow_schema: ArrowSchema = (&kernel_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::new_empty(Arc::new(arrow_schema));
+        StructArray::try_new(
+            batch.schema().fields.clone(),
+            batch.columns().to_vec(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Build a [`NestedFieldIdFixture`] covering Array+Map nested-id propagation through a
+    /// Struct boundary.
+    ///
+    /// ## 1. Kernel schema
+    ///
+    /// Two [`StructField`]s `top` and `inner` carry `parquet.field.id` (rewritten to
+    /// `PARQUET:field_id` in the Arrow output) plus a `<nested_ids_meta_key>` JSON map rooted
+    /// at each field's name. Each carries an array inside a map.
+    ///
+    /// ```json
+    /// {
+    ///   "type": "struct",
+    ///   "fields": [{
+    ///     "name": "top",
+    ///     "type": {
+    ///       "type": "map",
+    ///       "keyType":   {"type": "array", "elementType": "integer"},
+    ///       "valueType": {"type": "struct", "fields": [{
+    ///         "name": "inner",
+    ///         "type": {"type": "map", "keyType": "integer",
+    ///                  "valueType": {"type": "array", "elementType": "integer"}},
+    ///         "metadata": {
+    ///           "parquet.field.id": 2,
+    ///           "<nested_ids_meta_key>": {
+    ///             "inner.key": 200, "inner.value": 201, "inner.value.element": 202
+    ///           }
+    ///         }
+    ///       }]}
+    ///     },
+    ///     "metadata": {
+    ///       "parquet.field.id": 1,
+    ///       "<nested_ids_meta_key>": {
+    ///         "top.key": 100, "top.key.element": 101, "top.value": 102
+    ///       }
+    ///     }
+    ///   }]
+    /// }
+    /// ```
+    ///
+    /// ## 2. Input Arrow schema
+    ///
+    /// Same shape as kernel schema with no metadata anywhere, except a *stale*
+    /// `PARQUET:field_id=999` on the synthesized `top.key.element` field.
+    ///
+    /// ## 3. Expected output Arrow schema
+    ///
+    /// What `try_into_arrow(kernel schema)` and
+    /// `apply_schema(input arrow schema, kernel schema)` should both produce:
+    /// - `top` and `inner` carry `PARQUET:field_id` (rewritten from `parquet.field.id`).
+    /// - Synthesized list/map `key`/`value`/`element` fields each carry `PARQUET:field_id` pulled
+    ///   from the corresponding nested-ids JSON entry. `top.key.element` has `101` (kernel's), not
+    ///   the stale `999` from the input.
+    ///
+    /// ```json
+    /// {
+    ///   "fields": [{
+    ///     "name": "top", "type": "map",
+    ///     "metadata": {"PARQUET:field_id": "1"},
+    ///     "entries": { "name": "key_value", "type": "struct", "fields": [
+    ///       {
+    ///         "name": "key", "type": "list",
+    ///         "metadata": {"PARQUET:field_id": "100"},
+    ///         "element": {
+    ///           "name": "element", "type": "int32",
+    ///           "metadata": {"PARQUET:field_id": "101"}
+    ///         }
+    ///       },
+    ///       {
+    ///         "name": "value", "type": "struct",
+    ///         "metadata": {"PARQUET:field_id": "102"},
+    ///         "fields": [{
+    ///           "name": "inner", "type": "map",
+    ///           "metadata": {"PARQUET:field_id": "2"},
+    ///           "entries": { "name": "key_value", "type": "struct", "fields": [
+    ///             {
+    ///               "name": "key", "type": "int32",
+    ///               "metadata": {"PARQUET:field_id": "200"}
+    ///             },
+    ///             {
+    ///               "name": "value", "type": "list",
+    ///               "metadata": {"PARQUET:field_id": "201"},
+    ///               "element": {
+    ///                 "name": "element", "type": "int32",
+    ///                 "metadata": {"PARQUET:field_id": "202"}
+    ///               }
+    ///             }
+    ///           ]}
+    ///         }]
+    ///       }
+    ///     ]}
+    ///   }]
+    /// }
+    /// ```
+    pub(crate) fn complex_nested_with_field_ids(nested_ids_meta_key: &str) -> NestedFieldIdFixture {
+        NestedFieldIdFixture {
+            kernel_schema: build_complex_nested_kernel_schema(nested_ids_meta_key),
+            input_arrow_data: build_arrow_input_with_stale_element_id(),
+            expected_arrow_schema: expected_complex_nested_arrow_schema(),
+        }
+    }
+
+    /// Build the input Arrow data for [`complex_nested_with_field_ids`] by
+    /// striping the metadata from [`build_complex_nested_kernel_schema`], and
+    /// add one stale `PARQUET:field_id` to the `top.key.element` field.
+    fn build_arrow_input_with_stale_element_id() -> StructArray {
+        // Get the no-meta Arrow shape from the kernel schema.
+        let plain_inner = StructField::nullable("inner", complex_nested_inner_map_type());
+        let plain_top = StructField::nullable(
+            "top",
+            complex_nested_outer_map_type(StructType::try_new(vec![plain_inner]).unwrap()),
+        );
+        let plain_kernel_schema = StructType::try_new(vec![plain_top]).unwrap();
+        let plain_arrow_schema: ArrowSchema = (&plain_kernel_schema).try_into_arrow().unwrap();
+
+        // Add stale `PARQUET:field_id` to the `top.key.element` field.
+        let top = plain_arrow_schema.field(0);
+        let DataType::Map(entries, sorted) = top.data_type() else {
+            unreachable!("top is a Map by construction");
+        };
+        let DataType::Struct(entries_fields) = entries.data_type() else {
+            unreachable!("map entries is a Struct by construction");
+        };
+        let outer_key = &entries_fields[0];
+        let DataType::List(outer_element) = outer_key.data_type() else {
+            unreachable!("outer map key is a List by construction");
+        };
+        let stale_element = outer_element
+            .as_ref()
+            .clone()
+            .with_metadata([(PARQUET_FIELD_ID_META_KEY.to_string(), "999".to_string())].into());
+        let new_outer_key = Field::new(
+            outer_key.name(),
+            DataType::List(Arc::new(stale_element)),
+            outer_key.is_nullable(),
+        );
+        let new_entries = Field::new(
+            entries.name(),
+            DataType::Struct(vec![new_outer_key, entries_fields[1].as_ref().clone()].into()),
+            entries.is_nullable(),
+        );
+        let new_top = Field::new(
+            top.name(),
+            DataType::Map(Arc::new(new_entries), *sorted),
+            top.is_nullable(),
+        );
+        let arrow_input_schema = ArrowSchema::new(vec![new_top]);
+        let batch = RecordBatch::new_empty(Arc::new(arrow_input_schema));
+        StructArray::try_new(
+            batch.schema().fields.clone(),
+            batch.columns().to_vec(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn complex_nested_inner_map_type() -> KernelDataType {
+        KernelDataType::from(MapType::new(
+            KernelDataType::INTEGER,
+            ArrayType::new(KernelDataType::INTEGER, true),
+            true,
+        ))
+    }
+
+    fn complex_nested_outer_map_type(struct_value: StructType) -> KernelDataType {
+        KernelDataType::from(MapType::new(
+            ArrayType::new(KernelDataType::INTEGER, true),
+            struct_value,
+            true,
+        ))
+    }
+
+    /// Build the kernel schema described by [`complex_nested_with_field_ids`].
+    pub(crate) fn build_complex_nested_kernel_schema(nested_ids_meta_key: &str) -> StructType {
+        let top_nested_ids = test_utils::nested_ids_json(&[
+            ("top.key", 100),
+            ("top.key.element", 101),
+            ("top.value", 102),
+        ]);
+        let inner_nested_ids = test_utils::nested_ids_json(&[
+            ("inner.key", 200),
+            ("inner.value", 201),
+            ("inner.value.element", 202),
+        ]);
+        // Each `StructField` carries `parquet.field.id` plus the nested-ids JSON.
+        let inner_field = StructField::nullable("inner", complex_nested_inner_map_type())
+            .with_metadata([
+                (
+                    ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                    MetadataValue::from(2i64),
+                ),
+                (
+                    nested_ids_meta_key.to_string(),
+                    MetadataValue::Other(inner_nested_ids),
+                ),
+            ]);
+        let top_field = StructField::nullable(
+            "top",
+            complex_nested_outer_map_type(StructType::try_new(vec![inner_field]).unwrap()),
+        )
+        .with_metadata([
+            (
+                ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                MetadataValue::from(1i64),
+            ),
+            (
+                nested_ids_meta_key.to_string(),
+                MetadataValue::Other(top_nested_ids),
+            ),
+        ]);
+        StructType::try_new(vec![top_field]).unwrap()
+    }
+
+    /// Build the expected output Arrow schema for [`complex_nested_with_field_ids`].
+    fn expected_complex_nested_arrow_schema() -> ArrowSchema {
+        // top.value.inner.value.element: int (PARQUET:field_id=202).
+        let inner_list_element = Field::new("element", DataType::Int32, true)
+            .with_metadata(parquet_field_id_metadata(Some(202)));
+        // top.value.inner.value: list<int> (PARQUET:field_id=201).
+        let inner_value = Field::new("value", DataType::List(Arc::new(inner_list_element)), true)
+            .with_metadata(parquet_field_id_metadata(Some(201)));
+        // top.value.inner.key: int (PARQUET:field_id=200).
+        let inner_key = Field::new("key", DataType::Int32, false)
+            .with_metadata(parquet_field_id_metadata(Some(200)));
+        // top.value.inner.key_value: synthesized map-entries struct (no field id).
+        let inner_entries = Field::new(
+            "key_value",
+            DataType::Struct(vec![inner_key, inner_value].into()),
+            false,
+        );
+        // top.value.inner: map<int, list<int>> (PARQUET:field_id=2).
+        let inner_field = Field::new("inner", DataType::Map(Arc::new(inner_entries), false), true)
+            .with_metadata(parquet_field_id_metadata(Some(2)));
+        // top.value: struct<inner: ...> (PARQUET:field_id=102).
+        let struct_value_field =
+            Field::new("value", DataType::Struct(vec![inner_field].into()), true)
+                .with_metadata(parquet_field_id_metadata(Some(102)));
+        // top.key.element: int (PARQUET:field_id=101).
+        let outer_key_element = Field::new("element", DataType::Int32, true)
+            .with_metadata(parquet_field_id_metadata(Some(101)));
+        // top.key: list<int> (PARQUET:field_id=100).
+        let outer_key = Field::new("key", DataType::List(Arc::new(outer_key_element)), false)
+            .with_metadata(parquet_field_id_metadata(Some(100)));
+        // top.key_value: synthesized map-entries struct (no field id).
+        let outer_entries = Field::new(
+            "key_value",
+            DataType::Struct(vec![outer_key, struct_value_field].into()),
+            false,
+        );
+        // top: map<list<int>, struct<...>> (PARQUET:field_id=1).
+        let top_field = Field::new("top", DataType::Map(Arc::new(outer_entries), false), true)
+            .with_metadata(parquet_field_id_metadata(Some(1)));
+        ArrowSchema::new(vec![top_field])
+    }
+
     /// Flat schema: `[id: long, name: string]`
     pub(crate) fn test_schema_flat() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable("name", KernelDataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "name": STRING,
+        }
     }
 
     /// Flat schema with column mapping metadata.
     pub(crate) fn test_schema_flat_with_column_mapping() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable("name", KernelDataType::STRING),
-                2,
-                "phys_name",
-            ),
-        ]))
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("name", 2, "phys_name", KernelDataType::STRING)),
+        }
     }
 
     /// Nested struct schema with array and map inside the struct
     pub(crate) fn test_schema_nested() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable(
-                "info",
-                StructType::new_unchecked([
-                    StructField::nullable("name", KernelDataType::STRING),
-                    StructField::nullable("age", KernelDataType::INTEGER),
-                    StructField::nullable(
-                        "tags",
-                        MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
-                    ),
-                    StructField::nullable("scores", ArrayType::new(KernelDataType::INTEGER, true)),
-                ]),
-            ),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "info": {
+                nullable "name": STRING,
+                nullable "age": INTEGER,
+                nullable "tags": { STRING => nullable STRING },
+                nullable "scores": [ nullable INTEGER ],
+            },
+        }
     }
 
     /// Nested struct schema with column mapping metadata.
     pub(crate) fn test_schema_nested_with_column_mapping() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable(
-                    "info",
-                    StructType::new_unchecked([
-                        with_column_mapping(
-                            StructField::nullable("name", KernelDataType::STRING),
-                            3,
-                            "phys_name",
-                        ),
-                        with_column_mapping(
-                            StructField::nullable("age", KernelDataType::INTEGER),
-                            4,
-                            "phys_age",
-                        ),
-                        with_column_mapping(
-                            StructField::nullable(
-                                "tags",
-                                MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
-                            ),
-                            5,
-                            "phys_tags",
-                        ),
-                        with_column_mapping(
-                            StructField::nullable(
-                                "scores",
-                                ArrayType::new(KernelDataType::INTEGER, true),
-                            ),
-                            6,
-                            "phys_scores",
-                        ),
-                    ]),
-                ),
-                2,
-                "phys_info",
-            ),
-        ]))
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("info", 2, "phys_info", schema! {
+                (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
+                (cm_field("age", 4, "phys_age", KernelDataType::INTEGER)),
+                (cm_field("tags", 5, "phys_tags",
+                    MapType::new(KernelDataType::STRING, KernelDataType::STRING, true))),
+                (cm_field("scores", 6, "phys_scores",
+                    ArrayType::new(KernelDataType::INTEGER, true))),
+            })),
+        }
     }
 
     /// Schema with a map
     pub(crate) fn test_schema_with_map() -> SchemaRef {
-        let value_struct = StructType::new_unchecked([
-            StructField::nullable("key", KernelDataType::STRING),
-            StructField::nullable("value", KernelDataType::INTEGER),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable(
-                "entries",
-                MapType::new(
-                    KernelDataType::STRING,
-                    KernelDataType::Struct(Box::new(value_struct)),
-                    true,
-                ),
-            ),
-            StructField::nullable("name", KernelDataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "entries": { STRING => nullable {
+                nullable "key": STRING,
+                nullable "value": INTEGER,
+            } },
+            nullable "name": STRING,
+        }
     }
 
     /// Schema with a map and column mapping metadata.
     pub(crate) fn test_schema_with_map_and_column_mapping() -> SchemaRef {
-        let value_struct = StructType::new_unchecked([
-            with_column_mapping(
-                StructField::nullable("key", KernelDataType::STRING),
-                4,
-                "phys_key",
-            ),
-            with_column_mapping(
-                StructField::nullable("value", KernelDataType::INTEGER),
-                5,
-                "phys_value",
-            ),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable(
-                    "entries",
-                    MapType::new(
-                        KernelDataType::STRING,
-                        KernelDataType::Struct(Box::new(value_struct)),
-                        true,
-                    ),
-                ),
-                2,
-                "phys_entries",
-            ),
-            with_column_mapping(
-                StructField::nullable("name", KernelDataType::STRING),
-                3,
-                "phys_name",
-            ),
-        ]))
+        let value_struct = schema! {
+            (cm_field("key", 4, "phys_key", KernelDataType::STRING)),
+            (cm_field("value", 5, "phys_value", KernelDataType::INTEGER)),
+        };
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("entries", 2, "phys_entries",
+                MapType::new(KernelDataType::STRING, value_struct, true))),
+            (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
+        }
     }
 
     /// Schema with an array
     pub(crate) fn test_schema_with_array() -> SchemaRef {
-        let item_struct = StructType::new_unchecked([
-            StructField::nullable("label", KernelDataType::STRING),
-            StructField::nullable("count", KernelDataType::INTEGER),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", KernelDataType::LONG, true),
-            StructField::nullable(
-                "items",
-                ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
-            ),
-            StructField::nullable("name", KernelDataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": LONG,
+            nullable "items": [ nullable {
+                nullable "label": STRING,
+                nullable "count": INTEGER,
+            } ],
+            nullable "name": STRING,
+        }
     }
 
     /// Schema with an array and column mapping metadata.
     pub(crate) fn test_schema_with_array_and_column_mapping() -> SchemaRef {
-        let item_struct = StructType::new_unchecked([
-            with_column_mapping(
-                StructField::nullable("label", KernelDataType::STRING),
-                4,
-                "phys_label",
-            ),
-            with_column_mapping(
-                StructField::nullable("count", KernelDataType::INTEGER),
-                5,
-                "phys_count",
-            ),
-        ]);
-        Arc::new(StructType::new_unchecked([
-            with_column_mapping(
-                StructField::new("id", KernelDataType::LONG, true),
-                1,
-                "phys_id",
-            ),
-            with_column_mapping(
-                StructField::nullable(
-                    "items",
-                    ArrayType::new(KernelDataType::Struct(Box::new(item_struct)), true),
-                ),
-                2,
-                "phys_items",
-            ),
-            with_column_mapping(
-                StructField::nullable("name", KernelDataType::STRING),
-                3,
-                "phys_name",
-            ),
-        ]))
+        let item_struct = schema! {
+            (cm_field("label", 4, "phys_label", KernelDataType::STRING)),
+            (cm_field("count", 5, "phys_count", KernelDataType::INTEGER)),
+        };
+        schema_ref! {
+            (cm_field("id", 1, "phys_id", KernelDataType::LONG)),
+            (cm_field("items", 2, "phys_items", ArrayType::new(item_struct, true))),
+            (cm_field("name", 3, "phys_name", KernelDataType::STRING)),
+        }
     }
 
     /// Deeply nested schema: struct -> array -> struct -> map(value) -> struct.
@@ -690,24 +950,18 @@ pub(crate) mod test_utils {
     /// The leaf struct field is intentionally **not** annotated with column mapping metadata,
     /// so this schema can be used to test error paths when column mapping is enabled.
     pub(crate) fn test_deep_nested_schema_missing_leaf_cm() -> StructType {
-        let leaf_struct =
-            StructType::new_unchecked([StructField::new("leaf", KernelDataType::INTEGER, false)]);
         let map_type = MapType::new(
             KernelDataType::STRING,
-            KernelDataType::Struct(Box::new(leaf_struct)),
+            schema! { not_null "leaf": INTEGER },
             true,
         );
-        let mid_struct = StructType::new_unchecked([with_column_mapping(
-            StructField::nullable("mid_field", map_type),
-            2,
-            "phys_mid_field",
-        )]);
-        let array_type = ArrayType::new(KernelDataType::Struct(Box::new(mid_struct)), true);
-        StructType::new_unchecked([with_column_mapping(
-            StructField::nullable("top", array_type),
-            1,
-            "phys_top",
-        )])
+        let array_type = ArrayType::new(
+            schema! { (cm_field("mid_field", 2, "phys_mid_field", map_type)) },
+            true,
+        );
+        schema! {
+            (cm_field("top", 1, "phys_top", array_type)),
+        }
     }
 
     /// Build a create-table transaction with the given schema and column mapping mode.
@@ -722,7 +976,7 @@ pub(crate) mod test_utils {
             ColumnMappingMode::None => "none",
         };
         let store = Arc::new(InMemory::new());
-        let engine: Arc<dyn Engine> = Arc::new(DefaultEngineBuilder::new(store).build());
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store));
 
         let txn = create_table("memory:///test_table", schema, "DefaultEngine")
             .with_table_properties([("delta.columnMapping.mode", mode_str)])
@@ -831,10 +1085,76 @@ pub(crate) mod test_utils {
         let url = Url::from_directory_path(&path)
             .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
 
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store).build());
+        let engine = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         Ok((engine, snapshot, tempdir))
+    }
+
+    pub(crate) mod column_mapping_physical_name_dedup_fixtures {
+        use crate::schema::{
+            schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField,
+            StructType,
+        };
+
+        /// Two fields with the same physical name at different physical paths should be accepted.
+        pub(crate) fn same_phy_name_different_paths() -> StructType {
+            let nested = StructType::new_unchecked([cm_field("id", 3, "id", DataType::INTEGER)]);
+            StructType::new_unchecked([
+                cm_field("id", 1, "id", DataType::INTEGER),
+                cm_field("nested", 2, "nested", nested),
+            ])
+        }
+
+        /// Two nested fields with same physical path should be rejected.
+        pub(crate) fn deeply_nested_repeat_physical_paths() -> StructType {
+            let inner = StructType::new_unchecked([
+                cm_field("a", 2, "x", DataType::INTEGER),
+                cm_field("b", 3, "x", DataType::INTEGER),
+            ]);
+            let arr_of_struct = ArrayType::new(inner, true);
+            let map_to_arr = MapType::new(DataType::STRING, arr_of_struct, true);
+            StructType::new_unchecked([cm_field("outer", 1, "outer", map_to_arr)])
+        }
+
+        /// Full logical paths of the two colliding fields in
+        /// [`deeply_nested_repeat_physical_paths`], in the order the walker visits them.
+        pub(crate) fn deeply_nested_collider_paths() -> (&'static str, &'static str) {
+            (
+                "outer.`<map value>`.`<array element>`.a",
+                "outer.`<map value>`.`<array element>`.b",
+            )
+        }
+
+        /// Two collision sites in the same schema:
+        /// - **shallower** (visited first by DFS): top-level siblings `a` and `b`, both have
+        ///   physical name "p".
+        /// - **deeper** (never reached): inside `nested` struct, siblings `x` and `y`, both have
+        ///   physical name "q".
+        ///
+        /// Dedup must error at the shallower site and never report the deeper one.
+        pub(crate) fn multiple_physical_name_collisions() -> StructType {
+            schema! {
+                (cm_field("a", 1, "p", schema! { (cm_field("aa", 6, "aa", DataType::INTEGER)) })),
+                (cm_field("b", 2, "p", schema! { (cm_field("bb", 7, "bb", DataType::INTEGER)) })),
+                (cm_field("nested", 3, "nested", schema! {
+                    (cm_field("x", 4, "q", DataType::INTEGER)),
+                    (cm_field("y", 5, "q", DataType::INTEGER)),
+                })),
+            }
+        }
+
+        fn cm_field(name: &str, id: i64, phys: &str, ty: impl Into<DataType>) -> StructField {
+            StructField::new(name, ty, true).with_metadata([
+                (
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::Number(id),
+                ),
+                (
+                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                    MetadataValue::String(phys.to_string()),
+                ),
+            ])
+        }
     }
 }
 

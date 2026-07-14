@@ -88,24 +88,27 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod commit_range;
 pub mod committer;
-// Public under test-utils so integration tests can inspect CRC state via
-// Snapshot::get_current_crc_if_loaded_for_testing.
-#[cfg(feature = "test-utils")]
+#[cfg(feature = "internal-api")]
 pub mod crc;
-#[cfg(not(feature = "test-utils"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod incremental_scan;
 mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
+pub mod struct_patch;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -125,7 +128,7 @@ pub(crate) mod row_tracking;
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
 pub use arrow_compat::*;
 
 #[cfg(feature = "internal-api")]
@@ -133,10 +136,13 @@ pub mod column_trie;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
+#[cfg(feature = "internal-api")]
+pub mod utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::try_parse_uri;
+pub use utils::{try_parse_uri, CollectInto};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -177,17 +183,19 @@ use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, Error};
+pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+#[cfg(feature = "declarative-plans")]
+pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
-    feature = "arrow-conversion"
+    feature = "default-engine-base",
+    feature = "arrow-conversion",
+    feature = "declarative-plans"
 ))]
 pub mod engine;
 
@@ -204,8 +212,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+pub type FileDataReadResultIterator = DeltaResultIteratorStatic<Box<dyn EngineData>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,11 +591,20 @@ pub(crate) trait IntoEngineData {
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
 pub trait StorageHandler: AsAny {
-    /// List the paths in the same directory that are lexicographically greater than
-    /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
+    /// Recursively list files whose full path is lexicographically greater than (UTF-8 sorting)
+    /// the given `path`, restricted to descendants of `path`'s parent directory. The result must
+    /// be sorted by the full path (UTF-8 byte order).
     ///
-    /// If the path is directory-like (ends with '/'), the result should contain
-    /// all the files in the directory.
+    /// The listing is **recursive**: files in nested subdirectories are included, not just files
+    /// directly under the parent. For example, listing from `dir/0001.json` may return
+    /// `dir/0002.json`, `dir/sub/0003.json`, and `dir/sub/nested/0004.json`, all interleaved
+    /// in lexicographic order.
+    ///
+    /// The parent directory is derived from `path`:
+    /// - If `path` is directory-like (ends with `/`), the parent is `path` itself and the result
+    ///   contains all files at or below that directory.
+    /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
+    ///   under that parent) whose full path sorts strictly greater than `path` are returned.
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
@@ -612,6 +628,12 @@ pub trait StorageHandler: AsAny {
     ///
     /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
     fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
+
+    /// Delete the file at the given path.
+    ///
+    /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
+    /// For any other error, this must propagate the corresponding error.
+    fn delete(&self, path: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
@@ -658,9 +680,13 @@ pub trait JsonHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Atomically (!) write a single JSON file. Each row of the input data should be written as a
-    /// new JSON object appended to the file. this write must:
-    /// (1) serialize the data to newline-delimited json (each row is a json object literal)
+    /// Atomically (!) write a single JSON file. Each selected row of the input data must be
+    /// written as a new JSON object appended to the file; rows not selected by a batch's
+    /// selection vector (see [`FilteredEngineData`]) must not be written.
+    /// [`FilteredEngineData::apply_selection_vector`] produces the selected-rows view for
+    /// implementations that do not filter during serialization. This write must:
+    /// (1) serialize the selected rows to newline-delimited json (each row is a json object
+    ///     literal)
     /// (2) write the data to storage atomically (i.e. if the file already exists, fail unless the
     ///     overwrite flag is set)
     ///
@@ -675,15 +701,13 @@ pub trait JsonHandler: AsAny {
     /// # Parameters
     ///
     /// - `path` - URL specifying the location to write the JSON file
-    /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as a
-    ///   new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
-    ///   each row is a JSON object on a single line)
+    /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }
@@ -730,6 +754,16 @@ pub trait ParquetHandler: AsAny {
     ///    field id
     /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or
     ///    no matching parquet field ID is found, fall back to matching by column name
+    ///
+    /// # Type coercion
+    ///
+    /// A matched Parquet column whose physical type differs from the `physical_schema`
+    /// [`StructField`] must be coerced to the requested type. In particular, timestamp columns MUST
+    /// be normalized to the protocol specified microsecond precision: a `TIMESTAMP(MILLIS)` (or
+    /// any other non-microsecond unit) column read into a `TIMESTAMP` / `TIMESTAMP_NTZ` field
+    /// must be rescaled to microseconds (a finer unit such as nanosecond is truncated). The
+    /// default engine does this via `arrow::compute::cast` while reordering columns to the
+    /// requested schema.
     ///
     /// # Metadata Columns
     ///
@@ -856,6 +890,20 @@ pub trait ParquetHandler: AsAny {
     /// This will overwrite the file if it already exists. For filesystem-backed
     /// implementations, the parent directories must be created if they do not exist.
     ///
+    /// # Parquet field IDs
+    ///
+    /// The engine must write a Parquet `field_id` correctly when the kernel
+    /// [`StructField`] carries a field-id related annotation, including:
+    /// - [`ColumnMetadataKey::ColumnMappingId`] / [`ColumnMetadataKey::ParquetFieldId`]
+    /// - [`ColumnMetadataKey::ColumnMappingNestedIds`]
+    ///
+    /// For how to use these keys, refer to the Delta protocol's [Column Mapping] and
+    /// [IcebergCompatV2] sections.
+    ///
+    /// **Non-compliance produces files with incorrect `field_id`s**, which may lead to
+    /// read failures when column mapping mode is `id` and to failures when converting
+    /// the table to Iceberg.
+    ///
     /// # Parameters
     ///
     /// - `url` - The full URL path where the Parquet file should be written (e.g.,
@@ -865,10 +913,17 @@ pub trait ParquetHandler: AsAny {
     /// # Returns
     ///
     /// A [`DeltaResult`] indicating success or failure.
+    ///
+    /// [`StructField`]: crate::schema::StructField
+    /// [`ColumnMetadataKey::ColumnMappingId`]: crate::schema::ColumnMetadataKey::ColumnMappingId
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
+    /// [`ColumnMetadataKey::ColumnMappingNestedIds`]: crate::schema::ColumnMetadataKey::ColumnMappingNestedIds
+    /// [Column Mapping]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
+    /// [IcebergCompatV2]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#iceberg-compatibility-v2
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
@@ -925,22 +980,15 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-}
 
-// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with
-// _only_ default-engine-base, so we give a friendly error here.
-#[cfg(all(
-    feature = "default-engine-base",
-    not(any(
-        feature = "default-engine-native-tls",
-        feature = "default-engine-rustls",
-    ))
-))]
-compile_error!(
-    "The default-engine-base feature flag is not meant to be used directly. \
-    Please use either default-engine-native-tls or default-engine-rustls."
-);
+    /// Get the connector provided [`PlanExecutor`].
+    ///
+    /// The default implementation returns a trivial executor that errors on every operation.
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
+        Arc::new(())
+    }
+}
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
 // using doctests to test macros. Specifically, we are testing for failed macro invocations due

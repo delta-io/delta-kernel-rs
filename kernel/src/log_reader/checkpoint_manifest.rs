@@ -6,18 +6,18 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{Add, Remove, Sidecar, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
 pub(crate) struct CheckpointManifestReader {
-    actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    actions: DeltaResultIteratorStatic<ActionsBatch>,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
@@ -40,13 +40,11 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
-            Arc::new(StructType::new_unchecked([
-                StructField::nullable(ADD_NAME, Add::to_schema()),
-                StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-                StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-            ]))
-        });
+        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            (&ADD_FIELD),
+            (&REMOVE_FIELD),
+            (&SIDECAR_FIELD),
+        };
 
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(

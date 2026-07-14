@@ -137,7 +137,7 @@ impl<'col> StatsColumnFilter<'col> {
                     continue;
                 }
                 // Verify the required column exists in schema before adding
-                if schema.walk_column_fields(col).is_ok() {
+                if schema.field_at(col).is_ok() {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",
@@ -367,7 +367,7 @@ mod tests {
         ]);
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
-            StructField::nullable("address", DataType::Struct(Box::new(address_struct))),
+            StructField::nullable("address", address_struct),
         ]);
         let other_struct = StructType::new_unchecked([
             StructField::nullable("foo", DataType::STRING),
@@ -377,8 +377,8 @@ mod tests {
         let schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("name", DataType::STRING),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
-            StructField::nullable("other", DataType::Struct(Box::new(other_struct))),
+            StructField::nullable("user", user_struct),
+            StructField::nullable("other", other_struct),
             StructField::nullable("extra1", DataType::STRING),
             StructField::nullable("extra2", DataType::STRING),
         ]);

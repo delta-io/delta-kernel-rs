@@ -12,9 +12,10 @@ use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
+    PredicateRef, UnaryExpressionOp,
 };
-use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
+use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
     ParallelLogReplayProcessor,
@@ -23,11 +24,41 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
-    ColumnNamesAndTypes, DataType, LogicalSchemaRef, MapType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    schema_ref, ColumnNamesAndTypes, DataType, LogicalSchemaRef, MapType, SchemaRef,
+    SchemaStructPatchBuilder, StructField, StructType, ToSchema as _,
 };
-use crate::utils::require;
+use crate::utils::{require, FoldWithOption as _};
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+
+/// Read-time stats toggles consumed by [`ScanLogReplayProcessor`].
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ScanStatsOptions {
+    /// Skip reading file statistics entirely. Disables data skipping.
+    pub(crate) skip_stats: bool,
+    /// Synthesize the `stats` JSON output via `ToJson(stats_parsed)` on checkpoints
+    /// whose `add.stats` is null but whose `add.stats_parsed` is populated
+    /// (writeStatsAsJson=false, writeStatsAsStruct=true). When false, `ScanFile.stats`
+    /// is left null on such checkpoints; engines that consume `stats_parsed` directly
+    /// avoid the per-batch `ToJson` cost.
+    pub(crate) synthesize_json: bool,
+}
+
+impl Default for ScanStatsOptions {
+    fn default() -> Self {
+        Self {
+            skip_stats: false,
+            synthesize_json: true,
+        }
+    }
+}
+
+/// Read-time partition value toggles consumed by [`ScanLogReplayProcessor`].
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ScanPartitionValuesOptions {
+    /// Emit the typed `partitionValues_parsed` struct column in scan metadata output,
+    /// independent of any predicate.
+    pub(crate) parsed_struct: bool,
+}
 
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
@@ -40,9 +71,22 @@ struct InternalScanState {
     transform_spec: Option<Arc<TransformSpec>>,
     /// Physical stats schema for reading/parsing stats from checkpoint files
     physical_stats_schema: Option<SchemaRef>,
+    #[serde(default)]
+    stats_options: ScanStatsOptions,
+    #[serde(default)]
+    partition_values_options: ScanPartitionValuesOptions,
     /// Physical partition schema for checkpoint partition pruning via `partitionValues_parsed`
     physical_partition_schema: Option<SchemaRef>,
-    skip_stats: bool,
+    /// Physical leaf paths which are expected to have stats collected. Carried alongside
+    /// `physical_stats_schema` so the distributed `DataSkippingFilter` rebuilds the same
+    /// filter the sequential phase used. `#[serde(default)]` keeps older blobs readable:
+    /// an empty set drops every data-column reference, which means no skipping but is
+    /// still correct.
+    #[serde(default)]
+    physical_stats_columns: HashSet<ColumnName>,
+    #[serde(default)]
+    is_catalog_managed: bool,
+    skip_row_transforms: bool,
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -93,9 +137,9 @@ pub struct SerializableScanState {
 /// - Transformation: Applies a built-in transformation (`log_transform` or `checkpoint_transform`)
 ///   to convert selected Add actions into [`ScanMetadata`], the intermediate format passed to the
 ///   engine.
-/// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those
-///   derived from projection or filters) are preserved and passed through to the engine, which
-///   applies them as part of its scan execution logic.
+/// - Row StructPatch passthrough: Any user-provided row-level transformation expressions (e.g.
+///   those derived from projection or filters) are preserved and passed through to the engine,
+///   which applies them as part of its scan execution logic.
 ///
 /// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
 /// `process_actions_batch` method, which applies these steps to each batch of log actions and
@@ -105,17 +149,21 @@ pub struct SerializableScanState {
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 pub struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
-    /// Transform for log batches (commit files) - uses ParseJson for stats
+    /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
+    /// for partition values
     log_transform: Arc<dyn ExpressionEvaluator>,
-    /// Transform for checkpoint batches - uses coalesce(stats_parsed, ParseJson) when available
+    /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
+    /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
     seen_file_keys: HashSet<FileActionKey>,
-    /// Skip reading file statistics.
-    skip_stats: bool,
+    /// Read-time stats options.
+    stats_options: ScanStatsOptions,
+    /// Read-time partition value options.
+    partition_values_options: ScanPartitionValuesOptions,
     /// Information about checkpoint reading for stats optimization
     checkpoint_info: CheckpointReadInfo,
     /// Metrics related to the scan
@@ -127,24 +175,28 @@ impl ScanLogReplayProcessor {
     // `selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
     const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
-    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
+    const ADD_SIZE_INDEX: usize = 2; // Position of "add.size" in getters
+    const ADD_DV_START_INDEX: usize = 3; // Start position of add deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 6; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 7; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 8; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
-        skip_stats: bool,
+        stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
+        let dedup_capacity = state_info.dedup_capacity_hint();
         Self::new_with_seen_files(
             engine,
             state_info,
             checkpoint_info,
-            Default::default(),
-            skip_stats,
+            HashSet::with_capacity(dedup_capacity),
+            stats_options,
+            partition_values_options,
         )
     }
 
@@ -158,19 +210,26 @@ impl ScanLogReplayProcessor {
     /// - `state_info`: StateInfo containing schemas, transforms, and predicates
     /// - `checkpoint_info`: Information about checkpoint reading for stats optimization
     /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
-    /// - `skip_stats`: Skip reading file statistics
+    /// - `stats_options`: Read-time stats options (see [`ScanStatsOptions`])
+    /// - `partition_values_options`: Read-time partition value options (see
+    ///   [`ScanPartitionValuesOptions`])
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
         checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
-        skip_stats: bool,
+        stats_options: ScanStatsOptions,
+        partition_values_options: ScanPartitionValuesOptions,
     ) -> DeltaResult<Self> {
         let CheckpointReadInfo {
             has_stats_parsed,
             has_partition_values_parsed,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
+        let ScanStatsOptions {
+            skip_stats,
+            synthesize_json,
+        } = stats_options;
 
         // Create metrics first so we can pass them to DataSkippingFilter
         let metrics = Arc::new(ScanMetrics::default());
@@ -182,76 +241,88 @@ impl ScanLogReplayProcessor {
             _ => None,
         };
 
-        // When skip_stats is enabled, use None for stats schema to produce null stats output
+        // When skip_stats is enabled, disable both data column skipping and partition pruning.
+        // Both rely on the same DataSkippingFilter columnar pass, so they are controlled together.
         let stats_schema_for_transform = if skip_stats {
             None
         } else {
             state_info.physical_stats_schema.clone()
         };
 
-        // Compute physical partition schema for partition-based data skipping.
-        // Disabled when skip_stats is enabled (no predicate evaluation at all).
-        let partition_schema = if skip_stats {
-            None
-        } else {
-            state_info.physical_partition_schema.clone()
-        };
+        // The partition schema feeds two consumers: the DataSkippingFilter (predicate
+        // pruning, disabled by skip_stats together with stats) and the engine-facing
+        // `partitionValues_parsed` output column (requested via `parsed_struct`, independent
+        // of skip_stats). Either consumer keeps the transform emitting the column.
+        let partition_schema_for_transform =
+            if partition_values_options.parsed_struct || !skip_stats {
+                state_info.physical_partition_schema.clone()
+            } else {
+                None
+            };
 
-        let output_schema = scan_row_schema_with_stats_parsed(
+        let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
-            partition_schema.as_ref(),
-        );
+            partition_schema_for_transform.clone(),
+        )?;
 
-        // Create data skipping filter that reads stats_parsed and partitionValues_parsed from the
-        // transformed batch. This avoids double JSON parsing - the transform parses JSON once, then
-        // data skipping reads the already-parsed columns from the transform output.
-        // Disabled when skip_stats is enabled.
+        // Create data skipping filter that reads stats_parsed and partitionValues_parsed
+        // from the transformed batch. This avoids double JSON parsing -- the transform parses
+        // JSON once, then data skipping reads the already-parsed columns from the output.
+        //
+        // When partition columns are referenced by the predicate, the filter receives a
+        // partition schema + expression to extract typed partition values. Since the transform
+        // already produces `partitionValues_parsed`, the filter reads that column directly.
         let data_skipping_filter = if skip_stats {
             None
-        } else if state_info.physical_stats_schema.is_some() || partition_schema.is_some() {
+        } else {
             DataSkippingFilter::new(
                 engine,
                 physical_predicate.as_ref().map(|(p, _)| p.clone()),
-                state_info.physical_stats_schema.as_ref(),
+                stats_schema_for_transform.as_ref(),
                 column_expr_ref!("stats_parsed"),
-                partition_schema.as_ref(),
+                partition_schema_for_transform.as_ref(),
                 column_expr_ref!("partitionValues_parsed"),
+                // The transform flattens `add.*` to top-level columns, so `path` is non-null
+                // exactly for Add rows.
+                Arc::new(Predicate::is_not_null(column_expr!("path")).into()),
                 output_schema.clone(),
+                &state_info.physical_stats_columns,
                 Some(metrics.clone()),
             )
-        } else {
-            None
         };
 
         Ok(Self {
             data_skipping_filter,
-            // Log transform: always parse JSON (no stats_parsed in JSON commit files)
+            // Log transform: parse JSON for stats, MapToStruct for partition values
             log_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema.clone(),
                 get_add_transform_expr(
                     stats_schema_for_transform.clone(),
                     false,
                     skip_stats,
-                    partition_schema.as_ref(),
-                    false, // log batches never have partitionValues_parsed
+                    synthesize_json,
+                    partition_schema_for_transform.clone(),
+                    false,
                 ),
                 output_schema.clone().into(),
             )?,
-            // Checkpoint transform: read stats_parsed directly when available, otherwise parse JSON
+            // Checkpoint transform: read pre-parsed columns directly when available
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
                 get_add_transform_expr(
                     stats_schema_for_transform,
                     has_stats_parsed,
                     skip_stats,
-                    partition_schema.as_ref(),
+                    synthesize_json,
+                    partition_schema_for_transform,
                     has_partition_values_parsed,
                 ),
                 output_schema.into(),
             )?,
             seen_file_keys,
             state_info,
-            skip_stats,
+            stats_options,
+            partition_values_options,
             checkpoint_info,
             metrics,
         })
@@ -264,6 +335,10 @@ impl ScanLogReplayProcessor {
 
     pub(crate) fn get_metrics(&self) -> &ScanMetrics {
         self.metrics.as_ref()
+    }
+
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.state_info.is_catalog_managed
     }
 
     /// Serialize the processor state for distributed processing.
@@ -289,6 +364,9 @@ impl ScanLogReplayProcessor {
             transform_spec,
             physical_stats_schema,
             physical_partition_schema,
+            physical_stats_columns,
+            is_catalog_managed,
+            skip_row_transforms,
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -305,8 +383,12 @@ impl ScanLogReplayProcessor {
             transform_spec,
             predicate_schema,
             physical_stats_schema,
+            stats_options: self.stats_options,
+            partition_values_options: self.partition_values_options,
             physical_partition_schema,
-            skip_stats: self.skip_stats,
+            physical_stats_columns,
+            is_catalog_managed,
+            skip_row_transforms,
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {e}")))?;
@@ -362,6 +444,9 @@ impl ScanLogReplayProcessor {
             transform_spec: internal_state.transform_spec,
             physical_stats_schema: internal_state.physical_stats_schema,
             physical_partition_schema: internal_state.physical_partition_schema,
+            physical_stats_columns: internal_state.physical_stats_columns,
+            is_catalog_managed: internal_state.is_catalog_managed,
+            skip_row_transforms: internal_state.skip_row_transforms,
         });
 
         Self::new_with_seen_files(
@@ -369,7 +454,8 @@ impl ScanLogReplayProcessor {
             state_info,
             state.checkpoint_info,
             state.seen_file_keys,
-            internal_state.skip_stats,
+            internal_state.stats_options,
+            internal_state.partition_values_options,
         )
     }
 }
@@ -404,17 +490,26 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'b>(&mut self, i: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<bool> {
+    fn is_valid_add<'b>(
+        &mut self,
+        row: usize,
+        getters: &[&'b dyn GetData<'b>],
+    ) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on
         // action type:
-        // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
-        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at
-        //   indexes 6-8
+        // - For Add actions: path is at index 0, size at 2, then followed by DV fields at indexes
+        //   3-5
+        // - For Remove actions (in log batches only): path is at index 7, followed by DV fields at
+        //   indexes 8-10
         // The file extraction logic selects the appropriate indexes based on whether we found a
         // valid path. Remove getters are not included when visiting a non-log batch
         // (checkpoint batch), so do not try to extract remove actions in that case.
-        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
-            i,
+        let Some(FileActionInfo {
+            key: file_key,
+            size,
+            is_add,
+        }) = self.deduplicator.extract_file_action(
+            row,
             getters,
             !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
         )?
@@ -433,9 +528,9 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         // Partition pruning is handled by DataSkippingFilter in the columnar data skipping phase,
         // so we only need to parse values here for the transform.
         let partition_values = match &self.state_info.transform_spec {
-            Some(transform) if is_add => {
+            Some(transform) if is_add && !self.state_info.skip_row_transforms => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
-                    .get(i, "add.partitionValues")?;
+                    .get(row, "add.partitionValues")?;
                 parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -449,27 +544,29 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
-        let base_row_id: Option<i64> =
-            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
-        let transform = self
-            .state_info
-            .transform_spec
-            .as_ref()
-            .map(|transform| {
-                get_transform_expr(
-                    transform,
-                    partition_values,
-                    &self.state_info.physical_schema,
-                    base_row_id,
-                )
-            })
-            .transpose()?;
-        if transform.is_some() {
-            // fill in any needed `None`s for previous rows
-            self.row_transform_exprs.resize_with(i, Default::default);
-            self.row_transform_exprs.push(transform);
+        if !self.state_info.skip_row_transforms {
+            let base_row_id: Option<i64> =
+                getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
+            let patch_expr = self
+                .state_info
+                .transform_spec
+                .as_ref()
+                .map(|transform_spec| {
+                    get_transform_expr(
+                        transform_spec,
+                        partition_values,
+                        &self.state_info.physical_schema,
+                        base_row_id,
+                    )
+                })
+                .transpose()?;
+            if patch_expr.is_some() {
+                // fill in any needed `None`s for previous rows
+                self.row_transform_exprs.resize_with(row, Default::default);
+                self.row_transform_exprs.push(patch_expr);
+            }
         }
-        self.metrics.incr_active_add_files();
+        self.metrics.record_active_add_file(size);
         Ok(true)
     }
 }
@@ -485,6 +582,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (ss_map, column_name!("add.partitionValues")),
+                (LONG, column_name!("add.size")),
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
@@ -503,7 +601,8 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
-            (&names[..6], &types[..6])
+            let add_count = ScanLogReplayProcessor::REMOVE_PATH_INDEX;
+            (&names[..add_count], &types[..add_count])
         }
     }
 
@@ -511,7 +610,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
         let start = std::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 10 } else { 6 };
+        let expected_getters = if is_log_batch { 11 } else { 7 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -520,9 +619,9 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
             ))
         );
 
-        for i in 0..row_count {
-            if self.selection_vector[i] {
-                self.selection_vector[i] = self.is_valid_add(i, getters)?;
+        for row in 0..row_count {
+            if self.selection_vector[row] {
+                self.selection_vector[row] = self.is_valid_add(row, getters)?;
             }
         }
 
@@ -539,6 +638,7 @@ pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersi
 pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static TAGS_NAME: &str = "tags";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
+#[internal_api]
 pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
@@ -546,56 +646,49 @@ pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
-    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    let file_constant_values = StructType::new_unchecked([
-        StructField::nullable("partitionValues", partition_values),
-        StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-        StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-        StructField::nullable(
-            "tags",
-            MapType::new(
-                DataType::STRING,
-                DataType::STRING,
-                /* valueContainsNull */ true,
-            ),
-        ),
-        StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-    ]);
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("size", DataType::LONG),
-        StructField::nullable("modificationTime", DataType::LONG),
-        StructField::nullable("stats", DataType::STRING),
-        StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-        StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
-    ]))
+    schema_ref! {
+        nullable "path": STRING,
+        nullable "size": LONG,
+        nullable "modificationTime": LONG,
+        nullable "stats": STRING,
+        nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
+        nullable FILE_CONSTANT_VALUES_NAME: {
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable BASE_ROW_ID_NAME: LONG,
+            nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+            nullable "tags": { STRING => nullable STRING },
+            nullable CLUSTERING_PROVIDER_NAME: STRING,
+        },
+    }
 });
 
-/// Build the scan row schema with optional stats_parsed and partitionValues_parsed columns.
+/// Build the scan-row schema, appending the opt-in typed `stats_parsed` / `partitionValues_parsed`
+/// columns when requested.
 ///
-/// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
-/// When `partition_schema` is provided, adds a `partitionValues_parsed` struct column.
-fn scan_row_schema_with_stats_parsed(
+/// These typed columns are appended at the top level (siblings of `fileConstantValues`) rather than
+/// nested inside it. This mirrors `stats_parsed`, keeps `fileConstantValues` a fixed shape
+/// regardless of the engine's options, and keeps data-skipping paths uniform:
+/// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. The checkpoint source
+/// is also `add.partitionValues_parsed`, a sibling of `add.stats_parsed`.
+fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
-    partition_schema: Option<&SchemaRef>,
-) -> SchemaRef {
-    if stats_schema.is_none() && partition_schema.is_none() {
-        return SCAN_ROW_SCHEMA.clone();
+    partition_schema: Option<SchemaRef>,
+) -> DeltaResult<SchemaRef> {
+    let needs_extra = stats_schema.is_some() || partition_schema.is_some();
+    if !needs_extra {
+        return Ok(SCAN_ROW_SCHEMA.clone());
     }
-    let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
-    if let Some(schema) = stats_schema {
-        fields.push(StructField::nullable(
-            STATS_PARSED_NAME,
-            schema.as_ref().clone(),
-        ));
-    }
-    if let Some(schema) = partition_schema {
-        fields.push(StructField::nullable(
-            PARTITION_VALUES_PARSED_NAME,
-            schema.as_ref().clone(),
-        ));
-    }
-    Arc::new(StructType::new_unchecked(fields))
+    let patch = SchemaStructPatchBuilder::new()
+        .fold_with(stats_schema.as_ref(), |patch, schema| {
+            patch.append(StructField::nullable(STATS_PARSED_NAME, schema.clone()))
+        })
+        .fold_with(partition_schema.as_ref(), |patch, schema| {
+            patch.append(StructField::nullable(
+                PARTITION_VALUES_PARSED_NAME,
+                schema.clone(),
+            ))
+        });
+    Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
 /// Build the add transform expression with optional stats and partition value parsing.
@@ -603,13 +696,20 @@ fn scan_row_schema_with_stats_parsed(
 /// # Parameters
 /// - `physical_stats_schema`: Schema for parsing stats from JSON and for output (physical column
 ///   names), or None if stats should not be included in output.
-/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column.
+/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true and
+///   `synthesize_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))`
+///   so that `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
+///   (writeStatsAsJson=false).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
-/// - `partition_schema`: Schema of typed partition columns, or None if no partition value output is
-///   needed.
-/// - `has_partition_values_parsed`: Whether checkpoint has pre-parsed partitionValues_parsed
-///   column.
+/// - `synthesize_json`: When false, disables the `ToJson(add.stats_parsed)` fallback regardless of
+///   `has_stats_parsed`. Set false for engines that consume `stats_parsed` directly and don't want
+///   to pay the per-batch `ToJson` cost over potentially large stats structs.
+/// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
+///   value parsing is not needed.
+/// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
+///   column (checkpoint). When true it is read directly; otherwise the struct is reconstructed from
+///   the `partitionValues` string map.
 ///
 /// The transform includes `stats_parsed` only when `physical_stats_schema` is Some.
 /// The transform includes `partitionValues_parsed` only when `partition_schema` is Some.
@@ -618,11 +718,22 @@ fn get_add_transform_expr(
     physical_stats_schema: Option<SchemaRef>,
     has_stats_parsed: bool,
     skip_stats: bool,
-    partition_schema: Option<&SchemaRef>,
+    synthesize_json: bool,
+    partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+    } else if has_stats_parsed && synthesize_json {
+        // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
+        // serializing stats_parsed so ScanFile.stats is populated either way.
+        Arc::new(Expression::coalesce([
+            Expression::column(["add", "stats"]),
+            Expression::unary(
+                UnaryExpressionOp::ToJson,
+                Expression::column(["add", "stats_parsed"]),
+            ),
+        ]))
     } else {
         column_expr_ref!("add.stats")
     };
@@ -653,13 +764,14 @@ fn get_add_transform_expr(
         fields.push(Arc::new(stats_parsed_expr));
     }
 
-    // Add partitionValues_parsed when partition schema is provided
+    // Add partitionValues_parsed when partition columns are needed for data skipping or for the
+    // engine-facing typed output column.
     if partition_schema.is_some() {
         let partition_expr = if has_partition_values_parsed {
-            // Checkpoint has partitionValues_parsed column - read directly
+            // Checkpoint carries a native partitionValues_parsed column - read it directly.
             column_expr!("add.partitionValues_parsed")
         } else {
-            // Convert Map<String, String> to typed struct using the partition schema
+            // No native column (JSON commit): reconstruct from the string map.
             Expression::map_to_struct(column_expr!("add.partitionValues"))
         };
         fields.push(Arc::new(partition_expr));
@@ -741,6 +853,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
         )?;
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -814,6 +927,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &mut self.seen_file_keys,
             is_log_batch,
             Self::ADD_PATH_INDEX,
+            Self::ADD_SIZE_INDEX,
             Self::REMOVE_PATH_INDEX,
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
@@ -851,8 +965,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// Each row that is selected in the returned `engine_data` _must_ be processed to complete the
 /// scan. Non-selected rows _must_ be ignored.
 ///
-/// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
-/// data skipping is disabled.
+/// When `stats_options.skip_stats` is true, file statistics are not read from checkpoint parquet
+/// files and columnar data skipping is disabled (no stats-based or partition-value-based
+/// pruning), but row-level partition filtering still applies.
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
@@ -861,12 +976,19 @@ pub(crate) fn scan_action_iter(
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
     checkpoint_info: CheckpointReadInfo,
-    skip_stats: bool,
+    stats_options: ScanStatsOptions,
+    partition_values_options: ScanPartitionValuesOptions,
 ) -> DeltaResult<(
     impl Iterator<Item = DeltaResult<ScanMetadata>>,
     Arc<ScanMetrics>,
 )> {
-    let processor = ScanLogReplayProcessor::new(engine, state_info, checkpoint_info, skip_stats)?;
+    let processor = ScanLogReplayProcessor::new(
+        engine,
+        state_info,
+        checkpoint_info,
+        stats_options,
+        partition_values_options,
+    )?;
     let metrics = processor.metrics.clone();
     Ok((processor.process_actions_iter(action_iter), metrics))
 }
@@ -879,13 +1001,14 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        scan_action_iter, InternalScanState, ScanLogReplayProcessor, SerializableScanState,
+        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
+        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
     };
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
         BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator,
+        ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -903,9 +1026,9 @@ mod tests {
         add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::{PhysicalPredicate, StatsOutputMode};
+    use crate::scan::{PhysicalPredicate, StatsOptions};
     use crate::schema::{
-        DataType, LogicalSchema, MetadataColumnSpec, SchemaRef, StructField, StructType,
+        schema_ref, DataType, LogicalSchema, MetadataColumnSpec, SchemaRef, StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -1008,6 +1131,9 @@ mod tests {
             transform_spec: None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
         });
         let (iter, _metrics) = scan_action_iter(
             &SyncEngine::new(),
@@ -1016,7 +1142,8 @@ mod tests {
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
             test_checkpoint_info(),
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         for res in iter {
@@ -1044,30 +1171,32 @@ mod tests {
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
             test_checkpoint_info(),
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
-        fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
-            assert!(transform.is_some());
-            let Expr::Transform(transform) = transform.unwrap().as_ref() else {
-                panic!("Transform should always be a Transform expr");
+        fn validate_patch(patch_expr: Option<&ExpressionRef>, expected_date_offset: i32) {
+            assert!(patch_expr.is_some());
+            let Expr::StructPatch(patch) = patch_expr.unwrap().as_ref() else {
+                panic!("Expression should always be a StructPatch expr");
             };
 
-            // With sparse transforms, we expect only one insertion for the partition column
-            assert!(transform.prepended_fields.is_empty());
-            let mut field_transforms = transform.field_transforms.iter();
-            let (field_name, field_transform) = field_transforms.next().unwrap();
+            // With sparse patches, we expect only one insertion for the partition column.
+            assert!(patch.prepended_fields.is_empty());
+            assert!(patch.appended_fields.is_empty());
+            let mut field_patches = patch.field_patches.iter();
+            let (field_name, field_patch) = field_patches.next().unwrap();
             assert_eq!(field_name, "value");
-            assert!(!field_transform.is_replace);
-            let [expr] = &field_transform.exprs[..] else {
+            assert!(field_patch.keep_input);
+            let [expr] = &field_patch.insertions[..] else {
                 panic!("Expected a single insertion");
             };
             let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {
                 panic!("Expected a literal date");
             };
             assert_eq!(*date_offset, expected_date_offset);
-            assert!(field_transforms.next().is_none());
+            assert!(field_patches.next().is_none());
         }
 
         for res in iter {
@@ -1078,18 +1207,14 @@ mod tests {
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");
             assert!(transforms[0].is_none(), "transform at [0] should be None");
             assert!(transforms[2].is_none(), "transform at [2] should be None");
-            validate_transform(transforms[1].as_ref(), 17511);
-            validate_transform(transforms[3].as_ref(), 17510);
+            validate_patch(transforms[1].as_ref(), 17511);
+            validate_patch(transforms[3].as_ref(), 17510);
         }
     }
 
     #[test]
-    fn test_row_id_transform() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "value",
-            DataType::INTEGER,
-            true,
-        )]));
+    fn test_row_id_patch() {
+        let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
         let state_info = get_state_info(
             schema.clone(),
             vec![],
@@ -1129,7 +1254,8 @@ mod tests {
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
             test_checkpoint_info(),
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1137,16 +1263,16 @@ mod tests {
             let scan_metadata = res.unwrap();
             let transforms = scan_metadata.scan_file_transforms;
             assert_eq!(transforms.len(), 1, "Should have 1 transform");
-            if let Some(Expr::Transform(transform_expr)) = transforms[0].as_ref().map(Arc::as_ref) {
-                assert!(transform_expr.input_path.is_none());
-                let row_id_transform = transform_expr
-                    .field_transforms
+            if let Some(Expr::StructPatch(patch)) = transforms[0].as_ref().map(Arc::as_ref) {
+                assert!(patch.input_path.is_none());
+                let row_id_patch = patch
+                    .field_patches
                     .get("row_id_col")
-                    .expect("Should have row_id_col transform");
-                assert!(row_id_transform.is_replace);
-                assert_eq!(row_id_transform.exprs.len(), 1);
-                let expr = &row_id_transform.exprs[0];
-                let expeceted_expr = Arc::new(Expr::coalesce([
+                    .expect("Should have row_id_col patch");
+                assert!(!row_id_patch.keep_input);
+                assert_eq!(row_id_patch.insertions.len(), 1);
+                let expr = &row_id_patch.insertions[0];
+                let expected_expr = Arc::new(Expr::coalesce([
                     Expr::column(["row_id_col"]),
                     Expr::binary(
                         BinaryExpressionOp::Plus,
@@ -1154,9 +1280,9 @@ mod tests {
                         Expr::column(["row_indexes_for_row_id_0"]),
                     ),
                 ]));
-                assert_eq!(expr, &expeceted_expr);
+                assert_eq!(expr, &expected_expr);
             } else {
-                panic!("Should have been a transform expression");
+                panic!("Should have been a StructPatch expression");
             }
         }
     }
@@ -1174,7 +1300,8 @@ mod tests {
             &engine,
             Arc::new(get_simple_state_info(schema.clone(), vec![]).unwrap()),
             checkpoint_info.clone(),
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1249,7 +1376,7 @@ mod tests {
                 &[], // no table features
                 HashMap::new(),
                 vec![],
-                StatsOutputMode::AllColumns,
+                StatsOptions::all_struct(),
             )
             .unwrap(),
         );
@@ -1261,7 +1388,11 @@ mod tests {
             &engine,
             state_info.clone(),
             checkpoint_info.clone(),
-            /* skip_stats */ true,
+            ScanStatsOptions {
+                skip_stats: true,
+                synthesize_json: true,
+            },
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1279,7 +1410,7 @@ mod tests {
             state_info.physical_partition_schema
         );
         assert!(
-            deserialized.skip_stats,
+            deserialized.stats_options.skip_stats,
             "skip_stats must round-trip as true"
         );
     }
@@ -1316,7 +1447,8 @@ mod tests {
             &engine,
             state_info.clone(),
             checkpoint_info.clone(),
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1373,7 +1505,8 @@ mod tests {
             &engine,
             state_info.clone(),
             checkpoint_info.clone(),
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1393,11 +1526,7 @@ mod tests {
             ColumnMappingMode::Id,
             ColumnMappingMode::Name,
         ] {
-            let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-                "id",
-                DataType::INTEGER,
-                true,
-            )]));
+            let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
             let state_info = Arc::new(StateInfo {
                 logical_schema: LogicalSchema::new_for_test(schema.clone(), mode),
                 physical_schema: schema.clone(),
@@ -1405,11 +1534,19 @@ mod tests {
                 transform_spec: None,
                 physical_stats_schema: None,
                 physical_partition_schema: None,
+                physical_stats_columns: HashSet::new(),
+                is_catalog_managed: false,
+                skip_row_transforms: false,
             });
             let checkpoint_info = test_checkpoint_info();
-            let processor =
-                ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone(), false)
-                    .unwrap();
+            let processor = ScanLogReplayProcessor::new(
+                &engine,
+                state_info,
+                checkpoint_info.clone(),
+                ScanStatsOptions::default(),
+                ScanPartitionValuesOptions::default(),
+            )
+            .unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
                 &engine,
                 processor.into_serializable_state().unwrap(),
@@ -1427,11 +1564,7 @@ mod tests {
         // Test edge cases: empty seen_file_keys, no predicate, no transform_spec
         let engine = SyncEngine::new();
         let checkpoint_info = test_checkpoint_info();
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let state_info = Arc::new(StateInfo {
             logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
@@ -1439,16 +1572,88 @@ mod tests {
             transform_spec: None,
             physical_stats_schema: None,
             physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
         });
-        let processor =
-            ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone(), false)
-                .unwrap();
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            checkpoint_info.clone(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
         let serialized = processor.into_serializable_state().unwrap();
         assert!(serialized.predicate.is_none());
         let deserialized =
             ScanLogReplayProcessor::from_serializable_state(&engine, serialized).unwrap();
         assert_eq!(deserialized.seen_file_keys.len(), 0);
         assert!(deserialized.state_info.transform_spec.is_none());
+    }
+
+    #[test]
+    fn test_serialization_round_trips_is_catalog_managed() {
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
+        let state_info = Arc::new(StateInfo {
+            logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            physical_schema: schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            physical_stats_schema: None,
+            physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: true,
+            skip_row_transforms: false,
+        });
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let serialized = processor.into_serializable_state().unwrap();
+        let deserialized =
+            ScanLogReplayProcessor::from_serializable_state(&engine, serialized).unwrap();
+        assert!(deserialized.is_catalog_managed());
+    }
+
+    #[rstest]
+    fn test_serialization_round_trips_skip_row_transforms(#[values(false, true)] skip: bool) {
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )]));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
+            physical_schema: schema.clone(),
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            physical_stats_schema: None,
+            physical_partition_schema: None,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: skip,
+        });
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            test_checkpoint_info(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deserialized.state_info.skip_row_transforms, skip);
     }
 
     #[test]
@@ -1469,11 +1674,7 @@ mod tests {
     fn test_serialization_missing_predicate_schema() {
         // Test that missing predicate_schema when predicate exists is detected
         let engine = SyncEngine::new();
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let checkpoint_info = test_checkpoint_info();
         let invalid_internal_state = InternalScanState {
             logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
@@ -1481,8 +1682,12 @@ mod tests {
             predicate_schema: None, // Missing!
             transform_spec: None,
             physical_stats_schema: None,
+            stats_options: ScanStatsOptions::default(),
+            partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
-            skip_stats: false,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1501,19 +1706,19 @@ mod tests {
 
     #[test]
     fn deserialize_internal_state_with_extry_fields_fails() {
-        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )]));
+        let schema: SchemaRef = schema_ref! { nullable "id": INTEGER };
         let invalid_internal_state = InternalScanState {
             logical_schema: LogicalSchema::new_for_test(schema.clone(), ColumnMappingMode::None),
             physical_schema: schema,
             predicate_schema: None,
             transform_spec: None,
             physical_stats_schema: None,
+            stats_options: ScanStatsOptions::default(),
+            partition_values_options: ScanPartitionValuesOptions::default(),
             physical_partition_schema: None,
-            skip_stats: false,
+            physical_stats_columns: HashSet::new(),
+            is_catalog_managed: false,
+            skip_row_transforms: false,
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
@@ -1578,7 +1783,11 @@ mod tests {
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
             test_checkpoint_info(),
-            true,
+            ScanStatsOptions {
+                skip_stats: true,
+                ..Default::default()
+            },
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1668,7 +1877,8 @@ mod tests {
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
             test_checkpoint_info(),
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
         .unwrap();
 
@@ -1692,6 +1902,87 @@ mod tests {
             add_paths[0].contains("c000"),
             "Expected c000 add to survive, got: {}",
             add_paths[0]
+        );
+    }
+
+    /// Walk `expr` and count `Unary { op: ToJson, .. }` occurrences anywhere in the tree.
+    // Closures wrap `count_to_json` to dereference `&Arc<Expression>` -> `&Expression`;
+    // clippy doesn't see the auto-deref so flags them as redundant.
+    #[allow(clippy::redundant_closure)]
+    fn count_to_json(expr: &Expression) -> usize {
+        match expr {
+            Expression::Unary(u) => {
+                let here = (u.op == UnaryExpressionOp::ToJson) as usize;
+                here + count_to_json(&u.expr)
+            }
+            Expression::Binary(b) => count_to_json(&b.left) + count_to_json(&b.right),
+            Expression::Variadic(v) => v.exprs.iter().map(|e| count_to_json(e)).sum(),
+            Expression::Struct(fields, nullability) => {
+                fields.iter().map(|e| count_to_json(e)).sum::<usize>()
+                    + nullability.as_ref().map_or(0, |e| count_to_json(e))
+            }
+            Expression::StructPatch(p) => {
+                p.prepended_fields
+                    .iter()
+                    .chain(p.appended_fields.iter())
+                    .map(|e| count_to_json(e))
+                    .sum::<usize>()
+                    + p.field_patches
+                        .values()
+                        .flat_map(|fp| fp.insertions.iter())
+                        .map(|e| count_to_json(e))
+                        .sum::<usize>()
+            }
+            Expression::ParseJson(p) => count_to_json(&p.json_expr),
+            Expression::MapToStruct(m) => count_to_json(&m.map_expr),
+            Expression::Predicate(_)
+            | Expression::Literal(_)
+            | Expression::Column(_)
+            | Expression::Opaque(_)
+            | Expression::Unknown(_) => 0,
+        }
+    }
+
+    /// `synthesize_json=false` removes every `ToJson` node from the add transform;
+    /// `synthesize_json=true` leaves exactly one inside the COALESCE branch.
+    #[test]
+    fn add_transform_omits_to_json_when_synthesis_skipped() {
+        let stats_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("value", DataType::STRING),
+        ]));
+        let partition_schema: Option<SchemaRef> = Some(Arc::new(StructType::new_unchecked([
+            StructField::nullable("date", DataType::DATE),
+        ])));
+
+        // Synthesis enabled: COALESCE branch present -> exactly one ToJson.
+        let with_synthesis = get_add_transform_expr(
+            Some(stats_schema.clone()),
+            true,  // has_stats_parsed
+            false, // skip_stats
+            true,  // synthesize_json
+            partition_schema.clone(),
+            false, // has_partition_values_parsed
+        );
+        assert_eq!(
+            count_to_json(&with_synthesis),
+            1,
+            "expected exactly one ToJson(add.stats_parsed) in the COALESCE branch when synthesis is enabled"
+        );
+
+        // Synthesis disabled: no ToJson anywhere in the transform.
+        let without_synthesis = get_add_transform_expr(
+            Some(stats_schema),
+            true,  // has_stats_parsed
+            false, // skip_stats
+            false, // synthesize_json
+            partition_schema,
+            false, // has_partition_values_parsed
+        );
+        assert_eq!(
+            count_to_json(&without_synthesis),
+            0,
+            "expected no ToJson nodes anywhere in the transform when synthesis is skipped"
         );
     }
 }

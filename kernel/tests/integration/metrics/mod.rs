@@ -9,6 +9,7 @@
 //! - [`snapshot_load`]: snapshot-loading scenarios (delta-only, checkpoint, compaction, CRC, and
 //!   on-demand API calls like `get_domain_metadata`)
 //! - [`scan`]: scan execution scenarios (`scan.execute()` parquet data-file reads)
+//! - [`commit`]: `Transaction::commit()` success / conflict metrics
 //!
 //! Where possible, tests use [`TestTableBuilder`] for table setup. Tests that need
 //! checkpoint, CRC, or log compaction features still use manual helpers until those
@@ -18,19 +19,22 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::Int32Array;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
-use delta_kernel::metrics::WithMetricsReporterLayer as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::table_builder::{LogState, TestTableBuilder};
-use test_utils::{insert_data, test_table_setup_mt, CountingReporter};
-use tracing_subscriber::util::SubscriberInitExt as _;
+use test_utils::{
+    insert_data, install_thread_local_metrics_reporter, test_table_setup_mt, CountingReporter,
+};
 use url::Url;
 
+mod commit;
+mod parallel_scan;
 mod scan;
 mod snapshot_load;
+mod table_type;
 
 /// Build a `DefaultEngine` + `CountingReporter` backed by `store`, for use in the
 /// *measurement* phase (building a snapshot and asserting metric counters).
@@ -40,15 +44,15 @@ mod snapshot_load;
 fn measuring_engine(
     store: Arc<dyn delta_kernel::object_store::ObjectStore>,
 ) -> (
-    DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>,
+    DefaultEngine<
+        test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor,
+    >,
     Arc<CountingReporter>,
     tracing::subscriber::DefaultGuard,
 ) {
     let reporter = Arc::new(CountingReporter::default());
     let engine = DefaultEngineBuilder::new(store).build();
-    let guard = tracing_subscriber::registry()
-        .with_metrics_reporter_layer(reporter.clone())
-        .set_default();
+    let guard = install_thread_local_metrics_reporter(reporter.clone());
     (engine, reporter, guard)
 }
 
@@ -65,7 +69,9 @@ fn simple_schema() -> Arc<StructType> {
 async fn insert_rows(
     table_url: &Url,
     engine: &Arc<
-        DefaultEngine<delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor>,
+        DefaultEngine<
+            test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor,
+        >,
     >,
     start_val: i32,
     count: i32,

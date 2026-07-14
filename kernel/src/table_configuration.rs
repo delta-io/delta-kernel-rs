@@ -26,11 +26,12 @@ use crate::schema::{
     schema_has_invariants, LogicalSchema, LogicalSchemaRef, SchemaRef, StructField, StructType,
 };
 use crate::table_features::{
-    column_mapping_mode, get_any_level_column_physical_name,
+    check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
+    get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
     validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES,
-    LEGACY_WRITER_FEATURES, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
-    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -103,6 +104,23 @@ impl PartialEq for PhysicalSchemas {
         // PartialEq), so comparing them is redundant.
         self.full == other.full
     }
+}
+
+/// Validates that a table's partition columns are unique and all present in the logical schema.
+fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> DeltaResult<()> {
+    let mut seen = HashSet::new();
+    for col in metadata.partition_columns() {
+        if !seen.insert(col) {
+            return Err(Error::generic(format!(
+                "Duplicate partition column: '{col}'"
+            )));
+        }
+        require!(
+            logical_schema.field(col).is_some(),
+            Error::generic(format!("Partition column '{col}' not found in schema"))
+        );
+    }
+    Ok(())
 }
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
@@ -216,9 +234,17 @@ impl TableConfiguration {
             version,
         };
 
+        validate_partition_columns(&table_config.metadata, &table_config.logical_schema())?;
+
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
+
+        // TODO(#2630): Validate column-default metadata here so a table that declares a
+        // `CURRENT_DEFAULT` without the `allowColumnDefaults` feature, or with malformed default
+        // metadata, is rejected eagerly as corrupted rather than lazily in
+        // `Transaction::column_defaults`.
 
         Ok(table_config)
     }
@@ -349,6 +375,19 @@ impl TableConfiguration {
         )
     }
 
+    /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
+    /// every column reference in the rewritten predicate against this set, so the two
+    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
+    /// point to keep their gate input in lockstep.
+    pub(crate) fn physical_stats_columns_set(
+        &self,
+        required_columns: Option<&[ColumnName]>,
+    ) -> HashSet<ColumnName> {
+        self.physical_stats_column_names(required_columns)
+            .into_iter()
+            .collect()
+    }
+
     /// Returns the physical partition schema for `partitionValues_parsed`.
     ///
     /// Field names are physical column names (respecting column mapping mode),
@@ -381,22 +420,23 @@ impl TableConfiguration {
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
-    /// Returns the logical schema for data columns (excludes partition columns).
-    ///
-    /// Partition columns are excluded because statistics are only collected for data columns
-    /// that are physically stored in the parquet files. Partition values are stored in the
-    /// file path, not in the file content, so they don't have file-level statistics.
-    fn logical_data_schema(&self) -> SchemaRef {
-        let partition_columns = self.partition_columns();
+    /// Returns the logical schema excluding partition columns.
+    pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
+        let partition_columns: HashSet<&str> = self
+            .partition_columns()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        // Safety: subset of an already-valid schema.
         Arc::new(StructType::new_unchecked(
             self.logical_schema()
                 .fields()
-                .filter(|field| !partition_columns.contains(field.name()))
+                .filter(|field| !partition_columns.contains(field.name().as_str()))
                 .cloned(),
         ))
     }
 
-    /// Returns the physical data schema excluding partition columns.
+    /// Returns the physical data schema excluding partition columns. Lazily computed and cached.
     pub(crate) fn physical_data_schema_without_partition_columns(&self) -> SchemaRef {
         self.physical_schemas
             .without_partition
@@ -429,7 +469,7 @@ impl TableConfiguration {
             .data_skipping_stats_columns
             .as_ref()
             .map(|cols| {
-                let logical_schema = self.logical_data_schema();
+                let logical_schema = self.logical_schema_without_partition_columns();
                 let mode = self.column_mapping_mode();
                 cols.iter()
                     .filter_map(|col| {
@@ -518,7 +558,9 @@ impl TableConfiguration {
     ///
     /// When [`should_materialize_partition_columns`] is true, returns the full physical schema
     /// (partition columns are materialized in data files). Otherwise, returns the physical
-    /// schema with partition columns excluded. The result is eagerly cached at construction time.
+    /// schema with partition columns excluded. Void columns are always stripped from the
+    /// returned schema, since they are never written to Parquet. The result is eagerly cached at
+    /// construction time.
     ///
     /// [`should_materialize_partition_columns`]: Self::should_materialize_partition_columns
     pub(crate) fn physical_write_schema(&self) -> SchemaRef {
@@ -626,7 +668,6 @@ impl TableConfiguration {
                 check(&self.protocol, &self.table_properties, operation)?;
             }
         };
-
         self.validate_feature_requirements(feature)
     }
 
@@ -634,24 +675,7 @@ impl TableConfiguration {
     /// For table features protocol (v3), returns the explicit reader_features list.
     /// For legacy protocol (v1-2), infers features from the version number.
     fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
-        match self.protocol.min_reader_version() {
-            TABLE_FEATURES_MIN_READER_VERSION => {
-                // Table features reader: use explicit reader_features list
-                self.protocol
-                    .reader_features()
-                    .map(|f| f.to_vec())
-                    .unwrap_or_default()
-            }
-            v if (1..=2).contains(&v) => {
-                // Legacy reader: infer features from version
-                LEGACY_READER_FEATURES
-                    .iter()
-                    .filter(|f| f.is_valid_for_legacy_reader(v))
-                    .cloned()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
+        extract_enabled_reader_features(&self.protocol)
     }
 
     /// Returns all writer features enabled for this table based on protocol version.
@@ -693,20 +717,7 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        require!(
-            self.protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
-            Error::InvalidProtocol(format!(
-                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {}",
-                self.protocol.min_reader_version()
-            ))
-        );
-        // Version check: kernel supports reader versions 1..=MAX_VALID_READER_VERSION
-        if self.protocol.min_reader_version() > MAX_VALID_READER_VERSION {
-            return Err(Error::unsupported(format!(
-                "Unsupported minimum reader version {}",
-                self.protocol.min_reader_version()
-            )));
-        }
+        check_reader_version_range(&self.protocol)?;
 
         // Check all enabled reader features have kernel support
         for feature in self.get_enabled_reader_features() {
@@ -907,6 +918,32 @@ impl TableConfiguration {
     pub(crate) fn is_feature_enabled(&self, feature: &TableFeature) -> bool {
         Self::feature_enabled(&self.protocol, &self.table_properties, feature)
     }
+
+    /// Returns true when the table requires every AddFile to carry a non-null
+    /// `stats.numRecords`.
+    pub(crate) fn requires_stats_num_records(&self) -> bool {
+        // TODO(#1125): Add icebergCompatV2 to the list when it is supported.
+        self.is_feature_enabled(&TableFeature::IcebergCompatV3)
+    }
+
+    /// TODO(#2538): Row-tracking is not fully supported for removeFile currently.
+    /// See `crate::table_features::ROW_TRACKING_INFO` for more details.
+    pub(crate) fn validate_feature_support_for_remove(&self) -> DeltaResult<()> {
+        // RowTracking is a prerequisite for IcebergCompatV3, so the IcebergCompatV3 arm is
+        // technically redundant. Just be conservative here to check both.
+        if self.should_write_row_tracking() {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with rowTracking supported \
+                 and not suspended",
+            ));
+        }
+        if self.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            return Err(Error::unsupported(
+                "Remove actions are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -919,15 +956,16 @@ mod test {
     use url::Url;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
-    use crate::actions::{Metadata, Protocol};
-    use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
+    use crate::actions::{Metadata, Protocol, MIN_VALUES};
+    use crate::schema::{schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType};
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
-        TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
+        TableProperties, COLUMN_MAPPING_MODE, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
+        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+        ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -955,10 +993,7 @@ mod test {
         min_reader_version: i32,
         min_writer_version: i32,
     ) -> TableConfiguration {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1008,13 +1043,53 @@ mod test {
     }
 
     #[test]
+    fn table_configuration_rejects_partition_column_missing_from_schema() {
+        let schema = schema_ref! { nullable "value": INTEGER };
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["missing".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+
+        assert_result_error_with_message(result, "Partition column 'missing' not found in schema");
+    }
+
+    #[test]
+    fn table_configuration_rejects_duplicate_partition_columns() {
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("value", DataType::INTEGER),
+            StructField::nullable("part", DataType::STRING),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec!["part".to_string(), "part".to_string()],
+            0,
+            HashMap::new(),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+
+        assert_result_error_with_message(result, "Duplicate partition column: 'part'");
+    }
+
+    #[test]
     fn dv_supported_not_enabled() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1039,10 +1114,7 @@ mod test {
     fn dv_enabled() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1074,10 +1146,7 @@ mod test {
         #[case] wv: i32,
         #[case] op: Operation,
     ) {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol =
             Protocol::new_unchecked(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST);
@@ -1171,10 +1240,7 @@ mod test {
     fn ict_enabled_from_table_creation() {
         use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1206,10 +1272,7 @@ mod test {
             IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1250,10 +1313,7 @@ mod test {
             ENABLE_IN_COMMIT_TIMESTAMPS, IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION,
         };
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1284,10 +1344,7 @@ mod test {
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, [TableFeature::InCommitTimestamp])
@@ -1301,10 +1358,7 @@ mod test {
     }
     #[test]
     fn fails_on_unsupported_feature() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new_modern(["unknown"], ["unknown"]).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1317,10 +1371,7 @@ mod test {
     fn dv_not_supported() {
         use crate::table_properties::ENABLE_CHANGE_DATA_FEED;
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1348,10 +1399,7 @@ mod test {
     fn test_try_new_from() {
         use crate::table_properties::{ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS};
 
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1369,10 +1417,7 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let new_schema = schema_ref! { nullable "value": INTEGER };
         let new_metadata = Metadata::try_new(
             None,
             None,
@@ -1429,10 +1474,7 @@ mod test {
     #[test]
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "ts",
-            DataType::TIMESTAMP_NTZ,
-        )]));
+        let schema = schema_ref! { nullable "ts": TIMESTAMP_NTZ };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_timestamp_ntz_features =
@@ -1469,10 +1511,7 @@ mod test {
     #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "v",
-            DataType::unshredded_variant(),
-        )]));
+        let schema = schema_ref! { nullable "v": (DataType::unshredded_variant()) };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_variant_features =
@@ -1514,10 +1553,7 @@ mod test {
         let metadata = Metadata::try_new(
             None,
             None,
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                DataType::INTEGER,
-            )])),
+            schema_ref! { nullable "value": INTEGER },
             vec![],
             0,
             HashMap::new(),
@@ -1737,10 +1773,7 @@ mod test {
 
     #[test]
     fn test_illegal_writer_feature_combination() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol =
             Protocol::try_new_modern(TableFeature::EMPTY_LIST, vec![TableFeature::RowTracking])
@@ -1755,10 +1788,7 @@ mod test {
 
     #[test]
     fn test_row_tracking_with_domain_metadata_requirement() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new_modern(
             TableFeature::EMPTY_LIST,
@@ -1793,6 +1823,25 @@ mod test {
             ],
         );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    }
+
+    // A catalog-managed table requires inCommitTimestamp to be enabled.
+    #[rstest]
+    #[case::catalog_managed(
+        TableFeature::CatalogManaged,
+        "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"
+    )]
+    #[case::catalog_owned_preview(
+        TableFeature::CatalogOwnedPreview,
+        "Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled"
+    )]
+    fn test_catalog_managed_requires_in_commit_timestamp(
+        #[case] feature: TableFeature,
+        #[case] expected_error: &str,
+    ) {
+        let config = create_mock_table_config(&[], &[feature]);
+        let result = config.ensure_operation_supported(Operation::Write);
+        assert_result_error_with_message(result, expected_error);
     }
 
     /// Helper to create a schema with column mapping metadata using JSON deserialization
@@ -1887,7 +1936,7 @@ mod test {
         // Verify field names are logical names
         let min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = min_values {
@@ -1911,7 +1960,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         if let DataType::Struct(inner) = physical_min_values {
@@ -1947,7 +1996,7 @@ mod test {
         // Verify physical schema has physical names
         let physical_min_values = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type();
         let DataType::Struct(inner) = physical_min_values else {
@@ -2043,7 +2092,7 @@ mod test {
 
         let DataType::Struct(inner) = stats_schemas
             .physical
-            .field("minValues")
+            .field(MIN_VALUES)
             .unwrap()
             .data_type()
         else {
@@ -2061,6 +2110,25 @@ mod test {
             inner.field("phys_part_b").is_none(),
             "Partition column b should be excluded"
         );
+    }
+
+    #[test]
+    fn test_partition_columns_are_logical_under_column_mapping() {
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            "name",
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+
+        assert_eq!(config.partition_columns(), ["part_a", "part_b"]);
+        let partition_schema = config
+            .build_partition_values_parsed_schema()
+            .expect("partition schema should be present");
+        assert!(partition_schema.field("phys_part_a").is_some());
+        assert!(partition_schema.field("phys_part_b").is_some());
+        assert!(partition_schema.field("part_a").is_none());
+        assert!(partition_schema.field("part_b").is_none());
     }
 
     #[test]
@@ -2313,7 +2381,7 @@ mod test {
         &[(ENABLE_ICEBERG_COMPAT_V3, "true"), (ENABLE_ROW_TRACKING, "true")],
         vec!["value", "pcol"],
     )]
-    fn test_physical_write_schema_materializes_pv_when_iceberg_compact_v3_enabled(
+    fn test_physical_write_schema_materializes_pv_when_iceberg_compat_v3_enabled(
         #[case] writer_features: &[TableFeature],
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_field_names: Vec<&str>,
@@ -2351,7 +2419,50 @@ mod test {
     }
 
     #[test]
-    fn test_iceberg_compat_v3_write_rejected_as_not_supported() {
+    fn test_physical_write_schema_strips_void_columns() {
+        // Pins the invariant that `physical_write_schema()` strips void columns from the
+        // returned schema (top level and nested), so callers receive a Parquet-writable
+        // schema without needing to apply `strip_void_from_schema` themselves.
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("v", DataType::VOID),
+            StructField::nullable(
+                "s",
+                StructType::new_unchecked([
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("nested_void", DataType::VOID),
+                ]),
+            ),
+        ]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(Vec::<TableFeature>::new()),
+            Some(Vec::<TableFeature>::new()),
+        )
+        .unwrap();
+        let config =
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
+                .unwrap();
+
+        let write_schema = config.physical_write_schema();
+
+        // Top-level void is dropped.
+        let top_names: Vec<&str> = write_schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(top_names, vec!["id", "s"]);
+
+        // Nested void is also dropped, leaving only `a` inside `s`.
+        let s_field = write_schema.field("s").expect("s present after strip");
+        let DataType::Struct(s_inner) = s_field.data_type() else {
+            panic!("s should still be a struct");
+        };
+        let s_names: Vec<&str> = s_inner.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(s_names, vec!["a"]);
+    }
+
+    #[test]
+    fn test_iceberg_compat_v3_write_supported() {
         let config = create_mock_table_config_with_cm(
             &[
                 (ENABLE_ICEBERG_COMPAT_V3, "true"),
@@ -2366,10 +2477,9 @@ mod test {
                 TableFeature::DomainMetadata,
             ],
         );
-        assert_result_error_with_message(
-            config.ensure_operation_supported(Operation::Write),
-            "Feature 'icebergCompatV3' is not supported",
-        );
+        config
+            .ensure_operation_supported(Operation::Write)
+            .expect("V3 write should be supported once kernel_support flips to Supported");
     }
 
     #[rstest]
@@ -2525,6 +2635,121 @@ mod test {
         }
     }
 
+    // `validate_feature_requirements` reads only `feature_requirements`, which is compiled
+    // regardless of the `adaptive-metadata-in-dev` gate, so these cases run in the default build.
+    // See the adaptiveMetadata RFC (delta-io/delta#6978) for the enablement rules being checked.
+    #[rstest]
+    #[case::all_satisfied(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        None
+    )]
+    // Column mapping enabled but in `name` mode -> the `id`-mode Custom check fires.
+    #[case::cm_name_mode_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Name),
+        all_adaptive_metadata_deps(),
+        Some("column mapping in 'id' mode")
+    )]
+    // Column mapping feature absent entirely -> the `Enabled(ColumnMapping)` arm fires first.
+    #[case::column_mapping_not_supported(
+        all_adaptive_metadata_props(),
+        None,
+        adaptive_metadata_deps_without(TableFeature::ColumnMapping),
+        Some("requires 'columnMapping' to be enabled")
+    )]
+    #[case::row_tracking_not_enabled(
+        adaptive_metadata_props_without(ENABLE_ROW_TRACKING),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'rowTracking' to be enabled")
+    )]
+    #[case::domain_metadata_not_supported(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        adaptive_metadata_deps_without(TableFeature::DomainMetadata),
+        Some("requires 'domainMetadata' to be enabled")
+    )]
+    #[case::deletion_vectors_not_enabled(
+        adaptive_metadata_props_without(ENABLE_DELETION_VECTORS),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'deletionVectors' to be enabled")
+    )]
+    #[case::in_commit_timestamp_not_enabled(
+        adaptive_metadata_props_without(ENABLE_IN_COMMIT_TIMESTAMPS),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'inCommitTimestamp' to be enabled")
+    )]
+    fn test_adaptive_metadata_feature_requirements(
+        #[case] props: Vec<(&str, &str)>,
+        #[case] cm_mode: Option<ColumnMappingMode>,
+        #[case] deps: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        // Reader+writer features (adaptiveMetadata-preview itself, columnMapping, deletionVectors)
+        // must appear in both protocol lists to count as supported.
+        let reader_features: Vec<TableFeature> =
+            std::iter::once(TableFeature::AdaptiveMetadataPreview)
+                .chain(
+                    deps.iter()
+                        .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+                        .cloned(),
+                )
+                .collect();
+        let writer_features: Vec<TableFeature> =
+            std::iter::once(TableFeature::AdaptiveMetadataPreview)
+                .chain(deps.iter().cloned())
+                .collect();
+        let config =
+            create_mock_table_config_with_cm(&props, cm_mode, &reader_features, &writer_features);
+        let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
+    /// The table properties that enable adaptiveMetadata-preview's property-gated dependencies.
+    fn all_adaptive_metadata_props() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (ENABLE_ROW_TRACKING, "true"),
+            (ENABLE_DELETION_VECTORS, "true"),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+        ]
+    }
+
+    /// The adaptiveMetadata-preview enabling properties with `excluded` removed, to drive the
+    /// "dependency not enabled" requirement checks.
+    fn adaptive_metadata_props_without(excluded: &str) -> Vec<(&'static str, &'static str)> {
+        all_adaptive_metadata_props()
+            .into_iter()
+            .filter(|(k, _)| *k != excluded)
+            .collect()
+    }
+
+    /// The full set of adaptiveMetadata-preview dependency features.
+    fn all_adaptive_metadata_deps() -> Vec<TableFeature> {
+        vec![
+            TableFeature::ColumnMapping,
+            TableFeature::DeletionVectors,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+            TableFeature::InCommitTimestamp,
+        ]
+    }
+
+    /// The adaptiveMetadata-preview dependencies with `excluded` removed, to drive the
+    /// "dependency not supported" requirement checks.
+    fn adaptive_metadata_deps_without(excluded: TableFeature) -> Vec<TableFeature> {
+        all_adaptive_metadata_deps()
+            .into_iter()
+            .filter(|f| *f != excluded)
+            .collect()
+    }
+
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.
     #[rstest]
     #[case::v1_rejects_v2(
@@ -2592,6 +2817,24 @@ mod test {
         );
     }
 
+    /// `validate_feature_support_for_remove` must fire whenever row tracking is _supported_
+    /// and not _suspended_, which is broader than _enabled_.
+    #[rstest]
+    #[case::supported_only(&[], Some("rowTracking"))]
+    #[case::supported_and_enabled(&[(ENABLE_ROW_TRACKING, "true")], Some("rowTracking"))]
+    #[case::supported_and_suspended(&[(ROW_TRACKING_SUSPENDED, "true")], None /*expected_error_substring */)]
+    fn test_validate_feature_support_for_remove_row_tracking(
+        #[case] props: &[(&str, &str)],
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        let config = create_mock_table_config(props, &[TableFeature::RowTracking]);
+        let result = config.validate_feature_support_for_remove();
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
     /// Test helper: variant of `create_mock_table_config` that also takes an optional
     /// column-mapping mode and requires the caller to provide reader and writer feature lists
     /// explicitly. `name`/`id` modes need a column-mapping-annotated schema (otherwise
@@ -2606,10 +2849,7 @@ mod test {
     ) -> TableConfiguration {
         let schema: SchemaRef = match cm_mode {
             Some(ColumnMappingMode::Name | ColumnMappingMode::Id) => schema_with_column_mapping(),
-            _ => Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                DataType::INTEGER,
-            )])),
+            _ => schema_ref! { nullable "value": INTEGER },
         };
         let mut props: HashMap<String, String> = extra_props
             .iter()

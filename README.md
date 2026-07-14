@@ -1,4 +1,4 @@
-# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.88+]][rustc]
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] ![Crates.io MSRV](https://img.shields.io/crates/msrv/delta_kernel)
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
@@ -22,6 +22,8 @@ is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 Delta-kernel-rs is split into a few different crates:
 
 - kernel: The actual core kernel crate
+- default-engine: The default Arrow/Tokio-based `Engine` implementation, published as
+  `delta_kernel_default_engine`
 - acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
 - derive-macros: A crate for our [derive-macros] to live in
 - ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
@@ -45,27 +47,34 @@ In general, you will want to depend on `delta-kernel-rs` by adding it as a depen
 module. The core kernel includes facilities for reading and writing delta tables, and allows the
 consumer to implement their own `Engine` trait in order to build engine-specific implementations of
 the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
-`read_json_files()` using the native engine JSON reader). If there is no need to implement the
-consumer's own `Engine` trait, the kernel has a feature flag to enable a default, asynchronous
-`Engine` implementation built with [Arrow] and [Tokio].
+`read_json_files()` using the native engine JSON reader). If you do not need a custom `Engine`,
+add the `delta_kernel_default_engine` crate to get the default asynchronous `Engine` implementation
+built with [Arrow] and [Tokio].
 
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.22.0"
+delta_kernel = "0.25.0"
 
-# or turn on the default engine, based on latest arrow
-delta_kernel = { version = "0.22.0", features = ["default-engine-rustls", "arrow"] }
+# or pull in the default Arrow/Tokio engine alongside the kernel
+delta_kernel = "0.25.0"
+delta_kernel_default_engine = { version = "0.25.0", features = ["rustls"] }
 ```
 
 ### Feature flags
-There are more feature flags in addition to the `default-engine-rustls` flag shown above. Relevant
-flags include:
+`delta_kernel_default_engine` exposes the following feature flags:
 
 | Feature flag  | Description   |
 | ------------- | ------------- |
-| `default-engine-rustls`    | Turn on the 'default' engine with rustls TLS backend  |
-| `default-engine-native-tls`| Turn on the 'default' engine with native-tls TLS backend  |
+| `rustls`      | Use the rustls TLS backend for HTTPS object stores  |
+| `native-tls`  | Use the native-tls TLS backend for HTTPS object stores  |
+| `arrow-58`    | Build against arrow 58 (see Arrow versioning below) |
+| `arrow-59`    | Build against arrow 59 (see Arrow versioning below) |
+
+The `delta_kernel` crate itself exposes a few additional flags:
+
+| Feature flag  | Description   |
+| ------------- | ------------- |
 | `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
 | `arrow-expression`  | Expression system implementation for arrow |
 
@@ -75,7 +84,7 @@ are still unstable. We therefore may break APIs within minor releases (that is, 
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
-If you enable a default engine feature (`default-engine-rustls` or `default-engine-native-tls`),
+If you depend on `delta_kernel_default_engine` (with either the `rustls` or `native-tls` feature),
 you get an implementation of the `Engine` trait that uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
@@ -86,12 +95,12 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-57`: Use arrow version 57
 - `arrow-58`: Use arrow version 58
+- `arrow-59`: Use arrow version 59
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
-  specify it directly with `arrow-N`, e.g. `arrow-57`.
+  specify it directly with `arrow-N`, e.g. `arrow-58`.
 
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of

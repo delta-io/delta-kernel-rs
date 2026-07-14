@@ -11,8 +11,8 @@ use delta_kernel::expressions::Predicate;
 use delta_kernel::schema::LogicalSchemaRef;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Version};
-use delta_kernel_benchmarks::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
-use delta_kernel_benchmarks::predicate_parser::parse_predicate;
+use delta_kernel_workloads::models::{ReadSpec, SnapshotConstructionSpec, Spec, TimeTravel};
+use delta_kernel_workloads::predicate_parser::parse_predicate;
 use itertools::Itertools;
 use url::Url;
 

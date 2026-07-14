@@ -32,12 +32,13 @@ use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{validate_schema_column_mapping_strict, Operation, TableFeature};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
@@ -67,11 +68,12 @@ mod sealed {
 ///
 /// Uses a type-state pattern (`S`) to enforce at compile time:
 /// - At least one schema operation must be queued before `build()` is callable.
-/// - Only operations valid for the current state can be chained. This will disallow incompatibel
+/// - Only operations valid for the current state can be chained. This will disallow incompatible
 ///   chaining.
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
+    correlation_id: Option<Arc<str>>,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
@@ -88,8 +90,16 @@ impl<S> AlterTableTransactionBuilder<S> {
         AlterTableTransactionBuilder {
             snapshot: self.snapshot,
             operations: self.operations,
+            correlation_id: self.correlation_id,
             _state: PhantomData,
         }
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining the alter-table commit's metric
+    /// events to the caller's own request or operation id. An empty id is treated as unset.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
     }
 }
 
@@ -99,6 +109,7 @@ impl AlterTableTransactionBuilder<Ready> {
         AlterTableTransactionBuilder {
             snapshot,
             operations: Vec::new(),
+            correlation_id: None,
             _state: PhantomData,
         }
     }
@@ -177,14 +188,18 @@ impl AlterTableTransactionBuilder<Modifying> {
             current_max_column_id,
         )?;
 
-        let mut evolved_metadata = table_config
+        // Validates column mapping in strict mode (rejects stale CM annotations on a
+        // mapping-disabled table).
+        validate_schema_column_mapping_strict(&evolved_schema, column_mapping_mode)?;
+
+        let evolved_metadata = table_config
             .metadata()
             .clone()
-            .with_schema(evolved_schema.clone())?;
-        if let Some(id) = new_max_column_id {
-            evolved_metadata = evolved_metadata
-                .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string());
-        }
+            .with_schema(evolved_schema.clone())?
+            .fold_with(new_max_column_id, |evolved_metadata, id| {
+                evolved_metadata
+                    .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+            });
 
         // Validates the evolved metadata against the protocol.
         let evolved_table_config = TableConfiguration::try_new_with_schema(
@@ -193,6 +208,11 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_schema,
         )?;
 
-        AlterTableTransaction::try_new_alter_table(self.snapshot, evolved_table_config, committer)
+        AlterTableTransaction::try_new_alter_table(
+            self.snapshot,
+            evolved_table_config,
+            committer,
+            self.correlation_id,
+        )
     }
 }

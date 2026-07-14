@@ -7,17 +7,16 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::{DeltaResult, Error as KernelError, Snapshot};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::{DeltaResult, Error as KernelError};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{set_json_value, setup_test_tables, test_read};
+use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables, test_read};
 
 use crate::common::write_utils::{
     check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
@@ -123,9 +122,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         // Commit without adding any add files
@@ -191,17 +188,12 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         StructField::nullable("number", DataType::INTEGER),
         StructField::nullable("partition", DataType::STRING),
     ])?);
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let data_schema = schema_ref! { nullable "number": INTEGER };
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let mut txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine")
             .with_data_change(false);
 
@@ -332,22 +324,14 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let table_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let table_schema = schema_ref! { nullable "number": INTEGER };
     // incompatible data schema: one string column named 'string'
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "string",
-        DataType::STRING,
-    )])?);
+    let data_schema = schema_ref! { nullable "string": STRING };
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         // create two new arrow record batches to append

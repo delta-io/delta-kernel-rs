@@ -4,23 +4,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::{column_expr, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::scan::StatsOptions;
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    copy_directory, create_default_engine, create_default_engine_mt_executor,
-    read_actions_from_commit, setup_test_tables,
+    begin_transaction, copy_directory, create_default_engine, create_default_engine_mt_executor,
+    load_and_begin_transaction, read_actions_from_commit, setup_test_tables,
 };
 use url::Url;
 
@@ -56,9 +57,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_data_change(true);
 
@@ -151,7 +150,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
             // stats (optional)
             let stats = remove["stats"].as_str().expect("Missing stats");
             let stats_json: serde_json::Value = serde_json::from_str(stats)?;
-            assert_eq!(stats_json["numRecords"], 10);
+            assert_eq!(stats_json[NUM_RECORDS], 10);
 
             // tags (optional)
             let tags = remove["tags"].as_object().expect("Missing tags");
@@ -240,9 +239,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
         .build(engine.as_ref())?;
 
     // Create transaction with DV update mode enabled
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("UPDATE".to_string())
         .with_data_change(true);
@@ -538,9 +535,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
 
     // Create DV update transaction
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot
-        .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
         .with_operation("UPDATE".to_string())
         .with_data_change(true);
@@ -655,6 +650,106 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// A DV update over a batch where only some files are targeted: only the matched files get
+/// remove/add pairs.
+#[tokio::test]
+async fn test_update_deletion_vectors_updates_only_matched_files(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    let file_names = &[
+        "file0.parquet",
+        "file1.parquet",
+        "file2.parquet",
+        "file3.parquet",
+    ];
+    let (store, engine, table_url, file_paths) =
+        create_dv_table_with_files("test_table", schema, file_names).await?;
+
+    // Target only files 1 and 3 for a DV update; files 0 and 2 must be left untouched.
+    let targeted = [file_paths[1].clone(), file_paths[3].clone()];
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
+        .with_engine_info("test engine")
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    let dv_map: HashMap<String, DeletionVectorDescriptor> = targeted
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: format!("dv_{path}.bin"),
+                    offset: Some(1),
+                    size_in_bytes: 40,
+                    cardinality: 1,
+                },
+            )
+        })
+        .collect();
+
+    let scan_files = get_scan_files(snapshot, engine.as_ref())?;
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+    let version = committed.commit_version();
+
+    // Read the commit directly from the (in-memory) store.
+    let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
+    let commit_content = store
+        .get(&Path::from_url_path(commit_path.path())?)
+        .await?
+        .bytes()
+        .await?;
+    let actions: Vec<serde_json::Value> = Deserializer::from_slice(&commit_content)
+        .into_iter()
+        .try_collect()?;
+    let adds: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("add")).collect();
+    let removes: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("remove")).collect();
+
+    // Only the two targeted files produce remove/add pairs.
+    assert_eq!(adds.len(), 2, "only the targeted files should be re-added");
+    assert_eq!(
+        removes.len(),
+        2,
+        "only the targeted files should be removed"
+    );
+
+    let mut added_paths: Vec<&str> = adds.iter().map(|a| a["path"].as_str().unwrap()).collect();
+    added_paths.sort();
+    let mut expected: Vec<&str> = targeted.iter().map(String::as_str).collect();
+    expected.sort();
+    assert_eq!(
+        added_paths, expected,
+        "re-added paths must be exactly the targeted files"
+    );
+
+    // Each new add carries its DV and widened tightBounds, with numRecords preserved.
+    for add in &adds {
+        assert!(
+            add["deletionVector"].is_object(),
+            "new add must carry a deletion vector"
+        );
+        let stats: serde_json::Value = serde_json::from_str(add["stats"].as_str().unwrap())?;
+        assert_eq!(
+            stats[TIGHT_BOUNDS].as_bool(),
+            Some(false),
+            "DV-updated add must widen tightBounds"
+        );
+        assert_eq!(
+            stats[NUM_RECORDS].as_i64(),
+            Some(3),
+            "numRecords must be preserved"
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_remove_files_verify_files_excluded_from_scan(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -684,9 +779,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         assert!(initial_file_count > 0);
 
         // Now create a transaction to remove files
-        let mut txn = snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
 
         // Create a new scan to get file metadata for removal
         let scan2 = snapshot.scan_builder().build()?;
@@ -780,9 +873,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
         );
 
         // Create a transaction to remove files in two batches
-        let mut txn = snapshot
-            .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
             .with_engine_info("selective remove test")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
@@ -952,7 +1043,10 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         // Always request all stats columns so stats_parsed is present in scan metadata
         // regardless of whether a predicate is used. This ensures remove_files can always
         // reconstruct stats (including the coalesce path when writeStatsAsJson=false).
-        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        let mut scan_builder = snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(StatsOptions::all());
         if use_predicate {
             scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
                 column_expr!("number"),
@@ -961,9 +1055,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
 
         // Pass scan metadata (which contains stats_parsed) directly to remove_files.
         // This previously failed with "Too few fields in output schema".
@@ -982,7 +1074,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
         );
 
         // stats must be populated in every remove action: stats_parsed is always present
-        // (via include_all_stats_columns), so the coalesce path handles even checkpoints
+        // (via `StatsOptions::all()`), so the coalesce path handles even checkpoints
         // that omit the raw JSON stats string (writeStatsAsJson=false).
         for remove in &remove_actions {
             let stats_str = remove["stats"]
@@ -990,7 +1082,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
                 .expect("stats field should be a non-null JSON string");
             let stats: serde_json::Value = serde_json::from_str(stats_str)?;
             assert!(
-                stats["numRecords"].as_i64().unwrap_or(0) > 0,
+                stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
                 "stats.numRecords should be populated, got: {stats}"
             );
         }
@@ -1006,7 +1098,7 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
 ///   scans whose predicate misses the partition columns).
 /// - partition predicate: `partitionValues_parsed` present.
 ///
-/// Every case calls `.include_all_stats_columns()`, which forces `stats_parsed`
+/// Every case sets `.with_stats(StatsOptions::all())`, which forces `stats_parsed`
 /// into the scan output regardless of the predicate shape, so the partition-
 /// predicate case exercises both parsed-column drop paths together while the
 /// other two exercise only the `stats_parsed` drop path. The coalesce
@@ -1040,10 +1132,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("country", DataType::STRING),
     ])?);
-    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let data_schema = schema_ref! { nullable "id": INTEGER };
 
     // Local directory backing: `read_actions_from_commit` reads commit JSON off disk
     // and does not support the default in-memory store's `memory://` URL.
@@ -1061,10 +1150,8 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         let engine = Arc::new(engine);
 
         // Write two partitions: country="usa" and country="japan".
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn =
+            load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(true);
         let append_data = [[1, 2, 3], [10, 20, 30]].map(|data| -> delta_kernel::DeltaResult<_> {
             let data = RecordBatch::try_new(
                 Arc::new(data_schema.as_ref().try_into_arrow()?),
@@ -1083,15 +1170,16 @@ async fn test_remove_files_partitioned_with_parsed_columns(
         txn.commit(engine.as_ref())?.unwrap_committed();
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-        let mut scan_builder = snapshot.clone().scan_builder().include_all_stats_columns();
+        let mut scan_builder = snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(StatsOptions::all());
         if let Some(pred) = predicate.clone() {
             scan_builder = scan_builder.with_predicate(Arc::new(pred));
         }
         let scan = scan_builder.build()?;
 
-        let mut txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_data_change(true);
+        let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
         for scan_metadata in scan.scan_metadata(engine.as_ref())? {
             txn.remove_files(scan_metadata?.scan_files);
         }
@@ -1132,7 +1220,7 @@ async fn test_remove_files_partitioned_with_parsed_columns(
                 .expect("stats field should be a non-null JSON string");
             let stats: serde_json::Value = serde_json::from_str(stats_str)?;
             assert!(
-                stats["numRecords"].as_i64().unwrap_or(0) > 0,
+                stats[NUM_RECORDS].as_i64().unwrap_or(0) > 0,
                 "stats.numRecords should be populated, got: {stats}"
             );
         }

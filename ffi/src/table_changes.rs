@@ -7,7 +7,7 @@ use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-use delta_kernel::{DeltaResult, EngineData, Error, Version};
+use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, EngineData, Error, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -237,7 +237,7 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-type TableChangesData = Mutex<Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>>;
+type TableChangesData = Mutex<DeltaResultIteratorStatic<Box<dyn EngineData>>>;
 
 pub struct ScanTableChangesIterator {
     data: TableChangesData,
@@ -345,14 +345,12 @@ mod tests {
     use delta_kernel::arrow::util::pretty::pretty_format_batches;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::DynObjectStore;
-    #[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
-    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
     use delta_kernel_ffi::engine_data::get_engine_data;
     use itertools::Itertools;
     use test_utils::{
@@ -471,8 +469,11 @@ mod tests {
 
     pub fn generate_batch_with_id(start_i: i32) -> Result<RecordBatch, ArrowError> {
         generate_batch(vec![
-            ("id", vec![start_i, start_i + 1, start_i + 2].into_array()),
-            ("val", vec!["a", "b", "c"].into_array()),
+            (
+                "id",
+                vec![start_i, start_i + 1, start_i + 2].into_arrow_array(),
+            ),
+            ("val", vec!["a", "b", "c"].into_arrow_array()),
         ])
     }
 

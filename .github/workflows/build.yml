@@ -1,10 +1,25 @@
 name: build
 
-on: [push, pull_request, merge_group]
+# Restrict push to long-lived branches to avoid duplicate CI runs. See .github/CLAUDE.md.
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  merge_group:
+
+concurrency:
+  # A new push to a PR cancels that PR's in-flight run. On push to main/release, head_ref
+  # is empty, so run_id (always unique) is used and those runs never cancel each other.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Strip debuginfo (debugger source-line/variable maps, type layouts) in CI: no debugger
+  # attaches here, so it is pure compile overhead. Test output, logs, and panics are unaffected.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 # Supply chain security: all cargo commands that resolve dependencies use --locked to
 # enforce the committed Cargo.lock. This prevents CI from silently resolving a newer
@@ -24,8 +39,8 @@ env:
 #
 # Without this, GHA's ref-scoped caching works against us: each PR writes ~6.3GB of
 # cache entries (14 jobs x ~450MB) that only that PR can read. A handful of active PRs
-# fills the 10GB cache budget, LRU evicts main's shared entries, and every subsequent
-# PR compiles from scratch.
+# fills the 50GB cache budget (as of 2026-06), LRU evicts main's shared entries, and
+# every subsequent PR compiles from scratch.
 #
 # The save-if condition checks both event_name == 'push' and ref == main because
 # pull_request_target events set github.ref to the base branch (main), not the PR
@@ -35,6 +50,13 @@ env:
 # Note: actions-rust-lang/setup-rust-toolchain has built-in Swatinem/rust-cache that
 # writes on every run with no save-if support. We disable it with cache: false and
 # manage caching explicitly via the Swatinem/rust-cache steps below.
+#
+# cache-bin: false disables caching of ~/.cargo/bin to work around
+# https://github.com/Swatinem/rust-cache/issues/341, where the cached rustup binary
+# breaks cargo on the new macOS runner image. Drop the cache-bin: false lines once
+# that issue is resolved and we've bumped to a fixed version. Skipping this cache is
+# essentially free for us: all cargo tools (cargo-nextest, cargo-msrv, cargo-llvm-cov)
+# are installed via taiki-e/install-action, which fetches prebuilt binaries.
 
 jobs:
   format:
@@ -60,6 +82,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
         with:
@@ -80,6 +103,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@7bc99eee1f1b8902a125006cf790a1f4c8461e63 # v2.69.8
         with:
@@ -111,6 +135,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build docs
         run: cargo doc --locked --workspace --all-features --no-deps
@@ -125,6 +150,7 @@ jobs:
   # 1. build/clippy all packages that depend on the kernel with some features enabled:
   #    - acceptance
   #    - test_utils
+  #    - delta_kernel_workloads
   #    - feature_tests
   #    (and examples)
   #    - inspect-table
@@ -153,6 +179,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: build and lint with clippy
         run: cargo clippy --locked --benches --tests --all-features -- -D warnings
@@ -160,6 +187,10 @@ jobs:
         run: cargo clippy --locked --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
       - name: lint without default features - packages which don't depend on kernel with features enabled
         run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
+      - name: check kernel declarative-plans feature-only build
+        run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans
+      - name: lint kernel declarative-plans feature-only build
+        run: cargo clippy --locked -p delta_kernel --no-default-features --features declarative-plans --tests -- -D warnings
       - name: check kernel builds with default-engine-native-tls
         run: cargo build --locked -p feature_tests --features default-engine-native-tls
       - name: test native-tls backend has no crypto provider conflict
@@ -191,13 +222,45 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
         run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: doc tests
+        run: cargo test --locked --workspace --all-features --doc
       - name: trybuild tests
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
+      - name: metrics deadlock test
+        shell: bash
+        run: |
+          output=$(cargo run --profile test --example metrics-tester)
+          grep -q 'invalid_field' <<< "$output"
+          grep -q 'Invalid uuid' <<< "$output"
+
+  # Fails red on trybuild drift, but kept out of required checks so it never blocks a merge.
+  invalid-handle-code:
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install minimal stable
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: trybuild tests
+        run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
+      - name: notify on failure
+        if: failure()
+        run: |
+          echo "::warning title=invalid_handle_code trybuild tests failed::Check whether the compile_fail expectations need updating for the current rustc, or whether handle.rs/ffi-proc-macros regressed."
+          echo "## invalid_handle_code trybuild tests failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check whether the compile_fail expectations need updating for the current rustc, or whether \`ffi/src/handle.rs\` / \`ffi-proc-macros\` regressed." >> "$GITHUB_STEP_SUMMARY"
 
   ffi_test:
     runs-on: ${{ matrix.os }}
@@ -226,6 +289,8 @@ jobs:
               sudo apt install -y -V libarrow-glib-dev # For GLib (C)
               sudo apt install -y -V valgrind # For memory leak test
            fi
+      # TODO (#2707): This step's cache misses 100% of runs, wasting ~4.5 min per macOS run on a
+      #               fresh `brew install`. See the issue for root cause and fix options.
       - name: Install arrow-glib-macOS
         if: runner.os == 'macOS'
         uses: ./.github/actions/use-homebrew-tools
@@ -237,6 +302,7 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Set output on fail
         run: echo "CTEST_OUTPUT_ON_FAILURE=1" >> "$GITHUB_ENV"
@@ -291,9 +357,24 @@ jobs:
           cmake ..
           make
           make test
+      - name: build update-dv example
+        run: |
+          pushd ffi/examples/update-dv
+          mkdir build
+          pushd build
+          cmake ..
+          make
       - name: build and run read-table-changes test
         run: |
           pushd ffi/examples/read-table-changes
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
+      - name: build and run checkpoint-table test
+        run: |
+          pushd ffi/examples/checkpoint-table
           mkdir build
           pushd build
           cmake ..
@@ -314,12 +395,13 @@ jobs:
           cargo miri setup
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest
@@ -333,13 +415,14 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@2d15d02e710b40b6332201aba6af30d595b5cd96 # cargo-llvm-cov
       - name: Generate code coverage
         run: cargo llvm-cov --locked --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs --skip handle::tests::invalid_handle_code
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: codecov.json
           fail_ci_if_error: true

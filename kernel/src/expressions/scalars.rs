@@ -285,6 +285,17 @@ impl Scalar {
         matches!(self, Self::Null(_))
     }
 
+    /// Constructs a null `Scalar` of the given type. Accepts anything convertible into a
+    /// [`DataType`], so container types like [`StructType`], [`ArrayType`], and [`MapType`]
+    /// can be passed directly without an explicit `DataType::from(...)` wrapper.
+    ///
+    /// [`StructType`]: crate::schema::StructType
+    /// [`ArrayType`]: crate::schema::ArrayType
+    /// [`MapType`]: crate::schema::MapType
+    pub fn null(data_type: impl Into<DataType>) -> Self {
+        Self::Null(data_type.into())
+    }
+
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
@@ -694,6 +705,25 @@ impl PrimitiveType {
         DataType::Primitive(self.clone())
     }
 
+    /// Parses a serialized string into a [`Scalar`] of this primitive type, per the Delta
+    /// protocol's [partition value serialization] rules. An empty string parses as
+    /// [`Scalar::Null`].
+    ///
+    /// Note: the scan read path does not use this empty-string handling for partition values; it
+    /// applies a type-dependent cast instead (empty string on a string or binary column surfaces as
+    /// an empty value rather than null).
+    ///
+    /// Timestamp and TimestampNtz accept the space-separated form `{year}-{month}-{day}
+    /// {hour}:{minute}:{second}[.{fraction}]`. Timestamp (only) also accepts ISO 8601 / RFC 3339
+    /// strings such as `1970-01-01T00:00:00.123456Z`; an explicit offset is honored and the value
+    /// is normalized to UTC. The spec stores timestamp partition values either without a zone
+    /// (interpreted in the writer's local time zone) or adjusted to UTC with a `Z` suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ParseError`] if `raw` is not a valid encoding of this type.
+    ///
+    /// [partition value serialization]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
     pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, Error> {
         use PrimitiveType::*;
 
@@ -711,6 +741,7 @@ impl PrimitiveType {
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
             Float => self.parse_str_as_scalar(raw, Scalar::Float),
             Double => self.parse_str_as_scalar(raw, Scalar::Double),
+            Void => Err(self.parse_error(raw)),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
                     Ok(Scalar::Boolean(true))
@@ -729,20 +760,18 @@ impl PrimitiveType {
                 let days = date.signed_duration_since(DateTime::UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
             }
-            // NOTE: Timestamp and TimestampNtz are both parsed into microsecond since unix epoch.
-            // They may both have the format `{year}-{month}-{day} {hour}:{minute}:{second}`.
-            // Timestamps may additionally be encoded as a ISO 8601 formatted string such as
-            // `1970-01-01T00:00:00.123456Z`.
-            //
-            // The difference arises mostly in how they are to be handled on the engine side - i.e.
-            // timestampNTZ is not adjusted to UTC, this is just so we can
-            // (de-)serialize it as a date sting. https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
+            // NOTE: Timestamp and TimestampNtz are both parsed into microseconds since unix
+            // epoch. The difference arises mostly in how they are to be handled on the engine
+            // side - i.e. timestampNTZ is not adjusted to UTC, this is just so we can
+            // (de-)serialize it as a date string.
             TimestampNtz | Timestamp => {
                 let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
 
                 if timestamp.is_err() && *self == Timestamp {
-                    // Note: `%+` specifies the ISO 8601 / RFC 3339 format
-                    timestamp = NaiveDateTime::parse_from_str(raw, "%+");
+                    // `%+` is chrono's relaxed ISO 8601 / RFC 3339 parser: unlike the stricter
+                    // DateTime::parse_from_rfc3339, it also accepts a space or lowercase `t`
+                    // separator and colon-less offsets (e.g. `+0530`).
+                    timestamp = DateTime::parse_from_str(raw, "%+").map(|dt| dt.naive_utc());
                 }
                 let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
                 let timestamp = Utc.from_utc_datetime(&timestamp);
@@ -756,6 +785,29 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
+            IntervalYearMonth | IntervalDayTime => Err(Error::unsupported(
+                "Interval types are not supported as scalar or partition values",
+            )),
+        }
+    }
+
+    /// Casts an empty partition-value string to its target [`Scalar`], or `None` for a null value.
+    ///
+    /// An empty string is a value for a string or binary column (the empty string / empty bytes)
+    /// but has no representation for any other type, so it casts to null there. This aligns with
+    /// Spark, which reads the partition-value map as a non-ANSI SQL cast, and is the empty-string
+    /// rule the scan read path applies, in place of [`parse_scalar`]'s null-for-every-type
+    /// handling.
+    ///
+    /// A literal empty string only reaches this path from a foreign writer, since kernel
+    /// serializes its own empty and null partition values to JSON null on write.
+    ///
+    /// [`parse_scalar`]: PrimitiveType::parse_scalar
+    pub(crate) fn empty_string_partition_cast(&self) -> Option<Scalar> {
+        match self {
+            PrimitiveType::String => Some(Scalar::String(String::new())),
+            PrimitiveType::Binary => Some(Scalar::Binary(Vec::new())),
+            _ => None,
         }
     }
 
@@ -824,10 +876,22 @@ impl PrimitiveType {
 mod tests {
     use std::f32::consts::PI;
 
+    use rstest::rstest;
+
     use super::*;
     use crate::expressions::{column_expr, BinaryPredicateOp};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
+
+    #[test]
+    fn test_void_parse_scalar() {
+        // Empty string should produce Null (like all primitive types)
+        let scalar = PrimitiveType::Void.parse_scalar("").unwrap();
+        assert_eq!(scalar, Scalar::Null(DataType::VOID));
+
+        // Non-empty string should fail
+        PrimitiveType::Void.parse_scalar("anything").unwrap_err();
+    }
 
     #[test]
     fn test_bad_decimal() {
@@ -1055,48 +1119,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_timestamp_parse() {
-        let assert_timestamp_eq = |scalar_string, micros| {
-            let scalar = PrimitiveType::Timestamp
-                .parse_scalar(scalar_string)
-                .unwrap();
-            assert_eq!(scalar, Scalar::Timestamp(micros));
+    #[rstest]
+    #[case::seconds("2011-01-11 13:06:07", 1294751167000000)]
+    #[case::fractional_seconds("2011-01-11 13:06:07.123456", 1294751167123456)]
+    #[case::epoch("1970-01-01 00:00:00", 0)]
+    fn test_timestamp_space_form_parse(
+        #[values(PrimitiveType::Timestamp, PrimitiveType::TimestampNtz)] p_type: PrimitiveType,
+        #[case] raw: &str,
+        #[case] micros: i64,
+    ) {
+        let expected = match p_type {
+            PrimitiveType::Timestamp => Scalar::Timestamp(micros),
+            PrimitiveType::TimestampNtz => Scalar::TimestampNtz(micros),
+            _ => unreachable!(),
         };
-        assert_timestamp_eq("1971-07-22T03:06:40.678910Z", 49000000678910);
-        assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000);
-        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
-        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
-        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+        assert_eq!(p_type.parse_scalar(raw).unwrap(), expected);
     }
 
-    #[test]
-    fn test_timestamp_ntz_parse() {
-        let assert_timestamp_eq = |scalar_string, micros| {
-            let scalar = PrimitiveType::TimestampNtz
-                .parse_scalar(scalar_string)
-                .unwrap();
-            assert_eq!(scalar, Scalar::TimestampNtz(micros));
-        };
-        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
-        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
-        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+    #[rstest]
+    #[case::z_fractional("1971-07-22T03:06:40.678910Z", 49000000678910)]
+    #[case::z_seconds("1971-07-22T03:06:40Z", 49000000000000)]
+    #[case::z("2024-06-15T14:30:00Z", 1718461800000000)]
+    #[case::lowercase_t_z("2024-06-15t14:30:00z", 1718461800000000)]
+    #[case::zero_offset("2024-06-15T14:30:00+00:00", 1718461800000000)]
+    #[case::negative_zero_offset("2024-06-15T14:30:00-00:00", 1718461800000000)]
+    #[case::positive_offset("2024-06-15T14:30:00+05:00", 1718443800000000)] // 09:30:00Z
+    #[case::negative_offset("2024-06-15T14:30:00-05:00", 1718479800000000)] // 19:30:00Z
+    #[case::half_hour_offset("2024-06-15T14:30:00+05:30", 1718442000000000)] // 09:00:00Z
+    #[case::colonless_offset("2024-06-15T14:30:00+0530", 1718442000000000)] // 09:00:00Z
+    #[case::fractional_with_offset("2024-06-15T14:30:00.456+05:00", 1718443800456000)]
+    #[case::space_separator_with_offset("2024-06-15 14:30:00+05:00", 1718443800000000)]
+    #[case::pre_epoch_after_normalization("1970-01-01T00:00:00+05:00", -18000000000)]
+    fn test_timestamp_iso8601_parse(#[case] raw: &str, #[case] micros: i64) {
+        let scalar = PrimitiveType::Timestamp.parse_scalar(raw).unwrap();
+        assert_eq!(scalar, Scalar::Timestamp(micros));
     }
 
-    #[test]
-    fn test_timestamp_parse_fails() {
-        let assert_timestamp_fails = |p_type: &PrimitiveType, scalar_string| {
-            let res = p_type.parse_scalar(scalar_string);
-            assert!(res.is_err());
-        };
-
-        let p_type = PrimitiveType::TimestampNtz;
-        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40.678910Z");
-        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40Z");
-        assert_timestamp_fails(&p_type, "1971-07-22");
-
-        let p_type = PrimitiveType::Timestamp;
-        assert_timestamp_fails(&p_type, "1971-07-22");
+    #[rstest]
+    // TimestampNtz has no ISO 8601 fallback: rejects Z, offsets, and date-only
+    #[case::ntz_z_fractional(PrimitiveType::TimestampNtz, "1971-07-22T03:06:40.678910Z")]
+    #[case::ntz_z(PrimitiveType::TimestampNtz, "1971-07-22T03:06:40Z")]
+    #[case::ntz_offset(PrimitiveType::TimestampNtz, "2024-06-15T14:30:00+05:00")]
+    #[case::ntz_space_offset(PrimitiveType::TimestampNtz, "2024-06-15 14:30:00+05:00")]
+    #[case::ntz_date_only(PrimitiveType::TimestampNtz, "1971-07-22")]
+    // Timestamp rejects date-only and the T-form without a trailing Z or offset
+    #[case::date_only(PrimitiveType::Timestamp, "1971-07-22")]
+    #[case::zoneless_t_form(PrimitiveType::Timestamp, "2024-06-15T14:30:00")]
+    // out-of-range offsets and UTC normalizations that overflow chrono's datetime range
+    // error cleanly rather than being misinterpreted
+    #[case::offset_out_of_range(PrimitiveType::Timestamp, "2024-06-15T14:30:00+24:00")]
+    #[case::normalization_overflow(PrimitiveType::Timestamp, "-262143-01-01T00:00:00+05:00")]
+    fn test_timestamp_parse_fails(#[case] p_type: PrimitiveType, #[case] raw: &str) {
+        assert!(p_type.parse_scalar(raw).is_err());
     }
 
     #[test]
@@ -1325,5 +1399,81 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+    }
+
+    // #[ignore]d checklist of core kernel interval dataflows, red until interval support lands
+    const INTERVAL_YM_LITERAL: &str = "INTERVAL '1-0' YEAR TO MONTH";
+    const INTERVAL_YM_LITERAL_LARGER: &str = "INTERVAL '2-0' YEAR TO MONTH";
+    const INTERVAL_DT_LITERAL: &str = "INTERVAL '0 01:00:00.000000' DAY TO SECOND";
+    const INTERVAL_DT_LITERAL_LARGER: &str = "INTERVAL '0 02:00:00.000000' DAY TO SECOND";
+
+    #[ignore = "needs Scalar::Interval* variant + parse_scalar/data_type() support"]
+    #[test]
+    fn interval_parse_and_data_type() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        assert_eq!(ym.data_type(), DataType::INTERVAL_YEAR_MONTH);
+
+        let dt = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL)
+            .unwrap();
+        assert_eq!(dt.data_type(), DataType::INTERVAL_DAY_TIME);
+    }
+
+    #[ignore = "needs interval Display impl that round-trips with parse_scalar"]
+    #[test]
+    fn interval_display_round_trips() {
+        for (ptype, lit) in [
+            (PrimitiveType::IntervalYearMonth, INTERVAL_YM_LITERAL),
+            (PrimitiveType::IntervalDayTime, INTERVAL_DT_LITERAL),
+        ] {
+            let scalar = ptype.parse_scalar(lit).unwrap();
+            let reparsed = ptype.parse_scalar(&scalar.to_string()).unwrap();
+            assert_eq!(
+                scalar, reparsed,
+                "Display is not the inverse of parse for {lit}"
+            );
+        }
+    }
+
+    #[ignore = "needs interval logical_partial_cmp (orders within a family, incomparable across)"]
+    #[test]
+    fn interval_logical_partial_cmp() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        let ym_larger = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL_LARGER)
+            .unwrap();
+        assert_eq!(ym.logical_partial_cmp(&ym_larger), Some(Ordering::Less));
+        assert_eq!(ym_larger.logical_partial_cmp(&ym), Some(Ordering::Greater));
+        assert_eq!(ym.logical_partial_cmp(&ym), Some(Ordering::Equal));
+
+        let dt = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL)
+            .unwrap();
+        let dt_larger = PrimitiveType::IntervalDayTime
+            .parse_scalar(INTERVAL_DT_LITERAL_LARGER)
+            .unwrap();
+        assert_eq!(dt.logical_partial_cmp(&dt_larger), Some(Ordering::Less));
+
+        // Comparison is defined only within a family; everything else is incomparable.
+        assert_eq!(ym.logical_partial_cmp(&dt), None);
+        assert_eq!(ym.logical_partial_cmp(&Scalar::Integer(0)), None);
+    }
+
+    #[ignore = "needs interval logical_eq (NULL-aware equality via logical_partial_cmp)"]
+    #[test]
+    fn interval_logical_eq() {
+        let ym = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        let ym_same = PrimitiveType::IntervalYearMonth
+            .parse_scalar(INTERVAL_YM_LITERAL)
+            .unwrap();
+        assert!(ym.logical_eq(&ym_same));
+        // SQL NULL semantics: NULL is not equal to anything, including a like-typed value.
+        assert!(!ym.logical_eq(&Scalar::null(DataType::INTERVAL_YEAR_MONTH)));
     }
 }

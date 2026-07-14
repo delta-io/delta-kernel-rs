@@ -19,13 +19,12 @@ use crate::{DeltaResult, EngineData, Error, RowVisitor};
 
 /// File-level statistics for a table version: total file count, size, and histogram.
 ///
-/// Obtained via [`Snapshot::get_or_load_file_stats`], [`Snapshot::get_file_stats_if_loaded`],
-/// or [`Crc::file_stats()`](super::Crc::file_stats). Returns `None` when the stats are not
-/// known to be valid.
+/// Obtained via [`Snapshot::get_file_stats_if_present`] or [`Crc::file_stats()`]. Returns
+/// `None` when the source CRC's `file_stats_state` is not `Complete`.
 ///
-/// [`Snapshot::get_or_load_file_stats`]: crate::snapshot::Snapshot::get_or_load_file_stats
-/// [`Snapshot::get_file_stats_if_loaded`]: crate::snapshot::Snapshot::get_file_stats_if_loaded
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`Snapshot::get_file_stats_if_present`]: crate::snapshot::Snapshot::get_file_stats_if_present
+/// [`Crc::file_stats()`]: super::Crc::file_stats
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileStats {
     /// Number of active [`Add`](crate::actions::Add) file actions in this table version.
     pub(crate) num_files: i64,
@@ -55,41 +54,51 @@ impl FileStats {
     }
 }
 
-/// Net file count and size changes from a single commit, with an optional net histogram.
+/// Gross file-change totals from a single commit, plus an optional net file-size histogram.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileStatsDelta {
-    /// Net change in file count (files added minus files removed).
-    pub(crate) net_files: i64,
-    /// Net change in total bytes (bytes added minus bytes removed).
-    pub(crate) net_bytes: i64,
+    pub(crate) gross_add_files: u64,
+    pub(crate) gross_remove_files: u64,
+    pub(crate) gross_add_bytes: u64,
+    pub(crate) gross_remove_bytes: u64,
     /// Net change in file size histogram (adds minus removes per bin). May contain negative
     /// values in bins where more files were removed than added. `None` when the delta source
     /// does not provide histogram data.
     pub(crate) net_histogram: Option<FileSizeHistogram>,
 }
 
-impl FileStatsDelta {
-    /// Returns `true` if the given operation can be safely tracked by incremental file stats.
-    ///
-    /// Incremental-safe operations produce add/remove actions whose net counts give correct
-    /// file stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE
-    /// STATS re-adds existing files with updated statistics -- if we naively counted those
-    /// adds, we'd double count file stats.
-    const INCREMENTAL_SAFE_OPS: &[&str] = &[
-        "WRITE",
-        "MERGE",
-        "UPDATE",
-        "DELETE",
-        "OPTIMIZE",
-        "CREATE TABLE",
-        "REPLACE TABLE",
-        "CREATE TABLE AS SELECT",
-        "REPLACE TABLE AS SELECT",
-        "CREATE OR REPLACE TABLE AS SELECT",
-    ];
+const INCREMENTAL_SAFE_OPS: &[&str] = &[
+    "WRITE",
+    "MERGE",
+    "UPDATE",
+    "DELETE",
+    "OPTIMIZE",
+    "CREATE TABLE",
+    "REPLACE TABLE",
+    "CREATE TABLE AS SELECT",
+    "REPLACE TABLE AS SELECT",
+    "CREATE OR REPLACE TABLE AS SELECT",
+];
 
-    pub(crate) fn is_incremental_safe(operation: &str) -> bool {
-        Self::INCREMENTAL_SAFE_OPS.contains(&operation)
+/// Returns `true` if the given operation can be safely tracked by incremental file stats.
+///
+/// Incremental-safe operations produce add/remove actions whose net counts give correct file
+/// stats. Unknown or missing operations are treated as unsafe. For example, ANALYZE STATS
+/// re-adds existing files with updated statistics; naively counting those adds would
+/// double-count file stats.
+pub(crate) fn is_incremental_safe_operation(operation: &str) -> bool {
+    INCREMENTAL_SAFE_OPS.contains(&operation)
+}
+
+impl FileStatsDelta {
+    /// Net change in file count (added minus removed).
+    pub(crate) fn net_files(&self) -> i64 {
+        self.gross_add_files as i64 - self.gross_remove_files as i64
+    }
+
+    /// Net change in total bytes (added minus removed).
+    pub(crate) fn net_bytes(&self) -> i64 {
+        self.gross_add_bytes as i64 - self.gross_remove_bytes as i64
     }
 
     /// Compute file stats and a delta histogram from a transaction's staged add and remove
@@ -117,15 +126,17 @@ impl FileStatsDelta {
             Some(b) => FileSizeHistogram::create_empty_with_boundaries(b.to_vec())?,
             None => FileSizeHistogram::create_default(),
         };
-        let mut net_files = 0i64;
-        let mut net_bytes = 0i64;
+        let mut gross_add_files = 0u64;
+        let mut gross_remove_files = 0u64;
+        let mut gross_add_bytes = 0u64;
+        let mut gross_remove_bytes = 0u64;
 
         // Visit add files (insert into histogram). Every row is a file being added.
         for batch in add_files_metadata {
             let mut visitor = FileStatsVisitor::new(None, false, &mut histogram);
             visitor.visit_rows_of(batch.as_ref())?;
-            net_files += visitor.count;
-            net_bytes += visitor.total_size;
+            gross_add_files += visitor.count;
+            gross_add_bytes += visitor.total_size;
         }
 
         // Visit remove files (remove from histogram). Each FilteredEngineData has its own
@@ -135,23 +146,32 @@ impl FileStatsDelta {
             let sv_opt = if sv.is_empty() { None } else { Some(sv) };
             let mut visitor = FileStatsVisitor::new(sv_opt, true, &mut histogram);
             visitor.visit_rows_of(filtered_batch.data())?;
-            net_files += visitor.count;
-            net_bytes += visitor.total_size;
+            gross_remove_files += visitor.count;
+            gross_remove_bytes += visitor.total_size;
         }
 
         Ok(FileStatsDelta {
-            net_files,
-            net_bytes,
+            gross_add_files,
+            gross_remove_files,
+            gross_add_bytes,
+            gross_remove_bytes,
             net_histogram: Some(histogram),
         })
     }
 }
 
+/// Read a file `size` (a non-negative byte count stored as `i64`) as `u64`, erroring on a
+/// negative size (corrupt input).
+pub(crate) fn size_to_u64(size: i64) -> DeltaResult<u64> {
+    u64::try_from(size)
+        .map_err(|_| Error::internal_error(format!("File size must be non-negative, got {size}")))
+}
+
 /// Visitor that extracts the `size` column from file metadata and updates a shared histogram.
 ///
-/// When `is_remove` is false (add files), each visited row increments the histogram bin's count
-/// and bytes. When true (remove files), each row decrements them. This builds a single delta
-/// histogram directly without needing separate add/remove histograms.
+/// `is_remove` selects whether each visited row is inserted into (add) or removed from (remove)
+/// the shared delta histogram. `count`/`total_size` always accumulate gross magnitude; the
+/// add/remove direction is the caller's to track.
 ///
 /// Accepts an optional selection vector to filter which rows are visited. AddFiles pass `None`
 /// (count every row); RemoveFiles may pass `Some(sv)` from [`FilteredEngineData`] to skip rows
@@ -162,12 +182,12 @@ struct FileStatsVisitor<'sv, 'h> {
     selection_vector: Option<&'sv [bool]>,
     /// Offset into the selection vector, tracking position across multiple visit calls.
     offset: usize,
-    /// Whether this visitor is processing remove files (decrements) vs add files (increments).
+    /// Whether visited rows are removed from (vs added to) the histogram.
     is_remove: bool,
-    /// Net file count contribution from this visitor. Negative for remove visitors.
-    count: i64,
-    /// Net byte size contribution from this visitor. Negative for remove visitors.
-    total_size: i64,
+    /// Count of files visited.
+    count: u64,
+    /// Total bytes of files visited.
+    total_size: u64,
     /// Shared histogram that all visitors (add and remove) write to.
     histogram: &'h mut FileSizeHistogram,
 }
@@ -211,13 +231,11 @@ impl RowVisitor for FileStatsVisitor<'_, '_> {
             };
             if selected {
                 let size: i64 = getters[0].get(i, "size")?;
+                self.count += 1;
+                self.total_size += size_to_u64(size)?;
                 if self.is_remove {
-                    self.count -= 1;
-                    self.total_size -= size;
                     self.histogram.remove(size)?;
                 } else {
-                    self.count += 1;
-                    self.total_size += size;
                     self.histogram.insert(size)?;
                 }
             }
@@ -236,7 +254,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
 
     fn size_batch(sizes: Vec<i64>) -> Box<dyn EngineData> {
-        let batch = generate_batch(vec![("size", sizes.into_array())]).unwrap();
+        let batch = generate_batch(vec![("size", sizes.into_arrow_array())]).unwrap();
         Box::new(ArrowEngineData::new(batch))
     }
 
@@ -286,8 +304,8 @@ mod tests {
             .map(|sizes| FilteredEngineData::with_all_rows_selected(size_batch(sizes)))
             .collect();
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
-        assert_eq!(stats.net_files, case.expected_net_files);
-        assert_eq!(stats.net_bytes, case.expected_net_bytes);
+        assert_eq!(stats.net_files(), case.expected_net_files);
+        assert_eq!(stats.net_bytes(), case.expected_net_bytes);
     }
 
     #[test]
@@ -304,8 +322,12 @@ mod tests {
         let stats = FileStatsDelta::try_compute_for_txn(&adds, &removes, None).unwrap();
         // adds: 3 files, 600 bytes (100 + 200 + 300)
         // removes: 4 files, 2400 bytes (400 + 500 + 700 + 800)
-        assert_eq!(stats.net_files, -1); // 3 - 4
-        assert_eq!(stats.net_bytes, -1800); // 600 - 2400
+        assert_eq!(stats.net_files(), -1); // 3 - 4
+        assert_eq!(stats.net_bytes(), -1800); // 600 - 2400
+        assert_eq!(stats.gross_add_files, 3);
+        assert_eq!(stats.gross_remove_files, 4);
+        assert_eq!(stats.gross_add_bytes, 600);
+        assert_eq!(stats.gross_remove_bytes, 2400);
     }
 
     #[test]

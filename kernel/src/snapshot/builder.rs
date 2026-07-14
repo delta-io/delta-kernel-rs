@@ -1,10 +1,13 @@
 //! Builder for creating [`Snapshot`] instances.
 
+use std::sync::Arc;
+
 use tracing::{info, instrument};
 
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
-use crate::metrics::MetricId;
+use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
+use crate::metrics::{MetricId, SnapshotLoadMetricContext};
 use crate::path::LogPathFileType;
 use crate::snapshot::SnapshotRef;
 use crate::utils::{require, try_parse_uri};
@@ -39,9 +42,63 @@ pub struct SnapshotBuilder {
     version: Option<Version>,
     log_tail: Vec<LogPath>,
     max_catalog_version: Option<Version>,
+    incremental_replay: IncrementalReplay,
+    /// Kernel-minted id correlating this build's metric events with its child events.
+    operation_id: MetricId,
+    /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
+    /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
+    correlation_id: Option<Arc<str>>,
+}
+
+/// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
+/// in-memory CRC, or an on-disk CRC) to the target snapshot version on load. A CRC already at the
+/// target version is always used regardless of this setting; this only bounds the cost of
+/// advancing a *stale* CRC.
+///
+/// A resolved CRC gives the snapshot precomputed file statistics (file count and sizes, useful
+/// for query optimization and for writers producing a post-commit CRC) along with domain metadata
+/// and set transactions (useful for writers), all without extra log replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IncrementalReplay {
+    /// Never advance a stale CRC; fall back to normal log replay. `UpToCommits(0)` is equivalent.
+    #[default]
+    Disabled,
+    /// Advance only when the CRC is within `n` commits of the target version, i.e.
+    /// `target_version - crc_version <= n`.
+    UpToCommits(u64),
+    /// Advance regardless of how stale the CRC is.
+    Unlimited,
+}
+
+impl IncrementalReplay {
+    /// Whether the configured budget permits advancing a CRC at `crc_version` to `target_version`.
+    /// Errors if `crc_version` is ahead of `target_version`, which violates a caller invariant.
+    ///
+    /// Example: 95.crc with commits 96.json through 100.json is 5 commits, so `UpToCommits(5)`
+    /// advances and `UpToCommits(4)` does not; `Unlimited` always advances.
+    pub(crate) fn should_advance(
+        self,
+        crc_version: Version,
+        target_version: Version,
+    ) -> DeltaResult<bool> {
+        let distance = target_version.checked_sub(crc_version).ok_or_else(|| {
+            Error::internal_error(format!(
+                "CRC version {crc_version} is ahead of target version {target_version}"
+            ))
+        })?;
+        Ok(match self {
+            IncrementalReplay::Disabled => false,
+            IncrementalReplay::UpToCommits(n) => distance <= n,
+            IncrementalReplay::Unlimited => true,
+        })
+    }
 }
 
 impl SnapshotBuilder {
+    // ============================================================================
+    // Constructors
+    // ============================================================================
+
     pub(crate) fn new_for(table_root: impl AsRef<str>) -> Self {
         Self {
             table_root: Some(table_root.as_ref().to_string()),
@@ -49,6 +106,9 @@ impl SnapshotBuilder {
             version: None,
             log_tail: Vec::new(),
             max_catalog_version: None,
+            incremental_replay: IncrementalReplay::default(),
+            operation_id: MetricId::new(),
+            correlation_id: None,
         }
     }
 
@@ -59,8 +119,15 @@ impl SnapshotBuilder {
             version: None,
             log_tail: Vec::new(),
             max_catalog_version: None,
+            incremental_replay: IncrementalReplay::default(),
+            operation_id: MetricId::new(),
+            correlation_id: None,
         }
     }
+
+    // ============================================================================
+    // Chainable configuration
+    // ============================================================================
 
     /// Set the target version of the [`Snapshot`]. When omitted, the Snapshot is created at the
     /// latest version of the table.
@@ -105,32 +172,63 @@ impl SnapshotBuilder {
         self
     }
 
+    /// Bound how many commits kernel will replay to advance a stale CRC to the target version.
+    /// See [`IncrementalReplay`]. Defaults to [`IncrementalReplay::Disabled`].
+    ///
+    /// Writers should set this to [`IncrementalReplay::Unlimited`] for faster writes, as should
+    /// readers that always want table-level file statistics for query optimization.
+    ///
+    /// Applies to both fresh and incremental builds.
+    pub fn with_incremental_crc_replay(mut self, mode: IncrementalReplay) -> Self {
+        self.incremental_replay = mode;
+        self
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining this build's metric events to
+    /// the caller's own request or operation id. An empty id is treated as unset. When unset,
+    /// behavior is unchanged.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    // ============================================================================
+    // Terminal: build the Snapshot
+    // ============================================================================
+
     /// Create a new [`Snapshot`]. This returns a [`SnapshotRef`] (`Arc<Snapshot>`), perhaps
     /// returning a reference to an existing snapshot if the request to build a new snapshot
     /// matches the version of an existing snapshot.
     ///
-    /// Reports metrics: [`MetricEvent::SnapshotCompleted`] or [`MetricEvent::SnapshotFailed`].
+    /// Reports metrics: [`MetricEvent::SnapshotBuildSuccess`] or
+    /// [`MetricEvent::SnapshotBuildFailure`].
     ///
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     ///
-    /// [`MetricEvent::SnapshotCompleted`]: crate::metrics::MetricEvent::SnapshotCompleted
-    /// [`MetricEvent::SnapshotFailed`]: crate::metrics::MetricEvent::SnapshotFailed
-    // Span name must match `SNAP_BUILD_SPAN` in `metrics::reporter`.
+    /// [`MetricEvent::SnapshotBuildSuccess`]: crate::metrics::MetricEvent::SnapshotBuildSuccess
+    /// [`MetricEvent::SnapshotBuildFailure`]: crate::metrics::MetricEvent::SnapshotBuildFailure
+    // `is_catalog_managed` is the requested load mode, not the confirmed protocol
+    // (see `IS_CATALOG_MANAGED_FIELD`).
     #[instrument(
-        name = "snap.build",
+        name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = tracing::field::Empty),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or("")),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        // Fold the context into the message string rather than passing structured fields: this
+        // `info!` fires inside the `snap.build` metrics span, where any field the
+        // `SnapshotBuildSuccess` event doesn't recognize would trip a spurious "Invalid field"
+        // warning from the metrics layer.
         info!(
-            target = self.target_version_str(),
-            from_version = ?self.existing_snapshot.as_ref().map(|s| s.version()),
-            log_tail_len = self.log_tail.len(),
-            max_catalog_version = ?self.max_catalog_version,
-            "building snapshot"
+            "building snapshot: target={}, from_version={:?}, log_tail_len={}, \
+             max_catalog_version={:?}",
+            self.target_version_str(),
+            self.existing_snapshot.as_ref().map(|s| s.version()),
+            self.log_tail.len(),
+            self.max_catalog_version
         );
 
         // Destructure self so fields can be moved independently
@@ -140,11 +238,18 @@ impl SnapshotBuilder {
             version,
             log_tail,
             max_catalog_version,
+            incremental_replay,
+            operation_id,
+            correlation_id,
         } = self;
 
+        let metric_context = SnapshotLoadMetricContext {
+            operation_id,
+            is_catalog_managed: max_catalog_version.is_some(),
+            correlation_id,
+        };
+
         let log_tail: Vec<_> = log_tail.into_iter().map(Into::into).collect();
-        let operation_id = MetricId::new();
-        tracing::Span::current().record("operation_id", tracing::field::display(operation_id));
 
         // Pre-build validations for catalog-managed tables
         Self::validate_catalog_managed_build_inputs(version, max_catalog_version, &log_tail)?;
@@ -161,14 +266,14 @@ impl SnapshotBuilder {
                     table_url.join("_delta_log/")?,
                     log_tail,
                     effective_version,
-                    operation_id,
+                    metric_context.clone(),
                 )?;
                 Snapshot::try_new_from_log_segment(
                     table_url,
                     log_segment,
                     engine,
-                    operation_id,
-                    None,
+                    metric_context,
+                    incremental_replay,
                 )
                 .map(Into::into)
             })
@@ -185,7 +290,8 @@ impl SnapshotBuilder {
                         log_tail,
                         engine,
                         effective_version,
-                        operation_id,
+                        metric_context,
+                        incremental_replay,
                     )
                 })
         };
@@ -200,6 +306,10 @@ impl SnapshotBuilder {
         }
         result
     }
+
+    // ============================================================================
+    // Helpers
+    // ============================================================================
 
     // ===== Catalog-managed Validations =====
 
@@ -329,25 +439,20 @@ mod tests {
     use itertools::Itertools;
     use serde_json::json;
     use test_utils::{actions_to_string, add_commit, TestAction};
-    use tracing_subscriber::util::SubscriberInitExt as _;
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
-    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::engine::sync::SyncEngine;
+    use crate::metrics::MetricEvent;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use crate::utils::test_utils::CapturingReporter;
+    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::utils::FoldWithOption as _;
 
-    fn setup_test() -> (
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<DynObjectStore>,
-        String,
-    ) {
+    fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
         let table_root = String::from("memory:///");
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
+        let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
         (engine, store, table_root)
     }
 
@@ -406,7 +511,7 @@ mod tests {
                 "provider": "parquet",
                 "options": {}
             },
-            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"interval_col\",\"type\":\"interval second\",\"nullable\":true,\"metadata\":{}}]}",
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"interval_col\",\"type\":\"interval year to second\",\"nullable\":true,\"metadata\":{}}]}",
             "partitionColumns": [],
             "configuration": {},
             "createdTime": 1587968585495i64
@@ -437,7 +542,7 @@ mod tests {
         let err = result.unwrap_err();
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("Unsupported Delta table type: 'interval second'"),
+            err_msg.contains("Unsupported Delta table type: 'interval year to second'"),
             "Expected clear error message about unsupported type, got: {err_msg}"
         );
 
@@ -446,9 +551,7 @@ mod tests {
 
     fn measuring_reporter() -> (Arc<CapturingReporter>, tracing::subscriber::DefaultGuard) {
         let reporter = Arc::new(CapturingReporter::default());
-        let guard = tracing_subscriber::registry()
-            .with_metrics_reporter_layer(reporter.clone())
-            .set_default();
+        let guard = install_thread_local_metrics_reporter(reporter.clone());
         (reporter, guard)
     }
 
@@ -461,7 +564,7 @@ mod tests {
         let metadata = json!({
             "id": "test-table-id",
             "format": {"provider": "parquet", "options": {}},
-            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"interval second","nullable":true,"metadata":{}}]}"#,
+            "schemaString": r#"{"type":"struct","fields":[{"name":"id","type":"interval year to second","nullable":true,"metadata":{}}]}"#,
             "partitionColumns": [],
             "configuration": {},
             "createdTime": 1587968585495i64
@@ -486,14 +589,68 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
-            "expected SnapshotFailed event on build failure"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "expected SnapshotBuildFailure event on build failure"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
-            "should not emit SnapshotCompleted on failure"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            "should not emit SnapshotBuildSuccess on failure"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn log_segment_load_failure_emits_metric_on_empty_log(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, _store, table_root) = setup_test();
+        let (reporter, _guard) = measuring_reporter();
+
+        assert!(SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .is_err());
+
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .any(|e| matches!(e, MetricEvent::LogSegmentLoadFailure(_))),
+            "expected LogSegmentLoadFailure when the log has no commits"
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn protocol_metadata_load_failure_emits_metric_when_actions_absent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        // A commit with no protocol/metadata: the segment lists fine, then the read fails.
+        add_commit(
+            &table_root,
+            store.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Add("part-00000-test.parquet".into())]),
+        )
+        .await?;
+        let (reporter, _guard) = measuring_reporter();
+
+        assert!(SnapshotBuilder::new_for(table_root)
+            .build(engine.as_ref())
+            .is_err());
+
+        let events = reporter.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadFailure(_))),
+            "expected ProtocolMetadataLoadFailure when protocol/metadata are absent"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::ProtocolMetadataLoadSuccess(_))),
+            "must not emit ProtocolMetadataLoadSuccess when the load fails"
         );
         Ok(())
     }
@@ -516,26 +673,15 @@ mod tests {
         assert_eq!(snap_v1.version(), 1);
 
         let events = reporter.events();
-        let (version, total_duration) = events
+        let (version, duration) = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::SnapshotCompleted {
-                    version,
-                    total_duration,
-                    ..
-                } = e
-                {
-                    Some((*version, *total_duration))
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::SnapshotBuildSuccess(s) => Some((s.version, s.duration)),
+                _ => None,
             })
-            .expect("expected SnapshotCompleted event");
+            .expect("expected SnapshotBuildSuccess event");
         assert_eq!(version, 1, "version should match the updated snapshot");
-        assert!(
-            total_duration > Duration::ZERO,
-            "total_duration should be non-zero"
-        );
+        assert!(duration > Duration::ZERO, "duration should be non-zero");
         Ok(())
     }
 
@@ -563,20 +709,20 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotFailed { .. })),
-            "expected SnapshotFailed when version update goes backwards"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "expected SnapshotBuildFailure when version update goes backwards"
         );
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, MetricEvent::SnapshotCompleted { .. })),
-            "should not emit SnapshotCompleted when version update fails"
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            "should not emit SnapshotBuildSuccess when version update fails"
         );
         Ok(())
     }
 
     #[test_log::test(tokio::test)]
-    async fn snapshot_completed_total_duration_exceeds_log_segment_load_duration(
+    async fn snapshot_completed_duration_exceeds_log_segment_load_duration(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         create_table(&store, &table_root).await?;
@@ -585,34 +731,76 @@ mod tests {
         let _snap = SnapshotBuilder::new_for(table_root).build(engine.as_ref())?;
 
         let events = reporter.events();
-        let total_duration = events
+        let snap_duration = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::SnapshotCompleted { total_duration, .. } = e {
-                    Some(*total_duration)
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::SnapshotBuildSuccess(s) => Some(s.duration),
+                _ => None,
             })
-            .expect("expected SnapshotCompleted event");
+            .expect("expected SnapshotBuildSuccess event");
         let segment_duration = events
             .iter()
-            .find_map(|e| {
-                if let MetricEvent::LogSegmentLoaded { duration, .. } = e {
-                    Some(*duration)
-                } else {
-                    None
-                }
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoadSuccess(s) => Some(s.duration),
+                _ => None,
             })
-            .expect("expected LogSegmentLoaded event");
+            .expect("expected LogSegmentLoadSuccess event");
 
         assert!(
-            total_duration > Duration::ZERO,
-            "total_duration should be non-zero"
+            snap_duration > Duration::ZERO,
+            "duration should be non-zero"
         );
         assert!(
-            total_duration >= segment_duration,
-            "SnapshotCompleted.total_duration ({total_duration:?}) should be >= LogSegmentLoaded.duration ({segment_duration:?})"
+            snap_duration >= segment_duration,
+            "SnapshotBuildSuccess.duration ({snap_duration:?}) should be >= LogSegmentLoadSuccess.duration ({segment_duration:?})"
+        );
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::with_id(Some("req-abc-123"))]
+    #[case::without_id(None)]
+    #[test_log::test(tokio::test)]
+    async fn snapshot_build_and_child_events_carry_correlation_id(
+        #[case] correlation_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, store, table_root) = setup_test();
+        create_table(&store, &table_root).await?;
+
+        let (reporter, _guard) = measuring_reporter();
+        let _ = SnapshotBuilder::new_for(table_root)
+            .fold_with(correlation_id, SnapshotBuilder::with_correlation_id)
+            .build(engine.as_ref())?;
+
+        // The build event and its snapshot-load child events must all carry the id, since they
+        // ride the same SnapshotLoadMetricContext.
+        let events = reporter.events();
+        let id_of = |pick: fn(&MetricEvent) -> Option<&Option<Arc<str>>>| {
+            events
+                .iter()
+                .find_map(pick)
+                .expect("expected event")
+                .as_deref()
+                .map(str::to_string)
+        };
+        let build_id = id_of(|e| match e {
+            MetricEvent::SnapshotBuildSuccess(s) => Some(&s.correlation_id),
+            _ => None,
+        });
+        let segment_id = id_of(|e| match e {
+            MetricEvent::LogSegmentLoadSuccess(s) => Some(&s.correlation_id),
+            _ => None,
+        });
+        let metadata_id = id_of(|e| match e {
+            MetricEvent::ProtocolMetadataLoadSuccess(s) => Some(&s.correlation_id),
+            _ => None,
+        });
+        let expected = correlation_id.map(str::to_string);
+        assert_eq!(build_id, expected);
+        assert_eq!(segment_id, expected, "log-segment child must carry the id");
+        assert_eq!(
+            metadata_id, expected,
+            "protocol/metadata child must carry the id"
         );
         Ok(())
     }
@@ -641,11 +829,7 @@ mod tests {
 
         /// Creates an in-memory engine, store, and table root with an initial catalog-managed
         /// commit at version 0 (protocol + metadata).
-        async fn setup_catalog_managed_test() -> (
-            Arc<DefaultEngine<TokioBackgroundExecutor>>,
-            Arc<DynObjectStore>,
-            String,
-        ) {
+        async fn setup_catalog_managed_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
             let (engine, store, table_root) = setup_test();
             let actions = vec![TestAction::Metadata];
             add_commit(

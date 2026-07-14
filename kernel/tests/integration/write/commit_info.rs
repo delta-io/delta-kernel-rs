@@ -4,15 +4,13 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, RecordBatch, StringArray};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{set_json_value, setup_test_tables};
+use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
 
 use crate::common::write_utils::{
     get_simple_int_schema, validate_timestamp, validate_txn_id, ZERO_UUID,
@@ -30,10 +28,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // create a transaction
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let committer = Box::new(FileSystemCommitter::new());
-        let txn = snapshot
-            .transaction(committer, &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         // commit!
@@ -78,9 +73,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine");
 
         let _ = txn.commit(&engine)?;
@@ -155,9 +148,7 @@ async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::e
             StructField::nullable("operation", DataType::STRING),
         ]));
 
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_operation("WRITE".to_string())
             .with_commit_info(Box::new(ArrowEngineData::new(batch)), engine_schema);
 

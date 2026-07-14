@@ -8,10 +8,14 @@
 mod common;
 
 mod create_table;
+mod cross_product;
+mod data_skipping;
 mod features;
 mod golden_tables;
 mod hdfs;
 mod log;
 mod metrics;
+mod parsed_partition_values;
+mod parsed_stats;
 mod read;
 mod write;

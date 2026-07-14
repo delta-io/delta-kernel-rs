@@ -20,11 +20,11 @@
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
 use tempfile::TempDir;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::load_test_data;
 use url::Url;
 
@@ -38,7 +38,7 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let table_path = tempdir.path().join(table);
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
     // TODO: use multi-threaded executor
-    use delta_kernel::engine::default::storage::store_from_url;
+    use test_utils::delta_kernel_default_engine::storage::store_from_url;
     let store = store_from_url(&url).expect("Failed to create store");
     let engine = DefaultEngineBuilder::new(store).build();
 
@@ -66,22 +66,32 @@ fn scan_metadata_benchmark(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("scan_metadata");
     group.sample_size(SCAN_METADATA_BENCH_SAMPLE_SIZE);
-    group.bench_function("scan_metadata", |b| {
-        b.iter(|| {
-            let scan = snapshot
-                .clone() // arc
-                .scan_builder()
-                .build()
-                .expect("Failed to build scan");
-            let metadata_iter = scan
-                .scan_metadata(engine.as_ref())
-                .expect("Failed to get scan metadata");
-            // kernel scans are lazy, we must consume iterator to do the work we want to test
-            for result in metadata_iter {
-                result.expect("Failed to process scan metadata");
-            }
-        })
-    });
+    // Benchmark both the default path (kernel builds a per-file transform expression for this
+    // partitioned table) and the `without_row_transforms` opt-out (which skips that build and the
+    // per-row partition-value parse that feeds it).
+    for without_row_transforms in [false, true] {
+        let id = if without_row_transforms {
+            "scan_metadata_without_row_transforms"
+        } else {
+            "scan_metadata"
+        };
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let mut builder = snapshot.clone().scan_builder();
+                if without_row_transforms {
+                    builder = builder.without_row_transforms();
+                }
+                let scan = builder.build().expect("Failed to build scan");
+                let metadata_iter = scan
+                    .scan_metadata(engine.as_ref())
+                    .expect("Failed to get scan metadata");
+                // kernel scans are lazy, we must consume iterator to do the work we want to test
+                for result in metadata_iter {
+                    result.expect("Failed to process scan metadata");
+                }
+            })
+        });
+    }
     group.finish();
 }
 

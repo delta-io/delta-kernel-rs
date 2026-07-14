@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::history_manager::{first_version_after, latest_version_as_of, HistoryCommitType};
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::Snapshot;
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
     actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
     create_log_path, delta_path_for_version, TestAction,
@@ -160,6 +161,67 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
             .location,
         table_url.join(delta_path_for_version(0, "json").as_ref())?
     );
+
+    Ok(())
+}
+
+/// Timestamp-to-version resolution must see catalog-managed staged commits (issue #2443). Staged
+/// commits carry in-commit timestamps, so resolution feeds them in as the log_tail rather than
+/// erroring on snapshots that contain staged commits.
+#[tokio::test]
+async fn timestamp_resolution_with_staged_commits() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    let ict_v0: i64 = 1587968586154;
+    let ict_v1: i64 = ict_v0 + 100;
+    let ict_v2: i64 = ict_v0 + 200;
+    let staged_ict_body = |ict: i64| {
+        format!(
+            r#"{{"commitInfo":{{"timestamp":{ict},"inCommitTimestamp":{ict},"operation":"WRITE","isBlindAppend":true}}}}"#
+        )
+    };
+
+    // publish v0; v1, v2 are ratified staged commits. Also include the corresponding ICT to each
+    // version.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_catalog_managed(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let path1 = add_staged_commit(table_root, storage.as_ref(), 1, staged_ict_body(ict_v1)).await?;
+    let path2 = add_staged_commit(table_root, storage.as_ref(), 2, staged_ict_body(ict_v2)).await?;
+
+    let log_tail = vec![
+        create_log_path(&table_url, path1),
+        create_log_path(&table_url, path2),
+    ];
+    let snapshot = Snapshot::builder_for(table_root)
+        .with_log_tail(log_tail)
+        .with_max_catalog_version(2)
+        .build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), 2);
+
+    // latest_version_as_of rounds down; ICT between v1 and v2 rounds to v1.
+    let e = engine.as_ref();
+    let ct = HistoryCommitType::Published;
+    assert_eq!(latest_version_as_of(&snapshot, e, ict_v1, ct)?.version, 1);
+    assert_eq!(
+        latest_version_as_of(&snapshot, e, ict_v1 + 50, ct)?.version,
+        1
+    );
+    assert_eq!(latest_version_as_of(&snapshot, e, ict_v2, ct)?.version, 2);
+    // timestamps before v0 is out of range
+    assert!(latest_version_as_of(&snapshot, e, ict_v0 - 1, ct).is_err());
+
+    // first_version_after rounds up; ICT between v0 and v1 rounds to v1.
+    assert_eq!(
+        first_version_after(&snapshot, e, ict_v0 + 1, ct)?.version,
+        1
+    );
+    assert_eq!(first_version_after(&snapshot, e, ict_v2, ct)?.version, 2);
 
     Ok(())
 }

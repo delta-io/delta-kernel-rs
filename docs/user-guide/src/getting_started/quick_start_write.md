@@ -15,7 +15,8 @@ cd delta_write_example
 Writing data requires `tokio` because the default engine's Parquet writer is async:
 
 ```sh
-cargo add delta_kernel -F default-engine-rustls -F arrow -F internal-api
+cargo add delta_kernel -F internal-api
+cargo add delta_kernel_default_engine -F rustls
 cargo add tokio -F rt-multi-thread -F macros
 ```
 
@@ -27,6 +28,7 @@ Filename: src/main.rs
 
 ```rust,no_run
 # extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
 # extern crate tokio;
 use std::sync::Arc;
 
@@ -35,8 +37,8 @@ use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel_default_engine::storage::store_from_url;
+use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
