@@ -136,10 +136,9 @@ pub struct EngineExpressionVisitor {
     ),
     /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
     ///
-    /// The `type_tag` identifies the data type using the `NullTypeTag` encoding. For decimal
-    /// nulls (`type_tag == 12`), `precision` and `scale` carry the decimal type parameters;
-    /// for all other types, they are zero. Non-primitive types (struct, array, map, variant)
-    /// use `type_tag == 255`.
+    /// The `type_tag` identifies reconstructible primitive types with tags 0-14. Decimal nulls
+    /// use tag 12 with `precision` and `scale`; interval year-month and day-time nulls use tags
+    /// 13 and 14. Non-primitive types and `void` use the sentinel tag 255.
     pub visit_literal_null: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -801,126 +800,37 @@ mod tests {
         });
     }
 
-    macro_rules! ignored_literal_fn {
-        ($fn_name:ident, $value_type:ty) => {
+    macro_rules! ignore_fn {
+        ($fn_name:ident $(, $arg_type:ty)*) => {
             extern "C" fn $fn_name(
                 _data: *mut c_void,
                 _sibling_list_id: usize,
-                _value: $value_type,
+                $(_: $arg_type),*
             ) {
             }
         };
     }
 
-    ignored_literal_fn!(ignore_i32, i32);
-    ignored_literal_fn!(ignore_i64, i64);
-    ignored_literal_fn!(ignore_i16, i16);
-    ignored_literal_fn!(ignore_i8, i8);
-    ignored_literal_fn!(ignore_f32, f32);
-    ignored_literal_fn!(ignore_f64, f64);
-    ignored_literal_fn!(ignore_bool, bool);
-    ignored_literal_fn!(ignore_string_slice, KernelStringSlice);
-
-    extern "C" fn ignore_binary(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _buffer: *const u8,
-        _len: usize,
-    ) {
-    }
-
-    extern "C" fn ignore_decimal(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _value_ms: i64,
-        _value_ls: u64,
-        _precision: u8,
-        _scale: u8,
-    ) {
-    }
-
-    extern "C" fn ignore_struct_literal(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _child_field_list_id: usize,
-        _child_value_list_id: usize,
-    ) {
-    }
-
-    extern "C" fn ignore_child_list(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _child_list_id: usize,
-    ) {
-    }
-
-    extern "C" fn ignore_map_literal(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _key_list_id: usize,
-        _value_list_id: usize,
-    ) {
-    }
-
-    extern "C" fn ignore_null(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _type_tag: u8,
-        _precision: u8,
-        _scale: u8,
-    ) {
-    }
-
-    extern "C" fn ignore_parse_json(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _child_list_id: usize,
-        _output_schema: Handle<SharedSchema>,
-    ) {
-    }
-
-    extern "C" fn ignore_column(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _name: KernelStringSlice,
-    ) {
-    }
-
-    extern "C" fn ignore_struct_patch(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _input_path_list_id: usize,
-        _prepended_field_list_id: usize,
-        _field_patch_list_id: usize,
-        _appended_field_list_id: usize,
-    ) {
-    }
-
-    extern "C" fn ignore_field_patch(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _field_name: KernelStringSlice,
-        _insertion_expr_list_id: usize,
-        _keep_input: bool,
-        _optional: bool,
-    ) {
-    }
-
-    extern "C" fn ignore_opaque_expr(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _op: Handle<SharedOpaqueExpressionOp>,
-        _child_list_id: usize,
-    ) {
-    }
-
-    extern "C" fn ignore_opaque_pred(
-        _data: *mut c_void,
-        _sibling_list_id: usize,
-        _op: Handle<SharedOpaquePredicateOp>,
-        _child_list_id: usize,
-    ) {
-    }
+    ignore_fn!(ignore_i32, i32);
+    ignore_fn!(ignore_i64, i64);
+    ignore_fn!(ignore_i16, i16);
+    ignore_fn!(ignore_i8, i8);
+    ignore_fn!(ignore_f32, f32);
+    ignore_fn!(ignore_f64, f64);
+    ignore_fn!(ignore_bool, bool);
+    ignore_fn!(ignore_string_slice, KernelStringSlice);
+    ignore_fn!(ignore_binary, *const u8, usize);
+    ignore_fn!(ignore_decimal, i64, u64, u8, u8);
+    ignore_fn!(ignore_struct_literal, usize, usize);
+    ignore_fn!(ignore_child_list, usize);
+    ignore_fn!(ignore_map_literal, usize, usize);
+    ignore_fn!(ignore_null, u8, u8, u8);
+    ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
+    ignore_fn!(ignore_column, KernelStringSlice);
+    ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
+    ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
+    ignore_fn!(ignore_opaque_expr, Handle<SharedOpaqueExpressionOp>, usize);
+    ignore_fn!(ignore_opaque_pred, Handle<SharedOpaquePredicateOp>, usize);
 
     fn test_visitor(builder: &mut TestExpressionBuilder) -> EngineExpressionVisitor {
         EngineExpressionVisitor {
@@ -981,6 +891,30 @@ mod tests {
     #[case(
         Expression::literal(Scalar::IntervalDayTime(987_654)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(-13)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: -13 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(i32::MIN)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MIN }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(i32::MAX)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MAX }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(-86_400_000_000)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: -86_400_000_000 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(i64::MIN)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MIN }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(i64::MAX)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
     )]
     fn visit_expression_uses_interval_literal_callbacks(
         #[case] expression: Expression,

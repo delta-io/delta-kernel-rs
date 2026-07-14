@@ -363,9 +363,7 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, Expression::literal(Scalar::TimestampNtz(value)))
 }
 
-/// Visit an interval year-month literal expression.
-///
-/// The value is a signed count of months.
+/// Visit an interval year-month literal (signed month count).
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
@@ -374,9 +372,7 @@ pub extern "C" fn visit_expression_literal_interval_year_month(
     wrap_expression(state, Expression::literal(Scalar::IntervalYearMonth(value)))
 }
 
-/// Visit an interval day-time literal expression.
-///
-/// The value is a signed count of microseconds.
+/// Visit an interval day-time literal (signed microsecond count).
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_interval_day_time(
     state: &mut KernelExpressionVisitorState,
@@ -433,10 +429,10 @@ fn visit_expression_literal_decimal_impl(
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
-/// precision/scale parameters. Non-primitive types (struct, array, map, variant) and void use
-/// the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be reconstructed from
-/// a type tag alone.
+/// Most primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
+/// precision/scale parameters. Non-primitive types (struct, array, map, variant) and the `void`
+/// primitive use the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be
+/// reconstructed from a type tag alone.
 ///
 /// NOTE: These values are part of the FFI contract. Changing existing discriminants is a breaking
 /// change.
@@ -1071,6 +1067,12 @@ mod tests {
     #[rstest]
     #[case(Scalar::IntervalYearMonth(17))]
     #[case(Scalar::IntervalDayTime(1_234_567))]
+    #[case(Scalar::IntervalYearMonth(-13))]
+    #[case(Scalar::IntervalYearMonth(i32::MIN))]
+    #[case(Scalar::IntervalYearMonth(i32::MAX))]
+    #[case(Scalar::IntervalDayTime(-86_400_000_000))]
+    #[case(Scalar::IntervalDayTime(i64::MIN))]
+    #[case(Scalar::IntervalDayTime(i64::MAX))]
     fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
         let mut state = KernelExpressionVisitorState::default();
         let id = match expected {
