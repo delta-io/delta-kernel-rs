@@ -43,7 +43,10 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
     executor.drop_handle();
 }
 
-/// Construct a [`PlanBasedEngine`] from the given [`SharedPlanExecutor`].
+/// Construct a [`PlanBasedEngine`] from the given [`SharedPlanExecutor`], with no fallback engine.
+///
+/// Operations not yet implemented on the plan-execution path return an unsupported error. Use
+/// [`get_plan_based_engine_with_fallback`] to delegate those operations to another engine instead.
 ///
 /// This method consumes the [`SharedPlanExecutor`] handle, which should be freed when the engine
 /// is dropped via `free_engine` (caller responsibility).
@@ -63,35 +66,82 @@ pub unsafe extern "C" fn get_plan_based_engine(
     engine_to_handle(engine, allocate_error)
 }
 
+/// Construct a [`PlanBasedEngine`] backed by `plan_executor`, delegating operations not yet
+/// implemented on the plan-execution path to `fallback_engine`.
+///
+/// This method consumes BOTH the [`SharedPlanExecutor`] and [`SharedExternEngine`] handles.
+/// Ownership of the fallback engine transfers into the returned engine: dropping the returned
+/// engine (via `free_engine`) also drops the embedded fallback engine.
+///
+/// # Safety
+///
+/// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`], a
+/// valid [`SharedExternEngine`] handle, and a valid [`AllocateErrorFn`].
+#[no_mangle]
+pub unsafe extern "C" fn get_plan_based_engine_with_fallback(
+    plan_executor: Handle<SharedPlanExecutor>,
+    fallback_engine: Handle<SharedExternEngine>,
+    allocate_error: AllocateErrorFn,
+) -> Handle<SharedExternEngine> {
+    let executor: Arc<dyn PlanExecutor> = unsafe { plan_executor.into_inner() };
+    let fallback: Arc<dyn Engine> = unsafe { fallback_engine.into_inner() }.engine();
+    let engine: Arc<dyn Engine> = Arc::new(PlanBasedEngine::with_fallback(fallback, executor));
+    engine_to_handle(engine, allocate_error)
+}
+
 #[cfg(test)]
 mod tests {
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
+
     use super::*;
     use crate::error::EngineExecResult;
     use crate::ffi_test_utils::allocate_err;
     use crate::free_engine;
     use crate::plans::result::CPlanResult;
 
-    #[test]
-    fn get_plan_based_engine_returns_plan_based_engine() {
-        extern "C" fn unreachable_callback(
-            _context: NullableCvoid,
-            _plan_proto: crate::KernelBytesSlice,
-            _out: *mut EngineExecResult<CPlanResult>,
-        ) {
-            unreachable!("callback should not run -- this test only constructs the engine");
-        }
+    extern "C" fn unreachable_callback(
+        _context: NullableCvoid,
+        _plan_proto: crate::KernelBytesSlice,
+        _out: *mut EngineExecResult<CPlanResult>,
+    ) {
+        unreachable!("callback should not run -- this test only constructs the engine");
+    }
 
-        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
-        let engine_handle = unsafe { get_plan_based_engine(executor, allocate_err) };
-
-        // Confirm we got back a real `PlanBasedEngine`, not e.g. an accidental DefaultEngine.
+    /// Assert that the given engine handle wraps a `PlanBasedEngine` (not e.g. a DefaultEngine).
+    fn assert_is_plan_based_engine(engine_handle: &Handle<SharedExternEngine>) {
         let extern_engine = unsafe { engine_handle.as_ref() };
         let engine = extern_engine.engine();
         assert!(
             engine.any_ref().downcast_ref::<PlanBasedEngine>().is_some(),
             "engine handle must wrap a PlanBasedEngine",
         );
+    }
 
+    #[test]
+    fn get_plan_based_engine_returns_plan_based_engine() {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+        let engine_handle = unsafe { get_plan_based_engine(executor, allocate_err) };
+
+        assert_is_plan_based_engine(&engine_handle);
+
+        unsafe { free_engine(engine_handle) };
+    }
+
+    #[test]
+    fn get_plan_based_engine_with_fallback_returns_plan_based_engine() {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+
+        // Build a fallback engine handle whose ownership will transfer into the plan-based engine.
+        let fallback = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        let fallback_handle = engine_to_handle(Arc::new(fallback), allocate_err);
+
+        let engine_handle =
+            unsafe { get_plan_based_engine_with_fallback(executor, fallback_handle, allocate_err) };
+
+        assert_is_plan_based_engine(&engine_handle);
+
+        // Freeing the plan-based engine also frees the embedded fallback
         unsafe { free_engine(engine_handle) };
     }
 }
