@@ -601,21 +601,23 @@ async fn timestamp_partition_pruning_in_session_timezone(
     );
 }
 
-/// A native-checkpoint `partitionValues_parsed` column is read as the writer-frozen instant, NOT
-/// re-resolved in the reader's session zone. Kernel's checkpoint writer resolves an offset-less
-/// TIMESTAMP as UTC, so the frozen leaf is the UTC instant; a later scan with a non-UTC session
-/// zone reads that leaf unchanged. This locks the deliberate divergence documented on
-/// `with_session_timezone`: the passthrough is not reparsed, so a session zone does not shift it.
+/// A kernel checkpoint freezes offset-less TIMESTAMP partition values at UTC (the writer has no
+/// session zone). That frozen instant discards the writer's zone, so a scan supplying a session
+/// zone must NOT trust the native `partitionValues_parsed` column: it reparses the raw
+/// `partitionValues` map in the session zone instead, matching what the same table yields from a
+/// JSON commit. Here the frozen leaf would read 16:00Z, but under America/New_York (UTC-5) the
+/// reparse yields 21:00Z.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_checkpoint_partition_values_ignore_session_timezone() {
+async fn native_checkpoint_timestamp_partition_reparses_in_session_timezone() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let table_path = temp_dir.path().join("native-checkpoint-tz-passthrough");
+    let table_path = temp_dir.path().join("native-checkpoint-tz-reparse");
     let url = write_foreign_partition_table(
         &table_path,
         ts_partition_fields(),
         &["p_ts"],
         // `writeStatsAsStruct=true` makes the kernel checkpoint write a native
-        // `partitionValues_parsed` column, so the read exercises the passthrough branch.
+        // `partitionValues_parsed` column, so the read exercises the reparse-vs-passthrough
+        // branch.
         write_stats_as_struct_config(),
         &[add_action(
             "p_ts=2024-01-15 16%3A00%3A00/f.parquet",
@@ -630,13 +632,13 @@ async fn native_checkpoint_partition_values_ignore_session_timezone() {
         .unwrap();
     snapshot.checkpoint(engine.as_ref(), None).unwrap();
 
-    // The checkpoint froze the UTC instant (16:00 resolved as UTC). Reading under a UTC-5 session
-    // zone must still return that UTC instant, not 21:00Z, because the passthrough is not reparsed.
-    let utc_micros = 1_705_334_400_000_000_i64; // 2024-01-15T16:00:00Z
+    // 16:00 under America/New_York (UTC-5) is 21:00Z. The frozen UTC leaf (16:00Z) must be bypassed
+    // and the raw map reparsed in the session zone.
+    let session_micros = 1_705_352_400_000_000_i64; // 2024-01-15T21:00:00Z
     let by_file = scan_p_ts_by_file(engine.as_ref(), &url, "America/New_York");
     assert_eq!(
         by_file.get("f.parquet"),
-        Some(&utc_micros),
-        "native-checkpoint passthrough must read the writer-frozen UTC instant, ignoring the session zone"
+        Some(&session_micros),
+        "native-checkpoint TIMESTAMP partition must reparse in the session zone, not read the frozen UTC leaf"
     );
 }

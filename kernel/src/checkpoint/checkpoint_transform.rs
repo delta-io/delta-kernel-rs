@@ -208,10 +208,11 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// from a commit.
 ///
 /// The fallback resolves offset-less `TIMESTAMP` partition values as UTC (the checkpoint writer has
-/// no session zone), so a kernel-written checkpoint freezes the UTC instant. A subsequent scan with
-/// [`PartitionValuesOptions::with_session_timezone`] reads that frozen column directly and does not
-/// re-resolve it, which is the documented divergence on that option. Aligning the checkpoint write
-/// path with a session zone is a follow-up.
+/// no session zone), so a kernel-written checkpoint freezes the UTC instant. Because that frozen
+/// instant discards the writer's zone, a scan with
+/// [`PartitionValuesOptions::with_session_timezone`] on a `TIMESTAMP`-partitioned table bypasses
+/// the frozen column and reparses from the raw `partitionValues` map in the session zone. Aligning
+/// the checkpoint write path with a session zone is a follow-up.
 ///
 /// [`PartitionValuesOptions::with_session_timezone`]: crate::scan::PartitionValuesOptions::with_session_timezone
 ///

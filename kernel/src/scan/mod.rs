@@ -225,28 +225,32 @@ impl PartitionValuesOptions {
     /// fold of a DST transition) fails the scan rather than resolving to a chosen offset. Fixed
     /// offsets have no DST and are never affected.
     ///
-    /// # Scope and known limitation
+    /// # Scope
     ///
-    /// The zone applies only where `partitionValues_parsed` is reconstructed from the string map:
-    /// the typed output struct requested via [`Self::with_struct`] and the partition-pruning
-    /// column derived from it. Two paths are deliberately NOT affected and continue to resolve
-    /// offset-less `TIMESTAMP` values as UTC:
+    /// The zone governs `partitionValues_parsed` (the typed output struct requested via
+    /// [`Self::with_struct`] and the partition-pruning column derived from it), whether that struct
+    /// is reconstructed from a JSON commit's string map or from a checkpoint. On a checkpoint with
+    /// a native `partitionValues_parsed` column, the frozen leaf bakes the writer's zone
+    /// (kernel resolves offset-less values as UTC on write) and cannot be corrected in place,
+    /// so when the table has a `TIMESTAMP` partition column kernel bypasses the frozen column
+    /// and reparses from the raw `partitionValues` map in `tz`. Tables without a `TIMESTAMP`
+    /// partition column keep the native fast path, since every other partition type resolves
+    /// identically regardless of zone.
     ///
-    /// - The materialized logical partition column surfaced in scan output (built from the string
-    ///   map via [`PrimitiveType::parse_scalar`]). Kernel's read path materializes this value in
-    ///   core kernel, which is arrow-free and has no timezone database, so it cannot apply `tz`.
-    /// - A checkpoint's native `partitionValues_parsed` column, which is read as the writer-frozen
-    ///   instant. See the internal transform builder for the passthrough behavior.
+    /// # Known limitation
     ///
-    /// A lost timezone cannot be recovered by conservative widening the way truncated stat bounds
-    /// can (there is no safe direction: the true instant could lie at any offset), so kernel
-    /// leaves the UTC paths as-is rather than approximating. As a result, under a non-UTC `tz` the
-    /// pruning column and the materialized partition column can resolve the same offset-less value
-    /// to different instants. An engine that both pushes a partition predicate down to kernel
-    /// (pruned in `tz`) and re-applies a residual filter against the materialized column (UTC) can
-    /// keep a file yet drop all its rows, or vice versa. Engines consuming `partitionValues_parsed`
-    /// directly are unaffected. Aligning the materialized column and the checkpoint write path with
-    /// `tz` is tracked as a follow-up.
+    /// The materialized logical partition column surfaced in scan output is built in core kernel
+    /// (arrow-free, no timezone database, via [`PrimitiveType::parse_scalar`]) and always resolves
+    /// offset-less `TIMESTAMP` values as UTC, ignoring `tz`. A lost timezone cannot be recovered by
+    /// conservative widening the way truncated stat bounds can (there is no safe direction: the
+    /// true instant could lie at any offset), so kernel leaves this path as-is rather than
+    /// approximating. As a result, under a non-UTC `tz` the pruning column (in `tz`) and the
+    /// materialized partition column (UTC) can resolve the same offset-less value to different
+    /// instants. An engine that both pushes a partition predicate down to kernel and re-applies
+    /// a residual filter against the materialized column can keep a file yet drop all its rows,
+    /// or vice versa. Engines consuming `partitionValues_parsed` directly are unaffected.
+    /// Aligning the materialized column and the checkpoint write path with `tz` is tracked as a
+    /// follow-up.
     ///
     /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
     pub fn with_session_timezone(mut self, tz: impl Into<String>) -> Self {
