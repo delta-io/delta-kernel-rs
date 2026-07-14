@@ -38,7 +38,9 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
 mod incremental;
+mod snapshot_crc;
 pub use builder::{IncrementalReplay, SnapshotBuilder};
+use snapshot_crc::SnapshotCrc;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -71,10 +73,10 @@ pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
-    /// CRC at this snapshot's version, eagerly resolved at construction time. `Some(crc)`
-    /// means `crc.version == self.version()` and the CRC can be queried at zero I/O. `None`
-    /// means no CRC was loadable (no CRC on disk at this version, or the read failed).
-    crc: Option<Arc<Crc>>,
+    /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
+    /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
+    /// zero-I/O) or [`Snapshot::base_crc`] (possibly stale). See [`SnapshotCrc`].
+    crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
 }
@@ -153,9 +155,6 @@ impl Snapshot {
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
     ///
-    /// A `Some(crc)` must be at the table configuration's version; otherwise this returns an
-    /// internal error.
-    ///
     /// `built_as_latest` records whether the build confirmed this is the latest version
     /// (best-effort). See [`Snapshot::built_as_latest`].
     pub(crate) fn new_with_crc(
@@ -164,16 +163,12 @@ impl Snapshot {
         crc: Option<Arc<Crc>>,
         built_as_latest: bool,
     ) -> DeltaResult<Self> {
-        if let Some(crc) = crc.as_ref() {
-            require!(
-                crc.version == table_configuration.version(),
-                Error::internal_error(format!(
-                    "CRC version {} does not match snapshot version {}",
-                    crc.version,
-                    table_configuration.version()
-                ))
-            );
-        }
+        // Will perform version validations.
+        let crc = SnapshotCrc::try_new(
+            crc,
+            table_configuration.version(),
+            log_segment.checkpoint_version,
+        )?;
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -231,7 +226,7 @@ impl Snapshot {
         Self::new_with_crc(
             log_segment,
             table_configuration,
-            crc_at_version,
+            crc_at_version.or(base_crc),
             built_as_latest,
         )
     }
@@ -244,8 +239,8 @@ impl Snapshot {
     /// The `crc_delta` captures the CRC-relevant changes from the committed transaction
     /// (file stats, domain metadata, ICT, etc.). If this snapshot had a CRC at its version,
     /// the delta is applied to produce a precomputed in-memory CRC for the new version,
-    /// avoiding re-reading metadata from storage. If no CRC was available, the new snapshot
-    /// has no CRC either. CREATE TABLE handles CRC construction separately in
+    /// avoiding re-reading metadata from storage. A stale base is carried forward unchanged;
+    /// no CRC stays no CRC. CREATE TABLE handles CRC construction separately in
     /// `Transaction::into_committed`.
     pub(crate) fn new_post_commit(
         &self,
@@ -279,10 +274,14 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        let new_crc = self
-            .crc
-            .as_deref()
-            .map(|base| Arc::new(base.clone().apply(crc_delta, new_version)));
+        // `crc_delta` covers what the transaction committed, so it advances an at-version CRC;
+        // a stale base is carried forward unadvanced.
+        let new_crc = match self.crc_at_version() {
+            Some(base) => Some(Arc::new(
+                base.as_ref().clone().apply(crc_delta, new_version),
+            )),
+            None => self.base_crc().cloned(),
+        };
 
         // A successful commit means the post-commit snapshot is the latest version.
         Snapshot::new_with_crc(
@@ -303,13 +302,18 @@ impl Snapshot {
         &self.log_segment
     }
 
-    /// Returns the CRC for this snapshot, if one is resolved.
-    ///
-    /// When `Some(crc)`, `crc.version == self.version()` and queries backed by the CRC hit
-    /// cache at zero I/O.
+    /// The CRC iff it sits exactly at this snapshot's version. When `Some`, queries backed by the
+    /// CRC hit cache at zero I/O. Returns `None` when no CRC was resolved or the resolved CRC is
+    /// stale.
     #[internal_api]
-    pub(crate) fn crc(&self) -> Option<&Arc<Crc>> {
-        self.crc.as_ref()
+    pub(crate) fn crc_at_version(&self) -> Option<&Arc<Crc>> {
+        self.crc.at_version()
+    }
+
+    /// The held CRC regardless of version, for reuse that does not require an at-version CRC
+    /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
+    fn base_crc(&self) -> Option<&Arc<Crc>> {
+        self.crc.base()
     }
 
     pub fn table_root(&self) -> &Url {
@@ -461,7 +465,7 @@ impl Snapshot {
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
         // Fast path: serve from CRC if available at this version.
-        if let Some(crc) = self.crc.as_deref() {
+        if let Some(crc) = self.crc_at_version() {
             match &crc.set_transaction_state {
                 SetTransactionState::Complete(map) => {
                     // Complete is authoritative: a miss means the app_id has no transaction.
@@ -608,7 +612,7 @@ impl Snapshot {
         }
 
         // Fast path: serve from CRC if it tracks domain metadata at this version.
-        if let Some(crc) = self.crc.as_deref() {
+        if let Some(crc) = self.crc_at_version() {
             match &crc.domain_metadata_state {
                 DomainMetadataState::Complete(map) => {
                     let hits: DomainMetadataMap = match domains {
@@ -687,10 +691,12 @@ impl Snapshot {
             .collect())
     }
 
-    /// Returns file-level statistics, or `None` if this snapshot has no CRC, or its CRC does
-    /// not have `Complete` file stats. Performs no I/O (the CRC is resolved at construction).
+    /// Returns file-level statistics, or `None` if this snapshot has no CRC at its version (none
+    /// resolved, or the resolved CRC is stale), or its CRC does not have `Complete` file stats.
+    /// Performs no I/O.
     pub fn get_file_stats_if_present(&self) -> Option<FileStats> {
-        self.crc.as_ref().and_then(|crc| crc.file_stats().cloned())
+        self.crc_at_version()
+            .and_then(|crc| crc.file_stats().cloned())
     }
 
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
@@ -731,7 +737,7 @@ impl Snapshot {
         }
 
         // Fast path: serve ICT from CRC if available at this version.
-        if let Some(crc) = self.crc.as_deref() {
+        if let Some(crc) = self.crc_at_version() {
             match crc.in_commit_timestamp_opt {
                 Some(ict) => return Ok(Some(ict)),
                 None => {
@@ -969,7 +975,7 @@ impl Snapshot {
     fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
         let span = tracing::Span::current();
         // Case 1: an in-memory CRC at this version is ready to write as-is.
-        if let Some(crc) = &self.crc {
+        if let Some(crc) = self.crc_at_version() {
             span.record("root", "in_memory");
             return Ok(crc.clone());
         }
@@ -977,15 +983,11 @@ impl Snapshot {
         let end = self.version();
         let log_segment = &self.log_segment;
 
-        // Case 2: a stale on-disk CRC, older than this version. An on-disk CRC at exactly this
-        // version would have short-circuited to `AlreadyExists` in `write_checksum`. Advance it
-        // over the tail commits.
-        // TODO(#2889): `read_latest_crc` re-reads the CRC from disk. `LazyCrc` was deleted in the
-        //              pivot to incremental CRC being optional; reintroduce something like it so a
-        //              CRC already read during snapshot load is reused here instead of re-read.
-        if let Some(base) = log_segment.read_latest_crc(engine) {
+        // Case 2: a stale base CRC, older than this version. Advance the retained base over the
+        // tail commits (a held base is always at or above the checkpoint, so a tail exists).
+        if let Some(base) = self.base_crc() {
             span.record("root", "stale_crc");
-            let crc = log_segment.build_crc_from_base(engine, &base)?;
+            let crc = log_segment.build_crc_from_base(engine, base)?;
             return Ok(Arc::new(crc));
         }
 
@@ -1151,12 +1153,14 @@ impl Snapshot {
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
+        // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
+        // stale base could no longer be advanced over them.
         Ok((
             CheckpointWriteResult::Written,
             Arc::new(Snapshot::new_with_crc(
                 new_log_segment,
                 self.table_configuration().clone(),
-                self.crc.clone(),
+                self.crc_at_version().cloned(),
                 self.built_as_latest,
             )?),
         ))
@@ -1226,7 +1230,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
-            self.crc.clone(),
+            self.base_crc().cloned(),
             self.built_as_latest,
         )?))
     }
@@ -2159,6 +2163,47 @@ mod tests {
         // THEN
         assert_eq!(post_commit_snapshot.version(), next_version);
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
+    }
+
+    // A post-commit snapshot built from a parent holding a stale base (not an at-version CRC)
+    // keeps that base rather than dropping it: the single-commit delta can't advance it, but
+    // retaining it lets a later write reuse the parsed CRC.
+    #[test]
+    fn test_new_post_commit_from_stale_base_keeps_base() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+
+        // Rebuild the v1 snapshot so it holds a stale CRC@0 (base only, not at-version).
+        let built = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let stale_crc = Arc::new(Crc {
+            version: 0,
+            ..Default::default()
+        });
+        let parent = Snapshot::new_with_crc(
+            built.log_segment().clone(),
+            built.table_configuration().clone(),
+            Some(stale_crc),
+            false, /* built_as_latest */
+        )
+        .unwrap();
+        assert!(parent.crc_at_version().is_none());
+        assert_eq!(parent.base_crc().map(|c| c.version), Some(0));
+
+        let commit = ParsedLogPath::create_parsed_published_commit(&url, 2);
+        let post = parent.new_post_commit(commit, CrcDelta::default()).unwrap();
+
+        assert_eq!(post.version(), 2);
+        assert!(post.crc_at_version().is_none());
+        assert_eq!(
+            post.base_crc().map(|c| c.version),
+            Some(0),
+            "the stale base must be carried forward, not dropped"
+        );
     }
 
     #[test]

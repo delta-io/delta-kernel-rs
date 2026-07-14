@@ -295,7 +295,8 @@ impl Snapshot {
         // Advance the latest available base (the existing snapshot's in-memory CRC, or a newer
         // on-disk CRC the combined segment carries) to the new end version, subject to
         // `incremental_replay`.
-        let base_crc = combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.crc());
+        let base_crc =
+            combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.base_crc());
         let crc_at_version = combined_log_segment.try_build_crc_within_budget(
             engine,
             base_crc.as_ref(),
@@ -337,7 +338,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             combined_log_segment,
             table_configuration,
-            crc_at_version,
+            crc_at_version.or(base_crc),
             built_as_latest,
         )?))
     }
@@ -359,7 +360,7 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             existing.log_segment.clone(),
             existing.table_configuration.clone(),
-            existing.crc.clone(),
+            existing.base_crc().cloned(),
             true, // reached only when the flag flips false -> true
         )?))
     }
@@ -1183,7 +1184,7 @@ mod tests {
         // A fresh build advances the stale CRC via reverse-replay to a CRC at v3 (file stats
         // Indeterminate, since these synthetic commits carry no commitInfo). The segment's
         // latest CRC file still points at the on-disk CRC version.
-        assert_eq!(snapshot_v3.crc().map(|c| c.version), Some(3));
+        assert_eq!(snapshot_v3.crc_at_version().map(|c| c.version), Some(3));
         assert_eq!(
             snapshot_v3
                 .log_segment
@@ -1226,7 +1227,7 @@ mod tests {
                 .map(|f| f.version),
             expected_crc_file_v
         );
-        assert_eq!(updated.crc().map(|c| c.version), Some(3));
+        assert_eq!(updated.crc_at_version().map(|c| c.version), Some(3));
 
         Ok(())
     }
@@ -1255,13 +1256,13 @@ mod tests {
             .at_version(3)
             .with_incremental_crc_replay(IncrementalReplay::Unlimited)
             .build(ctx.engine.as_ref())?;
-        assert_eq!(snapshot_a.crc().map(|c| c.version), Some(3));
+        assert_eq!(snapshot_a.crc_at_version().map(|c| c.version), Some(3));
 
         let updated = Snapshot::builder_from(snapshot_a)
             .with_incremental_crc_replay(mode)
             .build(ctx.engine.as_ref())?;
         assert_eq!(updated.version(), 5);
-        assert_eq!(updated.crc().map(|c| c.version), expected_crc_v);
+        assert_eq!(updated.crc_at_version().map(|c| c.version), expected_crc_v);
         assert_eq!(
             updated
                 .log_segment
@@ -1473,7 +1474,7 @@ mod tests {
         let snapshot_v0 = Snapshot::builder_for(ctx.url.as_str())
             .at_version(0)
             .build(ctx.engine.as_ref())?;
-        assert!(snapshot_v0.crc().is_none());
+        assert!(snapshot_v0.crc_at_version().is_none());
 
         // Hop 2: incremental v0 -> v5 (new commits, no checkpoint -> P+M replay). This picks up
         // CRC@v5 from the listing, which is at the snapshot version.
@@ -1481,7 +1482,7 @@ mod tests {
             .at_version(5)
             .build(ctx.engine.as_ref())?;
         assert_eq!(snapshot_v5.log_segment.checkpoint_version, None);
-        assert_eq!(snapshot_v5.crc().map(|c| c.version), Some(5));
+        assert_eq!(snapshot_v5.crc_at_version().map(|c| c.version), Some(5));
 
         // Write checkpoint at v7.
         Snapshot::builder_for(ctx.url.as_str())
@@ -1497,7 +1498,7 @@ mod tests {
         compare_snapshots(&snapshot_v10, &fresh_v10);
         assert_eq!(snapshot_v10.version(), 10);
         assert_eq!(snapshot_v10.log_segment.checkpoint_version, Some(7));
-        assert!(snapshot_v10.crc().is_none());
+        assert!(snapshot_v10.crc_at_version().is_none());
 
         Ok(())
     }
