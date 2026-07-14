@@ -164,8 +164,7 @@ fn build_data_skipping_schemas(
 }
 
 impl StateInfo {
-    /// Create StateInfo with a custom field classifier for different scan types.
-    /// Get the state needed to process a scan.
+    /// Create StateInfo for a scan, using a custom field classifier for different scan types.
     ///
     /// `logical_read_schema` - The logical schema of the scan output
     /// `table_schema` - The schema against which predicate column references are resolved.

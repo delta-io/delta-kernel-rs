@@ -2516,7 +2516,7 @@ async fn read_table_with_void_column() -> Result<(), Box<dyn std::error::Error>>
     let scan = snapshot.scan_builder().build()?;
 
     // The scan's logical schema should contain the void column (returned as null)
-    let logical_schema = scan.logical_schema();
+    let logical_schema = scan.logical_schema().raw_schema();
     assert!(logical_schema.field("void_col").is_some());
     assert!(logical_schema.field("id").is_some());
     assert_eq!(logical_schema.fields().count(), 2);
@@ -2600,7 +2600,7 @@ async fn explicit_projection_with_void_column_returns_nulls(
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
 
     // The void column should be present in the logical schema (returned as null)
-    let logical_schema = scan.logical_schema();
+    let logical_schema = scan.logical_schema().raw_schema();
     assert!(logical_schema.field("void_col").is_some());
     assert!(logical_schema.field("id").is_some());
     assert_eq!(logical_schema.fields().count(), 2);
@@ -2677,7 +2677,7 @@ async fn read_table_with_void_in_nested_struct() -> Result<(), Box<dyn std::erro
     let scan = snapshot.scan_builder().build()?;
 
     // Scan logical schema should preserve the void field in the nested struct
-    let logical_schema = scan.logical_schema();
+    let logical_schema = scan.logical_schema().raw_schema();
     let info_field = logical_schema
         .field("info")
         .expect("info should exist in scan");
@@ -2987,7 +2987,7 @@ async fn read_all_void_table() -> Result<(), Box<dyn std::error::Error>> {
     assert!(snapshot.schema().field("b").is_some());
 
     let scan = snapshot.scan_builder().build()?;
-    let logical_schema = scan.logical_schema();
+    let logical_schema = scan.logical_schema().raw_schema();
     assert_eq!(logical_schema.fields().count(), 2);
 
     // Execute read_scan — runtime must not crash even with all-void schema.
@@ -3028,7 +3028,7 @@ async fn read_table_with_void_partition_column() -> Result<(), Box<dyn std::erro
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     let scan = snapshot.scan_builder().build()?;
-    let logical_schema = scan.logical_schema();
+    let logical_schema = scan.logical_schema().raw_schema();
     assert!(logical_schema.field("void_part").is_some());
     assert!(logical_schema.field("id").is_some());
 

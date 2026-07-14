@@ -420,13 +420,17 @@ impl TableConfiguration {
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
     }
 
-    /// Returns the logical schema excluding partition columns.
-    pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
-        let partition_columns: HashSet<&str> = self
-            .partition_columns()
+    /// Returns the set of partition column names, for filtering fields out of a schema.
+    fn partition_column_set(&self) -> HashSet<&str> {
+        self.partition_columns()
             .iter()
             .map(|s| s.as_str())
-            .collect();
+            .collect()
+    }
+
+    /// Returns the logical schema excluding partition columns.
+    pub(crate) fn logical_schema_without_partition_columns(&self) -> SchemaRef {
+        let partition_columns = self.partition_column_set();
         // Safety: subset of an already-valid schema.
         Arc::new(StructType::new_unchecked(
             self.logical_schema()
@@ -441,11 +445,7 @@ impl TableConfiguration {
         self.physical_schemas
             .without_partition
             .get_or_init(|| {
-                let partition_columns: HashSet<&str> = self
-                    .partition_columns()
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
+                let partition_columns = self.partition_column_set();
                 // Safety: subset of an already-valid schema.
                 Arc::new(StructType::new_unchecked(
                     self.logical_schema()
