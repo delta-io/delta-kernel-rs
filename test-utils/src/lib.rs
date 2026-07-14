@@ -196,6 +196,7 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
+use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
     try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, Error, FileMeta,
@@ -627,10 +628,36 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
-    reader_features: Vec<&str>,
-    writer_features: Vec<&str>,
+    mut reader_features: Vec<&str>,
+    mut writer_features: Vec<&str>,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
+
+    // IcebergCompatV3 requires ColumnMapping, RowTracking, and DomainMetadata. Add them so callers
+    // can pass just `icebergCompatV3` (plus e.g. `allowColumnDefaults`) and get a loadable table.
+    let enable_iceberg_compat_v3 = writer_features.contains(&"icebergCompatV3");
+    if enable_iceberg_compat_v3 {
+        if !reader_features.contains(&"columnMapping") {
+            reader_features.push("columnMapping");
+        }
+        for f in ["columnMapping", "rowTracking", "domainMetadata"] {
+            if !writer_features.contains(&f) {
+                writer_features.push(f);
+            }
+        }
+    }
+
+    // Column mapping requires per-field `id`/`physicalName` metadata, without which snapshot load
+    // fails. Assign it here (with nested ids for iceberg v3); `max_column_id` feeds
+    // `delta.columnMapping.maxColumnId` below.
+    let (schema, max_column_id) = if reader_features.contains(&"columnMapping") {
+        let mut max_id = find_max_column_id_in_schema(&schema).unwrap_or(0);
+        let schema =
+            assign_column_mapping_metadata(&schema, &mut max_id, enable_iceberg_compat_v3)?;
+        (Arc::new(schema), max_id)
+    } else {
+        (schema, 0i64)
+    };
     let schema = serde_json::to_string(&schema)?;
 
     let protocol = if use_37_protocol {
@@ -656,6 +683,13 @@ pub async fn create_table(
 
         if reader_features.contains(&"columnMapping") {
             config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+            config.insert(
+                "delta.columnMapping.maxColumnId".to_string(),
+                json!(max_column_id.to_string()),
+            );
+        }
+        if writer_features.contains(&"icebergCompatV3") {
+            config.insert("delta.enableIcebergCompatV3".to_string(), json!("true"));
         }
         if writer_features.contains(&"rowTracking") {
             config.insert("delta.enableRowTracking".to_string(), json!("true"));

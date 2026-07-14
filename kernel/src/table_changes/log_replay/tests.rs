@@ -857,6 +857,143 @@ async fn data_skipping_filter() {
     assert_eq!(sv, &[false, true, false, false, true]);
 }
 
+// The shared `for_raw_action_batch` filter prunes on partition values on the table_changes path
+// too: partition values are parsed from `add.partitionValues` via `map_to_struct`, so `part = 'x'`
+// drops the Add in partition `y`. The Remove in partition `y` must survive: the `OR(NOT is_add,
+// ...)` guard shields non-Add rows from the predicate, so tombstones are never dropped from the
+// change feed even when their partition does not match.
+#[tokio::test]
+async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([
+            Action::Add(Add {
+                path: "in_x".into(),
+                partition_values: HashMap::from([("part".to_string(), "x".to_string())]),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "in_y".into(),
+                partition_values: HashMap::from([("part".to_string(), "y".to_string())]),
+                data_change: true,
+                ..Default::default()
+            }),
+            // A tombstone in the pruned partition `y`. If the guard broke, `part = 'x'` would
+            // silently drop it from the change feed.
+            Action::Remove(Remove {
+                path: "gone_y".into(),
+                partition_values: Some(HashMap::from([("part".to_string(), "y".to_string())])),
+                data_change: true,
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    // Partitioned schema: `part` is the partition column, `id` a data column.
+    let logical_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("part", DataType::STRING),
+    ]));
+    let metadata = Metadata::try_new(
+        None,
+        None,
+        logical_schema.clone(),
+        vec!["part".to_string()],
+        0,
+        HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+    )
+    .unwrap();
+    let protocol = Protocol::try_new_legacy(1, 4).unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = TableConfiguration::try_new(metadata, protocol, table_root_url, 0).unwrap();
+
+    let predicate = Predicate::binary(
+        BinaryPredicateOp::Equal,
+        column_expr!("part"),
+        Scalar::from("x"),
+    );
+    let predicate =
+        match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
+            Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+            other => panic!("Unexpected result: {other:?}"),
+        };
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema, predicate)
+        .unwrap()
+        .flat_map(|scan_metadata| scan_metadata.unwrap().selection_vector)
+        .collect_vec();
+
+    // Add in `x` survives, Add in `y` is pruned, and the Remove in `y` survives via the guard.
+    assert_eq!(sv, &[true, false, true]);
+}
+
+// Stats-based pruning (as opposed to partition-value pruning) with a Remove present: `id > 4`
+// drops the out-of-range Add via its `add.stats`, keeps the in-range Add, and the standalone
+// Remove survives regardless of the predicate because non-Add rows bypass the stats filter.
+#[tokio::test]
+async fn data_skipping_filter_prunes_stats_but_keeps_removes() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([
+            // Standalone Remove (no matching Add, no DV): survives as a tombstone.
+            Action::Remove(Remove {
+                path: "gone".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            // id in [0, 2]: provably excluded by `id > 4`.
+            Action::Add(Add {
+                path: "out_of_range".into(),
+                stats: Some(
+                    "{\"numRecords\":4,\"minValues\":{\"id\":0},\"maxValues\":{\"id\":2},\"nullCount\":{\"id\":0}}".into(),
+                ),
+                data_change: true,
+                ..Default::default()
+            }),
+            // id in [4, 6]: overlaps `id > 4`, so kept.
+            Action::Add(Add {
+                path: "in_range".into(),
+                stats: Some(
+                    "{\"numRecords\":4,\"minValues\":{\"id\":4},\"maxValues\":{\"id\":6},\"nullCount\":{\"id\":0}}".into(),
+                ),
+                data_change: true,
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let logical_schema = get_schema();
+    let predicate = Predicate::binary(
+        BinaryPredicateOp::GreaterThan,
+        column_expr!("id"),
+        Scalar::from(4),
+    );
+    let predicate =
+        match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
+            Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+            other => panic!("Unexpected result: {other:?}"),
+        };
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let sv = table_changes_action_iter(engine, &table_config, commits, logical_schema, predicate)
+        .unwrap()
+        .flat_map(|scan_metadata| scan_metadata.unwrap().selection_vector)
+        .collect_vec();
+
+    // Remove survives, out-of-range Add is pruned, in-range Add survives.
+    assert_eq!(sv, &[true, false, true]);
+}
+
 #[tokio::test]
 async fn failing_protocol() {
     let engine = Arc::new(SyncEngine::new());

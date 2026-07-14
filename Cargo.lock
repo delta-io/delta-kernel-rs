@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acceptance"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "datatest-stable",
  "delta_kernel",
@@ -639,6 +639,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "assert-json-diff"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1039,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "clap",
  "delta_kernel",
@@ -1255,8 +1287,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadpool"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be2b1d1d6ec8d846f05e137292d0b89133caf95ef33695424c09568bdd39b1b"
+dependencies = [
+ "deadpool-runtime",
+ "lazy_static",
+ "num_cpus",
+ "tokio",
+]
+
+[[package]]
+name = "deadpool-runtime"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
+
+[[package]]
 name = "delta-kernel-unity-catalog"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
@@ -1275,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "arrow 58.1.0",
  "arrow 59.0.0",
@@ -1323,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_benchmarks"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "criterion",
  "delta-kernel-unity-catalog",
@@ -1346,10 +1396,12 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_default_engine"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "bytes",
+ "chrono",
  "delta_kernel",
  "delta_kernel_default_engine_test_utils",
  "futures",
@@ -1357,6 +1409,7 @@ dependencies = [
  "itertools 0.14.0",
  "reqwest 0.13.2",
  "rstest",
+ "serde",
  "serde_json",
  "tempfile",
  "test_utils",
@@ -1365,18 +1418,19 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
 name = "delta_kernel_default_engine_test_utils"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "delta_kernel",
 ]
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1386,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "bytes",
  "cbindgen",
@@ -1415,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_ffi_macros"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1424,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_workloads"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "delta_kernel",
  "itertools 0.14.0",
@@ -1589,7 +1643,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "feature_tests"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
@@ -2045,6 +2099,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "humantime"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2064,6 +2124,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "pin-utils",
@@ -2605,7 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "mem-test"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
@@ -2724,6 +2785,16 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]
@@ -3669,6 +3740,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
@@ -4323,7 +4395,7 @@ dependencies = [
 
 [[package]]
 name = "test_utils"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
@@ -4760,7 +4832,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unity-catalog-delta-client-api"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4771,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "unity-catalog-delta-rest-client"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "chrono",
  "clap",
@@ -5410,6 +5482,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a90e88e4667264a994d34e6d1ab2d26d398dcdca8b7f52bec8668957517fc7d8"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wiremock"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08db1edfb05d9b3c1542e521aea074442088292f00b5f28e435c714a98f85031"
+dependencies = [
+ "assert-json-diff",
+ "base64",
+ "deadpool",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]
