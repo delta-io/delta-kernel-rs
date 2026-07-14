@@ -7,18 +7,10 @@
 
 ### 🏗️ Breaking changes
 
-1. Add proper declarative plan agg node ([#2790])
-2. Conversion utilities for plan IR to proto bytes ([#2802])
-3. Read interval types in core kernel ([#2768])
-4. Identify plan nodes by index, drop RefId and output ([#2829])
-5. Expose checkpoint writes via checkpoint_snapshot + FfiCheckpointSpec ([#2722])
-6. Carry scan sub-step latencies as nanoseconds ([#2850])
-7. Add arrow-59, drop arrow-57 ([#2847])
-8. Introduce fluent PlanBuilder to easily construct Plans ([#2772])
-9. Simplify agg alias handling ([#2868])
-10. Define XXX_FIELD to go with XXX_NAME ([#2870])
-11. Embed proto serialized schema inside of CParquetFooter ([#2865])
-12. Add reader/writer features for AMT ([#2871])
+1. Read interval types in core kernel ([#2768])
+2. Expose checkpoint writes via checkpoint_snapshot + FfiCheckpointSpec ([#2722])
+3. Carry scan sub-step latencies as nanoseconds ([#2850])
+4. Add arrow-59, drop arrow-57 ([#2847])
 
 ### 🚀 Features / new APIs
 
