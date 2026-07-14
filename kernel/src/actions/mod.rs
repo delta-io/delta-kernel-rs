@@ -103,14 +103,30 @@ pub(crate) static CDC_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(CDC_NAME, Cdc::to_schema()));
 pub(crate) static DOMAIN_METADATA_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()));
-pub(crate) static CHECKPOINT_ACTION_FIELD: LazyLock<StructField> = LazyLock::new(|| {
-    StructField::nullable(CHECKPOINT_ACTION_NAME, CheckpointAction::to_schema())
-});
+pub(crate) static CONTENT_TREE_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(CONTENT_ROOT_NAME, ContentRoot::to_schema()));
+
+
 pub(crate) static CHECKPOINT_METADATA_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
 });
 pub(crate) static SIDECAR_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+
+/// The checkpoint action is array of non-content metadata action. This struct represents the union
+/// of each possible action type.
+static CHECKPOINT_ACTION_SCHEMA : lazy_schema_ref! {
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&CHECKPOINT_METADATA_FIELD),
+};
+
+pub(crate) static CHECKPOINT_ACTION_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(CHECKPOINT_ACTION_NAME, ArrayType::new(CHECKPOINT_ACTION_SCHEMA, /*nullable=*/false))
+});
 
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
@@ -986,24 +1002,24 @@ pub(crate) struct ContentRoot {
 ///
 /// JSON format:
 /// ```json
-/// { "checkpoint": {
-///     "version": 42,
-///     "contentRoot": { "path": "...", "sizeInBytes": 1024 },
-///     "protocol": { ... },
-///     "metaData": { ... }
-/// } }
+/// { "checkpoint": [ 
+///     { "checkpointMetadata: { "version": 42 } },
+///     { "contentRoot": { "path": "...", "sizeInBytes": 1024 }},
+///     { "protocol": { ... } },
+///     { "metaData": { ... } },
+///   ]
+/// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 #[cfg_attr(
     test,
-    derive(Serialize, Deserialize, Default),
     serde(rename_all = "camelCase")
 )]
 pub(crate) struct CheckpointAction {
     /// The table version up to which the checkpoint is complete. May be less than or equal to
     /// the commit version containing this checkpoint action.
-    pub(crate) version: i64,
+    pub(crate) checkpointMetadata : checkpointMetadata,
     /// Reference to the V4 root manifest file.
     pub(crate) content_root: ContentRoot,
     /// The table protocol at the checkpoint version.
