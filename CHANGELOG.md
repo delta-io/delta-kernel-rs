@@ -35,6 +35,12 @@
 19. Add generic REST/HTTP ObjectStore for the default engine ([#2661])
 20. Add SQL predicate tokenizer for CHECK constraints ([#2882])
 21. Expose if a snapshot is built as latest from intent level ([#2905])
+22. Add proper declarative plan agg node ([#2790])
+23. Conversion utilities for plan IR to proto bytes ([#2802])
+24. Introduce fluent PlanBuilder to easily construct Plans ([#2772])
+25. Simplify agg alias handling ([#2868])
+26. Embed proto serialized schema inside of CParquetFooter ([#2865])
+27. Add reader/writer features for AMT ([#2871])
 
 ### 🐛 Bug Fixes
 
@@ -56,6 +62,7 @@
 
 1. Extract shared table-feature promotion helpers ([#2844])
 2. Define and use FoldWithOption extension trait ([#2878])
+3. Identify plan nodes by index, drop RefId and output ([#2829])
 
 ### 🧪 Testing
 
@@ -69,6 +76,7 @@
 ### ⚙️ Chores/CI
 
 1. Upgrade to strum-28 ([#2849])
+2. Define XXX_FIELD to go with XXX_NAME ([#2870])
 
 
 [#2790]: https://github.com/delta-io/delta-kernel-rs/pull/2790
