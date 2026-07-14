@@ -25,9 +25,9 @@ pub use deserialize::ParseIntervalError;
 
 /// Prefix for delta table properties (e.g., `delta.enableChangeDataFeed`, `delta.appendOnly`).
 pub const DELTA_PROPERTY_PREFIX: &str = "delta.";
+
 /// Prefix under which CHECK constraints are stored in the table configuration, as
 /// `delta.constraints.<name>`.
-#[cfg(feature = "check-constraints-in-dev")]
 pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
 
 // Table property key constants
