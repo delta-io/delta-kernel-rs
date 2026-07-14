@@ -12,9 +12,7 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
-#[cfg(feature = "column-defaults-in-dev")]
-pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
-pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -127,9 +125,6 @@ pub(crate) enum TableFeature {
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
     /// Column Default Values.
-    ///
-    /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
-    /// the `column-defaults-in-dev` cargo feature.
     AllowColumnDefaults,
 
     ///////////////////////////
@@ -495,15 +490,11 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#2630): drop the gate once column-defaults is fully supported.
 static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "column-defaults-in-dev")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "column-defaults-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

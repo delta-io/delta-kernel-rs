@@ -74,10 +74,6 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
-- `column-defaults-in-dev` -- column defaults support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
-  listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
-  carrier type and the SQL literal parser (`parse_sql`).
 - `adaptive-metadata-in-dev` -- adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked

@@ -90,70 +90,7 @@ fn test_schema_with_column_defaults_overwrites_existing_default() {
     );
 }
 
-#[cfg(not(feature = "column-defaults-in-dev"))]
-mod feature_disabled {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use delta_kernel::committer::FileSystemCommitter;
-    use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Snapshot;
-    use test_utils::schema_with_column_defaults;
-
-    use super::setup_unpartitioned_table;
-
-    #[tokio::test]
-    async fn test_col_defaults_blocked_when_cargo_feature_off(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::try_new(vec![
-            StructField::nullable("id", DataType::LONG),
-            StructField::nullable("name", DataType::STRING),
-        ])?);
-
-        let (engine, table_url) =
-            setup_unpartitioned_table("test_col_defaults_off", schema, vec!["allowColumnDefaults"])
-                .await?;
-
-        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let err = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)
-            .expect_err("write must be blocked when allowColumnDefaults is unsupported");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("allowColumnDefaults"),
-            "error must name the unsupported feature; got: {msg}",
-        );
-
-        Ok(())
-    }
-
-    /// With the cargo feature off, the IcebergCompatV3 column-default validation is not compiled,
-    /// so a V3 table with a non-literal primitive default still loads. `allowColumnDefaults` is a
-    /// writer feature, so it does not block snapshot load.
-    #[tokio::test]
-    async fn test_v3_column_default_check_absent_when_cargo_feature_off(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let base = StructType::try_new(vec![StructField::nullable("c", DataType::TIMESTAMP)])?;
-        let schema =
-            schema_with_column_defaults(&base, HashMap::from([("c", "current_timestamp()")]))?;
-
-        let (engine, table_url) = setup_unpartitioned_table(
-            "test_v3_default_off",
-            schema,
-            vec!["allowColumnDefaults", "icebergCompatV3"],
-        )
-        .await?;
-
-        Snapshot::builder_for(table_url)
-            .build(&engine)
-            .expect("V3 table must load when the column-defaults check is not compiled in");
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "column-defaults-in-dev")]
-mod feature_enabled {
+mod supported {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -177,7 +114,7 @@ mod feature_enabled {
     use super::setup_unpartitioned_table;
 
     #[tokio::test]
-    async fn test_blind_append_to_col_defaults_table_supported_when_cargo_feature_on(
+    async fn test_blind_append_to_column_defaults_table_is_supported(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(StructType::try_new(vec![
             StructField::nullable("id", DataType::LONG),
@@ -462,7 +399,63 @@ mod feature_enabled {
 
         // Write: a write context builds without error.
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        assert!(
+            txn.top_level_column_defaults()?.is_empty(),
+            "orphaned defaults must not be surfaced without allowColumnDefaults",
+        );
         txn.unpartitioned_write_context()?;
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::null_default("null", "NULL", None)]
+    #[case::non_null_default("non_null", "'value'", Some("must be NULL"))]
+    #[tokio::test]
+    async fn test_variant_column_default_validation_at_snapshot_load(
+        #[case] label: &str,
+        #[case] default_sql: &str,
+        #[case] expected_error: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let variant_type = DataType::unshredded_variant();
+        let base = StructType::try_new(vec![StructField::nullable("v", variant_type)])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("v", default_sql)]))?;
+
+        let (store, engine, table_location) =
+            engine_store_setup(&format!("test_variant_default_{label}"), None);
+        let table_url = create_table(
+            store,
+            table_location,
+            schema,
+            &[],
+            true,
+            vec!["variantType"],
+            vec!["variantType", "allowColumnDefaults"],
+        )
+        .await?;
+
+        match expected_error {
+            Some(expected_error) => {
+                let error = Snapshot::builder_for(table_url)
+                    .build(&engine)
+                    .expect_err("a non-NULL Variant default must be rejected at snapshot load")
+                    .to_string();
+                assert!(error.contains(expected_error), "got: {error}");
+            }
+            None => {
+                let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+                let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+                let defaults = txn.top_level_column_defaults()?;
+                let column_default = &defaults["v"];
+                assert_eq!(column_default.raw_sql(), default_sql);
+                assert!(
+                    column_default
+                        .to_scalar()?
+                        .is_some_and(|value| value.is_null()),
+                    "a Variant NULL default must surface as a null scalar",
+                );
+            }
+        }
 
         Ok(())
     }

@@ -1,16 +1,13 @@
 //! IcebergCompatV3 checks.
 
-#[cfg(feature = "column-defaults-in-dev")]
 use tracing::warn;
 
 use super::{
     check_no_legacy_nested_ids, check_only_supported_types, IcebergCompatCheck,
     IcebergCompatValidator, IcebergCompatVersion,
 };
-#[cfg(feature = "column-defaults-in-dev")]
-use crate::schema::try_collect_column_defaults;
-use crate::schema::DataType;
 use crate::schema::PrimitiveType::*;
+use crate::schema::{try_collect_column_defaults, DataType};
 use crate::table_configuration::TableConfiguration;
 use crate::DeltaResult;
 
@@ -68,7 +65,6 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 /// # Errors
 ///
 /// Propagates malformed column-default metadata errors from [`try_collect_column_defaults`].
-#[cfg(feature = "column-defaults-in-dev")]
 pub(crate) fn iceberg_compat_v3_column_defaults_validation(
     table_configuration: &TableConfiguration,
 ) -> DeltaResult<()> {
@@ -136,7 +132,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "column-defaults-in-dev"))]
+#[cfg(test)]
 mod column_default_tests {
     use std::collections::HashMap;
 
