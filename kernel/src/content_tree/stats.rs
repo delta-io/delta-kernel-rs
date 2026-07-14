@@ -56,12 +56,6 @@ impl StatsSpace {
     const fn base(&self, field_id: i32) -> i32 {
         self.start + NUM_SUPPORTED_STATS_PER_COLUMN * (field_id - self.field_base)
     }
-
-    /// The field ID for a `base` stats field ID within this space (inverse of [`Self::base`]).
-    #[allow(dead_code)] // only used by the test-only inverse `statistics_base_to_field_id`
-    const fn field_id(&self, base: i32) -> i32 {
-        (base - self.start) / NUM_SUPPORTED_STATS_PER_COLUMN + self.field_base
-    }
 }
 
 const METADATA_SPACE: StatsSpace = StatsSpace {
