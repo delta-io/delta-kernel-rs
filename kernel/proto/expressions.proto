@@ -150,7 +150,6 @@ message ParseJsonExpression {
 
 message MapToStructExpression {
   Expression map_expr = 1;
-  optional string session_timezone = 2;
 }
 
 // `nullability_predicate` is optional: when set and it evaluates to false/null, the whole

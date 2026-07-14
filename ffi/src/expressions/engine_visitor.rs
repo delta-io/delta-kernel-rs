@@ -658,12 +658,7 @@ fn visit_expression_impl(
                 schema_handle
             );
         }
-        Expression::MapToStruct(MapToStructExpression {
-            map_expr,
-            // The FFI visitor protocol does not carry the session timezone; the C engine
-            // reconstructs the map only. Offset-less TIMESTAMP resolution is a scan-layer concern.
-            session_timezone: _,
-        }) => {
+        Expression::MapToStruct(MapToStructExpression { map_expr }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, map_expr, child_list_id);
             call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);

@@ -41,13 +41,16 @@ pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
 
 /// Translate a kernel [`StructField`]'s flat (non-nested) parquet field id metadata into Arrow
 /// field metadata: rewrites kernel-side `"parquet.field.id"` to arrow-side `"PARQUET:field_id"`
-/// (see [`PARQUET_FIELD_ID_META_KEY`]). All other entries pass through unchanged.
+/// (see [`PARQUET_FIELD_ID_META_KEY`]). The kernel-internal
+/// [`ColumnMetadataKey::SessionTimezone`] annotation is dropped so it never reaches engine-visible
+/// Arrow output. All other entries pass through unchanged.
 pub(crate) fn kernel_flat_parquet_id_to_arrow_metadata(
     field: &StructField,
 ) -> Result<HashMap<String, String>, ArrowError> {
     field
         .metadata()
         .iter()
+        .filter(|(key, _)| key.as_str() != ColumnMetadataKey::SessionTimezone.as_ref())
         .map(|(key, val)| {
             let transformed_key = if key == ColumnMetadataKey::ParquetFieldId.as_ref() {
                 PARQUET_FIELD_ID_META_KEY.to_string()

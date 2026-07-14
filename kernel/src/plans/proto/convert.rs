@@ -398,7 +398,6 @@ impl From<&MapToStructExpression> for proto_expr::MapToStructExpression {
     fn from(map_to_struct: &MapToStructExpression) -> Self {
         proto_expr::MapToStructExpression {
             map_expr: Some(Box::new(map_to_struct.map_expr.as_ref().into())),
-            session_timezone: map_to_struct.session_timezone.clone(),
         }
     }
 }
@@ -1558,24 +1557,6 @@ mod tests {
             panic!("expected a map_to_struct expression");
         };
         assert!(map_to_struct.map_expr.is_some());
-        assert_eq!(map_to_struct.session_timezone, None);
-    }
-
-    #[test]
-    fn from_map_to_struct_expression_in_timezone() {
-        let proto_expr::expression::Kind::MapToStruct(map_to_struct) =
-            expr_kind_of(Expression::map_to_struct_in_timezone(
-                Expression::Column(ColumnName::new(["m"])),
-                Some("America/New_York".to_string()),
-            ))
-        else {
-            panic!("expected a map_to_struct expression");
-        };
-        assert!(map_to_struct.map_expr.is_some());
-        assert_eq!(
-            map_to_struct.session_timezone.as_deref(),
-            Some("America/New_York")
-        );
     }
 
     #[test]

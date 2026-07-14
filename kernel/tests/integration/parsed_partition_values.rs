@@ -600,3 +600,43 @@ async fn timestamp_partition_pruning_in_session_timezone(
         "only the file whose session-zone instant equals the predicate survives"
     );
 }
+
+/// A native-checkpoint `partitionValues_parsed` column is read as the writer-frozen instant, NOT
+/// re-resolved in the reader's session zone. Kernel's checkpoint writer resolves an offset-less
+/// TIMESTAMP as UTC, so the frozen leaf is the UTC instant; a later scan with a non-UTC session
+/// zone reads that leaf unchanged. This locks the deliberate divergence documented on
+/// `with_session_timezone`: the passthrough is not reparsed, so a session zone does not shift it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_checkpoint_partition_values_ignore_session_timezone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("native-checkpoint-tz-passthrough");
+    let url = write_foreign_partition_table(
+        &table_path,
+        ts_partition_fields(),
+        &["p_ts"],
+        // `writeStatsAsStruct=true` makes the kernel checkpoint write a native
+        // `partitionValues_parsed` column, so the read exercises the passthrough branch.
+        write_stats_as_struct_config(),
+        &[add_action(
+            "p_ts=2024-01-15 16%3A00%3A00/f.parquet",
+            serde_json::json!({"p_ts": "2024-01-15 16:00:00"}),
+        )],
+    )
+    .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+
+    // The checkpoint froze the UTC instant (16:00 resolved as UTC). Reading under a UTC-5 session
+    // zone must still return that UTC instant, not 21:00Z, because the passthrough is not reparsed.
+    let utc_micros = 1_705_334_400_000_000_i64; // 2024-01-15T16:00:00Z
+    let by_file = scan_p_ts_by_file(engine.as_ref(), &url, "America/New_York");
+    assert_eq!(
+        by_file.get("f.parquet"),
+        Some(&utc_micros),
+        "native-checkpoint passthrough must read the writer-frozen UTC instant, ignoring the session zone"
+    );
+}

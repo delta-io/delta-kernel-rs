@@ -263,6 +263,12 @@ pub enum ColumnMetadataKey {
     InternalColumn,
     Invariants,
     MetadataSpec,
+    /// Kernel-internal, never persisted: the session timezone (IANA name or fixed offset) used to
+    /// resolve offset-less `TIMESTAMP` values when a `MapToStruct` transform parses partition
+    /// strings into a typed struct. Stamped on the target `TIMESTAMP` leaves by the scan layer and
+    /// consumed by the arrow evaluator; stripped before any schema crosses into Arrow so it never
+    /// reaches engine-visible output.
+    SessionTimezone,
 }
 
 impl AsRef<str> for ColumnMetadataKey {
@@ -289,6 +295,7 @@ impl AsRef<str> for ColumnMetadataKey {
             Self::InternalColumn => "delta.isInternalColumn",
             Self::Invariants => "delta.invariants",
             Self::MetadataSpec => "delta.metadataSpec",
+            Self::SessionTimezone => "delta.internal.sessionTimezone",
         }
     }
 }

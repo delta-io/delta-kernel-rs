@@ -546,37 +546,24 @@ impl ParseJsonExpression {
 /// - Parse errors are propagated (indicating a broken table)
 /// - Duplicate map keys are resolved by taking the rightmost entry
 ///
-/// Offset-less `TIMESTAMP` value strings (no trailing `Z`/offset) resolve in `session_timezone`,
-/// so the same string decodes to different instants under different session zones. A string with
-/// an explicit `Z`/offset honors that offset and ignores the zone, and `TIMESTAMP_NTZ` is always
-/// zone-independent. The zone is a `String` (IANA name or fixed offset) rather than an arrow type
-/// so this stays engine-agnostic and serializable across the plan wire format.
+/// The target schema governs how each value parses, including the session zone used to resolve
+/// offset-less `TIMESTAMP` leaves: a `TIMESTAMP` field carrying
+/// [`ColumnMetadataKey::SessionTimezone`] metadata resolves offset-less values in that zone (an
+/// explicit `Z`/offset still pins the instant), and without it they resolve as UTC. The expression
+/// itself carries no zone.
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+/// [`ColumnMetadataKey::SessionTimezone`]: crate::schema::ColumnMetadataKey::SessionTimezone
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructExpression {
     /// The expression that evaluates to a `Map<String, String>` column.
     pub map_expr: Box<Expression>,
-    /// Session timezone (IANA name or fixed offset) for resolving offset-less `TIMESTAMP` value
-    /// strings; `None` = UTC.
-    pub session_timezone: Option<String>,
 }
 
 impl MapToStructExpression {
     pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
-            session_timezone: None,
-        }
-    }
-
-    pub(crate) fn new_in_timezone(
-        map_expr: impl Into<Expression>,
-        session_timezone: Option<String>,
-    ) -> Self {
-        Self {
-            map_expr: Box::new(map_expr.into()),
-            session_timezone,
         }
     }
 }
@@ -764,20 +751,6 @@ impl Expression {
     /// and to null for every other type. See [`MapToStructExpression`] for the full contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
-    }
-
-    /// Like [`map_to_struct`](Self::map_to_struct), but resolves offset-less `TIMESTAMP` value
-    /// strings in `session_timezone` (IANA name or fixed offset) instead of UTC. `None` is
-    /// equivalent to [`map_to_struct`](Self::map_to_struct). See [`MapToStructExpression`] for the
-    /// full timestamp-resolution contract.
-    pub fn map_to_struct_in_timezone(
-        map_expr: impl Into<Expression>,
-        session_timezone: Option<String>,
-    ) -> Self {
-        Self::MapToStruct(MapToStructExpression::new_in_timezone(
-            map_expr,
-            session_timezone,
-        ))
     }
 }
 

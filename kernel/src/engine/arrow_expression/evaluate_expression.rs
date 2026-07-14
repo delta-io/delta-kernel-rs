@@ -40,7 +40,9 @@ use crate::expressions::{
     OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
-use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
+};
 
 pub(super) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
@@ -376,16 +378,7 @@ pub fn evaluate_expression(
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
             let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let session_tz = m
-                .session_timezone
-                .as_deref()
-                .map(|tz| {
-                    tz.parse::<Tz>().map_err(|_| {
-                        Error::generic(format!("Invalid session timezone for MAP_TO_STRUCT: {tz}"))
-                    })
-                })
-                .transpose()?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema, session_tz.as_ref())?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema)?;
             Ok(Arc::new(result) as ArrayRef)
         }
         (MapToStruct(_), dt) => Err(Error::Generic(format!(
@@ -905,6 +898,24 @@ pub fn coalesce_arrays(
     Ok(make_array(mutable.freeze()))
 }
 
+/// Reads a field's [`ColumnMetadataKey::SessionTimezone`] annotation and parses it into a [`Tz`],
+/// returning `None` when the annotation is absent. Errors when it is present but not a parseable
+/// zone name (an IANA name or fixed offset).
+fn field_session_timezone(field: &StructField) -> DeltaResult<Option<Tz>> {
+    let Some(value) = field.get_config_value(&ColumnMetadataKey::SessionTimezone) else {
+        return Ok(None);
+    };
+    let MetadataValue::String(tz) = value else {
+        return Err(Error::generic(format!(
+            "Field '{}' has a non-string session timezone annotation: {value:?}",
+            field.name()
+        )));
+    };
+    tz.parse::<Tz>()
+        .map(Some)
+        .map_err(|_| Error::generic(format!("Invalid session timezone for MAP_TO_STRUCT: {tz}")))
+}
+
 /// Parses `raw` as a wall-clock timestamp in `tz`, returning the UTC instant in microseconds, or
 /// `None` if `raw` is not a valid timestamp. An offset-less string is interpreted in `tz`; a string
 /// carrying an explicit `Z`/offset honors that offset regardless of `tz`.
@@ -965,8 +976,11 @@ fn parse_partition_scalar(
 
 /// Evaluates `MAP_TO_STRUCT(map_col, output_schema)`: extracts keys from a `Map<String, String>`
 /// and parses each value into its target type, producing a `StructArray`. An empty-string value
-/// casts via [`PrimitiveType::empty_string_partition_cast`]. `session_tz` resolves offset-less
-/// `TIMESTAMP` value strings; `None` = UTC.
+/// casts via [`PrimitiveType::empty_string_partition_cast`].
+///
+/// A `TIMESTAMP` output field carrying [`ColumnMetadataKey::SessionTimezone`] resolves offset-less
+/// value strings in that zone; without it they resolve as UTC. The zone is per field, read from the
+/// output schema rather than the expression, so `MapToStruct` stays generic.
 ///
 /// - Missing keys produce null values
 /// - Parse errors are propagated (indicating a broken table)
@@ -974,7 +988,6 @@ fn parse_partition_scalar(
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
-    session_tz: Option<&Tz>,
 ) -> DeltaResult<StructArray> {
     let map_array = map_arr
         .as_any()
@@ -995,9 +1008,10 @@ fn evaluate_map_to_struct(
     let num_rows = map_array.len();
     let fields: Vec<&StructField> = output_schema.fields().collect();
 
-    // Pre-build a builder and resolve the PrimitiveType for each output field.
+    // Pre-build a builder and resolve the PrimitiveType and session zone for each output field.
     let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::with_capacity(fields.len());
     let mut target_types: Vec<&PrimitiveType> = Vec::with_capacity(fields.len());
+    let mut session_tzs: Vec<Option<Tz>> = Vec::with_capacity(fields.len());
     for field in &fields {
         let prim = match field.data_type() {
             DataType::Primitive(p) => p,
@@ -1008,6 +1022,7 @@ fn evaluate_map_to_struct(
             }
         };
         target_types.push(prim);
+        session_tzs.push(field_session_timezone(field)?);
         let arrow_type = ArrowDataType::try_from_kernel(field.data_type())?;
         builders.push(arrow_array::make_builder(&arrow_type, num_rows));
     }
@@ -1055,7 +1070,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw, session_tz)? {
+                match parse_partition_scalar(target_types[i], raw, session_tzs[i].as_ref())? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -2392,9 +2407,10 @@ mod tests {
         assert_eq!(ts.value(0), 1718443800000000); // 2024-06-15T09:30:00Z
     }
 
-    /// Evaluates `map_to_struct_in_timezone({ts: raw}, session_tz)` for a single output field of
-    /// type `ts_type` (`TIMESTAMP` or `TIMESTAMP_NTZ`), returning the parsed micros of row 0 (or
-    /// the evaluation error).
+    /// Evaluates generic `map_to_struct({ts: raw})` against a single output field of type `ts_type`
+    /// (`TIMESTAMP` or `TIMESTAMP_NTZ`), with `session_tz` stamped on the output field via
+    /// [`ColumnMetadataKey::SessionTimezone`]. Returns the parsed micros of row 0 (or the
+    /// evaluation error). Mirrors how the scan layer annotates the transform's output schema.
     fn eval_ts_partition_in_tz(
         raw: &str,
         ts_type: PrimitiveType,
@@ -2412,10 +2428,16 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
 
-        let output_schema = StructType::new_unchecked(vec![StructField::nullable("ts", ts_type)]);
+        let mut ts_field = StructField::nullable("ts", ts_type);
+        if let Some(tz) = session_tz {
+            ts_field = ts_field.add_metadata([(
+                ColumnMetadataKey::SessionTimezone.as_ref().to_string(),
+                tz.to_string(),
+            )]);
+        }
+        let output_schema = StructType::new_unchecked(vec![ts_field]);
         let result_type = DataType::from(output_schema);
-        let expr =
-            Expr::map_to_struct_in_timezone(column_expr!("pv"), session_tz.map(str::to_string));
+        let expr = Expr::map_to_struct(column_expr!("pv"));
         let result = evaluate_expression(&expr, &batch, Some(&result_type))?;
         let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
         let ts = structs
