@@ -570,15 +570,15 @@ pub(crate) fn visit_metadata_at<'a>(
     let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
     // get format out of primitives
     let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-    let format_options_map_opt: Option<HashMap<_, _>> =
-        getters[4].get_opt(row_index, "metadata.format.options")?;
-    let format_options = format_options_map_opt.unwrap_or_else(HashMap::new);
+    let format_options: HashMap<_, _> = getters[4]
+        .get_opt(row_index, "metadata.format.options")?
+        .unwrap_or_default();
     let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
     let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
     let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
-    let configuration_map_opt: Option<HashMap<_, _>> =
-        getters[8].get_opt(row_index, "metadata.configuration")?;
-    let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
+    let configuration: HashMap<_, _> = getters[8]
+        .get_opt(row_index, "metadata.configuration")?
+        .unwrap_or_default();
 
     Ok(Some(Metadata {
         id,
