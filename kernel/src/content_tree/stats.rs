@@ -1,9 +1,15 @@
-//! Stats field ID calculation utilities for Adaptive Metadata Tree (AMT).
+//! Stats manipulation utilities for Adaptive Metadata Tree (AMT).
 //!
-//! This module provides functions to compute stats field IDs for parent struct fields,
-//! which are used in the AMT format for storing per-column statistics.
+//! This module provides functions for working with stats columns in the AMT.
+//! The AMT stores statistics as shredded columns within parquet files. Stats are stored
+//! in a column-major format (each column has an associated struct with fields representing
+//! min, max, etc).
+//!
+//! As with all fields in Iceberg, statistics are projected by field ID.
 
 /// Number of supported stats per column (each column gets a range of 200 field IDs).
+/// This value is the upper bound on the number of "statistic types", e.g. min/max.
+/// Each subfield is a constant offset from the top level stats structure.
 const NUM_SUPPORTED_STATS_PER_COLUMN: i32 = 200;
 
 /// Starting field ID of the stats space for data field IDs (regular column stats).
@@ -42,7 +48,7 @@ const SUPPORTED_METADATA_FIELD_IDS: [i32; 2] =
 const FIRST_SUPPORTED_METADATA_FIELD_ID: i32 = SUPPORTED_METADATA_FIELD_IDS[0];
 
 /// A contiguous region of the stats field ID space with a fixed [`NUM_SUPPORTED_STATS_PER_COLUMN`]
-/// stride, mapping field IDs to their stats base and back.
+/// stride, mapping field IDs to their stats base.
 ///
 /// A field ID `f` maps to base `start + 200 * (f - field_base)`; the data space uses
 /// `field_base == 0` so its base is simply `start + 200 * f`.
