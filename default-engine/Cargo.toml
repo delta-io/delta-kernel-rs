@@ -16,7 +16,7 @@ pre-release-replacements = [
 ]
 
 [dependencies]
-delta_kernel = { path = "../kernel", version = "0.25.0", features = [
+delta_kernel = { path = "../kernel", version = "0.26.0", features = [
   "default-engine-base",
   "internal-api",
 ] }
