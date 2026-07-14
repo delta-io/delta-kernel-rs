@@ -355,9 +355,8 @@ impl TableConfiguration {
     }
 
     /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
-    /// every column reference in the rewritten predicate against this set, so the two
-    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
-    /// point to keep their gate input in lockstep.
+    /// every column reference in the rewritten predicate against this set; every data-skipping
+    /// call site shares this entry point so their gate input stays in lockstep.
     pub(crate) fn physical_stats_columns_set(
         &self,
         required_columns: Option<&[ColumnName]>,
@@ -397,6 +396,35 @@ impl TableConfiguration {
             })
             .collect();
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
+    }
+
+    /// Typed physical partition schema for `DataSkippingFilter`, narrowed to the partition
+    /// columns referenced by `predicate_refs` (physical leaf names) with every field forced
+    /// nullable.
+    ///
+    /// Returns `None` when the table has no partition columns or the predicate references none;
+    /// the filter then treats partitions as unavailable and folds partition predicates to
+    /// keep-all. Every retained field is nullable because a `MapToStruct` over `partitionValues`
+    /// yields null for a missing key or the protocol's empty-string-is-null rule, which a
+    /// non-nullable field would reject.
+    pub(crate) fn predicate_partition_schema(
+        &self,
+        predicate_refs: &[ColumnName],
+    ) -> Option<SchemaRef> {
+        let referenced: HashSet<&str> = predicate_refs
+            .iter()
+            .filter_map(|c| match c.path() {
+                [name] => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let nullable_fields: Vec<StructField> = self
+            .build_partition_values_parsed_schema()?
+            .fields()
+            .filter(|f| referenced.contains(f.name().as_str()))
+            .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+            .collect();
+        (!nullable_fields.is_empty()).then(|| Arc::new(StructType::new_unchecked(nullable_fields)))
     }
 
     /// Returns the logical schema excluding partition columns.

@@ -19,6 +19,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
 
@@ -219,6 +220,75 @@ impl DataSkippingFilter {
             filter_evaluator,
             metrics,
         })
+    }
+
+    /// Builds a filter over raw `{ add, remove, ... }` action batches, parsing file stats from
+    /// the JSON `add.stats` string. This is the shape used by log-replay paths that skip
+    /// *before* transforming actions (the change-data-feed path and the incremental scan),
+    /// unlike the scan path which reads pre-parsed `stats_parsed` from transformed batches.
+    ///
+    /// The stats schema is derived from the predicate's column references via
+    /// [`TableConfiguration::build_expected_stats_schemas`], matching the write side exactly;
+    /// references outside the table's stats columns fold to NULL (keeping the file). Partition
+    /// values are parsed from the raw `add.partitionValues` string map with
+    /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
+    ///
+    /// Returns `None` (equivalent to keep-all) when the predicate is ineligible for data skipping
+    /// (references no stats columns, or fails evaluator construction).
+    ///
+    /// Pruning applies only to Add rows: Remove and cdc rows (null `add.path`) are never pruned,
+    /// guarded by the `add.path IS NOT NULL` `is_add` expression wired in below. Callers on the
+    /// change-data-feed path rely on this so tombstones survive a non-matching predicate.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for creating evaluators.
+    /// - `physical_predicate`: The predicate, already lowered to physical column names.
+    /// - `table_configuration`: Source of the stats schema, partition schema, and stats-column
+    ///   gate.
+    /// - `input_schema`: Schema of the raw action batches passed to [`apply()`](Self::apply).
+    pub(crate) fn for_raw_action_batch(
+        engine: &dyn Engine,
+        physical_predicate: PredicateRef,
+        table_configuration: &TableConfiguration,
+        input_schema: SchemaRef,
+    ) -> Option<Self> {
+        // Predicate refs become the `requested_physical_columns` filter; refs outside
+        // `physical_stats_columns` fold to NULL via the gate below. Clustering columns are
+        // deliberately not required here (see the scan path and #2588): loading clustering
+        // domain metadata would require a separate scan of the log, which this filter avoids.
+        let predicate_refs: Vec<ColumnName> = physical_predicate
+            .references()
+            .into_iter()
+            .cloned()
+            .collect();
+        let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
+        let physical_stats_schema = table_configuration
+            .build_expected_stats_schemas(None, Some(&predicate_refs))
+            .ok()?
+            .physical;
+        let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
+
+        // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
+        // from the raw `add.partitionValues` string map, and identify Add rows by
+        // `add.path IS NOT NULL` (raw batches keep the nested layout).
+        let stats_expr = Arc::new(Expr::parse_json(
+            column_expr!("add.stats"),
+            physical_stats_schema.clone(),
+        ));
+        let partition_expr = Arc::new(Expr::map_to_struct(column_expr!("add.partitionValues")));
+        let is_add_expr = Arc::new(Pred::is_not_null(column_expr!("add.path")).into());
+        Self::new(
+            engine,
+            Some(physical_predicate),
+            Some(&physical_stats_schema),
+            stats_expr,
+            partition_schema.as_ref(),
+            partition_expr,
+            is_add_expr,
+            input_schema,
+            &physical_stats_columns,
+            None,
+        )
     }
 
     /// Builds the unified schema and extraction expression from separate data stats and partition
