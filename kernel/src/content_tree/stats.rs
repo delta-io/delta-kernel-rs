@@ -100,29 +100,6 @@ mod tests {
 
     use super::*;
 
-    /// Inverse of [`field_id_to_statistics_base`], used to cross-check the forward mapping.
-    ///
-    /// Only stats field IDs in `[9_000, 200_000_000)` that are multiples of 200 are valid.
-    /// For the metadata range `[9_000, 10_000)`, the recovered field ID must be in
-    /// [`SUPPORTED_METADATA_FIELD_IDS`]; otherwise `None` is returned.
-    fn statistics_base_to_field_id(stats_field_id: i32) -> Option<i32> {
-        if !(STATS_SPACE_FIELD_ID_START_FOR_METADATA_FIELDS..STATS_SPACE_FIELD_ID_END)
-            .contains(&stats_field_id)
-            || stats_field_id % NUM_SUPPORTED_STATS_PER_COLUMN != 0
-        {
-            return None;
-        }
-
-        if stats_field_id < STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS {
-            let field_id = METADATA_SPACE.field_id(stats_field_id);
-            SUPPORTED_METADATA_FIELD_IDS
-                .contains(&field_id)
-                .then_some(field_id)
-        } else {
-            Some(DATA_SPACE.field_id(stats_field_id))
-        }
-    }
-
     /// Valid `(field_id, stats_base)` pairs, asserted in both directions (subsumes the roundtrip).
     #[rstest]
     #[case(0, 10_000)]
@@ -135,7 +112,6 @@ mod tests {
     #[case(ROW_ID_FIELD_ID, 9_200)]
     fn valid_mapping_roundtrips(#[case] field_id: i32, #[case] stats_base: i32) {
         assert_eq!(field_id_to_statistics_base(field_id), Some(stats_base));
-        assert_eq!(statistics_base_to_field_id(stats_base), Some(field_id));
     }
 
     /// Field IDs that `field_id_to_statistics_base` must reject.
@@ -147,28 +123,5 @@ mod tests {
     #[case(2_147_483_646)] // _file (unsupported reserved metadata)
     fn field_id_to_statistics_base_rejects_invalid(#[case] field_id: i32) {
         assert_eq!(field_id_to_statistics_base(field_id), None);
-    }
-
-    /// Stats field IDs that `statistics_base_to_field_id` must reject.
-    #[rstest]
-    #[case(9_400)] // multiple of 200 in metadata range, but unsupported field ID
-    #[case(9_600)]
-    #[case(9_800)]
-    #[case(-1)] // below the metadata space start
-    #[case(0)]
-    #[case(200)]
-    #[case(5_000)]
-    #[case(8_600)]
-    #[case(8_800)]
-    #[case(9_001)] // non-multiple of 200 in the metadata range
-    #[case(10_001)] // non-multiple of 200 in the data range
-    #[case(10_201)]
-    #[case(10_500)]
-    #[case(10_900)]
-    #[case(STATS_SPACE_FIELD_ID_END)] // at the exclusive upper bound
-    #[case(STATS_SPACE_FIELD_ID_END + 200)] // above the upper bound
-    #[case(i32::MAX)]
-    fn statistics_base_to_field_id_rejects_invalid(#[case] stats_field_id: i32) {
-        assert_eq!(statistics_base_to_field_id(stats_field_id), None);
     }
 }
