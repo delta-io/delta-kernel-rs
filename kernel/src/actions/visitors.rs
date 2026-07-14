@@ -800,7 +800,7 @@ mod tests {
         // A metaData action carrying a non-empty format.options map must round-trip through
         // the visitor rather than being dropped (getters[4] was previously skipped).
         let json_strings: StringArray = vec![
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{"contentDefinedChunking.enabled":"true","contentDefinedChunking.minChunkSize":"65536"}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{"contentDefinedChunking.enabled":"true","contentDefinedChunking.minChunkSize":"65536"}},"schemaString":"{}","partitionColumns":[],"configuration":{}}}"#,
         ]
         .into();
         let data = parse_json_batch(json_strings);
