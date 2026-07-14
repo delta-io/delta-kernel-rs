@@ -8,12 +8,34 @@
 ### 🏗️ Breaking changes
 
 1. Read interval types in core kernel ([#2768])
+   - `PrimitiveType` gains `IntervalYearMonth` / `IntervalDayTime` variants (with
+     `DataType::INTERVAL_YEAR_MONTH` / `INTERVAL_DAY_TIME` constants). Add arms to any exhaustive
+     match on `PrimitiveType` or `DataType`. Interval reads are not yet functional, so this is
+     only a compile break.
 2. Expose checkpoint writes via checkpoint_snapshot + FfiCheckpointSpec ([#2722])
+   - FFI only. `checkpoint_snapshot` gains a `spec: Option<&FfiCheckpointSpec>` argument and
+     returns `FfiCheckpointWriteResult` instead of `bool`. Pass `NULL` for the old auto-V1/V2
+     behavior, switch on the result tag, and `free_snapshot` the handle it carries.
 3. Carry scan sub-step latencies as nanoseconds ([#2850])
+   - `ScanMetadataCompleted`'s `dedup_visitor_time_ms` / `predicate_eval_time_ms` become
+     `Duration` fields `dedup_visitor_time` / `predicate_eval_time`; call `.as_millis()` for the
+     old value. The FFI struct instead renames them to `*_time_ns` (nanoseconds).
 4. Add arrow-59, drop arrow-57 ([#2847])
+   - The `arrow-57` cargo feature is removed and `arrow-59` added; the default `arrow` feature now
+     resolves to `arrow-59` (was `arrow-58`). Move any explicit `arrow-57` pin to `arrow-58` or
+     `arrow-59`; transitive Arrow 59 changes may surface.
 5. Added delete functionality to StorageHandler ([#2823])
+   - The `StorageHandler` trait gains a required `fn delete(&self, path: &Url) -> DeltaResult<()>`
+     (no default impl). Implement it on your handler; it must be idempotent (missing path returns
+     `Ok(())`).
 6. Make default engine read I/O concurrency configurable ([#2813])
+   - `DefaultParquetHandler::with_readahead` is removed; `with_buffer_size` / `with_batch_size`
+     (both handlers) now take `NonZero<usize>`. Replace `with_readahead(n)` with
+     `with_buffer_size(NonZero::new(n).unwrap())` and wrap existing size args in `NonZero::new`.
 7. Improve the column_name! macro and friends ([#2891])
+   - The internal re-exported proc macro `delta_kernel_derive::parse_column_name` is renamed to
+     `column_name_segments`. The user-facing macros (`column_name!`, `col!`, ...) are unchanged;
+     only direct callers of `parse_column_name!` need to switch.
 
 ### 🚀 Features / new APIs
 
