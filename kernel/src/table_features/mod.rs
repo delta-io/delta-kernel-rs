@@ -12,6 +12,7 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+pub(crate) use geospatial::validate_geospatial_unsupported;
 #[cfg(feature = "column-defaults-in-dev")]
 pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
@@ -32,6 +33,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+mod geospatial;
 mod iceberg_compat;
 mod timestamp_ntz;
 
