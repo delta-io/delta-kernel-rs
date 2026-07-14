@@ -66,6 +66,9 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
+/// Low-level helper exposed as internal-api for connectors doing customized log cleanup only;
+/// not for common use.
+#[internal_api]
 pub(crate) fn list_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
@@ -109,6 +112,9 @@ pub(crate) fn list_from_storage(
 ///
 /// NOTE: There could be a single-part and/or any number of uuid-based checkpoints. They
 /// are all equivalent, and this routine keeps only one of them (arbitrarily chosen).
+/// Low-level helper exposed as internal-api for connectors doing customized log cleanup only;
+/// not for common use.
+#[internal_api]
 fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
     let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
     for part_file in parts {
@@ -174,6 +180,9 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 /// Compaction and checkpoint files are skipped when empty -- they have fallbacks
 /// (individual commits, older checkpoints). Commit and CRC files are kept even
 /// if empty; the warning ensures the corrupt file is identifiable in logs.
+/// Low-level helper exposed as internal-api for connectors doing customized log cleanup only;
+/// not for common use.
+#[internal_api]
 pub(crate) fn should_process_log_file(file: &ParsedLogPath) -> bool {
     if file.location.size > 0 {
         return true;
