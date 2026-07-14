@@ -246,7 +246,7 @@ pub struct TableProperties {
     pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
     /// CHECK constraints declared on the table, keyed by name, with the raw constraint SQL as the
-    /// value.
+    /// value. Ordered by name for deterministic iteration.
     // TODO(#2896): `pub(crate)` while enforcement is in development. Expose a public accessor once
     // CHECK constraints ship.
     pub(crate) check_constraints: BTreeMap<String, String>,
