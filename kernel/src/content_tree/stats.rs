@@ -123,7 +123,7 @@ mod tests {
         }
     }
 
-    /// Valid `(field_id, stats_base)` pairs, asserted in both directions (subsumes the roundtrip).
+    /// Valid `(field_id, stats_base)` pairs, asserted in both directions
     #[rstest]
     #[case(0, 10_000)]
     #[case(1, 10_200)]
