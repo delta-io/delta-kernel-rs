@@ -32,7 +32,10 @@ use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{validate_schema_column_mapping_strict, Operation, TableFeature};
+use crate::table_features::{
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata, ColumnMappingMode,
+    Operation, TableFeature,
+};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
@@ -178,6 +181,12 @@ impl AlterTableTransactionBuilder<Modifying> {
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
         let column_mapping_mode = table_config.column_mapping_mode();
         let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+        // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
+        // strip below needs from it. Captured as a bool (not a clone) before
+        // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
+        // `None` mode, where no strip fires.
+        let current_has_cm = column_mapping_mode == ColumnMappingMode::None
+            && schema_has_column_mapping_metadata(&schema);
         let SchemaEvolutionResult {
             schema: evolved_schema,
             new_max_column_id,
@@ -188,9 +197,15 @@ impl AlterTableTransactionBuilder<Modifying> {
             current_max_column_id,
         )?;
 
-        // Validates column mapping in strict mode (rejects stale CM annotations on a
-        // mapping-disabled table).
-        validate_schema_column_mapping_strict(&evolved_schema, column_mapping_mode)?;
+        // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
+        // that was clean before it, strip them; residual annotations already present on the
+        // table are left in place (see `strip_stray_column_mapping_metadata`).
+        let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+            strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
+                .map_or(evolved_schema, Arc::new)
+        } else {
+            evolved_schema
+        };
 
         let evolved_metadata = table_config
             .metadata()
