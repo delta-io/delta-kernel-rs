@@ -140,8 +140,6 @@ static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 /// actions embedded in an adaptiveMetadata manifest commit. This schema is the union of every
 /// element type that may appear in that array (per the adaptiveMetadata RFC, delta-io/delta#6978):
 /// `checkpointMetadata`, `contentRoot`, `protocol`, `metaData`, `domainMetadata`, `txn`, `sidecar`.
-/// `commitInfo` is deliberately excluded -- the RFC routes it to the top-level Delta log, never
-/// into this array.
 #[cfg(feature = "adaptive-metadata-in-dev")]
 static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&CHECKPOINT_METADATA_FIELD),
