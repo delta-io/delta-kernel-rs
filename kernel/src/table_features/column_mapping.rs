@@ -781,20 +781,21 @@ pub(crate) fn schema_has_column_mapping_metadata(schema: &StructType) -> bool {
 /// returning `Some(stripped_schema)` when a strip is needed and `None` when `candidate` can be
 /// persisted as-is.
 ///
-/// A strip is needed only when `candidate` carries column-mapping annotations that `current` did
-/// not -- i.e. the write is introducing them into a clean table, so persisting `candidate` verbatim
-/// would originate a self-inconsistent table. When `current` already carries residual annotations
-/// they are left in place (matching delta-spark, which strips only annotations a commit newly
-/// introduces); `None` is returned.
+/// A strip is needed only when `candidate` carries column-mapping annotations that the pre-write
+/// schema did not -- i.e. the write is introducing them into a clean table, so persisting
+/// `candidate` verbatim would originate a self-inconsistent table. When the pre-write schema
+/// already carried residual annotations they are left in place (matching delta-spark, which strips
+/// only annotations a commit newly introduces); `None` is returned.
 ///
 /// Callers MUST gate this on `ColumnMappingMode::None`: with mapping enabled the annotations are
-/// load-bearing and must never be stripped. `current` is the pre-write schema (`None` for CREATE,
-/// which has no prior schema); `candidate` is the schema the write would otherwise persist.
+/// load-bearing and must never be stripped. `current_has_cm` is whether the pre-write schema
+/// carried any column-mapping metadata (always `false` for CREATE, which has no prior schema);
+/// passing the bool rather than the schema lets ALTER avoid cloning its pre-alter schema.
+/// `candidate` is the schema the write would otherwise persist.
 pub(crate) fn strip_stray_column_mapping_metadata(
-    current: Option<&StructType>,
+    current_has_cm: bool,
     candidate: &StructType,
 ) -> Option<StructType> {
-    let current_has_cm = current.is_some_and(schema_has_column_mapping_metadata);
     (!current_has_cm && schema_has_column_mapping_metadata(candidate)).then(|| {
         debug!(
             "Column mapping is disabled; stripping newly-introduced `delta.columnMapping.*` \
@@ -1261,18 +1262,18 @@ mod tests {
         let annotated = StructType::new_unchecked([make_cm_field("a", 1, DataType::INTEGER)]);
 
         // CREATE (no prior schema) introducing annotations -> stripped.
-        let stripped = strip_stray_column_mapping_metadata(None, &annotated)
+        let stripped = strip_stray_column_mapping_metadata(false, &annotated)
             .expect("newly-introduced annotations should be stripped");
         assert!(!schema_has_column_mapping_metadata(&stripped));
 
         // ALTER on a clean table introducing annotations -> stripped.
-        assert!(strip_stray_column_mapping_metadata(Some(&clean), &annotated).is_some());
+        assert!(strip_stray_column_mapping_metadata(false, &annotated).is_some());
 
         // ALTER on an already-annotated table -> left in place (no strip).
-        assert!(strip_stray_column_mapping_metadata(Some(&annotated), &annotated).is_none());
+        assert!(strip_stray_column_mapping_metadata(true, &annotated).is_none());
 
         // Candidate carries no annotations -> nothing to strip.
-        assert!(strip_stray_column_mapping_metadata(None, &clean).is_none());
+        assert!(strip_stray_column_mapping_metadata(false, &clean).is_none());
     }
 
     fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {

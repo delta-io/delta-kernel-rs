@@ -903,7 +903,9 @@ impl CreateTableTransactionBuilder {
         // any annotation the caller supplied is newly introduced (see
         // `strip_stray_column_mapping_metadata`).
         if column_mapping_mode == ColumnMappingMode::None {
-            if let Some(stripped) = strip_stray_column_mapping_metadata(None, &effective_schema) {
+            // A new table has no prior schema, so nothing was carried in (`current_has_cm =
+            // false`).
+            if let Some(stripped) = strip_stray_column_mapping_metadata(false, &effective_schema) {
                 effective_schema = Arc::new(stripped);
             }
         }

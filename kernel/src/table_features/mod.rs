@@ -7,9 +7,9 @@ pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
     column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
-    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
-    validate_and_extract_column_mapping_annotations, validate_column_mapping_id,
-    StaleAnnotationPolicy,
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
+    try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
+    validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
