@@ -155,7 +155,7 @@ fn expected(what: &str, found: Option<Token>) -> Error {
 mod tests {
     use rstest::rstest;
 
-    use super::super::token::{Keyword, Token};
+    use super::super::token::{tokenize, Keyword, Token};
     use super::{parse, CmpOp, Comparison, Operand};
     use crate::expressions::ColumnName;
 
@@ -165,6 +165,10 @@ mod tests {
 
     fn col(segments: &[&str]) -> Operand {
         Operand::Column(ColumnName::new(segments.iter().map(|s| s.to_string())))
+    }
+
+    fn lit(s: &str) -> Operand {
+        Operand::Literal(s.to_string())
     }
 
     /// Each operator token maps to its `CmpOp`, with the two operands preserved in order.
@@ -226,6 +230,43 @@ mod tests {
         let got = parse(tokens).unwrap();
         assert_eq!(got.left, left);
         assert_eq!(got.right, right);
+    }
+
+    /// Run a raw constraint string through the real tokenizer and into the parser, the way a caller
+    /// consumes it. The other tests hand-build `Token` vectors, so they cannot catch a mismatch
+    /// between what the tokenizer emits and what the parser expects; these end-to-end cases do.
+    /// `a > -.5` in particular exercises the tokenizer's leading-dot decimal plus the parser's
+    /// sign reassembly (`Minus` + `Literal(".5")` -> `Literal("-.5")`).
+    #[rstest]
+    #[case("a > -.5", CmpOp::Gt, col(&["a"]), lit("-.5"))]
+    #[case("amount >= -234", CmpOp::Ge, col(&["amount"]), lit("-234"))]
+    #[case("ratio == .25", CmpOp::Eq, col(&["ratio"]), lit(".25"))]
+    #[case("a.b.c <= 100", CmpOp::Le, col(&["a", "b", "c"]), lit("100"))]
+    #[case("x != y", CmpOp::Ne, col(&["x"]), col(&["y"]))]
+    #[case("n <=> NULL", CmpOp::NullSafeEq, col(&["n"]), lit("NULL"))]
+    #[case("+5 < a", CmpOp::Lt, lit("+5"), col(&["a"]))]
+    #[case("status = 'active'", CmpOp::Eq, col(&["status"]), lit("'active'"))]
+    fn tokenize_then_parse_yields_expected_comparison(
+        #[case] sql: &str,
+        #[case] op: CmpOp,
+        #[case] left: Operand,
+        #[case] right: Operand,
+    ) {
+        let got = parse(tokenize(sql).unwrap()).unwrap();
+        assert_eq!(got, Comparison { op, left, right });
+    }
+
+    /// End-to-end rejections: inputs that fail the tokenizer (`(`) or parse to something outside a
+    /// single comparison (junctions, `IS [NOT] NULL`, a bare boolean column) both surface as an
+    /// error through the real pipeline.
+    #[rstest]
+    #[case::junction_and("a > 0 AND b < 9")]
+    #[case::junction_or("a > 0 OR b > 0")]
+    #[case::is_not_null("a IS NOT NULL")]
+    #[case::parens("(amount > 0)")]
+    #[case::bare_bool_column("is_active")]
+    fn tokenize_then_parse_rejects_non_single_comparison(#[case] sql: &str) {
+        assert!(tokenize(sql).and_then(parse).is_err());
     }
 
     /// Anything outside a single `operand op operand` is rejected.
