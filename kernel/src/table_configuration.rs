@@ -21,6 +21,8 @@ use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
 };
+#[cfg(feature = "column-defaults-in-dev")]
+use crate::schema::validate_column_defaults_metadata;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
@@ -217,12 +219,11 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
+        // default on a Variant column).
+        #[cfg(feature = "column-defaults-in-dev")]
+        validate_column_defaults_metadata(&table_config.logical_schema)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
-
-        // TODO(#2630): Validate column-default metadata here so a table that declares a
-        // `CURRENT_DEFAULT` without the `allowColumnDefaults` feature, or with malformed default
-        // metadata, is rejected eagerly as corrupted rather than lazily in
-        // `Transaction::column_defaults`.
 
         Ok(table_config)
     }
@@ -354,9 +355,8 @@ impl TableConfiguration {
     }
 
     /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
-    /// every column reference in the rewritten predicate against this set, so the two
-    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
-    /// point to keep their gate input in lockstep.
+    /// every column reference in the rewritten predicate against this set; every data-skipping
+    /// call site shares this entry point so their gate input stays in lockstep.
     pub(crate) fn physical_stats_columns_set(
         &self,
         required_columns: Option<&[ColumnName]>,
@@ -396,6 +396,35 @@ impl TableConfiguration {
             })
             .collect();
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
+    }
+
+    /// Typed physical partition schema for `DataSkippingFilter`, narrowed to the partition
+    /// columns referenced by `predicate_refs` (physical leaf names) with every field forced
+    /// nullable.
+    ///
+    /// Returns `None` when the table has no partition columns or the predicate references none;
+    /// the filter then treats partitions as unavailable and folds partition predicates to
+    /// keep-all. Every retained field is nullable because a `MapToStruct` over `partitionValues`
+    /// yields null for a missing key or the protocol's empty-string-is-null rule, which a
+    /// non-nullable field would reject.
+    pub(crate) fn predicate_partition_schema(
+        &self,
+        predicate_refs: &[ColumnName],
+    ) -> Option<SchemaRef> {
+        let referenced: HashSet<&str> = predicate_refs
+            .iter()
+            .filter_map(|c| match c.path() {
+                [name] => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let nullable_fields: Vec<StructField> = self
+            .build_partition_values_parsed_schema()?
+            .fields()
+            .filter(|f| referenced.contains(f.name().as_str()))
+            .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+            .collect();
+        (!nullable_fields.is_empty()).then(|| Arc::new(StructType::new_unchecked(nullable_fields)))
     }
 
     /// Returns the logical schema excluding partition columns.

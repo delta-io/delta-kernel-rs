@@ -90,6 +90,8 @@ pub mod actions;
 pub mod checkpoint;
 pub mod commit_range;
 pub mod committer;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod content_tree;
 #[cfg(feature = "internal-api")]
 pub mod crc;
 #[cfg(not(feature = "internal-api"))]

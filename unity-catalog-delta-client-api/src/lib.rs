@@ -6,6 +6,7 @@
 //!
 //! # Traits
 //!
+//! - [`UpdateTableClient`] -- apply typed requirements + updates to a UC-managed Delta table
 //! - [`CommitClient`] -- commit a new version to a UC-managed Delta table
 //! - [`GetCommitsClient`] -- retrieve commits from a UC-managed Delta table
 //!
@@ -24,9 +25,12 @@ pub mod credentials;
 pub mod error;
 pub mod models;
 
-pub use clients::{CommitClient, GetCommitsClient};
+pub use clients::{CommitClient, GetCommitsClient, UpdateTableClient};
 #[cfg(any(test, feature = "test-utils"))]
 pub use clients::{InMemoryCommitsClient, TableData};
 pub use credentials::{AwsTempCredentials, Operation, TemporaryTableCredentials};
 pub use error::{Error, Result};
-pub use models::{Commit, CommitRequest, CommitsRequest, CommitsResponse};
+pub use models::{
+    CatalogConfig, Commit, CommitRequest, CommitsRequest, CommitsResponse, DeltaTableRequirement,
+    DeltaTableUpdate, LoadTableResponse, Protocol, TableMetadata, UpdateTableRequest,
+};

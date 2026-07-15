@@ -54,11 +54,11 @@ built with [Arrow] and [Tokio].
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.25.0"
+delta_kernel = "0.26.0"
 
 # or pull in the default Arrow/Tokio engine alongside the kernel
-delta_kernel = "0.25.0"
-delta_kernel_default_engine = { version = "0.25.0", features = ["rustls"] }
+delta_kernel = "0.26.0"
+delta_kernel_default_engine = { version = "0.26.0", features = ["rustls"] }
 ```
 
 ### Feature flags
