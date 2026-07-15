@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
+use tracing::debug;
 use uuid::Uuid;
 
 use super::TableFeature;
@@ -794,8 +795,13 @@ pub(crate) fn strip_stray_column_mapping_metadata(
     candidate: &StructType,
 ) -> Option<StructType> {
     let current_has_cm = current.is_some_and(schema_has_column_mapping_metadata);
-    (!current_has_cm && schema_has_column_mapping_metadata(candidate))
-        .then(|| drop_column_mapping_metadata(candidate))
+    (!current_has_cm && schema_has_column_mapping_metadata(candidate)).then(|| {
+        debug!(
+            "Column mapping is disabled; stripping newly-introduced `delta.columnMapping.*` \
+             annotations from the schema before persisting."
+        );
+        drop_column_mapping_metadata(candidate)
+    })
 }
 
 /// Removes every [`COLUMN_MAPPING_METADATA_KEYS`] annotation from every field in `schema`
