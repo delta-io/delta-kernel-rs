@@ -4,8 +4,8 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Fields, Item, Lit,
-    Meta, PathArguments, Token, Type, Visibility,
+    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Error, Expr, ExprLit, Field,
+    Fields, Item, Lit, Meta, PathArguments, Token, Type, Visibility,
 };
 
 mod schema_macro;
@@ -122,7 +122,19 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 /// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
 /// mark the value field as nullable, but those mappings will be dropped when converting to an
 /// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-#[proc_macro_derive(ToSchema, attributes(allow_null_container_values))]
+///
+/// Supported field attributes:
+/// - `#[field_id = N]`: Sets the Parquet field ID for this field.
+/// - `#[element_field_id = N]`: Sets the Parquet field ID for the element of a list field. Stored
+///   as `ColumnMappingNestedIds` metadata (`{"fieldName.element": N}`) on the parent `StructField`
+///   and propagated to the inner Arrow list element during schema conversion. The generated code
+///   references `serde_json::json!`, which must be available at the expansion site.
+/// - `#[allow_null_container_values]`: Marks the value field of a `HashMap` as nullable.
+/// - `#[skip_schema]`: Excludes this field from the generated schema.
+#[proc_macro_derive(
+    ToSchema,
+    attributes(allow_null_container_values, field_id, element_field_id, skip_schema)
+)]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
@@ -166,6 +178,46 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
+fn get_named_attr_id(
+    field_attributes: &[Attribute],
+    attr_name: &str,
+) -> Result<Option<i64>, Error> {
+    field_attributes
+        .iter()
+        .filter_map(|attr| match &attr.meta {
+            Meta::NameValue(nv) => Some(nv),
+            _ => None,
+        })
+        .find(|nv| matches!(nv.path.get_ident(), Some(ident) if ident == attr_name))
+        .map(|nv| {
+            let span = nv.value.span();
+            match &nv.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: Lit::Int(lit_int),
+                    ..
+                }) => lit_int.base10_parse().map_err(|e| {
+                    Error::new(
+                        lit_int.span(),
+                        format!("{} error: Failed to parse integer: {}", attr_name, e),
+                    )
+                }),
+                _ => Err(Error::new(
+                    span,
+                    format!("{} error: Expected an integer", attr_name),
+                )),
+            }
+        })
+        .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
+}
+
+fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
+    get_named_attr_id(field_attributes, "field_id")
+}
+
+fn get_element_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
+    get_named_attr_id(field_attributes, "element_field_id")
+}
+
 /// Check if a path segment is `Option<HashMap<K, V>>`.
 fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
     if seg.ident != "Option" {
@@ -186,6 +238,99 @@ fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
         .is_some_and(|seg| seg.ident == "HashMap")
 }
 
+fn gen_schema_field(field: &Field) -> TokenStream {
+    let name = get_schema_name(field.ident.as_ref().unwrap());
+    let have_schema_null = field.attrs.iter().any(|attr| {
+        // check if we have allow_null_container_values attr
+        match &attr.meta {
+            Meta::Path(path) => path
+                .get_ident()
+                .is_some_and(|ident| ident == "allow_null_container_values"),
+            _ => false,
+        }
+    });
+
+    match field.ty {
+        Type::Path(ref type_path) => {
+            // Convert the type path segments into a single quoted string
+            let type_path_quoted = type_path.path.segments.iter().map(|segment| {
+                let segment_ident = &segment.ident;
+                match &segment.arguments {
+                    PathArguments::None => quote! { #segment_ident :: },
+                    PathArguments::AngleBracketed(angle_args) => {
+                        quote! { #segment_ident::#angle_args :: }
+                    }
+                    _ => Error::new(
+                        segment.arguments.span(),
+                        "Can only handle <> type path args",
+                    )
+                    .to_compile_error(),
+                }
+            });
+
+            // First, determine which base function to call based on schema_null setting
+            let base_call = if have_schema_null {
+                if let Some(last_seg) = type_path.path.segments.last() {
+                    let is_valid = last_seg.ident == "HashMap" || is_option_of_hashmap(last_seg);
+                    if !is_valid {
+                        return Error::new(
+                            last_seg.ident.span(),
+                            format!(
+                                "Can only use allow_null_container_values on HashMap or \
+                                 Option<HashMap> fields, not {}",
+                                last_seg.ident
+                            ),
+                        )
+                        .to_compile_error();
+                    }
+                }
+                quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name)) }
+            } else {
+                quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name)) }
+            };
+
+            // Then, add field-id and element-field-id metadata if present
+            let field_id = match get_field_id(&field.attrs) {
+                Ok(v) => v,
+                Err(e) => return e.to_compile_error(),
+            };
+            let element_field_id = match get_element_field_id(&field.attrs) {
+                Ok(v) => v,
+                Err(e) => return e.to_compile_error(),
+            };
+
+            let with_field_id = if let Some(id) = field_id {
+                quote_spanned! { field.span() => #base_call.add_metadata([(delta_kernel::schema::ColumnMetadataKey::ParquetFieldId.as_ref(), #id)]) }
+            } else {
+                quote_spanned! { field.span() => #base_call }
+            };
+
+            if let Some(elem_id) = element_field_id {
+                let nested_key = format!("{}.element", name);
+                quote_spanned! { field.span() =>
+                    #with_field_id.add_metadata([(
+                        delta_kernel::schema::ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
+                        delta_kernel::schema::MetadataValue::Other(
+                            serde_json::json!({ #nested_key: #elem_id })
+                        )
+                    )])
+                }
+            } else {
+                with_field_id
+            }
+        }
+        _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty))
+            .to_compile_error(),
+    }
+}
+
+fn has_skip_schema(field: &Field) -> bool {
+    field.attrs.iter().any(|attr| match &attr.meta {
+        Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "skip_schema"),
+        _ => false,
+    })
+}
+
 fn gen_schema_fields(data: &Data) -> TokenStream {
     let fields = match data {
         Data::Struct(DataStruct {
@@ -201,46 +346,10 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         }
     };
 
-    let schema_fields = fields.iter().map(|field| {
-        let name = field.ident.as_ref().unwrap(); // we know these are named fields
-        let name = get_schema_name(name);
-        let have_schema_null = field.attrs.iter().any(|attr| {
-            // check if we have allow_null_container_values attr
-            match &attr.meta {
-                Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "allow_null_container_values"),
-                _ => false,
-            }
-        });
-
-        match field.ty {
-            Type::Path(ref type_path) => {
-                let type_path_quoted = type_path.path.segments.iter().map(|segment| {
-                    let segment_ident = &segment.ident;
-                    match &segment.arguments {
-                        PathArguments::None => quote! { #segment_ident :: },
-                        PathArguments::AngleBracketed(angle_args) => quote! { #segment_ident::#angle_args :: },
-                        _ => Error::new(segment.arguments.span(), "Can only handle <> type path args").to_compile_error()
-                    }
-                });
-                if have_schema_null {
-                    if let Some(last_seg) = type_path.path.segments.last() {
-                        let is_valid =
-                            last_seg.ident == "HashMap" || is_option_of_hashmap(last_seg);
-                        if !is_valid {
-                            return Error::new(
-                                last_seg.ident.span(),
-                                format!("Can only use allow_null_container_values on HashMap or Option<HashMap> fields, not {}", last_seg.ident)
-                            ).to_compile_error()
-                        }
-                    }
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name))}
-                } else {
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name))}
-                }
-            }
-            _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty)).to_compile_error()
-        }
-    });
+    let schema_fields = fields
+        .iter()
+        .filter(|f| !has_skip_schema(f))
+        .map(gen_schema_field);
     quote! { #(#schema_fields),* }
 }
 
