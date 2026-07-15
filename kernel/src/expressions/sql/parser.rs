@@ -1,9 +1,9 @@
-//! Parser for a single CHECK-constraint comparison.
+//! Parser for a single SQL comparison.
 //!
-//! Consumes the [`Token`] stream from [`super::token`] and produces a [`Comparison`] - exactly one
-//! `operand <op> operand`. Junctions (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are out
-//! of this grammar and surface as errors, which the caller treats as "not kernel-parsable".
-//! Lowering ([`super::lower`]) resolves the operands against the table schema.
+//! Consumes the [`Token`] stream from [`super::token`] and produces a [`Comparison`]: exactly one
+//! `operand <op> operand`. For now the grammar covers only a single comparison; junctions
+//! (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are not yet supported and surface as
+//! errors. A later stage resolves the operands against a schema.
 
 // WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
 // TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
@@ -55,7 +55,7 @@ pub(super) fn parse(tokens: Vec<Token>) -> DeltaResult<Comparison> {
     let comparison = parser.parse_comparison()?;
     if parser.advance().is_some() {
         return Err(Error::generic(
-            "unexpected trailing input in CHECK constraint: only a single comparison is supported",
+            "unexpected trailing input: only a single comparison is supported",
         ));
     }
     Ok(comparison)
@@ -96,28 +96,23 @@ impl Parser {
         Ok(op)
     }
 
-    // operand := ('+' | '-')? Literal | Ident ( '.' Ident )*
+    // operand := ('+' | '-')? Number | Literal | Ident ( '.' Ident )*
     //
-    // A leading sign applies only to a numeric literal (the tokenizer emits it as a separate
-    // Plus/Minus operator): the sign is folded back into the literal's raw text so the existing
-    // `parse_sql` types it, e.g. `-234` -> Literal("-234"). A sign before anything else (a column,
-    // string/date literal, keyword) is not a single-comparison operand and errors -- unary minus on
-    // a column and binary arithmetic are out of grammar.
+    // A leading sign applies only to a number (the tokenizer emits it as a separate Plus/Minus
+    // operator): the sign is folded back into the number's raw text so the later lowering stage
+    // types it, e.g. `-234` -> Literal("-234"). A sign before anything else (a column, string/date
+    // literal, keyword) is not a single-comparison operand and errors: unary minus on a column and
+    // binary arithmetic are out of grammar.
     fn parse_operand(&mut self) -> DeltaResult<Operand> {
         match self.advance() {
             Some(sign @ (Token::Plus | Token::Minus)) => {
                 let sign = if sign == Token::Minus { '-' } else { '+' };
                 match self.advance() {
-                    Some(Token::Literal(raw)) if starts_numeric(&raw) => {
-                        Ok(Operand::Literal(format!("{sign}{raw}")))
-                    }
-                    other => Err(expected(
-                        &format!("a numeric literal after '{sign}'"),
-                        other,
-                    )),
+                    Some(Token::Number(raw)) => Ok(Operand::Literal(format!("{sign}{raw}"))),
+                    other => Err(expected(&format!("a number after '{sign}'"), other)),
                 }
             }
-            Some(Token::Literal(raw)) => Ok(Operand::Literal(raw)),
+            Some(Token::Number(raw)) | Some(Token::Literal(raw)) => Ok(Operand::Literal(raw)),
             Some(Token::Ident(first)) => self.parse_column_path(first),
             other => Err(expected("a column or literal", other)),
         }
@@ -137,18 +132,10 @@ impl Parser {
     }
 }
 
-/// Whether a literal's raw text is numeric -- begins with a digit or a leading dot (`.5`), unlike
-/// string/binary/date/boolean/null literals.
-fn starts_numeric(raw: &str) -> bool {
-    raw.starts_with(|c: char| c.is_ascii_digit() || c == '.')
-}
-
-/// Build the `expected {what} in CHECK constraint, found {found:?}` error shared by the parser's
-/// operand and operator sites.
+/// Build the `expected {what}, found {found:?}` error shared by the parser's operand and operator
+/// sites.
 fn expected(what: &str, found: Option<Token>) -> Error {
-    Error::generic(format!(
-        "expected {what} in CHECK constraint, found {found:?}"
-    ))
+    Error::generic(format!("expected {what}, found {found:?}"))
 }
 
 #[cfg(test)]
@@ -181,7 +168,7 @@ mod tests {
     #[case(Token::Ne, CmpOp::Ne)]
     #[case(Token::NullSafeEq, CmpOp::NullSafeEq)]
     fn parses_each_operator(#[case] tok: Token, #[case] expected: CmpOp) {
-        let got = parse(vec![ident("a"), tok, Token::Literal("1".into())]).unwrap();
+        let got = parse(vec![ident("a"), tok, Token::Number("1".into())]).unwrap();
         assert_eq!(
             got,
             Comparison {
@@ -197,28 +184,37 @@ mod tests {
     #[rstest]
     #[case(vec![ident("a"), Token::Gt, ident("b")], col(&["a"]), col(&["b"]))]
     #[case(
-        vec![Token::Literal("0".into()), Token::Lt, ident("a")],
+        vec![Token::Number("0".into()), Token::Lt, ident("a")],
         Operand::Literal("0".into()),
         col(&["a"])
     )]
     #[case(
-        vec![ident("a"), Token::Dot, ident("b"), Token::Eq, Token::Literal("1".into())],
+        vec![ident("a"), Token::Dot, ident("b"), Token::Eq, Token::Number("1".into())],
         col(&["a", "b"]),
         Operand::Literal("1".into())
     )]
+    // A three-segment path exercises loop re-entry in `parse_column_path` (two `.` iterations).
     #[case(
-        vec![ident("a"), Token::Gt, Token::Minus, Token::Literal("234".into())],
+        vec![
+            ident("a"), Token::Dot, ident("b"), Token::Dot, ident("c"),
+            Token::Eq, Token::Number("1".into()),
+        ],
+        col(&["a", "b", "c"]),
+        Operand::Literal("1".into())
+    )]
+    #[case(
+        vec![ident("a"), Token::Gt, Token::Minus, Token::Number("234".into())],
         col(&["a"]),
         Operand::Literal("-234".into())
     )]
     #[case(
-        vec![Token::Plus, Token::Literal("5".into()), Token::Lt, ident("a")],
+        vec![Token::Plus, Token::Number("5".into()), Token::Lt, ident("a")],
         Operand::Literal("+5".into()),
         col(&["a"])
     )]
-    // A sign folds into a leading-dot decimal too (`.5`): `starts_numeric` accepts a leading `.`.
+    // A sign folds into a leading-dot decimal too (`.5`).
     #[case(
-        vec![ident("a"), Token::Gt, Token::Minus, Token::Literal(".5".into())],
+        vec![ident("a"), Token::Gt, Token::Minus, Token::Number(".5".into())],
         col(&["a"]),
         Operand::Literal("-.5".into())
     )]
@@ -236,7 +232,7 @@ mod tests {
     /// consumes it. The other tests hand-build `Token` vectors, so they cannot catch a mismatch
     /// between what the tokenizer emits and what the parser expects; these end-to-end cases do.
     /// `a > -.5` in particular exercises the tokenizer's leading-dot decimal plus the parser's
-    /// sign reassembly (`Minus` + `Literal(".5")` -> `Literal("-.5")`).
+    /// sign reassembly (`Minus` + `Number(".5")` -> `Literal("-.5")`).
     #[rstest]
     #[case("a > -.5", CmpOp::Gt, col(&["a"]), lit("-.5"))]
     #[case("amount >= -234", CmpOp::Ge, col(&["amount"]), lit("-234"))]
@@ -271,23 +267,23 @@ mod tests {
 
     /// Anything outside a single `operand op operand` is rejected.
     #[rstest]
-    #[case::trailing(vec![ident("a"), Token::Gt, Token::Literal("0".into()), ident("extra")])]
+    #[case::trailing(vec![ident("a"), Token::Gt, Token::Number("0".into()), ident("extra")])]
     #[case::missing_operator(vec![ident("a"), ident("b")])]
-    #[case::dangling_dot(vec![ident("a"), Token::Dot, Token::Gt, Token::Literal("0".into())])]
-    #[case::operator_first(vec![Token::Gt, Token::Literal("0".into())])]
+    #[case::dangling_dot(vec![ident("a"), Token::Dot, Token::Gt, Token::Number("0".into())])]
+    #[case::operator_first(vec![Token::Gt, Token::Number("0".into())])]
     #[case::empty(vec![])]
     #[case::keyword_operand(vec![ident("a"), Token::Gt, Token::Keyword(Keyword::And)])]
     #[case::keyword_junction(vec![
-        ident("a"), Token::Gt, Token::Literal("0".into()),
-        Token::Keyword(Keyword::And), ident("b"), Token::Lt, Token::Literal("9".into()),
+        ident("a"), Token::Gt, Token::Number("0".into()),
+        Token::Keyword(Keyword::And), ident("b"), Token::Lt, Token::Number("9".into()),
     ])]
-    #[case::sign_before_column(vec![Token::Minus, ident("a"), Token::Gt, Token::Literal("0".into())])]
+    #[case::sign_before_column(vec![Token::Minus, ident("a"), Token::Gt, Token::Number("0".into())])]
     #[case::sign_before_string(vec![
         ident("a"), Token::Eq, Token::Minus, Token::Literal("'foo'".into()),
     ])]
     #[case::sign_then_eof(vec![ident("a"), Token::Gt, Token::Minus])]
     #[case::double_sign(vec![
-        ident("a"), Token::Gt, Token::Minus, Token::Minus, Token::Literal("5".into()),
+        ident("a"), Token::Gt, Token::Minus, Token::Minus, Token::Number("5".into()),
     ])]
     fn rejects_non_single_comparison(#[case] tokens: Vec<Token>) {
         assert!(parse(tokens).is_err());
