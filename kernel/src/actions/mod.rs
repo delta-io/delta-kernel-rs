@@ -1046,9 +1046,6 @@ pub(crate) struct ContentRoot {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
-/// This struct carries every element type the wire array may hold: the `version`, `contentRoot`,
-/// `protocol`, and `metaData` extracted below, plus the inline `txn` / `domainMetadata` entries and
-/// their `sidecar` references. Population from wire data lands with the checkpoint reader (#2866);
 /// the collection fields default to empty until then.
 ///
 /// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
@@ -1074,7 +1071,7 @@ pub(crate) struct CheckpointAction {
     /// `checkpointMetadata.version`. May be less than or equal to the commit version containing
     /// this checkpoint action, and is `>= content_root.version` (see [`ContentRoot::version`]).
     pub(crate) version: i64,
-    /// Reference to the V4 root manifest file.
+    /// Reference to the root manifest file.
     pub(crate) content_root: ContentRoot,
     /// The table protocol at the checkpoint version.
     pub(crate) protocol: Protocol,
