@@ -2,24 +2,31 @@
 
 use std::sync::Arc;
 
+use tracing::debug;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
+    ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 /// A [`ParquetHandler`] that delegates to a [`PlanExecutor`].
+///
+/// Operations not yet implemented on the plan-execution path delegate to the required `fallback`
+/// handler.
 pub struct PlanBasedParquetHandler {
     executor: Arc<dyn PlanExecutor>,
+    fallback: Arc<dyn ParquetHandler>,
 }
 
 impl PlanBasedParquetHandler {
-    pub fn new(plan_executor: Arc<dyn PlanExecutor>) -> Self {
+    /// Construct a handler that delegates not-yet-implemented operations to `fallback`.
+    pub fn new(plan_executor: Arc<dyn PlanExecutor>, fallback: Arc<dyn ParquetHandler>) -> Self {
         Self {
             executor: plan_executor,
+            fallback,
         }
     }
 }
@@ -41,12 +48,11 @@ impl ParquetHandler for PlanBasedParquetHandler {
 
     fn write_parquet_file(
         &self,
-        _location: Url,
-        _data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+        location: Url,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
-        Err(Error::unsupported(
-            "PlanBasedParquetHandler does not support write_parquet_file yet",
-        ))
+        debug!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
+        self.fallback.write_parquet_file(location, data)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
@@ -72,12 +78,51 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::plan::SyncPlanExecutor;
+    use crate::engine::sync::SyncEngine;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
-    use crate::{FileMeta, ParquetHandler as _};
+    use crate::{Engine as _, EngineData, FileMeta, ParquetHandler as _};
 
     fn make_handler() -> PlanBasedParquetHandler {
-        PlanBasedParquetHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedParquetHandler::new(
+            Arc::new(SyncPlanExecutor::new()),
+            SyncEngine::new().parquet_handler(),
+        )
+    }
+
+    fn single_column_batch() -> RecordBatch {
+        RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        )])
+        .unwrap()
+    }
+
+    #[test]
+    fn test_write_parquet_file_delegates_to_fallback() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("out.parquet");
+        let url = Url::from_file_path(&path).unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(single_column_batch()));
+        make_handler()
+            .write_parquet_file(url.clone(), Box::new(std::iter::once(Ok(data))))
+            .unwrap();
+
+        // Read it back to confirm the fallback actually wrote the rows.
+        let schema: SchemaRef = Arc::new(
+            StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
+        );
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: std::fs::metadata(&path).unwrap().len(),
+        };
+        let rows: usize = make_handler()
+            .read_parquet_files(&[file_meta], schema, None)
+            .unwrap()
+            .map(|batch| batch.unwrap().len())
+            .sum();
+        assert_eq!(rows, 3);
     }
 
     fn file_meta_for(path: &Path) -> FileMeta {
