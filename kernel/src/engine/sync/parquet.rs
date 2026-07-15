@@ -125,9 +125,7 @@ impl ParquetHandler for SyncParquetHandler {
     }
 }
 
-/// Read the [`ParquetFooter`] (schema) of `file`. The Arrow-typed core behind
-/// [`ParquetHandler::read_parquet_footer`], also usable by in-module callers that hold a store
-/// directly rather than a handler.
+/// Read the [`ParquetFooter`] (schema) of `file`
 pub(super) fn parquet_footer(
     store: Option<&Arc<DynObjectStore>>,
     file: &FileMeta,
