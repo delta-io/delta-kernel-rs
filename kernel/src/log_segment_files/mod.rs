@@ -1,19 +1,14 @@
 //! [`LogSegmentFiles`] is a struct holding the result of listing the delta log. Currently, it
 //! exposes four APIs for listing:
-//! 1. [`list_commits`]: Lists all commit files between the provided start and end versions.
-//! 2. [`list`]: Lists all commit and checkpoint files between the provided start and end versions.
-//! 3. [`list_with_checkpoint_hint`]: Lists all commit and checkpoint files after the provided
+//! 1. `list_commits`: Lists all commit files between the provided start and end versions.
+//! 2. `list`: Lists all commit and checkpoint files between the provided start and end versions.
+//! 3. `list_with_checkpoint_hint`: Lists all commit and checkpoint files after the provided
 //!    checkpoint hint.
-//! 4. [`list_with_backward_checkpoint_scan`]: Scans backward from an end version in 1000-version
+//! 4. `list_with_backward_checkpoint_scan`: Scans backward from an end version in 1000-version
 //!    windows until a complete checkpoint is found or the log is exhausted.
 //!
 //! After listing, one can leverage the [`LogSegmentFiles`] to construct a [`LogSegment`].
 //!
-//! [`list_with_backward_checkpoint_scan`]: Self::list_with_backward_checkpoint_scan
-//!
-//! [`list_commits`]: Self::list_commits
-//! [`list`]: Self::list
-//! [`list_with_checkpoint_hint`]: Self::list_with_checkpoint_hint
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
 use std::collections::HashMap;
@@ -66,8 +61,7 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
-/// Low-level helper exposed as internal-api for connectors doing customized log cleanup only;
-/// not for common use.
+/// Exposed as internal-api for connectors to do log cleanup.
 #[internal_api]
 pub(crate) fn list_from_storage(
     storage: &dyn StorageHandler,
@@ -112,8 +106,7 @@ pub(crate) fn list_from_storage(
 ///
 /// NOTE: There could be a single-part and/or any number of uuid-based checkpoints. They
 /// are all equivalent, and this routine keeps only one of them (arbitrarily chosen).
-/// Low-level helper exposed as internal-api for connectors doing customized log cleanup only;
-/// not for common use.
+/// Exposed as internal-api for connectors to do log cleanup.
 #[internal_api]
 fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
     let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
@@ -180,8 +173,7 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 /// Compaction and checkpoint files are skipped when empty -- they have fallbacks
 /// (individual commits, older checkpoints). Commit and CRC files are kept even
 /// if empty; the warning ensures the corrupt file is identifiable in logs.
-/// Low-level helper exposed as internal-api for connectors doing customized log cleanup only;
-/// not for common use.
+/// Exposed as internal-api for connectors to do log cleanup.
 #[internal_api]
 pub(crate) fn should_process_log_file(file: &ParsedLogPath) -> bool {
     if file.location.size > 0 {
