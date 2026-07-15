@@ -35,11 +35,12 @@ fn workload_benchmarks(c: &mut Criterion) {
     let runtime = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
 
     for workload in &workloads {
-        let table_key = &workload.table_info.dir_name;
         let case_name = &workload.case_name;
         match &workload.spec {
             Spec::Read(read_spec) => {
-                let configs = registry.read_configs(table_key, case_name);
+                let configs = registry
+                    .read_configs(workload)
+                    .expect("loaded workload must have a registry table key");
                 for operation in [ReadOperation::ReadMetadata] {
                     for config in &configs {
                         let name = configured_benchmark_name(

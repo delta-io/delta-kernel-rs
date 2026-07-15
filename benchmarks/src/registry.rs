@@ -1,25 +1,12 @@
 //! Benchmark harness-config registry.
 //!
-//! Defines the read harness config types (`ReadConfig`, `ParallelScan`) and the registry that maps
-//! read benchmarks to them. These are benchmark-harness concepts (how to run a benchmark, not what
-//! the workload is).
-//!
-//! The registry is a checked-in JSON file (`benchmarks/bench-registry.json`) nesting each
-//! benchmark's harness configs by table name then case name: `{ table: { case: [configs] } }`.
-//! The table key is the table's directory name and the case key is the spec filename. Benchmark
-//! output uses the human-readable table name from `tableInfo.json` instead of the directory key.
-//!
-//! Each registered read benchmark expands into one Criterion benchmark per config; the config
-//! `name` becomes the trailing path segment of the benchmark name. A read benchmark whose
-//! `(table, case)` key is absent from the registry falls back to the built-in serial config.
-//!
-//! The `parallelScan` config field uses serde's externally-tagged form: the fieldless variant is
-//! a bare string (`"disabled"`) and the parameterized variant a single-key object
-//! (`{"enabled": {"numThreads": 2}}`).
+//! Defines benchmark harness parameters and maps workloads to the configurations used to run them.
+//! These parameters control how a benchmark runs rather than what operation it performs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use delta_kernel_workloads::models::Workload;
 use serde::Deserialize;
 
 // === Harness configs ===
@@ -41,8 +28,10 @@ pub fn default_read_configs() -> Vec<ReadConfig> {
     }]
 }
 
-/// Scan parallelism. Serialized externally-tagged: `"disabled"` or
-/// `{ "enabled": { "numThreads": <n> } }`.
+/// Scan parallelism configuration.
+///
+/// In registry JSON, disabled scans use the string `"disabled"`. Enabled scans use an object that
+/// specifies the thread count: `{ "enabled": { "numThreads": <n> } }`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ParallelScan {
@@ -55,8 +44,24 @@ pub enum ParallelScan {
 /// Error type for registry loading and lookup.
 pub type RegistryResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Registry deserialized from `benchmarks/bench-registry.json`: read harness configs nested by
-/// table name then case name.
+/// Read harness configs keyed by table directory name and workload spec filename.
+///
+/// For example, this entry runs `readMetadataLatest` against the table in the
+/// `10kAdds0CommitsSinceChkpt1V2Chkpt` directory once serially and once with two scan threads:
+///
+/// ```json
+/// {
+///   "10kAdds0CommitsSinceChkpt1V2Chkpt": {
+///     "readMetadataLatest": [
+///       { "name": "serial", "parallelScan": "disabled" },
+///       { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Each configuration creates a separate Criterion benchmark whose final name segment is the
+/// configuration `name`. Read workloads absent from the registry use the built-in serial config.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(transparent)]
 pub struct BenchRegistry {
@@ -74,11 +79,20 @@ impl BenchRegistry {
         Ok(registry)
     }
 
-    /// Configs for the read benchmark `"{table}/{case}"`: the registry entry if present, else the
-    /// built-in serial config.
-    pub fn read_configs(&self, table: &str, case: &str) -> Vec<ReadConfig> {
-        self.lookup(table, case)
-            .map_or_else(default_read_configs, ToOwned::to_owned)
+    /// Returns the registry configs for a read workload, or the built-in serial config when the
+    /// workload is not registered.
+    ///
+    /// Returns an error when the workload's table directory has no valid registry key.
+    pub fn read_configs(&self, workload: &Workload) -> RegistryResult<Vec<ReadConfig>> {
+        let table = workload.table_info.registry_table_key().ok_or_else(|| {
+            format!(
+                "could not derive a registry table key for workload '{}'",
+                workload.case_name
+            )
+        })?;
+        Ok(self
+            .lookup(table, &workload.case_name)
+            .map_or_else(default_read_configs, ToOwned::to_owned))
     }
 
     /// All `(table, case)` keys in the registry. Lets the harness cross-check every entry against
@@ -129,12 +143,36 @@ fn check_config_names<'a>(names: impl Iterator<Item = &'a str>, ctx: &str) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use delta_kernel_workloads::models::{Spec, TableInfo, Workload};
+
     use super::*;
 
     fn registry_from_str(json: &str) -> BenchRegistry {
         let registry: BenchRegistry = serde_json::from_str(json).expect("failed to parse registry");
         registry.validate().expect("registry should validate");
         registry
+    }
+
+    fn read_workload(table: &str, case: &str) -> Workload {
+        let mut table_info: TableInfo = serde_json::from_str(
+            r#"{
+                "name": "test", "description": "test", "tablePath": "s3://bucket/table",
+                "schema": {"type": "struct", "fields": []},
+                "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+                "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0,
+                    "numCommits": 1, "numActions": 1},
+                "properties": {}, "dataLayout": {}, "tags": []
+            }"#,
+        )
+        .unwrap();
+        table_info.table_info_dir = PathBuf::from(table);
+        Workload {
+            table_info,
+            case_name: case.to_string(),
+            spec: serde_json::from_str::<Spec>(r#"{"type": "read"}"#).unwrap(),
+        }
     }
 
     const FULL_REGISTRY: &str = r#"{
@@ -156,7 +194,9 @@ mod tests {
     #[test]
     fn read_configs_use_explicit_entry() {
         let registry = registry_from_str(FULL_REGISTRY);
-        let configs = registry.read_configs("v2", "readMetadataLatest");
+        let configs = registry
+            .read_configs(&read_workload("v2", "readMetadataLatest"))
+            .unwrap();
         let names: Vec<_> = configs.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["serial", "parallel2"]);
         assert_eq!(configs[0].parallel_scan, ParallelScan::Disabled);
@@ -171,10 +211,22 @@ mod tests {
         // An unlisted read benchmark in a populated registry and any lookup against an empty
         // registry both fall back to the built-in serial config.
         for registry in [registry_from_str(FULL_REGISTRY), registry_from_str("{}")] {
-            let read = registry.read_configs("other", "readMetadataLatest");
+            let read = registry
+                .read_configs(&read_workload("other", "readMetadataLatest"))
+                .unwrap();
             assert_eq!(read.len(), 1);
             assert_eq!(read[0].name, "serial");
         }
+    }
+
+    #[test]
+    fn read_configs_errors_without_registry_table_key() {
+        let registry = registry_from_str(FULL_REGISTRY);
+        let mut workload = read_workload("v2", "readMetadataLatest");
+        workload.table_info.table_info_dir.clear();
+
+        let error = registry.read_configs(&workload).unwrap_err().to_string();
+        assert!(error.contains("could not derive a registry table key"));
     }
 
     #[test]

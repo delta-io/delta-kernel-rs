@@ -121,9 +121,7 @@ fn load_specs_from_table(
         }
     }
 
-    // `from_json_path` derives the registry key (`TableInfo::dir_name`) from the directory
-    // basename; a table whose directory has no usable basename cannot be registered.
-    if table_info.dir_name.is_empty() {
+    if table_info.registry_table_key().is_none() {
         return Err(format!(
             "could not derive table name from directory {}",
             table_dir.display()
@@ -238,7 +236,10 @@ mod tests {
 
         let workloads = load_specs_from_table(&table_dir, None).unwrap();
         assert_eq!(workloads.len(), 1);
-        assert_eq!(workloads[0].table_info.dir_name, "dirBasename");
+        assert_eq!(
+            workloads[0].table_info.registry_table_key(),
+            Some("dirBasename")
+        );
         assert_eq!(workloads[0].table_info.name, "humanLabel");
         assert_eq!(workloads[0].case_name, "readMetadataLatest");
     }

@@ -63,10 +63,6 @@ pub struct TableInfo {
     /// Path to the directory containing the `tableInfo.json` file
     #[serde(skip, default)]
     pub table_info_dir: PathBuf,
-    /// Basename of [`Self::table_info_dir`], used as the registry table key. Populated by
-    /// [`Self::from_json_path`]; empty for a `TableInfo` deserialized without directory context.
-    #[serde(skip, default)]
-    pub dir_name: String,
 }
 
 impl TableInfo {
@@ -85,6 +81,14 @@ impl TableInfo {
         })
     }
 
+    /// Returns the basename of [`Self::table_info_dir`] used as the benchmark registry table key.
+    ///
+    /// Returns `None` when the table info has no directory context or the basename is not valid
+    /// UTF-8.
+    pub fn registry_table_key(&self) -> Option<&str> {
+        self.table_info_dir.file_name()?.to_str()
+    }
+
     pub fn from_json_path<P: AsRef<Path>>(path: P) -> Result<Self, serde_json::Error> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(serde_json::Error::io)?;
         let mut table_info: TableInfo = serde_json::from_str(&content)?;
@@ -94,12 +98,7 @@ impl TableInfo {
                 "catalog_info and table_path are mutually exclusive",
             )));
         }
-        // Stores the parent directory of the `tableInfo.json` file and its basename, which is the
-        // table's registry key (see `dir_name`).
         if let Some(parent) = path.as_ref().parent() {
-            if let Some(name) = parent.file_name().and_then(|n| n.to_str()) {
-                table_info.dir_name = name.to_string();
-            }
             table_info.table_info_dir = parent.to_path_buf();
         }
         Ok(table_info)
@@ -535,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn from_json_path_derives_dir_name_from_directory_not_name_field() {
+    fn registry_table_key_uses_directory_basename_not_name_field() {
         // The registry key is the directory basename, not the JSON `name` field.
         let dir = tempfile::tempdir().unwrap();
         let table_dir = dir.path().join("dirBasename");
@@ -550,15 +549,13 @@ mod tests {
         std::fs::write(table_dir.join("tableInfo.json"), json).unwrap();
 
         let table_info = TableInfo::from_json_path(table_dir.join("tableInfo.json")).unwrap();
-        assert_eq!(table_info.dir_name, "dirBasename");
+        assert_eq!(table_info.registry_table_key(), Some("dirBasename"));
         assert_eq!(table_info.name, "humanLabel");
     }
 
     #[test]
-    fn dir_name_is_empty_without_directory_context() {
-        // A `TableInfo` deserialized directly (no `from_json_path`) has no directory, so `dir_name`
-        // is the empty default -- registry callers must route through `from_json_path`.
+    fn registry_table_key_is_none_without_directory_context() {
         let info = make_table_info(&[]);
-        assert_eq!(info.dir_name, "");
+        assert_eq!(info.registry_table_key(), None);
     }
 }

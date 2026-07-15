@@ -419,9 +419,10 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::LazyLock;
 
-    use delta_kernel_workloads::models::{ReadSpec, Spec, TableInfo, TimeTravel};
+    use delta_kernel_workloads::models::{ReadSpec, Spec, TableInfo, TimeTravel, Workload};
 
     use super::*;
 
@@ -494,7 +495,6 @@ mod tests {
     fn configured_benchmark_name_uses_human_readable_table_name() {
         let mut table_info = test_table_info();
         table_info.name = "Human readable table".to_string();
-        table_info.dir_name = "registry-key".to_string();
 
         assert_eq!(
             configured_benchmark_name(&table_info, "testCase", "serial"),
@@ -581,7 +581,14 @@ mod tests {
         let path = format!("{}/bench-registry.json", env!("CARGO_MANIFEST_DIR"));
         let registry = BenchRegistry::load_from_path(std::path::Path::new(&path))
             .expect("checked-in bench-registry.json must load and validate");
-        let read = registry.read_configs("10kAdds0CommitsSinceChkpt1V2Chkpt", "readMetadataLatest");
+        let mut table_info = test_table_info();
+        table_info.table_info_dir = PathBuf::from("10kAdds0CommitsSinceChkpt1V2Chkpt");
+        let workload = Workload {
+            table_info,
+            case_name: "readMetadataLatest".to_string(),
+            spec: Spec::Read(test_read_spec()),
+        };
+        let read = registry.read_configs(&workload).unwrap();
         assert_eq!(
             read.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["serial", "parallel2"]
@@ -601,12 +608,17 @@ mod tests {
         let Ok(workloads) = load_all_workloads() else {
             return; // workload archive not downloaded -- nothing to cross-check
         };
-        let spec_by_key: HashMap<(&str, &str), &Spec> = workloads
+        let workload_by_key: HashMap<(&str, &str), &Workload> = workloads
             .iter()
             .map(|w| {
                 (
-                    (w.table_info.dir_name.as_str(), w.case_name.as_str()),
-                    &w.spec,
+                    (
+                        w.table_info
+                            .registry_table_key()
+                            .expect("loaded workloads must have a registry table key"),
+                        w.case_name.as_str(),
+                    ),
+                    w,
                 )
             })
             .collect();
@@ -616,11 +628,11 @@ mod tests {
             .expect("checked-in bench-registry.json must load and validate");
 
         for (table, case) in registry.keys() {
-            let spec = spec_by_key.get(&(table, case)).unwrap_or_else(|| {
+            let workload = workload_by_key.get(&(table, case)).unwrap_or_else(|| {
                 panic!("registry key '{table}/{case}' matches no workload (stale or typo'd?)")
             });
-            let resolved = match spec {
-                Spec::Read(_) => registry.read_configs(table, case).len(),
+            let resolved = match &workload.spec {
+                Spec::Read(_) => registry.read_configs(workload).unwrap().len(),
                 Spec::SnapshotConstruction(_) => panic!(
                     "registry key '{table}/{case}' refers to a snapshot-construction workload"
                 ),
