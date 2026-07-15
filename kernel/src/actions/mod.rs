@@ -1011,7 +1011,7 @@ impl SetTransaction {
     }
 }
 
-/// Reference to the root of the V4 content metadata tree.
+/// Reference to a root of of an adaptive metadata tree.
 ///
 /// Contains the path, size, and version of the root manifest file.
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1043,10 +1043,10 @@ pub(crate) struct ContentRoot {
     version: i64,
 }
 
-/// The checkpoint action embeds V4 metadata tree state in a Delta log entry.
+/// The checkpoint action embeds metadata tree state in a Delta log entry.
 ///
 /// When a manifest commit occurs, the Delta log entry contains a `checkpoint` action that
-/// references a V4 root manifest file. The `version` field indicates the table version up to
+/// references a root manifest file. The `version` field indicates the table version up to
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
@@ -1080,7 +1080,7 @@ pub(crate) struct CheckpointAction {
     /// The table protocol at the checkpoint version.
     pub(crate) protocol: Protocol,
     /// The table metadata at the checkpoint version.
-    pub(crate) meta_data: Metadata,
+    pub(crate) metadata: Metadata,
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1164,24 +1164,6 @@ impl CheckpointAction {
     #[internal_api]
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
         self.content_root.to_filemeta(table_root)
-    }
-
-    /// Fill missing protocol and metadata from this checkpoint action's nested fields.
-    ///
-    /// Manifest commits embed P+M inside the checkpoint action. This extracts them when
-    /// they haven't been found as top-level actions.
-    #[internal_api]
-    pub(crate) fn fill_missing_pm(
-        &self,
-        protocol_opt: &mut Option<Protocol>,
-        metadata_opt: &mut Option<Metadata>,
-    ) {
-        if protocol_opt.is_none() {
-            *protocol_opt = Some(self.protocol.clone());
-        }
-        if metadata_opt.is_none() {
-            *metadata_opt = Some(self.meta_data.clone());
-        }
     }
 }
 
