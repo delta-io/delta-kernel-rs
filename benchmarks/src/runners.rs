@@ -419,12 +419,16 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::slice;
     use std::sync::LazyLock;
 
     use delta_kernel_workloads::models::{ReadSpec, Spec, TableInfo, TimeTravel, Workload};
 
     use super::*;
+    use crate::registry::BenchRegistry;
+    use crate::utils::load_all_workloads;
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
@@ -576,11 +580,9 @@ mod tests {
     /// fails fast in `cargo test` rather than only when the harness runs.
     #[test]
     fn checked_in_registry_loads_and_validates() {
-        use crate::registry::BenchRegistry;
-
         let path = format!("{}/bench-registry.json", env!("CARGO_MANIFEST_DIR"));
-        let registry = BenchRegistry::load_from_path(std::path::Path::new(&path))
-            .expect("checked-in bench-registry.json must load and validate");
+        let registry = BenchRegistry::load_from_path(Path::new(&path))
+            .expect("checked-in bench-registry.json must load");
         let mut table_info = test_table_info();
         table_info.table_info_dir = PathBuf::from("10kAdds0CommitsSinceChkpt1V2Chkpt");
         let workload = Workload {
@@ -588,6 +590,9 @@ mod tests {
             case_name: "readMetadataLatest".to_string(),
             spec: Spec::Read(test_read_spec()),
         };
+        registry
+            .validate(slice::from_ref(&workload))
+            .expect("checked-in bench-registry.json must validate");
         let read = registry.read_configs(&workload).unwrap();
         assert_eq!(
             read.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
@@ -600,11 +605,6 @@ mod tests {
     /// Skips when the downloaded workload archive is absent (e.g. offline unit runs).
     #[test]
     fn checked_in_registry_keys_match_real_workloads() {
-        use std::collections::HashMap;
-
-        use crate::registry::BenchRegistry;
-        use crate::utils::load_all_workloads;
-
         let Ok(workloads) = load_all_workloads() else {
             return; // workload archive not downloaded -- nothing to cross-check
         };
@@ -624,20 +624,16 @@ mod tests {
             .collect();
 
         let path = format!("{}/bench-registry.json", env!("CARGO_MANIFEST_DIR"));
-        let registry = BenchRegistry::load_from_path(std::path::Path::new(&path))
-            .expect("checked-in bench-registry.json must load and validate");
+        let registry = BenchRegistry::load_from_path(Path::new(&path))
+            .expect("checked-in bench-registry.json must load");
+        registry
+            .validate(&workloads)
+            .expect("registry configs must match workload types");
 
         for (table, case) in registry.keys() {
-            let workload = workload_by_key.get(&(table, case)).unwrap_or_else(|| {
+            workload_by_key.get(&(table, case)).unwrap_or_else(|| {
                 panic!("registry key '{table}/{case}' matches no workload (stale or typo'd?)")
             });
-            let resolved = match &workload.spec {
-                Spec::Read(_) => registry.read_configs(workload).unwrap().len(),
-                Spec::SnapshotConstruction(_) => panic!(
-                    "registry key '{table}/{case}' refers to a snapshot-construction workload"
-                ),
-            };
-            assert_ne!(resolved, 0);
         }
     }
 

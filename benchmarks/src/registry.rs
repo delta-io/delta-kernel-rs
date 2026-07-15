@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use delta_kernel_workloads::models::Workload;
+use delta_kernel_workloads::models::{Spec, Workload};
 use serde::Deserialize;
 
 // === Harness configs ===
@@ -69,14 +69,15 @@ pub struct BenchRegistry {
 }
 
 impl BenchRegistry {
-    /// Load and validate a registry from `path`.
+    /// Loads a registry from `path`.
+    ///
+    /// Returns an error when the file cannot be read or deserialized. Call [`Self::validate`]
+    /// before using the registry.
     pub fn load_from_path(path: &Path) -> RegistryResult<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("reading registry {}: {e}", path.display()))?;
-        let registry: BenchRegistry = serde_json::from_str(&content)
-            .map_err(|e| format!("parsing registry {}: {e}", path.display()))?;
-        registry.validate()?;
-        Ok(registry)
+        serde_json::from_str(&content)
+            .map_err(|e| format!("parsing registry {}: {e}", path.display()).into())
     }
 
     /// Returns the registry configs for a read workload, or the built-in serial config when the
@@ -93,6 +94,47 @@ impl BenchRegistry {
         Ok(self
             .lookup(table, &workload.case_name)
             .map_or_else(default_read_configs, ToOwned::to_owned))
+    }
+
+    /// Validates the registry structure and its relationship to `workloads`.
+    ///
+    /// Only registry entries matching a workload in `workloads` receive workload-type validation,
+    /// allowing callers to validate a tag-filtered workload set. Returns an error for empty config
+    /// lists, duplicate config names, invalid workload registry keys, or read configs targeting a
+    /// non-read workload.
+    pub fn validate(&self, workloads: &[Workload]) -> RegistryResult<()> {
+        for (table, cases) in &self.tables {
+            for (case, configs) in cases {
+                let key = format!("{table}/{case}");
+                if configs.is_empty() {
+                    return Err(format!("registry entry '{key}' has an empty config list").into());
+                }
+                let names: HashSet<_> = configs.iter().map(|config| config.name.as_str()).collect();
+                if names.len() != configs.len() {
+                    return Err(format!("registry entry '{key}' has duplicate config names").into());
+                }
+            }
+        }
+
+        for workload in workloads {
+            let table = workload.table_info.registry_table_key().ok_or_else(|| {
+                format!(
+                    "could not derive a registry table key for workload '{}'",
+                    workload.case_name
+                )
+            })?;
+            if self.lookup(table, &workload.case_name).is_some() {
+                if let Spec::SnapshotConstruction(_) = &workload.spec {
+                    return Err(format!(
+                        "registry entry '{table}/{}' provides read configs for a {} workload",
+                        workload.case_name,
+                        workload.spec.as_str()
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// All `(table, case)` keys in the registry. Lets the harness cross-check every entry against
@@ -113,32 +155,6 @@ impl BenchRegistry {
             .and_then(|cases| cases.get(case))
             .map(Vec::as_slice)
     }
-
-    /// Validate every read config list independently of which benchmarks are later looked up.
-    fn validate(&self) -> RegistryResult<()> {
-        for (table, cases) in &self.tables {
-            for (case, configs) in cases {
-                let key = format!("{table}/{case}");
-                check_config_names(configs.iter().map(|c| c.name.as_str()), &key)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Errors if `names` is empty or contains a repeat. `ctx` identifies the offending list. An empty
-/// list would otherwise expand to zero benchmarks, silently dropping the benchmark.
-fn check_config_names<'a>(names: impl Iterator<Item = &'a str>, ctx: &str) -> RegistryResult<()> {
-    let mut seen = HashSet::new();
-    for name in names {
-        if !seen.insert(name) {
-            return Err(format!("duplicate config name '{name}' in '{ctx}'").into());
-        }
-    }
-    if seen.is_empty() {
-        return Err(format!("registry entry '{ctx}' has an empty config list").into());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -151,7 +167,7 @@ mod tests {
 
     fn registry_from_str(json: &str) -> BenchRegistry {
         let registry: BenchRegistry = serde_json::from_str(json).expect("failed to parse registry");
-        registry.validate().expect("registry should validate");
+        registry.validate(&[]).expect("registry should validate");
         registry
     }
 
@@ -230,7 +246,28 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_config_names_error_at_load() {
+    fn workload_validation_accepts_read_configs_for_read_workload() {
+        let registry = registry_from_str(FULL_REGISTRY);
+        registry
+            .validate(&[read_workload("v2", "readMetadataLatest")])
+            .unwrap();
+    }
+
+    #[test]
+    fn workload_validation_rejects_read_configs_for_snapshot_workload() {
+        let registry = registry_from_str(FULL_REGISTRY);
+        let mut workload = read_workload("v2", "readMetadataLatest");
+        workload.spec = serde_json::from_str(r#"{"type":"snapshotConstruction"}"#).unwrap();
+
+        let error = registry.validate(&[workload]).unwrap_err().to_string();
+        assert!(
+            error.contains("provides read configs for a snapshotConstruction workload"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_config_names_error_at_validation() {
         let json = r#"{
             "t": { "readMetadataLatest": [
                 { "name": "dup", "parallelScan": "disabled" },
@@ -238,18 +275,18 @@ mod tests {
             ] }
         }"#;
         let registry: BenchRegistry = serde_json::from_str(json).unwrap();
-        let err = registry.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate config name 'dup'"), "got: {err}");
+        let err = registry.validate(&[]).unwrap_err().to_string();
+        assert!(err.contains("duplicate config names"), "got: {err}");
     }
 
     #[test]
-    fn empty_config_list_errors_at_load() {
+    fn empty_config_list_errors_at_validation() {
         // An explicit `[]` would expand to zero benchmarks, silently dropping the benchmark, so it
         // is rejected at load rather than accepted like a missing key (which falls back to
         // default).
         let json = r#"{ "t": { "readMetadataLatest": [] } }"#;
         let registry: BenchRegistry = serde_json::from_str(json).unwrap();
-        let err = registry.validate().unwrap_err().to_string();
+        let err = registry.validate(&[]).unwrap_err().to_string();
         assert!(err.contains("empty config list"), "got: {err}");
     }
 

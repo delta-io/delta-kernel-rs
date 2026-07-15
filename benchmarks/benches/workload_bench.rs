@@ -30,6 +30,9 @@ fn workload_benchmarks(c: &mut Criterion) {
 
     let registry = BenchRegistry::load_from_path(Path::new(REGISTRY_PATH))
         .expect("Failed to load bench-registry.json");
+    registry
+        .validate(&workloads)
+        .expect("bench-registry.json must match the loaded workload types");
 
     let reporter = Arc::new(CountingReporter::new());
     let runtime = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create tokio runtime"));
