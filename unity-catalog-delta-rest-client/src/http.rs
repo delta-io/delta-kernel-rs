@@ -17,6 +17,11 @@ pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         ),
+        // Identifies the calling client to UC.
+        (
+            header::USER_AGENT,
+            header::HeaderValue::from_str(&config.user_agent)?,
+        ),
     ]);
 
     let client = Client::builder()
