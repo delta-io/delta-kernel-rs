@@ -121,19 +121,17 @@ pub(crate) static CONTENT_ROOT_FIELD: LazyLock<StructField> =
 
 /// A `sidecar` element inside a `checkpoint` action array. Unlike the V2-checkpoint [`Sidecar`]
 /// (which references spilled file actions), this references spilled user `txn` / `domainMetadata`
-/// entries, discriminated by its `type` field (`"txn"` or `"domainMetadata"`). Declared inline as a
-/// wire schema rather than via [`ToSchema`] because a `type` field cannot be produced from a Rust
-/// identifier (`stringify!(r#type)` keeps the `r#`), and no in-memory type consumes it yet (#2866).
+/// entries, discriminated by its `type` field (`"txn"` or `"domainMetadata"`). Its shape is a
+/// [`Sidecar`] prefixed with that `type` column, so the schema is composed from
+/// [`Sidecar::to_schema`] here rather than duplicated: `type` cannot be produced by [`ToSchema`]
+/// (which stringifies the Rust identifier, and `r#type` stringifies to `"r#type"`).
 #[cfg(feature = "adaptive-metadata-in-dev")]
 static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     StructField::nullable(
         SIDECAR_NAME,
         schema! {
             not_null "type": STRING,
-            not_null "path": STRING,
-            not_null "sizeInBytes": LONG,
-            not_null "modificationTime": LONG,
-            nullable "tags": { STRING => nullable STRING },
+            ..(Sidecar::to_schema().into_fields()),
         },
     )
 });
@@ -1050,20 +1048,23 @@ pub(crate) struct ContentRoot {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
-/// The wire schema (`CHECKPOINT_ACTION_ELEMENT_SCHEMA`) recognizes `txn`, `domainMetadata`, and
-/// `sidecar` array elements in addition to those extracted below; this struct surfaces only
-/// `version`, `contentRoot`, `protocol`, and `metaData` today (#2866 will consume the rest).
+/// This struct carries every element type the wire array may hold: the `version`, `contentRoot`,
+/// `protocol`, and `metaData` extracted below, plus the inline `txn` / `domainMetadata` entries and
+/// their `sidecar` references. Population from wire data lands with the checkpoint reader (#2866);
+/// the collection fields default to empty until then.
 ///
 /// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
 ///
-/// Example manifest-commit JSON (this struct reads only these element types; the array may also
-/// carry `txn`, `domainMetadata`, and `sidecar`):
+/// Example manifest-commit JSON:
 /// ```json
 /// { "checkpoint": [
 ///     { "checkpointMetadata": { "version": 42 } },
 ///     { "contentRoot": { "path": "...", "sizeInBytes": 1024, "version": 42 } },
 ///     { "protocol": { ... } },
-///     { "metaData": { ... } }
+///     { "metaData": { ... } },
+///     { "txn": { ... } },
+///     { "domainMetadata": { ... } },
+///     { "sidecar": { "type": "txn", "path": "...", "sizeInBytes": 1024, "modificationTime": 0 } }
 ///   ]
 /// }
 /// ```
@@ -1081,6 +1082,14 @@ pub(crate) struct CheckpointAction {
     pub(crate) protocol: Protocol,
     /// The table metadata at the checkpoint version.
     pub(crate) metadata: Metadata,
+    /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint array.
+    pub(crate) transactions: Vec<SetTransaction>,
+    /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint array.
+    pub(crate) domain_metadata: Vec<DomainMetadata>,
+    /// `sidecar` entries of type `txn`, referencing spilled [`SetTransaction`] actions.
+    pub(crate) txn_sidecars: Vec<Sidecar>,
+    /// `sidecar` entries of type `domainMetadata`, referencing spilled [`DomainMetadata`] actions.
+    pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
 }
 
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -2441,6 +2450,22 @@ mod tests {
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_content_sidecar_is_type_prefixed_sidecar() {
+        // The content-sidecar schema is composed from `Sidecar::to_schema()` with a `type`
+        // discriminator prepended, so it must equal exactly `type` followed by `Sidecar`'s fields.
+        let DataType::Struct(content_sidecar) = CONTENT_SIDECAR_FIELD.data_type() else {
+            panic!("content sidecar should be a struct");
+        };
+        let expected: Vec<StructField> =
+            std::iter::once(StructField::not_null("type", DataType::STRING))
+                .chain(Sidecar::to_schema().into_fields())
+                .collect();
+        let actual: Vec<StructField> = content_sidecar.fields().cloned().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
     #[rstest]
     #[case::relative_path(
         "memory:///table/",
@@ -2535,7 +2560,11 @@ mod tests {
                 version: 1,
             },
             protocol: Protocol::new_unchecked(1, 2, None, None),
-            meta_data: Metadata::default(),
+            metadata: Metadata::default(),
+            transactions: Vec::new(),
+            domain_metadata: Vec::new(),
+            txn_sidecars: Vec::new(),
+            domain_metadata_sidecars: Vec::new(),
         };
 
         let result = checkpoint_action.root_filemeta(&table_root);
@@ -2548,51 +2577,5 @@ mod tests {
             }
             Err(expected_message) => assert_result_error_with_message(result, expected_message),
         }
-    }
-
-    #[cfg(feature = "adaptive-metadata-in-dev")]
-    #[rstest]
-    fn test_fill_missing_pm_fills_only_when_absent(
-        #[values(true, false)] protocol_present: bool,
-        #[values(true, false)] metadata_present: bool,
-    ) {
-        let checkpoint_action = CheckpointAction {
-            version: 1,
-            content_root: ContentRoot {
-                path: "root.parquet".to_string(),
-                size_in_bytes: 1024,
-                version: 1,
-            },
-            protocol: Protocol::new_unchecked(3, 7, Some(vec![]), Some(vec![])),
-            meta_data: Metadata {
-                id: "from-checkpoint".to_string(),
-                ..Default::default()
-            },
-        };
-
-        // Distinct from the checkpoint's own P+M, so a wrongly-overwritten value is detectable.
-        let existing_protocol = Protocol::new_unchecked(1, 2, None, None);
-        let existing_metadata = Metadata {
-            id: "pre-existing".to_string(),
-            ..Default::default()
-        };
-
-        let mut protocol_opt = protocol_present.then(|| existing_protocol.clone());
-        let mut metadata_opt = metadata_present.then(|| existing_metadata.clone());
-
-        checkpoint_action.fill_missing_pm(&mut protocol_opt, &mut metadata_opt);
-
-        let expected_protocol = if protocol_present {
-            existing_protocol
-        } else {
-            checkpoint_action.protocol.clone()
-        };
-        let expected_metadata = if metadata_present {
-            existing_metadata
-        } else {
-            checkpoint_action.meta_data.clone()
-        };
-        assert_eq!(protocol_opt, Some(expected_protocol));
-        assert_eq!(metadata_opt, Some(expected_metadata));
     }
 }
