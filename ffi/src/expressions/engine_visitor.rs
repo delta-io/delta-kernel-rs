@@ -588,6 +588,8 @@ fn visit_expression_scalar(
                 scale
             )
         }
+        // TODO (#2811): the following is intentional just for this PR, will be addressed
+        // when FFI support for interval types is added
         Scalar::IntervalYearMonth(_) => {
             visit_unknown(visitor, sibling_list_id, "interval_year_month_literal")
         }

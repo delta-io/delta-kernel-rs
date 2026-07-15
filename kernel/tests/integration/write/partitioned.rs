@@ -140,7 +140,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
     DataType::INTERVAL_DAY_TIME,
     Arc::new(Int64Array::from(vec![131_445_000_000i64])) as ArrayRef,
     Scalar::IntervalDayTime(131_445_000_000),
-    "INTERVAL '1 12:30:45.000000' DAY TO SECOND"
+    "INTERVAL '1 12:30:45' DAY TO SECOND"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_interval_roundtrip(
@@ -205,7 +205,7 @@ async fn test_write_partitioned_interval_roundtrip(
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
     Scalar::IntervalDayTime(131_445_000_000),
-    "INTERVAL '1 12:30:45.000000' DAY TO SECOND"
+    "INTERVAL '1 12:30:45' DAY TO SECOND"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_materialized_partitioned_interval_roundtrip(

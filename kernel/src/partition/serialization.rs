@@ -14,7 +14,6 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::expressions::scalars::{format_day_time_interval, format_year_month_interval};
 use crate::expressions::{DecimalData, Scalar};
 use crate::{DeltaResult, Error};
 
@@ -93,9 +92,6 @@ pub fn serialize_partition_value(value: &Scalar) -> DeltaResult<Option<String>> 
         Scalar::Date(days) => Ok(Some(format_date(*days)?)),
         Scalar::Timestamp(us) => Ok(Some(format_timestamp(*us)?)),
         Scalar::TimestampNtz(us) => Ok(Some(format_timestamp_ntz(*us)?)),
-        // Intervals serialize as Spark ANSI interval literal strings (e.g.
-        // `INTERVAL '1-0' YEAR TO MONTH`).
-        // Inverse of `PrimitiveType::parse_scalar`.
         Scalar::IntervalYearMonth(months) => Ok(Some(format_year_month_interval(*months))),
         Scalar::IntervalDayTime(micros) => Ok(Some(format_day_time_interval(*micros))),
         Scalar::Decimal(d) => Ok(Some(format_decimal(d))),
@@ -195,6 +191,27 @@ fn format_timestamp(micros: i64) -> DeltaResult<String> {
 fn format_timestamp_ntz(micros: i64) -> DeltaResult<String> {
     micros_to_datetime(micros, "timestamp_ntz")
         .map(|dt| dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+}
+
+fn format_year_month_interval(months: i32) -> String {
+    let sign = if months < 0 { "-" } else { "" };
+    let abs = months.unsigned_abs();
+    format!("INTERVAL '{sign}{}-{}' YEAR TO MONTH", abs / 12, abs % 12)
+}
+
+fn format_day_time_interval(micros: i64) -> String {
+    let sign = if micros < 0 { "-" } else { "" };
+    let abs = micros.unsigned_abs();
+    let fraction = format!("{:06}", abs % 1_000_000);
+    let fraction = fraction.trim_end_matches('0');
+    let separator = if fraction.is_empty() { "" } else { "." };
+    let total_secs = abs / 1_000_000;
+    let (secs, total_mins) = (total_secs % 60, total_secs / 60);
+    let (mins, total_hours) = (total_mins % 60, total_mins / 60);
+    let (hours, days) = (total_hours % 24, total_hours / 24);
+    format!(
+        "INTERVAL '{sign}{days} {hours:02}:{mins:02}:{secs:02}{separator}{fraction}' DAY TO SECOND"
+    )
 }
 
 /// Formats a decimal value preserving scale (trailing zeros).
@@ -528,11 +545,15 @@ mod tests {
     #[case::interval_ym(Scalar::IntervalYearMonth(30), PrimitiveType::IntervalYearMonth)]
     #[case::interval_ym_neg(Scalar::IntervalYearMonth(-18), PrimitiveType::IntervalYearMonth)]
     #[case::interval_ym_zero(Scalar::IntervalYearMonth(0), PrimitiveType::IntervalYearMonth)]
+    #[case::interval_ym_min(Scalar::IntervalYearMonth(i32::MIN), PrimitiveType::IntervalYearMonth)]
+    #[case::interval_ym_max(Scalar::IntervalYearMonth(i32::MAX), PrimitiveType::IntervalYearMonth)]
     #[case::interval_dt(
         Scalar::IntervalDayTime(131_445_000_000),
         PrimitiveType::IntervalDayTime
     )]
     #[case::interval_dt_neg(Scalar::IntervalDayTime(-5), PrimitiveType::IntervalDayTime)]
+    #[case::interval_dt_min(Scalar::IntervalDayTime(i64::MIN), PrimitiveType::IntervalDayTime)]
+    #[case::interval_dt_max(Scalar::IntervalDayTime(i64::MAX), PrimitiveType::IntervalDayTime)]
     fn test_roundtrip(#[case] input: Scalar, #[case] ptype: PrimitiveType) {
         let serialized = serialize_partition_value(&input).unwrap().unwrap();
         let parsed = ptype.parse_scalar(&serialized).unwrap();
@@ -546,7 +567,7 @@ mod tests {
     #[case(Scalar::IntervalYearMonth(30), "INTERVAL '2-6' YEAR TO MONTH")]
     #[case(
         Scalar::IntervalDayTime(131_445_000_000),
-        "INTERVAL '1 12:30:45.000000' DAY TO SECOND"
+        "INTERVAL '1 12:30:45' DAY TO SECOND"
     )]
     fn test_spark_ref_interval(#[case] input: Scalar, #[case] expected: &str) {
         assert_eq!(

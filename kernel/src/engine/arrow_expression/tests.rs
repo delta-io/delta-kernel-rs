@@ -1496,8 +1496,7 @@ fn test_void_scalar_to_array() {
     assert_eq!(*array.data_type(), DataType::Null);
 }
 
-// Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros),
-// for both concrete values (append_to) and nulls (append_null).
+// Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
 #[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
 #[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
