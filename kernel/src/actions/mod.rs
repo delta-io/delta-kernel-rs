@@ -1046,7 +1046,6 @@ pub(crate) struct ContentRoot {
 /// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
 /// the table protocol and metadata, making the commit self-contained with respect to P+M.
 ///
-/// the collection fields default to empty until then.
 ///
 /// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
 ///
