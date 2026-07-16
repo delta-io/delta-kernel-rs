@@ -928,6 +928,21 @@ impl LogSegment {
         }
     }
 
+    /// Reads a parquet footer schema, failing fast if cancellation was already requested. The
+    /// pre-read `check_cancelled` is the only cancellation point when the engine uses the default
+    /// (non-cancellation-aware) footer impl, so it must stay paired with the read.
+    fn read_footer_schema(
+        engine: &dyn Engine,
+        file: &FileMeta,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<SchemaRef> {
+        check_cancelled(cancellation_token)?;
+        Ok(engine
+            .parquet_handler()
+            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
+            .schema)
+    }
+
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
     /// available or reading the parquet footer otherwise.
     fn read_checkpoint_schema(
@@ -938,16 +953,7 @@ impl LogSegment {
     ) -> DeltaResult<SchemaRef> {
         match hint_schema {
             Some(schema) => Ok(schema.clone()),
-            None => {
-                check_cancelled(cancellation_token)?;
-                Ok(engine
-                    .parquet_handler()
-                    .read_parquet_footer_with_cancellation(
-                        &checkpoint.location,
-                        cancellation_token.cloned(),
-                    )?
-                    .schema)
-            }
+            None => Self::read_footer_schema(engine, &checkpoint.location, cancellation_token),
         }
     }
 
@@ -963,15 +969,7 @@ impl LogSegment {
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         let sidecar_files = self.extract_sidecar_refs(engine, checkpoint, cancellation_token)?;
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => {
-                check_cancelled(cancellation_token)?;
-                Some(
-                    engine
-                        .parquet_handler()
-                        .read_parquet_footer_with_cancellation(first, cancellation_token.cloned())?
-                        .schema,
-                )
-            }
+            Some(first) => Some(Self::read_footer_schema(engine, first, cancellation_token)?),
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))

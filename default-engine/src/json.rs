@@ -165,15 +165,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let future = read_json_files_impl(
-            self.store.clone(),
-            files.to_vec(),
-            physical_schema,
-            predicate,
-            self.batch_size.get(),
-            self.buffer_size.get(),
-        );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        self.read_json_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
     fn read_json_files_with_cancellation(

@@ -261,9 +261,8 @@ pub enum Error {
 
     /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
     ///
-    /// Surfaced by cancellation-aware reads (e.g. a scan whose builder was given a token) as a
-    /// terminal iterator item; it is deliberately distinct from normal iterator exhaustion so a
-    /// cancelled listing can never be mistaken for a complete one.
+    /// Surfaced by cancellation-aware reads as a terminal error, distinct from normal iterator
+    /// exhaustion. See [`CancellableIterator`](crate::cancellation) for the enforced contract.
     #[error("Operation cancelled")]
     Cancelled,
 }
@@ -281,11 +280,6 @@ impl Error {
     }
     pub fn generic(msg: impl ToString) -> Self {
         Self::Generic(msg.to_string())
-    }
-    /// Constructs an [`Error::Cancelled`], signalling that a cancellation-aware operation was
-    /// stopped via its [`CancellationToken`](crate::CancellationToken).
-    pub fn cancelled() -> Self {
-        Self::Cancelled
     }
     pub fn file_not_found(path: impl ToString) -> Self {
         Self::FileNotFound(path.to_string())

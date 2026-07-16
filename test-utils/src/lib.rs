@@ -1398,38 +1398,52 @@ pub struct AddInfo {
     pub stats: Option<serde_json::Value>,
 }
 
-/// A simple [`CancellationToken`] for tests, backed by an atomic bool. Start uncancelled and
-/// flip it with [`cancel`](Self::cancel), or construct one already cancelled with
-/// [`cancelled`](Self::cancelled), to drive cancellation-aware reads.
+/// A [`CancellationToken`] for tests. Start uncancelled and flip it with
+/// [`cancel`](Self::cancel), or construct one already cancelled with
+/// [`cancelled`](Self::cancelled).
+///
+/// The [`cancelled`](CancellationToken::cancelled) future is backed by a [`tokio::sync::Notify`]
+/// so it resolves when [`cancel`](Self::cancel) fires even from another thread -- this drives the
+/// default engine's mid-read cancellation race, not just the synchronous `is_cancelled` poll.
 #[derive(Debug, Default)]
-pub struct TestCancellationToken(std::sync::atomic::AtomicBool);
+pub struct TestCancellationToken {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
 
 impl TestCancellationToken {
     /// A token that is already cancelled.
     pub fn cancelled() -> Self {
-        Self(std::sync::atomic::AtomicBool::new(true))
+        let token = Self::default();
+        token.cancel();
+        token
     }
 
-    /// Request cancellation.
+    /// Request cancellation, waking any future returned by
+    /// [`cancelled`](CancellationToken::cancelled).
     pub fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 }
 
 impl CancellationToken for TestCancellationToken {
     fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn cancelled(&self) -> CancelledFuture<'_> {
-        // Resolves immediately when already cancelled, otherwise never — enough for tests that
-        // cancel before/around a read and rely on the synchronous `is_cancelled` poll and the
-        // engine's pre-read check.
-        if self.is_cancelled() {
-            Box::pin(std::future::ready(()))
-        } else {
-            Box::pin(std::future::pending())
-        }
+        Box::pin(async move {
+            // `notified()` must be registered before the cancellation check to avoid missing a
+            // `notify_waiters` that races between the two; an already-cancelled token still
+            // returns immediately via the check.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        })
     }
 }
 

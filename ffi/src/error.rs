@@ -71,6 +71,7 @@ pub enum KernelError {
     SchemaError = 42,
     LogHistoryError = 43,
     RowTrackingChangeFeedUnsupported = 44,
+    CancelledError = 45,
 }
 
 impl From<Error> for KernelError {
@@ -136,6 +137,7 @@ impl From<Error> for KernelError {
             }
             Error::Schema(_) => KernelError::SchemaError,
             Error::LogHistory(_) => KernelError::LogHistoryError,
+            Error::Cancelled => KernelError::CancelledError,
             _ => KernelError::UnknownError,
         }
     }
@@ -338,6 +340,9 @@ impl From<EngineExecError> for Error {
             }
             code @ KernelError::MissingMetadataAndProtocolError => {
                 messageless_error(code, message, Error::MissingMetadataAndProtocol)
+            }
+            code @ KernelError::CancelledError => {
+                messageless_error(code, message, Error::Cancelled)
             }
 
             // These codes have no well-defined equivalent (e.g they wrap a foreign error type,

@@ -40,6 +40,21 @@ impl std::fmt::Debug for MeteredParquetHandler {
     }
 }
 
+impl MeteredParquetHandler {
+    /// Wraps an inner read iterator so it emits `ParquetReadCompleted` with `(num_files,
+    /// bytes_read)` when exhausted or dropped.
+    fn meter(files: &[FileMeta], inner: FileDataReadResultIterator) -> FileDataReadResultIterator {
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
+        Box::new(PrecountedMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_parquet_read_completed,
+        ))
+    }
+}
+
 impl ParquetHandler for MeteredParquetHandler {
     fn read_parquet_files(
         &self,
@@ -47,17 +62,10 @@ impl ParquetHandler for MeteredParquetHandler {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let num_files = files.len() as u64;
-        let bytes_read = files.iter().map(|f| f.size).sum();
         let inner = self
             .inner
             .read_parquet_files(files, physical_schema, predicate)?;
-        Ok(Box::new(PrecountedMetricsIterator::new(
-            inner,
-            num_files,
-            bytes_read,
-            emit_parquet_read_completed,
-        )))
+        Ok(Self::meter(files, inner))
     }
 
     fn read_parquet_files_with_cancellation(
@@ -67,20 +75,13 @@ impl ParquetHandler for MeteredParquetHandler {
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        let num_files = files.len() as u64;
-        let bytes_read = files.iter().map(|f| f.size).sum();
         let inner = self.inner.read_parquet_files_with_cancellation(
             files,
             physical_schema,
             predicate,
             cancellation_token,
         )?;
-        Ok(Box::new(PrecountedMetricsIterator::new(
-            inner,
-            num_files,
-            bytes_read,
-            emit_parquet_read_completed,
-        )))
+        Ok(Self::meter(files, inner))
     }
 
     fn write_parquet_file(

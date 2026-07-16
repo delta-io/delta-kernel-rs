@@ -563,4 +563,58 @@ mod tests {
         let url = Url::parse("https://example.com").unwrap();
         assert!(!url.is_presigned());
     }
+
+    // `block_on_or_cancelled` must return `None` (cancel won the race) when the future never
+    // completes on its own and the token fires while it is pending -- the `Either::Right` arm
+    // that the pre-cancelled fast-path never exercises.
+    #[test]
+    fn block_on_or_cancelled_none_when_cancel_wins_race() {
+        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        let token = Arc::new(test_utils::TestCancellationToken::default());
+        let ct: CancellationTokenRef = token.clone();
+
+        // Fire cancellation shortly after the block begins; the only way out is the cancel arm.
+        let firing = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            firing.cancel();
+        });
+
+        let out: Option<i32> = block_on_or_cancelled(&executor, &ct, std::future::pending::<i32>());
+        assert!(out.is_none(), "cancel must win the select and yield None");
+    }
+
+    // A stream that yields two items then blocks forever is cancelled mid-stream: the iterator
+    // yields the ready items, then exactly one `Err(Cancelled)`, then fuses.
+    #[test]
+    fn cancellable_stream_iterator_cancels_mid_stream_then_fuses() {
+        use futures::stream;
+
+        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        let token = Arc::new(test_utils::TestCancellationToken::default());
+        let ct: CancellationTokenRef = token.clone();
+
+        // 0, 1, then a pending tail that never resolves on its own.
+        let make_stream = async move {
+            let head = stream::iter(vec![Ok(0i32), Ok(1i32)]);
+            let tail = stream::once(std::future::pending::<DeltaResult<i32>>());
+            Ok(head.chain(tail).boxed())
+        };
+        let mut iter = stream_future_to_cancellable_iter(executor, make_stream, Some(ct)).unwrap();
+
+        assert!(matches!(iter.next(), Some(Ok(0))));
+        assert!(matches!(iter.next(), Some(Ok(1))));
+
+        let firing = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            firing.cancel();
+        });
+
+        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+        assert!(
+            iter.next().is_none(),
+            "iterator must fuse after cancellation"
+        );
+    }
 }
