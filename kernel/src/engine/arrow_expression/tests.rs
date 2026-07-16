@@ -1516,8 +1516,6 @@ fn test_interval_scalar_to_array_unsupported(#[case] interval_type: KernelDataTy
     .unwrap()
 ))))]
 fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
-    // Geo appends route through a dedicated unsupported arm; use a Binary builder since geo is
-    // WKB-encoded, though PR1 rejects it before touching the builder.
     let mut builder: Box<dyn crate::arrow::array::ArrayBuilder> =
         Box::new(crate::arrow::array::BinaryBuilder::new());
     let err = Scalar::append_null(builder.as_mut(), &dt, 1).unwrap_err();

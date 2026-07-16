@@ -1976,17 +1976,10 @@ pub enum PrimitiveType {
     IntervalDayTime,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
-    /// Geometry column: WKB-encoded values carrying a coordinate reference system (CRS).
-    /// The serde form is the `schemaString` type name `geometry(<crs>)`, spelled with
-    /// parentheses unlike the single-word siblings, so the mapping is not self-evident.
-    /// Kernel represents the type in schemas but does not yet support engine operations on
-    /// it (arrow conversion, scalar parsing, stats).
+    /// Geometry column with an associated coordinate reference system (CRS).
     #[serde(serialize_with = "serialize_geometry", untagged)]
     Geometry(Box<GeometryType>),
-    /// Geography column: WKB-encoded values carrying a CRS and an edge interpolation
-    /// algorithm. As with [`PrimitiveType::Geometry`], the serde form is the multi-part
-    /// `schemaString` type name `geography(<crs>, <algorithm>)`, and engines do not yet
-    /// operate on the type.
+    /// Geography column with an associated CRS and edge interpolation algorithm.
     #[serde(serialize_with = "serialize_geography", untagged)]
     Geography(Box<GeographyType>),
 }
