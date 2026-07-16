@@ -17,7 +17,7 @@ use crate::expressions::ColumnName;
 use crate::{DeltaResult, Error};
 
 /// An operand of a comparison: a column reference (its as-written path) or a literal (raw source
-/// text, e.g. `42`, `'foo'`, `NULL`). Both are resolved/typed during lowering.
+/// text, e.g. `42`, `'foo'`, `NULL`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Operand {
     Column(ColumnName),
