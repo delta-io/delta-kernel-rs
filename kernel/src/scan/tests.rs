@@ -1394,8 +1394,11 @@ fn test_checkpoint_row_group_skipping(
     }
 }
 
+/// `StatsOptions::none()` disables data-column skipping (no stats are read). Partition pruning is
+/// a separate path that survives `none()`, but this table is unpartitioned and the predicate is on
+/// a data column, so no skipping applies and every file is kept.
 #[test]
-fn test_skip_stats_disables_data_skipping() {
+fn test_skip_stats_disables_data_column_skipping() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());

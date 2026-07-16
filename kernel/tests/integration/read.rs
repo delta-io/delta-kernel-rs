@@ -21,7 +21,9 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
-use delta_kernel::scan::{Scan, StatsOptions};
+use delta_kernel::scan::{
+    AfterSequentialScanMetadata, ParallelScanMetadata, PartitionValuesOptions, Scan, StatsOptions,
+};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
@@ -882,6 +884,170 @@ fn partition_pruning_with_checkpoint_parsed_values(
     Ok(())
 }
 
+/// Counts the files surviving data skipping (selected rows across `scan_metadata`) for `scan`.
+fn surviving_file_count(
+    engine: &dyn Engine,
+    scan: &Scan,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut count = 0;
+    for res in scan.scan_metadata(engine)? {
+        count = res?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+    }
+    Ok(count)
+}
+
+/// Like [`surviving_file_count`] but drives the two-phase `parallel_scan_metadata` path, rebuilding
+/// the worker `DataSkippingFilter` from the serialized `InternalScanState`. Dispatches one file per
+/// `ParallelScanMetadata` to maximize coverage of the worker rebuild.
+fn surviving_file_count_parallel(
+    engine: Arc<dyn Engine>,
+    scan: &Scan,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut count = 0;
+    let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+    for res in sequential.by_ref() {
+        count = res?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+    }
+    if let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? {
+        let state = Arc::from(state);
+        for file in files {
+            let parallel =
+                ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
+            for res in parallel {
+                count = res?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Partition pruning survives a stats-off scan on both the sequential and parallel scan paths, for
+/// both `StatsOptions::none()` and the empty `struct_columns([])` projection (which normalizes to
+/// the same stats-off behavior). The `app-txn-checkpoint` table has 4 files (2 per `modified`
+/// partition) behind a checkpoint carrying `partitionValues_parsed`; `modified = '2021-02-02'`
+/// matches 2 of them, and partition values come from the Add action's partition map rather than
+/// `stats_parsed`, so the count drops to 2 with no stats read.
+///
+/// The mixed case (`modified = '2021-02-02' AND value > 1000000`, matched by no row) shows the
+/// stats-off divergence: with stats off the data-column arm can't prune (keeps 2), while default
+/// stats prune it to 0.
+///
+/// The `use_parallel` axis guards the serialization round-trip: the parallel worker recomputes
+/// `partition_only_skip` from the serialized options, so it must match the sequential count.
+#[rstest::rstest]
+#[case::stats_off(StatsOptions::none(), false)]
+#[case::stats_on(StatsOptions::default(), true)]
+#[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_pruning_survives_stats_none(
+    #[case] stats: StatsOptions,
+    #[case] stats_on: bool,
+    #[values(false, true)] mixed_with_data_col: bool,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine_mt_executor(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let partition_pred = column_expr!("modified").eq(Expr::literal("2021-02-02"));
+    let predicate = if mixed_with_data_col {
+        Pred::and(
+            partition_pred,
+            Pred::gt(column_expr!("value"), Expr::literal(1_000_000i32)),
+        )
+    } else {
+        partition_pred
+    };
+
+    // Partition arm always narrows to 2. With stats on, the data arm additionally prunes the mixed
+    // case to 0; with stats off, the data arm can't prune, so the mixed case stays at 2.
+    let expected = if mixed_with_data_col && stats_on {
+        0
+    } else {
+        2
+    };
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats(stats)
+        .build()?;
+
+    let count = if use_parallel {
+        surviving_file_count_parallel(engine.clone(), &scan)?
+    } else {
+        surviving_file_count(engine.as_ref(), &scan)?
+    };
+    assert_eq!(count, expected);
+    Ok(())
+}
+
+/// A data-only predicate under `none()` gains no partition pruning even when `parsed_struct` output
+/// is requested. Requesting the typed struct populates the internal partition schema with all
+/// partition columns, so pruning must key off whether the predicate references a partition column,
+/// not off schema presence. Here `value > 0` references none, so all 4 files survive.
+#[test]
+fn data_only_predicate_under_none_with_parsed_struct_does_not_prune(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::gt(
+            column_expr!("value"),
+            Expr::literal(0i32),
+        )))
+        .with_stats(StatsOptions::none())
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()?;
+
+    assert_eq!(surviving_file_count(engine.as_ref(), &scan)?, 4);
+    Ok(())
+}
+
+/// A NULL partition value under `StatsOptions::none()` must yield the same surviving set as the
+/// default (stats-on) path -- decoupling partition pruning from stats must not shift NULL-partition
+/// semantics. This is a JSON-only table (no checkpoint), so `partitionValues_parsed` comes from
+/// `map_to_struct(partitionValues)`; a null partition value parses to a NULL scalar. Of the three
+/// files (id=1, id=2, id=NULL), `id = 2` keeps exactly the id=2 file on both paths: id=1 mismatches
+/// and the id=NULL file holds only `id IS NULL` rows, none of which can equal 2.
+#[rstest::rstest]
+#[case::stats_none(StatsOptions::none())]
+#[case::stats_default(StatsOptions::default())]
+#[tokio::test]
+async fn null_partition_pruning_matches_across_stats_options(
+    #[case] stats: StatsOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":["id"],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"id=1/{PARQUET_FILE1}","partitionValues":{{"id":"1"}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+        format!(r#"{{"add":{{"path":"id=2/{PARQUET_FILE2}","partitionValues":{{"id":"2"}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+        // A null partition value is serialized as JSON null in the partition map.
+        format!(r#"{{"add":{{"path":"id=__HIVE_DEFAULT_PARTITION__/{PARQUET_FILE3}","partitionValues":{{"id":null}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::eq(column_expr!("id"), Expr::literal(2))))
+        .with_stats(stats)
+        .build()?;
+
+    assert_eq!(surviving_file_count(engine.as_ref(), &scan)?, 1);
+    Ok(())
+}
+
 /// Test mixed predicates (partition + data stats) on a checkpoint with both
 /// `partitionValues_parsed` and `stats_parsed`. This exercises the unified columnar data skipping
 /// pass that evaluates both partition values and data column statistics together.
@@ -1013,12 +1179,15 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
 /// Test partition pruning on a table with column mapping (name mode). The logical partition
 /// column "category" has physical name "phys_category". With column mapping, `partitionValues`
 /// in the log uses physical column names, and the partition schema + predicate must also use
-/// physical names for `MapToStruct` extraction and data skipping to work correctly.
+/// physical names for `MapToStruct` extraction and data skipping to work correctly. The
+/// `StatsOptions::none()` cases pin that physical-name partition pruning survives the stats-off
+/// path, where the filter is kept alive only by the predicate's partition reference.
 #[rstest::rstest]
 #[case::partition_only(
     // Partition-only predicate: category = 'A' prunes the category=B file
     Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
     None,
+    StatsOptions::default(),
     1
 )]
 #[case::mixed_partition_and_data(
@@ -1029,6 +1198,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
         Pred::gt(column_expr!("val"), Expr::literal("z")),
     )),
     None,
+    StatsOptions::default(),
     1
 )]
 #[case::predicate_on_unprojected_data_column(
@@ -1037,6 +1207,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // schema and prune both files: max(phys_val)='z' is NOT > 'z'.
     Arc::new(Pred::gt(column_expr!("val"), Expr::literal("z"))),
     Some(vec!["category"]),
+    StatsOptions::default(),
     0
 )]
 #[case::predicate_on_unprojected_partition_column(
@@ -1045,12 +1216,31 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // using the physical partition name, keeping only the category=A file.
     Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
     Some(vec!["val"]),
+    StatsOptions::default(),
+    1
+)]
+#[case::partition_only_stats_none(
+    // Same partition-only predicate under `none()`: the filter is kept alive only because the
+    // predicate references a partition column, and pruning must still resolve `category` to its
+    // physical name `phys_category` with no stats read.
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    None,
+    StatsOptions::none(),
+    1
+)]
+#[case::unprojected_partition_stats_none(
+    // Partition predicate on an unprojected column under `none()`: exercises physical-name
+    // partition pruning on the stats-off path.
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    Some(vec!["val"]),
+    StatsOptions::none(),
     1
 )]
 #[tokio::test]
 async fn test_partition_pruning_with_column_mapping(
     #[case] predicate: Arc<Pred>,
     #[case] select_cols: Option<Vec<&'static str>>,
+    #[case] stats: StatsOptions,
     #[case] expected_files: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_arrow_array())])?;
@@ -1106,6 +1296,7 @@ async fn test_partition_pruning_with_column_mapping(
         .scan_builder()
         .with_schema_opt(projection)
         .with_predicate(predicate)
+        .with_stats(stats)
         .build()?;
 
     let stream = scan.execute(engine)?;

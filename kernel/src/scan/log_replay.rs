@@ -245,20 +245,41 @@ impl ScanLogReplayProcessor {
             _ => None,
         };
 
-        // When skip_stats is enabled, disable both data column skipping and partition pruning.
-        // Both rely on the same DataSkippingFilter columnar pass, so they are controlled together.
+        // `skip_stats` suppresses data-column skipping (no stats are read), but partition pruning
+        // survives it: partition values come from the Add action's partition map, not
+        // `stats_parsed`, so a predicate on partition columns can still prune files with no
+        // stats read at all. When `skip_stats` holds and the predicate references a
+        // partition column, we keep a partition-only filter alive (data stats stay off).
+        //
+        // The reference check is what gates this: a present `physical_partition_schema` does not
+        // imply the predicate touches partitions (requesting `parsed_struct` output populates it
+        // with all partition columns), so gate on the reference to avoid a per-batch all-keep
+        // filter.
+        let predicate_references_partition = || {
+            let (Some((predicate, _)), Some(partition_schema)) =
+                (&physical_predicate, &state_info.physical_partition_schema)
+            else {
+                return false;
+            };
+            let refs = predicate.references();
+            partition_schema
+                .fields()
+                .any(|f| refs.contains(&ColumnName::new([f.name()])))
+        };
+        let partition_only_skip = skip_stats && predicate_references_partition();
+
         let stats_schema_for_transform = if skip_stats {
             None
         } else {
             state_info.physical_stats_schema.clone()
         };
 
-        // The partition schema feeds two consumers: the DataSkippingFilter (predicate
-        // pruning, disabled by skip_stats together with stats) and the engine-facing
-        // `partitionValues_parsed` output column (requested via `parsed_struct`, independent
-        // of skip_stats). Either consumer keeps the transform emitting the column.
+        // The partition schema feeds two consumers: the DataSkippingFilter (partition pruning,
+        // which survives `skip_stats` via `partition_only_skip`) and the engine-facing
+        // `partitionValues_parsed` output column (requested via `parsed_struct`). Either consumer
+        // keeps the transform emitting the column.
         let partition_schema_for_transform =
-            if partition_values_options.parsed_struct || !skip_stats {
+            if partition_values_options.parsed_struct || !skip_stats || partition_only_skip {
                 state_info.physical_partition_schema.clone()
             } else {
                 None
@@ -269,14 +290,18 @@ impl ScanLogReplayProcessor {
             partition_schema_for_transform.clone(),
         )?;
 
-        // Create data skipping filter that reads stats_parsed and partitionValues_parsed
-        // from the transformed batch. This avoids double JSON parsing -- the transform parses
-        // JSON once, then data skipping reads the already-parsed columns from the output.
+        // Create data skipping filter that reads stats_parsed and partitionValues_parsed from the
+        // transformed batch. This avoids double JSON parsing: the transform parses JSON once, then
+        // data skipping reads the already-parsed columns from the output.
         //
-        // When partition columns are referenced by the predicate, the filter receives a
-        // partition schema + expression to extract typed partition values. Since the transform
-        // already produces `partitionValues_parsed`, the filter reads that column directly.
-        let data_skipping_filter = if skip_stats {
+        // When partition columns are referenced by the predicate, the filter receives a partition
+        // schema + expression to extract typed partition values. Since the transform already
+        // produces `partitionValues_parsed`, the filter reads that column directly.
+        //
+        // Under `partition_only_skip` the filter runs with `stats_schema_for_transform = None`, so
+        // it ignores the stats columns entirely: data-column arms fold to NULL (keep) and only
+        // partition arms prune.
+        let data_skipping_filter = if skip_stats && !partition_only_skip {
             None
         } else {
             DataSkippingFilter::new(
@@ -982,9 +1007,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// Each row that is selected in the returned `engine_data` _must_ be processed to complete the
 /// scan. Non-selected rows _must_ be ignored.
 ///
-/// When `stats_options.skip_stats` is true, file statistics are not read from checkpoint parquet
-/// files and columnar data skipping is disabled (no stats-based or partition-value-based
-/// pruning), but row-level partition filtering still applies.
+/// When `stats_options.skip_stats` is true, no stats columns are read from checkpoint parquet
+/// files and data-column skipping is off. Partition-value-based pruning still applies when the
+/// predicate references a partition column (partition values come from the Add action's partition
+/// map, not stats), and row-level partition filtering still applies.
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.

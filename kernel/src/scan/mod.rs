@@ -95,8 +95,9 @@ pub use crate::parallel::parallel_scan_metadata::{
 ///   `stats_parsed` directly; avoids the per-batch `ToJson` cost.
 /// - [`Self::struct_columns`] -- struct stats projected to a subset of columns, no JSON.
 /// - [`Self::all`] -- both representations.
-/// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
-///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
+/// - [`Self::none`] neither, and turns off data-column skipping. Unlike the other four
+///   constructors, this one reads no stats columns from parquet; partition pruning still applies
+///   when the predicate references a partition column (partition values need no stats read).
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
     /// Whether to surface JSON stats on parsed-stats checkpoints (where the
@@ -117,8 +118,8 @@ pub struct StatsOptions {
 #[derive(Clone, Debug)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
-    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
-    /// disables stats reading entirely.
+    /// data-column skipping unless the caller picked [`StatsOptions::none`], which
+    /// reads no stats columns (partition pruning is unaffected).
     None,
     /// Emit all indexed stats columns.
     All,
@@ -154,7 +155,14 @@ impl StatsOptions {
 
     /// Struct stats projected to the specified columns, no JSON. Like
     /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
+    ///
+    /// An empty `cols` is normalized to [`Self::none`]: projecting stats to zero columns is the
+    /// same as reading no stats, so data-column skipping is off while partition pruning still
+    /// applies when the predicate references a partition column.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
+        if cols.is_empty() {
+            return Self::none();
+        }
         Self {
             synthesize_json: false,
             struct_stats: StructStats::Columns(cols),
@@ -169,11 +177,13 @@ impl StatsOptions {
         }
     }
 
-    /// **Disables all stats work**: no stats output, no internal data skipping (even
-    /// when a predicate is set). Kernel reads no stats columns from parquet at all.
-    /// Use when the engine handles its own pruning.
+    /// **Disables data-column stats work**: no stats output, and no stats columns are read from
+    /// parquet, so data-column skipping is off. Partition pruning still applies when the predicate
+    /// references a partition column (partition values come from the Add action's partition map,
+    /// not `stats_parsed`, so they need no stats read). Use when the engine handles its own
+    /// data-column pruning but still wants kernel to prune partitions.
     ///
-    /// To get internal predicate-based skipping without `stats_parsed` output, use
+    /// To also get data-column predicate skipping without `stats_parsed` output, use
     /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `All`/`Columns(_)`.
     pub fn none() -> Self {
         Self {
@@ -667,9 +677,17 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
-    /// Whether stats reading is entirely skipped, disabling internal data skipping.
+    /// Whether stats reading is entirely skipped, disabling data-column skipping. An empty
+    /// `StructStats::Columns` projection reads no stats, so it is equivalent to `StructStats::None`
+    /// here (the public [`StatsOptions::struct_columns`] normalizes it, but internal construction
+    /// can still produce it).
     fn skip_stats(&self) -> bool {
-        !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
+        let no_struct_stats = match &self.stats.struct_stats {
+            StructStats::None => true,
+            StructStats::Columns(cols) => cols.is_empty(),
+            StructStats::All => false,
+        };
+        !self.stats.synthesize_json && no_struct_stats
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
@@ -882,12 +900,20 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+        //
+        // `skip_stats` also drops the stats schema: leaving it set would project `stats_parsed`
+        // out of any checkpoint that carries it, only for the transform to discard it (stats
+        // output is off). Passing `None` keeps `none()` honest -- no stats columns are read.
+        let (checkpoint_schema, meta_predicate, stats_schema) = if self.skip_stats() {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None, None)
         } else {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
                 self.build_actions_meta_predicate(),
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
             )
         };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
@@ -895,10 +921,7 @@ impl Scan {
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
-            self.state_info
-                .physical_stats_schema
-                .as_ref()
-                .map(|s| s.as_ref()),
+            stats_schema,
             None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
@@ -965,12 +988,21 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
+        // `skip_stats` drops the stats schema alongside the checkpoint schema: leaving it set
+        // would project `stats_parsed` out of any checkpoint that carries it, only for the
+        // transform to discard it (stats output is off). Passing `None` keeps `none()` honest --
+        // no stats columns are read. The partition schema still flows through so partition pruning
+        // survives (see `partition_only_skip` in the log-replay processor).
+        let (checkpoint_schema, meta_predicate, stats_schema) = if self.skip_stats() {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None, None)
         } else {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
                 self.build_actions_meta_predicate(),
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
             )
         };
         self.snapshot
@@ -980,10 +1012,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
-                self.state_info
-                    .physical_stats_schema
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                stats_schema,
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
