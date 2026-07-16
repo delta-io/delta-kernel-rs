@@ -345,7 +345,7 @@ impl Transaction {
         }
 
         self.dv_matched_files.extend(matched_files);
-        // matched_dv_files is this call's validated count of files whose DV was updated.
+        // Reached only after the count == descriptors check above, so this can't over-count.
         self.num_dv_updates += matched_dv_files;
         Ok(())
     }
