@@ -1221,10 +1221,14 @@ mod tests {
             schema_string: "{".to_string(),
             ..Default::default()
         };
-        assert!(matches!(
-            malformed_metadata.parse_schema(),
-            Err(Error::MalformedJson(_))
-        ));
+        let malformed_error = malformed_metadata.parse_schema().unwrap_err();
+        // Error conversion captures a backtrace only when enabled, so normalize both forms before
+        // checking the underlying error.
+        let malformed_error = match malformed_error {
+            Error::Backtraced { source, .. } => *source,
+            error => error,
+        };
+        assert!(matches!(malformed_error, Error::MalformedJson(_)));
     }
 
     #[test]
