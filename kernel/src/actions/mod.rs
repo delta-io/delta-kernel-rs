@@ -351,11 +351,12 @@ impl Metadata {
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
         serde_json::from_str(&self.schema_string).map_err(|error| {
-            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so its display text is
-            // the only available discriminator.
-            if error
-                .to_string()
-                .starts_with(SERDE_JSON_RECURSION_LIMIT_EXCEEDED)
+            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
+            // matching.
+            if error.is_syntax()
+                && error
+                    .to_string()
+                    .starts_with(SERDE_JSON_RECURSION_LIMIT_EXCEEDED)
             {
                 Error::SchemaNestingDepthExceeded(error)
             } else {
