@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
@@ -24,8 +24,14 @@ use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::{
     AfterSequentialScanMetadata, ParallelScanMetadata, PartitionValuesOptions, Scan, StatsOptions,
 };
-use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{Engine, FileMeta, Snapshot};
+use delta_kernel::schema::{
+    DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType,
+};
+use delta_kernel::{
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
+    FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Snapshot,
+    StorageHandler,
+};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
@@ -1045,6 +1051,138 @@ async fn null_partition_pruning_matches_across_stats_options(
         .build()?;
 
     assert_eq!(surviving_file_count(engine.as_ref(), &scan)?, 1);
+    Ok(())
+}
+
+/// A `ParquetHandler` that records the physical read schema of every `read_parquet_files` call and
+/// otherwise delegates to an inner handler. Used to observe which columns a scan projects out of
+/// checkpoint parquet.
+struct RecordingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    read_schemas: Arc<Mutex<Vec<SchemaRef>>>,
+}
+
+impl ParquetHandler for RecordingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_schemas
+            .lock()
+            .unwrap()
+            .push(physical_schema.clone());
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+}
+
+/// Delegates every handler to an inner engine except `parquet_handler`, which records read schemas.
+struct RecordingEngine {
+    inner: Arc<dyn Engine>,
+    parquet: Arc<RecordingParquetHandler>,
+}
+
+impl Engine for RecordingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.inner.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet.clone()
+    }
+}
+
+/// Returns true if `schema` (or any nested struct field) contains a field named `name`.
+fn schema_contains_field(schema: &StructType, name: &str) -> bool {
+    schema.fields().any(|f| {
+        f.name() == name
+            || match f.data_type() {
+                DataType::Struct(s) => schema_contains_field(s, name),
+                _ => false,
+            }
+    })
+}
+
+/// Ground-truth for the stats-off optimization: under `StatsOptions::none()` the checkpoint parquet
+/// read must project neither the JSON `stats` field nor the native `stats_parsed` struct, while the
+/// default (stats-on) path still reads `stats`. Surviving file COUNT is invariant to whether stats
+/// are read, so this asserts on the physical read schema directly -- the observable proof that the
+/// wide per-column stats are no longer read from the checkpoint.
+///
+/// The predicate references the data column `value`, so `physical_stats_schema` is `Some`. That is
+/// the case the read-path gating must suppress under `none()`: without it, `stats_parsed` would be
+/// projected from the checkpoint (and discarded), which is exactly the wasteful read `none()`
+/// avoids.
+#[rstest::rstest]
+#[case::stats_none(StatsOptions::none(), false)]
+#[case::stats_default(StatsOptions::default(), true)]
+fn stats_none_does_not_read_stats_from_checkpoint(
+    #[case] stats: StatsOptions,
+    #[case] expect_stats_read: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let inner = test_utils::create_default_engine(&url)?;
+    let read_schemas = Arc::new(Mutex::new(Vec::new()));
+    let engine = RecordingEngine {
+        parquet: Arc::new(RecordingParquetHandler {
+            inner: inner.parquet_handler(),
+            read_schemas: read_schemas.clone(),
+        }),
+        inner,
+    };
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+
+    // A predicate on the data column `value` makes `physical_stats_schema` Some, so the read-path
+    // gating is what suppresses the stats projection under `none()`.
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(
+            column_expr!("value").gt(Expr::literal(1_000_000i32)),
+        ))
+        .with_stats(stats)
+        .build()?;
+    surviving_file_count(&engine, &scan)?;
+
+    // The checkpoint read is the one whose schema carries the `add` action.
+    let schemas = read_schemas.lock().unwrap();
+    let checkpoint_reads: Vec<_> = schemas
+        .iter()
+        .filter(|s| schema_contains_field(s, "add"))
+        .collect();
+    assert!(
+        !checkpoint_reads.is_empty(),
+        "expected at least one checkpoint parquet read"
+    );
+    for schema in checkpoint_reads {
+        let reads_stats = schema_contains_field(schema, "stats");
+        let reads_stats_parsed = schema_contains_field(schema, "stats_parsed");
+        assert_eq!(
+            reads_stats || reads_stats_parsed,
+            expect_stats_read,
+            "checkpoint read schema stats presence mismatch (stats={reads_stats}, \
+             stats_parsed={reads_stats_parsed}), expected_stats_read={expect_stats_read}"
+        );
+    }
     Ok(())
 }
 
