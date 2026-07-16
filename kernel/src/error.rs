@@ -232,6 +232,10 @@ pub enum Error {
     #[error("Schema error: {0}")]
     Schema(String),
 
+    /// The table schema exceeds the JSON parser's supported nesting depth
+    #[error("Table schema nesting exceeds the supported depth: {0}")]
+    SchemaNestingDepthExceeded(#[source] serde_json::Error),
+
     /// Validation error for file statistics (e.g., missing required clustering column stats)
     #[error("Stats validation error: {0}")]
     StatsValidation(String),

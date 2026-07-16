@@ -27,6 +27,7 @@ use crate::{
 };
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERDE_JSON_RECURSION_LIMIT_EXCEEDED: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
@@ -348,7 +349,19 @@ impl Metadata {
 
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
-        Ok(serde_json::from_str(&self.schema_string)?)
+        // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
+        serde_json::from_str(&self.schema_string).map_err(|error| {
+            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so its display text is
+            // the only available discriminator.
+            if error
+                .to_string()
+                .starts_with(SERDE_JSON_RECURSION_LIMIT_EXCEEDED)
+            {
+                Error::SchemaNestingDepthExceeded(error)
+            } else {
+                error.into()
+            }
+        })
     }
 
     #[internal_api]
@@ -1185,6 +1198,33 @@ mod tests {
             ]),
         )]));
         assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn parse_schema_distinguishes_excessive_nesting_from_malformed_json() {
+        let deeply_nested_schema = (0..42).fold(
+            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
+            |schema, depth| {
+                StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
+            },
+        );
+        let deeply_nested_metadata = Metadata {
+            schema_string: serde_json::to_string(&deeply_nested_schema).unwrap(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            deeply_nested_metadata.parse_schema(),
+            Err(Error::SchemaNestingDepthExceeded(_))
+        ));
+
+        let malformed_metadata = Metadata {
+            schema_string: "{".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            malformed_metadata.parse_schema(),
+            Err(Error::MalformedJson(_))
+        ));
     }
 
     #[test]
