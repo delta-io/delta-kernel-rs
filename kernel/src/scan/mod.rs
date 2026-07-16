@@ -191,7 +191,8 @@ impl StatsOptions {
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
 /// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// when present, otherwise from parsing the string map; see [`Self::with_session_timezone`] for the
+/// case where a session zone forces reparsing from the map even when the native column exists.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
@@ -219,7 +220,13 @@ impl PartitionValuesOptions {
     /// Resolve offset-less `TIMESTAMP` partition value strings in `tz` (an IANA name like
     /// `America/New_York` or a fixed offset like `+05:00`) instead of UTC. A partition value
     /// carrying an explicit `Z`/offset honors that offset regardless, and `TIMESTAMP_NTZ` columns
-    /// are always zone-independent. An invalid zone fails the scan at evaluation time.
+    /// are always zone-independent. Prefer an IANA name over a fixed offset when the writer's zone
+    /// observes DST: a fixed offset silently produces instants an hour off for the part of the year
+    /// the writer was on the other offset.
+    ///
+    /// The zone is parsed only when the table has a `TIMESTAMP` partition column (the only case it
+    /// applies to), so an invalid zone fails the scan at evaluation time on such tables and is
+    /// otherwise inert.
     ///
     /// An offset-less value whose wall-clock time is nonexistent or ambiguous in `tz` (the gap or
     /// fold of a DST transition) fails the scan rather than resolving to a chosen offset. Fixed

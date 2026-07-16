@@ -285,7 +285,7 @@ impl ScanLogReplayProcessor {
         // `TIMESTAMP_NTZ`) resolves identically regardless of zone, so those tables keep
         // the native fast path even under a session zone.
         let reparse_partition_values_from_map = partition_values_options.session_timezone.is_some()
-            && partition_schema_has_timestamp(partition_schema_for_transform.as_ref());
+            && partition_schema_has_zoned_timestamp(partition_schema_for_transform.as_ref());
         let checkpoint_has_partition_values_parsed =
             has_partition_values_parsed && !reparse_partition_values_from_map;
 
@@ -727,21 +727,24 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
-/// Returns whether `partition_schema` has a `TIMESTAMP` column, i.e. a column whose resolved
-/// instant depends on the session zone. `TIMESTAMP_NTZ` is a zoneless wall-clock and does not
-/// count. Partition columns are flat primitives, so only top-level leaves are inspected.
-fn partition_schema_has_timestamp(partition_schema: Option<&SchemaRef>) -> bool {
-    partition_schema.is_some_and(|schema| {
-        schema
-            .fields()
-            .any(|field| field.data_type() == &DataType::Primitive(PrimitiveType::Timestamp))
-    })
+/// Whether `field` is a partition column whose resolved instant depends on the session zone. Only
+/// zoned `TIMESTAMP` qualifies; `TIMESTAMP_NTZ` is a zoneless wall-clock and every other type is
+/// zone-independent. Single source of truth shared by the checkpoint-bypass gate
+/// ([`partition_schema_has_zoned_timestamp`]) and the annotation stamper
+/// ([`annotate_partition_timezone`]), which must agree on exactly which leaves the zone applies to.
+fn partition_field_is_zoned_timestamp(field: &StructField) -> bool {
+    field.data_type() == &DataType::Primitive(PrimitiveType::Timestamp)
 }
 
-/// Stamps `session_timezone` onto each `TIMESTAMP` field of `partition_schema` via
+/// Returns whether `partition_schema` has a zoned `TIMESTAMP` column. Partition columns are flat
+/// primitives, so only top-level leaves are inspected.
+fn partition_schema_has_zoned_timestamp(partition_schema: Option<&SchemaRef>) -> bool {
+    partition_schema.is_some_and(|schema| schema.fields().any(partition_field_is_zoned_timestamp))
+}
+
+/// Stamps `session_timezone` onto each zoned `TIMESTAMP` field of `partition_schema` via
 /// [`ColumnMetadataKey::SessionTimezone`], returning the schema unchanged when the zone is `None`.
-/// Partition columns are flat primitives, so only top-level `TIMESTAMP` leaves need annotating;
-/// `TIMESTAMP_NTZ` is zone-independent and left alone.
+/// Partition columns are flat primitives, so only top-level leaves need annotating.
 fn annotate_partition_timezone(
     partition_schema: &StructType,
     session_timezone: Option<&str>,
@@ -750,7 +753,7 @@ fn annotate_partition_timezone(
         return Arc::new(partition_schema.clone());
     };
     let fields = partition_schema.fields().map(|field| {
-        if field.data_type() == &DataType::Primitive(PrimitiveType::Timestamp) {
+        if partition_field_is_zoned_timestamp(field) {
             field.clone().add_metadata([(
                 ColumnMetadataKey::SessionTimezone.as_ref().to_string(),
                 tz.to_string(),
@@ -1086,7 +1089,7 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        annotate_partition_timezone, get_add_transform_expr, partition_schema_has_timestamp,
+        annotate_partition_timezone, get_add_transform_expr, partition_schema_has_zoned_timestamp,
         scan_action_iter, InternalScanState, ScanLogReplayProcessor, ScanPartitionValuesOptions,
         ScanStatsOptions, SerializableScanState,
     };
@@ -1998,33 +2001,33 @@ mod tests {
         );
     }
 
-    /// `partition_schema_has_timestamp` gates the native-checkpoint reparse: it is true only when a
-    /// `TIMESTAMP` column is present. `TIMESTAMP_NTZ`, date, and other types are zone-independent
-    /// and keep the fast path.
+    /// `partition_schema_has_zoned_timestamp` gates the native-checkpoint reparse: it is true only
+    /// when a zoned `TIMESTAMP` column is present. `TIMESTAMP_NTZ`, date, and other types are
+    /// zone-independent and keep the fast path.
     #[test]
-    fn partition_schema_has_timestamp_only_for_tz_timestamp() {
+    fn partition_schema_has_zoned_timestamp_only_for_tz_timestamp() {
         use crate::schema::PrimitiveType;
 
         let ts: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
             "p",
             DataType::TIMESTAMP,
         )]));
-        assert!(partition_schema_has_timestamp(Some(&ts)));
+        assert!(partition_schema_has_zoned_timestamp(Some(&ts)));
 
         let mixed: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::nullable("d", DataType::DATE),
             StructField::nullable("n", DataType::Primitive(PrimitiveType::TimestampNtz)),
             StructField::nullable("t", DataType::TIMESTAMP),
         ]));
-        assert!(partition_schema_has_timestamp(Some(&mixed)));
+        assert!(partition_schema_has_zoned_timestamp(Some(&mixed)));
 
         let no_ts: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::nullable("d", DataType::DATE),
             StructField::nullable("n", DataType::Primitive(PrimitiveType::TimestampNtz)),
             StructField::nullable("i", DataType::INTEGER),
         ]));
-        assert!(!partition_schema_has_timestamp(Some(&no_ts)));
-        assert!(!partition_schema_has_timestamp(None));
+        assert!(!partition_schema_has_zoned_timestamp(Some(&no_ts)));
+        assert!(!partition_schema_has_zoned_timestamp(None));
     }
 
     /// `annotate_partition_timezone` stamps the session zone only on `TIMESTAMP` leaves, leaving

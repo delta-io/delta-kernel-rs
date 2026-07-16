@@ -2540,6 +2540,23 @@ mod tests {
     }
 
     #[test]
+    fn map_to_struct_offset_less_timestamp_in_dst_fold_errors() {
+        // 01:30 on 2024-11-03 occurs twice in America/New_York (clocks fall back 02:00 -> 01:00),
+        // so the wall-clock is ambiguous and the parse errors rather than picking an offset. Unlike
+        // the gap, a fold value is one a writer could legitimately have stored.
+        let err = eval_ts_partition_in_tz(
+            "2024-11-03 01:30:00",
+            PrimitiveType::Timestamp,
+            Some("America/New_York"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ParseError(..)),
+            "expected a ParseError for a DST-fold wall-clock, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_map_to_struct_duplicate_keys() {
         let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         builder.keys().append_value("x");

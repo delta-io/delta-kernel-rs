@@ -260,10 +260,7 @@ async fn parsed_partition_values_read_foreign_empty_string(
     let engine = create_default_engine_mt_executor(&url).unwrap();
 
     if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+        checkpoint(engine.as_ref(), &url);
     }
 
     // Confirm the scan reads from the intended source: the checkpoint axis must actually place a
@@ -352,10 +349,7 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
     let engine = create_default_engine_mt_executor(&url).unwrap();
 
     if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+        checkpoint(engine.as_ref(), &url);
     }
 
     let surviving = |predicate: Predicate| -> Vec<String> {
@@ -429,6 +423,16 @@ fn ts_partition_fields() -> serde_json::Value {
         {"name": "p_ts", "type": "timestamp", "nullable": true, "metadata": {}},
         {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
     ])
+}
+
+/// Builds a snapshot at `url` and writes a checkpoint, so subsequent reads exercise the native
+/// checkpoint path.
+fn checkpoint(engine: &dyn delta_kernel::Engine, url: &Url) {
+    Snapshot::builder_for(url.clone())
+        .build(engine)
+        .unwrap()
+        .checkpoint(engine, None)
+        .unwrap();
 }
 
 /// Reads the single `p_ts` value each file surfaces in `partitionValues_parsed`, keyed by the
@@ -505,10 +509,7 @@ async fn timestamp_partition_resolves_in_session_timezone(
     let engine = create_default_engine_mt_executor(&url).unwrap();
 
     if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+        checkpoint(engine.as_ref(), &url);
     }
 
     // Micros for the instant each raw string denotes under a UTC-5 session zone:
@@ -531,7 +532,9 @@ async fn timestamp_partition_resolves_in_session_timezone(
 /// instant it denotes in the session zone, so an equality predicate written as the equivalent `Z`
 /// instant keeps the matching file and prunes the other. This is the mispruning the session zone
 /// fixes: under UTC the offset-less value would resolve to a different instant and the predicate
-/// would prune the wrong file.
+/// would prune the wrong file. The `native_checkpoint` case writes a native (UTC-frozen)
+/// `partitionValues_parsed` column, so it also proves pruning runs over the reparsed column rather
+/// than the frozen leaf.
 #[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timestamp_partition_pruning_in_session_timezone(
@@ -539,13 +542,21 @@ async fn timestamp_partition_pruning_in_session_timezone(
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("timestamp-pruning-session-tz");
+    // With `native_checkpoint`, write stats as struct so the checkpoint emits a native
+    // `partitionValues_parsed` column (frozen at UTC), forcing pruning to run over the reparsed
+    // column rather than the frozen leaf. Otherwise the checkpoint reconstructs from the map.
+    let config = if native_checkpoint {
+        write_stats_as_struct_config()
+    } else {
+        serde_json::json!({})
+    };
     // Two offset-less values one hour apart. Under America/New_York (UTC-5) they denote
     // 2024-01-15T21:00:00Z and 2024-01-15T22:00:00Z respectively.
     let url = write_foreign_partition_table(
         &table_path,
         ts_partition_fields(),
         &["p_ts"],
-        serde_json::json!({}),
+        config,
         &[
             add_action(
                 "p_ts=2024-01-15 16%3A00%3A00/a.parquet",
@@ -561,10 +572,7 @@ async fn timestamp_partition_pruning_in_session_timezone(
     let engine = create_default_engine_mt_executor(&url).unwrap();
 
     if native_checkpoint {
-        let snapshot = Snapshot::builder_for(url.clone())
-            .build(engine.as_ref())
-            .unwrap();
-        snapshot.checkpoint(engine.as_ref(), None).unwrap();
+        checkpoint(engine.as_ref(), &url);
     }
 
     let surviving = |predicate: Predicate| -> Vec<String> {
@@ -627,10 +635,7 @@ async fn native_checkpoint_timestamp_partition_reparses_in_session_timezone() {
     .await;
     let engine = create_default_engine_mt_executor(&url).unwrap();
 
-    let snapshot = Snapshot::builder_for(url.clone())
-        .build(engine.as_ref())
-        .unwrap();
-    snapshot.checkpoint(engine.as_ref(), None).unwrap();
+    checkpoint(engine.as_ref(), &url);
 
     // 16:00 under America/New_York (UTC-5) is 21:00Z. The frozen UTC leaf (16:00Z) must be bypassed
     // and the raw map reparsed in the session zone.
@@ -641,4 +646,126 @@ async fn native_checkpoint_timestamp_partition_reparses_in_session_timezone() {
         Some(&session_micros),
         "native-checkpoint TIMESTAMP partition must reparse in the session zone, not read the frozen UTC leaf"
     );
+}
+
+/// Under `name` column mapping, the `partitionValues` map is keyed by the physical column name and
+/// the session-zone annotation is stamped on the physical partition schema. This confirms the zone
+/// survives logical->physical resolution end to end: a regression would drop the annotation and
+/// resolve the offset-less value as UTC, but only under column mapping, so it would pass every
+/// non-mapped test. Runs across a JSON commit and a native checkpoint.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timestamp_partition_reparses_in_session_timezone_under_column_mapping(
+    #[values(false, true)] native_checkpoint: bool,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("timestamp-session-tz-cm");
+    std::fs::create_dir_all(&table_path).unwrap();
+    let url = Url::from_directory_path(&table_path).unwrap();
+    let table_root = url.to_string();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // `name`-mode column mapping: the logical column `p_ts` has a distinct physical name that keys
+    // both the parquet data and the raw `partitionValues` map.
+    let physical_ts = "col-p-ts-phys";
+    let config = if native_checkpoint {
+        serde_json::json!({
+            "delta.columnMapping.mode": "name",
+            "delta.columnMapping.maxColumnId": "2",
+            "delta.checkpoint.writeStatsAsStruct": "true",
+        })
+    } else {
+        serde_json::json!({
+            "delta.columnMapping.mode": "name",
+            "delta.columnMapping.maxColumnId": "2",
+        })
+    };
+    let schema_string = serde_json::json!({
+        "type": "struct",
+        "fields": [
+            {"name": "p_ts", "type": "timestamp", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 1, "delta.columnMapping.physicalName": physical_ts,
+            }},
+            {"name": "value", "type": "integer", "nullable": true, "metadata": {
+                "delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "col-value-phys",
+            }},
+        ],
+    })
+    .to_string();
+    let protocol = r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}"#;
+    let metadata = serde_json::json!({
+        "metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema_string,
+            "partitionColumns": ["p_ts"],
+            "configuration": config,
+            "createdTime": 1700000000000_i64,
+        },
+    })
+    .to_string();
+    // The partition map is keyed by the PHYSICAL name under column mapping.
+    let add = serde_json::json!({
+        "add": {
+            "path": "col-p-ts-phys=2024-01-15 16%3A00%3A00/f.parquet",
+            "partitionValues": {physical_ts: "2024-01-15 16:00:00"},
+            "size": 100,
+            "modificationTime": 1700000000000_i64,
+            "dataChange": true,
+            "stats": "{\"numRecords\":1}",
+        },
+    })
+    .to_string();
+    add_commit(
+        &table_root,
+        store.as_ref(),
+        0,
+        format!("{protocol}\n{metadata}"),
+    )
+    .await
+    .unwrap();
+    add_commit(&table_root, store.as_ref(), 1, add)
+        .await
+        .unwrap();
+
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+    if native_checkpoint {
+        checkpoint(engine.as_ref(), &url);
+    }
+
+    // 16:00 in America/New_York (UTC-5) is 21:00Z. Read `partitionValues_parsed` by physical name.
+    let session_micros = 1_705_352_400_000_000_i64;
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_session_timezone("America/New_York"),
+        )
+        .build()
+        .unwrap();
+    let mut found = false;
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let (data, selection) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pv = get_column!(batch, "partitionValues_parsed", StructArray);
+        let ts = pv
+            .column_by_name(physical_ts)
+            .expect("partitionValues_parsed must key p_ts by physical name")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            ts.value(0),
+            session_micros,
+            "offset-less timestamp must resolve in the session zone under column mapping (native_checkpoint={native_checkpoint})"
+        );
+        found = true;
+    }
+    assert!(found, "expected one surviving file");
 }
