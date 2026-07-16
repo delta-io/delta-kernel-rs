@@ -1325,6 +1325,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1398,6 +1399,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1463,6 +1465,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1725,6 +1728,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1817,6 +1821,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -3075,7 +3080,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
 
     // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
     // version
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {
         assert_eq!(schema, hint_schema, "should use hint when versions match");
@@ -3141,7 +3146,7 @@ async fn test_get_file_actions_schema_v2_identity_filter(
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
     let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
     if identity_matches {
         assert_eq!(
@@ -3222,7 +3227,7 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
 
     // Verify stats_parsed is detectable in the returned schema.
@@ -3946,6 +3951,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
+        None, // cancellation_token
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -4011,6 +4017,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
+        None, // cancellation_token
     )?;
 
     // Verify it's false

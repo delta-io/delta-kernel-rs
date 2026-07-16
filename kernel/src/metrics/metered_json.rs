@@ -9,8 +9,8 @@ use crate::metrics::events::emit_json_read_completed;
 use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator,
+    FileMeta, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn JsonHandler>` that emits a
@@ -59,6 +59,29 @@ impl JsonHandler for MeteredJsonHandler {
         let inner = self
             .inner
             .read_json_files(files, physical_schema, predicate)?;
+        Ok(Box::new(PrecountedMetricsIterator::new(
+            inner,
+            num_files,
+            bytes_read,
+            emit_json_read_completed,
+        )))
+    }
+
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let num_files = files.len() as u64;
+        let bytes_read = files.iter().map(|f| f.size).sum();
+        let inner = self.inner.read_json_files_with_cancellation(
+            files,
+            physical_schema,
+            predicate,
+            cancellation_token,
+        )?;
         Ok(Box::new(PrecountedMetricsIterator::new(
             inner,
             num_files,

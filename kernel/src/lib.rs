@@ -87,6 +87,7 @@ use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
+pub mod cancellation;
 pub mod checkpoint;
 pub mod commit_range;
 pub mod committer;
@@ -183,6 +184,7 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
+pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
 pub use engine_data::{
@@ -694,6 +696,26 @@ pub trait JsonHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
+    /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than reading every file to completion. The default implementation ignores the token
+    /// and delegates to [`read_json_files`](Self::read_json_files), so existing `JsonHandler`
+    /// implementations remain source-compatible; kernel still polls the token at action-batch
+    /// boundaries regardless.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        _cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_json_files(files, physical_schema, predicate)
+    }
+
     /// Atomically (!) write a single JSON file. Each selected row of the input data must be
     /// written as a new JSON object appended to the file; rows not selected by a batch's
     /// selection vector (see [`FilteredEngineData`]) must not be written.
@@ -900,6 +922,26 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
+    /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than reading every file to completion. The default implementation ignores the token
+    /// and delegates to [`read_parquet_files`](Self::read_parquet_files), so existing
+    /// `ParquetHandler` implementations remain source-compatible; kernel still polls the token at
+    /// action-batch boundaries regardless.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        _cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_parquet_files(files, physical_schema, predicate)
+    }
+
     /// Write data to a Parquet file at the specified URL.
     ///
     /// This method writes the provided `data` to a Parquet file at the given `url`.
@@ -978,6 +1020,22 @@ pub trait ParquetHandler: AsAny {
     /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
+
+    /// Cancellation-aware variant of [`read_parquet_footer`](Self::read_parquet_footer).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
+    /// and return [`Error::Cancelled`] once cancellation is observed. The default implementation
+    /// ignores the token and delegates to [`read_parquet_footer`](Self::read_parquet_footer), so
+    /// existing `ParquetHandler` implementations remain source-compatible.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_parquet_footer_with_cancellation(
+        &self,
+        file: &FileMeta,
+        _cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<ParquetFooter> {
+        self.read_parquet_footer(file)
+    }
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

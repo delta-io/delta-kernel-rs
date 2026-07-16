@@ -30,8 +30,8 @@ use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObject
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -338,6 +338,28 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
 
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let future = read_parquet_files_impl(
+            self.store.clone(),
+            files.to_vec(),
+            physical_schema,
+            predicate,
+            self.buffer_size.get(),
+            self.batch_size.get(),
+        );
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )
+    }
+
     /// Writes engine data to a Parquet file at the specified location.
     ///
     /// This implementation uses asynchronous file I/O with object_store to write the Parquet file.
@@ -392,11 +414,19 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.read_parquet_footer_with_cancellation(file, None)
+    }
+
+    fn read_parquet_footer_with_cancellation(
+        &self,
+        file: &FileMeta,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
 
-        self.task_executor.block_on(async move {
+        let footer_future = async move {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
                 let response =
@@ -416,7 +446,14 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
             Ok(ParquetFooter { schema })
-        })
+        };
+
+        // Race the footer read against cancellation so a cancelled request stops promptly.
+        match cancellation_token {
+            Some(token) => super::block_on_or_cancelled(&self.task_executor, &token, footer_future)
+                .unwrap_or(Err(Error::Cancelled)),
+            None => self.task_executor.block_on(footer_future),
+        }
     }
 }
 

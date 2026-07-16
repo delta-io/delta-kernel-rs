@@ -16,6 +16,7 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
@@ -222,6 +223,7 @@ pub struct ScanBuilder {
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
     partition_values: PartitionValuesOptions,
+    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -248,6 +250,7 @@ impl ScanBuilder {
             correlation_id: None,
             without_row_transforms: false,
             partition_values: PartitionValuesOptions::default(),
+            cancellation_token: None,
         }
     }
 
@@ -342,6 +345,25 @@ impl ScanBuilder {
         self
     }
 
+    /// Provide a [`CancellationToken`] so a cancelled request can stop an in-flight
+    /// [`scan_metadata`](Scan::scan_metadata) log replay instead of running to completion.
+    ///
+    /// Cancellation is cooperative: kernel polls the token at each action-batch boundary, and a
+    /// cancellation-aware [`Engine`] additionally races its checkpoint/commit reads against it.
+    /// When cancellation is observed, the `scan_metadata` iterator yields a single
+    /// [`Error::Cancelled`] and then ends — never a silent early `None` — so a cancelled listing
+    /// cannot be mistaken for a complete one. Without a token, behavior is unchanged.
+    ///
+    /// [`CancellationToken`]: crate::CancellationToken
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    pub fn with_cancellation_token(
+        mut self,
+        token: impl Into<Option<CancellationTokenRef>>,
+    ) -> Self {
+        self.cancellation_token = token.into();
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -392,6 +414,7 @@ impl ScanBuilder {
             stats: self.stats,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
+            cancellation_token: self.cancellation_token,
         })
     }
 }
@@ -653,6 +676,9 @@ pub struct Scan {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
+    /// Optional cooperative cancellation token supplied via
+    /// [`ScanBuilder::with_cancellation_token`]. `None` preserves the pre-cancellation behavior.
+    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for Scan {
@@ -900,6 +926,8 @@ impl Scan {
                 .as_ref()
                 .map(|s| s.as_ref()),
             None,
+            // Cancellation is not wired into the incremental `scan_metadata_from` path yet.
+            None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -932,9 +960,17 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
+                // Poll the cancellation token at each action-batch boundary by wrapping the
+                // input iterator: on cancellation it yields a single `Err(Error::Cancelled)` and
+                // then ends, so a cancelled listing can never look complete. Wrapping the input
+                // (rather than the shared `process_actions_iter`) keeps this scoped to scans.
+                let actions = CancellableIterator::new(
+                    actions_with_checkpoint_info.actions,
+                    self.cancellation_token.clone(),
+                );
                 let (it, m) = scan_action_iter(
                     engine,
-                    actions_with_checkpoint_info.actions,
+                    actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
@@ -990,6 +1026,7 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                self.cancellation_token.as_ref(),
             )
     }
 

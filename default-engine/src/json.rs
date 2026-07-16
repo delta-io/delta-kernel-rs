@@ -20,8 +20,8 @@ use delta_kernel::object_store::{
 };
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
-    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    JsonHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -174,6 +174,28 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             self.buffer_size.get(),
         );
         super::stream_future_to_iter(self.task_executor.clone(), future)
+    }
+
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let future = read_json_files_impl(
+            self.store.clone(),
+            files.to_vec(),
+            physical_schema,
+            predicate,
+            self.batch_size.get(),
+            self.buffer_size.get(),
+        );
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )
     }
 
     // note: for now we just buffer all the data and write it out all at once

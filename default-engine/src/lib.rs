@@ -18,8 +18,10 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
+    ParquetHandler, StorageHandler,
 };
+use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
 
@@ -59,6 +61,60 @@ pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor
     }))
 }
 
+/// Like [`stream_future_to_iter`], but each blocking poll is raced against the cancellation
+/// token. When the token fires, the iterator yields a single `Err(Error::Cancelled)` and then
+/// ends, abandoning the in-flight read (dropping the stream releases its buffered work).
+///
+/// Restricted to `DeltaResult` streams so cancellation can be surfaced as an item. With a `None`
+/// token, behavior is identical to [`stream_future_to_iter`].
+pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
+    task_executor: Arc<E>,
+    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, DeltaResult<U>>>>
+        + Send
+        + 'static,
+    cancellation_token: Option<CancellationTokenRef>,
+) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<U>> + Send>> {
+    let Some(token) = cancellation_token else {
+        return stream_future_to_iter(task_executor, stream_future);
+    };
+    // Race even the initial stream-producing future against cancellation.
+    let stream = match block_on_or_cancelled(&task_executor, &token, stream_future) {
+        Some(result) => result?,
+        None => return Err(Error::Cancelled),
+    };
+    Ok(Box::new(CancellableStreamIterator {
+        stream: Some(stream),
+        task_executor,
+        token,
+    }))
+}
+
+/// Blocks on `future`, racing it against `token`'s cancellation. Returns `Some(output)` if the
+/// future completed first, or `None` if cancellation won. Fast-paths an already-cancelled token.
+pub(crate) fn block_on_or_cancelled<T, E: executor::TaskExecutor>(
+    task_executor: &Arc<E>,
+    token: &CancellationTokenRef,
+    future: impl Future<Output = T> + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    if token.is_cancelled() {
+        return None;
+    }
+    // Clone the `Arc` into the async block so the awaited `cancelled()` future borrows an owned
+    // local, keeping the whole future `'static` as `block_on` requires.
+    let token = token.clone();
+    task_executor.block_on(async move {
+        let cancelled = token.cancelled();
+        futures::pin_mut!(cancelled);
+        match future::select(std::pin::pin!(future), cancelled).await {
+            Either::Left((output, _)) => Some(output),
+            Either::Right(((), _)) => None,
+        }
+    })
+}
+
 struct BlockingStreamIterator<T: Send + 'static, E: executor::TaskExecutor> {
     stream: Option<BoxStream<'static, T>>,
     task_executor: Arc<E>,
@@ -80,6 +136,38 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
         }
 
         item
+    }
+}
+
+/// Cancellation-aware counterpart to [`BlockingStreamIterator`]: each `next()` races the blocking
+/// `stream.next()` against the token and, once cancelled, drops the stream and yields exactly one
+/// terminal `Err(Error::Cancelled)`.
+struct CancellableStreamIterator<U: Send + 'static, E: executor::TaskExecutor> {
+    stream: Option<BoxStream<'static, DeltaResult<U>>>,
+    task_executor: Arc<E>,
+    token: CancellationTokenRef,
+}
+
+impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStreamIterator<U, E> {
+    type Item = DeltaResult<U>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut stream = self.stream.take()?;
+        match block_on_or_cancelled(&self.task_executor, &self.token, async move {
+            let item = stream.next().await;
+            (item, stream)
+        }) {
+            Some((item, stream)) => {
+                // We must not poll an exhausted stream after it returned None.
+                if item.is_some() {
+                    self.stream = Some(stream);
+                }
+                item
+            }
+            // Cancelled: `stream` was moved into the (now-dropped) future, releasing buffered
+            // work. Emit one terminal error; the taken `self.stream` stays `None`, fusing us.
+            None => Some(Err(Error::Cancelled)),
+        }
     }
 }
 

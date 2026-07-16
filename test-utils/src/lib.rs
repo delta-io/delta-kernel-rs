@@ -199,8 +199,8 @@ use delta_kernel::schema::{
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, Error, FileMeta,
-    FilteredEngineData, LogPath, Snapshot,
+    try_parse_uri, CancellationToken, CancelledFuture, DeltaResult, DeltaResultIterator, Engine,
+    EngineData, Error, FileMeta, FilteredEngineData, LogPath, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -1396,6 +1396,41 @@ pub async fn write_batch_to_table(
 pub struct AddInfo {
     pub path: String,
     pub stats: Option<serde_json::Value>,
+}
+
+/// A simple [`CancellationToken`] for tests, backed by an atomic bool. Start uncancelled and
+/// flip it with [`cancel`](Self::cancel), or construct one already cancelled with
+/// [`cancelled`](Self::cancelled), to drive cancellation-aware reads.
+#[derive(Debug, Default)]
+pub struct TestCancellationToken(std::sync::atomic::AtomicBool);
+
+impl TestCancellationToken {
+    /// A token that is already cancelled.
+    pub fn cancelled() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(true))
+    }
+
+    /// Request cancellation.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl CancellationToken for TestCancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn cancelled(&self) -> CancelledFuture<'_> {
+        // Resolves immediately when already cancelled, otherwise never — enough for tests that
+        // cancel before/around a read and rely on the synchronous `is_cancelled` poll and the
+        // engine's pre-read check.
+        if self.is_cancelled() {
+            Box::pin(std::future::ready(()))
+        } else {
+            Box::pin(std::future::pending())
+        }
+    }
 }
 
 /// Reads all [`AddInfo`]s from a snapshot's log segment.

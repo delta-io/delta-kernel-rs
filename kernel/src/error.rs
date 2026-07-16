@@ -258,6 +258,14 @@ pub enum Error {
         expected: &'static str,
         actual: &'static str,
     },
+
+    /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
+    ///
+    /// Surfaced by cancellation-aware reads (e.g. a scan whose builder was given a token) as a
+    /// terminal iterator item; it is deliberately distinct from normal iterator exhaustion so a
+    /// cancelled listing can never be mistaken for a complete one.
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -273,6 +281,11 @@ impl Error {
     }
     pub fn generic(msg: impl ToString) -> Self {
         Self::Generic(msg.to_string())
+    }
+    /// Constructs an [`Error::Cancelled`], signalling that a cancellation-aware operation was
+    /// stopped via its [`CancellationToken`](crate::CancellationToken).
+    pub fn cancelled() -> Self {
+        Self::Cancelled
     }
     pub fn file_not_found(path: impl ToString) -> Self {
         Self::FileNotFound(path.to_string())
