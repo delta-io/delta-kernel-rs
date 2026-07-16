@@ -1019,10 +1019,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> DeltaResult<()> {
+    fn test_parallel_without_stats_output() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
-        // Get expected paths using single-node scan_metadata with skip_stats=true
+        // Get expected paths using single-node scan_metadata without connector-visible stats.
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -1033,14 +1033,14 @@ mod tests {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "Single-node: scan_file.stats should be None when skip_stats=true"
+                    "single-node scan_file.stats should be None"
                 );
                 ps.push(scan_file.path);
             })
         })?;
         expected_paths.sort();
 
-        // Run parallel workflow with skip_stats=true
+        // Run the parallel workflow with the same output choice.
         let scan = snapshot
             .scan_builder()
             .with_stats(StatsOptions::none())
@@ -1052,7 +1052,7 @@ mod tests {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "sequential: scan_file.stats should be None when skip_stats=true"
+                    "sequential scan_file.stats should be None"
                 );
                 ps.push(scan_file.path);
             })
@@ -1069,7 +1069,7 @@ mod tests {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                         assert!(
                             scan_file.stats.is_none(),
-                            "parallel: scan_file.stats should be None when skip_stats=true"
+                            "parallel scan_file.stats should be None"
                         );
                         ps.push(scan_file.path);
                     })
@@ -1083,7 +1083,7 @@ mod tests {
         all_paths.sort();
         assert_eq!(
             all_paths, expected_paths,
-            "Parallel workflow with skip_stats=true should return same files as single-node scan_metadata"
+            "parallel workflow should return the same files as single-node scan_metadata"
         );
 
         Ok(())

@@ -18,7 +18,7 @@ use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{col, column_name, lit, Predicate as Pred};
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
-use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
+use crate::scan::{PartitionValuesOptions, Scan, StatsOptions};
 use crate::unit_test_utils::load_test_table;
 use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
 
@@ -299,18 +299,11 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] expected_stats_field_groups: &[&[&str]],
 ) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
-    let struct_stats = stats.struct_stats.clone();
-    let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
-    let expected_stats = if no_stats {
-        StatsOptions::json_only()
-    } else {
-        stats.clone()
-    };
     let predicate: PredicateRef = col!("id").gt(lit(0i64)).into();
     let expected_builder = snapshot
         .clone()
         .scan_builder()
-        .with_stats(expected_stats)
+        .with_stats(stats.clone())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate.clone());
     let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
@@ -347,39 +340,11 @@ fn declarative_metadata_matches_imperative_across_stats_options(
         .collect();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
-    // Imperative metadata exposes source and predicate stats even when they were not requested.
-    // Compare only the caller-requested stats after checking the declarative schema above.
-    let parsed_stats_requested = match &struct_stats {
-        StructStats::None => false,
-        StructStats::Columns(columns) => !columns.is_empty(),
-        StructStats::All => true,
-    };
-    if !parsed_stats_requested {
-        let declarative_schema = actual.first().expect("declarative metadata").schema();
-        let imperative_schema = expected.first().expect("imperative metadata").schema();
-        assert!(declarative_schema.field_with_name(STATS_PARSED).is_err());
-        imperative_schema
-            .field_with_name(STATS_PARSED)
-            .expect("imperative predicate stats");
-    }
-    let ignored_stats = match (stats.synthesize_json, parsed_stats_requested) {
-        (true, true) => {
-            // Both representations were requested, so the outputs are directly comparable.
-            &[][..]
-        }
-        (true, false) => {
-            // Only JSON was requested; imperative metadata also exposes predicate stats.
-            &[STATS_PARSED][..]
-        }
-        (false, true) => {
-            // Only parsed stats were requested; imperative metadata also retains source JSON.
-            &[STATS][..]
-        }
-        (false, false) => {
-            // Neither representation was requested, but imperative metadata retains source JSON
-            // and predicate-required parsed stats.
-            &[STATS, STATS_PARSED][..]
-        }
+    let ignored_stats = if stats.emit_json {
+        &[][..]
+    } else {
+        // The imperative scan row schema keeps a null JSON stats placeholder.
+        &[STATS][..]
     };
     assert_metadata_eq(
         &actual,
@@ -519,7 +484,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] expected_field_groups: &[&[&str]],
 ) {
     (|| -> DeltaResult<()> {
-        let json_requested = stats.synthesize_json;
+        let json_requested = stats.emit_json;
         let (engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let scan = snapshot
@@ -680,7 +645,7 @@ fn assert_metadata_output_options(
     table_config: TableConfig,
     stats: StatsOptions,
 ) -> DeltaResult<()> {
-    let json_requested = stats.synthesize_json;
+    let json_requested = stats.emit_json;
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)

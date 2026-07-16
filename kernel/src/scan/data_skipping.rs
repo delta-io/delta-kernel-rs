@@ -131,9 +131,9 @@ impl DataSkippingFilter {
     ///   rewrites so non-Add rows are never filtered out.
     /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
     /// - `stats_columns`: Physical leaf paths whose stats are in `stats_schema`. References to
-    ///   other data columns fold to NULL (keeping the file). Must line up with `stats_schema` --
-    ///   otherwise the rewritten predicate references columns the unified schema doesn't have and
-    ///   evaluator construction fails.
+    ///   other data columns fold to NULL (keeping the file). When `stats_schema` is `None`, this
+    ///   set is treated as empty because no data-column stats are available; partition arms can
+    ///   still prune.
     /// - `metrics`: Optional metrics to record data skipping statistics.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -156,6 +156,13 @@ impl DataSkippingFilter {
 
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
+
+        let empty_stats_columns = HashSet::new();
+        let stats_columns = if stats_schema.is_some() {
+            stats_columns
+        } else {
+            &empty_stats_columns
+        };
 
         // Build the unified evaluation schema and extraction expression. Data stats and partition
         // values are conceptually separate, but the evaluator needs a single schema/expression.

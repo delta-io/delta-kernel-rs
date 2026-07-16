@@ -173,8 +173,8 @@ impl ParallelState {
 
     /// Get the schema to use for reading checkpoint files.
     ///
-    /// Returns the checkpoint read schema which may have stats excluded
-    /// if skip_stats was enabled when the scan was created.
+    /// Returns the checkpoint read schema, which excludes statistics when they're needed for
+    /// neither output nor data skipping.
     pub fn file_read_schema(&self) -> SchemaRef {
         self.inner.checkpoint_info().checkpoint_read_schema.clone()
     }
@@ -316,6 +316,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            output_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: true,
