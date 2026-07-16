@@ -124,13 +124,14 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 /// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
 ///
 /// Supported field attributes:
-/// - `#[field_id = N]`: Sets the Parquet field ID for this field.
-/// - `#[element_field_id = N]`: Sets the Parquet field ID for the element of a list field. Stored
-///   as `ColumnMappingNestedIds` metadata (`{"fieldName.element": N}`) on the parent `StructField`
-///   and propagated to the inner Arrow list element during schema conversion. The generated code
-///   references `serde_json::json!`, which must be available at the expansion site.
+/// - `#[field_id = N]`: Sets the Parquet field ID for this field. `N` must be in `1..=i32::MAX`.
+/// - `#[element_field_id = N]`: Sets the Parquet field ID for the element of a list field (`Vec<T>`
+///   or `Option<Vec<T>>`; rejected on any other type). Stored as `ColumnMappingNestedIds` metadata
+///   (`{"fieldName.element": N}`) on the parent `StructField` and propagated to the inner Arrow
+///   list element during schema conversion. `N` must be in `1..=i32::MAX`.
 /// - `#[allow_null_container_values]`: Marks the value field of a `HashMap` as nullable.
-/// - `#[skip_schema]`: Excludes this field from the generated schema.
+/// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
+///   derives `IntoEngineData`, from the produced engine data).
 #[proc_macro_derive(
     ToSchema,
     attributes(allow_null_container_values, field_id, element_field_id, skip_schema)
@@ -178,48 +179,53 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
+/// Reads a `#[<attr_name> = N]` field attribute, returning `Ok(None)` if absent. The value must be
+/// an integer literal in `1..=i32::MAX` (the valid Parquet field-id range); a bare `#[<attr_name>]`
+/// or `#[<attr_name>(..)]` shape, a non-integer, or an out-of-range value is a hard error. If the
+/// attribute is repeated, the first occurrence wins.
 fn get_named_attr_id(
     field_attributes: &[Attribute],
     attr_name: &str,
 ) -> Result<Option<i64>, Error> {
-    field_attributes
+    // Match on the attribute path first so a malformed shape (bare path / list form) on the right
+    // name is a diagnosable error rather than silently skipped.
+    let Some(attr) = field_attributes
         .iter()
-        .filter_map(|attr| match &attr.meta {
-            Meta::NameValue(nv) => Some(nv),
-            _ => None,
-        })
-        .find(|nv| matches!(nv.path.get_ident(), Some(ident) if ident == attr_name))
-        .map(|nv| {
-            let span = nv.value.span();
-            match &nv.value {
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: Lit::Int(lit_int),
-                    ..
-                }) => lit_int.base10_parse().map_err(|e| {
-                    Error::new(
-                        lit_int.span(),
-                        format!("{} error: Failed to parse integer: {}", attr_name, e),
-                    )
-                }),
-                _ => Err(Error::new(
-                    span,
-                    format!("{} error: Expected an integer", attr_name),
-                )),
-            }
-        })
-        .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
+        .find(|attr| attr.path().is_ident(attr_name))
+    else {
+        return Ok(None);
+    };
+    let Meta::NameValue(nv) = &attr.meta else {
+        return Err(Error::new(
+            attr.span(),
+            format!("{attr_name} error: expected `#[{attr_name} = N]`"),
+        ));
+    };
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(lit_int),
+        ..
+    }) = &nv.value
+    else {
+        return Err(Error::new(
+            nv.value.span(),
+            format!("{attr_name} error: expected an integer"),
+        ));
+    };
+    let value: i64 = lit_int
+        .base10_parse()
+        .map_err(|e| Error::new(lit_int.span(), format!("{attr_name} error: {e}")))?;
+    if !(1..=i64::from(i32::MAX)).contains(&value) {
+        return Err(Error::new(
+            lit_int.span(),
+            format!("{attr_name} error: field id {value} must be in 1..=2147483647"),
+        ));
+    }
+    Ok(Some(value))
 }
 
-fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
-    get_named_attr_id(field_attributes, "field_id")
-}
-
-fn get_element_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
-    get_named_attr_id(field_attributes, "element_field_id")
-}
-
-/// Check if a path segment is `Option<HashMap<K, V>>`.
-fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
+/// Check if a path segment is `Option<{inner}<..>>` (e.g. `Option<HashMap<K, V>>`), matching on the
+/// inner type's last segment identifier.
+fn is_option_of(seg: &syn::PathSegment, inner: &str) -> bool {
     if seg.ident != "Option" {
         return false;
     }
@@ -230,29 +236,32 @@ fn is_option_of_hashmap(seg: &syn::PathSegment) -> bool {
     let Some(syn::GenericArgument::Type(Type::Path(inner_type))) = angle_args.args.first() else {
         return false;
     };
-    // Check if the inner type's last segment is HashMap
     inner_type
         .path
         .segments
         .last()
-        .is_some_and(|seg| seg.ident == "HashMap")
+        .is_some_and(|seg| seg.ident == inner)
+}
+
+/// Check if a path segment is a list-shaped type: `Vec<T>` or `Option<Vec<T>>`.
+fn is_list_segment(seg: &syn::PathSegment) -> bool {
+    seg.ident == "Vec" || is_option_of(seg, "Vec")
+}
+
+/// Check if any of `attrs` is a bare-path attribute named `name` (e.g. `#[skip_schema]`).
+fn has_path_attr(attrs: &[Attribute], name: &str) -> bool {
+    attrs.iter().any(|attr| match &attr.meta {
+        Meta::Path(path) => path.is_ident(name),
+        _ => false,
+    })
 }
 
 fn gen_schema_field(field: &Field) -> TokenStream {
     let name = get_schema_name(field.ident.as_ref().unwrap());
-    let have_schema_null = field.attrs.iter().any(|attr| {
-        // check if we have allow_null_container_values attr
-        match &attr.meta {
-            Meta::Path(path) => path
-                .get_ident()
-                .is_some_and(|ident| ident == "allow_null_container_values"),
-            _ => false,
-        }
-    });
+    let have_schema_null = has_path_attr(&field.attrs, "allow_null_container_values");
 
     match field.ty {
         Type::Path(ref type_path) => {
-            // Convert the type path segments into a single quoted string
             let type_path_quoted = type_path.path.segments.iter().map(|segment| {
                 let segment_ident = &segment.ident;
                 match &segment.arguments {
@@ -268,10 +277,9 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                 }
             });
 
-            // First, determine which base function to call based on schema_null setting
             let base_call = if have_schema_null {
                 if let Some(last_seg) = type_path.path.segments.last() {
-                    let is_valid = last_seg.ident == "HashMap" || is_option_of_hashmap(last_seg);
+                    let is_valid = last_seg.ident == "HashMap" || is_option_of(last_seg, "HashMap");
                     if !is_valid {
                         return Error::new(
                             last_seg.ident.span(),
@@ -289,12 +297,11 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                 quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name)) }
             };
 
-            // Then, add field-id and element-field-id metadata if present
-            let field_id = match get_field_id(&field.attrs) {
+            let field_id = match get_named_attr_id(&field.attrs, "field_id") {
                 Ok(v) => v,
                 Err(e) => return e.to_compile_error(),
             };
-            let element_field_id = match get_element_field_id(&field.attrs) {
+            let element_field_id = match get_named_attr_id(&field.attrs, "element_field_id") {
                 Ok(v) => v,
                 Err(e) => return e.to_compile_error(),
             };
@@ -306,12 +313,28 @@ fn gen_schema_field(field: &Field) -> TokenStream {
             };
 
             if let Some(elem_id) = element_field_id {
+                // The `<field>.element` nested id is only meaningful for a list element; reject it
+                // on any other type, mirroring the allow_null_container_values guard above.
+                let is_list = type_path.path.segments.last().is_some_and(is_list_segment);
+                if !is_list {
+                    return Error::new(
+                        field.span(),
+                        format!(
+                            "Can only use element_field_id on Vec or Option<Vec> fields, not {}",
+                            type_path.path.segments.last().map_or_else(
+                                || "<empty path>".to_string(),
+                                |seg| seg.ident.to_string()
+                            )
+                        ),
+                    )
+                    .to_compile_error();
+                }
                 let nested_key = format!("{}.element", name);
                 quote_spanned! { field.span() =>
                     #with_field_id.add_metadata([(
                         delta_kernel::schema::ColumnMetadataKey::ColumnMappingNestedIds.as_ref().to_string(),
                         delta_kernel::schema::MetadataValue::Other(
-                            serde_json::json!({ #nested_key: #elem_id })
+                            ::serde_json::json!({ #nested_key: #elem_id })
                         )
                     )])
                 }
@@ -325,10 +348,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
 }
 
 fn has_skip_schema(field: &Field) -> bool {
-    field.attrs.iter().any(|attr| match &attr.meta {
-        Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "skip_schema"),
-        _ => false,
-    })
+    has_path_attr(&field.attrs, "skip_schema")
 }
 
 fn gen_schema_fields(data: &Data) -> TokenStream {
@@ -376,9 +396,15 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         .into();
     };
 
-    let fields = &fields.named;
-    let field_idents = fields.iter().map(|f| &f.ident);
-    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+    // Honor `#[skip_schema]` so the produced engine data matches the arity of the schema built by
+    // the `ToSchema` derive (which filters the same fields).
+    let kept: Vec<_> = fields
+        .named
+        .iter()
+        .filter(|f| !has_skip_schema(f))
+        .collect();
+    let field_idents = kept.iter().map(|f| &f.ident);
+    let field_types: Vec<_> = kept.iter().map(|f| &f.ty).collect();
 
     let expanded = quote! {
         #[automatically_derived]
@@ -486,14 +512,16 @@ fn make_public(mut item: Item) -> Item {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    // Tests for field_id parsing and validation
+    use rstest::rstest;
 
-    // Helper function to parse a struct and extract the field_id logic
-    fn test_field_id_parsing(input: &str) -> Result<TokenStream, String> {
+    use super::*;
+
+    /// Expand `gen_schema_fields` for `input` and return the generated tokens as a string. Macro
+    /// errors are embedded as `compile_error!` tokens in that string; `Err` only signals that the
+    /// input itself failed to parse as a `DeriveInput`.
+    fn schema_fields_tokens(input: &str) -> Result<String, String> {
         let input = syn::parse_str::<DeriveInput>(input).map_err(|e| e.to_string())?;
-        let tokens = gen_schema_fields(&input.data);
-        Ok(tokens)
+        Ok(gen_schema_fields(&input.data).to_string())
     }
 
     #[test]
@@ -510,150 +538,86 @@ mod tests {
             }
         "#;
 
-        let result = test_field_id_parsing(input);
-        assert!(result.is_ok(), "Valid field_id should parse successfully");
-
-        let tokens = result.unwrap();
-        let token_string = tokens.to_string();
-
-        // Should contain metadata for valid field_ids
-        assert!(token_string.contains("123"));
-        assert!(token_string.contains("456"));
+        let tokens = schema_fields_tokens(input).unwrap();
+        assert!(tokens.contains("123"));
+        assert!(tokens.contains("456"));
+        assert!(!tokens.contains("compile_error"));
     }
 
-    #[test]
-    fn test_field_id_edge_cases() {
-        // Test with zero
-        let input_zero = r#"
-            struct TestStruct {
-                #[field_id = 0]
-                zero_field: String,
-            }
-        "#;
-        let result = test_field_id_parsing(input_zero);
-        assert!(result.is_ok(), "field_id = 0 should be valid");
-        let token_stream = result.unwrap().to_string();
-        assert!(
-            token_stream.contains(
-                "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , 0i64)"
-            ),
-            "Expected 0, found: {}",
-            token_stream
+    #[rstest]
+    #[case::one("1", "1i64")]
+    #[case::max("2147483647", "2147483647i64")]
+    fn field_id_in_range_renders_literal(#[case] id: &str, #[case] expected: &str) {
+        let input = format!("struct S {{ #[field_id = {id}] f: String }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        let needle = format!(
+            "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , {expected})"
         );
+        assert!(tokens.contains(&needle), "found: {tokens}");
+    }
 
-        // Test with negative number
-        let input_negative = r#"
-            struct TestStruct {
-                #[field_id = -1]
-                negative_field: String,
-            }
-        "#;
-        let result = test_field_id_parsing(input_negative);
-        assert!(result.is_ok(), "field_id = -1 should be valid");
-        let token_stream = result.unwrap().to_string();
+    #[rstest]
+    #[case::zero("#[field_id = 0]")]
+    #[case::negative("#[field_id = -1]")]
+    #[case::overflow_i32("#[field_id = 2147483648]")]
+    #[case::overflow_i64("#[field_id = 9223372036854775808]")]
+    #[case::not_an_integer(r#"#[field_id = "x"]"#)]
+    #[case::bare_path("#[field_id]")]
+    #[case::list_form("#[field_id(1)]")]
+    fn field_id_rejected(#[case] attr: &str) {
+        let input = format!("struct S {{ {attr} f: String }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
         assert!(
-            token_stream.contains(
-                "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , - 1i64)"
-            ),
-            "Expected -1, found: {}",
-            token_stream
-        );
-
-        // Test with large number
-        let input_large = r#"
-            struct TestStruct {
-                #[field_id = 9223372036854775807]
-                large_field: String,
-            }
-        "#;
-        let result = test_field_id_parsing(input_large);
-        assert!(result.is_ok(), "Large field_id should be valid");
-        let token_stream = result.unwrap().to_string();
-        assert!(
-            token_stream.contains(
-                "(delta_kernel :: schema :: ColumnMetadataKey :: ParquetFieldId . as_ref () , 9223372036854775807i64)"
-            ),
-            "Expected 9223372036854775807, found: {}",
-            token_stream
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
         );
     }
 
+    #[rstest]
+    // With a companion field_id, both metadata keys are emitted.
+    #[case::with_field_id("#[field_id = 132]\n#[element_field_id = 133]", true)]
+    // Element id alone emits only the nested id, not ParquetFieldId.
+    #[case::without_field_id("#[element_field_id = 133]", false)]
+    fn element_field_id_on_list(#[case] attrs: &str, #[case] expect_parquet_field_id: bool) {
+        let input = format!("struct S {{ {attrs}\nsplit_offsets: Option<Vec<i64>> }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(!tokens.contains("compile_error"), "found: {tokens}");
+        assert!(tokens.contains("ColumnMappingNestedIds"), "found: {tokens}");
+        assert!(tokens.contains("splitOffsets.element"), "found: {tokens}");
+        assert!(tokens.contains("133i64"), "found: {tokens}");
+        assert_eq!(
+            tokens.contains("ParquetFieldId . as_ref"),
+            expect_parquet_field_id,
+            "found: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::scalar("f: String")]
+    #[case::map("f: std::collections::HashMap<String, i64>")]
+    fn element_field_id_rejected_on_non_list(#[case] field: &str) {
+        let input = format!("struct S {{ #[element_field_id = 5] {field} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
+        );
+    }
+
     #[test]
-    fn test_element_field_id_parsing() {
+    fn skip_schema_excludes_field() {
         let input = r#"
             struct TestStruct {
-                #[field_id = 132]
-                #[element_field_id = 133]
-                split_offsets: Option<Vec<i64>>,
-
-                #[field_id = 100]
-                normal_field: String,
+                #[skip_schema]
+                skipped: String,
+                kept: i32,
             }
         "#;
-
-        let result = test_field_id_parsing(input);
-        assert!(result.is_ok(), "element_field_id should parse successfully");
-
-        let token_stream = result.unwrap().to_string();
-
-        // Should contain ParquetFieldId and ColumnMappingNestedIds metadata
+        let tokens = schema_fields_tokens(input).unwrap();
+        assert!(tokens.contains("kept"), "kept field must remain: {tokens}");
         assert!(
-            token_stream.contains("ParquetFieldId"),
-            "Should contain ParquetFieldId, found: {}",
-            token_stream
-        );
-        assert!(
-            token_stream.contains("ColumnMappingNestedIds"),
-            "Should contain ColumnMappingNestedIds, found: {}",
-            token_stream
-        );
-        assert!(
-            token_stream.contains("splitOffsets.element"),
-            "Should contain dot-path splitOffsets.element, found: {}",
-            token_stream
-        );
-        assert!(
-            token_stream.contains("132i64"),
-            "Should contain field_id 132, found: {}",
-            token_stream
-        );
-        assert!(
-            token_stream.contains("133i64"),
-            "Should contain element_field_id 133, found: {}",
-            token_stream
-        );
-    }
-
-    #[test]
-    fn test_element_field_id_without_field_id() {
-        let input = r#"
-            struct TestStruct {
-                #[element_field_id = 42]
-                list_field: Option<Vec<i64>>,
-            }
-        "#;
-
-        let result = test_field_id_parsing(input);
-        assert!(
-            result.is_ok(),
-            "element_field_id alone should parse successfully"
-        );
-
-        let token_stream = result.unwrap().to_string();
-        assert!(
-            token_stream.contains("ColumnMappingNestedIds"),
-            "Should contain ColumnMappingNestedIds, found: {}",
-            token_stream
-        );
-        assert!(
-            token_stream.contains("listField.element"),
-            "Should contain dot-path listField.element, found: {}",
-            token_stream
-        );
-        assert!(
-            !token_stream.contains("ParquetFieldId . as_ref"),
-            "Should NOT contain ParquetFieldId, found: {}",
-            token_stream
+            !tokens.contains("skipped"),
+            "skipped field must be absent: {tokens}"
         );
     }
 }
