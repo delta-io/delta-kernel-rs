@@ -2,6 +2,7 @@
 members = [
     "acceptance",
     "benchmarks",
+    "datafusion-executor",
     "default-engine",
     "default-engine/test-utils",
     "derive-macros",
