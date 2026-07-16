@@ -24,8 +24,8 @@ pub(super) enum Operand {
     Literal(String),
 }
 
-/// A comparison operator. Kernel has no native `<=`/`>=`/`!=`; lowering maps these to the
-/// corresponding `Predicate` constructors (`le`/`ge`/`ne`).
+/// A comparison operator. Kernel has no native `<=`/`>=`/`!=` predicate op; lowering composes them
+/// from the primitives it does have (`<`/`>`/`=`), e.g. `le` is `not(gt)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CmpOp {
     Lt,
