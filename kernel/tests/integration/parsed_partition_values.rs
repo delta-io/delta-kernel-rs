@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    Array, BinaryArray, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Int32Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -646,6 +646,77 @@ async fn native_checkpoint_timestamp_partition_reparses_in_session_timezone() {
         Some(&session_micros),
         "native-checkpoint TIMESTAMP partition must reparse in the session zone, not read the frozen UTC leaf"
     );
+}
+
+/// A session zone set on a table with no zoned `TIMESTAMP` partition column must NOT trigger the
+/// native-checkpoint reparse: a `DATE` partition value resolves identically in every zone, so the
+/// frozen `partitionValues_parsed` column stays trustworthy and the fast path is kept. The value a
+/// scan surfaces is the same date regardless of the zone, and matches what a JSON-commit read
+/// yields.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_timezone_does_not_reparse_non_timestamp_partition(
+    #[values(false, true)] native_checkpoint: bool,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("session-tz-date-partition");
+    let url = write_foreign_partition_table(
+        &table_path,
+        serde_json::json!([
+            {"name": "p_date", "type": "date", "nullable": true, "metadata": {}},
+            {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
+        ]),
+        &["p_date"],
+        // `writeStatsAsStruct=true` makes the checkpoint write a native `partitionValues_parsed`
+        // column, so the read exercises the passthrough (no-reparse) branch under a session zone.
+        write_stats_as_struct_config(),
+        &[add_action(
+            "p_date=2024-01-15/f.parquet",
+            serde_json::json!({"p_date": "2024-01-15"}),
+        )],
+    )
+    .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+
+    if native_checkpoint {
+        checkpoint(engine.as_ref(), &url);
+    }
+
+    // Days since the Unix epoch for 2024-01-15, zone-independent.
+    let expected_days = 19_737_i32;
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_session_timezone("America/New_York"),
+        )
+        .build()
+        .unwrap();
+    let mut found = false;
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let (data, selection) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pv = get_column!(batch, "partitionValues_parsed", StructArray);
+        let p_date = pv
+            .column_by_name("p_date")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(
+            p_date.value(0),
+            expected_days,
+            "DATE partition must resolve zone-independently (native_checkpoint={native_checkpoint})"
+        );
+        found = true;
+    }
+    assert!(found, "expected one surviving file");
 }
 
 /// Under `name` column mapping, the `partitionValues` map is keyed by the physical column name and
