@@ -223,7 +223,6 @@ impl TableConfiguration {
         // default on a Variant column).
         #[cfg(feature = "column-defaults-in-dev")]
         validate_column_defaults_metadata(&table_config.logical_schema)?;
-        validate_geospatial_unsupported(&table_config)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
         Ok(table_config)
