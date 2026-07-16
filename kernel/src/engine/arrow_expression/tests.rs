@@ -1491,3 +1491,15 @@ fn test_void_scalar_to_array() {
     assert_eq!(array.len(), 5);
     assert_eq!(*array.data_type(), DataType::Null);
 }
+
+// Unit test to ensure scalars reject interval types
+#[rstest]
+#[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH)]
+#[case::day_time(KernelDataType::INTERVAL_DAY_TIME)]
+fn test_interval_scalar_to_array_unsupported(#[case] interval_type: KernelDataType) {
+    let result = Scalar::Null(interval_type).to_array(1);
+    assert!(
+        matches!(result, Err(crate::error::Error::Unsupported(_))),
+        "expected Unsupported, got {result:?}"
+    );
+}
