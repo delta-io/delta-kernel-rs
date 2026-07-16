@@ -4,11 +4,33 @@ use std::collections::HashMap;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    schema_ref, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField, StructType,
 };
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::DeltaResult;
-use test_utils::{schema_with_column_defaults, test_table_setup};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::{create_table, engine_store_setup, schema_with_column_defaults, test_table_setup};
+use url::Url;
+
+async fn setup_unpartitioned_table(
+    name: &str,
+    schema: SchemaRef,
+    writer_features: Vec<&str>,
+) -> Result<(DefaultEngine<TokioBackgroundExecutor>, Url), Box<dyn std::error::Error>> {
+    let (store, engine, table_location) = engine_store_setup(name, None);
+    let table_url = create_table(
+        store,
+        table_location,
+        schema,
+        &[],
+        true,
+        vec![],
+        writer_features,
+    )
+    .await?;
+    Ok((engine, table_url))
+}
 
 // TODO(#2630): Allow create table to support column defaults
 #[test]
@@ -70,12 +92,15 @@ fn test_schema_with_column_defaults_overwrites_existing_default() {
 
 #[cfg(not(feature = "column-defaults-in-dev"))]
 mod feature_disabled {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Snapshot;
-    use test_utils::{create_table, engine_store_setup};
+    use test_utils::schema_with_column_defaults;
+
+    use super::setup_unpartitioned_table;
 
     #[tokio::test]
     async fn test_col_defaults_blocked_when_cargo_feature_off(
@@ -85,17 +110,9 @@ mod feature_disabled {
             StructField::nullable("name", DataType::STRING),
         ])?);
 
-        let (store, engine, table_location) = engine_store_setup("test_col_defaults_off", None);
-        let table_url = create_table(
-            store.clone(),
-            table_location,
-            schema,
-            &[],                         /* partition_columns */
-            true,                        /* use_37_protocol */
-            vec![],                      /* reader_features */
-            vec!["allowColumnDefaults"], /* writer_features */
-        )
-        .await?;
+        let (engine, table_url) =
+            setup_unpartitioned_table("test_col_defaults_off", schema, vec!["allowColumnDefaults"])
+                .await?;
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let err = snapshot
@@ -109,6 +126,30 @@ mod feature_disabled {
 
         Ok(())
     }
+
+    /// With the cargo feature off, the IcebergCompatV3 column-default validation is not compiled,
+    /// so a V3 table with a non-literal primitive default still loads. `allowColumnDefaults` is a
+    /// writer feature, so it does not block snapshot load.
+    #[tokio::test]
+    async fn test_v3_column_default_check_absent_when_cargo_feature_off(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable("c", DataType::TIMESTAMP)])?;
+        let schema =
+            schema_with_column_defaults(&base, HashMap::from([("c", "current_timestamp()")]))?;
+
+        let (engine, table_url) = setup_unpartitioned_table(
+            "test_v3_default_off",
+            schema,
+            vec!["allowColumnDefaults", "icebergCompatV3"],
+        )
+        .await?;
+
+        Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect("V3 table must load when the column-defaults check is not compiled in");
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "column-defaults-in-dev")]
@@ -116,19 +157,24 @@ mod feature_enabled {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use delta_kernel::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::committer::FileSystemCommitter;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::expressions::Scalar;
-    use delta_kernel::schema::{ArrayType, DataType, StructField, StructType};
+    use delta_kernel::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel::Snapshot;
     use rstest::rstest;
     use test_utils::{
         create_table, engine_store_setup, insert_data, schema_with_column_defaults, test_read,
+        LoggingTest,
     };
+
+    use super::setup_unpartitioned_table;
 
     #[tokio::test]
     async fn test_blind_append_to_col_defaults_table_supported_when_cargo_feature_on(
@@ -269,14 +315,21 @@ mod feature_enabled {
     #[case::all_data_columns(&[])]
     #[case::default_on_partition_column(&["b"])]
     #[tokio::test]
-    async fn test_transaction_column_defaults_exposes_all_top_level_defaults(
+    async fn test_transaction_top_level_column_defaults_excludes_nested_defaults(
         #[case] partition_columns: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // `a`: no default, `b`: kernel-parsable default, `c`: non-kernel-parsable default.
+        let nested_default = StructField::nullable("inner", DataType::INTEGER).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+            MetadataValue::String("7".to_string()),
+        )]);
+
+        // `a`: no default, `b`: kernel-parsable default, `c`: non-kernel-parsable default,
+        // `s.inner`: nested default that the top-level API must not return.
         let base = StructType::try_new(vec![
             StructField::nullable("a", DataType::INTEGER),
             StructField::nullable("b", DataType::INTEGER),
             StructField::nullable("c", DataType::TIMESTAMP),
+            StructField::nullable("s", DataType::try_struct_type([nested_default])?),
         ])?;
         let schema = schema_with_column_defaults(
             &base,
@@ -298,9 +351,13 @@ mod feature_enabled {
         let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
 
-        let defaults = txn.column_defaults()?;
+        let defaults = txn.top_level_column_defaults()?;
         assert_eq!(defaults.len(), 2, "only b and c declare a default");
         assert!(!defaults.contains_key("a"), "a has no default");
+        assert!(
+            !defaults.contains_key("s") && !defaults.contains_key("s.inner"),
+            "nested defaults must not be returned by the top-level API"
+        );
 
         let b = &defaults["b"];
         assert_eq!(b.raw_sql(), "1337");
@@ -317,38 +374,199 @@ mod feature_enabled {
         Ok(())
     }
 
-    /// A non-NULL default on a non-primitive column is accepted at create time but surfaces as an
-    /// error when later discovered via `Transaction::column_defaults`.
+    /// On an `icebergCompatV3` table, a default kernel cannot verify as a literal produces a
+    /// warning rather than an error, so the snapshot loads and a DML transaction constructs.
+    #[rstest]
+    #[case::non_literal(
+        "non_literal",
+        DataType::TIMESTAMP,
+        "current_timestamp()",
+        "could not verify"
+    )]
+    #[case::unparsable_non_primitive(
+        "non_primitive",
+        DataType::from(ArrayType::new(DataType::INTEGER, true)),
+        "ARRAY(1)",
+        "could not verify"
+    )]
     #[tokio::test]
-    async fn test_transaction_column_defaults_errors_on_non_null_non_primitive_default(
+    async fn test_load_and_write_tolerate_v3_unverifiable_default(
+        #[case] label: &str,
+        #[case] field_type: DataType,
+        #[case] default_sql: &str,
+        #[case] warning_text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable("c", field_type)])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", default_sql)]))?;
+
+        let (engine, table_url) = setup_unpartitioned_table(
+            &format!("test_v3_tolerates_{label}"),
+            schema,
+            vec!["allowColumnDefaults", "icebergCompatV3"],
+        )
+        .await?;
+
+        // Read: the snapshot loads despite the unverifiable default.
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+        let logging = LoggingTest::new();
+        snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        assert!(
+            logging.logs().contains(warning_text),
+            "logs: {}",
+            logging.logs()
+        );
+
+        Ok(())
+    }
+
+    /// A non-string `CURRENT_DEFAULT` value is corrupt and rejected at snapshot load. Built by
+    /// hand because `schema_with_column_defaults` only writes string values.
+    #[tokio::test]
+    async fn test_load_rejects_non_string_column_default() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let field = StructField::nullable("c", DataType::INTEGER).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+            MetadataValue::Number(7),
+        )]);
+        let schema = Arc::new(StructType::try_new(vec![field])?);
+
+        let (engine, table_url) = setup_unpartitioned_table(
+            "test_load_rejects_non_string_default",
+            schema,
+            vec!["allowColumnDefaults"],
+        )
+        .await?;
+
+        let err = Snapshot::builder_for(table_url)
+            .build(&engine)
+            .expect_err("a non-string CURRENT_DEFAULT must be rejected at load")
+            .to_string();
+        assert!(err.contains("non-string"), "got: {err}");
+
+        Ok(())
+    }
+
+    /// Orphaned column-default metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults`
+    /// feature) is tolerated: the snapshot loads and a write context builds without error.
+    #[tokio::test]
+    async fn test_load_and_write_allow_orphan_default() -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![StructField::nullable("c", DataType::INTEGER)])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42")]))?;
+
+        let (engine, table_url) =
+            setup_unpartitioned_table("test_load_orphan_default", schema, vec![]).await?;
+
+        // Read: snapshot loads despite the orphaned metadata.
+        let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+        // Write: a write context builds without error.
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        txn.unpartitioned_write_context()?;
+
+        Ok(())
+    }
+
+    /// A non-`NULL` default on a non-primitive (Array) column is protocol-legal but
+    /// unmaterializable by kernel: the snapshot loads, and the default surfaces via raw SQL
+    /// (`to_scalar` returns `None`) so the connector can evaluate it itself. Contrast a
+    /// non-`NULL` Variant default, which the protocol forbids and kernel rejects at load.
+    #[tokio::test]
+    async fn test_load_tolerates_non_primitive_non_null_default(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let base = StructType::try_new(vec![StructField::nullable(
-            "arr",
+            "c",
             ArrayType::new(DataType::INTEGER, true),
         )])?;
-        let schema = schema_with_column_defaults(&base, HashMap::from([("arr", "ARRAY(1)")]))?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", "ARRAY(1)")]))?;
 
-        let (store, engine, table_location) =
-            engine_store_setup("test_txn_column_defaults_non_primitive", None);
-        let table_url = create_table(
-            store,
-            table_location,
+        let (engine, table_url) = setup_unpartitioned_table(
+            "test_load_non_primitive_default",
             schema,
-            &[],                         /* partition_columns */
-            true,                        /* use_37_protocol */
-            vec![],                      /* reader_features */
-            vec!["allowColumnDefaults"], /* writer_features */
+            vec!["allowColumnDefaults"],
         )
         .await?;
 
         let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+        let defaults = txn.top_level_column_defaults()?;
 
-        let err = txn
-            .column_defaults()
-            .expect_err("a non-NULL default on a non-primitive column must error")
-            .to_string();
-        assert!(err.contains("not supported"), "got: {err}");
+        let c = &defaults["c"];
+        assert_eq!(c.raw_sql(), "ARRAY(1)");
+        assert_eq!(
+            c.to_scalar()?,
+            None,
+            "kernel cannot parse a non-primitive default"
+        );
+
+        Ok(())
+    }
+
+    /// End-to-end: a literal column default composes with `icebergCompatV3`. The default survives
+    /// the column-mapping transform (so it is still discoverable by its logical name), and a write
+    /// that materializes the default round-trips on read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_column_default_with_iceberg_compat_v3_e2e(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = StructType::try_new(vec![
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("c", DataType::INTEGER),
+        ])?;
+        let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42")]))?;
+
+        let (store, engine, table_location) = engine_store_setup("test_v3_col_default_e2e", None);
+        // The helper auto-enables V3's dependencies (columnMapping, rowTracking, domainMetadata)
+        // and assigns the per-field column-mapping metadata a valid V3 table requires.
+        let table_url = create_table(
+            store,
+            table_location,
+            schema.clone(),
+            &[],    /* partition_columns */
+            true,   /* use_37_protocol */
+            vec![], /* reader_features */
+            vec!["allowColumnDefaults", "icebergCompatV3"],
+        )
+        .await?;
+        let engine = Arc::new(engine);
+
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let writer_features = snapshot
+            .table_configuration()
+            .protocol()
+            .writer_features()
+            .expect("writer_features must be present on a writer v7 table");
+        for feature in [
+            TableFeature::IcebergCompatV3,
+            TableFeature::RowTracking,
+            TableFeature::ColumnMapping,
+            TableFeature::AllowColumnDefaults,
+        ] {
+            assert!(
+                writer_features.contains(&feature),
+                "writer_features must include {feature:?}; got {writer_features:?}",
+            );
+        }
+
+        // The default is still keyed by the logical name `c` and parses to its literal.
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        let defaults = txn.top_level_column_defaults()?;
+        assert_eq!(defaults["c"].to_scalar()?, Some(Scalar::Integer(42)));
+        drop(defaults);
+        drop(txn);
+
+        // The connector materializes the default (42) into the batch, then writes.
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![42, 42, 42])),
+        ];
+        assert!(insert_data(snapshot, &engine, columns.clone())
+            .await?
+            .is_committed());
+
+        let data = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), columns)?;
+        test_read(&ArrowEngineData::new(data), &table_url, engine)?;
 
         Ok(())
     }

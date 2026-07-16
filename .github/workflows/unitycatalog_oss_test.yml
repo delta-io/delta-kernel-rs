@@ -1,0 +1,99 @@
+name: unity-catalog-oss-test
+
+# Runs the gated `unity-catalog-delta-rest-client` live integration tests against a real Unity
+# Catalog OSS server (built from a pinned commit). Exercises the read-only `get_config` handshake
+# (needs no table) and `load_table` against a table seeded via the Delta-Commits (legacy) API
+# before the test step.
+on:
+  push:
+    branches: [main, "release/**"]
+    paths:
+      - "unity-catalog-delta-client-api/**"
+      - "unity-catalog-delta-rest-client/**"
+      - ".github/workflows/unitycatalog_oss_test.yml"
+      - ".github/scripts/setup_unitycatalog.sh"
+      - ".github/scripts/uc_oss_server.sh"
+      - ".github/scripts/seed_uc_table.sh"
+  pull_request:
+    paths:
+      - "unity-catalog-delta-client-api/**"
+      - "unity-catalog-delta-rest-client/**"
+      - ".github/workflows/unitycatalog_oss_test.yml"
+      - ".github/scripts/setup_unitycatalog.sh"
+      - ".github/scripts/uc_oss_server.sh"
+      - ".github/scripts/seed_uc_table.sh"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  UC_COMMIT: 0f1445227bd251b386420c90136515daefa4e03d
+  UC_DIR: ${{ github.workspace }}/.uc-server
+
+jobs:
+  uc-oss-test:
+    name: UC OSS server integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Java 17
+        uses: actions/setup-java@17f84c3641ba7b8f6deff6309fc4c864478f5d62 # v3.14.1
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+
+      - name: Cache Unity Catalog build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ env.UC_DIR }}
+            ~/.ivy2
+            ~/.sbt
+            ~/.cache/coursier
+          key: uc-oss-${{ runner.os }}-${{ env.UC_COMMIT }}-${{ hashFiles('.github/scripts/setup_unitycatalog.sh') }}
+
+      - name: Build Unity Catalog server
+        run: bash .github/scripts/setup_unitycatalog.sh
+
+      - name: Start Unity Catalog server
+        run: bash .github/scripts/uc_oss_server.sh start
+
+      # Seed a catalog-managed (MANAGED) Delta table so the load_table live test has a table to read.
+      - name: Seed a managed table
+        run: bash .github/scripts/seed_uc_table.sh unity default smoke_test_table
+
+      - name: Run UC live integration tests
+        env:
+          UC_SERVER_URL: http://localhost:8080
+          UC_TOKEN: not-used
+          # Fresh OSS server seeds the `unity` catalog with a `default` schema.
+          UC_TEST_CATALOG: unity
+          UC_TEST_SCHEMA: default
+          UC_TEST_TABLE: smoke_test_table
+        run: cargo nextest run --locked -p unity-catalog-delta-rest-client --features integration-test -E 'test(live_)'
+
+      - name: Stop Unity Catalog server
+        if: always()
+        run: bash .github/scripts/uc_oss_server.sh stop
+
+      - name: Dump server log on failure
+        if: failure()
+        run: cat "$UC_DIR/uc-server.log" || true

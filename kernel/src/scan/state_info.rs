@@ -137,23 +137,14 @@ fn build_data_skipping_schemas(
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     table_configuration: &TableConfiguration,
-    table_partition_schema: Option<SchemaRef>,
 ) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
-    // Filter partition schema to only predicate-referenced columns. The DataSkippingFilter
-    // only needs partition columns that appear in the predicate, and the transform output
-    // should not include unused partition columns.
-    let predicate_partition_schema = match (&table_partition_schema, physical_predicate) {
-        (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
-            // Partition values extracted from the string map via MapToStruct are always
-            // nullable (map lookup can return null), so we force all partition fields nullable.
-            ref_schema
-                .with_fields_filtered_nonempty(|f| tps.field(f.name()).is_some())?
-                .map(|partition_schema| {
-                    let nullable_fields = partition_schema
-                        .fields()
-                        .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
-                    Arc::new(StructType::new_unchecked(nullable_fields))
-                })
+    // Narrow the table's typed partition schema to the columns the predicate references. The
+    // DataSkippingFilter only needs partition columns that appear in the predicate, and the
+    // shared helper forces every field nullable (MapToStruct can yield null for a missing key).
+    let predicate_partition_schema = match physical_predicate {
+        PhysicalPredicate::Some(pred, _ref_schema) => {
+            let refs: Vec<ColumnName> = pred.references().into_iter().cloned().collect();
+            table_configuration.predicate_partition_schema(&refs)
         }
         _ => None,
     };
@@ -419,7 +410,6 @@ impl StateInfo {
             &physical_predicate,
             &predicate_column_names,
             table_configuration,
-            table_partition_schema.clone(),
         )?;
 
         // When the engine requested the typed struct, emit all partition columns rather than

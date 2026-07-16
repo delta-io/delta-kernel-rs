@@ -2,17 +2,18 @@
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
-// Crate-visible alias so kernel code avoids the deprecated `pub` re-export above.
-pub(crate) use column_mapping::validate_schema_column_mapping as validate_schema_column_mapping_strict;
 pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
     column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+#[cfg(feature = "column-defaults-in-dev")]
+pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
@@ -442,7 +443,6 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// Attention in the future:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
 ///   tables.
-/// - Column defaults: when supported, only literal expressions are allowed.
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
 ///   always use INT64; INT96 is forbidden.

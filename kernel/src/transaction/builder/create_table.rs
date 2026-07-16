@@ -28,7 +28,7 @@ use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     find_max_column_id_in_schema, get_any_level_column_physical_name,
     get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    validate_schema_column_mapping_strict, ColumnMappingMode, TableFeature,
+    strip_stray_column_mapping_metadata, ColumnMappingMode, TableFeature,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
@@ -892,16 +892,23 @@ impl CreateTableTransactionBuilder {
         let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
-        let (effective_schema, column_mapping_mode) =
+        let (mut effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
 
-        // Validates column mapping in strict mode (rejects stale CM annotations on a
-        // mapping-disabled table).
-        validate_schema_column_mapping_strict(&effective_schema, column_mapping_mode)?;
+        // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
+        // any annotation the caller supplied is newly introduced (see
+        // `strip_stray_column_mapping_metadata`).
+        if column_mapping_mode == ColumnMappingMode::None {
+            // A new table has no prior schema, so nothing was carried in (`current_has_cm =
+            // false`).
+            if let Some(stripped) = strip_stray_column_mapping_metadata(false, &effective_schema) {
+                effective_schema = Arc::new(stripped);
+            }
+        }
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
