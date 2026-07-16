@@ -1,0 +1,18 @@
+[package]
+name = "datafusion_executor"
+description = "DataFusion-based PlanExecutor for delta_kernel declarative plans."
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+delta_kernel = { path = "../kernel", version = "0.26.0", default-features = false, features = [
+  "declarative-plans",
+  "arrow-58",
+  "default-engine-base",
+] }
+datafusion = "53"
