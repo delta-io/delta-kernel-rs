@@ -18,6 +18,8 @@ use crate::log_replay::ActionsBatch;
 use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
 use crate::metrics::SnapshotLoadMetricContext;
 #[cfg(feature = "declarative-plans")]
+use crate::plans::ir::nodes::FileType;
+#[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
@@ -110,14 +112,22 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        #[cfg(feature = "declarative-plans")]
-        let actions_batches = self.read_pm_batches_via_plan(engine).or_else(|err| {
-            info!("declarative P&M plan unavailable, using legacy replay: {err}");
-            self.read_pm_batches(engine)
-                .map(|batches| Box::new(batches) as _)
-        })?;
+        // The declarative P&M plan is not yet the default. It stays compiled and type-checked (see
+        // `read_pm_batches_via_plan`) but disabled behind an always-false cfg (`any()`) until a
+        // followup makes it the default; legacy replay runs for now. TODO(#2874-followup).
+        #[cfg(all(feature = "declarative-plans", any()))]
+        let actions_batches = match self.read_pm_batches_via_plan(engine) {
+            Ok(batches) => batches,
+            // Fall back to legacy replay only when the engine's plan executor does not support the
+            // P&M plan. A genuine execution failure must propagate rather than silently re-run.
+            Err(Error::Unsupported(msg)) => {
+                info!("declarative P&M plan unsupported, using legacy replay: {msg}");
+                Box::new(self.read_pm_batches(engine)?)
+            }
+            Err(err) => return Err(err),
+        };
 
-        #[cfg(not(feature = "declarative-plans"))]
+        #[cfg(not(all(feature = "declarative-plans", any())))]
         let actions_batches = self.read_pm_batches(engine)?;
 
         let mut metadata_opt = None;
@@ -137,7 +147,10 @@ impl LogSegment {
         Ok((metadata_opt, protocol_opt))
     }
 
+    // Disabled on the snapshot-load path (see `replay_for_pm`); kept compiled and type-checked
+    // until a followup makes the declarative P&M plan the default. TODO(#2874-followup).
     #[cfg(feature = "declarative-plans")]
+    #[allow(dead_code)]
     fn read_pm_batches_via_plan(
         &self,
         engine: &dyn Engine,
@@ -149,19 +162,26 @@ impl LogSegment {
         };
 
         let commit_files = self.commit_cover_version_tagged_scan_files()?;
-        // Note: only one of json_checkpoint and parquet_checkpoint is nonempty.
-        let (json_checkpoint, parquet_checkpoint) = self.checkpoint_version_tagged_scan_files()?;
-        let plan = PlanBuilder::union_all([
-            PlanBuilder::scan_json(commit_files, &["version"], Arc::clone(&versioned_schema))?,
-            // We rely on `PlanBuilder`'s dead code elimination to remove the empty checkpoint scan.
-            PlanBuilder::scan_json(json_checkpoint, &["version"], Arc::clone(&versioned_schema))?,
-            PlanBuilder::scan_parquet(parquet_checkpoint, &["version"], versioned_schema)?,
-        ])?
-        .aggregate_ungrouped(|a| {
-            a.max_non_null_by(ColumnName::new([PROTOCOL_NAME]), column_name!("version"))
-                .max_non_null_by(ColumnName::new([METADATA_NAME]), column_name!("version"))
-        })?
-        .build()?;
+        let commits = PlanBuilder::scan_json(commit_files, &["version"], versioned_schema.clone())?;
+
+        // A checkpoint's parts share one format; scan them with the matching operator.
+        let checkpoint = self
+            .checkpoint_version_tagged_scan_files()?
+            .map(|(file_type, checkpoint_files)| {
+                let scan = match file_type {
+                    FileType::Json => PlanBuilder::scan_json,
+                    FileType::Parquet => PlanBuilder::scan_parquet,
+                };
+                scan(checkpoint_files, &["version"], versioned_schema.clone())
+            })
+            .transpose()?;
+
+        let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+            .aggregate_ungrouped(|a| {
+                a.max_non_null_by(ColumnName::new([PROTOCOL_NAME]), column_name!("version"))
+                    .max_non_null_by(ColumnName::new([METADATA_NAME]), column_name!("version"))
+            })?
+            .build()?;
 
         // NOTE: The plan dedupes all actions, so mark all results as coming from checkpoint
         let batches = engine

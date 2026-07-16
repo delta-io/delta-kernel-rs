@@ -25,7 +25,7 @@ use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
-use crate::plans::ir::nodes::ScanFile;
+use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
@@ -831,21 +831,29 @@ impl LogSegment {
         Self::version_tagged_scan_files(&self.find_commit_cover_paths())
     }
 
-    /// Returns checkpoint-part files tagged with file-constant `version`, split by format into
-    /// `(json_parts, parquet_parts)`. V2 checkpoints may be UUID-named JSON, so callers must route
-    /// each part to the matching scan operator rather than assuming parquet.
+    /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
+    /// [`FileType`] they share, or `None` when there is no checkpoint. A V2 checkpoint may be
+    /// UUID-named JSON, so the caller routes the parts to the matching scan operator by `FileType`.
+    ///
+    /// All checkpoint parts of a version share one format (`validate_checkpoint_parts` rejects a
+    /// mixed set), so a single `FileType` describes the whole group -- making a json/parquet mix
+    /// unrepresentable in the return type.
+    ///
+    /// [`FileType`]: crate::plans::ir::nodes::FileType
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn checkpoint_version_tagged_scan_files(
         &self,
-    ) -> DeltaResult<(Vec<ScanFile>, Vec<ScanFile>)> {
-        let (json, parquet): (Vec<_>, Vec<_>) = self
-            .listed
-            .checkpoint_parts
-            .iter()
-            .partition(|part| part.extension == "json");
-        let json = Self::version_tagged_scan_files(json)?;
-        let parquet = Self::version_tagged_scan_files(parquet)?;
-        Ok((json, parquet))
+    ) -> DeltaResult<Option<(FileType, Vec<ScanFile>)>> {
+        let parts = &self.listed.checkpoint_parts;
+        let Some(first) = parts.first() else {
+            return Ok(None);
+        };
+        let file_type = if first.is_json() {
+            FileType::Json
+        } else {
+            FileType::Parquet
+        };
+        Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
