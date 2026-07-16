@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::credentials::StorageCredential;
+
 // ============================================================================
 // Delta-Commits API (legacy)
 //
@@ -303,9 +305,6 @@ pub struct CatalogConfig {
 // ============================================================================
 
 /// Typed Delta protocol wire model (mirrors kernel's `Protocol` action).
-///
-/// TODO: introduce `CreateTableRequest` and `CreateStagingTableResponse`, which both carry a
-/// typed `protocol` field.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Protocol {
@@ -319,6 +318,76 @@ pub struct Protocol {
     /// Writer features (Delta's `writerFeatures` list).
     #[serde(default)]
     pub writer_features: Vec<String>,
+}
+
+// ============================================================================
+// create-table: staging-tables and tables (CREATE flow)
+// ============================================================================
+
+/// Body of a `POST /delta/v1/catalogs/{c}/schemas/{s}/staging-tables` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CreateStagingTableRequest {
+    /// Table name (catalog and schema are in the URL path).
+    pub name: String,
+}
+
+/// Response from the `staging-tables` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CreateStagingTableResponse {
+    /// Allocated table UUID.
+    pub table_id: String,
+    /// Table type (always `"MANAGED"` for staging tables).
+    pub table_type: String,
+    /// Cloud-storage location for the table's `_delta_log/` parent.
+    pub location: String,
+    /// Temporary credentials for the initial commit.
+    pub storage_credentials: Vec<StorageCredential>,
+    /// Required protocol that the v0 commit must satisfy.
+    pub required_protocol: Protocol,
+    /// Suggested protocol the client should consider. Modeled as opaque JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_protocol: Option<serde_json::Value>,
+    /// Required raw configuration entries. Null values mean "any valid value".
+    #[serde(default)]
+    pub required_properties: HashMap<String, Option<String>>,
+    /// Suggested raw configuration entries.
+    #[serde(default)]
+    pub suggested_properties: HashMap<String, Option<String>>,
+}
+
+/// Body of a `POST /delta/v1/catalogs/{c}/schemas/{s}/tables` request, the
+/// typed CREATE finalization payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CreateTableRequest {
+    /// Table name (catalog and schema are in the URL path).
+    pub name: String,
+    /// Cloud-storage location of the table.
+    pub location: String,
+    /// Table type, e.g. `"MANAGED"` or `"EXTERNAL"`.
+    pub table_type: String,
+    /// Optional table comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Typed Delta schema: a `StructType` JSON value.
+    pub columns: serde_json::Value,
+    /// Partition column names, in declaration order.
+    #[serde(default)]
+    pub partition_columns: Vec<String>,
+    /// Typed Delta protocol.
+    pub protocol: Protocol,
+    /// Raw `metaData.configuration` entries; the server derives all `delta.*`
+    /// properties itself.
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
+    /// Per-domain metadata, keyed by domain name. Each value is opaque JSON.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub domain_metadata: HashMap<String, serde_json::Value>,
+    /// Timestamp of version 0 (the commit the client wrote before calling this
+    /// endpoint), in epoch milliseconds.
+    pub last_commit_timestamp_ms: i64,
 }
 
 #[cfg(test)]
@@ -520,5 +589,122 @@ mod tests {
         .unwrap();
         assert_eq!(config.protocol_version, "1.0");
         assert_eq!(config.endpoints.len(), 1);
+    }
+
+    #[test]
+    fn create_staging_table_request_wire_shape() {
+        let v = serde_json::to_value(CreateStagingTableRequest {
+            name: "t".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["name"], "t");
+    }
+
+    #[test]
+    fn create_staging_table_response_decodes_renamed_fields() {
+        // Pin the `table-id` rename and that storage-credentials / optional advertisement
+        // fields decode.
+        let body = r#"{
+            "table-id": "abc",
+            "table-type": "MANAGED",
+            "location": "s3://bucket/t",
+            "storage-credentials": [
+                {"prefix": "s3://bucket/t/", "operation": "READ_WRITE",
+                 "expiration-time-ms": 123, "config": {"s3.access-key-id": "ak"}}
+            ],
+            "required-protocol": {"min-reader-version": 3, "min-writer-version": 7}
+        }"#;
+        let resp: CreateStagingTableResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.table_id, "abc");
+        assert_eq!(resp.location, "s3://bucket/t");
+        assert_eq!(resp.storage_credentials.len(), 1);
+        assert_eq!(resp.required_protocol.min_reader_version, 3);
+        // Absent advertisement fields default rather than fail to decode.
+        assert!(resp.suggested_protocol.is_none());
+        assert!(resp.required_properties.is_empty());
+    }
+
+    #[test]
+    fn create_staging_table_response_decodes_property_maps_and_suggested_protocol() {
+        let body = r#"{
+            "table-id": "abc",
+            "table-type": "MANAGED",
+            "location": "s3://bucket/t",
+            "storage-credentials": [],
+            "required-protocol": {"min-reader-version": 3, "min-writer-version": 7},
+            "suggested-protocol": {"min-reader-version": 1, "min-writer-version": 2},
+            "required-properties": {"delta.appendOnly": "true", "delta.columnMapping.mode": null},
+            "suggested-properties": {"delta.checkpointInterval": null}
+        }"#;
+        let resp: CreateStagingTableResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            resp.required_properties["delta.appendOnly"],
+            Some("true".to_string())
+        );
+        assert_eq!(resp.required_properties["delta.columnMapping.mode"], None);
+        assert_eq!(resp.suggested_properties["delta.checkpointInterval"], None);
+        assert!(resp.suggested_protocol.is_some());
+    }
+
+    #[test]
+    fn create_table_request_wire_shape() {
+        let req = CreateTableRequest {
+            name: "t".to_string(),
+            location: "s3://bucket/t".to_string(),
+            table_type: "MANAGED".to_string(),
+            comment: None,
+            columns: serde_json::json!({"type": "struct", "fields": []}),
+            partition_columns: vec![],
+            protocol: Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features: vec!["catalogManaged".to_string()],
+                writer_features: vec!["catalogManaged".to_string()],
+            },
+            properties: HashMap::from([("delta.appendOnly".to_string(), "true".to_string())]),
+            domain_metadata: HashMap::new(),
+            last_commit_timestamp_ms: 42,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        // Field renames.
+        assert_eq!(v["location"], "s3://bucket/t");
+        assert_eq!(v["table-type"], "MANAGED");
+        assert_eq!(v["last-commit-timestamp-ms"], 42);
+        // Protocol is sent typed and separate; properties carry only raw configuration (the server
+        // derives `delta.feature.*` / versions itself), so no derived keys leak into `properties`.
+        assert_eq!(v["protocol"]["min-reader-version"], 3);
+        assert_eq!(v["properties"]["delta.appendOnly"], "true");
+        assert!(v["properties"].get("delta.minReaderVersion").is_none());
+        assert!(v["properties"]
+            .get("delta.feature.catalogManaged")
+            .is_none());
+        // Empty domain metadata is omitted from the wire body.
+        assert!(v.get("domain-metadata").is_none());
+    }
+
+    #[test]
+    fn create_table_request_serializes_optional_fields_when_present() {
+        let req = CreateTableRequest {
+            name: "t".to_string(),
+            location: "s3://bucket/t".to_string(),
+            table_type: "MANAGED".to_string(),
+            comment: Some("hello".to_string()),
+            columns: serde_json::json!({"type": "struct", "fields": []}),
+            partition_columns: vec!["p1".to_string(), "p2".to_string()],
+            protocol: Protocol::default(),
+            properties: HashMap::new(),
+            domain_metadata: HashMap::from([(
+                "delta.clustering".to_string(),
+                serde_json::json!({"clusteringColumns": ["c1"]}),
+            )]),
+            last_commit_timestamp_ms: 42,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["comment"], "hello");
+        assert_eq!(v["partition-columns"], serde_json::json!(["p1", "p2"]));
+        assert_eq!(
+            v["domain-metadata"]["delta.clustering"]["clusteringColumns"][0],
+            "c1"
+        );
     }
 }
