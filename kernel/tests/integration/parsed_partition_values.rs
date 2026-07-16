@@ -8,7 +8,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{col, lit, ColumnName, Predicate};
+use delta_kernel::expressions::{col, lit, ColumnName, Predicate, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::scan::state::ScanFile;
@@ -401,10 +401,10 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
 // `DefaultEngine` built via `DefaultEngineBuilder::with_session_timezone` supplies it. This is the
 // end-to-end counterpart to the unit tests in `evaluate_expression`.
 
-/// Writes a single-`p_ts`-TIMESTAMP-partition foreign table with one offset-less add, and returns
+/// Writes a `p_ts`-TIMESTAMP-partition foreign table, one `add` per `(path, raw_ts)`, and returns
 /// its URL. `writeStatsAsStruct=false` so the JSON commit reconstructs `partitionValues_parsed`
 /// from the string map on read (the tz-aware path).
-async fn write_ts_partition_table(table_path: &std::path::Path, raw_ts: &str) -> Url {
+async fn write_ts_partition_table(table_path: &std::path::Path, files: &[(&str, &str)]) -> Url {
     std::fs::create_dir_all(table_path).unwrap();
     let url = Url::from_directory_path(table_path).unwrap();
     let table_root = url.to_string();
@@ -430,17 +430,23 @@ async fn write_ts_partition_table(table_path: &std::path::Path, raw_ts: &str) ->
         },
     })
     .to_string();
-    let add = serde_json::json!({
-        "add": {
-            "path": "f.parquet",
-            "partitionValues": {"p_ts": raw_ts},
-            "size": 100,
-            "modificationTime": 1700000000000_i64,
-            "dataChange": true,
-            "stats": "{\"numRecords\":1}",
-        },
-    })
-    .to_string();
+    let adds = files
+        .iter()
+        .map(|(path, raw_ts)| {
+            serde_json::json!({
+                "add": {
+                    "path": path,
+                    "partitionValues": {"p_ts": raw_ts},
+                    "size": 100,
+                    "modificationTime": 1700000000000_i64,
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":1}",
+                },
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     add_commit(
         &table_root,
@@ -450,10 +456,31 @@ async fn write_ts_partition_table(table_path: &std::path::Path, raw_ts: &str) ->
     )
     .await
     .unwrap();
-    add_commit(&table_root, store.as_ref(), 1, add)
+    add_commit(&table_root, store.as_ref(), 1, adds)
         .await
         .unwrap();
     url
+}
+
+/// Builds a multi-threaded `DefaultEngine` over `url`, optionally carrying a session zone.
+/// `session_tz = None` resolves offset-less TIMESTAMP partition values at UTC.
+fn zoned_engine(
+    url: &Url,
+    session_tz: Option<&str>,
+) -> test_utils::delta_kernel_default_engine::DefaultEngine<
+    test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
+> {
+    let store = test_utils::delta_kernel_default_engine::storage::store_from_url(url).unwrap();
+    let task_executor = Arc::new(
+        test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    let mut builder = DefaultEngineBuilder::new(store).with_task_executor(task_executor);
+    if let Some(tz) = session_tz {
+        builder = builder.with_session_timezone(tz).unwrap();
+    }
+    builder.build()
 }
 
 /// An engine built with a session zone resolves an offset-less TIMESTAMP partition value in that
@@ -472,19 +499,8 @@ async fn engine_session_timezone_resolves_offset_less_timestamp_partition(
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("engine-tz-offset-less");
-    let url = write_ts_partition_table(&table_path, "2024-01-15 16:00:00").await;
-
-    let store = test_utils::delta_kernel_default_engine::storage::store_from_url(&url).unwrap();
-    let task_executor = Arc::new(
-        test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor::new(
-            tokio::runtime::Handle::current(),
-        ),
-    );
-    let mut builder = DefaultEngineBuilder::new(store).with_task_executor(task_executor);
-    if let Some(tz) = session_tz {
-        builder = builder.with_session_timezone(tz).unwrap();
-    }
-    let engine = builder.build();
+    let url = write_ts_partition_table(&table_path, &[("f.parquet", "2024-01-15 16:00:00")]).await;
+    let engine = zoned_engine(&url, session_tz);
 
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
     let scan = snapshot
@@ -516,4 +532,50 @@ async fn engine_session_timezone_resolves_offset_less_timestamp_partition(
         found = true;
     }
     assert!(found, "expected one surviving file");
+}
+
+/// The engine's session zone actually eliminates files: a partition predicate written as an
+/// absolute instant keeps only the file whose offset-less TIMESTAMP resolves (in that zone) to the
+/// same instant, and prunes the other. Under UTC the same predicate would keep the other file, so
+/// this proves the pruning acts on the zone-resolved value, not a fixed-UTC one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_session_timezone_prunes_offset_less_timestamp_partition() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("engine-tz-pruning");
+    // Two offset-less values one hour apart. Under America/New_York (UTC-5) they denote
+    // 2024-01-15T21:00:00Z (a.parquet) and 2024-01-15T22:00:00Z (b.parquet).
+    let url = write_ts_partition_table(
+        &table_path,
+        &[
+            ("a.parquet", "2024-01-15 16:00:00"),
+            ("b.parquet", "2024-01-15 17:00:00"),
+        ],
+    )
+    .await;
+    let engine = zoned_engine(&url, Some("America/New_York"));
+
+    let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
+    // 16:00 in America/New_York is 21:00Z. The predicate written as that instant keeps a.parquet
+    // (21:00Z) and prunes b.parquet (22:00Z). Under UTC, a.parquet would resolve to 16:00Z and be
+    // pruned instead, so a surviving `a.parquet` proves the zone was applied.
+    let target = lit(Scalar::Timestamp(1_705_352_400_000_000)); // 2024-01-15T21:00:00Z
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .with_predicate(Arc::new(Predicate::eq(col!("p_ts"), target)))
+        .build()
+        .unwrap();
+
+    let mut paths = Vec::new();
+    for scan_metadata in scan.scan_metadata(&engine).unwrap() {
+        paths = scan_metadata
+            .unwrap()
+            .visit_scan_files(paths, collect_path)
+            .unwrap();
+    }
+    assert_eq!(
+        paths,
+        vec!["a.parquet".to_string()],
+        "only the file whose session-zone instant equals the predicate survives"
+    );
 }
