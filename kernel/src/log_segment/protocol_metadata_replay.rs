@@ -116,16 +116,11 @@ impl LogSegment {
         // `read_pm_batches_via_plan`) but disabled behind an always-false cfg (`any()`) until a
         // followup makes it the default; legacy replay runs for now. TODO(#2874-followup).
         #[cfg(all(feature = "declarative-plans", any()))]
-        let actions_batches = match self.read_pm_batches_via_plan(engine) {
-            Ok(batches) => batches,
-            // Fall back to legacy replay only when the engine's plan executor does not support the
-            // P&M plan. A genuine execution failure must propagate rather than silently re-run.
-            Err(Error::Unsupported(msg)) => {
-                info!("declarative P&M plan unsupported, using legacy replay: {msg}");
-                Box::new(self.read_pm_batches(engine)?)
-            }
-            Err(err) => return Err(err),
-        };
+        let actions_batches = self.read_pm_batches_via_plan(engine).or_else(|err| {
+            info!("declarative P&M plan failed, using legacy replay: {err}");
+            self.read_pm_batches(engine)
+                .map(|batches| Box::new(batches) as _)
+        })?;
 
         #[cfg(not(all(feature = "declarative-plans", any())))]
         let actions_batches = self.read_pm_batches(engine)?;
