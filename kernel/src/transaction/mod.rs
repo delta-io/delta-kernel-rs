@@ -416,7 +416,11 @@ impl<S> Transaction<S> {
             );
         }
 
-        // Validate clustering column stats if ClusteredTable feature is enabled
+        // Validate protocol-required add-file statistics.
+        // Note: Stats validation cannot use `StagedDataValidator` because its columns and types
+        // are determined at runtime, whereas `RowVisitor::selected_column_names_and_types` must
+        // return a static projection. Consequently, stats validation makes a separate pass for
+        // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
         // Validate required fields for addFile.

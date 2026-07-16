@@ -6,7 +6,6 @@ use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
-use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 /// Column indices, matching the order in [`MANDATORY_ADD_FILE_COLUMNS`].
@@ -31,37 +30,31 @@ impl StagedDataValidator {
 /// `partitionValues`, `size`, `modificationTime`) present.
 pub(crate) struct AddFileRequiredFields;
 
+fn require_add_file_field<T>(value: Option<T>, path: &str, field: &str) -> DeltaResult<T> {
+    value.ok_or_else(|| {
+        Error::missing_data(format!(
+            "AddFile for '{path}' is missing required field '{field}'"
+        ))
+    })
+}
+
 impl Validation for AddFileRequiredFields {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
             .ok_or_else(|| Error::missing_data("Add action is missing required field 'path'"))?;
 
-        require!(
-            getters[PARTITION_VALUES]
-                .get_map(row, "partitionValues")?
-                .is_some(),
-            Error::missing_data(format!(
-                "Add action for '{path}' is missing required field 'partitionValues'"
-            ))
-        );
-
-        let size: Option<i64> = getters[SIZE].get_opt(row, "size")?;
-        require!(
-            size.is_some(),
-            Error::missing_data(format!(
-                "Add action for '{path}' is missing required field 'size'"
-            ))
-        );
-
-        let modification_time: Option<i64> =
-            getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?;
-        require!(
-            modification_time.is_some(),
-            Error::missing_data(format!(
-                "Add action for '{path}' is missing required field 'modificationTime'"
-            ))
-        );
+        require_add_file_field(
+            getters[PARTITION_VALUES].get_map(row, "partitionValues")?,
+            path,
+            "partitionValues",
+        )?;
+        require_add_file_field::<i64>(getters[SIZE].get_opt(row, "size")?, path, "size")?;
+        require_add_file_field::<i64>(
+            getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
+            path,
+            "modificationTime",
+        )?;
         Ok(())
     }
 }
@@ -71,7 +64,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::new_null_array;
+    use crate::arrow::array::{new_null_array, Array};
+    use crate::arrow::compute::{concat, concat_batches};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::ColumnName;
@@ -82,13 +76,29 @@ mod tests {
         valid_add_file_batch(true /* all_nullable */)
     }
 
-    /// Return `batch` with `field`'s column replaced by an all-null array of the same type.
-    fn set_field_as_null(batch: &RecordBatch, field: &str) -> RecordBatch {
+    fn nullable_add_files(row_count: usize) -> RecordBatch {
+        let batch = nullable_add_file();
+        concat_batches(&batch.schema(), &vec![batch; row_count])
+            .expect("failed to concatenate rows into a multi-row add-file batch")
+    }
+
+    /// Return `batch` with `field` set to null at `row`.
+    fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
         let schema = batch.schema();
         let index = schema.index_of(field).expect("field in schema");
         let mut columns = batch.columns().to_vec();
-        columns[index] = new_null_array(schema.field(index).data_type(), batch.num_rows());
-        RecordBatch::try_new(schema, columns).expect("record batch with nulled field")
+        let column = &columns[index];
+        let null = new_null_array(schema.field(index).data_type(), 1);
+        let slices = [
+            column.slice(0, row),
+            null,
+            column.slice(row + 1, batch.num_rows() - row - 1),
+        ];
+        let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
+        columns[index] = concat(&arrays)
+            .expect("failed to replace the selected add-file field with a null value");
+        RecordBatch::try_new(schema, columns)
+            .expect("failed to rebuild add-file batch after replacing a field value with null")
     }
 
     fn add_validator() -> StagedDataValidator {
@@ -124,8 +134,11 @@ mod tests {
     #[case::partition_values("partitionValues")]
     #[case::size("size")]
     #[case::modification_time("modificationTime")]
-    fn required_field_missing_rejected(#[case] field: &str) {
-        let batch = set_field_as_null(&nullable_add_file(), field);
+    fn required_field_missing_at_any_row_rejected(
+        #[case] field: &str,
+        #[values(0, 1, 2)] invalid_row: usize,
+    ) {
+        let batch = set_field_as_null(&nullable_add_files(3), field, invalid_row);
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
         assert_result_error_with_message(
             add_validator().validate(&adds),
