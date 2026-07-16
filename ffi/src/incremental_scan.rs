@@ -8,9 +8,12 @@
 //! snapshot_incremental_scan_builder(snapshot, base_version, engine)
 //!   -> incremental_scan_builder_with_predicate(builder, engine, predicate) // optional; prunes live Adds
 //!   -> incremental_scan_builder_build(builder)   // -> OptionalValue<stream>; None => full-scan fallback
-//!   -> incremental_scan_stream_next_arrow(stream) // drain filtered Add batches, newest-first
-//!   -> incremental_scan_stream_into_summary(stream) // -> summary; consumes the stream
 //! ```
+//!
+//! The stream is then drained by exactly one of two terminal consumers:
+//! [`incremental_scan_stream_next_arrow`] (pull filtered Add batches as Arrow, newest-first) or
+//! [`incremental_scan_stream_into_summary`] (recover the live-Add and Remove key sets;
+//! `into_summary` also drains any batches `next_arrow` left behind).
 //!
 //! [`incremental_scan_builder_build`] returns [`OptionalValue::None`] (not an error) when the
 //! target snapshot's commit list can't cover the range, which is the signal to fall back to a
@@ -19,6 +22,13 @@
 //! The Arrow batch step (`incremental_scan_stream_next_arrow` and
 //! [`FilteredEngineDataArrowResult`]) requires the `default-engine-base` feature; the builder,
 //! summary, and visitor entry points are always available.
+//!
+//! Pass-through fields decoded from a batch (`stats`, `partitionValues`, `baseRowId`) must be
+//! interpreted against the protocol at that row's own commit version, not against the target
+//! snapshot: in-range protocol/metadata changes are not yet surfaced (see
+//! <https://github.com/delta-io/delta-kernel-rs/issues/2552>). For example, a `columnMapping`
+//! change within the range shifts the physical column names keying `stats` and `partitionValues`,
+//! so decoding older-commit rows against the target snapshot's names reads them wrong.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -31,9 +41,8 @@ use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
-use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::handle::Handle;
-use crate::scan::EnginePredicate;
+use crate::scan::{decode_engine_predicate, EnginePredicate};
 #[cfg(feature = "default-engine-base")]
 use crate::KernelBoolSlice;
 use crate::{
@@ -133,15 +142,7 @@ fn incremental_scan_builder_with_predicate_impl(
     mut builder: FfiIncrementalScanBuilder,
     predicate: &mut EnginePredicate,
 ) -> DeltaResult<Handle<MutableFfiIncrementalScanBuilder>> {
-    let mut visitor_state = KernelExpressionVisitorState::default();
-    let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
-        Error::generic(
-            "engine predicate visitor returned an invalid expression ID; \
-             predicate could not be decoded",
-        )
-    })?;
-    builder.predicate = Some(Arc::new(predicate));
+    builder.predicate = Some(Arc::new(decode_engine_predicate(predicate)?));
     Ok(Box::new(builder).into())
 }
 
@@ -212,7 +213,13 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 /// A read failure from the underlying commit stream kills it: later calls return `Ok(null)` and
 /// [`incremental_scan_stream_into_summary`] will error, so rebuild the stream to retry. A failure
 /// converting a successfully-read batch to Arrow is non-terminal; the errored batch's rows are
-/// dropped, but the stream can still be advanced and its summary is unaffected.
+/// dropped and the stream can still be advanced. That batch's file keys were already folded into
+/// the summary before conversion, so after any `Err` from this function the summary's `live_adds`
+/// can name files whose Arrow rows were never delivered. Treat the summary as the authoritative
+/// key set and re-fetch the dropped rows out of band, or rebuild the stream.
+///
+/// Decode pass-through fields against each row's own commit protocol, not the target snapshot;
+/// see the module-level note on <https://github.com/delta-io/delta-kernel-rs/issues/2552>.
 ///
 /// # Safety
 ///
@@ -272,16 +279,16 @@ fn incremental_scan_stream_next_arrow_impl(
 pub unsafe extern "C" fn incremental_scan_stream_into_summary(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
-    let engine = unsafe { stream.as_ref() }.engine.clone();
-    let result = incremental_scan_stream_into_summary_impl(&stream);
+    let inner_stream = unsafe { stream.as_ref() };
+    let engine = inner_stream.engine.clone();
+    let result = incremental_scan_stream_into_summary_impl(inner_stream);
     stream.drop_handle();
     result.into_extern_result(&engine.as_ref())
 }
 
 fn incremental_scan_stream_into_summary_impl(
-    stream: &Handle<SharedIncrementalScanStream>,
+    stream: &FfiIncrementalScanStream,
 ) -> DeltaResult<Handle<SharedIncrementalScanSummary>> {
-    let stream = unsafe { stream.as_ref() };
     let inner = lock_stream(stream)?
         .take()
         .ok_or_else(|| Error::generic("incremental scan stream was already consumed"))?;
@@ -334,7 +341,7 @@ pub unsafe extern "C" fn incremental_scan_summary_target_version(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid summary handle.
+/// Caller must pass a valid summary handle and a non-null `callback` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
     summary: Handle<SharedIncrementalScanSummary>,
@@ -352,7 +359,7 @@ pub unsafe extern "C" fn incremental_scan_summary_visit_live_adds(
 ///
 /// # Safety
 ///
-/// Caller must pass a valid summary handle.
+/// Caller must pass a valid summary handle and a non-null `callback` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_summary_visit_removes(
     summary: Handle<SharedIncrementalScanSummary>,
@@ -479,64 +486,16 @@ mod tests {
         snapshot_builder_build, snapshot_builder_set_version, NullableCvoid, TryFromStringSlice,
     };
 
-    /// Build an in-memory engine handle and a snapshot pinned to `target_version`, pre-loaded
-    /// with a metadata commit at v0 and the given `commits` at v1.. Returns
+    /// Build an in-memory engine handle and a snapshot pinned to the last version, from a v0
+    /// metadata commit (`v0_metadata`) followed by `commits` (raw JSON) at v1.. Returns
     /// `(engine_handle, snapshot_handle)`; the caller frees both.
-    async fn setup(
-        commits: Vec<Vec<TestAction>>,
-    ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            0,
-            actions_to_string(vec![TestAction::Metadata]),
-        )
-        .await
-        .unwrap();
-        let target_version = commits.len() as u64;
-        for (idx, body) in commits.into_iter().enumerate() {
-            add_commit(
-                table_root,
-                storage.as_ref(),
-                (idx + 1) as u64,
-                actions_to_string(body),
-            )
-            .await
-            .unwrap();
-        }
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let mut builder = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        unsafe { snapshot_builder_set_version(&mut builder, target_version) };
-        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-        (engine, snapshot)
-    }
-
-    // Protocol + metadata commit enabling the deletionVectors feature, so DV-bearing Adds
-    // parse. `TestAction` can't emit a `deletionVector` field, so DV tests write raw JSON.
-    const DV_METADATA: &str = "{\"metaData\":{\"id\":\"test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[]}\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
-
-    fn add_with_dv(path: &str, storage_type: &str, path_or_inline: &str, offset: i32) -> String {
-        format!(
-            "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":null,\"deletionVector\":{{\"storageType\":\"{storage_type}\",\"pathOrInlineDv\":\"{path_or_inline}\",\"offset\":{offset},\"sizeInBytes\":10,\"cardinality\":1}}}}}}"
-        )
-    }
-
-    /// Build an engine + snapshot (pinned to the last version) from raw commit-JSON strings at
-    /// v1.., with a DV-enabling metadata commit at v0.
-    async fn setup_raw(
+    async fn setup_from_raw(
+        v0_metadata: String,
         commits: Vec<String>,
     ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
         let table_root = "memory:///";
         let storage = Arc::new(InMemory::new());
-        add_commit(table_root, storage.as_ref(), 0, DV_METADATA.to_string())
+        add_commit(table_root, storage.as_ref(), 0, v0_metadata)
             .await
             .unwrap();
         let target_version = commits.len() as u64;
@@ -556,6 +515,32 @@ mod tests {
         unsafe { snapshot_builder_set_version(&mut builder, target_version) };
         let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
         (engine, snapshot)
+    }
+
+    /// Standard `id`/`val` metadata commit plus `TestAction` commit bodies at v1..
+    async fn setup(
+        commits: Vec<Vec<TestAction>>,
+    ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
+        let v0 = actions_to_string(vec![TestAction::Metadata]);
+        setup_from_raw(v0, commits.into_iter().map(actions_to_string).collect()).await
+    }
+
+    // Protocol + metadata commit enabling the deletionVectors feature, so DV-bearing Adds
+    // parse. `TestAction` can't emit a `deletionVector` field, so DV tests write raw JSON.
+    const DV_METADATA: &str = "{\"metaData\":{\"id\":\"test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[]}\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
+
+    fn add_with_dv(path: &str, storage_type: &str, path_or_inline: &str, offset: i32) -> String {
+        format!(
+            "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":null,\"deletionVector\":{{\"storageType\":\"{storage_type}\",\"pathOrInlineDv\":\"{path_or_inline}\",\"offset\":{offset},\"sizeInBytes\":10,\"cardinality\":1}}}}}}"
+        )
+    }
+
+    /// Build an engine + snapshot from raw commit-JSON strings at v1.., with a DV-enabling
+    /// metadata commit at v0.
+    async fn setup_raw(
+        commits: Vec<String>,
+    ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
+        setup_from_raw(DV_METADATA.to_string(), commits).await
     }
 
     // Collect the (path, dv_unique_id) pairs a summary visitor reports. `RefCell` because the
@@ -593,6 +578,25 @@ mod tests {
         keys.into_inner()
     }
 
+    /// Build a stream over `(base_version, target]`, asserting the range is covered. Tests that
+    /// exercise the builder-error or `OptionalValue::None` paths call the FFI directly instead.
+    fn build_stream(
+        snapshot: &Handle<SharedSnapshot>,
+        engine: &Handle<SharedExternEngine>,
+        base_version: Version,
+    ) -> Handle<SharedIncrementalScanStream> {
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(
+                snapshot.shallow_copy(),
+                base_version,
+                engine.shallow_copy(),
+            )
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        maybe_stream.expect("range covered, expected Some(stream)")
+    }
+
     #[tokio::test]
     async fn build_and_summary_reports_live_adds_and_removes(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -607,12 +611,7 @@ mod tests {
         ])
         .await;
 
-        let builder = unsafe {
-            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
-        };
-        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
-            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
-        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let stream = build_stream(&snapshot, &engine, 0);
 
         let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
 
@@ -653,12 +652,7 @@ mod tests {
         ])
         .await;
 
-        let builder = unsafe {
-            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
-        };
-        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
-            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
-        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let stream = build_stream(&snapshot, &engine, 0);
 
         let mut batches = 0;
         loop {
@@ -732,12 +726,7 @@ mod tests {
         ])
         .await;
 
-        let builder = unsafe {
-            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
-        };
-        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
-            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
-        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let stream = build_stream(&snapshot, &engine, 0);
         let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
 
         let mut live_adds = visit_live_adds(&summary);
@@ -766,12 +755,7 @@ mod tests {
     async fn terminal_calls_after_into_summary_error() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
 
-        let builder = unsafe {
-            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
-        };
-        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
-            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
-        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let stream = build_stream(&snapshot, &engine, 0);
 
         // A second owning reference keeps the object alive after into_summary consumes it.
         let surviving = unsafe { stream.clone_handle() };
@@ -794,12 +778,7 @@ mod tests {
     async fn free_stream_without_draining() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snapshot) = setup(vec![vec![TestAction::Add("A".to_string())]]).await;
 
-        let builder = unsafe {
-            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
-        };
-        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
-            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
-        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let stream = build_stream(&snapshot, &engine, 0);
         unsafe { free_incremental_scan_stream(stream) };
 
         unsafe { free_snapshot(snapshot) };
@@ -818,12 +797,7 @@ mod tests {
         ])
         .await;
 
-        let builder = unsafe {
-            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
-        };
-        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
-            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
-        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let stream = build_stream(&snapshot, &engine, 0);
 
         // Read exactly one batch, leaving the other for into_summary to drain.
         let ptr = unsafe { ok_or_panic(incremental_scan_stream_next_arrow(stream.shallow_copy())) };
@@ -858,33 +832,12 @@ mod tests {
         )
     }
 
-    /// Build an engine + snapshot (pinned to the last version) from raw commit-JSON strings at
-    /// v1.., with an `id`-column metadata commit at v0.
+    /// Build an engine + snapshot from raw commit-JSON strings at v1.., with an `id`-column
+    /// metadata commit at v0.
     async fn setup_with_id_metadata(
         commits: Vec<String>,
     ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
-        let table_root = "memory:///";
-        let storage = Arc::new(InMemory::new());
-        add_commit(table_root, storage.as_ref(), 0, ID_METADATA.to_string())
-            .await
-            .unwrap();
-        let target_version = commits.len() as u64;
-        for (idx, body) in commits.into_iter().enumerate() {
-            add_commit(table_root, storage.as_ref(), (idx + 1) as u64, body)
-                .await
-                .unwrap();
-        }
-        let engine = DefaultEngineBuilder::new(storage.clone()).build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-        let mut builder = unsafe {
-            ok_or_panic(get_snapshot_builder(
-                kernel_string_slice!(table_root),
-                engine.shallow_copy(),
-            ))
-        };
-        unsafe { snapshot_builder_set_version(&mut builder, target_version) };
-        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
-        (engine, snapshot)
+        setup_from_raw(ID_METADATA.to_string(), commits).await
     }
 
     /// Predicate visitor that constructs `id > 25`.
@@ -996,5 +949,173 @@ mod tests {
         };
         let lit = visit_expression_literal_int(state, 25);
         visit_predicate_gt(state, col, lit)
+    }
+
+    // The predicate's selection vector must line up with the drained Arrow batch, not just the
+    // summary: two Adds land in one batch, `id > 25` prunes the low file, and only the high file's
+    // row is selected. Guards the FFI-owned "only `true` rows are live Adds" contract for
+    // `next_arrow` (the summary path is covered separately by `with_predicate_prunes_live_adds`).
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test]
+    async fn next_arrow_selection_vector_reflects_predicate_pruning(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use delta_kernel::arrow::array::{Array, RecordBatch, StringArray, StructArray};
+        use delta_kernel::arrow::ffi::from_ffi;
+
+        let (engine, snapshot) = setup_with_id_metadata(vec![[
+            add_with_id_stats("low.parquet", 0, 9),
+            add_with_id_stats("high.parquet", 20, 30),
+        ]
+        .join("\n")])
+        .await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_id_gt_25,
+        };
+        let builder = unsafe {
+            ok_or_panic(incremental_scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+
+        let ptr = unsafe { ok_or_panic(incremental_scan_stream_next_arrow(stream.shallow_copy())) };
+        assert!(!ptr.is_null(), "expected one batch for the single commit");
+        let FilteredEngineDataArrowResult {
+            arrow_data,
+            selection_vector,
+        } = unsafe { *Box::from_raw(ptr) };
+        let array_data = unsafe { from_ffi(arrow_data.array, &arrow_data.schema) }?;
+        let batch: RecordBatch = StructArray::from(array_data).into();
+        let sv = unsafe { selection_vector.into_vec() };
+
+        // The batch carries every action row read; only the row whose `add.path` is the high file
+        // is selected. Inspect the column rather than assuming row order.
+        let add_paths = batch
+            .column_by_name("add")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+            .and_then(|s| s.column_by_name("path"))
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("add.path column");
+        let selected: Vec<&str> = (0..batch.num_rows())
+            .filter(|&i| sv[i] && !add_paths.is_null(i))
+            .map(|i| add_paths.value(i))
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["high.parquet"],
+            "only the high file is selected"
+        );
+
+        let ptr = unsafe { ok_or_panic(incremental_scan_stream_next_arrow(stream.shallow_copy())) };
+        assert!(ptr.is_null(), "stream exhausted after one batch");
+
+        unsafe { free_incremental_scan_stream(stream) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // `build` returns `OptionalValue::None` (not an error) when the target snapshot's commit list
+    // can't cover `base_version + 1` -- the signal to fall back to a full scan. A checkpoint above
+    // the base truncates the retained commit JSONs so version 1 is no longer listed; a base of 0
+    // then requires commit 1 and the range is uncovered. Needs a multi-thread runtime because
+    // `checkpoint_snapshot` issues nested `block_on` calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_returns_none_when_range_not_covered() -> Result<(), Box<dyn std::error::Error>> {
+        use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+
+        use crate::{checkpoint_snapshot, version, FfiCheckpointWriteResult};
+
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await
+        .unwrap();
+        for v in 1..=3u64 {
+            add_commit(
+                table_root,
+                storage.as_ref(),
+                v,
+                actions_to_string(vec![TestAction::Add(format!("file{v}.parquet"))]),
+            )
+            .await
+            .unwrap();
+        }
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
+
+        // Checkpoint at v2 so the log segment for a later snapshot starts at the checkpoint and
+        // drops commit 1's JSON.
+        let mut builder_v2 = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        unsafe { snapshot_builder_set_version(&mut builder_v2, 2) };
+        let snapshot_v2 = unsafe { ok_or_panic(snapshot_builder_build(builder_v2)) };
+        // checkpoint_snapshot borrows its handle (clone_as_arc) but does not consume it, so pass a
+        // shallow copy and free the original separately.
+        let checkpointed = match unsafe {
+            ok_or_panic(checkpoint_snapshot(
+                snapshot_v2.shallow_copy(),
+                engine.shallow_copy(),
+                None,
+            ))
+        } {
+            FfiCheckpointWriteResult::Written(s) | FfiCheckpointWriteResult::AlreadyExists(s) => s,
+        };
+        assert_eq!(unsafe { version(checkpointed.shallow_copy()) }, 2);
+        unsafe { free_snapshot(checkpointed) };
+        unsafe { free_snapshot(snapshot_v2) };
+
+        // Fresh snapshot at v3: its log segment starts at the v2 checkpoint, so commit 1 is gone.
+        let mut builder_v3 = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        unsafe { snapshot_builder_set_version(&mut builder_v3, 3) };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder_v3)) };
+
+        // base_version 0 needs commit 1, which the checkpoint truncated => None, not an error.
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        assert!(
+            maybe_stream.is_none(),
+            "range not covered => None (full-scan fallback signal), not an error"
+        );
+
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
     }
 }

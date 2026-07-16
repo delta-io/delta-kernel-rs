@@ -142,23 +142,33 @@ pub unsafe extern "C" fn scan(
     scan_impl(snapshot, predicate, schema).into_extern_result(&engine.as_ref())
 }
 
-/// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
+/// Decode an [`EnginePredicate`] into a kernel [`Predicate`] by running the engine's visitor.
 ///
-/// Returns an error if the engine's visitor fails to produce a valid predicate (i.e. returns
-/// an invalid expression ID). A `None` result from the visitor indicates the engine-side
-/// predicate construction failed, which would silently produce a full-table scan if ignored.
-fn apply_predicate(
-    builder: ScanBuilder,
+/// Returns an error if the visitor fails to produce a valid predicate (i.e. returns an invalid
+/// expression ID). A `None` result from the visitor indicates the engine-side predicate
+/// construction failed, which would silently widen to a full scan if ignored.
+pub(crate) fn decode_engine_predicate(
     predicate: &mut EnginePredicate,
-) -> DeltaResult<ScanBuilder> {
+) -> DeltaResult<delta_kernel::Predicate> {
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
+    unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
         delta_kernel::Error::generic(
             "engine predicate visitor returned an invalid expression ID; \
              predicate could not be decoded",
         )
-    })?;
+    })
+}
+
+/// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
+///
+/// Returns an error if the engine's visitor fails to produce a valid predicate; see
+/// [`decode_engine_predicate`].
+fn apply_predicate(
+    builder: ScanBuilder,
+    predicate: &mut EnginePredicate,
+) -> DeltaResult<ScanBuilder> {
+    let predicate = decode_engine_predicate(predicate)?;
     debug!("Got predicate: {:#?}", predicate);
     Ok(builder.with_predicate(Some(Arc::new(predicate))))
 }

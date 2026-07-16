@@ -81,14 +81,24 @@ letting an engine advance a cached file listing without a full log replay
 snapshot_incremental_scan_builder(snapshot, base_version, engine)
   -> incremental_scan_builder_with_predicate(builder, engine, predicate)  // optional; prunes live Adds
   -> incremental_scan_builder_build(builder)      // -> OptionalValue<stream>; None => full-scan fallback
-  -> incremental_scan_stream_next_arrow(stream)    // drain live-Add batches (Arrow), newest-first
-  -> incremental_scan_stream_into_summary(stream)  // -> summary; consumes the stream
 ```
+
+The stream is then drained by exactly one of two terminal consumers (not both in sequence):
+- `incremental_scan_stream_next_arrow(stream)` — pull live-Add batches as Arrow, newest-first
+- `incremental_scan_stream_into_summary(stream)` — recover the live-Add / Remove key sets;
+  also drains any batches `next_arrow` left behind, then consumes the stream
 
 `incremental_scan_builder_build` returns `OptionalValue::None` (not an error) when the target
 snapshot's commit list can't cover `(base_version, target_version]`, which is the signal to fall
 back to a full scan. The builder is always consumed by `build`; discard it early with
 `free_incremental_scan_builder`.
+
+Pass-through fields decoded from a batch (`stats`, `partitionValues`, `baseRowId`) must be
+interpreted against the protocol at each row's own commit version, not the target snapshot:
+in-range protocol/metadata changes (e.g. a `columnMapping` flip) are not yet surfaced (kernel
+issue #2552). If a `next_arrow` call returns an error, its batch's keys were already folded into
+the summary, so `summary.live_adds` may name files whose Arrow rows were never delivered; treat
+the summary as authoritative and re-fetch dropped rows, or rebuild the stream.
 
 `incremental_scan_builder_with_predicate` takes an `EnginePredicate` (same shape used by `scan`)
 and prunes streamed live Adds by their file stats, the same data-skipping the read path applies.
