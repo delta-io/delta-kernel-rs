@@ -1,6 +1,7 @@
 //! Integration tests for the `allowColumnDefaults` writer feature.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -53,7 +54,7 @@ fn add_column_defaults_feature_commit(
     schema: Option<&StructType>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let initial_commit =
-        std::fs::read_to_string(table_path.join("_delta_log/00000000000000000000.json"))?;
+        fs::read_to_string(table_path.join("_delta_log/00000000000000000000.json"))?;
     let mut actions = initial_commit
         .lines()
         .map(serde_json::from_str::<serde_json::Value>)
@@ -87,7 +88,7 @@ fn add_column_defaults_feature_commit(
         serde_json::to_string(&protocol)?,
         serde_json::to_string(&metadata)?,
     );
-    std::fs::write(
+    fs::write(
         table_path.join(format!("_delta_log/{version:020}.json")),
         commit,
     )?;
@@ -551,7 +552,7 @@ async fn test_load_tolerates_non_primitive_non_null_default(
 
 #[test]
 fn test_column_default_composes_with_deletion_vectors() -> Result<(), Box<dyn std::error::Error>> {
-    let source_path = std::fs::canonicalize("./tests/data/table-with-dv-small/")?;
+    let source_path = fs::canonicalize("./tests/data/table-with-dv-small/")?;
     let temp_dir = tempfile::tempdir()?;
     let table_path = temp_dir.path().join("table-with-dv-and-column-default");
     copy_directory(&source_path, &table_path)?;
