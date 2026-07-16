@@ -379,10 +379,9 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 /// meaningful. When `nullCount` stats are present for a void column, `eval_pred_is_null` can
 /// use them for `IS NULL` / `IS NOT NULL` file skipping.
 ///
-/// Geometry and Geography are excluded here even though the Delta protocol lists them as
-/// skipping-eligible: kernel does not yet parse or compare geo min/max stats (`parse_scalar`
-/// errors on geo), so claiming eligibility would emit predicate refs to stats kernel can't
-/// evaluate. Add them back once geo stats parsing and comparison are implemented.
+/// Geometry and Geography are excluded even though the Delta protocol lists them as
+/// skipping-eligible: kernel cannot parse or compare geo min/max stats (`parse_scalar` errors on
+/// geo), so claiming eligibility would emit predicate refs to stats kernel cannot evaluate.
 ///
 /// See: <https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61>
 pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {

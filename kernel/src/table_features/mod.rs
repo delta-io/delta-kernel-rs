@@ -33,7 +33,6 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
-mod geospatial;
 mod iceberg_compat;
 mod timestamp_ntz;
 
