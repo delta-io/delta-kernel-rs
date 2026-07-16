@@ -79,6 +79,7 @@ letting an engine advance a cached file listing without a full log replay
 
 ```
 snapshot_incremental_scan_builder(snapshot, base_version, engine)
+  -> incremental_scan_builder_with_predicate(builder, engine, predicate)  // optional; prunes live Adds
   -> incremental_scan_builder_build(builder)      // -> OptionalValue<stream>; None => full-scan fallback
   -> incremental_scan_stream_next_arrow(stream)    // drain live-Add batches (Arrow), newest-first
   -> incremental_scan_stream_into_summary(stream)  // -> summary; consumes the stream
@@ -88,6 +89,11 @@ snapshot_incremental_scan_builder(snapshot, base_version, engine)
 snapshot's commit list can't cover `(base_version, target_version]`, which is the signal to fall
 back to a full scan. The builder is always consumed by `build`; discard it early with
 `free_incremental_scan_builder`.
+
+`incremental_scan_builder_with_predicate` takes an `EnginePredicate` (same shape used by `scan`)
+and prunes streamed live Adds by their file stats, the same data-skipping the read path applies.
+It consumes and returns the builder handle. Removes are never pruned, and skipping is
+conservative, so the engine must still re-apply the predicate at read time.
 
 Read the diff via `incremental_scan_summary_base_version` / `_target_version` and the
 `incremental_scan_summary_visit_live_adds` / `_visit_removes` callbacks (each key is a `(path,

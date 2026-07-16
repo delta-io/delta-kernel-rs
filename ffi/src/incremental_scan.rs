@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! snapshot_incremental_scan_builder(snapshot, base_version, engine)
+//!   -> incremental_scan_builder_with_predicate(builder, engine, predicate) // optional; prunes live Adds
 //!   -> incremental_scan_builder_build(builder)   // -> OptionalValue<stream>; None => full-scan fallback
 //!   -> incremental_scan_stream_next_arrow(stream) // drain filtered Add batches, newest-first
 //!   -> incremental_scan_stream_into_summary(stream) // -> summary; consumes the stream
@@ -25,12 +26,14 @@ use std::sync::{Arc, Mutex};
 use delta_kernel::incremental_scan::{IncrementalScanStream, IncrementalScanSummary};
 use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{DeltaResult, Error, Version};
+use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 #[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
+use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::handle::Handle;
+use crate::scan::EnginePredicate;
 #[cfg(feature = "default-engine-base")]
 use crate::KernelBoolSlice;
 use crate::{
@@ -47,6 +50,7 @@ pub struct FfiIncrementalScanBuilder {
     engine: Arc<dyn ExternEngine>,
     target_snapshot: SnapshotRef,
     base_version: Version,
+    predicate: Option<PredicateRef>,
 }
 
 /// An opaque handle with exclusive (Box-like) ownership of a [`FfiIncrementalScanBuilder`].
@@ -95,8 +99,50 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
         engine,
         target_snapshot,
         base_version,
+        predicate: None,
     })
     .into()
+}
+
+/// Apply a predicate to an incremental scan builder to prune streamed live Adds by their file
+/// stats (data-skipping). Removes are never pruned; skipping is conservative, so the engine must
+/// still re-apply the predicate at read time.
+///
+/// Consumes the `builder` handle and returns a new handle with the predicate applied. The
+/// `builder` handle must not be used after this call. A later call replaces any previously
+/// applied predicate. Returns an error if the engine's predicate visitor fails to produce a valid
+/// predicate (i.e. returns an invalid expression ID); on error, the builder is dropped.
+///
+/// # Safety
+///
+/// `builder` and `engine` must be valid handles. The `builder` handle must not be used after this
+/// call. `predicate` must be a valid, non-null [`EnginePredicate`] whose `visitor` and `predicate`
+/// fields are safe to call and read.
+#[no_mangle]
+pub unsafe extern "C" fn incremental_scan_builder_with_predicate(
+    builder: Handle<MutableFfiIncrementalScanBuilder>,
+    engine: Handle<SharedExternEngine>,
+    predicate: &mut EnginePredicate,
+) -> ExternResult<Handle<MutableFfiIncrementalScanBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { builder.into_inner() };
+    incremental_scan_builder_with_predicate_impl(*builder, predicate).into_extern_result(&engine)
+}
+
+fn incremental_scan_builder_with_predicate_impl(
+    mut builder: FfiIncrementalScanBuilder,
+    predicate: &mut EnginePredicate,
+) -> DeltaResult<Handle<MutableFfiIncrementalScanBuilder>> {
+    let mut visitor_state = KernelExpressionVisitorState::default();
+    let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
+    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
+        Error::generic(
+            "engine predicate visitor returned an invalid expression ID; \
+             predicate could not be decoded",
+        )
+    })?;
+    builder.predicate = Some(Arc::new(predicate));
+    Ok(Box::new(builder).into())
 }
 
 /// Consume the builder and return the incremental scan stream, or [`OptionalValue::None`] when
@@ -109,7 +155,8 @@ pub unsafe extern "C" fn snapshot_incremental_scan_builder(
 /// succeeds.
 ///
 /// Returns an error if `base_version >= target_version`, the target snapshot's protocol has an
-/// unsupported reader feature, or the engine fails to open the commit stream.
+/// unsupported reader feature, a [`incremental_scan_builder_with_predicate`] predicate references
+/// a column absent from the table schema, or the engine fails to open the commit stream.
 ///
 /// # Safety
 ///
@@ -130,6 +177,7 @@ fn incremental_scan_builder_build_impl(
     let maybe_stream = builder
         .target_snapshot
         .incremental_scan_builder(builder.base_version)
+        .with_predicate(builder.predicate)
         .build(engine.as_ref())?;
     let handle = maybe_stream.map(|stream| {
         Arc::new(FfiIncrementalScanStream {
@@ -410,6 +458,7 @@ pub unsafe extern "C" fn free_filtered_engine_data_arrow_result(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::ffi::c_void;
     use std::sync::Arc;
 
     use delta_kernel::object_store::memory::InMemory;
@@ -418,6 +467,10 @@ mod tests {
 
     use super::*;
     use crate::error::KernelError;
+    use crate::expressions::kernel_visitor::{
+        visit_expression_column, visit_expression_literal_int, visit_predicate_gt,
+        KernelExpressionVisitorState,
+    };
     use crate::ffi_test_utils::{
         allocate_err, assert_extern_result_error_with_message, ok_or_panic,
     };
@@ -789,5 +842,159 @@ mod tests {
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };
         Ok(())
+    }
+
+    // Metadata declaring a single `id: integer` column, so `id` predicates are eligible for data
+    // skipping against `add.stats`.
+    const ID_METADATA: &str = "{\"metaData\":{\"id\":\"test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"integer\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}}]}\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}";
+
+    // Raw Add carrying `id` stats over the closed range `[id_min, id_max]`.
+    fn add_with_id_stats(path: &str, id_min: i32, id_max: i32) -> String {
+        let stats = format!(
+            "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"id\\\":0}},\\\"minValues\\\":{{\\\"id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"id\\\":{id_max}}}}}"
+        );
+        format!(
+            "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+        )
+    }
+
+    /// Build an engine + snapshot (pinned to the last version) from raw commit-JSON strings at
+    /// v1.., with an `id`-column metadata commit at v0.
+    async fn setup_with_id_metadata(
+        commits: Vec<String>,
+    ) -> (Handle<SharedExternEngine>, Handle<SharedSnapshot>) {
+        let table_root = "memory:///";
+        let storage = Arc::new(InMemory::new());
+        add_commit(table_root, storage.as_ref(), 0, ID_METADATA.to_string())
+            .await
+            .unwrap();
+        let target_version = commits.len() as u64;
+        for (idx, body) in commits.into_iter().enumerate() {
+            add_commit(table_root, storage.as_ref(), (idx + 1) as u64, body)
+                .await
+                .unwrap();
+        }
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let mut builder = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ))
+        };
+        unsafe { snapshot_builder_set_version(&mut builder, target_version) };
+        let snapshot = unsafe { ok_or_panic(snapshot_builder_build(builder)) };
+        (engine, snapshot)
+    }
+
+    /// Predicate visitor that constructs `id > 25`.
+    extern "C" fn visit_id_gt_25(
+        _pred_ptr: *mut c_void,
+        state: &mut KernelExpressionVisitorState,
+    ) -> usize {
+        let id = "id";
+        let col = unsafe {
+            ok_or_panic(visit_expression_column(
+                state,
+                kernel_string_slice!(id),
+                allocate_err,
+            ))
+        };
+        let lit = visit_expression_literal_int(state, 25);
+        visit_predicate_gt(state, col, lit)
+    }
+
+    // A predicate applied through the builder prunes streamed live Adds by their `add.stats`:
+    // `id > 25` drops the [0, 9] file and keeps the [20, 30] file. Removes are unaffected.
+    #[tokio::test]
+    async fn with_predicate_prunes_live_adds() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_with_id_metadata(vec![[
+            add_with_id_stats("low.parquet", 0, 9),
+            add_with_id_stats("high.parquet", 20, 30),
+        ]
+        .join("\n")])
+        .await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_id_gt_25,
+        };
+        let builder = unsafe {
+            ok_or_panic(incremental_scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let maybe_stream: Option<Handle<SharedIncrementalScanStream>> =
+            unsafe { ok_or_panic(incremental_scan_builder_build(builder)) }.into();
+        let stream = maybe_stream.expect("range covered, expected Some(stream)");
+        let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
+
+        let live_adds: Vec<_> = visit_live_adds(&summary)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            live_adds,
+            vec!["high.parquet".to_string()],
+            "only the file whose stats overlap `id > 25` survives"
+        );
+
+        unsafe { free_incremental_scan_summary(summary) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    // A predicate referencing a column absent from the table schema fails at build (fail-fast),
+    // surfacing the unresolved column rather than silently keeping every Add.
+    #[tokio::test]
+    async fn with_predicate_unknown_column_errors_at_build(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) =
+            setup_with_id_metadata(vec![add_with_id_stats("a.parquet", 0, 9)]).await;
+
+        let builder = unsafe {
+            snapshot_incremental_scan_builder(snapshot.shallow_copy(), 0, engine.shallow_copy())
+        };
+        // `id > 25` is fine to decode, but we point the visitor at a missing column below.
+        let mut predicate = EnginePredicate {
+            predicate: std::ptr::null_mut(),
+            visitor: visit_nonexistent_gt_25,
+        };
+        let builder = unsafe {
+            ok_or_panic(incremental_scan_builder_with_predicate(
+                builder,
+                engine.shallow_copy(),
+                &mut predicate,
+            ))
+        };
+        let result = unsafe { incremental_scan_builder_build(builder) };
+        assert_extern_result_error_with_message(result, KernelError::MissingColumnError, None);
+
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    /// Predicate visitor that constructs `nonexistent > 25` over a column not in the schema.
+    extern "C" fn visit_nonexistent_gt_25(
+        _pred_ptr: *mut c_void,
+        state: &mut KernelExpressionVisitorState,
+    ) -> usize {
+        let missing = "nonexistent";
+        let col = unsafe {
+            ok_or_panic(visit_expression_column(
+                state,
+                kernel_string_slice!(missing),
+                allocate_err,
+            ))
+        };
+        let lit = visit_expression_literal_int(state, 25);
+        visit_predicate_gt(state, col, lit)
     }
 }
