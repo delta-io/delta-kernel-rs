@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
     Array, BinaryArray, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -390,4 +391,129 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
         vec![other.clone()],
         "empty-bytes file must be pruned under p_bin = X'6f74686572'"
     );
+}
+
+// === Engine-supplied session timezone (Option 6) ===
+//
+// The engine's `ArrowEvaluationHandler` carries the session zone. When it evaluates the
+// `MAP_TO_STRUCT` that reconstructs `partitionValues_parsed`, offset-less TIMESTAMP values resolve
+// in that zone. Kernel emits a generic `MAP_TO_STRUCT` and never sees the timezone; a
+// `DefaultEngine` built via `DefaultEngineBuilder::with_session_timezone` supplies it. This is the
+// end-to-end counterpart to the unit tests in `evaluate_expression`.
+
+/// Writes a single-`p_ts`-TIMESTAMP-partition foreign table with one offset-less add, and returns
+/// its URL. `writeStatsAsStruct=false` so the JSON commit reconstructs `partitionValues_parsed`
+/// from the string map on read (the tz-aware path).
+async fn write_ts_partition_table(table_path: &std::path::Path, raw_ts: &str) -> Url {
+    std::fs::create_dir_all(table_path).unwrap();
+    let url = Url::from_directory_path(table_path).unwrap();
+    let table_root = url.to_string();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+
+    let schema_string = serde_json::json!({
+        "type": "struct",
+        "fields": [
+            {"name": "p_ts", "type": "timestamp", "nullable": true, "metadata": {}},
+            {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
+        ],
+    })
+    .to_string();
+    let protocol = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    let metadata = serde_json::json!({
+        "metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema_string,
+            "partitionColumns": ["p_ts"],
+            "configuration": {},
+            "createdTime": 1700000000000_i64,
+        },
+    })
+    .to_string();
+    let add = serde_json::json!({
+        "add": {
+            "path": "f.parquet",
+            "partitionValues": {"p_ts": raw_ts},
+            "size": 100,
+            "modificationTime": 1700000000000_i64,
+            "dataChange": true,
+            "stats": "{\"numRecords\":1}",
+        },
+    })
+    .to_string();
+
+    add_commit(
+        &table_root,
+        store.as_ref(),
+        0,
+        format!("{protocol}\n{metadata}"),
+    )
+    .await
+    .unwrap();
+    add_commit(&table_root, store.as_ref(), 1, add)
+        .await
+        .unwrap();
+    url
+}
+
+/// An engine built with a session zone resolves an offset-less TIMESTAMP partition value in that
+/// zone; a default (zoneless) engine resolves it at UTC. This exercises the full Option-6 path:
+/// `DefaultEngineBuilder::with_session_timezone` -> zoned `ArrowEvaluationHandler` ->
+/// `evaluate_map_to_struct`.
+#[rstest]
+// Offset-less `2024-01-15 16:00:00` under America/New_York (UTC-5 in January) is 21:00Z.
+#[case::in_zone(Some("America/New_York"), 1_705_352_400_000_000)]
+// A zoneless engine resolves the same string at UTC: 16:00Z.
+#[case::no_zone(None, 1_705_334_400_000_000)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_session_timezone_resolves_offset_less_timestamp_partition(
+    #[case] session_tz: Option<&str>,
+    #[case] expected_micros: i64,
+) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("engine-tz-offset-less");
+    let url = write_ts_partition_table(&table_path, "2024-01-15 16:00:00").await;
+
+    let store = test_utils::delta_kernel_default_engine::storage::store_from_url(&url).unwrap();
+    let task_executor = Arc::new(
+        test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor::new(
+            tokio::runtime::Handle::current(),
+        ),
+    );
+    let mut builder = DefaultEngineBuilder::new(store).with_task_executor(task_executor);
+    if let Some(tz) = session_tz {
+        builder = builder.with_session_timezone(tz).unwrap();
+    }
+    let engine = builder.build();
+
+    let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    let mut found = false;
+    for scan_metadata in scan.scan_metadata(&engine).unwrap() {
+        let (data, selection) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pv = get_column!(batch, "partitionValues_parsed", StructArray);
+        let p_ts = pv
+            .column_by_name("p_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            p_ts.value(0),
+            expected_micros,
+            "offset-less TIMESTAMP must resolve in the engine's session zone"
+        );
+        found = true;
+    }
+    assert!(found, "expected one surviving file");
 }

@@ -63,7 +63,7 @@ impl SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler::new(store.clone())),
             json_handler: Arc::new(json::SyncJsonHandler::new(store.clone())),
             parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store)),
-            evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
+            evaluation_handler: Arc::new(ArrowEvaluationHandler::default()),
         }
     }
 }

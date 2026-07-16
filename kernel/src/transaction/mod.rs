@@ -2297,7 +2297,7 @@ mod tests {
         let physical_schema = wc.physical_schema();
         let l2p = wc.logical_to_physical();
 
-        let handler = ArrowEvaluationHandler;
+        let handler = ArrowEvaluationHandler::default();
         let evaluator = handler.new_expression_evaluator(
             input_schema.into(),
             l2p,
@@ -2907,7 +2907,8 @@ mod tests {
                 Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
             ],
         )?);
-        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
+        ArrowEvaluationHandler::default()
+            .create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
     }
 
     /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting
@@ -2933,7 +2934,7 @@ mod tests {
 
         // Evaluate the logical_to_physical expression
         let input_schema: SchemaRef = logical_schema.clone();
-        let handler = ArrowEvaluationHandler;
+        let handler = ArrowEvaluationHandler::default();
         let evaluator = handler.new_expression_evaluator(
             input_schema,
             logical_to_physical_expression.clone(),
@@ -3059,7 +3060,7 @@ mod tests {
             })
             .collect();
         let row_refs: Vec<&[Scalar]> = rows.iter().map(|r| r.as_slice()).collect();
-        ArrowEvaluationHandler
+        ArrowEvaluationHandler::default()
             .create_many(schema, &row_refs)
             .unwrap()
     }

@@ -14,7 +14,7 @@ use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-use crate::engine::arrow_expression::evaluate_expression::to_json;
+use crate::engine::arrow_expression::evaluate_expression::{evaluate_expression, to_json};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
@@ -802,7 +802,7 @@ fn test_null_row() {
         ),
         StructField::nullable("c", KernelDataType::STRING),
     ]));
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     let result = handler.null_row(schema.clone()).unwrap();
     let expected = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into_arrow().unwrap()),
@@ -830,7 +830,7 @@ fn test_null_row_err() {
         "a",
         KernelDataType::STRING,
     )]));
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     assert_result_error_with_message(
         handler.null_row(not_null_schema),
         "Invalid argument error: Column 'a' is declared as non-nullable but contains null values",
@@ -839,7 +839,7 @@ fn test_null_row_err() {
 
 // helper to take values/schema to pass to `create_one` and assert the result = expected
 fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     let actual = handler.create_one(schema, values).unwrap();
     let actual_rb = actual.try_into_record_batch().unwrap();
     assert_eq!(actual_rb, expected);
@@ -963,7 +963,7 @@ fn test_create_one_mismatching_scalar_types() {
         "version",
         KernelDataType::INTEGER,
     )]));
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     assert_result_error_with_message(
         handler.create_one(schema, values),
         "Schema error: Mismatched scalar type while creating Expression: expected Integer, got Long",
@@ -985,7 +985,7 @@ fn test_create_one_not_null_struct() {
             StructField::nullable("c", KernelDataType::INTEGER),
         ]),
     )]));
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     assert_result_error_with_message(
         handler.create_one(schema, values),
         "Column 'a' is declared as non-nullable but contains null values",
@@ -997,7 +997,7 @@ fn test_create_one_top_level_null() {
     // Creating a NOT NULL field with null value should error.
     // The error comes from Arrow's RecordBatch validation.
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
 
     let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "col_1",
@@ -1283,7 +1283,7 @@ fn test_evaluator_mixed_string_types_identity_transform() {
     let input_schema = Arc::new(StructType::new_unchecked(fields.clone()));
     let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     let expression: ExpressionRef =
         Arc::new(Expression::struct_patch(ExpressionStructPatchBuilder::new()).unwrap());
     handler
@@ -1314,7 +1314,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
     )]));
     let output_type = KernelDataType::from(StructType::new_unchecked(fields));
 
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     let expression: ExpressionRef = Arc::new(column_expr!("st"));
     handler
         .new_expression_evaluator(input_schema, expression, output_type)
@@ -1325,7 +1325,7 @@ fn test_evaluator_mixed_string_types_struct_expression() {
 
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`
 fn assert_create_many(rows: &[&[Scalar]], schema: SchemaRef, expected: RecordBatch) {
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     let actual = handler.create_many(schema, rows).unwrap();
     let actual_rb = actual.try_into_record_batch().unwrap();
     assert_eq!(actual_rb, expected);
@@ -1361,7 +1361,7 @@ fn test_create_many_empty_rows_returns_zero_row_batch() {
         StructField::nullable("a", KernelDataType::INTEGER),
         StructField::nullable("b", KernelDataType::STRING),
     ]));
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     let result = handler.create_many(schema.clone(), &[]).unwrap();
     assert_eq!(result.len(), 0);
     let rb = result.try_into_record_batch().unwrap();
@@ -1377,7 +1377,7 @@ fn test_create_many_wrong_field_count_returns_error() {
     ]));
     // Row has 3 scalars but schema has 2 fields
     let bad_row: &[Scalar] = &[1.into(), "x".into(), 99.into()];
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     assert_result_error_with_message(
         handler.create_many(schema, &[bad_row]),
         "Row 0 has 3 scalars but schema has 2 fields",
@@ -1393,7 +1393,7 @@ fn test_create_many_wrong_field_type_returns_error() {
     // Row 1 passes a Long where an Integer is expected for field "a"
     let good_row: &[Scalar] = &[1.into(), "x".into()];
     let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     assert_result_error_with_message(
         handler.create_many(schema, &[good_row, bad_row]),
         "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",
@@ -1413,7 +1413,7 @@ fn test_create_many_single_row_matches_create_one() {
         StructField::nullable("b", KernelDataType::STRING),
         StructField::nullable("c", KernelDataType::INTEGER),
     ]));
-    let handler = ArrowEvaluationHandler;
+    let handler = ArrowEvaluationHandler::default();
     let from_one = handler
         .create_one(schema.clone(), values)
         .unwrap()

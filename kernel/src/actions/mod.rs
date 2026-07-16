@@ -1094,7 +1094,7 @@ mod tests {
 
     impl ExprEngine {
         fn new() -> Self {
-            ExprEngine(Arc::new(ArrowEvaluationHandler))
+            ExprEngine(Arc::new(ArrowEvaluationHandler::default()))
         }
     }
 

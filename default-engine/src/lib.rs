@@ -10,6 +10,7 @@ use std::future::Future;
 use std::num::NonZero;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::timezone::Tz;
 use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
@@ -18,7 +19,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
+    StorageHandler,
 };
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
@@ -133,6 +135,9 @@ pub struct DefaultEngineBuilder<E> {
     /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
     /// fall back to the handlers' defaults.
     io_config: ReadIoConfig,
+    /// Session timezone for the evaluation handler; resolves offset-less `TIMESTAMP` partition
+    /// values. `None` = UTC. See [`DefaultEngineBuilder::with_session_timezone`].
+    session_timezone: Option<Tz>,
 }
 
 /// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
@@ -158,13 +163,19 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
             object_store,
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
+            session_timezone: None,
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            task_executor,
+            self.io_config,
+            self.session_timezone,
+        )
     }
 }
 
@@ -180,7 +191,22 @@ impl<E> DefaultEngineBuilder<E> {
             object_store: self.object_store,
             task_executor,
             io_config: self.io_config,
+            session_timezone: self.session_timezone,
         }
+    }
+
+    /// Set the session timezone used to resolve offset-less `TIMESTAMP` partition values (a string
+    /// with no `Z` or explicit offset). Such a value denotes a different instant per zone; the
+    /// engine resolves it here. Unset resolves at UTC.
+    ///
+    /// Errors if `timezone` is not a valid IANA name or fixed offset.
+    pub fn with_session_timezone(mut self, timezone: &str) -> DeltaResult<Self> {
+        self.session_timezone = Some(
+            timezone
+                .parse::<Tz>()
+                .map_err(|_| Error::generic(format!("Invalid session timezone: {timezone}")))?,
+        );
+        Ok(self)
     }
 
     /// Set the maximum number of files read concurrently by the JSON and Parquet handlers in their
@@ -208,7 +234,12 @@ impl<E> DefaultEngineBuilder<E> {
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.task_executor,
+            self.io_config,
+            self.session_timezone,
+        )
     }
 }
 
@@ -228,6 +259,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
         io_config: ReadIoConfig,
+        session_timezone: Option<Tz>,
     ) -> Self {
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
@@ -251,7 +283,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             raw_parquet,
             object_store,
             task_executor,
-            evaluation: Arc::new(ArrowEvaluationHandler {}),
+            evaluation: Arc::new(ArrowEvaluationHandler::new(session_timezone)),
         }
     }
 
