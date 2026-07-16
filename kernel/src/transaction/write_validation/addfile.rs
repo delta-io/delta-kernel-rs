@@ -42,7 +42,7 @@ impl Validation for AddFileRequiredFields {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
             .get_opt(row, "path")?
-            .ok_or_else(|| Error::missing_data("Add action is missing required field 'path'"))?;
+            .ok_or_else(|| Error::missing_data("AddFile is missing required field 'path'"))?;
 
         require_add_file_field(
             getters[PARTITION_VALUES].get_map(row, "partitionValues")?,
