@@ -1721,6 +1721,21 @@ mod test {
         );
     }
 
+    // Read-only slice: with the gate on, intervalType-preview tables are readable via Scan and CDF
+    // but not writable. Gated because `INTERVAL_TYPE_PREVIEW_INFO` is `NotSupported` without the
+    // flag.
+    #[cfg(feature = "interval-type-in-dev")]
+    #[test]
+    fn test_ensure_operation_supported_interval_type_is_read_only() {
+        let config = create_mock_table_config(&[], &[TableFeature::IntervalTypePreview]);
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            r#"Feature 'intervalType-preview' is not supported for writes"#,
+        );
+    }
+
     #[test]
     fn test_illegal_writer_feature_combination() {
         let schema = schema_ref! { nullable "value": INTEGER };
