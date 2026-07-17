@@ -697,7 +697,7 @@ mod tests {
     #[case::mixed_case_prefix("Delta.Constraints.c1", Some("Delta.Constraints.c1"))]
     #[case::name_case_preserved("delta.constraints.MyCheck", Some("MyCheck"))]
     #[case::whitespace_name("delta.constraints. ", Some(" "))]
-    #[case::bare_prefix_empty_name("delta.constraints.", Some(""))]
+    #[case::bare_prefix_empty_name("delta.constraints.", None)]
     #[case::unrecognized_long_key("delta.someOtherKey", None)]
     #[case::prefix_without_trailing_dot("delta.constraintsX", None)]
     #[case::too_short_for_prefix("delta.con", None)]

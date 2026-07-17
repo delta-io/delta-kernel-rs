@@ -104,43 +104,46 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP => {
             props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
         }
-        // A `delta.constraints.<name>` key records a CHECK constraint; any other unrecognized key
-        // falls through to `unknown_properties`. See `strip_constraint_prefix`.
-        _ => {
+        // A `delta.constraints.<name>` key records a CHECK constraint. `strip_constraint_prefix`
+        // owns the (case-insensitive) prefix match, so the guard delegates to it rather than
+        // duplicating the logic here.
+        k if strip_constraint_prefix(k).is_some() => {
             let name = strip_constraint_prefix(k)?;
             props
                 .check_constraints
                 .insert(name.to_string(), v.to_string());
         }
+        _ => return None,
     }
     Some(())
 }
 
-/// Returns the check-constraint name for a `delta.constraints.<name>` key. The prefix is matched
-/// case-insensitively but stripped case-sensitively, so two keys differing only in prefix case
-/// yield distinct names and never collide. Returns `None` for any non-constraint key.
+/// Returns the check-constraint name for a `delta.constraints.<name>` key, or `None` for any key
+/// that is not a (non-empty-named) constraint. The prefix is matched case-insensitively but
+/// stripped case-sensitively, so two keys differing only in prefix case yield distinct names and
+/// never collide.
 ///
 /// Examples:
-/// * `delta.constraints.foo` -> `foo`
-/// * `DELTA.CONSTRAINTS.foo` -> `DELTA.CONSTRAINTS.foo`
-/// * `delta.constraints.` -> `` (empty name)
+/// * `delta.constraints.foo` -> `Some("foo")`
+/// * `DELTA.CONSTRAINTS.foo` -> `Some("DELTA.CONSTRAINTS.foo")`
+/// * `delta.constraints.` -> `None` (empty name)
+/// * `delta.enableChangeDataFeed` -> `None` (not a constraint)
 ///
-/// The bare prefix yields an empty name rather than `None`: Delta-Spark's `getCheckConstraints`
-/// strips the prefix without rejecting an empty result, so we keep the same key set on read.
-/// Spark's `ADD CONSTRAINT` command does not validate the name either (it rejects only the
-/// reserved char/varchar name and duplicates), and Spark has no test covering empty names. So this
-/// mirrors an unspecified Spark edge case rather than a guaranteed behavior.
-// TODO(#2896): revisit if CHECK-constraint enforcement needs to reject empty names explicitly.
+/// The bare `delta.constraints.` key yields `None`: Delta-Spark keeps such an empty-named
+/// constraint (`getCheckConstraints` strips the prefix without validating the result, and no
+/// layer rejects it), but a nameless constraint cannot be keyed or enforced meaningfully, so
+/// kernel deliberately drops it to `unknown_properties` rather than mirroring that edge case.
 fn strip_constraint_prefix(key: &str) -> Option<&str> {
     let (prefix, name) = key.split_at_checked(CHECK_CONSTRAINT_PREFIX.len())?;
     if !prefix.eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX) {
         return None;
     }
-    Some(if prefix == CHECK_CONSTRAINT_PREFIX {
+    let name = if prefix == CHECK_CONSTRAINT_PREFIX {
         name
     } else {
         key
-    })
+    };
+    (!name.is_empty()).then_some(name)
 }
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
