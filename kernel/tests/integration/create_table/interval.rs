@@ -91,10 +91,14 @@ fn test_create_table_rejects_interval_clustering(
 mod feature_enabled {
     use delta_kernel::schema::SchemaRef;
     use delta_kernel::table_features::{
-        TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+        ColumnMappingMode, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use rstest::rstest;
+    use test_utils::cm_properties;
 
+    use super::super::column_mapping::{
+        assert_column_mapping_config, strip_column_mapping_metadata,
+    };
     use super::*;
 
     /// Top-level schema carrying the given interval `DataType`.
@@ -117,21 +121,24 @@ mod feature_enabled {
         ]))
     }
 
-    /// Creating a table whose schema contains an interval column does not auto-enable
-    /// `intervalType-preview`, and the schema round-trips. The write path requires kernel support,
-    /// so this test is gated behind the `interval-type-in-dev` cargo feature.
+    /// Creating a table whose schema contains an interval column auto-enables
+    /// `intervalType-preview` across column mapping modes, and the logical schema round-trips. The
+    /// write path requires kernel support, so this test is gated behind the
+    /// `interval-type-in-dev` cargo feature.
     #[rstest]
-    fn test_create_table_with_interval_does_not_auto_enable_feature(
+    fn test_create_table_with_interval_auto_enables_feature(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
         #[values(top_level_interval_schema, nested_interval_schema)] make_schema: fn(
             DataType,
         )
             -> SchemaRef,
+        #[values("none", "name", "id")] cm_mode: &str,
     ) -> DeltaResult<()> {
         let (_temp_dir, table_path, engine) = test_table_setup()?;
         let schema = make_schema(interval);
 
         let _ = create_table(&table_path, schema.clone(), "Test/1.0")
+            .with_table_properties(cm_properties(cm_mode))
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?;
 
@@ -140,21 +147,33 @@ mod feature_enabled {
         let table_config = snapshot.table_configuration();
 
         assert!(
-            !table_config.is_feature_supported(&TableFeature::IntervalTypePreview),
-            "intervalType feature should not be auto-enabled"
+            table_config.is_feature_supported(&TableFeature::IntervalTypePreview),
+            "intervalType feature should be auto-enabled"
         );
         let protocol = table_config.protocol();
-        assert!(!protocol
+        assert!(protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION);
+        assert!(protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION);
+        assert!(protocol
             .reader_features()
             .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
-        assert!(!protocol
+        assert!(protocol
             .writer_features()
             .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
 
+        let expected_cm_mode = match cm_mode {
+            "none" => ColumnMappingMode::None,
+            "name" => ColumnMappingMode::Name,
+            "id" => ColumnMappingMode::Id,
+            _ => unreachable!(),
+        };
+        assert_column_mapping_config(&snapshot, expected_cm_mode);
+
+        let read_schema = snapshot.schema();
+        let stripped_schema = strip_column_mapping_metadata(&read_schema);
         assert_eq!(
-            snapshot.schema().as_ref(),
+            &stripped_schema,
             schema.as_ref(),
-            "schema should round-trip through create table"
+            "logical schema should round-trip through create table"
         );
         Ok(())
     }

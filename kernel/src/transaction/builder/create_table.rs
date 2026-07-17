@@ -27,10 +27,10 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     find_max_column_id_in_schema, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
-    strip_stray_column_mapping_metadata, validate_interval_type_feature_support_on_write,
-    ColumnMappingMode, TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX,
-    SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    get_column_mapping_mode_from_properties, schema_contains_interval_type,
+    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
+    validate_interval_type_feature_support_on_write, ColumnMappingMode, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -90,9 +90,8 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
     TableFeature::IcebergCompatV3,
-    // Connectors can opt into the intervalType-preview protocol feature explicitly. It is not
-    // auto-enabled from the schema so tables created for legacy interoperability remain readable
-    // by connectors that predate the feature.
+    // Connectors can pre-enable intervalType-preview before adding interval columns. CREATE TABLE
+    // also auto-enables it when the schema contains an interval type.
     TableFeature::IntervalTypePreview,
 ];
 
@@ -393,6 +392,21 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `intervalType-preview` feature to the protocol when the schema contains
+/// interval columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn auto_enable_interval_type_if_in_schema(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) {
+    if schema_contains_interval_type(schema) {
+        add_feature_to_lists(
+            TableFeature::IntervalTypePreview,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -937,6 +951,7 @@ impl CreateTableTransactionBuilder {
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        auto_enable_interval_type_if_in_schema(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
@@ -1349,6 +1364,26 @@ mod tests {
         },
         &[TableFeature::TimestampWithoutTimezone],
     )]
+    #[case::interval_top_level(
+        Arc::new(StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("iv", DataType::INTERVAL_YEAR_MONTH),
+        ])),
+        &[TableFeature::IntervalTypePreview],
+    )]
+    #[case::interval_nested(
+        Arc::new(StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable(
+                "nested",
+                StructType::new_unchecked([StructField::nullable(
+                    "inner_iv",
+                    DataType::INTERVAL_DAY_TIME,
+                )]),
+            ),
+        ])),
+        &[TableFeature::IntervalTypePreview],
+    )]
     #[case::both_variant_and_ntz(
         Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
@@ -1373,6 +1408,7 @@ mod tests {
 
         maybe_enable_variant_type(&schema, &mut validated);
         maybe_enable_timestamp_ntz(&schema, &mut validated);
+        auto_enable_interval_type_if_in_schema(&schema, &mut validated);
 
         for feature in expected_features {
             assert!(

@@ -16,7 +16,9 @@ use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
 pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
-pub(crate) use interval_type::validate_interval_type_feature_support_on_write;
+pub(crate) use interval_type::{
+    schema_contains_interval_type, validate_interval_type_feature_support_on_write,
+};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
