@@ -347,6 +347,12 @@ impl Metadata {
         &self.schema_string
     }
 
+    /// Parses the table schema from its JSON representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth, or
+    /// [`Error::MalformedJson`] for other JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
