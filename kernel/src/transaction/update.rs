@@ -345,7 +345,6 @@ impl Transaction {
         }
 
         self.dv_matched_files.extend(matched_files);
-        // Reached only after the count == descriptors check above, so this can't over-count.
         self.num_dv_updates += matched_dv_files;
         Ok(())
     }
