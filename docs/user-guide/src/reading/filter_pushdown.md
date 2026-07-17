@@ -218,7 +218,7 @@ connector. To override the default, call `ScanBuilder::with_stats` with a
 `StatsOptions` value. The named constructors cover the common shapes; you can also
 build the struct directly for any combination.
 
-### Disabling data skipping entirely
+### Disabling data-column skipping
 
 If your compute engine performs its own data skipping, you can tell Kernel to skip reading
 statistics altogether. This avoids the cost of parsing statistics from checkpoint files.
@@ -245,13 +245,19 @@ let scan = snapshot
 
 With `StatsOptions::none()`:
 
-- Kernel skips the stats column entirely during checkpoint reads.
-- No statistics-based or partition-value-based file pruning occurs (row-level
-  partition filtering still applies).
+- Kernel reads no statistics columns from checkpoint files, so no statistics-based (data-column)
+  file pruning occurs.
+- Partition pruning still applies when your predicate references a partition column. Partition
+  values come from each file's partition map, not from statistics, so Kernel can still drop files
+  whose partition values cannot match the predicate.
 - The `stats` field on each `ScanFile` is `None`.
 
-Use this when your connector or compute engine already handles file pruning and you want to
-avoid the overhead of parsing statistics you won't use.
+Use this when your connector or compute engine handles data-column pruning itself and you want to
+avoid the overhead of reading statistics you won't use, while still letting Kernel prune partitions.
+
+> [!NOTE]
+> `StatsOptions::struct_columns([])` (an empty column projection) behaves the same as
+> `StatsOptions::none()`: projecting statistics to zero columns reads no statistics.
 
 ### Including all statistics in scan metadata
 
@@ -326,7 +332,7 @@ Only the named columns appear in `stats_parsed`.
 | Goal | Constructor |
 |------|-------------|
 | Default behavior (Kernel skips files internally, no stats exposed) | No call needed (or `StatsOptions::json_only()`) |
-| Disable all stats reading for performance | `StatsOptions::none()` |
+| Skip stats reading but keep partition pruning | `StatsOptions::none()` |
 | Expose all struct stats to your connector for custom pruning (cheap path) | `StatsOptions::all_struct()` |
 | Expose both struct stats and the JSON `stats` column | `StatsOptions::all()` |
 | Expose stats for specific columns only | `StatsOptions::struct_columns(cols)` |

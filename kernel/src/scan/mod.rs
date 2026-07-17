@@ -95,7 +95,7 @@ pub use crate::parallel::parallel_scan_metadata::{
 ///   `stats_parsed` directly; avoids the per-batch `ToJson` cost.
 /// - [`Self::struct_columns`] -- struct stats projected to a subset of columns, no JSON.
 /// - [`Self::all`] -- both representations.
-/// - [`Self::none`] neither, and turns off data-column skipping. Unlike the other four
+/// - [`Self::none`] -- neither, and turns off data-column skipping. Unlike the other four
 ///   constructors, this one reads no stats columns from parquet; partition pruning still applies
 ///   when the predicate references a partition column (partition values need no stats read).
 #[derive(Clone, Debug)]
