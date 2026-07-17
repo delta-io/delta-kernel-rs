@@ -28,11 +28,12 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Snapshot, SnapshotRef};
 use rstest::rstest;
+#[cfg(feature = "interval-type-in-dev")]
+use test_utils::create_table as create_test_table;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    add_commit, create_table as create_test_table, create_table_and_load_snapshot,
-    test_table_setup_mt, write_batch_to_table,
+    add_commit, create_table_and_load_snapshot, test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 

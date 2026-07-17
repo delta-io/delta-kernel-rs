@@ -15,8 +15,11 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
+#[cfg(feature = "interval-type-in-dev")]
 use delta_kernel::object_store::local::LocalFileSystem;
+#[cfg(feature = "interval-type-in-dev")]
 use delta_kernel::object_store::path::Path;
+#[cfg(feature = "interval-type-in-dev")]
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
@@ -24,9 +27,10 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
+#[cfg(feature = "interval-type-in-dev")]
+use test_utils::create_table as create_test_table;
 use test_utils::{
-    begin_transaction, create_table as create_test_table, get_column, read_scan,
-    test_table_setup_mt, write_batch_to_table,
+    begin_transaction, get_column, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
