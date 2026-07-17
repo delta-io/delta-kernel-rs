@@ -12,6 +12,10 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
 use delta_kernel::Engine;
 
+mod scalar;
+
+pub use scalar::to_datafusion_scalar;
+
 /// Executes kernel declarative plans on DataFusion.
 ///
 /// Holds three handles, each owning a distinct part of the work:
