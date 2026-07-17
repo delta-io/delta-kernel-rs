@@ -105,6 +105,25 @@ descriptor handles are consumed by `dv_descriptor_map_insert` only on success an
 freed by the caller on error. DV updates require both the `deletionVectors` reader/writer
 feature and `delta.enableDeletionVectors=true`.
 
+## Column Defaults (feature `column-defaults-in-dev`)
+
+Gated behind the `column-defaults-in-dev` feature (which forwards to the kernel feature of the
+same name). A single visitor, `EngineColumnDefaultVisitor`, is driven by two entry points that
+report each top-level column declaring a `CURRENT_DEFAULT`:
+
+- `visit_column_defaults(txn, engine, visitor)` -- over a transaction; mirrors
+  `Transaction::column_defaults` and requires the `allowColumnDefaults` writer feature (a default
+  on a table that does not enable it is an error).
+- `visit_schema_column_defaults(schema, engine, visitor)` -- over a `SharedSchema` (e.g. a
+  snapshot's `logical_schema`); mirrors `StructField::column_default` and is not feature-gated, so
+  an engine can inspect defaults before opening a transaction.
+
+Each `visit_default` callback receives the logical name, the raw `CURRENT_DEFAULT` SQL, an
+`is_kernel_parsable` flag, and -- when parsable -- the evaluated literal as an owned
+`Handle<SharedExpression>` the engine reads via `visit_expression` and MUST free with
+`free_kernel_expression`. When not parsable, the handle is absent and the engine evaluates the
+raw SQL itself. Name/raw-SQL slices are valid only for the duration of the callback.
+
 ## Tracing & Metrics
 
 Gated behind the `tracing` feature. A single global `tracing` subscriber backs both logging and
