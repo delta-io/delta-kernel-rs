@@ -4,7 +4,7 @@
 use reqwest::StatusCode;
 use tracing::instrument;
 use unity_catalog_delta_client_api::{
-    CatalogConfig, LoadTableResponse, Operation, TemporaryTableCredentials,
+    CatalogConfig, CredentialsResponse, LoadTableResponse, Operation, TemporaryTableCredentials,
 };
 use url::Url;
 
@@ -13,6 +13,13 @@ use crate::error::Result;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
 use crate::models::credentials::CredentialsRequest;
 use crate::models::tables::TablesResponse;
+
+/// Builds the Delta-Tables per-table resource path
+/// (`delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`) that the `load_table` and
+/// credential-vending endpoints share.
+fn table_path(catalog: &str, schema: &str, table: &str) -> String {
+    format!("delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}")
+}
 
 /// An HTTP client for interacting with the Unity Catalog API.
 #[derive(Debug, Clone)]
@@ -67,8 +74,7 @@ impl UCClient {
         schema: &str,
         table: &str,
     ) -> Result<LoadTableResponse> {
-        let path = format!("delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}");
-        let url = self.base_url.join(&path)?;
+        let url = self.base_url.join(&table_path(catalog, schema, table))?;
 
         let response =
             execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
@@ -99,6 +105,28 @@ impl UCClient {
         })
         .await?;
 
+        handle_response(response).await
+    }
+
+    /// Vend temporary cloud-storage credentials for the table via the Delta-Tables
+    /// `GET .../catalogs/{catalog}/schemas/{schema}/tables/{table}/credentials?operation=...`
+    /// endpoint.
+    // TODO: remove `get_credentials` once the read path swaps onto this Delta-Tables endpoint.
+    #[instrument(skip(self))]
+    pub async fn get_table_credentials(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        operation: Operation,
+    ) -> Result<CredentialsResponse> {
+        let path = format!("{}/credentials", table_path(catalog, schema, table));
+        let mut url = self.base_url.join(&path)?;
+        url.query_pairs_mut()
+            .append_pair("operation", &operation.to_string());
+
+        let response =
+            execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
         handle_response(response).await
     }
 
