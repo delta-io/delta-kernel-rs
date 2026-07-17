@@ -35,8 +35,9 @@ use serde_json::{json, Value};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, install_thread_local_metrics_reporter,
-    test_table_setup_mt, write_batch_to_table, CapturingReporter,
+    add_commit, create_table as create_test_table, create_table_and_load_snapshot,
+    install_thread_local_metrics_reporter, test_table_setup_mt, write_batch_to_table,
+    CapturingReporter,
 };
 use url::Url;
 
@@ -983,15 +984,19 @@ async fn interval_partition_values_do_not_prune_files(
         StructField::nullable("period", interval),
         StructField::nullable("v", DataType::LONG),
     ])?);
-    create_table(&table_path, schema, "Test/1.0")
-        .with_data_layout(DataLayout::partitioned(["period"]))
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
     let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
     let table_url = Url::from_directory_path(&table_path)
         .map_err(|_| "table_path should be a valid file URL")?;
+    create_test_table(
+        Arc::clone(&store),
+        table_url.clone(),
+        schema,
+        &["period"],
+        true,
+        vec!["intervalType-preview"],
+        vec!["intervalType-preview"],
+    )
+    .await?;
     add_commit(
         table_url.as_str(),
         store.as_ref(),
