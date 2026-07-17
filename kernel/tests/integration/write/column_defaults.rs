@@ -8,8 +8,8 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 use delta_kernel::expressions::Scalar;
 use delta_kernel::schema::{
     schema_ref, ArrayType, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
@@ -23,9 +23,9 @@ use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    copy_directory, create_default_engine, create_table, engine_store_setup, insert_data,
-    read_actions_from_commit, read_scan, schema_with_column_defaults, test_read, test_table_setup,
-    test_table_setup_mt, write_batch_to_table, LoggingTest,
+    copy_directory, create_default_engine, create_table, engine_store_setup, get_column,
+    insert_data, read_actions_from_commit, read_scan, schema_with_column_defaults, test_read,
+    test_table_setup, test_table_setup_mt, write_batch_to_table, LoggingTest,
 };
 use url::Url;
 
@@ -109,6 +109,21 @@ fn assert_top_level_default(
         Some(expected)
     );
     Ok(())
+}
+
+fn assert_no_column_default_metadata(field: &StructField) {
+    assert!(
+        field
+            .get_config_value(&ColumnMetadataKey::CurrentDefault)
+            .is_none(),
+        "checkpoint-derived field '{}' must not carry CURRENT_DEFAULT metadata",
+        field.name(),
+    );
+    if let DataType::Struct(nested) = field.data_type() {
+        for child in nested.fields() {
+            assert_no_column_default_metadata(child);
+        }
+    }
 }
 
 // TODO(#2630): Allow create table to support column defaults
@@ -220,17 +235,17 @@ async fn test_blind_append_to_column_defaults_table_is_supported(
     Ok(())
 }
 
-/// Creates a single-column table whose `c` column has `default_sql` as its `CURRENT_DEFAULT`,
-/// then asserts the type and default round-trip through a freshly loaded snapshot.
-///
-/// `extra_features` are reader+writer features the column type requires beyond
-/// `allowColumnDefaults` (e.g. `timestampNtz` for a TIMESTAMP_NTZ column); they are added to
-/// both the reader and writer feature lists.
-async fn assert_column_default_persists(
+/// Creates a single-column table, materializes its default through the connector-facing API,
+/// and asserts the metadata and written value round-trip.
+async fn assert_materialized_column_default_round_trips(
     data_type: DataType,
     default_sql: &str,
-    extra_features: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let extra_features: &[&str] = if data_type == DataType::TIMESTAMP_NTZ {
+        &["timestampNtz"]
+    } else {
+        &[]
+    };
     let base = StructType::try_new(vec![StructField::nullable("c", data_type.clone())])?;
     let schema = schema_with_column_defaults(&base, HashMap::from([("c", default_sql)]))?;
 
@@ -247,9 +262,10 @@ async fn assert_column_default_persists(
     )
     .await?;
 
-    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-    let schema = snapshot.schema();
-    let field = schema
+    let engine = Arc::new(engine);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let loaded_schema = snapshot.schema();
+    let field = loaded_schema
         .field("c")
         .expect("c field must exist in loaded schema");
 
@@ -264,6 +280,26 @@ async fn assert_column_default_persists(
         "CURRENT_DEFAULT raw SQL must round-trip verbatim",
     );
     assert_eq!(column_default.data_type(), &data_type);
+
+    let scalar = {
+        let txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+        let defaults = txn.top_level_column_defaults()?;
+        defaults["c"]
+            .to_scalar()?
+            .expect("a primitive literal default must materialize")
+    };
+    let values = scalar.to_array(1)?;
+    insert_data(snapshot, &engine, vec![values.clone()])
+        .await?
+        .unwrap_committed();
+
+    let expected = RecordBatch::try_new(
+        Arc::new(loaded_schema.as_ref().try_into_arrow()?),
+        vec![values],
+    )?;
+    test_read(&ArrowEngineData::new(expected), &table_url, engine)?;
 
     Ok(())
 }
@@ -280,28 +316,14 @@ async fn assert_column_default_persists(
 #[case::binary(DataType::BINARY, "X'deadbeef'")]
 #[case::date(DataType::DATE, "DATE '2024-01-01'")]
 #[case::timestamp(DataType::TIMESTAMP, "TIMESTAMP '2024-01-01T12:00:00Z'")]
+#[case::timestamp_ntz(DataType::TIMESTAMP_NTZ, "TIMESTAMP_NTZ '2024-01-01 12:00:00'")]
 #[case::decimal(DataType::decimal(10, 2).unwrap(), "1.23")]
 #[tokio::test]
-async fn test_create_table_with_column_default_persists_metadata(
+async fn test_materialized_primitive_column_default_round_trips(
     #[case] data_type: DataType,
     #[case] default_sql: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    assert_column_default_persists(data_type, default_sql, &[]).await
-}
-
-// TIMESTAMP_NTZ is split out because it needs the orthogonal `timestampNtz` reader+writer
-// feature, unlike every other primitive literal above.
-//
-// TODO(#2630): Merge into the parameterized test once create supports column defaults
-#[tokio::test]
-async fn test_create_table_with_timestamp_ntz_column_default_persists_metadata(
-) -> Result<(), Box<dyn std::error::Error>> {
-    assert_column_default_persists(
-        DataType::TIMESTAMP_NTZ,
-        "TIMESTAMP_NTZ '2024-01-01 12:00:00'",
-        &["timestampNtz"],
-    )
-    .await
+    assert_materialized_column_default_round_trips(data_type, default_sql).await
 }
 
 #[rstest]
@@ -515,21 +537,25 @@ async fn test_variant_column_default_validation_at_snapshot_load(
     Ok(())
 }
 
-/// A non-`NULL` default on a non-primitive (Array) column is protocol-legal but
-/// unmaterializable by kernel: the snapshot loads, and the default surfaces via raw SQL
-/// (`to_scalar` returns `None`) so the connector can evaluate it itself. Contrast a
-/// non-`NULL` Variant default, which the protocol forbids and kernel rejects at load.
+/// Defaults kernel cannot materialize surface via raw SQL so the connector can evaluate them.
+#[rstest]
+#[case::type_mismatch("type_mismatch", DataType::INTEGER, "'not an int'")]
+#[case::non_primitive(
+    "non_primitive",
+    DataType::from(ArrayType::new(DataType::INTEGER, true)),
+    "ARRAY(1)"
+)]
 #[tokio::test]
-async fn test_load_tolerates_non_primitive_non_null_default(
+async fn test_load_tolerates_unmaterializable_default(
+    #[case] label: &str,
+    #[case] data_type: DataType,
+    #[case] default_sql: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base = StructType::try_new(vec![StructField::nullable(
-        "c",
-        ArrayType::new(DataType::INTEGER, true),
-    )])?;
-    let schema = schema_with_column_defaults(&base, HashMap::from([("c", "ARRAY(1)")]))?;
+    let base = StructType::try_new(vec![StructField::nullable("c", data_type)])?;
+    let schema = schema_with_column_defaults(&base, HashMap::from([("c", default_sql)]))?;
 
     let (engine, table_url) = setup_unpartitioned_table(
-        "test_load_non_primitive_default",
+        &format!("test_load_{label}_default"),
         schema,
         vec!["allowColumnDefaults"],
     )
@@ -540,11 +566,11 @@ async fn test_load_tolerates_non_primitive_non_null_default(
     let defaults = txn.top_level_column_defaults()?;
 
     let c = &defaults["c"];
-    assert_eq!(c.raw_sql(), "ARRAY(1)");
+    assert_eq!(c.raw_sql(), default_sql);
     assert_eq!(
         c.to_scalar()?,
         None,
-        "kernel cannot parse a non-primitive default"
+        "kernel must leave an unmaterializable default to the connector"
     );
 
     Ok(())
@@ -570,12 +596,7 @@ fn test_column_default_composes_with_deletion_vectors() -> Result<(), Box<dyn st
     let batches = read_scan(&scan, engine)?;
     let mut values = Vec::new();
     for batch in batches {
-        let value_array = batch
-            .column_by_name("value")
-            .expect("scan must contain value")
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("value must be Int32");
+        let value_array = get_column!(batch, "value", Int32Array);
         values.extend((0..value_array.len()).map(|index| value_array.value(index)));
     }
     values.sort_unstable();
@@ -638,15 +659,17 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
     let base = StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("c", DataType::INTEGER),
+        StructField::nullable("p", DataType::INTEGER),
     ])?;
-    let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42")]))?;
+    let schema = schema_with_column_defaults(&base, HashMap::from([("c", "42"), ("p", "7")]))?;
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let mut builder = kernel_create_table(&table_path, schema.clone(), "Test/1.0");
+    let mut table_properties = vec![("delta.checkpoint.writeStatsAsStruct", "true")];
     if column_mapping_mode != "none" {
-        builder =
-            builder.with_table_properties([("delta.columnMapping.mode", column_mapping_mode)]);
+        table_properties.push(("delta.columnMapping.mode", column_mapping_mode));
     }
-    builder
+    kernel_create_table(&table_path, schema.clone(), "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["p"]))
+        .with_table_properties(table_properties)
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();
@@ -655,26 +678,73 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
     let table_url = Url::from_directory_path(&table_path).expect("table path must be a URL");
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert_top_level_default(&snapshot, engine.as_ref(), "c", Scalar::Integer(42))?;
+    assert_top_level_default(&snapshot, engine.as_ref(), "p", Scalar::Integer(7))?;
 
-    let columns: Vec<ArrayRef> = vec![
+    let data_schema = StructType::try_new(vec![
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("c", DataType::INTEGER),
+    ])?;
+    let data_columns: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(vec![1, 2, 3])),
         Arc::new(Int32Array::from(vec![42, 42, 42])),
     ];
-    let post_commit_snapshot = insert_data(snapshot, &engine, columns.clone())
-        .await?
-        .unwrap_post_commit_snapshot();
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        data_columns.clone(),
+    )?;
+    let post_commit_snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
+        HashMap::from([("p".to_string(), Scalar::Integer(7))]),
+    )
+    .await?;
+
+    let checkpoint_writer = post_commit_snapshot
+        .clone()
+        .create_checkpoint_writer(engine.as_ref())?;
+    let mut checkpoint_data = checkpoint_writer.checkpoint_data(engine.as_ref())?;
+    let checkpoint_batch = checkpoint_data
+        .next()
+        .expect("checkpoint data must contain at least one batch")?
+        .apply_selection_vector()?
+        .try_into_record_batch()?;
+    for batch in checkpoint_data {
+        batch?;
+    }
+    let checkpoint_output_schema = StructType::try_from_arrow(checkpoint_batch.schema())?;
+    let add_field = checkpoint_output_schema
+        .field("add")
+        .expect("checkpoint output must contain add actions");
+    let DataType::Struct(add_schema) = add_field.data_type() else {
+        panic!("checkpoint add field must be a struct");
+    };
+    for parsed_field in ["partitionValues_parsed", "stats_parsed"] {
+        let field = add_schema
+            .field(parsed_field)
+            .unwrap_or_else(|| panic!("checkpoint add field must contain {parsed_field}"));
+        assert_no_column_default_metadata(field);
+    }
+
     post_commit_snapshot.checkpoint(engine.as_ref(), None)?;
 
-    let checkpoint_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let checkpoint_schema = checkpoint_snapshot.schema();
-    let default = checkpoint_schema
+    let reloaded_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let reloaded_table_schema = reloaded_snapshot.schema();
+    let default = reloaded_table_schema
         .field("c")
         .expect("c field must exist after checkpoint reload")
         .column_default()?
         .expect("c default must survive checkpoint reload");
     assert_eq!(default.to_scalar()?, Some(Scalar::Integer(42)));
 
-    let expected = RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), columns)?;
+    let expected = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![
+            data_columns[0].clone(),
+            data_columns[1].clone(),
+            Arc::new(Int32Array::from(vec![7, 7, 7])),
+        ],
+    )?;
     test_read(&ArrowEngineData::new(expected), &table_url, engine)?;
 
     Ok(())
