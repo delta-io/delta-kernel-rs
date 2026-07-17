@@ -22,7 +22,7 @@ use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
-use crate::table_properties::ENABLE_ROW_TRACKING;
+use crate::table_properties::{ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
@@ -396,54 +396,79 @@ async fn cdf_disabled_midstream() {
     assert_midstream_failure(engine, &mock_table);
 }
 
+#[rstest]
+#[case::disabled(&[(ENABLE_ROW_TRACKING, "false")])]
+#[case::suspended(&[
+    (ENABLE_ROW_TRACKING, "true"),
+    (ROW_TRACKING_SUSPENDED, "true"),
+])]
 #[tokio::test]
-async fn row_tracking_disabled_midstream_fails() {
+async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &str)]) {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
-    // First commit: row tracking enabled.
     mock_table
         .commit([metadata_with_row_tracking(get_schema())])
         .await;
-    // Second commit: row tracking disabled.
     mock_table
         .commit([metadata_action(
             get_schema(),
-            HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "false".to_string())]),
+            properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
         )])
         .await;
 
     let res = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
     assert!(
-        matches!(&res, Err(Error::RowTrackingChangeFeedUnsupported(_))),
-        "expected row-tracking-disabled error, got {res:?}"
+        matches!(&res, Err(Error::RowTrackingChangeFeedUnsupported(1))),
+        "expected row tracking to be unavailable at version 1, got {res:?}"
     );
 }
 
-/// The row-tracking path allows additive schema evolution (a commit whose schema is readable-as the
-/// end schema) but rejects an incompatible one (a commit carrying a column the end schema lacks).
+fn nested_id_type(value_type: DataType) -> DataType {
+    DataType::from(StructType::new_unchecked([StructField::nullable("value", value_type)]))
+}
+
 #[rstest]
-#[case::additive(["id", "value"].as_slice(), ["id", "value", "year"].as_slice(), true)]
-#[case::incompatible(["id", "value", "year"].as_slice(), ["id", "value"].as_slice(), false)]
+#[case::additive(DataType::INTEGER, DataType::INTEGER, false, true, true)]
+#[case::type_widening(DataType::INTEGER, DataType::LONG, false, false, false)]
+#[case::nested_type_widening(
+    nested_id_type(DataType::INTEGER),
+    nested_id_type(DataType::LONG),
+    false,
+    false,
+    false
+)]
+#[case::removed_column(DataType::INTEGER, DataType::INTEGER, true, false, false)]
 #[tokio::test]
 async fn row_tracking_schema_compatibility(
-    #[case] commit_columns: &[&str],
-    #[case] end_columns: &[&str],
+    #[case] commit_id_type: DataType,
+    #[case] end_id_type: DataType,
+    #[case] commit_has_year: bool,
+    #[case] end_has_year: bool,
     #[case] expect_compatible: bool,
 ) {
-    let int_schema = |columns: &[&str]| {
-        Arc::new(StructType::new_unchecked(
-            columns
-                .iter()
-                .map(|name| StructField::nullable(*name, DataType::INTEGER)),
-        ))
+    let schema = |id_type: DataType, has_year: bool| {
+        let fields = [
+            StructField::nullable("id", id_type),
+            StructField::nullable("value", DataType::STRING),
+        ]
+        .into_iter()
+        .chain(has_year.then(|| StructField::nullable("year", DataType::INTEGER)));
+        Arc::new(StructType::new_unchecked(fields))
     };
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
-        .commit([metadata_with_row_tracking(int_schema(commit_columns))])
+        .commit([metadata_with_row_tracking(schema(
+            commit_id_type,
+            commit_has_year,
+        ))])
         .await;
-    let res = execute_row_tracking(engine, &mock_table, int_schema(end_columns)).map(|_| ());
+    let res = execute_row_tracking(engine, &mock_table, schema(end_id_type, end_has_year))
+        .map(|_| ());
     if expect_compatible {
         assert!(
             res.is_ok(),

@@ -67,11 +67,11 @@ pub(crate) fn table_changes_action_iter(
     )
 }
 
-/// Like [`table_changes_action_iter`], but selects the change-feed semantics via `mode`. The
-/// row-tracking listing path ([`TableChanges::scan_file_listing`]) uses [`CdfMode::ReadTime`];
-/// the data-reading path uses [`CdfMode::WriteTime`].
+/// Replays change-feed actions according to `mode`.
 ///
-/// [`TableChanges::scan_file_listing`]: crate::table_changes::TableChanges::scan_file_listing
+/// [`CdfMode::WriteTime`] uses `AddCDCFile` actions because they contain changes recorded by
+/// the writer. [`CdfMode::ReadTime`] ignores those actions and reconstructs changes from
+/// row lineage in the data files referenced by `add` and `remove` actions.
 pub(crate) fn table_changes_action_iter_with_mode(
     engine: Arc<dyn Engine>,
     start_table_configuration: &TableConfiguration,
@@ -245,9 +245,8 @@ impl LogReplayScanner {
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
-                // Every in-range commit's schema must be compatible with the end (read) schema: the
-                // connector reads the listed files against the end schema. The per-mode policy
-                // (strict equality vs. additive evolution) lives in `CdfMode::schemas_compatible`.
+                // Compatibility uses logical fields; column mapping may assign different physical
+                // names.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
                     Error::change_data_feed_incompatible_schema_at_version(
@@ -475,8 +474,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                         .insert(path.to_string(), DvInfo { deletion_vector });
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
-                // In row-tracking mode we ignore `_change_data` (cdc) files entirely and
-                // reconstruct changes from add/remove actions.
+                // A cdc action supersedes add and remove actions only for write-time replay.
                 if self.mode == CdfMode::WriteTime {
                     *self.has_cdc_action = true;
                 }

@@ -65,6 +65,7 @@ pub enum KernelError {
     ParseIntervalError = 36,
     ChangeDataFeedUnsupported = 37,
     ChangeDataFeedIncompatibleSchema = 38,
+    RowTrackingChangeFeedUnsupported = 44,
     InvalidCheckpoint = 39,
     LiteralExpressionTransformError = 40,
     CheckpointWriteError = 41,
@@ -123,6 +124,9 @@ impl From<Error> for KernelError {
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
             Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
+            Error::RowTrackingChangeFeedUnsupported(_) => {
+                KernelError::RowTrackingChangeFeedUnsupported
+            }
             Error::ChangeDataFeedIncompatibleSchema(_, _) => {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
@@ -337,6 +341,7 @@ impl From<EngineExecError> for Error {
             | KernelError::ParseIntervalError
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
+            | KernelError::RowTrackingChangeFeedUnsupported
             | KernelError::LiteralExpressionTransformError
             | KernelError::LogHistoryError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
@@ -377,6 +382,10 @@ mod tests {
     #[case::fallback_io(
         KernelError::IOErrorError,
         "Generic delta kernel error: engine execution error (IOErrorError): boom"
+    )]
+    #[case::fallback_row_tracking(
+        KernelError::RowTrackingChangeFeedUnsupported,
+        "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
     )]
     fn engine_exec_error_maps_kernel_error_code(
         #[case] etype: KernelError,

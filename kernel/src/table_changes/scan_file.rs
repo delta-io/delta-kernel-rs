@@ -58,26 +58,17 @@ pub(crate) struct CdfScanFile {
     pub commit_timestamp: i64,
     /// The size of the file in bytes
     pub size: Option<i64>,
-    /// The base row ID of the file's first row, from the action's `baseRowId` field. See
-    /// [`TableChangesScanFile::base_row_id`] for the full row-id contract (effective row id,
-    /// materialized override column). `None` for files with no base row ID (e.g. predating row
-    /// tracking).
+    /// The `baseRowId` from the file action.
     pub base_row_id: Option<i64>,
-    /// The default row commit version of the file, from the action's `defaultRowCommitVersion`
-    /// field. See [`TableChangesScanFile::default_row_commit_version`]. Only populated for tables
-    /// with row tracking enabled.
+    /// The `defaultRowCommitVersion` from the file action.
     pub default_row_commit_version: Option<i64>,
 }
 
 pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile);
 
-/// One side of a [`TableChangesFileAction`]: a single file that must be read, together with the
-/// row-tracking and deletion-vector metadata needed to reconstruct change events, but without any
-/// data read.
+/// Describes one data file and the metadata required to reconstruct row-level changes.
 ///
-/// `deletion_vector` is always the file's *physical* on-disk deletion vector, exactly as recorded
-/// in the underlying `add`/`remove` action -- the same meaning whether this is the `add` or the
-/// `remove` side. The kernel never rewrites it into a computed change-set.
+/// Its deletion vector is the physical vector recorded in the file action.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct TableChangesScanFile {
@@ -87,7 +78,9 @@ pub struct TableChangesScanFile {
     /// The file's physical deletion vector, if any.
     pub deletion_vector: Option<DeletionVectorDescriptor>,
 
-    /// Partition values for the file.
+    /// Partition values from the file action.
+    ///
+    /// The keys are physical column names when column mapping is enabled.
     pub partition_values: HashMap<String, String>,
 
     /// The size of the file in bytes, if known.
@@ -100,46 +93,33 @@ pub struct TableChangesScanFile {
     /// table has in-commit timestamps enabled; otherwise the commit file's modification time.
     pub commit_timestamp: i64,
 
-    /// The base row ID of the file's first row. A row's *default* row ID is `base_row_id +
-    /// physical_row_index` (its position in the file before applying the deletion vector). This
-    /// default can be overridden per-row: a file may carry a materialized row-id column whose
-    /// non-null values take precedence, so the effective row ID is `coalesce(materialized_row_id,
-    /// base_row_id + physical_row_index)`. To match pre-image and post-image rows you must read
-    /// that column rather than rely on `base_row_id` alone. The column's name is not carried
-    /// on this listing entry; resolve it from the table's
-    /// `delta.rowTracking.materializedRowIdColumnName` property, read from the
-    /// [`crate::table_properties::TableProperties`] of a [`crate::Snapshot`] built at the feed's
-    /// end version. `None` for files with no base row ID (e.g. predating row tracking).
+    /// The base row ID assigned to the file's first physical row.
+    ///
+    /// The effective row ID is
+    /// `coalesce(materialized_row_id, base_row_id + physical_row_index)`, where the physical index
+    /// is assigned before applying the deletion vector. The materialized column name is stored in
+    /// `delta.rowTracking.materializedRowIdColumnName` and is a physical Parquet column even when
+    /// table columns use column mapping.
     pub base_row_id: Option<i64>,
 
-    /// The default row commit version of the file. Analogous to `base_row_id`: the effective
-    /// per-row commit version is `coalesce(materialized_row_commit_version,
-    /// default_row_commit_version)`, where the materialized column is named by the
-    /// `delta.rowTracking.materializedRowCommitVersionColumnName` table property.
+    /// The first commit version containing an `add` action for this path.
+    ///
+    /// This value is not necessarily the last version that updated a row. A row's commit version is
+    /// derived as `coalesce(materialized_row_commit_version, default_row_commit_version)`. The
+    /// materialized column name is stored in
+    /// `delta.rowTracking.materializedRowCommitVersionColumnName`.
     pub default_row_commit_version: Option<i64>,
 }
 
-/// A file's change over the listed range, grouped into its `add` and `remove` sides. This is the
-/// public, listing-only output of [`TableChanges::scan_file_listing`]: it identifies *which* files
-/// to read and carries their row-tracking and deletion-vector metadata, but reads no data. The
-/// connector performs the data scan and the row-id reconciliation itself.
+/// Describes the add and remove file images used to reconstruct row-level changes.
 ///
-/// The change type is encoded by which sides are present -- there is no separate kind or flag:
-/// - `{ add: Some, remove: None }` -- an insert.
-/// - `{ add: None, remove: Some }` -- a delete.
-/// - `{ add: Some, remove: Some }` -- an update of the same file: read the pre-image (the `remove`
-///   side under its DV) and the post-image (the `add` side under its DV) and reconcile rows by row
-///   id (see [`TableChangesScanFile::base_row_id`]) -- a row present only post-image is an insert,
-///   only pre-image a delete, in both unchanged.
+/// The remove side is the pre-image and the add side is the post-image. Matching rows by stable row
+/// ID and comparing row commit versions distinguishes updates from rows carried forward by a
+/// copy-on-write rewrite. Rows present only on the remove side are deletes; rows present only on
+/// the add side are inserts.
 ///
-/// At least one side is always present. A copy-on-write update that rewrites one file into a file
-/// at a *different* path is not grouped here (the two sides have different paths); it surfaces as a
-/// delete of the old path and an insert of the new, reconciled by row id across the whole listing.
-///
-/// Unlike the (`enableChangeDataFeed`) reader, this never references `_change_data` (cdc) files:
-/// change events are reconstructed from `add`/`remove` actions and their row-tracking fields.
-///
-/// [`TableChanges::scan_file_listing`]: crate::table_changes::TableChanges::scan_file_listing
+/// At least one side is present. Copy-on-write actions with different paths remain separate and
+/// require reconciliation across the full listing. `AddCDCFile` actions are ignored.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct TableChangesFileAction {
@@ -150,11 +130,7 @@ pub struct TableChangesFileAction {
 }
 
 impl TableChangesFileAction {
-    /// Converts an internal [`CdfScanFile`] into a public [`TableChangesFileAction`]. A same-commit
-    /// deletion-vector update (an `add` whose `remove_dv` is set) is grouped into both sides for
-    /// the one file; an unpaired add or remove yields a single-sided action. Returns an error
-    /// for `cdc`-typed scan files: the row-tracking listing path never selects `_change_data`
-    /// files, so encountering one indicates an internal inconsistency.
+    /// Converts a scan file, preserving both sides of a same-commit deletion-vector update.
     pub(crate) fn try_from_scan_file(scan_file: CdfScanFile) -> DeltaResult<Self> {
         // The remove side of a same-commit paired update is the same physical file in the same
         // commit as the add, differing only in its deletion vector.
@@ -196,10 +172,6 @@ impl TableChangesFileAction {
 }
 
 impl TableChangesScanFile {
-    /// Builds a [`TableChangesScanFile`] from a scan file, taking the scan file's own deletion
-    /// vector (`dv_info`). Used for a plain add side or an unpaired remove side; the paired
-    /// remove side of a same-commit update is built separately since its DV comes from
-    /// `remove_dv`.
     fn from_scan_file(scan_file: CdfScanFile) -> Self {
         TableChangesScanFile {
             path: scan_file.path,
@@ -281,10 +253,31 @@ struct CdfScanFileVisitor<'a, T> {
     context: T,
 }
 
+const ADD_PATH_INDEX: usize = 0;
+const ADD_DV_START_INDEX: usize = 1;
+const ADD_DV_END_INDEX: usize = 5;
+const ADD_PARTITION_VALUES_INDEX: usize = 6;
+const ADD_SIZE_INDEX: usize = 7;
+const ADD_BASE_ROW_ID_INDEX: usize = 8;
+const ADD_DEFAULT_ROW_COMMIT_VERSION_INDEX: usize = 9;
+const REMOVE_PATH_INDEX: usize = 10;
+const REMOVE_DV_START_INDEX: usize = 11;
+const REMOVE_DV_END_INDEX: usize = 15;
+const REMOVE_PARTITION_VALUES_INDEX: usize = 16;
+const REMOVE_SIZE_INDEX: usize = 17;
+const REMOVE_BASE_ROW_ID_INDEX: usize = 18;
+const REMOVE_DEFAULT_ROW_COMMIT_VERSION_INDEX: usize = 19;
+const CDC_PATH_INDEX: usize = 20;
+const CDC_PARTITION_VALUES_INDEX: usize = 21;
+const CDC_SIZE_INDEX: usize = 22;
+const COMMIT_TIMESTAMP_INDEX: usize = 23;
+const COMMIT_VERSION_INDEX: usize = 24;
+const CDF_SCAN_FILE_GETTER_COUNT: usize = 25;
+
 impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 25,
+            getters.len() == CDF_SCAN_FILE_GETTER_COUNT,
             Error::InternalError(format!(
                 "Wrong number of CdfScanFileVisitor getters: {}",
                 getters.len()
@@ -303,15 +296,21 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 size,
                 base_row_id,
                 default_row_commit_version,
-            ) = if let Some(path) = getters[0].get_opt(row_index, "scanFile.add.path")? {
+            ) = if let Some(path) =
+                getters[ADD_PATH_INDEX].get_opt(row_index, "scanFile.add.path")?
+            {
                 let scan_type = CdfScanFileType::Add;
-                let deletion_vector = visit_deletion_vector_at(row_index, &getters[1..=5])?;
-                let partition_values = getters[6]
+                let deletion_vector = visit_deletion_vector_at(
+                    row_index,
+                    &getters[ADD_DV_START_INDEX..=ADD_DV_END_INDEX],
+                )?;
+                let partition_values = getters[ADD_PARTITION_VALUES_INDEX]
                     .get_opt(row_index, "scanFile.add.fileConstantValues.partitionValues")?;
-                let size = getters[7].get_opt(row_index, "scanFile.add.size")?;
-                let base_row_id = getters[8].get_opt(row_index, "scanFile.add.baseRowId")?;
-                let default_row_commit_version =
-                    getters[9].get_opt(row_index, "scanFile.add.defaultRowCommitVersion")?;
+                let size = getters[ADD_SIZE_INDEX].get_opt(row_index, "scanFile.add.size")?;
+                let base_row_id =
+                    getters[ADD_BASE_ROW_ID_INDEX].get_opt(row_index, "scanFile.add.baseRowId")?;
+                let default_row_commit_version = getters[ADD_DEFAULT_ROW_COMMIT_VERSION_INDEX]
+                    .get_opt(row_index, "scanFile.add.defaultRowCommitVersion")?;
                 (
                     scan_type,
                     path,
@@ -321,17 +320,24 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                     base_row_id,
                     default_row_commit_version,
                 )
-            } else if let Some(path) = getters[10].get_opt(row_index, "scanFile.remove.path")? {
+            } else if let Some(path) =
+                getters[REMOVE_PATH_INDEX].get_opt(row_index, "scanFile.remove.path")?
+            {
                 let scan_type = CdfScanFileType::Remove;
-                let deletion_vector = visit_deletion_vector_at(row_index, &getters[11..=15])?;
-                let partition_values = getters[16].get_opt(
+                let deletion_vector = visit_deletion_vector_at(
+                    row_index,
+                    &getters[REMOVE_DV_START_INDEX..=REMOVE_DV_END_INDEX],
+                )?;
+                let partition_values = getters[REMOVE_PARTITION_VALUES_INDEX].get_opt(
                     row_index,
                     "scanFile.remove.fileConstantValues.partitionValues",
                 )?;
-                let size = getters[17].get_opt(row_index, "scanFile.remove.size")?;
-                let base_row_id = getters[18].get_opt(row_index, "scanFile.remove.baseRowId")?;
+                let size = getters[REMOVE_SIZE_INDEX].get_opt(row_index, "scanFile.remove.size")?;
+                let base_row_id = getters[REMOVE_BASE_ROW_ID_INDEX]
+                    .get_opt(row_index, "scanFile.remove.baseRowId")?;
                 let default_row_commit_version =
-                    getters[19].get_opt(row_index, "scanFile.remove.defaultRowCommitVersion")?;
+                    getters[REMOVE_DEFAULT_ROW_COMMIT_VERSION_INDEX]
+                    .get_opt(row_index, "scanFile.remove.defaultRowCommitVersion")?;
                 (
                     scan_type,
                     path,
@@ -341,11 +347,13 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                     base_row_id,
                     default_row_commit_version,
                 )
-            } else if let Some(path) = getters[20].get_opt(row_index, "scanFile.cdc.path")? {
+            } else if let Some(path) =
+                getters[CDC_PATH_INDEX].get_opt(row_index, "scanFile.cdc.path")?
+            {
                 let scan_type = CdfScanFileType::Cdc;
-                let partition_values = getters[21]
+                let partition_values = getters[CDC_PARTITION_VALUES_INDEX]
                     .get_opt(row_index, "scanFile.cdc.fileConstantValues.partitionValues")?;
-                let size = getters[22].get_opt(row_index, "scanFile.cdc.size")?;
+                let size = getters[CDC_SIZE_INDEX].get_opt(row_index, "scanFile.cdc.size")?;
                 (scan_type, path, None, partition_values, size, None, None)
             } else {
                 continue;
@@ -357,8 +365,10 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 path,
                 dv_info: DvInfo { deletion_vector },
                 partition_values,
-                commit_timestamp: getters[23].get(row_index, "scanFile.timestamp")?,
-                commit_version: getters[24].get(row_index, "scanFile.commit_version")?,
+                commit_timestamp: getters[COMMIT_TIMESTAMP_INDEX]
+                    .get(row_index, "scanFile.timestamp")?,
+                commit_version: getters[COMMIT_VERSION_INDEX]
+                    .get(row_index, "scanFile.commit_version")?,
                 size,
                 base_row_id,
                 default_row_commit_version,
@@ -458,6 +468,7 @@ mod tests {
     use std::sync::Arc;
 
     use itertools::Itertools;
+    use rstest::rstest;
 
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType, TableChangesFileAction};
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
@@ -477,6 +488,97 @@ mod tests {
     };
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Engine as _;
+
+    fn test_deletion_vector(path: &str, cardinality: i64) -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: path.to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality,
+        }
+    }
+
+    fn row_tracking_add(
+        path: &str,
+        deletion_vector: Option<DeletionVectorDescriptor>,
+        data_change: bool,
+        base_row_id: i64,
+        default_row_commit_version: i64,
+    ) -> Add {
+        Add {
+            path: path.into(),
+            deletion_vector,
+            partition_values: HashMap::new(),
+            data_change,
+            size: 100,
+            base_row_id: Some(base_row_id),
+            default_row_commit_version: Some(default_row_commit_version),
+            ..Default::default()
+        }
+    }
+
+    fn row_tracking_remove(
+        path: &str,
+        deletion_vector: Option<DeletionVectorDescriptor>,
+        base_row_id: Option<i64>,
+        default_row_commit_version: Option<i64>,
+    ) -> Remove {
+        Remove {
+            path: path.into(),
+            deletion_vector,
+            data_change: true,
+            base_row_id,
+            default_row_commit_version,
+            ..Default::default()
+        }
+    }
+
+    fn row_tracking_scan_files(
+        engine: Arc<SyncEngine>,
+        mock_table: &LocalMockTable,
+    ) -> Vec<CdfScanFile> {
+        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let log_segment = LogSegment::for_table_changes(
+            engine.storage_handler().as_ref(),
+            table_root.join("_delta_log/").unwrap(),
+            0,
+            None,
+        )
+        .unwrap();
+        let table_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
+        ]));
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            table_schema.clone(),
+            vec![],
+            0,
+            HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            [TableFeature::RowTracking, TableFeature::DomainMetadata],
+        )
+        .unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        let scan_metadata = table_changes_action_iter_with_mode(
+            engine,
+            &table_config,
+            log_segment.listed.ascending_commit_files,
+            table_schema,
+            None,
+            CdfMode::ReadTime,
+        )
+        .unwrap();
+        scan_metadata_to_scan_file(scan_metadata)
+            .try_collect()
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn test_scan_file_visiting() {
@@ -670,161 +772,35 @@ mod tests {
         let engine = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
 
-        // commit 0: a deletion-vector update (remove+add on the same path) plus an unpaired remove.
-        let post_dv = DeletionVectorDescriptor {
-            storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
-            offset: Some(1),
-            size_in_bytes: 36,
-            cardinality: 2,
-        };
-        let add_paired = Add {
-            path: "path_1".into(),
-            deletion_vector: Some(post_dv.clone()),
-            partition_values: HashMap::new(),
-            data_change: true,
-            size: 100,
-            base_row_id: Some(10),
-            default_row_commit_version: Some(0),
-            ..Default::default()
-        };
-        let baseline_dv = DeletionVectorDescriptor {
-            storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
-            offset: Some(1),
-            size_in_bytes: 38,
-            cardinality: 1,
-        };
-        let paired_remove = Remove {
-            path: "path_1".into(),
-            deletion_vector: Some(baseline_dv.clone()),
-            data_change: true,
-            base_row_id: Some(10),
-            default_row_commit_version: Some(0),
-            ..Default::default()
-        };
-        let remove_unpaired = Remove {
-            path: "path_2".into(),
-            deletion_vector: None,
-            data_change: true,
-            ..Default::default()
-        };
-
-        // commit 1: a cdc action that the row-tracking path must ignore.
+        let post_dv = test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2);
+        let baseline_dv = test_deletion_vector("U5OWRz5k%CFT.Td}yCPW", 1);
+        let add_paired = row_tracking_add("path_1", Some(post_dv.clone()), true, 10, 0);
+        let paired_remove =
+            row_tracking_remove("path_1", Some(baseline_dv.clone()), Some(10), Some(0));
+        let remove_unpaired = row_tracking_remove("path_2", None, None, None);
         let cdc = Cdc {
             path: "cdc_path".into(),
             partition_values: HashMap::new(),
             ..Default::default()
         };
-
-        // commit 2: a standalone add (an insert).
-        let add_insert = Add {
-            path: "path_4".into(),
-            deletion_vector: None,
-            partition_values: HashMap::new(),
-            data_change: true,
-            size: 50,
-            base_row_id: Some(20),
-            default_row_commit_version: Some(2),
-            ..Default::default()
-        };
-
-        // commit 3: a deletion-vector update whose removed version carried no deletion vector (so
-        // the update is detectable only by the paired remove side, not its DV), plus a
-        // metadata-only add (`data_change == false`) that must be excluded from the feed.
-        let add_paired_no_dv = Add {
-            path: "path_5".into(),
-            deletion_vector: None,
-            partition_values: HashMap::new(),
-            data_change: true,
-            size: 70,
-            base_row_id: Some(30),
-            default_row_commit_version: Some(3),
-            ..Default::default()
-        };
-        let paired_remove_no_dv = Remove {
-            path: "path_5".into(),
-            deletion_vector: None,
-            data_change: true,
-            base_row_id: Some(30),
-            default_row_commit_version: Some(3),
-            ..Default::default()
-        };
-        let add_no_data_change = Add {
-            path: "path_6".into(),
-            deletion_vector: None,
-            partition_values: HashMap::new(),
-            data_change: false,
-            size: 80,
-            base_row_id: Some(40),
-            default_row_commit_version: Some(3),
-            ..Default::default()
-        };
+        let add_insert = row_tracking_add("path_4", None, true, 20, 2);
+        let add_no_data_change = row_tracking_add("path_6", None, false, 40, 3);
 
         mock_table
             .commit([
-                Action::Remove(paired_remove.clone()),
-                Action::Add(add_paired.clone()),
-                Action::Remove(remove_unpaired.clone()),
+                Action::Remove(paired_remove),
+                Action::Add(add_paired),
+                Action::Remove(remove_unpaired),
             ])
             .await;
-        mock_table.commit([Action::Cdc(cdc.clone())]).await;
-        mock_table.commit([Action::Add(add_insert.clone())]).await;
-        mock_table
-            .commit([
-                Action::Remove(paired_remove_no_dv.clone()),
-                Action::Add(add_paired_no_dv.clone()),
-                Action::Add(add_no_data_change.clone()),
-            ])
-            .await;
+        mock_table.commit([Action::Cdc(cdc)]).await;
+        mock_table.commit([Action::Add(add_insert)]).await;
+        mock_table.commit([Action::Add(add_no_data_change)]).await;
 
-        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let log_root = table_root.join("_delta_log/").unwrap();
-        let log_segment =
-            LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
-                .unwrap();
-        let table_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]));
-
-        // Build a row-tracking-enabled start configuration, matching `CdfMode::ReadTime`. The
-        // iterator's row-tracking behavior is driven by the mode argument; the feature enablement
-        // on this config is not re-checked here unless a commit in the range carries a metadata
-        // update (none do). `RowTracking` requires `DomainMetadata` to be supported.
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            table_schema.clone(),
-            vec![],
-            0,
-            HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            TableFeature::EMPTY_LIST,
-            [TableFeature::RowTracking, TableFeature::DomainMetadata],
-        )
-        .unwrap();
-        let table_config =
-            TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
-
-        let scan_metadata = table_changes_action_iter_with_mode(
-            engine,
-            &table_config,
-            log_segment.listed.ascending_commit_files.clone(),
-            table_schema,
-            None,
-            CdfMode::ReadTime,
-        )
-        .unwrap();
-        let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
-            .try_collect()
-            .unwrap();
+        let scan_files = row_tracking_scan_files(engine, &mock_table);
 
         // The cdc action in commit 1 is ignored: only add/remove-derived files appear. The
-        // metadata-only add (`data_change == false`) in commit 3 is also excluded, leaving path_1,
-        // path_2, path_4, and path_5.
+        // metadata-only add (`data_change == false`) in commit 3 is also excluded.
         assert!(scan_files
             .iter()
             .all(|f| f.scan_type != CdfScanFileType::Cdc));
@@ -832,7 +808,7 @@ mod tests {
             !scan_files.iter().any(|f| f.path == "path_6"),
             "metadata-only add (data_change=false) must be excluded"
         );
-        assert_eq!(scan_files.len(), 4);
+        assert_eq!(scan_files.len(), 3);
 
         // The paired add (a DV update) carries its own (post-image) DV, the paired remove's
         // (baseline) DV, and the row-tracking fields.
@@ -896,21 +872,6 @@ mod tests {
         assert!(paired_remove.deletion_vector.is_some());
         assert_eq!(paired_remove.base_row_id, Some(10));
 
-        // A DV update whose removed version had no deletion vector still groups into both sides;
-        // the remove side simply carries no DV. This is the case that would look like a bare insert
-        // if the two sides were not grouped.
-        let paired_no_dv = listing
-            .iter()
-            .find(|fa| path_of(fa).as_deref() == Some("path_5"))
-            .expect("paired-no-dv listing present");
-        let paired_no_dv_add = paired_no_dv.add.as_ref().expect("paired-no-dv add side");
-        let paired_no_dv_remove = paired_no_dv
-            .remove
-            .as_ref()
-            .expect("paired-no-dv remove side");
-        assert_eq!(paired_no_dv_add.base_row_id, Some(30));
-        assert!(paired_no_dv_remove.deletion_vector.is_none());
-
         // The unpaired remove (path_2) is a single-sided delete.
         let unpaired_delete = listing
             .iter()
@@ -929,6 +890,34 @@ mod tests {
             insert.add.as_ref().expect("insert add side").base_row_id,
             Some(20)
         );
+    }
+
+    #[rstest]
+    #[case::with_deletion_vector(Some(test_deletion_vector("baseline", 1)))]
+    #[case::without_deletion_vector(None)]
+    fn cdf_file_action_preserves_paired_remove_deletion_vector(
+        #[case] deletion_vector: Option<DeletionVectorDescriptor>,
+    ) {
+        let scan_file = CdfScanFile {
+            scan_type: CdfScanFileType::Add,
+            path: "path".into(),
+            dv_info: DvInfo {
+                deletion_vector: Some(test_deletion_vector("current", 2)),
+            },
+            remove_dv: Some(DvInfo {
+                deletion_vector: deletion_vector.clone(),
+            }),
+            partition_values: HashMap::new(),
+            commit_version: 1,
+            commit_timestamp: 2,
+            size: Some(3),
+            base_row_id: Some(4),
+            default_row_commit_version: Some(5),
+        };
+
+        let action = TableChangesFileAction::try_from_scan_file(scan_file).unwrap();
+        assert_eq!(action.remove.unwrap().deletion_vector, deletion_vector);
+        assert!(action.add.is_some());
     }
 
     #[test]

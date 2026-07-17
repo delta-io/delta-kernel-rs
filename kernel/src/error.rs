@@ -341,35 +341,21 @@ impl Error {
         actual: &StructType,
     ) -> Self {
         Self::ChangeDataFeedIncompatibleSchema(
-            Self::format_schema_fields(expected),
-            Self::format_schema_fields(actual),
+            expected.to_string(),
+            actual.to_string(),
         )
     }
 
-    /// Like [`Self::change_data_feed_incompatible_schema`] but names the version at which the
-    /// incompatible `actual` schema was observed — the message a connector surfaces for an in-range
-    /// commit whose schema cannot be read through the change feed's read schema.
+    /// Creates an incompatible-schema error that identifies the version of `actual`.
     pub(crate) fn change_data_feed_incompatible_schema_at_version(
         expected: &StructType,
         actual: &StructType,
         version: Version,
     ) -> Self {
         Self::ChangeDataFeedIncompatibleSchema(
-            Self::format_schema_fields(expected),
-            format!(
-                "schema at version {version}: {}",
-                Self::format_schema_fields(actual)
-            ),
+            expected.to_string(),
+            format!("schema at version {version}: {actual}"),
         )
-    }
-
-    /// Formats a schema as a compact `[name: type, …]` field list for incompatible-schema errors.
-    fn format_schema_fields(schema: &StructType) -> String {
-        let fields: Vec<String> = schema
-            .fields()
-            .map(|field| format!("{}: {}", field.name(), field.data_type))
-            .collect();
-        format!("[{}]", fields.join(", "))
     }
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {

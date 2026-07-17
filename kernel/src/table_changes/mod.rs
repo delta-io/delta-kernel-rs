@@ -40,7 +40,6 @@ use url::Url;
 
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
-use crate::schema::compare::SchemaComparison;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
@@ -57,49 +56,36 @@ mod scan_file;
 
 pub use scan_file::{TableChangesFileAction, TableChangesScanFile};
 
-/// Selects how [`TableChanges::scan_file_listing`] presents the row-tracking change-feed files.
+/// Selects the history represented by [`TableChanges::scan_file_listing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TableChangesListingMode {
-    /// One [`TableChangesFileAction`] per commit occurrence, with no cross-commit collapsing: a
-    /// same-commit `add`+`remove` of one path groups into `{add, remove}` (an in-commit update),
-    /// and an unpaired `add` or `remove` is single-sided. Like `NetChanges`, this buffers the full
-    /// range before returning (see the method-level note on [`TableChanges::scan_file_listing`]).
+    /// Preserves each commit's file actions.
     ///
-    /// The `{add, remove}` grouping here is a *same-commit-only* convenience: a cross-commit
-    /// update (a `remove` in one commit and the re-`add` in a later one) is **not** grouped --
-    /// it surfaces as two separate single-sided actions. So `{add, remove}` present does not
-    /// enumerate every update in this mode; the connector should reconcile pre-image and
-    /// post-image rows by row id across the whole listing regardless of grouping (see
-    /// [`TableChangesFileAction`]). To get each path's update grouped into one action, use
-    /// [`NetChanges`](Self::NetChanges).
+    /// An `add` and `remove` for the same path in one commit are grouped. Actions for the same path
+    /// in different commits remain separate and require reconciliation by stable row ID.
     AllChanges,
-    /// Each file path reduced to its net effect across the whole range, as one
-    /// [`TableChangesFileAction`]: a net insert (`{add: Some}`), a net delete (`{remove: Some}`),
-    /// or -- when a path is removed then re-added with a different deletion vector -- a net update
-    /// (`{add: Some, remove: Some}`) whose remove side is the pre-image (earliest remove, with its
-    /// DV) and add side the post-image (latest add, with its DV); the connector reconciles them by
-    /// row id. The result reflects the net effect, not the intermediate actions: a path added,
-    /// removed, then re-added within the range still collapses to a single net-insert. Paths that
-    /// net to no change are dropped; dropping is conservative (only structurally identical
-    /// boundary deletion vectors are dropped), so a surviving path is not a guarantee its rows
-    /// changed. Because the net effect is a property of the whole range, this mode buffers
-    /// every per-commit action before emitting -- its memory is proportional to the range's
-    /// action count and it is not streaming.
+    /// Reduces each path to its net effect between the start and end of the range.
+    ///
+    /// The remove side represents the earliest pre-image and the add side represents the latest
+    /// post-image. Intermediate actions are omitted, but each surviving action still requires
+    /// row-level reconciliation. Computing net changes buffers the full range.
     NetChanges,
 }
 
 /// Selects which semantics a [`TableChanges`] uses to derive the change data feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CdfMode {
-    /// Write time CDF: requires `delta.enableChangeDataFeed`, reads `_change_data`
-    /// (cdc) files when present, and falls back to add/remove + deletion-vector diffing. This is
-    /// the semantics used by the data-reading [`scan`] / `execute` path.
+    /// Uses change data recorded by writers.
+    ///
+    /// This mode requires `delta.enableChangeDataFeed`. It reads `_change_data` files when a
+    /// commit contains them and otherwise derives changes from `add` and `remove` actions. The
+    /// data-reading [`scan`] and `execute` paths use these semantics.
     WriteTime,
-    /// Read Time CDF: requires `delta.enableRowTracking` (not `enableChangeDataFeed`),
-    /// ignores `_change_data` (cdc) files, and surfaces the row-tracking fields needed to
-    /// reconstruct change events from add/remove actions. Used by the listing-only
-    /// [`TableChanges::scan_file_listing`] path.
+    /// Uses row lineage to reconstruct changes while reading data files.
+    ///
+    /// This mode requires `delta.enableRowTracking`. It ignores `_change_data` files and returns
+    /// metadata from `add` and `remove` actions for [`TableChanges::scan_file_listing`].
     ReadTime,
 }
 
@@ -122,9 +108,11 @@ impl CdfMode {
         }
     }
 
-    /// Whether a file written with `candidate` schema can be read against the change feed's
-    /// `read_schema`. The write time CDF currently requires exact schema equality. The read time
-    /// path allows additive evolution (`candidate` must be readable as `read_schema`).
+    /// Whether data written with `candidate` can be read using the change feed's `read_schema`.
+    ///
+    /// Write-time CDF requires exact equality. Read-time CDF accepts top-level field additions
+    /// while requiring common fields to retain their types without tightening nullability. Physical
+    /// names do not determine logical compatibility.
     pub(crate) fn schemas_compatible(
         self,
         candidate: &StructType,
@@ -132,14 +120,11 @@ impl CdfMode {
     ) -> bool {
         match self {
             CdfMode::WriteTime => candidate == read_schema,
-            CdfMode::ReadTime => candidate.can_read_as(read_schema).is_ok(),
+            CdfMode::ReadTime => read_time_cdf_schema_compatible(candidate, read_schema),
         }
     }
 
-    /// Maps a start-vs-end boundary schema mismatch to the per-mode error. The write time path
-    /// reports a generic message; the read time path returns
-    /// [`Error::change_data_feed_incompatible_schema`] with the arguments as `(end, start)` (the
-    /// end schema is the read schema that the start schema must be readable as).
+    /// Returns the mode-specific error for incompatible range-boundary schemas.
     pub(crate) fn boundary_schema_error(self, start: &StructType, end: &StructType) -> Error {
         match self {
             CdfMode::WriteTime => Error::generic(format!(
@@ -149,16 +134,24 @@ impl CdfMode {
         }
     }
 
-    /// Maps a reader-support failure on a mid-range protocol update to the appropriate error. The
-    /// change-data-file path reports [`Error::ChangeDataFeedUnsupported`] for backward
-    /// compatibility; the row-tracking path propagates the `underlying` error so it names the
-    /// actual unsupported feature.
+    /// Maps a reader-support failure on a protocol update to the mode-specific error.
     pub(crate) fn protocol_support_error(self, underlying: Error, version: Version) -> Error {
         match self {
             CdfMode::WriteTime => Error::change_data_feed_unsupported(version),
             CdfMode::ReadTime => underlying,
         }
     }
+}
+
+fn read_time_cdf_schema_compatible(candidate: &StructType, read_schema: &StructType) -> bool {
+    candidate.fields().all(|candidate_field| {
+        read_schema
+            .field(candidate_field.name())
+            .is_some_and(|read_field| {
+                (read_field.is_nullable() || !candidate_field.is_nullable())
+                    && candidate_field.data_type() == read_field.data_type()
+            })
+    })
 }
 
 pub(crate) const CHANGE_TYPE_COL_NAME: &str = "_change_type";
@@ -257,31 +250,28 @@ impl TableChanges {
         )
     }
 
-    /// Creates a new [`TableChanges`] that derives the change data feed from *row tracking* rather
-    /// than change-data-file (`delta.enableChangeDataFeed`) semantics.
+    /// Creates a listing-only change feed from row-tracking metadata.
     ///
-    /// Unlike [`TableChanges::try_new`], this:
-    /// - requires `delta.enableRowTracking` (not `delta.enableChangeDataFeed`) to be enabled for
-    ///   the entire range, and
-    /// - ignores any `_change_data` (cdc) files, reconstructing change events from `add`/`remove`
-    ///   actions and their row-tracking fields instead.
+    /// This path requires `delta.enableRowTracking` throughout the requested range and ignores
+    /// `_change_data` files. [`TableChanges::scan_file_listing`] returns the `add` and `remove`
+    /// actions whose data must be reconciled by row ID.
     ///
-    /// This is intended for the listing-only [`TableChanges::scan_file_listing`] API, where the
-    /// connector performs the data scan and the row-id matching that pairs an update's pre-image
-    /// and post-image. The same reader support checks as [`TableChanges::try_new`] apply: every
-    /// enabled reader feature must be supported by the kernel.
-    ///
-    /// Note: a table may have both `delta.enableChangeDataFeed` and `delta.enableRowTracking`
-    /// enabled. The two paths derive the feed differently (cdc files vs. add/remove + row tracking)
-    /// and may classify changes differently, so the caller chooses which semantics to use; this
-    /// constructor always uses the row-tracking semantics.
+    /// Every enabled reader feature must be supported by Kernel. Each schema in the range must be
+    /// readable using the end-version logical schema.
     ///
     /// # Parameters
-    /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `start_version`: The start version of the change data feed
+    ///
+    /// - `table_root`: URL of the table root containing `_delta_log`.
+    /// - `engine`: Engine used to read the transaction log.
+    /// - `start_version`: First version in the change feed.
     /// - `end_version`: The end version (inclusive) of the change data feed. If this is none, this
     ///   defaults to the newest table version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the range cannot be loaded, row tracking is unavailable within the
+    /// range, an enabled reader feature is unsupported, or a schema is incompatible with the
+    /// end-version schema.
     pub fn try_new_row_tracking(
         table_root: Url,
         engine: &dyn Engine,
@@ -348,14 +338,9 @@ impl TableChanges {
         check_table_config(&start_snapshot)?;
         check_table_config(&end_snapshot)?;
 
-        // Validate that the start-version schema is compatible with the end-version (read) schema.
-        // The per-commit check during log replay only fires for commits that carry a metadata
-        // action, so a range whose schema was last set before `start_version` would otherwise go
-        // unchecked at its boundary. The change-data-file path requires strict equality; the
-        // row-tracking path allows additive evolution (the start schema must be readable as the end
-        // schema), consistent with its per-commit check. See issue
-        // [#523](https://github.com/delta-io/delta-kernel-rs/issues/523) for relaxing the
-        // change-data-file equality check.
+        // Log replay validates only commits that contain metadata, so validate the range boundary
+        // separately. Compatibility uses logical schemas; column mapping may change physical
+        // names.
         let start_schema = start_snapshot.schema();
         let end_schema = end_snapshot.schema();
         if !mode.schemas_compatible(start_schema.as_ref(), end_schema.as_ref()) {
@@ -410,36 +395,31 @@ impl TableChanges {
         TableChangesScanBuilder::new(self)
     }
 
-    /// Returns a *listing-only* iterator of the files that must be read to produce a row-tracking
-    /// Change Data Feed over this `TableChanges`' version range, **without reading any data**.
+    /// Lists the files required to reconstruct a row-tracking change feed without reading data
+    /// files.
     ///
-    /// Each [`TableChangesFileAction`] groups a file's change into its `add` and `remove` sides;
-    /// which sides are present encodes the change (insert / delete / update). It carries the
-    /// per-file deletion-vector and row-tracking metadata the connector needs to (a) perform the
-    /// data scan itself and (b) reconstruct change events by reading each side under its own DV and
-    /// reconciling an update's pre-image and post-image rows by row id. `cdc` (`_change_data`)
-    /// files are never referenced.
+    /// Each [`TableChangesFileAction`] contains an add side, a remove side, or both. Read each side
+    /// using its own deletion vector. For every selected physical row, reconstruct the row ID as
+    /// `coalesce(materialized_row_id, base_row_id + physical_row_index)`. Reconstruct the row
+    /// commit version as
+    /// `coalesce(materialized_row_commit_version, default_row_commit_version)`. The materialized
+    /// column names come from the end-version table configuration. Assign physical row indexes
+    /// before applying deletion vectors.
     ///
-    /// `mode` selects how the files are presented ([`TableChangesListingMode`]):
-    /// - [`TableChangesListingMode::AllChanges`] yields one action per commit occurrence (a
-    ///   same-commit `add`+`remove` of one path groups into `{add, remove}`; an unpaired `add` or
-    ///   `remove` is single-sided).
-    /// - [`TableChangesListingMode::NetChanges`] collapses each path to its net effect across the
-    ///   range.
+    /// Rows present only on the add side are inserts, rows present only on the remove side are
+    /// deletes, and matching row IDs with different row commit versions are updates. Matching both
+    /// the row ID and row commit version identifies a row carried forward without change.
+    /// `AddCDCFile` actions are ignored.
     ///
-    /// Both modes buffer the full range before returning (NetChanges must, to compute the net
-    /// effect); the returned iterator walks that materialized listing. Its memory is proportional
-    /// to the range's action count.
+    /// Both listing modes buffer the selected actions before returning. The iterator therefore
+    /// reports preparation errors immediately and uses memory proportional to the range's action
+    /// count. This method requires a [`TableChanges`] created by
+    /// [`TableChanges::try_new_row_tracking`].
     ///
-    /// This requires the `TableChanges` to have been constructed with
-    /// [`TableChanges::try_new_row_tracking`]; calling it on a change-data-file `TableChanges`
-    /// returns an error.
+    /// # Errors
     ///
-    /// Note: like the data-reading [`scan`] path, this currently reads each commit file in the
-    /// range twice (a prepare pass and a scan pass). Collapsing the row-tracking listing path to a
-    /// single read per commit is a future optimization.
-    ///
-    /// [`scan`]: crate::table_changes::scan
+    /// Returns an error if this value was not created by [`TableChanges::try_new_row_tracking`] or
+    /// if the log actions cannot be replayed into a valid listing.
     pub fn scan_file_listing(
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
@@ -489,12 +469,9 @@ mod tests {
     use crate::table_changes::CDF_FIELDS;
     use crate::table_features::TableFeature;
     use crate::table_properties::ENABLE_ROW_TRACKING;
-    use crate::utils::test_utils::{Action, LocalMockTable};
+    use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
     use crate::{Engine, Error};
 
-    // === Row-tracking listing e2e helpers ===
-
-    /// The `(id, value)` schema shared by the row-tracking listing end-to-end tests.
     fn listing_test_schema() -> Arc<StructType> {
         Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
@@ -502,8 +479,6 @@ mod tests {
         ]))
     }
 
-    /// The v0 setup actions (protocol + row-tracking-enabled metadata) for `schema`, shared by the
-    /// row-tracking listing end-to-end tests. Callers chain their v0 data actions onto these.
     fn row_tracking_setup_actions(schema: Arc<StructType>) -> [Action; 2] {
         let metadata = Metadata::try_new(
             None,
@@ -522,8 +497,6 @@ mod tests {
         [Action::Protocol(protocol), Action::Metadata(metadata)]
     }
 
-    /// Two distinct deletion-vector descriptors used as the before/after DVs of an update in the
-    /// row-tracking listing end-to-end tests.
     fn listing_test_dvs() -> (DeletionVectorDescriptor, DeletionVectorDescriptor) {
         let dv1 = DeletionVectorDescriptor {
             storage_type: DeletionVectorStorageType::PersistedRelative,
@@ -839,14 +812,13 @@ mod tests {
         assert_eq!(all_add.add.as_ref().unwrap().commit_version, 2);
     }
 
-    /// A same-commit deletion-vector update (an `add` and a `remove` of the same path in one
-    /// commit) flows through the real log-replay pipeline as a paired action. Both modes surface it
-    /// identically: one grouped `{add, remove}` action at that commit, the add side carrying the
-    /// post-image DV and the remove side the pre-image DV. (The two modes only diverge for a
-    /// *cross-commit* update, covered by
-    /// `scan_file_listing_net_changes_collapses_a_cross_commit_update`.)
+    #[rstest::rstest]
+    #[case::all_changes(TableChangesListingMode::AllChanges)]
+    #[case::net_changes(TableChangesListingMode::NetChanges)]
     #[tokio::test]
-    async fn scan_file_listing_same_commit_dv_update_grouped_in_both_modes() {
+    async fn scan_file_listing_groups_same_commit_dv_update(
+        #[case] mode: TableChangesListingMode,
+    ) {
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
         let (dv1, dv2) = listing_test_dvs();
@@ -890,39 +862,23 @@ mod tests {
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let new_table_changes = || {
-            Arc::new(
-                TableChanges::try_new_row_tracking(table_root.clone(), engine.as_ref(), 1, Some(1))
-                    .unwrap(),
-            )
-        };
-
-        // Both modes group the same-commit DV update into one `{add, remove}` action at v1: the add
-        // side carries the post-image (dv2), the remove side the pre-image (dv1).
-        let assert_grouped = |listing: Vec<TableChangesFileAction>| {
-            assert_eq!(listing.len(), 1, "expected one grouped action: {listing:?}");
-            let update = &listing[0];
-            let add = update.add.as_ref().expect("add side");
-            let remove = update.remove.as_ref().expect("remove side");
-            assert_eq!(add.commit_version, 1);
-            assert_eq!(add.deletion_vector, Some(dv2.clone()));
-            assert_eq!(remove.commit_version, 1);
-            assert_eq!(remove.deletion_vector, Some(dv1.clone()));
-        };
-
-        let all: Vec<TableChangesFileAction> = new_table_changes()
-            .scan_file_listing(engine.clone(), TableChangesListingMode::AllChanges)
+        let table_changes = Arc::new(
+            TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 1, Some(1)).unwrap(),
+        );
+        let listing: Vec<TableChangesFileAction> = table_changes
+            .scan_file_listing(engine, mode)
             .unwrap()
             .try_collect()
             .unwrap();
-        assert_grouped(all);
 
-        let net: Vec<TableChangesFileAction> = new_table_changes()
-            .scan_file_listing(engine, TableChangesListingMode::NetChanges)
-            .unwrap()
-            .try_collect()
-            .unwrap();
-        assert_grouped(net);
+        assert_eq!(listing.len(), 1, "expected one grouped action: {listing:?}");
+        let update = &listing[0];
+        let add = update.add.as_ref().expect("add side");
+        let remove = update.remove.as_ref().expect("remove side");
+        assert_eq!(add.commit_version, 1);
+        assert_eq!(add.deletion_vector, Some(dv2));
+        assert_eq!(remove.commit_version, 1);
+        assert_eq!(remove.deletion_vector, Some(dv1));
     }
 
     #[tokio::test]
@@ -940,9 +896,9 @@ mod tests {
         let table_changes =
             TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 0, Some(0)).unwrap();
         let res = table_changes.into_scan_builder().build();
-        assert!(
-            matches!(res, Err(Error::Unsupported(_))),
-            "building a data scan from a row-tracking TableChanges must be unsupported, got {res:?}"
+        assert_result_error_with_message(
+            res,
+            "A row-tracking TableChanges cannot be scanned for data",
         );
     }
 

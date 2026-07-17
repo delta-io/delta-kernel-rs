@@ -109,11 +109,8 @@ impl TableChangesScanBuilder {
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
     pub fn build(self) -> DeltaResult<TableChangesScan> {
-        // The data-reading scan path always uses WriteTime semantics (it reads
-        // `_change_data` files and enforces strict schema equality). A read time
-        // `TableChanges` carries different semantics and is meant to be consumed via
-        // `TableChanges::scan_file_listing`, so reject it here rather than silently
-        // applying the wrong feed semantics.
+        // Read-time CDF requires row-level reconciliation by row IDs, which this
+        // scanner does not perform.
         if self.table_changes.mode != CdfMode::WriteTime {
             return Err(Error::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
