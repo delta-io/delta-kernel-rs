@@ -1859,6 +1859,12 @@ impl PrimitiveType {
         Ok(DecimalType::try_new(precision, scale)?.into())
     }
 
+    /// Returns whether this is one of the ANSI interval primitive types.
+    #[internal_api]
+    pub(crate) fn is_interval(&self) -> bool {
+        matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
+    }
+
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
     /// Widening rules:

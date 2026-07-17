@@ -288,17 +288,14 @@ fn validate_partition_columns(
             Error::generic(format!("Partition column '{col}' not found in schema"))
         })?;
 
-        if !matches!(field.data_type(), DataType::Primitive(_)) {
+        let DataType::Primitive(primitive_type) = field.data_type() else {
             return Err(Error::generic(format!(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
                 field.data_type()
             )));
-        }
-        if matches!(
-            field.data_type(),
-            &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME
-        ) {
+        };
+        if primitive_type.is_interval() {
             return Err(Error::generic(format!(
                 "Partition column '{col}' has unsupported interval type '{}'. \
                  Interval types are not supported for partition columns.",

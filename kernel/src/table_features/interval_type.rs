@@ -35,10 +35,10 @@ impl<'a> SchemaTransform<'a> for UsesIntervalType {
     transform_output_type!(|'a, T| Result<(), ()>);
 
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
-        match ptype {
-            PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => Err(()),
-            _ => Ok(()),
+        if ptype.is_interval() {
+            return Err(());
         }
+        Ok(())
     }
 }
 

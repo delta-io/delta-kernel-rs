@@ -600,8 +600,10 @@ fn collect_stats_with_null_count_only(
 }
 
 fn is_interval_type(data_type: &KernelDataType) -> bool {
-    data_type == &KernelDataType::INTERVAL_YEAR_MONTH
-        || data_type == &KernelDataType::INTERVAL_DAY_TIME
+    let KernelDataType::Primitive(primitive_type) = data_type else {
+        return false;
+    };
+    primitive_type.is_interval()
 }
 
 fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> Vec<ColumnName> {

@@ -83,10 +83,11 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
 - `interval-type-in-dev` -- ANSI interval type support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `intervalType-preview` reader-writer feature (auto-enabled
-  when a schema has an interval column; reads and writes of tables listing this feature are blocked
-  with the cargo feature off). Reads of legacy featureless interval tables (which never declare the
-  feature) are unaffected.
+  `KernelSupport::Supported` for the `intervalType-preview` reader-writer feature. CREATE TABLE
+  auto-enables the table feature when the schema contains an interval column. With the cargo
+  feature off, creating or writing any table with interval columns is blocked, as are reads and
+  writes of tables listing `intervalType-preview`. Reads of legacy featureless interval tables
+  (which never declare the table feature) remain supported.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
