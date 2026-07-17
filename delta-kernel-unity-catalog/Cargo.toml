@@ -37,3 +37,4 @@ unity-catalog-delta-rest-client = { path = "../unity-catalog-delta-rest-client",
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
 test_utils = { path = "../test-utils" }
 tempfile = "3"
+rstest = "0.23"
