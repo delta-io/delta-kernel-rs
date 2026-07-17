@@ -32,12 +32,13 @@ use delta_kernel::{Error, Snapshot, SnapshotRef};
 use rstest::rstest;
 use serde::Serialize;
 use serde_json::{json, Value};
+#[cfg(feature = "interval-type-in-dev")]
+use test_utils::create_table as create_test_table;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    add_commit, create_table as create_test_table, create_table_and_load_snapshot,
-    install_thread_local_metrics_reporter, test_table_setup_mt, write_batch_to_table,
-    CapturingReporter,
+    add_commit, create_table_and_load_snapshot, install_thread_local_metrics_reporter,
+    test_table_setup_mt, write_batch_to_table, CapturingReporter,
 };
 use url::Url;
 
