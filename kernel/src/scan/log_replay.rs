@@ -276,18 +276,17 @@ impl ScanLogReplayProcessor {
             partition_values_options.session_timezone.as_deref(),
         )?;
 
-        // A native checkpoint `partitionValues_parsed` column bakes offset-less TIMESTAMP values at
-        // the writer's zone (kernel resolves them as UTC on write), which a session-aware reader
-        // cannot recover from the frozen instant. So when the engine supplies a session zone AND
-        // the table has a TIMESTAMP partition column, bypass the frozen column and
-        // reconstruct partition values from the raw `partitionValues` string map, resolving
-        // them in the session zone. Every other partition type (date, int, string,
+        // A native checkpoint `partitionValues_parsed` column bakes a TIMESTAMP partition value at
+        // the writer's zone, which a reader cannot recover from the frozen instant. Trusting it
+        // would make a checkpoint read disagree with a JSON-commit read of the same table (which
+        // always reconstructs from the map). So whenever the table has a TIMESTAMP partition
+        // column, bypass the frozen column and reconstruct partition values from the raw
+        // `partitionValues` string map, resolving them in the session zone (or UTC when
+        // none is supplied). Every other partition type (date, int, string,
         // `TIMESTAMP_NTZ`) resolves identically regardless of zone, so those tables keep
-        // the native fast path even under a session zone.
-        let reparse_partition_values_from_map = should_reparse_partition_values_from_map(
-            partition_values_options.session_timezone.as_deref(),
-            partition_schema_for_transform.as_ref(),
-        );
+        // the native fast path.
+        let reparse_partition_values_from_map =
+            should_reparse_partition_values_from_map(partition_schema_for_transform.as_ref());
         let checkpoint_has_partition_values_parsed =
             has_partition_values_parsed && !reparse_partition_values_from_map;
 
@@ -745,18 +744,15 @@ fn partition_schema_has_zoned_timestamp(partition_schema: Option<&SchemaRef>) ->
 }
 
 /// Whether a native checkpoint's frozen `partitionValues_parsed` column must be bypassed and
-/// reconstructed from the raw `partitionValues` string map in the session zone.
+/// reconstructed from the raw `partitionValues` string map.
 ///
-/// True only when the engine supplies a session zone AND the table has a zoned `TIMESTAMP`
-/// partition column: those are the only values whose frozen instant (resolved at the writer's zone,
-/// discarded on write) disagrees with a session-aware read. With no zone, or with only
-/// zone-independent partition types (date, int, string, `TIMESTAMP_NTZ`), the frozen column is
-/// trusted and the native fast path is kept.
-fn should_reparse_partition_values_from_map(
-    session_timezone: Option<&str>,
-    partition_schema: Option<&SchemaRef>,
-) -> bool {
-    session_timezone.is_some() && partition_schema_has_zoned_timestamp(partition_schema)
+/// True whenever the table has a zoned `TIMESTAMP` partition column, zone supplied or not: its
+/// frozen instant was resolved at the writer's (discarded) zone, which a reader cannot recover, so
+/// trusting it would make a checkpoint read disagree with a JSON-commit read of the same table. The
+/// reconstruction resolves in the session zone when one is supplied, else UTC. Zone-independent
+/// partition types (date, int, string, `TIMESTAMP_NTZ`) keep the native fast path.
+fn should_reparse_partition_values_from_map(partition_schema: Option<&SchemaRef>) -> bool {
+    partition_schema_has_zoned_timestamp(partition_schema)
 }
 
 /// Stamps `session_timezone` onto each zoned `TIMESTAMP` field of `partition_schema` via
@@ -2048,49 +2044,30 @@ mod tests {
         assert!(!partition_schema_has_zoned_timestamp(None));
     }
 
-    /// The native-checkpoint reparse gate fires only on the AND of both conditions: a session zone
-    /// is supplied AND the table has a zoned `TIMESTAMP` partition column. Every other corner
-    /// keeps the frozen `partitionValues_parsed` fast path. Guards the `&&` from silently
-    /// widening to an OR (which would abandon the fast path whenever a zone is set) or
-    /// collapsing to either operand.
+    /// The native-checkpoint reparse gate fires whenever a `TIMESTAMP` partition column exists,
+    /// independent of any session zone: the frozen instant carries the writer's unrecoverable zone,
+    /// so it must always be reparsed from the raw map. Zone-independent types keep the fast path.
     #[rstest]
-    #[case::zone_and_timestamp(Some("America/New_York"), true, true)]
-    #[case::zone_but_no_timestamp(Some("America/New_York"), false, false)]
-    #[case::timestamp_but_no_zone(None, true, false)]
-    #[case::neither(None, false, false)]
-    fn reparse_gate_requires_both_zone_and_timestamp_column(
-        #[case] session_timezone: Option<&str>,
-        #[case] has_timestamp_partition: bool,
+    #[case::timestamp(DataType::TIMESTAMP, true)]
+    #[case::date(DataType::DATE, false)]
+    fn reparse_gate_fires_for_timestamp_partition_regardless_of_zone(
+        #[case] leaf: DataType,
         #[case] expected_reparse: bool,
     ) {
-        let ts_col = DataType::TIMESTAMP;
-        // A zone on a non-TIMESTAMP-partitioned table must not trigger reparse: DATE resolves
-        // identically in every zone, so the frozen column stays trustworthy.
-        let non_ts_col = DataType::DATE;
-        let leaf = if has_timestamp_partition {
-            ts_col
-        } else {
-            non_ts_col
-        };
         let partition_schema: SchemaRef =
             Arc::new(StructType::new_unchecked([StructField::nullable(
                 "p", leaf,
             )]));
-
         assert_eq!(
-            should_reparse_partition_values_from_map(session_timezone, Some(&partition_schema)),
+            should_reparse_partition_values_from_map(Some(&partition_schema)),
             expected_reparse,
         );
     }
 
-    /// A table with no partition schema at all never reparses, regardless of session zone.
+    /// A table with no partition schema at all never reparses.
     #[test]
     fn reparse_gate_false_without_partition_schema() {
-        assert!(!should_reparse_partition_values_from_map(
-            Some("America/New_York"),
-            None
-        ));
-        assert!(!should_reparse_partition_values_from_map(None, None));
+        assert!(!should_reparse_partition_values_from_map(None));
     }
 
     /// `annotate_partition_timezone` stamps the session zone only on `TIMESTAMP` leaves, leaving

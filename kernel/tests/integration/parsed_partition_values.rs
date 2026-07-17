@@ -648,6 +648,66 @@ async fn native_checkpoint_timestamp_partition_reparses_in_session_timezone() {
     );
 }
 
+/// Even with NO session zone, a native checkpoint's frozen `partitionValues_parsed` for a TIMESTAMP
+/// partition column is always bypassed and reparsed from the raw map (at UTC). The frozen instant
+/// carries the writer's unrecoverable zone, so trusting it would make a checkpoint read disagree
+/// with a JSON-commit read of the same table. This is the commit-vs-checkpoint consistency
+/// guarantee: reparse fires on the presence of a TIMESTAMP column, independent of any zone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_checkpoint_timestamp_partition_always_reparses_without_zone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("native-checkpoint-reparse-no-zone");
+    let url = write_foreign_partition_table(
+        &table_path,
+        ts_partition_fields(),
+        &["p_ts"],
+        write_stats_as_struct_config(),
+        &[add_action(
+            "p_ts=2024-01-15 16%3A00%3A00/f.parquet",
+            serde_json::json!({"p_ts": "2024-01-15 16:00:00"}),
+        )],
+    )
+    .await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+
+    checkpoint(engine.as_ref(), &url);
+
+    // No session zone supplied. The frozen native column must still be bypassed and the raw map
+    // reparsed at UTC: "2024-01-15 16:00:00" -> 16:00Z.
+    let utc_micros = 1_705_334_400_000_000_i64;
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+    let mut found = false;
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let (data, selection) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pv = get_column!(batch, "partitionValues_parsed", StructArray);
+        let p_ts = pv
+            .column_by_name("p_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            p_ts.value(0),
+            utc_micros,
+            "TIMESTAMP partition must reparse from the raw map even with no session zone"
+        );
+        found = true;
+    }
+    assert!(found, "expected one surviving file");
+}
+
 /// A session zone set on a table with no zoned `TIMESTAMP` partition column must NOT trigger the
 /// native-checkpoint reparse: a `DATE` partition value resolves identically in every zone, so the
 /// frozen `partitionValues_parsed` column stays trustworthy and the fast path is kept. The value a
