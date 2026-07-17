@@ -70,7 +70,6 @@ pub enum KernelError {
     CheckpointWriteError = 41,
     SchemaError = 42,
     LogHistoryError = 43,
-    SchemaNestingDepthExceededError = 44,
 }
 
 impl From<Error> for KernelError {
@@ -132,7 +131,6 @@ impl From<Error> for KernelError {
                 KernelError::LiteralExpressionTransformError
             }
             Error::Schema(_) => KernelError::SchemaError,
-            Error::SchemaNestingDepthExceeded(_) => KernelError::SchemaNestingDepthExceededError,
             Error::LogHistory(_) => KernelError::LogHistoryError,
             _ => KernelError::UnknownError,
         }
@@ -340,8 +338,7 @@ impl From<EngineExecError> for Error {
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
             | KernelError::LiteralExpressionTransformError
-            | KernelError::LogHistoryError
-            | KernelError::SchemaNestingDepthExceededError) => {
+            | KernelError::LogHistoryError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
             }
             #[cfg(feature = "default-engine-base")]
@@ -387,16 +384,5 @@ mod tests {
     ) {
         let err: Error = exec_error(etype, "boom").into();
         assert_eq!(err.to_string(), expected);
-    }
-
-    #[test]
-    fn schema_nesting_depth_error_maps_ffi_error_code() {
-        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
-        let error = Error::SchemaNestingDepthExceeded(source);
-
-        assert_eq!(
-            KernelError::from(error),
-            KernelError::SchemaNestingDepthExceededError
-        );
     }
 }

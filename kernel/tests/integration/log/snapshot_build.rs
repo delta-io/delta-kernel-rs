@@ -15,7 +15,8 @@ use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    add_commit, engine_store_setup, insert_data_with, test_table_setup_mt, TestCatalogCommitter,
+    add_commit, assert_result_error_with_message, engine_store_setup, insert_data_with,
+    test_table_setup_mt, TestCatalogCommitter,
 };
 
 /// The newest version of the table built by [`setup_multi_version_table`].
@@ -102,7 +103,7 @@ async fn setup_multi_version_table<E: TaskExecutor>(
 }
 
 #[tokio::test]
-async fn deeply_nested_schema_snapshot_load_returns_specific_error(
+async fn deeply_nested_schema_snapshot_load_returns_schema_error(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deeply_nested_schema = (0..42).fold(
         StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
@@ -128,10 +129,20 @@ async fn deeply_nested_schema_snapshot_load_returns_specific_error(
     .join("\n");
     add_commit(table_url.as_str(), store.as_ref(), 0, commit).await?;
 
-    assert!(matches!(
-        Snapshot::builder_for(table_url).build(&engine),
-        Err(Error::SchemaNestingDepthExceeded(_))
-    ));
+    let result = Snapshot::builder_for(table_url).build(&engine);
+    assert_result_error_with_message(
+        result.as_ref(),
+        concat!(
+            "Schema error: Table schema is too deeply nested: decoding ",
+            "metaData.schemaString exceeded serde_json's ",
+            "recursion limit: recursion limit exceeded"
+        ),
+    );
+    let error = match result.unwrap_err() {
+        Error::Backtraced { source, .. } => *source,
+        error => error,
+    };
+    assert!(matches!(error, Error::Schema(_)));
     Ok(())
 }
 

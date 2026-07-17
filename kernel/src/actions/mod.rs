@@ -27,7 +27,7 @@ use crate::{
 };
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERDE_JSON_RECURSION_LIMIT_EXCEEDED: &str = "recursion limit exceeded";
+const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
@@ -356,9 +356,13 @@ impl Metadata {
             if error.is_syntax()
                 && error
                     .to_string()
-                    .starts_with(SERDE_JSON_RECURSION_LIMIT_EXCEEDED)
+                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
             {
-                Error::SchemaNestingDepthExceeded(error)
+                Error::schema(format!(
+                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
+                     serde_json's recursion limit: {error}"
+                ))
+                .with_backtrace()
             } else {
                 error.into()
             }
@@ -1201,23 +1205,37 @@ mod tests {
         assert_eq!(schema, expected);
     }
 
-    #[test]
-    fn parse_schema_distinguishes_excessive_nesting_from_malformed_json() {
-        let deeply_nested_schema = (0..42).fold(
-            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
-            |schema, depth| {
-                StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
-            },
-        );
-        let deeply_nested_metadata = Metadata {
-            schema_string: serde_json::to_string(&deeply_nested_schema).unwrap(),
+    #[rstest]
+    #[case::supported(41, false)]
+    #[case::exceeded(42, true)]
+    fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
+        let metadata = Metadata {
+            schema_string: serde_json::to_string(&nested_schema(depth)).unwrap(),
             ..Default::default()
         };
-        assert!(matches!(
-            deeply_nested_metadata.parse_schema(),
-            Err(Error::SchemaNestingDepthExceeded(_))
-        ));
 
+        let result = metadata.parse_schema();
+        if exceeds_limit {
+            assert_result_error_with_message(
+                result.as_ref(),
+                concat!(
+                    "Schema error: Table schema is too deeply nested: decoding ",
+                    "metaData.schemaString exceeded serde_json's ",
+                    "recursion limit: recursion limit exceeded"
+                ),
+            );
+            let error = match result.unwrap_err() {
+                Error::Backtraced { source, .. } => *source,
+                error => error,
+            };
+            assert!(matches!(error, Error::Schema(_)));
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn parse_schema_malformed_json_returns_malformed_json() {
         let malformed_metadata = Metadata {
             schema_string: "{".to_string(),
             ..Default::default()
@@ -1230,6 +1248,15 @@ mod tests {
             error => error,
         };
         assert!(matches!(malformed_error, Error::MalformedJson(_)));
+    }
+
+    fn nested_schema(depth: usize) -> StructType {
+        (0..depth).fold(
+            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
+            |schema, depth| {
+                StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
+            },
+        )
     }
 
     #[test]

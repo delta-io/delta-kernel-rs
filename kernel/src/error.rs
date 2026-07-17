@@ -228,16 +228,9 @@ pub enum Error {
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
 
-    /// Schema mismatch has occurred or invalid schema used somewhere
+    /// Schema mismatch has occurred or invalid/not-kernel-supported schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
-
-    /// The table schema exceeds `serde_json`'s supported nesting depth.
-    ///
-    /// The Delta protocol does not define a schema nesting limit; this is a Delta Kernel
-    /// limitation inherited from `serde_json`.
-    #[error("Table schema nesting exceeds the supported depth: {0}")]
-    SchemaNestingDepthExceeded(#[source] serde_json::Error),
 
     /// Validation error for file statistics (e.g., missing required clustering column stats)
     #[error("Stats validation error: {0}")]
