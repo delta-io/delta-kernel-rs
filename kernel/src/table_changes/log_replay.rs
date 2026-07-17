@@ -245,8 +245,7 @@ impl LogReplayScanner {
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
-                // Compatibility uses logical fields; column mapping may assign different physical
-                // names.
+                // Compatibility is evaluated against the end version's logical schema.
                 require!(
                     mode.schemas_compatible(&schema, table_schema.as_ref()),
                     Error::change_data_feed_incompatible_schema_at_version(

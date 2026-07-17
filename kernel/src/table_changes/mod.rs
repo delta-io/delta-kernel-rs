@@ -111,8 +111,7 @@ impl CdfMode {
     /// Whether data written with `candidate` can be read using the change feed's `read_schema`.
     ///
     /// Write-time CDF requires exact equality. Read-time CDF accepts top-level field additions
-    /// while requiring common fields to retain their types without tightening nullability. Physical
-    /// names do not determine logical compatibility.
+    /// while requiring common fields to retain their types without tightening nullability.
     pub(crate) fn schemas_compatible(
         self,
         candidate: &StructType,
@@ -339,8 +338,7 @@ impl TableChanges {
         check_table_config(&end_snapshot)?;
 
         // Log replay validates only commits that contain metadata, so validate the range boundary
-        // separately. Compatibility uses logical schemas; column mapping may change physical
-        // names.
+        // separately. Compatibility is evaluated against the logical schemas.
         let start_schema = start_snapshot.schema();
         let end_schema = end_snapshot.schema();
         if !mode.schemas_compatible(start_schema.as_ref(), end_schema.as_ref()) {
