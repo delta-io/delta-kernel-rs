@@ -73,49 +73,21 @@ with `free_commit_action`.
 
 ## Incremental Scan Flow
 
-An incremental scan streams the file-action diff between a base version and a target snapshot,
-letting an engine advance a cached file listing without a full log replay
+An incremental scan streams the file-action diff between a base version and a target snapshot
 (`ffi/src/incremental_scan.rs`):
 
 ```
 snapshot_incremental_scan_builder(snapshot, base_version, engine)
   -> incremental_scan_builder_with_predicate(builder, engine, predicate)  // optional; prunes live Adds
   -> incremental_scan_builder_build(builder)      // -> OptionalValue<stream>; None => full-scan fallback
+  -> incremental_scan_stream_next_arrow(stream)*  // optional: pull live-Add batches as Arrow
+  -> incremental_scan_stream_into_summary(stream) // live-Add / Remove key sets; consumes the stream
 ```
 
-The stream is then drained by exactly one of two terminal consumers (not both in sequence):
-- `incremental_scan_stream_next_arrow(stream)` — pull live-Add batches as Arrow, newest-first
-- `incremental_scan_stream_into_summary(stream)` — recover the live-Add / Remove key sets;
-  also drains any batches `next_arrow` left behind, then consumes the stream
-
-`incremental_scan_builder_build` returns `OptionalValue::None` (not an error) when the target
-snapshot's commit list can't cover `(base_version, target_version]`, which is the signal to fall
-back to a full scan. The builder is always consumed by `build`; discard it early with
-`free_incremental_scan_builder`.
-
-Pass-through fields decoded from a batch (`stats`, `partitionValues`, `baseRowId`) must be
-interpreted against the protocol at each row's own commit version, not the target snapshot:
-in-range protocol/metadata changes (e.g. a `columnMapping` flip) are not yet surfaced (kernel
-issue #2552). If a `next_arrow` call returns an error, its batch's keys were already folded into
-the summary, so `summary.live_adds` may name files whose Arrow rows were never delivered; treat
-the summary as authoritative and re-fetch dropped rows, or rebuild the stream.
-
-`incremental_scan_builder_with_predicate` takes an `EnginePredicate` (same shape used by `scan`)
-and prunes streamed live Adds by their file stats, the same data-skipping the read path applies.
-It consumes and returns the builder handle. Removes are never pruned, and skipping is
-conservative, so the engine must still re-apply the predicate at read time.
-
-Read the diff via `incremental_scan_summary_base_version` / `_target_version` and the
-`incremental_scan_summary_visit_live_adds` / `_visit_removes` callbacks (each key is a `(path,
-dv_unique_id)` pair; `dv_unique_id` is a zero-length slice when absent). Release handles with
-`free_incremental_scan_stream`, `free_incremental_scan_summary`, and each Arrow batch with
-`free_filtered_engine_data_arrow_result`.
-
-To advance a cached listing, evict base entries whose key is in `removes` OR is re-added by the
-range. OPTIMIZE / clustering re-tags a file under the same `(path, dv_unique_id)` key, so it
-lands in `live_adds` but not `removes`; masking with `removes` alone leaves a stale row. The
-full mask is `removes` unioned with the base keys also present in `live_adds`. The Rust API
-computes this via `into_summary_against_base_*`, which the FFI does not yet expose.
+The module-level docs in `incremental_scan.rs` are the source of truth for the error contract
+(any `next_arrow` error kills the stream), the `OptionalValue::None` full-scan-fallback signal,
+the pass-through-field version caveat (kernel issue #2552), and handle release. The Arrow batch
+reuses `ScanMetadataArrowResult` with null `transforms`.
 
 ## Write Flow
 

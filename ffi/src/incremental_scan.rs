@@ -1,8 +1,7 @@
 //! FFI bindings for the incremental scan API.
 //!
 //! An incremental scan streams the file-action diff between a base version and a target
-//! [`SharedSnapshot`], letting an engine advance a cached file listing without a full log replay.
-//! The flow mirrors the Rust API:
+//! [`SharedSnapshot`]. The flow mirrors the Rust API:
 //!
 //! ```text
 //! snapshot_incremental_scan_builder(snapshot, base_version, engine)
@@ -10,18 +9,20 @@
 //!   -> incremental_scan_builder_build(builder)   // -> OptionalValue<stream>; None => full-scan fallback
 //! ```
 //!
-//! The stream is then drained by exactly one of two terminal consumers:
-//! [`incremental_scan_stream_next_arrow`] (pull filtered Add batches as Arrow, newest-first) or
-//! [`incremental_scan_stream_into_summary`] (recover the live-Add and Remove key sets;
-//! `into_summary` also drains any batches `next_arrow` left behind).
+//! Pull the diff's live-Add batches as Arrow with repeated
+//! [`incremental_scan_stream_next_arrow`] calls (newest-commit first), then consume the stream
+//! with [`incremental_scan_stream_into_summary`] to recover the live-Add and Remove key sets.
+//! `into_summary` is the terminal consumer: it drains any batches `next_arrow` left behind, then
+//! frees the stream. Any error from `next_arrow` kills the stream, so a later `next_arrow` or
+//! `into_summary` call fails; rebuild the stream to retry.
 //!
 //! [`incremental_scan_builder_build`] returns [`OptionalValue::None`] (not an error) when the
 //! target snapshot's commit list can't cover the range, which is the signal to fall back to a
 //! full scan.
 //!
-//! The Arrow batch step (`incremental_scan_stream_next_arrow` and
-//! [`FilteredEngineDataArrowResult`]) requires the `default-engine-base` feature; the builder,
-//! summary, and visitor entry points are always available.
+//! The Arrow batch step (`incremental_scan_stream_next_arrow`, which reuses
+//! [`crate::scan::ScanMetadataArrowResult`]) requires the `default-engine-base` feature; the
+//! builder, summary, and visitor entry points are always available.
 //!
 //! Pass-through fields decoded from a batch (`stats`, `partitionValues`, `baseRowId`) must be
 //! interpreted against the protocol at that row's own commit version, not against the target
@@ -44,7 +45,7 @@ use crate::engine_data::ArrowFFIData;
 use crate::handle::Handle;
 use crate::scan::{decode_engine_predicate, EnginePredicate};
 #[cfg(feature = "default-engine-base")]
-use crate::KernelBoolSlice;
+use crate::scan::{CTransforms, ScanMetadataArrowResult};
 use crate::{
     kernel_string_slice, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
     NullableCvoid, OptionalValue, SharedExternEngine, SharedSnapshot,
@@ -204,19 +205,15 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 
 /// Get the next live-Add batch from the stream as Arrow via the C Data Interface.
 ///
-/// Returns `Ok(non-null)` with the next [`FilteredEngineDataArrowResult`] (an Arrow batch paired
-/// with a boolean selection vector), `Ok(null)` when the stream is exhausted, or `Err` on a read
-/// failure. Only rows selected by the vector are live Adds; batches are yielded newest-commit
-/// first. The engine must free each non-null result with
-/// [`free_filtered_engine_data_arrow_result`].
+/// Returns `Ok(non-null)` with the next [`ScanMetadataArrowResult`] (an Arrow batch paired with a
+/// boolean selection vector; its `transforms` are always null, as an incremental scan never
+/// rewrites rows), `Ok(null)` when the stream is exhausted, or `Err` on failure. Only rows
+/// selected by the vector are live Adds; batches are yielded newest-commit first. The engine must
+/// free each non-null result with [`crate::scan::free_scan_metadata_arrow_result`].
 ///
-/// A read failure from the underlying commit stream kills it: later calls return `Ok(null)` and
-/// [`incremental_scan_stream_into_summary`] will error, so rebuild the stream to retry. A failure
-/// converting a successfully-read batch to Arrow is non-terminal; the errored batch's rows are
-/// dropped and the stream can still be advanced. That batch's file keys were already folded into
-/// the summary before conversion, so after any `Err` from this function the summary's `live_adds`
-/// can name files whose Arrow rows were never delivered. Treat the summary as the authoritative
-/// key set and re-fetch the dropped rows out of band, or rebuild the stream.
+/// Any error kills the stream: later [`incremental_scan_stream_next_arrow`] and
+/// [`incremental_scan_stream_into_summary`] calls both fail, so no partial summary is exposed after
+/// a failure. Rebuild the stream to retry.
 ///
 /// Decode pass-through fields against each row's own commit protocol, not the target snapshot;
 /// see the module-level note on <https://github.com/delta-io/delta-kernel-rs/issues/2552>.
@@ -228,7 +225,7 @@ pub unsafe extern "C" fn free_incremental_scan_builder(
 #[no_mangle]
 pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
     stream: Handle<SharedIncrementalScanStream>,
-) -> ExternResult<*mut FilteredEngineDataArrowResult> {
+) -> ExternResult<*mut ScanMetadataArrowResult> {
     let stream = unsafe { stream.as_ref() };
     incremental_scan_stream_next_arrow_impl(stream).into_extern_result(&stream.engine.as_ref())
 }
@@ -236,26 +233,38 @@ pub unsafe extern "C" fn incremental_scan_stream_next_arrow(
 #[cfg(feature = "default-engine-base")]
 fn incremental_scan_stream_next_arrow_impl(
     stream: &FfiIncrementalScanStream,
-) -> DeltaResult<*mut FilteredEngineDataArrowResult> {
+) -> DeltaResult<*mut ScanMetadataArrowResult> {
     let mut guard = lock_stream(stream)?;
     let Some(inner) = guard.as_mut() else {
-        // The stream was already consumed by `into_summary`.
+        // The stream was already consumed by `into_summary` or dropped by a prior error.
         return Err(Error::generic(
             "incremental scan stream was already consumed",
         ));
     };
-    match inner.next().transpose()? {
-        Some(filtered) => {
-            let (engine_data, selection_vector) = filtered.into_parts();
-            let arrow_data = ArrowFFIData::try_from_engine_data(engine_data)?;
-            let result = Box::new(FilteredEngineDataArrowResult {
-                arrow_data,
-                selection_vector: selection_vector.into(),
-            });
-            Ok(Box::into_raw(result))
-        }
-        None => Ok(std::ptr::null_mut()),
+    let result = next_arrow_batch(inner);
+    // Kill the stream on any error so a later next_arrow / into_summary can't return a partial
+    // result; the caller must rebuild to retry.
+    if result.is_err() {
+        guard.take();
     }
+    result
+}
+
+#[cfg(feature = "default-engine-base")]
+fn next_arrow_batch(
+    stream: &mut IncrementalScanStream,
+) -> DeltaResult<*mut ScanMetadataArrowResult> {
+    let Some(filtered) = stream.next().transpose()? else {
+        return Ok(std::ptr::null_mut());
+    };
+    let (engine_data, selection_vector) = filtered.into_parts();
+    let arrow_data = ArrowFFIData::try_from_engine_data(engine_data)?;
+    let result = Box::new(ScanMetadataArrowResult {
+        arrow_data,
+        selection_vector: selection_vector.into(),
+        transforms: Box::into_raw(Box::new(CTransforms::empty())),
+    });
+    Ok(Box::into_raw(result))
 }
 
 /// Drain any unread batches, then consume the stream and return its summary of live Add and
@@ -265,12 +274,9 @@ fn incremental_scan_stream_next_arrow_impl(
 /// succeeds. Returns an error if a prior [`incremental_scan_stream_next_arrow`] call errored, or
 /// if draining the remaining batches fails.
 ///
-/// To advance a cached listing with the result, evict every base entry whose key is in
-/// `removes` OR is re-added by the range. A file that OPTIMIZE or clustering re-tags keeps its
-/// `(path, dv_unique_id)` key, so it appears in `live_adds` but not `removes`. Masking the base
-/// with `removes` alone leaves that file's stale row pointing at a data file that's no longer
-/// current. The full eviction mask is `removes` unioned with the intersection of your base and
-/// `live_adds` (visit `live_adds` and keep the keys your base already holds).
+/// `live_adds` are the file keys still present at the target version; `removes` are those removed
+/// within the range. A file re-tagged in place (e.g. by OPTIMIZE or clustering) keeps its `(path,
+/// dv_unique_id)` key, so it appears in `live_adds` but not `removes`.
 ///
 /// # Safety
 ///
@@ -279,11 +285,9 @@ fn incremental_scan_stream_next_arrow_impl(
 pub unsafe extern "C" fn incremental_scan_stream_into_summary(
     stream: Handle<SharedIncrementalScanStream>,
 ) -> ExternResult<Handle<SharedIncrementalScanSummary>> {
-    let inner_stream = unsafe { stream.as_ref() };
+    let inner_stream = unsafe { stream.into_inner() };
     let engine = inner_stream.engine.clone();
-    let result = incremental_scan_stream_into_summary_impl(inner_stream);
-    stream.drop_handle();
-    result.into_extern_result(&engine.as_ref())
+    incremental_scan_stream_into_summary_impl(&inner_stream).into_extern_result(&engine.as_ref())
 }
 
 fn incremental_scan_stream_into_summary_impl(
@@ -332,10 +336,9 @@ pub unsafe extern "C" fn incremental_scan_summary_target_version(
 /// Visit each live-Add file key in the summary, invoking `callback` once per key with its path
 /// and (nullable) deletion-vector unique id.
 ///
-/// A live Add is a file still present at the target version. Match on the whole `(path,
-/// dv_unique_id)` key, not the path alone: the same path with different DV ids refers to
-/// distinct logical files. `dv_unique_id` is passed as a zero-length slice when the file has no
-/// deletion vector.
+/// Match on the whole `(path, dv_unique_id)` key, not the path alone: the same path with different
+/// DV ids refers to distinct logical files. `dv_unique_id` is passed as a zero-length slice when
+/// the file has no deletion vector.
 ///
 /// The slices passed to the callback are only valid for the duration of the callback.
 ///
@@ -418,50 +421,6 @@ pub unsafe extern "C" fn free_incremental_scan_summary(
     summary.drop_handle();
 }
 
-/// Result of [`incremental_scan_stream_next_arrow`]: an Arrow C Data Interface batch of commit
-/// actions plus a boolean selection vector marking the live Adds within it.
-///
-/// The engine must free this with [`free_filtered_engine_data_arrow_result`] exactly once.
-///
-/// This mirrors [`crate::scan::ScanMetadataArrowResult`] minus its per-row transforms (the
-/// incremental scan produces none). Keep the release sequence in sync with that type's.
-#[cfg(feature = "default-engine-base")]
-#[repr(C)]
-pub struct FilteredEngineDataArrowResult {
-    /// Arrow C Data Interface batch for one source commit, projecting the `add` and `remove`
-    /// action columns. Rows include Removes and Adds cancelled by a later commit in the range,
-    /// so honor `selection_vector`: only its `true` rows are live Adds.
-    pub arrow_data: ArrowFFIData,
-    /// Boolean selection vector; `true` at index `i` means row `i` is a live Add. Length equals
-    /// the batch row count.
-    pub selection_vector: KernelBoolSlice,
-}
-
-/// Free a [`FilteredEngineDataArrowResult`] returned by [`incremental_scan_stream_next_arrow`].
-///
-/// # Safety
-///
-/// `result` must be a pointer returned by [`incremental_scan_stream_next_arrow`], or null. Must
-/// be called at most once per result.
-#[cfg(feature = "default-engine-base")]
-#[no_mangle]
-pub unsafe extern "C" fn free_filtered_engine_data_arrow_result(
-    result: *mut FilteredEngineDataArrowResult,
-) {
-    if result.is_null() {
-        return;
-    }
-    let FilteredEngineDataArrowResult {
-        arrow_data,
-        selection_vector,
-    } = unsafe { *Box::from_raw(result) };
-    // KernelBoolSlice is a leaked Vec<bool>; reconstitute and drop to free.
-    let _ = unsafe { selection_vector.into_vec() };
-    // ArrowFFIData's FFI structs release themselves on drop; a no-op if the consumer already
-    // imported the data.
-    drop(arrow_data);
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -479,8 +438,10 @@ mod tests {
         KernelExpressionVisitorState,
     };
     use crate::ffi_test_utils::{
-        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+        allocate_err, assert_extern_result_error_with_message, ok_or_panic, recover_error,
     };
+    #[cfg(feature = "default-engine-base")]
+    use crate::scan::free_scan_metadata_arrow_result;
     use crate::{
         engine_to_handle, free_engine, free_snapshot, get_snapshot_builder, kernel_string_slice,
         snapshot_builder_build, snapshot_builder_set_version, NullableCvoid, TryFromStringSlice,
@@ -662,7 +623,7 @@ mod tests {
                 break;
             }
             batches += 1;
-            unsafe { free_filtered_engine_data_arrow_result(ptr) };
+            unsafe { free_scan_metadata_arrow_result(ptr) };
         }
         assert_eq!(batches, 2, "one live-Add batch per commit");
 
@@ -776,6 +737,37 @@ mod tests {
         Ok(())
     }
 
+    // A malformed `deletionVector` makes the kernel stream yield an error when the batch is
+    // processed. The first `next_arrow` surfaces it, and the error kills the stream: a second
+    // `next_arrow` and a following `into_summary` both fail rather than exposing a partial summary.
+    #[cfg(feature = "default-engine-base")]
+    #[tokio::test]
+    async fn next_arrow_error_kills_stream() -> Result<(), Box<dyn std::error::Error>> {
+        // A DV with `storageType` set but `pathOrInlineDv` null fails the required-field read
+        // when the stream extracts the file key.
+        let bad_dv = "{\"add\":{\"path\":\"X.parquet\",\"partitionValues\":{},\"size\":100,\"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":null,\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":null,\"offset\":1,\"sizeInBytes\":10,\"cardinality\":1}}}";
+        let (engine, snapshot) = setup_raw(vec![bad_dv.to_string()]).await;
+
+        let stream = build_stream(&snapshot, &engine, 0);
+
+        // The first call surfaces the read error; later calls hit the taken-Option guard and report
+        // GenericError. Either way, no partial result leaks through.
+        let first = unsafe { incremental_scan_stream_next_arrow(stream.shallow_copy()) };
+        let ExternResult::Err(e) = first else {
+            panic!("malformed DV must error");
+        };
+        drop(unsafe { recover_error(e) });
+
+        let again = unsafe { incremental_scan_stream_next_arrow(stream.shallow_copy()) };
+        assert_extern_result_error_with_message(again, KernelError::GenericError, None);
+        let summary = unsafe { incremental_scan_stream_into_summary(stream) };
+        assert_extern_result_error_with_message(summary, KernelError::GenericError, None);
+
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
     // Abandoning a never-drained stream must free the retained engine Arc and undrained kernel
     // stream without leak or panic (the symmetric counterpart to free_builder_without_building).
     #[tokio::test]
@@ -806,7 +798,7 @@ mod tests {
         // Read exactly one batch, leaving the other for into_summary to drain.
         let ptr = unsafe { ok_or_panic(incremental_scan_stream_next_arrow(stream.shallow_copy())) };
         assert!(!ptr.is_null());
-        unsafe { free_filtered_engine_data_arrow_result(ptr) };
+        unsafe { free_scan_metadata_arrow_result(ptr) };
 
         let summary = unsafe { ok_or_panic(incremental_scan_stream_into_summary(stream)) };
         let mut live_adds: Vec<_> = visit_live_adds(&summary)
@@ -993,10 +985,14 @@ mod tests {
 
         let ptr = unsafe { ok_or_panic(incremental_scan_stream_next_arrow(stream.shallow_copy())) };
         assert!(!ptr.is_null(), "expected one batch for the single commit");
-        let FilteredEngineDataArrowResult {
+        let ScanMetadataArrowResult {
             arrow_data,
             selection_vector,
+            transforms,
         } = unsafe { *Box::from_raw(ptr) };
+        // Incremental scan never rewrites rows, but the transforms box is always allocated.
+        assert!(!transforms.is_null());
+        drop(unsafe { Box::from_raw(transforms) });
         let array_data = unsafe { from_ffi(arrow_data.array, &arrow_data.schema) }?;
         let batch: RecordBatch = StructArray::from(array_data).into();
         let sv = unsafe { selection_vector.into_vec() };

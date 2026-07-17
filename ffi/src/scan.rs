@@ -586,6 +586,17 @@ pub struct CTransforms {
     transforms: Vec<Option<ExpressionRef>>,
 }
 
+impl CTransforms {
+    /// A [`CTransforms`] carrying no per-row transforms, so [`get_transform_for_row`] returns
+    /// `NULL` for every row. Used by scan paths (e.g. incremental scan) that never rewrite rows.
+    #[cfg(feature = "default-engine-base")]
+    pub(crate) fn empty() -> Self {
+        Self {
+            transforms: Vec::new(),
+        }
+    }
+}
+
 #[no_mangle]
 /// Allow getting the transform for a particular row. If the requested row is outside the range of
 /// the passed `CTransforms` returns `NULL`, otherwise returns the element at the index of the
