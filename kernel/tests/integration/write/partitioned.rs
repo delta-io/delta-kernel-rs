@@ -15,6 +15,9 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
@@ -22,7 +25,8 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::Snapshot;
 use rstest::rstest;
 use test_utils::{
-    begin_transaction, get_column, read_scan, test_table_setup_mt, write_batch_to_table,
+    begin_transaction, create_table as create_test_table, get_column, read_scan,
+    test_table_setup_mt, write_batch_to_table,
 };
 use url::Url;
 
@@ -132,20 +136,17 @@ async fn test_write_partitioned_normal_values_roundtrip(
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
-    Arc::new(Int32Array::from(vec![30])) as ArrayRef,
     Scalar::IntervalYearMonth(30),
     "INTERVAL '2-6' YEAR TO MONTH"
 )]
 #[case::day_time(
     DataType::INTERVAL_DAY_TIME,
-    Arc::new(Int64Array::from(vec![131_445_000_000i64])) as ArrayRef,
     Scalar::IntervalDayTime(131_445_000_000),
     "INTERVAL '1 12:30:45' DAY TO SECOND"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_partitioned_interval_roundtrip(
     #[case] interval: DataType,
-    #[case] partition_arrow_column: ArrayRef,
     #[case] partition_value: Scalar,
     #[case] expected_partition_value: &str,
     #[values(
@@ -159,14 +160,19 @@ async fn test_write_partitioned_interval_roundtrip(
         StructField::nullable("value", DataType::INTEGER),
         StructField::nullable("period", interval),
     ])?);
-    // Full logical-schema columns; the partition column's data is dropped by the logical->physical
-    // transform, and its value comes from `partition_values`.
-    let (_tmp_dir, table_path, snapshot, engine) = setup_and_write(
-        schema,
-        &["period"],
-        cm_mode,
-        true, // write_partition_values_parsed
-        vec![Arc::new(Int32Array::from(vec![7])), partition_arrow_column],
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_interval_partitioned_table(&table_path, engine.as_ref(), schema, cm_mode, false)
+            .await?;
+    let data_schema = StructType::try_new([StructField::nullable("value", DataType::INTEGER)])?;
+    let batch = RecordBatch::try_new(
+        Arc::new((&data_schema).try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![7]))],
+    )?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        batch,
         HashMap::from([("period".to_string(), partition_value.clone())]),
     )
     .await?;
@@ -182,7 +188,7 @@ async fn test_write_partitioned_interval_roundtrip(
     }
 
     // The partition value round-trips: scan materializes `period` back as its physical integer.
-    let sorted = read_sorted(&snapshot, engine)?;
+    let sorted = read_sorted(&snapshot, engine as Arc<dyn delta_kernel::Engine>)?;
     assert_eq!(
         get_column!(&sorted, "value", Int32Array).value(0),
         7,
@@ -225,15 +231,9 @@ async fn test_materialized_partitioned_interval_roundtrip(
     ])?);
 
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let _ = create_table(&table_path, schema, "test/1.0")
-        .with_data_layout(DataLayout::partitioned(["period"]))
-        .with_table_properties([
-            ("delta.feature.materializePartitionColumns", "supported"),
-            ("delta.columnMapping.mode", cm_mode_str(cm_mode)),
-        ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let snapshot =
+        create_interval_partitioned_table(&table_path, engine.as_ref(), schema, cm_mode, true)
+            .await?;
 
     let data_schema = StructType::try_new(vec![StructField::nullable("value", DataType::INTEGER)])?;
     let batch = RecordBatch::try_new(
@@ -772,6 +772,52 @@ fn cm_mode_str(mode: ColumnMappingMode) -> &'static str {
         ColumnMappingMode::Id => "id",
         ColumnMappingMode::Name => "name",
     }
+}
+
+#[cfg(feature = "interval-type-in-dev")]
+async fn create_interval_partitioned_table(
+    table_path: &str,
+    engine: &dyn delta_kernel::Engine,
+    schema: Arc<StructType>,
+    cm_mode: ColumnMappingMode,
+    materialize_partition_columns: bool,
+) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    let mut reader_features = vec!["intervalType-preview"];
+    let mut writer_features = vec!["intervalType-preview"];
+    if materialize_partition_columns {
+        writer_features.push("materializePartitionColumns");
+    }
+    if cm_mode != ColumnMappingMode::None {
+        reader_features.push("columnMapping");
+        writer_features.push("columnMapping");
+    }
+    create_test_table(
+        Arc::clone(&store),
+        table_url.clone(),
+        schema,
+        &["period"],
+        true,
+        reader_features,
+        writer_features,
+    )
+    .await?;
+    if cm_mode == ColumnMappingMode::Id {
+        let commit_url = table_url.join("_delta_log/00000000000000000000.json")?;
+        let commit_path = Path::from_url_path(commit_url.path())?;
+        let commit = String::from_utf8(store.get(&commit_path).await?.bytes().await?.to_vec())?;
+        let updated = commit.replace(
+            r#""delta.columnMapping.mode":"name""#,
+            r#""delta.columnMapping.mode":"id""#,
+        );
+        if updated == commit {
+            return Err("column mapping mode was not present in the test table commit".into());
+        }
+        store.put(&commit_path, updated.into()).await?;
+    }
+    Ok(Snapshot::builder_for(table_path).build(engine)?)
 }
 
 fn create_partitioned_table(
