@@ -402,9 +402,14 @@ async fn empty_string_partition_pruning(#[values(false, true)] native_checkpoint
 // end-to-end counterpart to the unit tests in `evaluate_expression`.
 
 /// Writes a `p_ts`-TIMESTAMP-partition foreign table, one `add` per `(path, raw_ts)`, and returns
-/// its URL. `writeStatsAsStruct=false` so the JSON commit reconstructs `partitionValues_parsed`
-/// from the string map on read (the tz-aware path).
-async fn write_ts_partition_table(table_path: &std::path::Path, files: &[(&str, &str)]) -> Url {
+/// its URL. With `write_stats_as_struct = false` a JSON commit reconstructs
+/// `partitionValues_parsed` from the string map on read; with `true` a later kernel checkpoint
+/// writes a native `partitionValues_parsed` column, exercising the reparse-vs-passthrough branch.
+async fn write_ts_partition_table(
+    table_path: &std::path::Path,
+    files: &[(&str, &str)],
+    write_stats_as_struct: bool,
+) -> Url {
     std::fs::create_dir_all(table_path).unwrap();
     let url = Url::from_directory_path(table_path).unwrap();
     let table_root = url.to_string();
@@ -418,6 +423,11 @@ async fn write_ts_partition_table(table_path: &std::path::Path, files: &[(&str, 
         ],
     })
     .to_string();
+    let configuration = if write_stats_as_struct {
+        serde_json::json!({"delta.checkpoint.writeStatsAsStruct": "true"})
+    } else {
+        serde_json::json!({})
+    };
     let protocol = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     let metadata = serde_json::json!({
         "metaData": {
@@ -425,7 +435,7 @@ async fn write_ts_partition_table(table_path: &std::path::Path, files: &[(&str, 
             "format": {"provider": "parquet", "options": {}},
             "schemaString": schema_string,
             "partitionColumns": ["p_ts"],
-            "configuration": {},
+            "configuration": configuration,
             "createdTime": 1700000000000_i64,
         },
     })
@@ -499,7 +509,8 @@ async fn engine_session_timezone_resolves_offset_less_timestamp_partition(
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let table_path = temp_dir.path().join("engine-tz-offset-less");
-    let url = write_ts_partition_table(&table_path, &[("f.parquet", "2024-01-15 16:00:00")]).await;
+    let url =
+        write_ts_partition_table(&table_path, &[("f.parquet", "2024-01-15 16:00:00")], false).await;
     let engine = zoned_engine(&url, session_tz);
 
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
@@ -550,6 +561,7 @@ async fn engine_session_timezone_prunes_offset_less_timestamp_partition() {
             ("a.parquet", "2024-01-15 16:00:00"),
             ("b.parquet", "2024-01-15 17:00:00"),
         ],
+        false,
     )
     .await;
     let engine = zoned_engine(&url, Some("America/New_York"));
@@ -578,4 +590,64 @@ async fn engine_session_timezone_prunes_offset_less_timestamp_partition() {
         vec!["a.parquet".to_string()],
         "only the file whose session-zone instant equals the predicate survives"
     );
+}
+
+/// A native checkpoint's frozen `partitionValues_parsed` for a TIMESTAMP partition column is always
+/// bypassed and reparsed from the raw map, even with NO session zone. A foreign writer froze
+/// `2024-01-15 16:00:00` at some non-UTC instant, but a zoneless kernel read must reconstruct it
+/// from the raw string at UTC (16:00Z), proving the frozen column was not trusted. This is the
+/// commit-vs-checkpoint consistency guarantee: the same table reads identically before and after a
+/// checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_checkpoint_timestamp_partition_always_reparses_without_zone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table_path = temp_dir.path().join("forced-reparse-no-zone");
+    // `writeStatsAsStruct=true` so the kernel checkpoint writes a native `partitionValues_parsed`
+    // column, exercising the reparse-vs-passthrough branch.
+    let url =
+        write_ts_partition_table(&table_path, &[("f.parquet", "2024-01-15 16:00:00")], true).await;
+    let engine = create_default_engine_mt_executor(&url).unwrap();
+
+    // Force a checkpoint so the read sees a native frozen column, not a JSON commit.
+    Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap()
+        .checkpoint(engine.as_ref(), None)
+        .unwrap();
+
+    // Zoneless engine (no session timezone). The frozen column must still be bypassed and the raw
+    // map reparsed at UTC: "2024-01-15 16:00:00" -> 16:00Z.
+    let utc_micros = 1_705_334_400_000_000_i64;
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+
+    let mut found = false;
+    for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        let (data, selection) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data).unwrap().into();
+        let batch = filter_record_batch(&batch, &BooleanArray::from(selection)).unwrap();
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pv = get_column!(batch, "partitionValues_parsed", StructArray);
+        let p_ts = pv
+            .column_by_name("p_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            p_ts.value(0),
+            utc_micros,
+            "TIMESTAMP partition must reparse from the raw map even with no session zone"
+        );
+        found = true;
+    }
+    assert!(found, "expected one surviving file");
 }

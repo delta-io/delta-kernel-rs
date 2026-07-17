@@ -24,8 +24,8 @@ use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::scan::Scalar;
 use crate::schema::{
-    schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, StructType, ToSchema as _,
+    schema_ref, ColumnNamesAndTypes, DataType, MapType, PrimitiveType, SchemaRef,
+    SchemaStructPatchBuilder, StructField, StructType, ToSchema as _,
 };
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, FoldWithOption as _};
@@ -269,6 +269,16 @@ impl ScanLogReplayProcessor {
             partition_schema_for_transform.clone(),
         )?;
 
+        // A native checkpoint `partitionValues_parsed` column bakes a `TIMESTAMP` partition value
+        // at the writer's zone, which a reader cannot recover from the frozen instant.
+        // Trusting it would make a checkpoint read disagree with a JSON-commit read of the
+        // same table. So when a `TIMESTAMP` partition column exists, bypass the frozen
+        // column and reconstruct partition values from the raw `partitionValues` string
+        // map. Every other partition type is zone-independent and keeps the native fast
+        // path.
+        let checkpoint_has_partition_values_parsed = has_partition_values_parsed
+            && !should_reparse_partition_values_from_map(partition_schema_for_transform.as_ref());
+
         // Create data skipping filter that reads stats_parsed and partitionValues_parsed
         // from the transformed batch. This avoids double JSON parsing -- the transform parses
         // JSON once, then data skipping reads the already-parsed columns from the output.
@@ -319,7 +329,7 @@ impl ScanLogReplayProcessor {
                     skip_stats,
                     synthesize_json,
                     partition_schema_for_transform,
-                    has_partition_values_parsed,
+                    checkpoint_has_partition_values_parsed,
                 ),
                 output_schema.into(),
             )?,
@@ -698,6 +708,29 @@ fn scan_row_schema_with_parsed_columns(
     Ok(Arc::new(patch.build(&SCAN_ROW_SCHEMA)?))
 }
 
+/// Whether `partition_schema` has a `TIMESTAMP` column. Partition columns are flat primitives, so
+/// only top-level leaves are inspected.
+fn partition_schema_has_timestamp(partition_schema: Option<&SchemaRef>) -> bool {
+    partition_schema.is_some_and(|schema| {
+        schema
+            .fields()
+            .any(|field| field.data_type() == &DataType::Primitive(PrimitiveType::Timestamp))
+    })
+}
+
+/// Whether a native checkpoint's frozen `partitionValues_parsed` column must be bypassed and
+/// reconstructed from the raw `partitionValues` string map.
+///
+/// A `TIMESTAMP` partition value is serialized without a zone, so its frozen instant was resolved
+/// in the writer's zone, which a reader cannot recover. Trusting the frozen column would make a
+/// checkpoint read disagree with a JSON-commit read of the same table (which always reconstructs
+/// from the map). So whenever a `TIMESTAMP` partition column exists, always reconstruct from the
+/// raw map. Every other partition type (date, int, string, `TIMESTAMP_NTZ`) is zone-independent and
+/// keeps the native fast path.
+fn should_reparse_partition_values_from_map(partition_schema: Option<&SchemaRef>) -> bool {
+    partition_schema_has_timestamp(partition_schema)
+}
+
 /// Build the add transform expression with optional stats and partition value parsing.
 ///
 /// # Parameters
@@ -1018,8 +1051,9 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        get_add_transform_expr, scan_action_iter, InternalScanState, ScanLogReplayProcessor,
-        ScanPartitionValuesOptions, ScanStatsOptions, SerializableScanState,
+        get_add_transform_expr, scan_action_iter, should_reparse_partition_values_from_map,
+        InternalScanState, ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+        SerializableScanState,
     };
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
@@ -1927,5 +1961,36 @@ mod tests {
             0,
             "expected no ToJson nodes anywhere in the transform when synthesis is skipped"
         );
+    }
+
+    /// A native checkpoint's frozen `partitionValues_parsed` must be reparsed from the raw map
+    /// whenever a `TIMESTAMP` partition column exists (its frozen instant carries the writer's
+    /// unrecoverable zone), and trusted for every zone-independent type.
+    #[test]
+    fn reparse_gate_forces_reparse_only_for_timestamp_partition() {
+        use crate::schema::PrimitiveType;
+
+        let ts: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "p",
+            DataType::TIMESTAMP,
+        )]));
+        assert!(should_reparse_partition_values_from_map(Some(&ts)));
+
+        // A TIMESTAMP among other columns still forces reparse.
+        let mixed: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::nullable("d", DataType::DATE),
+            StructField::nullable("n", DataType::Primitive(PrimitiveType::TimestampNtz)),
+            StructField::nullable("t", DataType::TIMESTAMP),
+        ]));
+        assert!(should_reparse_partition_values_from_map(Some(&mixed)));
+
+        // Zone-independent types (including TIMESTAMP_NTZ) keep the native fast path.
+        let no_ts: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::nullable("d", DataType::DATE),
+            StructField::nullable("n", DataType::Primitive(PrimitiveType::TimestampNtz)),
+            StructField::nullable("i", DataType::INTEGER),
+        ]));
+        assert!(!should_reparse_partition_values_from_map(Some(&no_ts)));
+        assert!(!should_reparse_partition_values_from_map(None));
     }
 }
