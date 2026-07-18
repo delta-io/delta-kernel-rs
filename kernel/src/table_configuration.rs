@@ -391,7 +391,7 @@ impl TableConfiguration {
                 StructField::new(
                     field.physical_name(column_mapping_mode).to_owned(),
                     field.data_type().clone(),
-                    field.is_nullable(),
+                    true,
                 )
             })
             .collect();
