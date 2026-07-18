@@ -28,10 +28,12 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{Snapshot, SnapshotRef};
 use rstest::rstest;
+use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    add_commit, create_table_and_load_snapshot, test_table_setup_mt, write_batch_to_table,
+    add_commit, create_table_and_load_snapshot, read_add_infos, test_table_setup_mt,
+    write_batch_to_table,
 };
 use url::Url;
 
@@ -582,6 +584,127 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
         2
+    );
+    Ok(())
+}
+
+/// Replace table may change a partition column's type. A scan after replacement should remain
+/// compatible with the old addFiles.
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_compatible_with_replace_partition_change(
+    #[values(false, true)] use_parallel: bool,
+    #[values(false, true)] checkpoint_old_add: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+
+    // Commit 1 creates the table with a string partition column.
+    let old_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("part", DataType::STRING),
+        StructField::nullable("value", DataType::LONG),
+    ])?);
+    let snapshot = create_table(&table_path, old_schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["part"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+
+    // Commit 2 writes an addFile with `old_schema`.
+    let physical_data_schema: ArrowSchema =
+        (&StructType::try_new([StructField::nullable("value", DataType::LONG)])?)
+            .try_into_arrow()?;
+    let physical_data_schema = Arc::new(physical_data_schema);
+    let data = RecordBatch::try_new(
+        physical_data_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1i64]))],
+    )?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        data,
+        HashMap::from([(
+            "part".to_string(),
+            Scalar::String("not-an-integer".to_string()),
+        )]),
+    )
+    .await?;
+    let old_path = read_add_infos(&snapshot, engine.as_ref())?
+        .into_iter()
+        .next()
+        .ok_or("commit 2 should contain an addFile")?
+        .path;
+
+    if checkpoint_old_add {
+        snapshot.checkpoint(engine.as_ref(), None)?;
+    }
+
+    // Commit 3 replaces the table metadata and removes the old addFile without adding data.
+    let replacement_schema = StructType::try_new(vec![
+        StructField::nullable("part", DataType::LONG),
+        StructField::nullable("value", DataType::LONG),
+    ])?;
+    let replacement = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000001000i64,
+                "operation": "CREATE OR REPLACE TABLE",
+                "version": 2,
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "replacement-table",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": serde_json::to_string(&replacement_schema)?,
+                "partitionColumns": ["part"],
+                "configuration": {},
+                "createdTime": 1700000001000i64,
+            }
+        }),
+        json!({
+            "remove": {
+                "path": old_path.clone(),
+                "deletionTimestamp": 1700000001000i64,
+                "dataChange": true,
+                "extendedFileMetadata": false,
+            }
+        }),
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        2,
+        replacement.map(|action| action.to_string()).join("\n"),
+    )
+    .await?;
+
+    // Commit 4 writes an addFile using the replacement LONG partition type.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let data = RecordBatch::try_new(
+        physical_data_schema,
+        vec![Arc::new(Int64Array::from(vec![2i64]))],
+    )?;
+    let snapshot = write_batch_to_table(
+        &snapshot,
+        engine.as_ref(),
+        data,
+        HashMap::from([("part".to_string(), Scalar::Long(1))]),
+    )
+    .await?;
+    let new_path = read_add_infos(&snapshot, engine.as_ref())?
+        .into_iter()
+        .find(|add| add.path != old_path)
+        .ok_or("commit 4 should contain an addFile")?
+        .path;
+
+    let predicate = Arc::new(Pred::eq(column_expr!("part"), Expr::literal(1i64)));
+    assert_eq!(
+        surviving_paths(&table_path, engine, predicate, use_parallel)?,
+        vec![new_path]
     );
     Ok(())
 }

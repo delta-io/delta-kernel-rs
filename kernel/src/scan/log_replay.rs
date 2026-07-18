@@ -10,7 +10,7 @@ use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
     PredicateRef, UnaryExpressionOp,
@@ -464,6 +464,38 @@ impl ScanLogReplayProcessor {
             internal_state.partition_values_options,
         )
     }
+
+    fn transform_and_data_skip(
+        &self,
+        actions: &dyn EngineData,
+        is_log_batch: bool,
+    ) -> DeltaResult<(Box<dyn EngineData>, Vec<bool>)> {
+        let transform = if is_log_batch {
+            &self.log_transform
+        } else {
+            &self.checkpoint_transform
+        };
+        let transformed = transform.evaluate(actions)?;
+        require!(
+            transformed.len() == actions.len(),
+            Error::internal_error(format!(
+                "transform output length {} != actions length {}",
+                transformed.len(),
+                actions.len()
+            ))
+        );
+
+        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
+        require!(
+            selection_vector.len() == actions.len(),
+            Error::internal_error(format!(
+                "selection vector length {} != actions length {}",
+                selection_vector.len(),
+                actions.len()
+            ))
+        );
+        Ok((transformed, selection_vector))
+    }
 }
 
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
@@ -530,11 +562,18 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             self.metrics.incr_remove_files_seen()
         };
 
+        // Check both adds and removes (skipping already-seen), but only transform and return adds
+        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
+            return Ok(false);
+        }
+
         // Parse partition values for building the per-row transform expression.
         // Partition pruning is handled by DataSkippingFilter in the columnar data skipping phase,
         // so we only need to parse values here for the transform.
+
+        // Only needed for survived addFiles.
         let partition_values = match &self.state_info.transform_spec {
-            Some(transform) if is_add && !self.state_info.skip_row_transforms => {
+            Some(transform) if !self.state_info.skip_row_transforms => {
                 let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
                     .get(row, "add.partitionValues")?;
                 parse_partition_values(
@@ -547,10 +586,6 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
             _ => Default::default(),
         };
 
-        // Check both adds and removes (skipping already-seen), but only transform and return adds
-        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
-            return Ok(false);
-        }
         if !self.state_info.skip_row_transforms {
             let base_row_id: Option<i64> =
                 getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(row, "add.baseRowId")?;
@@ -829,59 +864,57 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
         );
 
-        // Step 1: Apply transform FIRST (parses JSON once, outputs stats_parsed).
-        // This is done before data skipping so we can read the already-parsed stats.
-        // We use the checkpoint_transform because we checked above that we're reading a checkpoint.
-        let transformed = self.checkpoint_transform.evaluate(actions.as_ref())?;
-        debug_assert_eq!(transformed.len(), actions.len());
-        require!(
-            transformed.len() == actions.len(),
-            Error::internal_error(format!(
-                "checkpoint transform output length {} != actions length {}",
-                transformed.len(),
-                actions.len()
-            ))
-        );
+        let mut retry_after_dedup = false;
+        // Step 1: Apply transform + data skipping. Do this before deduplication to reduce the size
+        // of the dedup map and avoid String allocations.
+        // This step transforms all Adds, including those superseded by Removes (dead Adds).
+        // The transform for a dead Add may fail because it may have a different partition column
+        // type. In that case, we get a ParseError and retry after deduplication.
+        let (transformed_result, selection_vector) =
+            match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
+                Ok((transformed, selection_vector)) => (Ok(transformed), selection_vector),
+                Err(err @ Error::ParseError(_, _)) => {
+                    retry_after_dedup = true;
+                    (Err(err), vec![true; actions.len()])
+                }
+                Err(err) => return Err(err),
+            };
 
-        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly).
-        // This avoids double JSON parsing -- the transform already parsed the stats.
-        // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
-        // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
-        // with ISNULL guards that keep rows with missing stats. For partition values, the
-        // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
-        // rows always pass the partition filter regardless of null partition values.
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
-        debug_assert_eq!(selection_vector.len(), actions.len());
-        require!(
-            selection_vector.len() == actions.len(),
-            Error::internal_error(format!(
-                "selection vector length {} != actions length {}",
-                selection_vector.len(),
-                actions.len()
-            ))
-        );
-
-        // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
+        // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
             Self::ADD_PATH_INDEX,
             Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
         )?;
-        let mut visitor = AddRemoveDedupVisitor::new(
-            deduplicator,
-            selection_vector,
-            self.state_info.clone(),
-            &self.metrics,
-        );
-        visitor.visit_rows_of(actions.as_ref())?;
+        let (dedup_selection, row_transform_exprs) = {
+            let mut visitor = AddRemoveDedupVisitor::new(
+                deduplicator,
+                selection_vector,
+                self.state_info.clone(),
+                &self.metrics,
+            );
+            visitor.visit_rows_of(actions.as_ref())?;
+            (visitor.selection_vector, visitor.row_transform_exprs)
+        };
 
-        // Step 4: Return transformed batch with updated selection vector
-        let scan_metadata = ScanMetadata::try_new(
-            transformed,
-            visitor.selection_vector,
-            visitor.row_transform_exprs,
-        )?;
+        // Step 3: Return transformed batch with updated selection vector
+        let scan_metadata = if retry_after_dedup {
+            // If step 1 failed with a parse error, filter out the dead Adds and retry after
+            // deduplication.
+            let row_transform_exprs = dedup_selection
+                .iter()
+                .enumerate()
+                .filter(|(_, selected)| **selected)
+                .map(|(row, _)| row_transform_exprs.get(row).cloned().flatten())
+                .collect();
+            let actions = actions.apply_selection_vector(dedup_selection)?;
+            let (transformed, selection_vector) =
+                self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+            ScanMetadata::try_new(transformed, selection_vector, row_transform_exprs)?
+        } else {
+            ScanMetadata::try_new(transformed_result?, dedup_selection, row_transform_exprs)?
+        };
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -906,20 +939,6 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         // Use the correct transform based on batch type:
         // - Log batches: parse JSON for stats, MapToStruct for partition values
         // - Checkpoint batches: read pre-parsed columns directly when available
-        let transform = if is_log_batch {
-            &self.log_transform
-        } else {
-            &self.checkpoint_transform
-        };
-        let transformed = transform.evaluate(actions.as_ref())?;
-        require!(
-            transformed.len() == actions.len(),
-            Error::internal_error(format!(
-                "transform output length {} != actions length {}",
-                transformed.len(),
-                actions.len()
-            ))
-        );
 
         // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly).
         // This avoids double JSON parsing -- the transform already parsed the stats.
@@ -928,16 +947,16 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         // with ISNULL guards that keep rows with missing stats. For partition values, the
         // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
         // rows always pass the partition filter regardless of null partition values.
-        let selection_vector = self.build_selection_vector(transformed.as_ref())?;
-        debug_assert_eq!(selection_vector.len(), actions.len());
-        require!(
-            selection_vector.len() == actions.len(),
-            Error::internal_error(format!(
-                "selection vector length {} != actions length {}",
-                selection_vector.len(),
-                actions.len()
-            ))
-        );
+        let mut retry_after_dedup = false;
+        let (transformed_result, selection_vector) =
+            match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
+                Ok((transformed, selection_vector)) => (Ok(transformed), selection_vector),
+                Err(err @ Error::ParseError(_, _)) => {
+                    retry_after_dedup = true;
+                    (Err(err), vec![true; actions.len()])
+                }
+                Err(err) => return Err(err),
+            };
 
         // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = FileActionDeduplicator::new(
@@ -949,20 +968,32 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
         );
-        let mut visitor = AddRemoveDedupVisitor::new(
-            deduplicator,
-            selection_vector,
-            self.state_info.clone(),
-            &self.metrics,
-        );
-        visitor.visit_rows_of(actions.as_ref())?;
+        let (dedup_selection, row_transform_exprs) = {
+            let mut visitor = AddRemoveDedupVisitor::new(
+                deduplicator,
+                selection_vector,
+                self.state_info.clone(),
+                &self.metrics,
+            );
+            visitor.visit_rows_of(actions.as_ref())?;
+            (visitor.selection_vector, visitor.row_transform_exprs)
+        };
 
         // Step 4: Return transformed batch with updated selection vector
-        let scan_metadata = ScanMetadata::try_new(
-            transformed,
-            visitor.selection_vector,
-            visitor.row_transform_exprs,
-        )?;
+        let scan_metadata = if retry_after_dedup {
+            let row_transform_exprs = dedup_selection
+                .iter()
+                .enumerate()
+                .filter(|(_, selected)| **selected)
+                .map(|(row, _)| row_transform_exprs.get(row).cloned().flatten())
+                .collect();
+            let actions = actions.apply_selection_vector(dedup_selection)?;
+            let (transformed, selection_vector) =
+                self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+            ScanMetadata::try_new(transformed, selection_vector, row_transform_exprs)?
+        } else {
+            ScanMetadata::try_new(transformed_result?, dedup_selection, row_transform_exprs)?
+        };
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
