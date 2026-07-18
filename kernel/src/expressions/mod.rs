@@ -548,7 +548,7 @@ impl ParseJsonExpression {
 /// empty bytes for binary, and to null for every other type.
 ///
 /// - Missing keys produce null values
-/// - Parse errors are propagated (indicating a broken table)
+/// - A value that cannot be parsed as its target field type returns [`Error::ParseError`]
 /// - Duplicate map keys are resolved by taking the rightmost entry
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
