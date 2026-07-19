@@ -45,9 +45,10 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
 /// Construct a [`PlanBasedEngine`] backed by `plan_executor`, delegating operations not yet
 /// implemented on the plan-execution path to `fallback_engine`.
 ///
-/// This method consumes BOTH the [`SharedPlanExecutor`] and [`SharedExternEngine`] handles.
-/// Ownership of the fallback engine transfers into the returned engine: dropping the returned
-/// engine (via `free_engine`) also drops the embedded fallback engine.
+/// This method consumes the [`SharedPlanExecutor`] handle. It does NOT consume `fallback_engine`:
+/// the caller retains ownership of the fallback engine handle and must free it separately via
+/// `free_engine`. The returned plan-based engine clones the handlers it needs from the fallback,
+/// so it remains valid independently of when the caller frees its fallback handle.
 ///
 /// # Safety
 ///
@@ -60,7 +61,7 @@ pub unsafe extern "C" fn get_plan_based_engine(
     allocate_error: AllocateErrorFn,
 ) -> Handle<SharedExternEngine> {
     let executor: Arc<dyn PlanExecutor> = unsafe { plan_executor.into_inner() };
-    let fallback: Arc<dyn Engine> = unsafe { fallback_engine.into_inner() }.engine();
+    let fallback: Arc<dyn Engine> = unsafe { fallback_engine.as_ref() }.engine();
     let engine: Arc<dyn Engine> = Arc::new(PlanBasedEngine::new(fallback, executor));
     engine_to_handle(engine, allocate_error)
 }
@@ -98,16 +99,19 @@ mod tests {
     fn get_plan_based_engine_returns_plan_based_engine() {
         let executor = unsafe { get_plan_executor(None, unreachable_callback) };
 
-        // Build a fallback engine handle whose ownership will transfer into the plan-based engine.
+        // The caller retains ownership of the fallback engine handle. `shallow_copy` mimics C
+        // passing the pointer by value, so we can still free our own handle afterward.
         let fallback = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
         let fallback_handle = engine_to_handle(Arc::new(fallback), allocate_err);
 
-        let engine_handle =
-            unsafe { get_plan_based_engine(executor, fallback_handle, allocate_err) };
+        let engine_handle = unsafe {
+            get_plan_based_engine(executor, fallback_handle.shallow_copy(), allocate_err)
+        };
 
         assert_is_plan_based_engine(&engine_handle);
 
-        // Freeing the plan-based engine also frees the embedded fallback
+        // The plan-based engine and the fallback are freed independently.
         unsafe { free_engine(engine_handle) };
+        unsafe { free_engine(fallback_handle) };
     }
 }
