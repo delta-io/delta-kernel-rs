@@ -844,6 +844,15 @@ async fn scan_with_replace_table_schema_change(
             .join("\n"),
     )
     .await?;
+
+    if use_parallel {
+        // Put the active incompatible Add in a sidecar so the parallel processor rejects it.
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        });
+        snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
+    }
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
     assert!(matches!(

@@ -832,6 +832,7 @@ impl PrimitiveType {
     }
 
     fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, Error> {
+        // TODO(#2950): Normalize all decimal parsing failures to Error::ParseError.
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {

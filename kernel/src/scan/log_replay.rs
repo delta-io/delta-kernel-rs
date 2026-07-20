@@ -130,17 +130,18 @@ pub struct SerializableScanState {
 /// During a table scan, the processor reads batches of log actions (in reverse chronological order)
 /// and performs the following steps:
 ///
-/// - Data Skipping: Applies a predicate-based filter (via [`DataSkippingFilter`]) to quickly skip
-///   files that are irrelevant for the query. This includes both data column stats
-///   (min/max/nullCount) and partition value filtering in a single columnar pass. A secondary
-///   row-level partition filter catches remaining files the columnar pass cannot prune (e.g. null
-///   partition values where null-safety conservatively keeps them).
+/// - Transformation and Data Skipping: Applies a built-in transformation (`log_transform` or
+///   `checkpoint_transform`) to parse action metadata, then applies a predicate-based filter (via
+///   [`DataSkippingFilter`]). This includes both data column stats (min/max/nullCount) and
+///   partition value filtering in a single columnar pass. A secondary row-level partition filter
+///   catches remaining files the columnar pass cannot prune (e.g. null partition values where
+///   null-safety conservatively keeps them).
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique
 ///   file (identified by its path and deletion vector unique ID), only the latest valid Add action
 ///   is processed.
-/// - Transformation: Applies a built-in transformation (`log_transform` or `checkpoint_transform`)
-///   to convert selected Add actions into [`ScanMetadata`], the intermediate format passed to the
-///   engine.
+/// - Parse-error fallback: If transformation and data skipping return [`Error::ParseError`],
+///   deduplicates the raw batch first, then retries transformation and data skipping on the
+///   surviving actions.
 /// - Row StructPatch passthrough: Any user-provided row-level transformation expressions (e.g.
 ///   those derived from projection or filters) are preserved and passed through to the engine,
 ///   which applies them as part of its scan execution logic.
