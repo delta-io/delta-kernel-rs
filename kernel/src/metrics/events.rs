@@ -1180,7 +1180,10 @@ pub struct ScanMetadataCompleted {
     pub scan_type: ScanType,
     /// Wall-clock time from scan start to iterator exhaustion.
     pub duration: Duration,
-    /// Add files that entered deduplication (excludes files filtered by data skipping).
+    /// Add files that entered deduplication. This normally excludes add files filtered by data
+    /// skipping. During parse-error fallback, deduplication runs first, so add files filtered by
+    /// retry-time data skipping are included. See
+    /// [`LogReplayProcessor::process_actions_batch`](crate::log_replay::LogReplayProcessor::process_actions_batch).
     pub num_add_files_seen: u64,
     /// Add files that survived log replay (the files the connector reads).
     pub num_active_add_files: u64,

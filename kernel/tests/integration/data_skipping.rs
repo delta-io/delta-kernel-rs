@@ -16,18 +16,19 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Int64Array, RecordBatch};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
     column_expr, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
 };
-use delta_kernel::metrics::MetricEvent;
+use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::{Snapshot, SnapshotRef};
+use delta_kernel::{Error, Snapshot, SnapshotRef};
 use rstest::rstest;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -616,7 +617,7 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     103
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scan_compatible_with_replace_partition_change(
+async fn scan_with_replace_table_schema_change(
     #[case] predicate: PredicateRef,
     #[case] expected_paths: &[&str],
     #[case] expected_active_files: u64,
@@ -633,6 +634,7 @@ async fn scan_compatible_with_replace_partition_change(
     ])?);
     create_table(&table_path, old_schema, "Test/1.0")
         .with_data_layout(DataLayout::partitioned(["part"]))
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
@@ -680,7 +682,10 @@ async fn scan_compatible_with_replace_partition_change(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     if checkpoint_old_add {
-        snapshot.checkpoint(engine.as_ref(), None)?;
+        let checkpoint_spec = CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+            file_actions_per_sidecar_hint: Some(1),
+        });
+        snapshot.checkpoint(engine.as_ref(), Some(&checkpoint_spec))?;
     }
 
     // Commit 3 replaces the table metadata and removes the addFiles.
@@ -757,26 +762,94 @@ async fn scan_compatible_with_replace_partition_change(
     let reporter = Arc::new(CapturingReporter::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
     assert_eq!(
-        surviving_paths(&table_path, engine, predicate, use_parallel)?,
+        surviving_paths(&table_path, engine.clone(), predicate.clone(), use_parallel)?,
         expected_paths
             .iter()
             .map(|path| (*path).to_string())
             .collect::<Vec<_>>()
     );
-    let (active_files, active_bytes) = reporter
+    let scan_events = reporter
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            MetricEvent::ScanMetadataCompleted(event) => {
-                Some((event.num_active_add_files, event.active_add_files_bytes))
-            }
+            MetricEvent::ScanMetadataCompleted(event) => Some(event),
             _ => None,
         })
-        .fold((0, 0), |(files, bytes), (event_files, event_bytes)| {
-            (files + event_files, bytes + event_bytes)
-        });
-    assert_eq!(active_files, expected_active_files);
-    assert_eq!(active_bytes, expected_active_bytes);
+        .collect::<Vec<_>>();
+    if use_parallel && checkpoint_old_add {
+        assert!(
+            scan_events
+                .iter()
+                .any(|event| event.scan_type == ScanType::ParallelPhase),
+            "the V2 sidecar should be processed by the parallel phase"
+        );
+    }
+    assert_eq!(
+        scan_events
+            .iter()
+            .map(|e| e.num_add_files_seen)
+            .sum::<u64>(),
+        4
+    );
+    assert_eq!(
+        scan_events
+            .iter()
+            .map(|e| e.num_active_add_files)
+            .sum::<u64>(),
+        expected_active_files
+    );
+    assert_eq!(
+        scan_events
+            .iter()
+            .map(|e| e.active_add_files_bytes)
+            .sum::<u64>(),
+        expected_active_bytes
+    );
+    assert_eq!(
+        scan_events
+            .iter()
+            .map(|e| e.num_remove_files_seen)
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(
+        scan_events
+            .iter()
+            .map(|e| e.num_predicate_filtered)
+            .sum::<u64>(),
+        2
+    );
+    // Negative test: a live addFile with incompatible schema should fail the scan.
+    let active_incompatible_add = [
+        json!({
+            "commitInfo": {
+                "timestamp": 1700000003000i64,
+                "operation": "WRITE",
+                "version": 4,
+            }
+        }),
+        add_file_action(
+            "active-incompatible.parquet",
+            301,                               /* size */
+            "not-an-integer-active-partition", /* partition_value */
+            "not-an-integer-active-value",     /* data_value */
+        )?,
+    ];
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        4,
+        active_incompatible_add
+            .map(|action| action.to_string())
+            .join("\n"),
+    )
+    .await?;
+    let error = surviving_paths(&table_path, engine, predicate, use_parallel)
+        .expect_err("an active incompatible add file should fail the scan");
+    assert!(matches!(
+        error.downcast_ref::<Error>(),
+        Some(Error::ParseError(_, _))
+    ));
     Ok(())
 }
 
