@@ -4,7 +4,7 @@
 //! intentionally minimal and grows with the grammar the parser supports. Literal tokens keep their
 //! raw source text so a caller can decode them however it needs.
 //!
-//! Example: `` `col1` > 5 `` tokenizes to `[Ident("col1"), Gt, Literal("5")]`.
+//! Example: `` `col1` > 5 `` tokenizes to `[Ident("col1"), Gt, Number("5")]`.
 
 // WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
 // TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
@@ -23,8 +23,12 @@ type CharStream<'a> = Peekable<Chars<'a>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Token {
     Ident(String),
-    /// A literal's raw, undecoded source text (quotes and any typed-literal keyword retained):
-    /// numbers, quoted strings, `X'..'` binary, `TRUE`/`FALSE`/`NULL`, and typed
+    /// An unsigned numeric literal's raw source text, e.g. `42`, `.5`, `2e+1`. A leading sign is a
+    /// separate `Plus`/`Minus` token, never part of the number. Kept distinct from `Literal` so a
+    /// caller need not re-derive number-ness from the raw text.
+    Number(String),
+    /// A non-numeric literal's raw, undecoded source text (quotes and any typed-literal keyword
+    /// retained): quoted strings, `X'..'` binary, `TRUE`/`FALSE`/`NULL`, and typed
     /// `DATE`/`TIMESTAMP`/ `TIMESTAMP_LTZ`/`TIMESTAMP_NTZ` literals.
     Literal(String),
     Dot,
@@ -39,7 +43,7 @@ pub(super) enum Token {
     NullSafeEq,
     /// `+` and `-`. Emitted as standalone operators (matching Spark, where a leading sign is unary
     /// minus/plus, not part of the number). A number is never lexed with a sign; the caller
-    /// reassembles a signed literal from `Minus`/`Plus` followed by a numeric `Literal`.
+    /// reassembles a signed literal from `Minus`/`Plus` followed by a `Number`.
     Plus,
     Minus,
     /// The `AND`/`OR`/`NOT`/`IS` keywords. Recognized here so a backtick-quoted column
@@ -71,7 +75,7 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
             // otherwise it is a column-path separator.
             '.' => {
                 if matches!(peek_second(&chars), Some(d) if d.is_ascii_digit()) {
-                    tokens.push(Token::Literal(take_number(&mut chars)));
+                    tokens.push(Token::Number(take_number(&mut chars)));
                 } else {
                     chars.next();
                     tokens.push(Token::Dot);
@@ -145,7 +149,7 @@ pub(super) fn tokenize(sql: &str) -> DeltaResult<Vec<Token>> {
                 chars.next();
                 tokens.push(Token::Minus);
             }
-            c if c.is_ascii_digit() => tokens.push(Token::Literal(take_number(&mut chars))),
+            c if c.is_ascii_digit() => tokens.push(Token::Number(take_number(&mut chars))),
             c if c.is_ascii_alphabetic() || c == '_' => {
                 tokens.push(classify_word(&mut chars, sql)?)
             }
@@ -282,6 +286,10 @@ mod tests {
         Token::Literal(s.to_string())
     }
 
+    fn num(s: &str) -> Token {
+        Token::Number(s.to_string())
+    }
+
     /// `==` aliases `=`; `<>`/`!=` are `Ne`; `!>`/`!<` are Spark aliases for `<=`/`>=`.
     #[rstest]
     #[case("<", Token::Lt)]
@@ -300,36 +308,41 @@ mod tests {
     fn tokenizes_each_operator(#[case] op: &str, #[case] expected: Token) {
         assert_eq!(
             tokenize(&format!("a {op} 1")).unwrap(),
-            [ident("a"), expected.clone(), lit("1")]
+            [ident("a"), expected.clone(), num("1")]
         );
         // Whitespace around the operator is optional.
         assert_eq!(
             tokenize(&format!("a{op}1")).unwrap(),
-            [ident("a"), expected, lit("1")]
+            [ident("a"), expected, num("1")]
         );
     }
 
-    /// A leading `+`/`-` is a standalone operator, not part of the number -- so a signed literal
-    /// lexes as two tokens (the parser reassembles it), and whitespace between the sign and the
-    /// digits (`- 5`) is irrelevant. The exponent's own sign stays inside the number.
+    /// A leading `+`/`-` is a standalone operator, not part of the number: a signed number lexes as
+    /// two tokens (the parser reassembles it), and whitespace between the sign and the digits
+    /// (`- 5`) is irrelevant. The exponent's own sign stays inside the number.
     #[rstest]
-    #[case("-5", &[Token::Minus, lit("5")])]
-    #[case("- 5", &[Token::Minus, lit("5")])]
-    #[case("+5", &[Token::Plus, lit("5")])]
-    #[case("-.5", &[Token::Minus, lit(".5")])]
-    #[case("-2e+1", &[Token::Minus, lit("2e+1")])]
+    #[case("-5", &[Token::Minus, num("5")])]
+    #[case("- 5", &[Token::Minus, num("5")])]
+    #[case("+5", &[Token::Plus, num("5")])]
+    #[case("-.5", &[Token::Minus, num(".5")])]
+    #[case("-2e+1", &[Token::Minus, num("2e+1")])]
     // `1+1` is three tokens (the sign never glues onto the following number), so the number after
     // an operator is not swallowed into the previous one.
-    #[case("1+1", &[lit("1"), Token::Plus, lit("1")])]
-    fn tokenizes_signed_number_as_sign_then_literal(#[case] sql: &str, #[case] expected: &[Token]) {
+    #[case("1+1", &[num("1"), Token::Plus, num("1")])]
+    fn tokenizes_signed_number_as_sign_then_number(#[case] sql: &str, #[case] expected: &[Token]) {
         assert_eq!(tokenize(sql).unwrap(), expected);
     }
 
     #[rstest]
-    #[case("42", lit("42"))]
-    #[case(".5", lit(".5"))]
-    #[case("1e3", lit("1e3"))]
-    #[case("2e+1", lit("2e+1"))] // the exponent sign is part of the number
+    #[case("42", num("42"))]
+    #[case(".5", num(".5"))]
+    #[case("1e3", num("1e3"))]
+    #[case("2e+1", num("2e+1"))] // the exponent sign is part of the number
+    fn tokenizes_number_as_single_raw_token(#[case] sql: &str, #[case] expected: Token) {
+        assert_eq!(tokenize(sql).unwrap(), [expected]);
+    }
+
+    #[rstest]
     #[case("'foo'", lit("'foo'"))]
     #[case("'O''Brien'", lit("'O''Brien'"))] // doubled '' escape retained
     #[case("NULL", lit("NULL"))]
@@ -384,13 +397,13 @@ mod tests {
         assert_eq!(tokenize(sql).unwrap(), []);
     }
 
-    /// A malformed number is emitted verbatim as one raw literal token; the tokenizer does not
+    /// A malformed number is emitted verbatim as one raw `Number` token; the tokenizer does not
     /// validate numeric structure.
     #[rstest]
-    #[case("1e", lit("1e"))]
-    #[case("1.2.3", lit("1.2.3"))]
-    #[case("1E3", lit("1E3"))]
-    #[case("5e-3", lit("5e-3"))]
+    #[case("1e", num("1e"))]
+    #[case("1.2.3", num("1.2.3"))]
+    #[case("1E3", num("1E3"))]
+    #[case("5e-3", num("5e-3"))]
     fn tokenizes_malformed_number_as_single_raw_token(#[case] sql: &str, #[case] expected: Token) {
         assert_eq!(tokenize(sql).unwrap(), [expected]);
     }
@@ -409,7 +422,7 @@ mod tests {
     fn tokenizes_backtick_field_in_comparison_and_path() {
         assert_eq!(
             tokenize("`my col` > 0").unwrap(),
-            [ident("my col"), Token::Gt, lit("0")]
+            [ident("my col"), Token::Gt, num("0")]
         );
         assert_eq!(
             tokenize("a.`b c`").unwrap(),

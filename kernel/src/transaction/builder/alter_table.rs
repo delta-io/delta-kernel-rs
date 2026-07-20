@@ -155,6 +155,8 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///
     /// # Errors
     ///
+    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which ALTER TABLE does not
+    ///   yet support
     /// - Any individual operation fails validation (see per-method errors above)
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
@@ -170,6 +172,12 @@ impl AlterTableTransactionBuilder<Modifying> {
         if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             return Err(Error::unsupported(
                 "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        // TODO(#2630): Support ALTER TABLE on tables with column defaults.
+        if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
+            return Err(Error::unsupported(
+                "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
             ));
         }
         // Rejects writes to tables kernel can't safely commit to: writer version out of

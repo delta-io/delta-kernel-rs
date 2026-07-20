@@ -25,11 +25,8 @@ use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-#[cfg(feature = "column-defaults-in-dev")]
 pub(crate) mod column_default;
-#[cfg(feature = "column-defaults-in-dev")]
 pub use column_default::ColumnDefault;
-#[cfg(feature = "column-defaults-in-dev")]
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
@@ -527,7 +524,6 @@ impl StructField {
     /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
     ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
     ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
-    #[cfg(feature = "column-defaults-in-dev")]
     pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
             None => return Ok(None),
@@ -1857,6 +1853,12 @@ pub enum PrimitiveType {
 impl PrimitiveType {
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(DecimalType::try_new(precision, scale)?.into())
+    }
+
+    /// Returns whether this is one of the ANSI interval primitive types.
+    #[internal_api]
+    pub(crate) fn is_interval(&self) -> bool {
+        matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
     }
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
@@ -4241,7 +4243,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "column-defaults-in-dev")]
     mod column_default_method {
         use super::*;
         use crate::schema::column_default::field_with_default;
