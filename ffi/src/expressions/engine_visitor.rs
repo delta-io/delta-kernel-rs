@@ -663,9 +663,8 @@ fn visit_expression_impl(
             visit_expression_impl(visitor, map_expr, child_list_id);
             call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
         }
-        // The engine-visitor FFI has no cast callback yet. Surface it as an unknown expression so
-        // the boundary neither drops nor misinterprets it; an engine treats it as uninterpretable
-        // rather than fabricating one.
+        // The engine-visitor FFI has no cast callback yet; surface it as an unknown expression,
+        // which an engine treats as uninterpretable.
         Expression::Cast(cast) => visit_unknown(
             visitor,
             sibling_list_id,

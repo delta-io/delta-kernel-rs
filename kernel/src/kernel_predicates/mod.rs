@@ -691,16 +691,18 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
 }
 
 /// Casts a scalar following SQL `CAST` semantics, for the cases exact partition-value pruning
-/// needs: a string source is parsed into a primitive target (the way partition values are parsed
-/// to their declared type), and a source already of the target type passes through. An unparseable
-/// string yields `Scalar::Null` (never TRUE against a comparison), matching the safe-cast semantics
-/// of the arrow evaluation path.
+/// needs: a string source is parsed into a primitive target via
+/// [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar),
+/// and a source already of the target type passes through. An unparseable string yields
+/// `Scalar::Null` (never TRUE against a comparison).
 ///
-/// This is deliberately narrower than a full cast: any other source/target combination yields
-/// `None` so the caller conservatively keeps the file. In particular it does not attempt
-/// numeric/temporal casts (e.g. `Long -> Int`) that the arrow path can perform; those only reach
-/// this scalar path through a resolver that supplies partition values as scalars, which no
-/// production caller does today (the sole production evaluator uses an empty column resolver).
+/// `parse_scalar` accepts a strict subset of the formats the arrow evaluation path accepts (e.g.
+/// arrow parses the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is
+/// only ever more conservative than arrow: a form it rejects becomes NULL (keep), never a differing
+/// non-null value. This is also deliberately narrower than a full cast -- any source/target
+/// combination other than string-to-primitive or an identity pass-through yields `None` so the
+/// caller conservatively keeps the file, and it does not attempt numeric/temporal casts (e.g.
+/// `Long -> Int`) that the arrow path can perform.
 fn cast_scalar(value: Scalar, target: &DataType) -> Option<Scalar> {
     if value.data_type() == *target {
         return Some(value);

@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 };
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -485,16 +485,34 @@ fn binary_comparison_predicate(
     val: &Scalar,
     inverted: bool,
 ) -> Option<Pred> {
-    let pred_fn = match (op, inverted) {
-        (BinaryPredicateOp::LessThan, false) => Pred::lt,
-        (BinaryPredicateOp::LessThan, true) => Pred::ge,
-        (BinaryPredicateOp::GreaterThan, false) => Pred::gt,
-        (BinaryPredicateOp::GreaterThan, true) => Pred::le,
-        (BinaryPredicateOp::Equal, false) => Pred::eq,
-        (BinaryPredicateOp::Equal, true) => Pred::ne,
-        (BinaryPredicateOp::Distinct | BinaryPredicateOp::In, _) => return None,
+    let ord = match op {
+        BinaryPredicateOp::LessThan => Ordering::Less,
+        BinaryPredicateOp::GreaterThan => Ordering::Greater,
+        BinaryPredicateOp::Equal => Ordering::Equal,
+        BinaryPredicateOp::Distinct | BinaryPredicateOp::In => return None,
     };
-    Some(pred_fn(expr, val.clone()))
+    Some(comparison_predicate(ord, expr, val, inverted))
+}
+
+/// Whether a cast to `target` is eligible for partition-cast pruning. Restricted to string
+/// parsing into an integer type: a base-10 integer parse is unambiguous, so wherever the arrow
+/// cast the rewrite evaluates yields a non-null value it equals what any other engine's cast
+/// yields, and any disagreement leaves one side NULL (keep), never two differing non-null values.
+/// Rounding-sensitive (`decimal`, `float`) and timezone-sensitive (`timestamp`, and `date` --
+/// arrow parses an offset-bearing string like `2024-01-15T20:00:00-08:00` as a UTC instant and
+/// takes its date, which can land on a different day than an engine that casts date-only) targets
+/// can produce differing non-null values across engines and could skip a matching file, so they
+/// are excluded.
+fn is_cast_prunable_target(target: &DataType) -> bool {
+    matches!(
+        target,
+        DataType::Primitive(
+            PrimitiveType::Byte
+                | PrimitiveType::Short
+                | PrimitiveType::Integer
+                | PrimitiveType::Long
+        )
+    )
 }
 
 /// Collects sub-predicates into a junction (AND/OR), replacing unsupported sub-predicates (None)
@@ -559,8 +577,8 @@ fn has_min_max_stats(data_type: &DataType) -> bool {
 /// the exact value for every row in the file (serving as both min and max).
 struct DataSkippingPredicateCreator<'a> {
     /// Physical names of partition columns mapped to their declared types. For these columns,
-    /// stats come from `partitionValues.<col>` (exact values) instead of min/max ranges. The
-    /// declared type gates cast pushdown (see [`Self::eval_pred_cast`]).
+    /// stats come from `partitionValues_parsed.<col>` (exact values) instead of min/max ranges.
+    /// The declared type gates cast pushdown (see [`Self::eval_pred_cast`]).
     partition_columns: &'a HashMap<String, DataType>,
     /// Physical leaf paths whose stats are present in `stats_parsed` (honors
     /// `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, and required
@@ -703,20 +721,22 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 
     /// Prunes `CAST(<partition_col> AS target) <op> <val>` by casting the exact partition value.
     ///
-    /// Pruning is restricted to casting a **string** partition column to a **primitive** target.
-    /// Two independent reasons converge on this:
+    /// Pruning is restricted to casting a **string** partition column to an integer target (see
+    /// [`is_cast_prunable_target`]). Three conditions converge on soundness:
     ///
     /// - Only partition columns have an exact value per file (min == max), so casting that single
     ///   value and comparing is precise. A data column would have to cast its min/max stats, which
     ///   is unsound because a cast is not order-preserving in general (e.g. lexicographic string
     ///   order is not numeric order), so casted min/max need not bound the casted values.
     /// - The rewrite is evaluated by the engine, so pruning is only sound when the engine and the
-    ///   arrow evaluator agree on the cast. Parsing a string into a primitive is the protocol's own
-    ///   partition-value parsing and is deterministic across engines; other directions (e.g. `date
-    ///   -> string` rendering, `float -> int` rounding, timezone interpretation) can differ and
-    ///   would risk skipping a matching file.
+    ///   arrow evaluator agree on the cast. A base-10 integer parse is unambiguous across engines;
+    ///   timezone- and rounding-sensitive targets (`timestamp`, `date`, `decimal`, `float`) can
+    ///   differ and would risk skipping a matching file.
+    /// - Arrow's comparison kernels error on a mismatched type pair rather than yielding NULL, and
+    ///   an error on the skipping path aborts the scan. Pushing down only when the literal already
+    ///   matches the cast target keeps the comparison well-typed.
     ///
-    /// Any other source or a non-primitive target returns `None` (keep the file). The rewrite
+    /// Any other source, target, or literal type returns `None` (keep the file). The rewrite
     /// compares `CAST(partitionValues_parsed.<col> AS target)`, which the arrow evaluator applies
     /// per row with safe (NULL-on-failure) semantics, wrapped in `OR(NOT is_add, ...)` so Remove
     /// rows are never filtered.
@@ -729,7 +749,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         inverted: bool,
     ) -> Option<Pred> {
         let source = self.partition_column_type(col)?;
-        if *source != DataType::STRING || !matches!(target, DataType::Primitive(_)) {
+        if *source != DataType::STRING
+            || !is_cast_prunable_target(target)
+            || val.data_type() != *target
+        {
             return None;
         }
         let cast_expr = Expr::cast(
