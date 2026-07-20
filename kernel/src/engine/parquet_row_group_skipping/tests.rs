@@ -87,10 +87,11 @@ fn test_get_stat_values() {
         Some(3i64.into())
     );
 
-    // Should be Some(0), but https://github.com/apache/arrow-rs/issues/9451
+    // The utf8 column has no nulls, and parquet 58.1+ reports its footer null count as an exact
+    // zero (see https://github.com/apache/arrow-rs/issues/9451).
     assert_eq!(
         filter.get_nullcount_stat(&column_name!("varlen.utf8")),
-        None // Some(0i64.into())
+        Some(0i64.into())
     );
 
     assert_eq!(
@@ -456,6 +457,70 @@ fn test_get_stat_values() {
                 .unwrap()
         )
     );
+}
+
+// A missing footer null count must decode to `None` (keep the row group), while an exact zero
+// count must be preserved as `Some(0)`. Parquet 58.1+ distinguishes the two; earlier versions
+// forced a missing count to zero (arrow-rs#9451), which this extractor previously worked around
+// by suppressing every zero -- losing the legitimate `Some(0)` needed to prune on IS NULL.
+#[test]
+fn test_extract_nullcount_distinguishes_missing_from_zero() {
+    // No statistics at all -> None (can't decide, keep).
+    assert_eq!(extract_nullcount(None), None);
+    // Statistics present but null count absent -> None (can't decide, keep).
+    assert_eq!(
+        extract_nullcount(Some(&Statistics::int64(
+            Some(1),
+            Some(2),
+            None,
+            None,
+            false
+        ))),
+        None
+    );
+    // Exact zero null count -> Some(0) (no nulls; IS NULL can prune).
+    assert_eq!(
+        extract_nullcount(Some(&Statistics::int64(
+            Some(1),
+            Some(2),
+            None,
+            Some(0),
+            false
+        ))),
+        Some(0)
+    );
+    // Positive null count -> preserved.
+    assert_eq!(
+        extract_nullcount(Some(&Statistics::int64(
+            Some(1),
+            Some(2),
+            None,
+            Some(3),
+            false
+        ))),
+        Some(3)
+    );
+}
+
+// An exact zero footer null count lets IS NULL prune a row group whose column has no nulls, while
+// a positive count keeps it. Exercises the production `RowGroupFilter::apply` path against the
+// shared fixture (`varlen.utf8` has 0 nulls, `bool` has 3).
+#[test]
+fn test_row_group_filter_is_null_prunes_when_nullcount_is_zero() {
+    let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
+    let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+    let row_group = metadata.metadata().row_group(0);
+
+    // `varlen.utf8` has an exact zero null count, so IS NULL matches nothing and prunes.
+    assert!(!RowGroupFilter::apply(
+        row_group,
+        &Predicate::is_null(column_name!("varlen.utf8"))
+    ));
+    // `bool` has 3 nulls, so IS NULL keeps the row group.
+    assert!(RowGroupFilter::apply(
+        row_group,
+        &Predicate::is_null(column_name!("bool"))
+    ));
 }
 
 // Intervals are unsupported for skipping under any footer encoding, so extraction returns None.
@@ -1033,10 +1098,11 @@ fn checkpoint_filter_opaque_predicate_with_missing_stats() {
 }
 
 #[test]
-fn checkpoint_filter_partition_nullcount_is_null() {
-    // All partition values are non-null, so footer nullcount for partitionValues_parsed.part_col
-    // is 0. extract_nullcount suppresses Some(0) due to the arrow-rs#9451 workaround, so
-    // get_nullcount_stat returns None. IS NULL on the partition column can't prune.
+fn checkpoint_filter_partition_is_null_prunes_when_all_values_present() {
+    // All partition values are non-null, so the footer null count for
+    // partitionValues_parsed.part_col is an exact 0 (parquet 58.1+ no longer conflates a missing
+    // count with zero, see https://github.com/apache/arrow-rs/issues/9451). `part_col IS NULL`
+    // therefore matches no add file and the row group can be pruned.
     let tmp = write_checkpoint_parquet(
         &[Some(10), Some(20)],
         &[Some(100), Some(200)],
@@ -1051,10 +1117,13 @@ fn checkpoint_filter_partition_nullcount_is_null() {
     let predicate = Predicate::is_null(column_name!("part_col"));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &partition_columns);
 
-    // extract_nullcount never returns Some(0), so nullcount stat is None (can't decide).
-    assert_eq!(filter.get_nullcount_stat(&column_name!("part_col")), None);
-    // IS NULL evaluates to None (can't decide) -> row group is kept.
-    assert_eq!(filter.eval_sql_where(&predicate), None);
+    // The footer reports an exact zero null count for the partition value column.
+    assert_eq!(
+        filter.get_nullcount_stat(&column_name!("part_col")),
+        Some(0i64.into())
+    );
+    // IS NULL evaluates to Some(false) -> the row group is pruned.
+    assert_eq!(filter.eval_sql_where(&predicate), Some(false));
 }
 
 #[test]

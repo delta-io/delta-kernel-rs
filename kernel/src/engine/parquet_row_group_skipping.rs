@@ -254,17 +254,15 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
     Some(value)
 }
 
-/// Extracts the null count from parquet footer statistics for a column.
+/// Extracts the null count from parquet footer statistics for a column. Returns `None` when the
+/// footer carries no null count for the column (parquet 58.1+ preserves a missing count as `None`
+/// rather than forcing it to zero; see https://github.com/apache/arrow-rs/issues/9451), and
+/// `Some(0)` when the footer genuinely reports zero nulls.
 fn extract_nullcount(stats: Option<&Statistics>) -> Option<i64> {
-    // WARNING: The parquet footer decoding forces missing stats to Some(0), which would cause
-    // an IS NULL predicate to wrongly skip the file if it contains any NULL values. To be safe,
-    // we must never return Some(0). See https://github.com/apache/arrow-rs/issues/9451.
-    let nullcount = stats?.null_count_opt().filter(|n| *n > 0);
-
     // Parquet nullcount stats are always u64, so we can directly return the value instead of
     // wrapping it in a Scalar. We can safely cast it from u64 to i64 because the nullcount can
     // never be larger than the rowcount and the parquet rowcount stat is i64.
-    Some(nullcount? as i64)
+    Some(stats?.null_count_opt()? as i64)
 }
 
 fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar> {
