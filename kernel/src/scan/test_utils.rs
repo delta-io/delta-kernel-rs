@@ -121,6 +121,22 @@ pub(crate) fn remove_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData
     ArrowEngineData::try_from_engine_data(parsed).unwrap()
 }
 
+// A batch of two Add actions (no other action types), parsed with the schema provided. Every row
+// has a non-null `add.path`, so this builds an all-add row group that survives an
+// `add.path IS NOT NULL` filter.
+pub(crate) fn adds_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+    let handler = SyncJsonHandler::new(None);
+    let json_strings: StringArray = vec![
+        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true}}"#,
+        r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c002.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true}}"#,
+    ]
+        .into();
+    let parsed = handler
+        .parse_json(string_array_to_engine_data(json_strings), output_schema)
+        .unwrap();
+    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+}
+
 // A batch with a Remove action and a partition column (`date`). The Remove has
 // `partitionValues: {"date": "2017-12-10"}` but the transform reads from `add.*` columns,
 // so the Remove's partition values are not visible to the data skipping filter.
