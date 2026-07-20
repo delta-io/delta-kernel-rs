@@ -12,7 +12,7 @@
 //! the supported SQL surface grows, options include moving parsing behind the
 //! [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 //!
-//! Where kernel cannot yet match Spark's coercion it errors rather than guess, so the constraint is
+//! Kernel errors out rather than guess, in cases where kernel cannot match Spark semantics, so the constraint is
 //! left to the connector (fail-closed, never a silent wrong answer). One notable such gap: a
 //! decimal literal must match the column's scale exactly (`parse_scalar` does not pad), so
 //! `amount >= 0` on a `DECIMAL(10,2)` column is rejected where Spark would read `0` as `0.00`.
