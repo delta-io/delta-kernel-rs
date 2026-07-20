@@ -88,11 +88,18 @@ pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> Delt
 ///
 /// Returns an error if the input is not a SQL form this parser accepts, or if the parsed value
 /// is not compatible with `data_type` (incompatible type, out of range, etc.).
-// Reached only via the `column-defaults-in-dev` re-export today; under `check-constraints-in-dev`
-// alone it has no caller until the lowering stage lands (which calls it via `super::parse_sql`).
+// Reached via the `column-defaults-in-dev` re-export and, under `check-constraints-in-dev`, by the
+// lowering stage (`lower` types each literal through `super::parse_sql`); dead only when neither
+// feature is enabled.
 #[cfg_attr(
-    not(feature = "column-defaults-in-dev"),
-    allow(dead_code, reason = "wired up by the check-constraints lowering stage")
+    not(any(
+        feature = "column-defaults-in-dev",
+        feature = "check-constraints-in-dev"
+    )),
+    allow(
+        dead_code,
+        reason = "wired up by column defaults and check-constraint lowering"
+    )
 )]
 pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
     let trimmed = sql.trim();
