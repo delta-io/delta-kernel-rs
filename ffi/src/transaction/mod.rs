@@ -823,9 +823,11 @@ mod tests {
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
+    #[cfg(feature = "delta-kernel-unity-catalog")]
+    use crate::snapshot_publish_with_committer;
     use crate::{
-        free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema,
-        snapshot_publish_with_committer, version, KernelStringSlice, NullableCvoid, OptionalValue,
+        free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
+        KernelStringSlice, NullableCvoid, OptionalValue,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
