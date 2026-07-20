@@ -14,6 +14,9 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+#[cfg(feature = "geo-type-in-dev")]
+use strum::{Display as StrumDisplay, EnumString};
+
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
@@ -1809,43 +1812,22 @@ fn validate_crs(crs: &str) -> DeltaResult<()> {
 
 /// Algorithm used to interpolate edges between two vertices of a geography path.
 #[cfg(feature = "geo-type-in-dev")]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, EnumString, StrumDisplay)]
 pub enum EdgeInterpolationAlgorithm {
+    #[strum(serialize = "spherical")]
     Spherical,
+
+    #[strum(serialize = "vincenty")]
     Vincenty,
+
+    #[strum(serialize = "thomas")]
     Thomas,
+
+    #[strum(serialize = "andoyer")]
     Andoyer,
+
+    #[strum(serialize = "karney")]
     Karney,
-}
-
-#[cfg(feature = "geo-type-in-dev")]
-impl Display for EdgeInterpolationAlgorithm {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Spherical => write!(f, "spherical"),
-            Self::Vincenty => write!(f, "vincenty"),
-            Self::Thomas => write!(f, "thomas"),
-            Self::Andoyer => write!(f, "andoyer"),
-            Self::Karney => write!(f, "karney"),
-        }
-    }
-}
-
-#[cfg(feature = "geo-type-in-dev")]
-impl std::str::FromStr for EdgeInterpolationAlgorithm {
-    type Err = Error;
-    fn from_str(s: &str) -> DeltaResult<Self> {
-        match s.trim() {
-            "spherical" => Ok(Self::Spherical),
-            "vincenty" => Ok(Self::Vincenty),
-            "thomas" => Ok(Self::Thomas),
-            "andoyer" => Ok(Self::Andoyer),
-            "karney" => Ok(Self::Karney),
-            other => Err(Error::generic(format!(
-                "Unknown edge interpolation algorithm: '{other}'"
-            ))),
-        }
-    }
 }
 
 /// A geometry column type with an associated coordinate reference system (CRS)
@@ -2717,26 +2699,22 @@ mod tests {
         geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
         "geography(EPSG:4326, karney)"
     )]
-    fn test_geo_deserialize_succeed(
+    fn test_geo_round_trip(
         #[case] type_str: &str,
         #[case] expected: PrimitiveType,
         #[case] canonical: &str,
     ) {
         let field: StructField = serde_json::from_str(&geo_field_json(type_str)).unwrap();
-        assert_eq!(field.data_type, DataType::Primitive(expected.clone()));
+        assert_eq!(field.data_type, DataType::Primitive(expected));
 
-        assert_eq!(expected.to_string(), canonical);
-        let roundtrip: StructField = serde_json::from_str(&geo_field_json(canonical)).unwrap();
-        assert_eq!(roundtrip.data_type, DataType::Primitive(expected));
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(json_str, geo_field_json(canonical));
     }
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
-    #[case(
-        "geography(EPSG:4326, unknown_algo)",
-        "Unknown edge interpolation algorithm"
-    )]
-    #[case("geography(EPSG:4326,)", "Unknown edge interpolation algorithm")]
+    #[case("geography(EPSG:4326, unknown_algo)", "Matching variant not found")]
+    #[case("geography(EPSG:4326,)", "Matching variant not found")]
     #[case("geometry(EPSG:4326", "Unsupported Delta table type")]
     #[case("geographyz", "Unsupported Delta table type")]
     #[case("geometry", "Unsupported Delta table type")]
@@ -2745,10 +2723,7 @@ mod tests {
     #[case("geography(, vincenty)", "must be in 'AUTHORITY:CODE' format")]
     #[case("geography(EPSG:4326)", "expected 'geography(<crs>, <algorithm>)'")]
     #[case("geography(vincenty)", "expected 'geography(<crs>, <algorithm>)'")]
-    #[case(
-        "geography(EPSG:4326, vincenty, karney)",
-        "Unknown edge interpolation algorithm"
-    )]
+    #[case("geography(EPSG:4326, vincenty, karney)", "Matching variant not found")]
     fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
         let result: Result<StructField, _> = serde_json::from_str(&geo_field_json(invalid_type));
         let err = result.expect_err(&format!("expected '{invalid_type}' to be rejected"));
