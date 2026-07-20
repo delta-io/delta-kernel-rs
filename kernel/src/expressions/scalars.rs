@@ -832,15 +832,15 @@ impl PrimitiveType {
     }
 
     fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, Error> {
+        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {
                 let (base, exp) = raw.split_at(pos);
                 // exp now has '[e/E][exponent]', strip the 'e/E' and parse it
-                (base, exp[1..].parse()?)
+                (base, exp[1..].parse().map_err(|_| parse_error())?)
             }
         };
-        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
         require!(!base.is_empty(), parse_error());
 
         // now split on any '.' and parse
@@ -865,10 +865,14 @@ impl PrimitiveType {
         let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
         require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
-            None => int_part.parse()?,
-            Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
+            None => int_part.parse().map_err(|_| parse_error())?,
+            Some(frac_part) => format!("{int_part}{frac_part}")
+                .parse()
+                .map_err(|_| parse_error())?,
         };
-        Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
+        DecimalData::try_new(int, dtype)
+            .map(Scalar::Decimal)
+            .map_err(|_| parse_error())
     }
 }
 
@@ -899,6 +903,25 @@ mod tests {
         DecimalData::try_new(123456789, dtype).expect_err("should have failed");
         PrimitiveType::parse_decimal("0.12345", dtype).expect_err("should have failed");
         PrimitiveType::parse_decimal("12345", dtype).expect_err("should have failed");
+    }
+
+    #[test]
+    fn test_decimal_parse_errors_normalized() {
+        // Failures caused by the raw decimal string must surface as ParseError, not the
+        // lower-level ParseIntError / InvalidDecimal variants they originate from.
+        let dtype = DecimalType::try_new(5, 2).unwrap();
+        let cases = [
+            "1.2e",    // non-numeric exponent -> ParseIntError from exp parse
+            "1x.23",   // non-numeric integer part -> ParseIntError from int parse
+            "1.2x",    // non-numeric fractional part -> ParseIntError from combined parse
+            "1234.56", // exceeds target precision -> InvalidDecimal from DecimalData::try_new
+        ];
+        for raw in cases {
+            match PrimitiveType::parse_decimal(raw, dtype) {
+                Err(Error::ParseError(..)) => {}
+                other => panic!("expected ParseError for {raw:?}, got {other:?}"),
+            }
+        }
     }
     #[test]
     fn test_decimal_display() {
