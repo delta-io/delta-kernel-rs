@@ -74,7 +74,7 @@ features = ["chrono-tz", "ffi", "json"]
 optional = true
 [dependencies.parquet_58]
 package = "parquet"
-version = "58"
+version = "58.1"
 features = ["async", "object_store"]
 optional = true
 
