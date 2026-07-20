@@ -108,9 +108,7 @@ pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngine
     ArrowEngineData::try_from_engine_data(parsed).unwrap()
 }
 
-// A batch containing only a Remove action, parsed with the schema provided. Under an add-only
-// read schema this projects to a null `add`, so its parquet row group carries an all-null
-// `add.path` and is skippable by an `add.path IS NOT NULL` predicate.
+// A batch containing only a Remove action, parsed with the schema provided.
 pub(crate) fn remove_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData> {
     let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = vec![

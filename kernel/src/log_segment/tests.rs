@@ -1369,10 +1369,8 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 /// A checkpoint part whose only row is a Remove action projects to a null `add` under the add-only
 /// scan checkpoint schema. `read_actions_with_projected_checkpoint_actions` derives an
 /// `add.path IS NOT NULL` predicate from that schema, which skips the part's row group so the scan
-/// never materializes the tombstone.
-///
-/// The contrast is what proves the predicate does the skipping: reading the same part with no
-/// predicate yields the null-`add` row, but reading through the derived predicate yields nothing.
+/// never materializes the tombstone. Reading the same part with no predicate (as a baseline) still
+/// yields the null-`add` row, confirming the predicate is what does the skipping.
 #[tokio::test]
 async fn test_scan_checkpoint_read_skips_all_remove_part() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1442,8 +1440,7 @@ async fn test_scan_checkpoint_read_skips_all_remove_part() -> DeltaResult<()> {
 
 /// A checkpoint row group that mixes Adds and a Remove has non-null `add.path` values, so the
 /// derived `add.path IS NOT NULL` predicate must NOT skip it. This guards against an
-/// over-aggressive predicate silently dropping live Adds (or resurrecting a removed file by
-/// dropping the group that also proves the file gone).
+/// over-aggressive predicate silently dropping live Adds.
 #[tokio::test]
 async fn test_scan_checkpoint_read_keeps_mixed_add_remove_part() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();

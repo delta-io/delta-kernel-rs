@@ -128,14 +128,11 @@ pub(crate) struct LogSegment {
 /// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
 ///
 /// For `add`, an `add.path IS NOT NULL` predicate drops a checkpoint's Remove tombstones, which
-/// project to a null `add` under an add-only read schema. Scan log replay already discards
-/// checkpoint removes without deduplicating on them (`skip_removes = !is_log_batch`), so filtering
-/// them out at the parquet layer changes no survivor and lets the reader skip all-remove row
-/// groups. This makes the predicate safe only for a reader that ignores checkpoint removes: it is
-/// emitted for an add-only checkpoint read schema, while a multi-action schema that also names
-/// `remove` (checkpoint write, log compaction) has no identifying column for `remove` and
-/// short-circuits to `None` below, preserving tombstones. Commit reads use a separate schema, so
-/// removes in commits are unaffected.
+/// project to a null `add` under an add-only read schema. This is safe because scan log replay
+/// already discards checkpoint removes without deduplicating on them (`skip_removes =
+/// !is_log_batch`), so skipping all-remove row groups changes no survivor. A schema that also
+/// names `remove` (checkpoint write, log compaction) has no identifying column for it and
+/// short-circuits to `None` below, preserving tombstones.
 fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
     match action_name {
         ADD_NAME => Some(column_name!(ADD_NAME, "path")),
