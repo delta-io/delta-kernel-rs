@@ -17,6 +17,8 @@ use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
 
 #[cfg(feature = "check-constraints-in-dev")]
+mod parser;
+#[cfg(feature = "check-constraints-in-dev")]
 mod token;
 
 /// Parse a SQL string into an [`Expression`] that yields a value of the given [`DataType`]
@@ -37,12 +39,6 @@ mod token;
 ///
 /// Returns an error if the input is not a SQL form this parser accepts, or if the parsed value
 /// is not compatible with `data_type` (incompatible type, out of range, etc.).
-// Reached only via the `column-defaults-in-dev` re-export today; under `check-constraints-in-dev`
-// alone it has no caller until the lowering stage lands (which calls it via `super::parse_sql`).
-#[cfg_attr(
-    not(feature = "column-defaults-in-dev"),
-    allow(dead_code, reason = "wired up by the check-constraints lowering stage")
-)]
 pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {

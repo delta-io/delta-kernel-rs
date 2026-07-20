@@ -11,31 +11,27 @@ use super::LogSegment;
 use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::crc::Crc;
 use crate::log_replay::ActionsBatch;
-use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::ProtocolMetadataSource;
 use crate::schema::schema_ref;
 use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// Returns an error if either is missing.
+    /// Returns an error if either is missing, and the [`ProtocolMetadataSource`] describing how
+    /// P&M was resolved.
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
-    ///
-    /// Reports metrics: `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure`.
-    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, crc))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-        metric_context: SnapshotLoadMetricContext,
-    ) -> DeltaResult<(Metadata, Protocol)> {
+    ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
-            (Some(m), Some(p)) => Ok((m, p)),
-            (None, Some(_)) => Err(Error::MissingMetadata),
-            (Some(_), None) => Err(Error::MissingProtocol),
-            (None, None) => Err(Error::MissingMetadataAndProtocol),
+            (Some(m), Some(p), source) => Ok((m, p, source)),
+            (None, Some(_), _) => Err(Error::MissingMetadata),
+            (Some(_), None, _) => Err(Error::MissingProtocol),
+            (None, None, _) => Err(Error::MissingMetadataAndProtocol),
         }
     }
 
@@ -53,11 +49,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
-            return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
+            return Ok((
+                Some(crc.metadata.clone()),
+                Some(crc.protocol.clone()),
+                ProtocolMetadataSource::CrcAtTarget,
+            ));
         }
 
         // We didn't return above, so we need to do log replay to find P&M.
@@ -80,7 +80,11 @@ impl LogSegment {
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
-                return Ok((metadata_opt, protocol_opt));
+                return Ok((
+                    metadata_opt,
+                    protocol_opt,
+                    ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+                ));
             }
 
             // Case 2(b): P&M incomplete from pruned replay, use the CRC.
@@ -90,11 +94,17 @@ impl LogSegment {
             return Ok((
                 metadata_opt.or_else(|| Some(crc.metadata.clone())),
                 protocol_opt.or_else(|| Some(crc.protocol.clone())),
+                ProtocolMetadataSource::CrcSeededPmOnlyReplay,
             ));
         }
 
         // Case 3: Full P&M log replay.
-        self.replay_for_pm(engine)
+        let (metadata_opt, protocol_opt) = self.replay_for_pm(engine)?;
+        Ok((
+            metadata_opt,
+            protocol_opt,
+            ProtocolMetadataSource::FullReplay,
+        ))
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.

@@ -74,23 +74,16 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
-- `column-defaults-in-dev` -- column defaults support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
-  listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
-  carrier type and the SQL literal parser (`parse_sql`).
-- `check-constraints-in-dev` -- CHECK constraints support (experimental, in development). Gates the
-  in-progress CHECK-constraint SQL parsing and, later, `checkConstraints` write enforcement.
-  Reading `delta.constraints.*` properties into `TableProperties` is always compiled.
 - `adaptive-metadata-in-dev` -- adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
 - `interval-type-in-dev` -- ANSI interval type support (experimental, in development). Gates
-  kernel support for the `intervalType-preview` reader-writer feature: with the flag off, both
-  reads and writes of tables that declare this feature are blocked. With the flag on, such tables
-  are readable (scan and CDF) but writes are still refused, since write support is not yet
-  implemented. Reads of legacy featureless interval tables (which never declare the feature) are
-  unaffected either way.
+  `KernelSupport::Supported` for the `intervalType-preview` reader-writer feature. CREATE TABLE
+  auto-enables the table feature when the schema contains an interval column. With the cargo
+  feature off, creating or writing any table with interval columns is blocked, as are reads and
+  writes of tables listing `intervalType-preview`. Reads of legacy featureless interval tables
+  (which never declare the table feature) remain supported.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost

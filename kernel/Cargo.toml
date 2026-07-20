@@ -117,10 +117,6 @@ schema-diff = []
 # Declarative plan IR (experimental).
 declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored"]
 
-# Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
-# work. TODO(#2630): remove once full column-defaults support ships.
-column-defaults-in-dev = []
-
 # Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
 # work. TODO(#2896): remove once full check-constraints support ships.
 check-constraints-in-dev = []

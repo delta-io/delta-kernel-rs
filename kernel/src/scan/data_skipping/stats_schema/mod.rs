@@ -372,8 +372,8 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 /// This is also used to validate clustering column types, since clustering requires
 /// per-file statistics on clustering columns.
 ///
-/// Note: Boolean and Binary are intentionally excluded as min/max statistics provide minimal
-/// skipping benefit for low-cardinality or opaque data types.
+/// Note: Boolean, Binary, and Interval are intentionally excluded as min/max statistics provide
+/// minimal skipping benefit or do not have stable protocol-level ordering semantics.
 ///
 /// Void is also excluded: void columns are never materialized to Parquet, so min/max are not
 /// meaningful. When `nullCount` stats are present for a void column, `eval_pred_is_null` can
@@ -655,10 +655,12 @@ mod tests {
         // - "id" (LONG) - eligible for both null count and min/max
         // - "is_active" (BOOLEAN) - eligible for null count but NOT for min/max
         // - "metadata" (BINARY) - eligible for null count but NOT for min/max
+        // - "duration" (INTERVAL_DAY_TIME) - eligible for null count but NOT for min/max
         let file_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("is_active", DataType::BOOLEAN),
             StructField::nullable("metadata", DataType::BINARY),
+            StructField::nullable("duration", DataType::INTERVAL_DAY_TIME),
         ]);
 
         let stats_schema = expected_stats_schema(
@@ -674,9 +676,10 @@ mod tests {
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
+            StructField::nullable("duration", DataType::LONG),
         ]);
 
-        // Expected minValues/maxValues schema: only eligible fields (no boolean, no binary)
+        // Expected minValues/maxValues schema: only eligible fields
         let expected_min_max =
             StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
@@ -748,6 +751,7 @@ mod tests {
         let file_schema = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::BOOLEAN),
             StructField::nullable("metadata", DataType::BINARY),
+            StructField::nullable("duration", DataType::INTERVAL_DAY_TIME),
             StructField::nullable("tags", ArrayType::new(DataType::STRING, false)),
         ]);
 
@@ -759,14 +763,15 @@ mod tests {
         )
         .unwrap();
 
-        // nullCount includes boolean, binary, and array (all non-struct types get nullCount)
+        // nullCount includes all selected non-struct fields
         let expected_null_count = StructType::new_unchecked([
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
+            StructField::nullable("duration", DataType::LONG),
             StructField::nullable("tags", DataType::LONG),
         ]);
 
-        // minValues/maxValues: no fields are eligible (boolean/binary/array excluded)
+        // minValues/maxValues: no fields are eligible
         let expected = StructType::new_unchecked([
             StructField::nullable(NUM_RECORDS, DataType::LONG),
             StructField::nullable(NULL_COUNT, expected_null_count),
@@ -774,6 +779,39 @@ mod tests {
         ]);
 
         assert_eq!(&expected, &stats_schema);
+    }
+
+    #[rstest::rstest]
+    #[case::num_indexed_cols("delta.dataSkippingNumIndexedCols", "1")]
+    #[case::stats_columns("delta.dataSkippingStatsColumns", "iv")]
+    fn test_interval_stats_respect_column_selection(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+        #[case] property_name: &str,
+        #[case] property_value: &str,
+    ) {
+        let properties: TableProperties = [(property_name, property_value)].into();
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("iv", interval),
+            StructField::nullable("value", DataType::LONG),
+        ]);
+
+        let stats_schema = expected_stats_schema(
+            &file_schema,
+            &stats_config_from_table_properties(&properties),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(
+                NULL_COUNT,
+                StructType::new_unchecked([StructField::nullable("iv", DataType::LONG)]),
+            ),
+            StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
+        ]);
+        assert_eq!(expected, stats_schema);
     }
 
     #[test]

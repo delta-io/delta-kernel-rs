@@ -228,7 +228,7 @@ pub enum Error {
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
 
-    /// Schema mismatch has occurred or invalid schema used somewhere
+    /// Schema mismatch has occurred or invalid/not-kernel-supported schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
 
