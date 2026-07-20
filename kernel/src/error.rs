@@ -185,6 +185,7 @@ pub enum Error {
     InvalidDecimal(String),
 
     /// Invalid CRS or other parameter for a Geometry / Geography type
+    #[cfg(feature = "geo-type-in-dev")]
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
 
@@ -299,6 +300,7 @@ impl Error {
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
     }
+    #[cfg(feature = "geo-type-in-dev")]
     pub fn invalid_geo_params(msg: impl ToString) -> Self {
         Self::InvalidGeoParams(msg.to_string())
     }

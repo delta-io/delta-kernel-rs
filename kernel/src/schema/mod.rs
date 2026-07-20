@@ -1783,6 +1783,7 @@ fn default_true() -> bool {
 /// Validates that a CRS is in AUTHORITY:CODE form: contains a colon, has non-empty text
 /// before and after it, and has no leading or trailing whitespace. Validating the value
 /// against the full set of recognized CRSes is future work.
+#[cfg(feature = "geo-type-in-dev")]
 fn validate_crs(crs: &str) -> DeltaResult<()> {
     require!(
         crs == crs.trim(),
@@ -1807,6 +1808,7 @@ fn validate_crs(crs: &str) -> DeltaResult<()> {
 }
 
 /// Algorithm used to interpolate edges between two vertices of a geography path.
+#[cfg(feature = "geo-type-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeInterpolationAlgorithm {
     Spherical,
@@ -1816,6 +1818,7 @@ pub enum EdgeInterpolationAlgorithm {
     Karney,
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl Display for EdgeInterpolationAlgorithm {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1828,6 +1831,7 @@ impl Display for EdgeInterpolationAlgorithm {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl std::str::FromStr for EdgeInterpolationAlgorithm {
     type Err = Error;
     fn from_str(s: &str) -> DeltaResult<Self> {
@@ -1845,11 +1849,13 @@ impl std::str::FromStr for EdgeInterpolationAlgorithm {
 }
 
 /// A geometry column type with an associated coordinate reference system (CRS)
+#[cfg(feature = "geo-type-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeometryType {
     crs: String,
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl GeometryType {
     /// Constructs a GeometryType from the given CRS, or returns an error if the CRS is
     /// not in AUTHORITY:CODE form.
@@ -1865,6 +1871,7 @@ impl GeometryType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl Display for GeometryType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "geometry({})", self.crs)
@@ -1872,12 +1879,14 @@ impl Display for GeometryType {
 }
 
 /// Geography column type with an associated CRS and edge interpolation algorithm.
+#[cfg(feature = "geo-type-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeographyType {
     crs: String,
     algorithm: EdgeInterpolationAlgorithm,
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl GeographyType {
     /// Constructs a GeographyType from the given CRS and edge interpolation algorithm, or
     /// returns an error if the CRS is not in AUTHORITY:CODE form.
@@ -1898,6 +1907,7 @@ impl GeographyType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl Display for GeographyType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "geography({}, {})", self.crs, self.algorithm)
@@ -1977,9 +1987,11 @@ pub enum PrimitiveType {
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
     /// Geometry column with an associated coordinate reference system (CRS).
+    #[cfg(feature = "geo-type-in-dev")]
     #[serde(serialize_with = "serialize_geometry", untagged)]
     Geometry(Box<GeometryType>),
     /// Geography column with an associated CRS and edge interpolation algorithm.
+    #[cfg(feature = "geo-type-in-dev")]
     #[serde(serialize_with = "serialize_geography", untagged)]
     Geography(Box<GeographyType>),
 }
@@ -2056,6 +2068,7 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 fn serialize_geometry<S: serde::Serializer>(
     gtype: &GeometryType,
     serializer: S,
@@ -2063,6 +2076,7 @@ fn serialize_geometry<S: serde::Serializer>(
     serializer.serialize_str(&gtype.to_string())
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 fn serialize_geography<S: serde::Serializer>(
     gtype: &GeographyType,
     serializer: S,
@@ -2151,6 +2165,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .map(PrimitiveType::Decimal)
                     .map_err(serde::de::Error::custom)
             }
+            #[cfg(feature = "geo-type-in-dev")]
             geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
                 let crs = &geo_str[9..geo_str.len() - 1];
                 GeometryType::try_new(crs.trim())
@@ -2158,6 +2173,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .map(PrimitiveType::Geometry)
                     .map_err(serde::de::Error::custom)
             }
+            #[cfg(feature = "geo-type-in-dev")]
             geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
                 let inner = &geo_str[10..geo_str.len() - 1];
                 // Kernel accepts only the canonical serialized form that every writer emits:
@@ -2207,7 +2223,9 @@ impl Display for PrimitiveType {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
             PrimitiveType::Void => write!(f, "void"),
+            #[cfg(feature = "geo-type-in-dev")]
             PrimitiveType::Geometry(t) => write!(f, "{t}"),
+            #[cfg(feature = "geo-type-in-dev")]
             PrimitiveType::Geography(t) => write!(f, "{t}"),
         }
     }
@@ -2242,21 +2260,25 @@ impl From<DecimalType> for DataType {
         PrimitiveType::from(dtype).into()
     }
 }
+#[cfg(feature = "geo-type-in-dev")]
 impl From<GeometryType> for PrimitiveType {
     fn from(gtype: GeometryType) -> Self {
         PrimitiveType::Geometry(Box::new(gtype))
     }
 }
+#[cfg(feature = "geo-type-in-dev")]
 impl From<GeometryType> for DataType {
     fn from(gtype: GeometryType) -> Self {
         PrimitiveType::from(gtype).into()
     }
 }
+#[cfg(feature = "geo-type-in-dev")]
 impl From<GeographyType> for PrimitiveType {
     fn from(gtype: GeographyType) -> Self {
         PrimitiveType::Geography(Box::new(gtype))
     }
 }
+#[cfg(feature = "geo-type-in-dev")]
 impl From<GeographyType> for DataType {
     fn from(gtype: GeographyType) -> Self {
         PrimitiveType::from(gtype).into()
@@ -2648,14 +2670,17 @@ mod tests {
         test_deep_nested_schema_missing_leaf_cm,
     };
 
+    #[cfg(feature = "geo-type-in-dev")]
     fn geography(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
         PrimitiveType::Geography(Box::new(GeographyType::try_new(crs, algorithm).unwrap()))
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
     fn geo_field_json(type_str: &str) -> String {
         format!(r#"{{"name":"g","type":"{type_str}","nullable":true,"metadata":{{}}}}"#)
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     #[case(
         "geometry(EPSG:4326)",
@@ -2705,6 +2730,7 @@ mod tests {
         assert_eq!(roundtrip.data_type, DataType::Primitive(expected));
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     #[case(
         "geography(EPSG:4326, unknown_algo)",
@@ -2732,6 +2758,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     fn test_geo_try_new_rejects_invalid_crs(
         #[values(

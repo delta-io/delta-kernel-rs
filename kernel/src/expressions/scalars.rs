@@ -789,6 +789,7 @@ impl PrimitiveType {
                 "Interval types are not supported as scalar or partition values",
             )),
             // Kernel does not support parsing text into Geometry/Geography types yet.
+            #[cfg(feature = "geo-type-in-dev")]
             Geometry(_) | Geography(_) => Err(Error::Unsupported(format!(
                 "parse_scalar is not supported for {self:?}"
             ))),
@@ -897,6 +898,7 @@ mod tests {
         PrimitiveType::Void.parse_scalar("anything").unwrap_err();
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest::rstest]
     #[case(PrimitiveType::Geometry(Box::new(
         crate::schema::GeometryType::try_new("EPSG:4326").unwrap()

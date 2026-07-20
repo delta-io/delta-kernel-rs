@@ -203,6 +203,7 @@ fn extract_min_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (Decimal(..), _) => return None,
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
+        #[cfg(feature = "geo-type-in-dev")]
         (Geometry(_) | Geography(_), _) => return None,
     };
     Some(value)
@@ -251,6 +252,7 @@ fn extract_max_scalar(data_type: &DataType, stats: &Statistics) -> Option<Scalar
         (Decimal(..), _) => return None,
         // Void columns have no Parquet representation, so no stats exist
         (Void, _) => return None,
+        #[cfg(feature = "geo-type-in-dev")]
         (Geometry(_) | Geography(_), _) => return None,
     };
     Some(value)

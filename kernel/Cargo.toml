@@ -128,6 +128,9 @@ check-constraints-in-dev = []
 # Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
 # (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
 adaptive-metadata-in-dev = []
+# Experimental, temporary, test-only feature flag guarding the in-progress geospatial
+# (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
+geo-type-in-dev = []
 
 # Experimental, temporary feature flag guarding the in-progress ANSI interval-type work.
 # Gates `KernelSupport::Supported` for the `intervalType-preview` reader-writer table feature;

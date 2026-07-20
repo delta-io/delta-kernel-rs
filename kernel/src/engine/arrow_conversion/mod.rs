@@ -373,6 +373,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
                     // Geometry/Geography are not yet supported by the default engine. They are
                     // representable in a kernel schema but no engine operation materializes them.
+                    #[cfg(feature = "geo-type-in-dev")]
                     PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
                         Err(ArrowError::SchemaError(format!(
                             "Geo types are not yet supported in the default engine: {p}"
@@ -666,9 +667,11 @@ mod tests {
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, EdgeInterpolationAlgorithm, GeographyType,
-        GeometryType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+        StructType,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::transforms::{transform_output_type, SchemaTransform};
     use crate::utils::test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
@@ -676,6 +679,7 @@ mod tests {
     };
     use crate::DeltaResult;
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     #[case(DataType::Primitive(PrimitiveType::Geometry(Box::new(
         GeometryType::try_new("EPSG:4326").unwrap()

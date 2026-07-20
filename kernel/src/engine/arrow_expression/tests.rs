@@ -1504,6 +1504,7 @@ fn test_interval_scalar_to_array_unsupported(#[case] interval_type: KernelDataTy
     );
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 #[rstest]
 #[case(KernelDataType::Primitive(crate::schema::PrimitiveType::Geometry(Box::new(
     crate::schema::GeometryType::try_new("EPSG:4326").unwrap()

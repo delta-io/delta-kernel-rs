@@ -344,9 +344,10 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
                 // TODO(#2811): add visit_interval_* callbacks; skipping silently drops the column
                 tracing::warn!("Skipping unsupported interval field '{name}' in FFI schema visit");
             }
+            #[cfg(feature = "geo-type-in-dev")]
             DataType::Primitive(PrimitiveType::Geometry(_))
             | DataType::Primitive(PrimitiveType::Geography(_)) => {
-                // TODO(#2914): add visit_geometry / visit_geography callbacks carrying the CRS;
+                // TODO(#2949): add visit_geometry / visit_geography callbacks carrying the CRS;
                 // skipping silently drops the column
                 tracing::warn!("Skipping unsupported geo field '{name}' in FFI schema visit");
             }

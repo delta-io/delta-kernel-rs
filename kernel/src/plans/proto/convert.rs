@@ -4,7 +4,9 @@ use super::plan::agg as proto_agg;
 use super::schema::data_type::Kind as DataTypeKind;
 use super::schema::metadata_value::Value as MetadataValueKind;
 use super::schema::primitive_type::Kind as PrimitiveTypeKind;
-use super::schema::{EdgeInterpolationAlgorithm as EdgeAlgo, SimplePrimitiveType as Simple};
+#[cfg(feature = "geo-type-in-dev")]
+use super::schema::EdgeInterpolationAlgorithm as EdgeAlgo;
+use super::schema::SimplePrimitiveType as Simple;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
 };
@@ -22,9 +24,11 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
 use crate::schema::{
-    ArrayType, DataType, DecimalType, EdgeInterpolationAlgorithm, GeographyType, GeometryType,
-    MapType, MetadataValue, PrimitiveType, StructField, StructType,
+    ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
+    StructType,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 use crate::{DeltaResult, Error, FileMeta, FileSlice};
 
 // === Helpers ===
@@ -628,9 +632,11 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Timestamp => PrimitiveTypeKind::Simple(Simple::Timestamp as i32),
             PrimitiveType::TimestampNtz => PrimitiveTypeKind::Simple(Simple::TimestampNtz as i32),
             PrimitiveType::Decimal(decimal) => PrimitiveTypeKind::Decimal((*decimal).into()),
+            #[cfg(feature = "geo-type-in-dev")]
             PrimitiveType::Geometry(geometry) => {
                 PrimitiveTypeKind::Geometry(geometry.as_ref().into())
             }
+            #[cfg(feature = "geo-type-in-dev")]
             PrimitiveType::Geography(geography) => {
                 PrimitiveTypeKind::Geography(geography.as_ref().into())
             }
@@ -655,6 +661,7 @@ impl From<DecimalType> for proto_schema::DecimalType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl From<&GeometryType> for proto_schema::GeometryType {
     fn from(geometry: &GeometryType) -> Self {
         proto_schema::GeometryType {
@@ -663,6 +670,7 @@ impl From<&GeometryType> for proto_schema::GeometryType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl From<&GeographyType> for proto_schema::GeographyType {
     fn from(geography: &GeographyType) -> Self {
         proto_schema::GeographyType {
@@ -672,6 +680,7 @@ impl From<&GeographyType> for proto_schema::GeographyType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl From<&EdgeInterpolationAlgorithm> for EdgeAlgo {
     fn from(algorithm: &EdgeInterpolationAlgorithm) -> Self {
         match algorithm {
@@ -827,11 +836,21 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                 }
             }
             PrimitiveTypeKind::Decimal(decimal) => PrimitiveType::Decimal(decimal.try_into()?),
+            #[cfg(feature = "geo-type-in-dev")]
             PrimitiveTypeKind::Geometry(geometry) => {
                 PrimitiveType::Geometry(Box::new(geometry.try_into()?))
             }
+            #[cfg(feature = "geo-type-in-dev")]
             PrimitiveTypeKind::Geography(geography) => {
                 PrimitiveType::Geography(Box::new(geography.try_into()?))
+            }
+            // The proto oneof always carries the geo variants, but kernel only knows how to decode
+            // them when the geo feature is enabled.
+            #[cfg(not(feature = "geo-type-in-dev"))]
+            PrimitiveTypeKind::Geometry(_) | PrimitiveTypeKind::Geography(_) => {
+                return Err(Error::schema(
+                    "geometry/geography types require the 'geo-type-in-dev' feature",
+                ))
             }
         };
         Ok(primitive)
@@ -850,6 +869,7 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeometryType> for GeometryType {
     type Error = Error;
     fn try_from(proto: proto_schema::GeometryType) -> DeltaResult<Self> {
@@ -857,6 +877,7 @@ impl TryFrom<proto_schema::GeometryType> for GeometryType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<proto_schema::GeographyType> for GeographyType {
     type Error = Error;
     fn try_from(proto: proto_schema::GeographyType) -> DeltaResult<Self> {
@@ -872,6 +893,7 @@ impl TryFrom<proto_schema::GeographyType> for GeographyType {
     }
 }
 
+#[cfg(feature = "geo-type-in-dev")]
 impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
     type Error = Error;
     fn try_from(proto: EdgeAlgo) -> DeltaResult<Self> {
@@ -968,9 +990,11 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, EdgeInterpolationAlgorithm, GeographyType, GeometryType,
-        MapType, MetadataValue, PrimitiveType, SchemaRef, StructField, StructType,
+        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
+        StructField, StructType,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::{DeltaResult, FileMeta, FileSlice};
 
     // === Test helpers ===
@@ -2130,6 +2154,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     #[case(GeometryType::try_new("OGC:CRS84").unwrap())]
     #[case(GeometryType::try_new("EPSG:4326").unwrap())]
@@ -2139,6 +2164,7 @@ mod tests {
         ))));
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     fn round_trip_geography(
         #[values("OGC:CRS84", "EPSG:4326")] crs: &str,

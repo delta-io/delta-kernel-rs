@@ -403,12 +403,16 @@ pub(crate) fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "geo-type-in-dev")]
     use rstest::rstest;
 
     use super::*;
-    use crate::schema::{ArrayType, EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+    use crate::schema::ArrayType;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::table_properties::TableProperties;
 
+    #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
     #[case(PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())))]
     #[case(PrimitiveType::Geography(Box::new(

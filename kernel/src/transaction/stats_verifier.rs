@@ -190,9 +190,11 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
             format!("Interval types are not supported for stats validation: {dt}"),
         )),
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => Err(
+            Error::internal_error(format!("Unsupported data type for stats validation: {dt}")),
+        ),
         &DataType::VOID
-        | DataType::Primitive(PrimitiveType::Geometry(_))
-        | DataType::Primitive(PrimitiveType::Geography(_))
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -229,9 +231,13 @@ fn is_stat_present<'b>(
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
             format!("Interval types are not supported for stats presence check: {data_type}"),
         )),
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+            Err(Error::internal_error(format!(
+                "Unsupported data type for stats presence check: {data_type}"
+            )))
+        }
         &DataType::VOID
-        | DataType::Primitive(PrimitiveType::Geometry(_))
-        | DataType::Primitive(PrimitiveType::Geography(_))
         | DataType::Struct(_)
         | DataType::Array(_)
         | DataType::Map(_)
@@ -344,7 +350,7 @@ impl RowVisitor for NumRecordsValidator<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "geo-type-in-dev"))]
 mod tests {
     use rstest::rstest;
 

@@ -520,7 +520,8 @@ impl NullTypeTag {
                 // algorithm) that cannot fit in the (tag, u8, u8) payload. Like intervals
                 // above, they fall back to the sentinel so a reconstruction attempt errors
                 // rather than silently mistyping the null; the CRS is not recoverable from
-                // the tag. See #2914 for adding real geo FFI support.
+                // the tag. See #2949 for adding real geo FFI support.
+                #[cfg(feature = "geo-type-in-dev")]
                 PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
                     (Self::NonPrimitive, 0, 0)
                 }
