@@ -66,7 +66,6 @@ fn metadata_with_row_tracking(schema: SchemaRef) -> Action {
     )
 }
 
-/// Table config that supports and enables row tracking, for the [`CdfMode::ReadTime`] path.
 fn get_row_tracking_table_config(table_root: &url::Url) -> TableConfiguration {
     let metadata = Metadata::try_new(
         None,
@@ -101,7 +100,7 @@ fn execute_row_tracking(
         commits,
         end_schema,
         None,
-        CdfMode::ReadTime,
+        CdfMode::RowTracking,
     )?
     .try_collect()
 }
@@ -1199,7 +1198,7 @@ async fn file_meta_timestamp() {
         &mut table_config,
         commit,
         &get_schema(),
-        CdfMode::WriteTime,
+        CdfMode::ChangeDataFeed,
     )
     .unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
@@ -1499,7 +1498,7 @@ async fn test_timestamp_with_ict_enabled() {
         &mut table_config,
         commit,
         &get_schema(),
-        CdfMode::WriteTime,
+        CdfMode::ChangeDataFeed,
     )
     .unwrap();
     assert_eq!(scanner.timestamp, 2000);
@@ -1550,7 +1549,7 @@ async fn test_timestamp_with_ict_disabled() {
         &mut table_config,
         commit.clone(),
         &get_schema(),
-        CdfMode::WriteTime,
+        CdfMode::ChangeDataFeed,
     )
     .unwrap();
     assert_ne!(scanner.timestamp, 2000);
@@ -1608,7 +1607,7 @@ async fn test_timestamp_with_commit_info_not_first() {
         &mut table_config,
         commit,
         &get_schema(),
-        CdfMode::WriteTime,
+        CdfMode::ChangeDataFeed,
     );
 
     // Should error because ICT is enabled but not found in the first action

@@ -63,14 +63,14 @@ pub(crate) fn table_changes_action_iter(
         commit_files,
         table_schema,
         physical_predicate,
-        CdfMode::WriteTime,
+        CdfMode::ChangeDataFeed,
     )
 }
 
 /// Replays change-feed actions according to `mode`.
 ///
-/// [`CdfMode::WriteTime`] uses `AddCDCFile` actions because they contain changes recorded by
-/// the writer. [`CdfMode::ReadTime`] ignores those actions and reconstructs changes from
+/// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
+/// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
 /// row lineage in the data files referenced by `add` and `remove` actions.
 pub(crate) fn table_changes_action_iter_with_mode(
     engine: Arc<dyn Engine>,
@@ -119,8 +119,8 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///    In this phase, we do the following:
 ///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
 ///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead of
-///       time whether to filter out add/remove actions. In [`CdfMode::ReadTime`] mode `cdc` actions
-///       are ignored entirely (never flagged), so add/remove actions always drive the feed.
+///       time whether to filter out add/remove actions. In [`CdfMode::RowTracking`] mode `cdc`
+///       actions are ignored entirely, so add/remove actions always drive the feed.
 ///     - Constructs the remove deletion vector map from paths belonging to `remove` actions to the
 ///       action's corresponding [`DvInfo`]. This map will be filtered to only contain paths that
 ///       exists in another `add` action _within the same commit_. We store the result in
@@ -473,8 +473,8 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                         .insert(path.to_string(), DvInfo { deletion_vector });
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
-                // A cdc action supersedes add and remove actions only for write-time replay.
-                if self.mode == CdfMode::WriteTime {
+                // A cdc action supersedes add and remove actions only in change-data-feed mode.
+                if self.mode == CdfMode::ChangeDataFeed {
                     *self.has_cdc_action = true;
                 }
             }

@@ -109,9 +109,9 @@ impl TableChangesScanBuilder {
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
     pub fn build(self) -> DeltaResult<TableChangesScan> {
-        // Read-time CDF requires row-level reconciliation by row IDs, which this
+        // Row-tracking CDF requires row-level reconciliation by row IDs, which this
         // scanner does not perform.
-        if self.table_changes.mode != CdfMode::WriteTime {
+        if self.table_changes.mode != CdfMode::ChangeDataFeed {
             return Err(Error::unsupported(
                 "A row-tracking TableChanges cannot be scanned for data; use \
                  TableChanges::scan_file_listing instead",

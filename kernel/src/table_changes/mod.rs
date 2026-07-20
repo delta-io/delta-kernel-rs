@@ -73,7 +73,7 @@ pub enum TableChangesListingMode {
     NetChanges,
 }
 
-/// Selects which semantics a [`TableChanges`] uses to derive the change data feed.
+/// Identifies the table feature that must remain enabled across the change-feed range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CdfMode {
     /// Uses change data recorded by writers.
@@ -81,68 +81,67 @@ pub(crate) enum CdfMode {
     /// This mode requires `delta.enableChangeDataFeed`. It reads `_change_data` files when a
     /// commit contains them and otherwise derives changes from `add` and `remove` actions. The
     /// data-reading [`scan`] and `execute` paths use these semantics.
-    WriteTime,
+    ChangeDataFeed,
     /// Uses row lineage to reconstruct changes while reading data files.
     ///
     /// This mode requires `delta.enableRowTracking`. It ignores `_change_data` files and returns
     /// metadata from `add` and `remove` actions for [`TableChanges::scan_file_listing`].
-    ReadTime,
+    RowTracking,
 }
 
 impl CdfMode {
     /// The table feature that must be enabled across the entire change-feed range for this mode.
     pub(crate) fn required_feature(self) -> TableFeature {
         match self {
-            CdfMode::WriteTime => TableFeature::ChangeDataFeed,
-            CdfMode::ReadTime => TableFeature::RowTracking,
+            CdfMode::ChangeDataFeed => TableFeature::ChangeDataFeed,
+            CdfMode::RowTracking => TableFeature::RowTracking,
         }
     }
 
-    /// The error to return when [`CdfMode::required_feature`] is not enabled at `version`. Each
-    /// mode has its own typed error variant ([`Error::ChangeDataFeedUnsupported`] /
-    /// [`Error::RowTrackingChangeFeedUnsupported`]) so callers can match on the cause.
+    /// Returns the mode-specific error when [`CdfMode::required_feature`] is disabled at `version`.
     pub(crate) fn feature_disabled_error(self, version: Version) -> Error {
         match self {
-            CdfMode::WriteTime => Error::change_data_feed_unsupported(version),
-            CdfMode::ReadTime => Error::row_tracking_change_feed_unsupported(version),
+            CdfMode::ChangeDataFeed => Error::change_data_feed_unsupported(version),
+            CdfMode::RowTracking => Error::row_tracking_change_feed_unsupported(version),
         }
     }
 
     /// Whether data written with `candidate` can be read using the change feed's `read_schema`.
     ///
-    /// Write-time CDF requires exact equality. Read-time CDF accepts top-level field additions
-    /// while requiring common fields to retain their types without tightening nullability.
+    /// [`CdfMode::ChangeDataFeed`] requires exact equality. Row-tracking CDF accepts top-level
+    /// field additions while requiring common fields to retain their types without tightening
+    /// nullability.
     pub(crate) fn schemas_compatible(
         self,
         candidate: &StructType,
         read_schema: &StructType,
     ) -> bool {
         match self {
-            CdfMode::WriteTime => candidate == read_schema,
-            CdfMode::ReadTime => read_time_cdf_schema_compatible(candidate, read_schema),
+            CdfMode::ChangeDataFeed => candidate == read_schema,
+            CdfMode::RowTracking => row_tracking_cdf_schema_compatible(candidate, read_schema),
         }
     }
 
     /// Returns the mode-specific error for incompatible range-boundary schemas.
     pub(crate) fn boundary_schema_error(self, start: &StructType, end: &StructType) -> Error {
         match self {
-            CdfMode::WriteTime => Error::generic(format!(
+            CdfMode::ChangeDataFeed => Error::generic(format!(
                 "Failed to build TableChanges: Start and end version schemas are different. Found start version schema {start:?} and end version schema {end:?}",
             )),
-            CdfMode::ReadTime => Error::change_data_feed_incompatible_schema(end, start),
+            CdfMode::RowTracking => Error::change_data_feed_incompatible_schema(end, start),
         }
     }
 
     /// Maps a reader-support failure on a protocol update to the mode-specific error.
     pub(crate) fn protocol_support_error(self, underlying: Error, version: Version) -> Error {
         match self {
-            CdfMode::WriteTime => Error::change_data_feed_unsupported(version),
-            CdfMode::ReadTime => underlying,
+            CdfMode::ChangeDataFeed => Error::change_data_feed_unsupported(version),
+            CdfMode::RowTracking => underlying,
         }
     }
 }
 
-fn read_time_cdf_schema_compatible(candidate: &StructType, read_schema: &StructType) -> bool {
+fn row_tracking_cdf_schema_compatible(candidate: &StructType, read_schema: &StructType) -> bool {
     candidate.fields().all(|candidate_field| {
         read_schema
             .field(candidate_field.name())
@@ -245,7 +244,7 @@ impl TableChanges {
             engine,
             start_version,
             end_version,
-            CdfMode::WriteTime,
+            CdfMode::ChangeDataFeed,
         )
     }
 
@@ -271,7 +270,7 @@ impl TableChanges {
     /// Returns an error if the range cannot be loaded, row tracking is unavailable within the
     /// range, an enabled reader feature is unsupported, or a schema is incompatible with the
     /// end-version schema.
-    pub fn try_new_row_tracking(
+    pub fn try_new_row_tracking_cdf_listing(
         table_root: Url,
         engine: &dyn Engine,
         start_version: Version,
@@ -282,7 +281,7 @@ impl TableChanges {
             engine,
             start_version,
             end_version,
-            CdfMode::ReadTime,
+            CdfMode::RowTracking,
         )
     }
 
@@ -412,21 +411,22 @@ impl TableChanges {
     /// Both listing modes buffer the selected actions before returning. The iterator therefore
     /// reports preparation errors immediately and uses memory proportional to the range's action
     /// count. This method requires a [`TableChanges`] created by
-    /// [`TableChanges::try_new_row_tracking`].
+    /// [`TableChanges::try_new_row_tracking_cdf_listing`].
     ///
     /// # Errors
     ///
-    /// Returns an error if this value was not created by [`TableChanges::try_new_row_tracking`] or
-    /// if the log actions cannot be replayed into a valid listing.
+    /// Returns an error if this value was not created by
+    /// [`TableChanges::try_new_row_tracking_cdf_listing`] or if the log actions cannot be replayed
+    /// into a valid listing.
     pub fn scan_file_listing(
         self: Arc<Self>,
         engine: Arc<dyn Engine>,
         mode: TableChangesListingMode,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesFileAction>>> {
-        if self.mode != CdfMode::ReadTime {
+        if self.mode != CdfMode::RowTracking {
             return Err(Error::unsupported(
                 "scan_file_listing is only supported for row-tracking change feeds; construct \
-                 the TableChanges with TableChanges::try_new_row_tracking",
+                 the TableChanges with TableChanges::try_new_row_tracking_cdf_listing",
             ));
         }
 
@@ -590,13 +590,14 @@ mod tests {
     }
 
     #[test]
-    fn try_new_row_tracking_fails_when_row_tracking_disabled() {
+    fn try_new_row_tracking_cdf_listing_fails_when_row_tracking_disabled() {
         // table-with-cdf enables change data feed but not row tracking, so the row-tracking feed
         // must be rejected at construction.
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
-        let res = TableChanges::try_new_row_tracking(url, engine.as_ref(), 0, Some(1));
+        let res =
+            TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
         assert!(
             matches!(&res, Err(Error::RowTrackingChangeFeedUnsupported(_))),
             "expected a row-tracking-disabled error, got {res:?}"
@@ -604,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_new_row_tracking_rejects_incompatible_start_schema() {
+    async fn try_new_row_tracking_cdf_listing_rejects_incompatible_start_schema() {
         // The start-version schema (in effect for in-range commits before any metadata update)
         // carries a column the end-version schema drops. No in-range commit re-declares the start
         // schema, so this boundary incompatibility is caught only by the start-vs-end check, not
@@ -644,7 +645,12 @@ mod tests {
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let res = TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 1, Some(2));
+        let res = TableChanges::try_new_row_tracking_cdf_listing(
+            table_root,
+            engine.as_ref(),
+            1,
+            Some(2),
+        );
         assert!(
             matches!(&res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
             "expected an incompatible start schema to be rejected, got {res:?}"
@@ -684,7 +690,13 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_changes = Arc::new(
-            TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 0, Some(1)).unwrap(),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                0,
+                Some(1),
+            )
+            .unwrap(),
         );
         let listing: Vec<TableChangesFileAction> = table_changes
             .scan_file_listing(engine, TableChangesListingMode::AllChanges)
@@ -756,8 +768,13 @@ mod tests {
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let new_table_changes = || {
             Arc::new(
-                TableChanges::try_new_row_tracking(table_root.clone(), engine.as_ref(), 1, Some(2))
-                    .unwrap(),
+                TableChanges::try_new_row_tracking_cdf_listing(
+                    table_root.clone(),
+                    engine.as_ref(),
+                    1,
+                    Some(2),
+                )
+                .unwrap(),
             )
         };
         let listing: Vec<TableChangesFileAction> = new_table_changes()
@@ -861,7 +878,13 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_changes = Arc::new(
-            TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 1, Some(1)).unwrap(),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                1,
+                Some(1),
+            )
+            .unwrap(),
         );
         let listing: Vec<TableChangesFileAction> = table_changes
             .scan_file_listing(engine, mode)
@@ -881,9 +904,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_builder_rejects_row_tracking_table_changes() {
-        // Symmetric to `scan_file_listing_rejects_cdc_file_table_changes`: a row-tracking
-        // (`ReadTime`) `TableChanges` carries different feed semantics than the data-reading scan
-        // path, so building a scan from it must be rejected rather than silently mis-scanned.
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
         mock_table
@@ -891,8 +911,13 @@ mod tests {
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let table_changes =
-            TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 0, Some(0)).unwrap();
+        let table_changes = TableChanges::try_new_row_tracking_cdf_listing(
+            table_root,
+            engine.as_ref(),
+            0,
+            Some(0),
+        )
+        .unwrap();
         let res = table_changes.into_scan_builder().build();
         assert_result_error_with_message(
             res,
@@ -917,7 +942,13 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_changes = Arc::new(
-            TableChanges::try_new_row_tracking(table_root, engine.as_ref(), 0, Some(0)).unwrap(),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                0,
+                Some(0),
+            )
+            .unwrap(),
         );
         let listing: Vec<TableChangesFileAction> = table_changes
             .scan_file_listing(engine, mode)

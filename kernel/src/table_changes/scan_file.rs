@@ -572,7 +572,7 @@ mod tests {
             log_segment.listed.ascending_commit_files,
             table_schema,
             None,
-            CdfMode::ReadTime,
+            CdfMode::RowTracking,
         )
         .unwrap();
         scan_metadata_to_scan_file(scan_metadata)
