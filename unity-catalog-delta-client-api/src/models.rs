@@ -350,7 +350,6 @@ pub struct CreateStagingTableResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_protocol: Option<serde_json::Value>,
     /// Required raw configuration entries. Null values mean "any valid value".
-    #[serde(default)]
     pub required_properties: HashMap<String, Option<String>>,
     /// Suggested raw configuration entries.
     #[serde(default)]
@@ -364,7 +363,7 @@ pub struct CreateStagingTableResponse {
 pub struct CreateTableRequest {
     /// Table name (catalog and schema are in the URL path).
     pub name: String,
-    /// Cloud-storage location of the table.
+    /// Cloud-storage location of the table root, e.g. `"s3://bucket/path/to/table"`.
     pub location: String,
     /// Table type, e.g. `"MANAGED"` or `"EXTERNAL"`.
     pub table_type: String,
@@ -378,9 +377,9 @@ pub struct CreateTableRequest {
     pub partition_columns: Vec<String>,
     /// Typed Delta protocol.
     pub protocol: Protocol,
-    /// Raw `metaData.configuration` entries; the server derives all `delta.*`
-    /// properties itself.
-    #[serde(default)]
+    /// Raw `metaData.configuration` entries. The server derives the *protocol* properties
+    /// (`delta.minReaderVersion`/`minWriterVersion`, `delta.feature.*`) from the typed `protocol`,
+    /// so those must not appear here.
     pub properties: HashMap<String, String>,
     /// Per-domain metadata, keyed by domain name. Each value is opaque JSON.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -612,14 +611,14 @@ mod tests {
                 {"prefix": "s3://bucket/t/", "operation": "READ_WRITE",
                  "expiration-time-ms": 123, "config": {"s3.access-key-id": "ak"}}
             ],
-            "required-protocol": {"min-reader-version": 3, "min-writer-version": 7}
+            "required-protocol": {"min-reader-version": 3, "min-writer-version": 7},
+            "required-properties": {}
         }"#;
         let resp: CreateStagingTableResponse = serde_json::from_str(body).unwrap();
         assert_eq!(resp.table_id, "abc");
         assert_eq!(resp.location, "s3://bucket/t");
         assert_eq!(resp.storage_credentials.len(), 1);
         assert_eq!(resp.required_protocol.min_reader_version, 3);
-        // Absent advertisement fields default rather than fail to decode.
         assert!(resp.suggested_protocol.is_none());
         assert!(resp.required_properties.is_empty());
     }
@@ -695,7 +694,7 @@ mod tests {
             properties: HashMap::new(),
             domain_metadata: HashMap::from([(
                 "delta.clustering".to_string(),
-                serde_json::json!({"clusteringColumns": ["c1"]}),
+                serde_json::json!({"clusteringColumns": [["c1"]]}),
             )]),
             last_commit_timestamp_ms: 42,
         };
@@ -704,7 +703,7 @@ mod tests {
         assert_eq!(v["partition-columns"], serde_json::json!(["p1", "p2"]));
         assert_eq!(
             v["domain-metadata"]["delta.clustering"]["clusteringColumns"][0],
-            "c1"
+            serde_json::json!(["c1"])
         );
     }
 }
