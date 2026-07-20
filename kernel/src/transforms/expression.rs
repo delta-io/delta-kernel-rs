@@ -2,7 +2,7 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef,
+    BinaryExpression, BinaryPredicate, CastExpression, ColumnName, Expression, ExpressionRef,
     ExpressionStructPatch, JunctionPredicate, MapToStructExpression, OpaqueExpression,
     OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression, UnaryPredicate,
     VariadicExpression,
@@ -139,6 +139,12 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_map_to_struct(expr)
     }
 
+    /// Called for each cast expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_cast`].
+    fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
+        self.recurse_into_expr_cast(expr)
+    }
+
     /// Called for the child of each predicate expression encountered during the
     /// traversal. The provided implementation just forwards to [`Self::recurse_into_expr_pred`].
     fn transform_expr_pred(&mut self, pred: &'a Predicate) -> Self::Output<Predicate> {
@@ -262,6 +268,10 @@ pub trait ExpressionTransform<'a> {
                 let child = self.transform_expr_map_to_struct(m);
                 map_owned_or_else(expr, child, Expression::MapToStruct)
             }
+            Expression::Cast(c) => {
+                let child = self.transform_expr_cast(c);
+                map_owned_or_else(expr, child, Expression::Cast)
+            }
             Expression::Unknown(u) => {
                 let child = self.transform_expr_unknown(u);
                 map_owned_or_else(expr, child, Expression::Unknown)
@@ -335,6 +345,12 @@ pub trait ExpressionTransform<'a> {
     ) -> Self::Output<MapToStructExpression> {
         let nested = self.transform_expr(&expr.map_expr);
         map_owned_or_else(expr, nested, MapToStructExpression::new)
+    }
+
+    /// Recursively transforms the child expression of a cast expression (unary).
+    fn recurse_into_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
+        let f = |child| CastExpression::new(child, expr.target.clone());
+        map_owned_or_else(expr, self.transform_expr(&expr.expr), f)
     }
 
     /// Recursively transforms the children of an opaque expression (variadic).

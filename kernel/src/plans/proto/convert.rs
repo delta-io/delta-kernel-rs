@@ -319,6 +319,10 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
+            // The declarative-plans proto has no cast node yet. Serialize as an opaque unknown so
+            // the boundary neither drops nor misinterprets it; a receiver treats it as an
+            // uninterpretable expression rather than fabricating one.
+            Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
         };
         proto_expr::Expression { kind: Some(kind) }
     }

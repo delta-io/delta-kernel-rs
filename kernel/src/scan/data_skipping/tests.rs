@@ -417,7 +417,7 @@ fn test_all_null_pruning_all_comparison_ops(#[case] pred: Pred) {
 
 #[test]
 fn test_timestamp_stats_enabled() {
-    let empty = HashSet::new();
+    let empty = HashMap::new();
     let stats_columns: HashSet<ColumnName> = [column_name!("timestamp_col")].into_iter().collect();
     let creator = DataSkippingPredicateCreator {
         partition_columns: &empty,
@@ -737,6 +737,72 @@ fn test_partition_column_rewrite() {
             .is_some_and(|s| s.contains("stats_parsed.maxValues.data_col")),
         "Expected stats_parsed.maxValues.data_col for data column, got {pred_str:?}"
     );
+}
+
+/// A `CAST(<partition_col> AS DATE) <op> <literal>` predicate rewrites to a comparison on
+/// `CAST(partitionValues_parsed.<col> AS DATE)`, guarded so Remove rows are never filtered. The
+/// same cast over a data column is not supported (data stats aren't exact), so it folds out.
+#[test]
+fn test_cast_partition_column_rewrite() {
+    let partition_columns = test_partition_columns();
+
+    let cast_part = Expr::cast(column_expr!("part_col"), DataType::DATE);
+    let pred = Pred::eq(cast_part, Scalar::Date(20185));
+    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns);
+    assert_eq!(
+        skipping_pred.as_ref().map(|p| p.to_string()),
+        Some(
+            "OR(NOT(Column(is_add)), CAST(Column(partitionValues_parsed.part_col) AS date) = 20185)"
+                .to_string()
+        ),
+        "cast over a partition column should compare the cast partition value, got {skipping_pred:?}"
+    );
+
+    // The same cast over a data column has no exact value to cast, so it is unsupported (keep).
+    let cast_data = Expr::cast(column_expr!("data_col"), DataType::DATE);
+    let pred = Pred::eq(cast_data, Scalar::Date(20185));
+    assert_eq!(
+        as_data_skipping_predicate_with_partitions(&pred, &partition_columns),
+        None,
+        "cast over a data column should not produce a skipping predicate"
+    );
+}
+
+/// Only a string partition column is cast-pruned. Casting a non-string partition column (here a
+/// DATE column to LONG) is not the protocol's string-parse direction and could disagree with the
+/// engine's cast, so it folds out (keep) rather than risk skipping a matching file.
+#[test]
+fn test_cast_non_string_partition_column_not_pruned() {
+    let partition_columns = HashMap::from_iter([("part_col".to_string(), DataType::DATE)]);
+    let cast_part = Expr::cast(column_expr!("part_col"), DataType::LONG);
+    let pred = Pred::eq(cast_part, Scalar::from(20185i64));
+    let stats_columns = all_referenced_columns(&pred);
+    let creator = DataSkippingPredicateCreator::new(&partition_columns, &stats_columns);
+    assert_eq!(
+        creator.eval(&pred),
+        None,
+        "casting a non-string partition column must not produce a skipping predicate"
+    );
+}
+
+/// The direct (scalar) evaluator casts the exact string partition value and compares it, so it can
+/// keep or prune a file by evaluating `CAST(part AS DATE) = <date>` against the partition value.
+#[test]
+fn test_cast_partition_direct_eval() {
+    // 2025-04-11 is 20189 days after the unix epoch.
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("part_col"),
+        Scalar::from("2025-04-11"),
+    )]));
+    let cast_part = Expr::cast(column_expr!("part_col"), DataType::DATE);
+
+    // Matching date: keep (TRUE).
+    let pred = Pred::eq(cast_part.clone(), Scalar::Date(20189));
+    assert_eq!(resolver.eval_pred(&pred, false), TRUE);
+
+    // Non-matching date: prune (FALSE).
+    let pred = Pred::eq(cast_part, Scalar::Date(20190));
+    assert_eq!(resolver.eval_pred(&pred, false), FALSE);
 }
 
 #[rstest]
@@ -1506,6 +1572,7 @@ fn stats_columns_gate_rewrite(
     #[case] stats: HashSet<ColumnName>,
     #[case] expected: &str,
 ) {
+    let partition_columns = string_partition_columns(&partition_columns);
     let result =
         as_sql_data_skipping_predicate_with_stats_columns(&pred, &partition_columns, &stats)
             .expect("SQL-WHERE rewrite always returns Some for these cases");

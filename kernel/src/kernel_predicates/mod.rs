@@ -126,6 +126,22 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// A (possibly inverted) comparison between `CAST(<col> AS target)` and a scalar, e.g.
+    /// `CAST(<col> AS DATE) < <value>`. The scalar is always on the right (the caller commutes the
+    /// operator for `<value> op CAST(<col>)`). Unsupported by default so evaluators that cannot
+    /// reason about a cast conservatively keep the file; implementations that can (e.g. exact
+    /// partition-value pruning) override it.
+    fn eval_pred_cast(
+        &self,
+        _op: BinaryPredicateOp,
+        _col: &ColumnName,
+        _target: &DataType,
+        _val: &Scalar,
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        None
+    }
+
     /// Dispatches an opaque predicate.
     fn eval_pred_opaque(
         &self,
@@ -186,6 +202,7 @@ pub trait KernelPredicateEvaluator {
             | Expr::Variadic(_)
             | Expr::ParseJson(_)
             | Expr::MapToStruct(_)
+            | Expr::Cast(_)
             | Expr::Unknown(_) => None,
         }
     }
@@ -216,6 +233,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Opaque(_)
                 | Expr::ParseJson { .. }
                 | Expr::MapToStruct(_)
+                | Expr::Cast(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
@@ -271,7 +289,7 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output> {
         use BinaryPredicateOp::*;
-        use Expr::{Column, Literal};
+        use Expr::{Cast, Column, Literal};
 
         match (left, right) {
             (Column(a), Column(b)) => self.eval_pred_binary_columns(op, a, b, inverted),
@@ -290,6 +308,22 @@ pub trait KernelPredicateEvaluator {
                 Equal => self.eval_pred_eq(col, val, inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
+            },
+            // `CAST(<col> AS target) op <value>` for a bare column child, e.g.
+            // `CAST(<col> AS DATE) < <value>`.
+            (Cast(c), Literal(val)) => match c.expr.as_ref() {
+                Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
+                _ => None,
+            },
+            (Literal(val), Cast(c)) => match c.expr.as_ref() {
+                // Commute so the cast column is on the left, mirroring the `Literal op Column` arm.
+                Column(col) => match op {
+                    LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
+                    GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
+                    Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
+                    Distinct | In => None,
+                },
+                _ => None,
             },
             _ => {
                 debug!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
@@ -648,10 +682,37 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
+            Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target),
             // ParseJson and MapToStruct produce structured output, not scalar values
             Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
             Expr::Unknown(_) => None,
         }
+    }
+}
+
+/// Casts a scalar following SQL `CAST` semantics, for the cases exact partition-value pruning
+/// needs: a string source is parsed into a primitive target (the way partition values are parsed
+/// to their declared type), and a source already of the target type passes through. An unparseable
+/// string yields `Scalar::Null` (never TRUE against a comparison), matching the safe-cast semantics
+/// of the arrow evaluation path.
+///
+/// This is deliberately narrower than a full cast: any other source/target combination yields
+/// `None` so the caller conservatively keeps the file. In particular it does not attempt
+/// numeric/temporal casts (e.g. `Long -> Int`) that the arrow path can perform; those only reach
+/// this scalar path through a resolver that supplies partition values as scalars, which no
+/// production caller does today (the sole production evaluator uses an empty column resolver).
+fn cast_scalar(value: Scalar, target: &DataType) -> Option<Scalar> {
+    if value.data_type() == *target {
+        return Some(value);
+    }
+    match (value, target) {
+        (Scalar::String(raw), DataType::Primitive(ptype)) => Some(
+            ptype
+                .parse_scalar(&raw)
+                .unwrap_or_else(|_| Scalar::Null(target.clone())),
+        ),
+        (Scalar::Null(_), _) => Some(Scalar::Null(target.clone())),
+        _ => None,
     }
 }
 
@@ -693,6 +754,18 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
         self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &col, val, inverted)
+    }
+
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<bool> {
+        let col = cast_scalar(self.resolve_column(col)?, target)?;
+        self.eval_pred_binary_scalars(op, &col, val, inverted)
     }
 
     fn eval_pred_binary_scalars(
@@ -927,6 +1000,19 @@ pub trait DataSkippingPredicateEvaluator {
         };
         self.finish_eval_pred_junction(op, &mut preds.into_iter(), false)
     }
+
+    /// See [`KernelPredicateEvaluator::eval_pred_cast`]. Unsupported by default, so evaluators that
+    /// cannot reason about a cast conservatively keep the file.
+    fn eval_pred_cast(
+        &self,
+        _op: BinaryPredicateOp,
+        _col: &ColumnName,
+        _target: &DataType,
+        _val: &Scalar,
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        None
+    }
 }
 
 impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T {
@@ -976,6 +1062,17 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         _inverted: bool,
     ) -> Option<Self::Output> {
         None
+    }
+
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        self.eval_pred_cast(op, col, target, val, inverted)
     }
 
     fn eval_pred_opaque(

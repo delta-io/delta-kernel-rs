@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -51,6 +51,18 @@ pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator::new(&Default::default(), &stats_columns).eval(pred)
 }
 
+/// Test helper: builds a partition name->type map defaulting every column to `STRING`, the type
+/// that enables cast pushdown. Tests that need a non-string partition type build the map directly.
+#[cfg(test)]
+pub(crate) fn string_partition_columns(
+    partition_columns: &HashSet<String>,
+) -> HashMap<String, DataType> {
+    partition_columns
+        .iter()
+        .map(|name| (name.clone(), DataType::STRING))
+        .collect()
+}
+
 /// Permissive stats-columns set for tests that exercise rewrite mechanics, not the gate.
 #[cfg(test)]
 pub(crate) fn all_referenced_columns(pred: &Pred) -> HashSet<ColumnName> {
@@ -63,7 +75,8 @@ pub(crate) fn as_data_skipping_predicate_with_partitions(
     partition_columns: &HashSet<String>,
 ) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
-    DataSkippingPredicateCreator::new(partition_columns, &stats_columns).eval(pred)
+    let partition_columns = string_partition_columns(partition_columns);
+    DataSkippingPredicateCreator::new(&partition_columns, &stats_columns).eval(pred)
 }
 
 /// Like [`as_data_skipping_predicate_with_partitions`] but invokes
@@ -74,7 +87,8 @@ fn as_sql_data_skipping_predicate(
     partition_columns: &HashSet<String>,
 ) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
-    as_sql_data_skipping_predicate_with_stats_columns(pred, partition_columns, &stats_columns)
+    let partition_columns = string_partition_columns(partition_columns);
+    as_sql_data_skipping_predicate_with_stats_columns(pred, &partition_columns, &stats_columns)
 }
 
 /// Like [`as_sql_data_skipping_predicate`] but only rewrites references to columns in
@@ -82,7 +96,7 @@ fn as_sql_data_skipping_predicate(
 /// junction-fold into NULL literals.
 pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     pred: &Pred,
-    partition_columns: &HashSet<String>,
+    partition_columns: &HashMap<String, DataType>,
     stats_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
@@ -308,9 +322,13 @@ impl DataSkippingFilter {
         physical_partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
         is_add_expr: ExpressionRef,
-    ) -> Option<(SchemaRef, ExpressionRef, HashSet<String>)> {
-        let partition_columns: HashSet<String> = physical_partition_schema
-            .map(|s| s.fields().map(|f| f.name().to_string()).collect())
+    ) -> Option<(SchemaRef, ExpressionRef, HashMap<String, DataType>)> {
+        let partition_columns: HashMap<String, DataType> = physical_partition_schema
+            .map(|s| {
+                s.fields()
+                    .map(|f| (f.name().to_string(), f.data_type().clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let stats_field =
@@ -458,6 +476,27 @@ fn comparison_predicate(ord: Ordering, col: Expr, val: &Scalar, inverted: bool) 
     pred_fn(col, val.clone())
 }
 
+/// Builds an exact `<expr> <op> <val>` comparison predicate (honoring inversion), for a value
+/// that is exact rather than a min/max range. Returns `None` for operators that are not
+/// order/equality comparisons (`Distinct`, `In`).
+fn binary_comparison_predicate(
+    op: BinaryPredicateOp,
+    expr: Expr,
+    val: &Scalar,
+    inverted: bool,
+) -> Option<Pred> {
+    let pred_fn = match (op, inverted) {
+        (BinaryPredicateOp::LessThan, false) => Pred::lt,
+        (BinaryPredicateOp::LessThan, true) => Pred::ge,
+        (BinaryPredicateOp::GreaterThan, false) => Pred::gt,
+        (BinaryPredicateOp::GreaterThan, true) => Pred::le,
+        (BinaryPredicateOp::Equal, false) => Pred::eq,
+        (BinaryPredicateOp::Equal, true) => Pred::ne,
+        (BinaryPredicateOp::Distinct | BinaryPredicateOp::In, _) => return None,
+    };
+    Some(pred_fn(expr, val.clone()))
+}
+
 /// Collects sub-predicates into a junction (AND/OR), replacing unsupported sub-predicates (None)
 /// with a single NULL literal to preserve correct three-valued logic. One NULL is enough to
 /// produce the correct behavior during predicate evaluation; additional NULLs are redundant.
@@ -519,9 +558,10 @@ fn has_min_max_stats(data_type: &DataType) -> bool {
 /// For partition columns, rewrites to `partitionValues_parsed.*` since the partition value is
 /// the exact value for every row in the file (serving as both min and max).
 struct DataSkippingPredicateCreator<'a> {
-    /// Physical names of partition columns. For these columns, stats come from
-    /// `partitionValues.<col>` (exact values) instead of min/max ranges.
-    partition_columns: &'a HashSet<String>,
+    /// Physical names of partition columns mapped to their declared types. For these columns,
+    /// stats come from `partitionValues.<col>` (exact values) instead of min/max ranges. The
+    /// declared type gates cast pushdown (see [`Self::eval_pred_cast`]).
+    partition_columns: &'a HashMap<String, DataType>,
     /// Physical leaf paths whose stats are present in `stats_parsed` (honors
     /// `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, and required
     /// columns). References to data columns not in this set return `None` from the
@@ -533,7 +573,10 @@ struct DataSkippingPredicateCreator<'a> {
 }
 
 impl<'a> DataSkippingPredicateCreator<'a> {
-    fn new(partition_columns: &'a HashSet<String>, stats_columns: &'a HashSet<ColumnName>) -> Self {
+    fn new(
+        partition_columns: &'a HashMap<String, DataType>,
+        stats_columns: &'a HashSet<ColumnName>,
+    ) -> Self {
         Self {
             partition_columns,
             stats_columns,
@@ -542,7 +585,15 @@ impl<'a> DataSkippingPredicateCreator<'a> {
 
     fn is_partition_column(&self, col: &ColumnName) -> bool {
         let path = col.path();
-        path.len() == 1 && self.partition_columns.contains(path[0].as_str())
+        path.len() == 1 && self.partition_columns.contains_key(path[0].as_str())
+    }
+
+    /// Returns the declared type of `col` if it is a single-path partition column.
+    fn partition_column_type(&self, col: &ColumnName) -> Option<&DataType> {
+        match col.path() {
+            [name] => self.partition_columns.get(name.as_str()),
+            _ => None,
+        }
     }
 
     /// Returns `true` when `col` is in `stats_columns`.
@@ -648,6 +699,45 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         } else {
             cmp
         })
+    }
+
+    /// Prunes `CAST(<partition_col> AS target) <op> <val>` by casting the exact partition value.
+    ///
+    /// Pruning is restricted to casting a **string** partition column to a **primitive** target.
+    /// Two independent reasons converge on this:
+    ///
+    /// - Only partition columns have an exact value per file (min == max), so casting that single
+    ///   value and comparing is precise. A data column would have to cast its min/max stats, which
+    ///   is unsound because a cast is not order-preserving in general (e.g. lexicographic string
+    ///   order is not numeric order), so casted min/max need not bound the casted values.
+    /// - The rewrite is evaluated by the engine, so pruning is only sound when the engine and the
+    ///   arrow evaluator agree on the cast. Parsing a string into a primitive is the protocol's own
+    ///   partition-value parsing and is deterministic across engines; other directions (e.g. `date
+    ///   -> string` rendering, `float -> int` rounding, timezone interpretation) can differ and
+    ///   would risk skipping a matching file.
+    ///
+    /// Any other source or a non-primitive target returns `None` (keep the file). The rewrite
+    /// compares `CAST(partitionValues_parsed.<col> AS target)`, which the arrow evaluator applies
+    /// per row with safe (NULL-on-failure) semantics, wrapped in `OR(NOT is_add, ...)` so Remove
+    /// rows are never filtered.
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Pred> {
+        let source = self.partition_column_type(col)?;
+        if *source != DataType::STRING || !matches!(target, DataType::Primitive(_)) {
+            return None;
+        }
+        let cast_expr = Expr::cast(
+            joined_column_expr!("partitionValues_parsed", col),
+            target.clone(),
+        );
+        let cmp = binary_comparison_predicate(op, cast_expr, val, inverted)?;
+        Some(self.guard_for_removes(cmp))
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
