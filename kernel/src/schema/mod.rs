@@ -12,10 +12,9 @@ use delta_kernel_derive::internal_api;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
-
 #[cfg(feature = "geo-type-in-dev")]
 use strum::{Display as StrumDisplay, EnumString};
+use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
