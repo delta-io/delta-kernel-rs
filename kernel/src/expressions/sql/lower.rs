@@ -201,7 +201,7 @@ fn resolve_column(
             .fields()
             .find(|f| f.name().eq_ignore_ascii_case(name))
     })?;
-    let canonical: Vec<String> = fields.iter().map(|f| f.name().to_string()).collect();
+    let canonical = Vec::from_iter(fields.iter().map(|f| f.name().to_string());
     let leaf = fields
         .last()
         .ok_or_else(|| Error::generic("CHECK constraint references an empty column path"))?;
