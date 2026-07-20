@@ -10,7 +10,7 @@
 #![cfg(feature = "integration-test")]
 
 use unity_catalog_delta_client_api::{
-    CreateStagingTableRequest, CreateStagingTableResponse, Operation,
+    CommitReport, CreateStagingTableRequest, CreateStagingTableResponse, Operation,
 };
 use unity_catalog_delta_rest_client::http::build_http_client;
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
@@ -167,6 +167,49 @@ async fn live_get_table_credentials() {
             location
         );
     }
+}
+
+/// Reports commit metrics for the seeded table and asserts the server accepts them.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_report_metrics() {
+    let Some((url, token)) = server_env() else {
+        eprintln!("UC_SERVER_URL unset; skipping live_report_metrics");
+        return;
+    };
+    if std::env::var("UC_CREATE").is_err() {
+        eprintln!("UC_CREATE unset; skipping mutating live_report_metrics");
+        return;
+    }
+    let Some(table) = std::env::var("UC_TEST_TABLE").ok() else {
+        eprintln!("UC_TEST_TABLE unset; skipping live_report_metrics");
+        return;
+    };
+    let catalog = std::env::var("UC_TEST_CATALOG").unwrap_or_else(|_| "unity".to_string());
+    let schema = std::env::var("UC_TEST_SCHEMA").unwrap_or_else(|_| "default".to_string());
+
+    let client = client(&url, &token);
+    let table_id = client
+        .load_table(&catalog, &schema, &table)
+        .await
+        .expect("load_table failed")
+        .metadata
+        .table_uuid;
+
+    let report = CommitReport {
+        num_files_added: 2,
+        num_bytes_added: 200,
+        num_files_removed: 0,
+        num_bytes_removed: 0,
+        num_rows_inserted: Some(10),
+        num_rows_removed: None,
+        num_rows_updated: None,
+        file_size_histogram: None,
+    };
+
+    client
+        .report_metrics(&catalog, &schema, &table, &table_id, report)
+        .await
+        .expect("report_metrics failed");
 }
 
 /// Validates the `CreateStagingTableRequest` / `CreateStagingTableResponse` wire types against a

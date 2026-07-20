@@ -87,8 +87,8 @@ where
     }
 }
 
-/// Handle a response that carries no body (or a body the caller ignores). Preserves the server's
-/// error message on failure without decoding the success body.
+/// Handle a response with no body to deserialize (e.g. a `204 No Content`). On success returns
+/// `Ok(())`; on failure preserves the server's error body, matching [`handle_response`].
 pub async fn handle_empty_response(response: Response) -> Result<()> {
     if response.status().is_success() {
         Ok(())
@@ -97,8 +97,7 @@ pub async fn handle_empty_response(response: Response) -> Result<()> {
     }
 }
 
-/// Build an error from a non-success response, preserving the server's body and mapping
-/// authentication / not-found statuses.
+/// Build a typed error from a non-success response, reading the body for context.
 async fn error_from_response(response: Response) -> Error {
     let status = response.status();
     let error_body = response

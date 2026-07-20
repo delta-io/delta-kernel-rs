@@ -33,7 +33,8 @@ pub use clients::{InMemoryUpdateTableClient, TableData};
 pub use credentials::{CredentialsResponse, Operation, StorageCredential};
 pub use error::{Error, Result};
 pub use models::{
-    CatalogConfig, Commit, CreateStagingTableRequest, CreateStagingTableResponse,
-    CreateTableRequest, DeltaTableRequirement, DeltaTableUpdate, LoadTableResponse, Protocol,
-    TableMetadata, TableName, UpdateTableRequest,
+    CatalogConfig, Commit, CommitReport, CreateStagingTableRequest, CreateStagingTableResponse,
+    CreateTableRequest, DeltaTableRequirement, DeltaTableUpdate, FileSizeHistogram,
+    LoadTableResponse, MetricsReport, Protocol, ReportMetricsRequest, TableMetadata, TableName,
+    UpdateTableRequest,
 };

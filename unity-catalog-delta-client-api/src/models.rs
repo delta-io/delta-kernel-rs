@@ -322,6 +322,76 @@ pub struct CreateTableRequest {
     pub last_commit_timestamp_ms: i64,
 }
 
+// ============================================================================
+// reportMetrics: post-commit telemetry
+// ============================================================================
+
+/// Body of a `POST /delta/v1/catalogs/{c}/schemas/{s}/tables/{t}/metrics` request.
+///
+/// Commit telemetry reported to the catalog after a commit succeeds. This is best-effort
+/// telemetry, not part of the commit's correctness path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct ReportMetricsRequest {
+    /// Table UUID; must match the table identified by the URL path.
+    pub table_id: String,
+    /// The metrics being reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<MetricsReport>,
+}
+
+/// Wrapper matching the server's `report` envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct MetricsReport {
+    /// Per-commit statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_report: Option<CommitReport>,
+}
+
+/// Statistics describing a single commit.
+///
+/// File and byte counts are derivable from the commit's add/remove actions. Row counts and the
+/// file-size histogram are only known to the connector's write engine, so they are optional.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommitReport {
+    /// Number of files added.
+    pub num_files_added: i64,
+    /// Number of bytes added.
+    pub num_bytes_added: i64,
+    /// Number of files removed.
+    pub num_files_removed: i64,
+    /// Number of bytes removed.
+    pub num_bytes_removed: i64,
+    /// Rows inserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_rows_inserted: Option<i64>,
+    /// Rows removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_rows_removed: Option<i64>,
+    /// Rows updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_rows_updated: Option<i64>,
+    /// File-size distribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_histogram: Option<FileSizeHistogram>,
+}
+
+/// Histogram tracking file counts and total bytes across size ranges.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct FileSizeHistogram {
+    /// Sorted bin boundary values.
+    pub sorted_bin_boundaries: Vec<i64>,
+    /// Count of files in each bin.
+    pub file_counts: Vec<i64>,
+    /// Total bytes in each bin.
+    pub total_bytes: Vec<i64>,
+    /// The commit version this histogram is for.
+    pub commit_version: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +692,54 @@ mod tests {
             v["domain-metadata"]["delta.clustering"]["clusteringColumns"][0],
             serde_json::json!(["c1"])
         );
+    }
+
+    #[test]
+    fn report_metrics_request_wire_shape() {
+        let req = ReportMetricsRequest {
+            table_id: "abc".to_string(),
+            report: Some(MetricsReport {
+                commit_report: Some(CommitReport {
+                    num_files_added: 3,
+                    num_bytes_added: 300,
+                    num_files_removed: 1,
+                    num_bytes_removed: 100,
+                    num_rows_inserted: Some(42),
+                    num_rows_removed: None,
+                    num_rows_updated: None,
+                    file_size_histogram: Some(FileSizeHistogram {
+                        sorted_bin_boundaries: vec![0, 1000],
+                        file_counts: vec![2, 1],
+                        total_bytes: vec![150, 150],
+                        commit_version: 7,
+                    }),
+                }),
+            }),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["table-id"], "abc");
+        let cr = &v["report"]["commit-report"];
+        assert_eq!(cr["num-files-added"], 3);
+        assert_eq!(cr["num-bytes-removed"], 100);
+        assert_eq!(cr["num-rows-inserted"], 42);
+        // Absent optional row counts are omitted from the wire body.
+        assert!(cr.get("num-rows-removed").is_none());
+        assert!(cr.get("num-rows-updated").is_none());
+        assert_eq!(cr["file-size-histogram"]["commit-version"], 7);
+        assert_eq!(
+            cr["file-size-histogram"]["sorted-bin-boundaries"],
+            serde_json::json!([0, 1000])
+        );
+    }
+
+    #[test]
+    fn report_metrics_request_omits_absent_report() {
+        let req = ReportMetricsRequest {
+            table_id: "abc".to_string(),
+            report: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["table-id"], "abc");
+        assert!(v.get("report").is_none());
     }
 }

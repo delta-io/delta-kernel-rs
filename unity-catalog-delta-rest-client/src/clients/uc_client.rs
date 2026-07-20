@@ -1,13 +1,14 @@
 use reqwest::StatusCode;
 use tracing::instrument;
 use unity_catalog_delta_client_api::{
-    CatalogConfig, CredentialsResponse, LoadTableResponse, Operation,
+    CatalogConfig, CommitReport, CredentialsResponse, LoadTableResponse, MetricsReport, Operation,
+    ReportMetricsRequest,
 };
 use url::Url;
 
 use crate::config::ClientConfig;
 use crate::error::Result;
-use crate::http::{build_http_client, execute_with_retry, handle_response};
+use crate::http::{build_http_client, execute_with_retry, handle_empty_response, handle_response};
 
 /// Builds the Delta-Tables per-table resource path
 /// (`delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`) that the `load_table` and
@@ -103,5 +104,36 @@ impl UCClient {
         let response =
             execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
         handle_response(response).await
+    }
+
+    /// `POST /delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}/metrics`: report
+    /// best-effort commit telemetry to the catalog after a commit succeeds.
+    ///
+    /// Connectors should call it after a successful commit, supplying the row counts and histogram
+    /// that only the write engine knows (file/byte counts are derivable from the commit's
+    /// add/remove actions).
+    #[instrument(skip(self, report))]
+    pub async fn report_metrics(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        table_id: &str,
+        report: CommitReport,
+    ) -> Result<()> {
+        let path = format!("{}/metrics", table_path(catalog, schema, table));
+        let url = self.base_url.join(&path)?;
+        let body = ReportMetricsRequest {
+            table_id: table_id.to_string(),
+            report: Some(MetricsReport {
+                commit_report: Some(report),
+            }),
+        };
+
+        let response = execute_with_retry(&self.config, || {
+            self.http_client.post(url.clone()).json(&body).send()
+        })
+        .await?;
+        handle_empty_response(response).await
     }
 }
