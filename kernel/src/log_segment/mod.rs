@@ -129,10 +129,9 @@ pub(crate) struct LogSegment {
 ///
 /// For `add`, an `add.path IS NOT NULL` predicate drops a checkpoint's Remove tombstones, which
 /// project to a null `add` under an add-only read schema. This is safe because scan log replay
-/// already discards checkpoint removes without deduplicating on them (`skip_removes =
-/// !is_log_batch`), so skipping all-remove row groups changes no survivor. A schema that also
-/// names `remove` (checkpoint write, log compaction) has no identifying column for it and
-/// short-circuits to `None` below, preserving tombstones.
+/// discards checkpoint removes without deduplicating on them, so skipping all-remove row groups
+/// changes no survivor. A schema that also names `remove` (checkpoint write, log compaction) has
+/// no identifying column for it and short-circuits to `None` below, preserving tombstones.
 fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
     match action_name {
         ADD_NAME => Some(column_name!(ADD_NAME, "path")),
