@@ -36,7 +36,8 @@ mod sql;
 #[cfg(feature = "column-defaults-in-dev")]
 pub(crate) use self::sql::parse_sql;
 #[cfg(feature = "check-constraints-in-dev")]
-// TODO(#2896): Wire up `parse_sql_simple_predicate` to check-constraints discovery; remove this allow
+// TODO(#2896): Wire up `parse_sql_simple_predicate` to check-constraints discovery; remove this
+// allow
 #[allow(unused_imports)]
 pub(crate) use self::sql::parse_sql_simple_predicate;
 

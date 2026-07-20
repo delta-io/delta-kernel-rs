@@ -4,8 +4,8 @@
 //! column-resolution paths). A literal's type is inferred from the column on the other side of the
 //! comparison, and the literal itself is parsed by reusing [`super::parse_sql`].
 
-// WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
-// TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
+// WIP feature behind `check-constraints-in-dev`; some items have no caller until discovery lands.
+// TODO(#2896): remove this allow once check-constraint discovery wires up a caller.
 #![allow(dead_code)]
 
 use super::parse_sql;
@@ -30,17 +30,22 @@ use crate::{DeltaResult, Error};
 /// semantics the parser cannot re-express as a `Predicate`. These are engine-wide gaps (not
 /// constraint-specific) and are left to the enforcement layer rather than rejected here, which
 /// would forgo nearly all float and string constraints:
-/// - NaN: Spark SQL makes `NaN = NaN` true and orders NaN above every value; kernel compares floats
-///   with IEEE semantics (NaN unordered), so a float/double constraint on a NaN-bearing column can
-///   silently disagree -- affecting even the DOUBLE and FLOAT-vs-FLOAT cases that lower here.
+/// - Float semantics: the default engine compares floats via arrow's IEEE-754 *totalOrder*
+///   (bitwise), not Spark/ANSI float equality. The two mostly agree -- kernel makes `NaN = NaN`
+///   TRUE and orders NaN as the maximum, matching Spark -- but `-0.0 = 0.0` is FALSE under
+///   totalOrder (the bits differ) where Spark returns TRUE. So a float/double `=`/`<>`/`<=>` on a
+///   column holding `-0.0` can silently disagree, affecting even the DOUBLE and FLOAT-vs-FLOAT
+///   cases that lower here. The enforcement layer must normalize signed zero (Spark's
+///   `NormalizeFloatingNumbers`) before evaluating, or reject float equality outright.
 /// - String collation: kernel compares bytewise; a non-default collation (e.g. `UTF8_LCASE`) would
 ///   compare differently under Spark.
 pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult<Predicate> {
     let Comparison { op, left, right } = comparison;
     let left = resolve_operand(left, schema)?;
     let right = resolve_operand(right, schema)?;
-    // Comparison policy lives here, not in `resolve_operand`: only primitive-typed columns are
-    // comparable (struct/array/map columns have no scalar comparison semantics).
+    // Reject non-primitive columns explicitly: `parse_sql("NULL", <struct>)` succeeds (NULL is
+    // valid for any type), so without this check `nested = NULL` would lower silently. (`nested =
+    // 0` is already caught by `parse_sql`, which rejects a non-primitive literal target.)
     for operand in [&left, &right] {
         if let ResolvedOperand::Column {
             canonical,
@@ -130,7 +135,9 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
 /// common type; whether the FLOAT column stays f32 or is widened to f64 depends on the literal's
 /// Spark type:
 /// - INT/LONG literal (an integer in i64 range): the common type is FLOAT, so Spark casts the
-///   *literal* to f32 and compares at f32 -- identical to kernel. Safe to lower.
+///   *literal* to f32 and compares at f32 -- identical compare *width* to kernel, so safe to lower.
+///   (The signed-zero divergence in [`lower`]'s doc is orthogonal: it is about the column's stored
+///   value, not the literal's type, and applies to any float comparison regardless of this gate.)
 /// - DECIMAL/DOUBLE literal (has a `.`/exponent, or an integer beyond i64): the common type is
 ///   DOUBLE, so Spark widens the *column* to f64 and compares at f64. For a literal not exactly
 ///   representable in f32 (e.g. `0.1`) this reaches the opposite result from kernel's f32 compare,
@@ -166,8 +173,8 @@ enum ResolvedOperand {
 
 /// Resolve an operand against `schema`, walking a column path at most once: a column yields its
 /// canonical (schema-cased) path and leaf type; a literal is carried as raw text and typed by
-/// [`lower`]. This is pure resolution -- comparison-specific policy (primitive-only operands) lives
-/// in [`lower`], so `resolve_operand` can also resolve non-primitive columns for other callers.
+/// [`lower`]. Resolution is kept separate from comparison policy (the primitive-only check) because
+/// [`lower`] must inspect *both* resolved operands jointly before it can judge them.
 fn resolve_operand(operand: &Operand, schema: &StructType) -> DeltaResult<ResolvedOperand> {
     match operand {
         Operand::Literal(raw) => Ok(ResolvedOperand::Literal(raw.clone())),
@@ -189,16 +196,11 @@ fn resolve_column(
     column: &ColumnName,
     schema: &StructType,
 ) -> DeltaResult<(Vec<String>, DataType)> {
-    let mut fields = Vec::with_capacity(column.len());
-    schema.visit_fields_of_path_by(
-        column,
-        |parent, name| {
-            parent
-                .fields()
-                .find(|f| f.name().eq_ignore_ascii_case(name))
-        },
-        |field| fields.push(field),
-    )?;
+    let fields = schema.fields_of_path_by(column, |parent, name| {
+        parent
+            .fields()
+            .find(|f| f.name().eq_ignore_ascii_case(name))
+    })?;
     let canonical: Vec<String> = fields.iter().map(|f| f.name().to_string()).collect();
     let leaf = fields
         .last()
@@ -370,6 +372,13 @@ mod tests {
     #[case::float_column_int_literal_on_left(
         "5 < weight",
         Predicate::lt(Expression::literal(Scalar::Float(5.0)), col("weight"))
+    )]
+    // A NULL literal against a FLOAT column is allowed: a null comparison involves no f32/f64
+    // rounding, so the FLOAT-widening gate exempts it (the `!is_null` guard in
+    // `type_literal_from_column`). Without the exemption this would wrongly error.
+    #[case::float_column_vs_null(
+        "weight = NULL",
+        Predicate::eq(col("weight"), Expression::literal(Scalar::Null(DataType::FLOAT)))
     )]
     // `NULL` is an operand, typed from the column it is compared against.
     #[case::null_operand(

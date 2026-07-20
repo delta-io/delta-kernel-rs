@@ -859,9 +859,9 @@ impl PrimitiveType {
             }
         };
 
-        // we can assume this won't underflow since `frac_digits` is at minimum 0, and exp is at
-        // most i128::MAX, and 0-i128::MAX doesn't underflow
-        let scale = frac_digits - exp;
+        // `exp` is untrusted (parsed from `raw`), so a pathological exponent near i128::MIN would
+        // overflow a plain `frac_digits - exp`; fail closed with checked_sub rather than panic.
+        let scale = frac_digits.checked_sub(exp).ok_or_else(parse_error)?;
         let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
         require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
@@ -1042,6 +1042,8 @@ mod tests {
         expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 1, 0);
         // scale will be too small to fit in i8
         expect_fail_parse("0.E170141183460469231731687303715884105727", 1, 0);
+        // exp == i128::MIN: `frac_digits - exp` would overflow i128; must fail closed, not panic
+        expect_fail_parse("1E-170141183460469231731687303715884105728", 1, 0);
     }
 
     #[test]

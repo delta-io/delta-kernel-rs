@@ -39,7 +39,8 @@ mod token;
 ///
 /// The supported grammar is exactly one comparison `<operand> <op> <operand>`, where each operand
 /// is a column reference (case-insensitive, dotted paths allowed), a literal, or `NULL`, and
-/// `<op>` is one of `< <= > >= = == != <>`. Literal leaves are parsed by [`parse_sql`], typed from
+/// `<op>` is any comparison operator: `<`, `<=`, `>`, `>=`, `=`, `<>`, null-safe `<=>`, and their
+/// Spark spellings (`==`, `!=`, `!>`, `!<`). Literal leaves are parsed by [`parse_sql`], typed from
 /// the column on the other side of the comparison; a comparison must therefore reference at least
 /// one column.
 ///
@@ -55,9 +56,18 @@ mod token;
 ///
 /// # Errors
 ///
-/// Returns an error for any input outside the supported grammar (junctions, functions, arithmetic,
-/// `IN`, `BETWEEN`, ...), for unknown columns, and for type-incompatible literals. Callers treat
-/// that error as the signal that a constraint is *not kernel-parsable*.
+/// Returns an error for any input the kernel cannot lower. Two distinct conditions currently share
+/// the one error channel, and a caller may want to treat them differently:
+/// - *Not kernel-parsable* -- grammar or types the kernel cannot yet lower but Spark accepts
+///   (junctions, functions, arithmetic, `IN`/`BETWEEN`, type-incompatible literals, the
+///   FLOAT-vs-DECIMAL/DOUBLE-literal rejection). The constraint is well-formed; the connector can
+///   still enforce it.
+/// - *Invalid constraint* -- a column reference absent from `schema`. A stored constraint is
+///   validated against the schema at `ADD CONSTRAINT` time, so this signals corrupt metadata (or a
+///   wrong schema view) rather than a lowering gap; the connector cannot enforce it either.
+///
+/// Both surface as `Error::generic` today; the taxonomy is documented here so a future caller
+/// (#2896) can decide fall-back-to-connector vs hard-fail without string-matching messages.
 #[cfg(feature = "check-constraints-in-dev")]
 // TODO(#2896): remove once check-constraints discovery calls this; no in-crate caller until then.
 #[allow(dead_code)]
@@ -88,19 +98,6 @@ pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> Delt
 ///
 /// Returns an error if the input is not a SQL form this parser accepts, or if the parsed value
 /// is not compatible with `data_type` (incompatible type, out of range, etc.).
-// Reached via the `column-defaults-in-dev` re-export and, under `check-constraints-in-dev`, by the
-// lowering stage (`lower` types each literal through `super::parse_sql`); dead only when neither
-// feature is enabled.
-#[cfg_attr(
-    not(any(
-        feature = "column-defaults-in-dev",
-        feature = "check-constraints-in-dev"
-    )),
-    allow(
-        dead_code,
-        reason = "wired up by column defaults and check-constraint lowering"
-    )
-)]
 pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expression> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {

@@ -5,8 +5,8 @@
 //! (`AND`/`OR`/`NOT`), parentheses, and `IS [NOT] NULL` are not yet supported and surface as
 //! errors. A later stage resolves the operands against a schema.
 
-// WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
-// TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
+// WIP feature behind `check-constraints-in-dev`; some items have no caller until discovery lands.
+// TODO(#2896): remove this allow once check-constraint discovery wires up a caller.
 #![allow(dead_code)]
 
 use std::iter::Peekable;

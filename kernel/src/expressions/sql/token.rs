@@ -6,8 +6,8 @@
 //!
 //! Example: `` `col1` > 5 `` tokenizes to `[Ident("col1"), Gt, Number("5")]`.
 
-// WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
-// TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
+// WIP feature behind `check-constraints-in-dev`; some items have no caller until discovery lands.
+// TODO(#2896): remove this allow once check-constraint discovery wires up a caller.
 #![allow(dead_code)]
 
 use std::iter::Peekable;

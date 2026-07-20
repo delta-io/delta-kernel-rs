@@ -1073,6 +1073,26 @@ impl StructType {
         Ok(result)
     }
 
+    /// Like [`fields_of_path`](Self::fields_of_path), but with a caller-provided field name
+    /// resolver (e.g. a case-insensitive one) -- the collecting sibling of
+    /// [`visit_fields_of_path_by`](Self::visit_fields_of_path_by).
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(crate) fn fields_of_path_by<'a, F>(
+        &'a self,
+        col: &ColumnName,
+        find_field: F,
+    ) -> DeltaResult<Vec<&'a StructField>>
+    where
+        F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
+    {
+        let mut result = Vec::with_capacity(col.path().len());
+        self.visit_fields_of_path_by(col, find_field, |f| result.push(f))?;
+        Ok(result)
+    }
+
     /// Visits all fields along the given column path, using a caller-provided field name resolver.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
