@@ -111,12 +111,37 @@ pub struct LogSegmentLoadFailure {
     pub table_type: TableType,
 }
 
+/// How a snapshot load resolved Protocol and Metadata.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum ProtocolMetadataSource {
+    CrcAtTarget,
+    CrcAdvancedByReplay,
+    CrcSeededPmOnlyReplay,
+    FullReplay,
+    Unknown,
+}
+
+impl From<kernel::ProtocolMetadataSource> for ProtocolMetadataSource {
+    fn from(s: kernel::ProtocolMetadataSource) -> Self {
+        match s {
+            kernel::ProtocolMetadataSource::CrcAtTarget => Self::CrcAtTarget,
+            kernel::ProtocolMetadataSource::CrcAdvancedByReplay => Self::CrcAdvancedByReplay,
+            kernel::ProtocolMetadataSource::CrcSeededPmOnlyReplay => Self::CrcSeededPmOnlyReplay,
+            kernel::ProtocolMetadataSource::FullReplay => Self::FullReplay,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Protocol and metadata actions were read from the log.
 #[repr(C)]
 pub struct ProtocolMetadataLoadSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
+    pub source: ProtocolMetadataSource,
     pub duration_ns: u64,
 }
 
@@ -335,11 +360,13 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                source,
                 duration,
             }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
+                source: (*source).into(),
                 duration_ns: ns(*duration),
             }),
             K::ProtocolMetadataLoadFailure(kernel::ProtocolMetadataLoadFailure {
@@ -676,6 +703,34 @@ mod tests {
             assert_eq!(e.peak_hash_set_size, 41);
             assert_eq!(e.dedup_visitor_time_ns, 43);
             assert_eq!(e.predicate_eval_time_ns, 47);
+        });
+    }
+
+    #[test]
+    fn from_kernel_protocol_metadata_load_success_maps_source() {
+        let id = kernel::MetricId::new();
+        let event =
+            kernel::MetricEvent::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
+                operation_id: id,
+                correlation_id: Some("pm-req".into()),
+                table_type: kernel::TableType::CatalogManaged,
+                source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
+                duration: Duration::from_nanos(53),
+            });
+        with_ffi_event(&event, |ffi| {
+            let MetricEvent::ProtocolMetadataLoadSuccess(e) = ffi else {
+                panic!("expected ProtocolMetadataLoadSuccess");
+            };
+            assert_eq!(e.operation_id.bytes, id.as_bytes());
+            assert!(matches!(e.table_type, TableType::CatalogManaged));
+            let cid: &str =
+                unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
+            assert_eq!(cid, "pm-req");
+            assert_eq!(
+                discriminant(&e.source),
+                discriminant(&ProtocolMetadataSource::CrcAdvancedByReplay)
+            );
+            assert_eq!(e.duration_ns, 53);
         });
     }
 
