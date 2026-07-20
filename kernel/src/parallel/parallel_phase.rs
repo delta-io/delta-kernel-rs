@@ -12,6 +12,7 @@ use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
+use crate::log_segment::schema_to_is_not_null_predicate;
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, EngineData, FileMeta};
@@ -53,9 +54,13 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
     ) -> DeltaResult<Self> {
+        // Derive an IS NOT NULL predicate from the read schema so checkpoint parquet row groups
+        // with no relevant action type are skipped, matching the sequential path in
+        // `LogSegment::read_actions_with_projected_checkpoint_actions`.
+        let is_not_null_pred = schema_to_is_not_null_predicate(&read_schema);
         let leaf_checkpoint_reader = engine
             .parquet_handler()
-            .read_parquet_files(&leaf_files, read_schema, None)?
+            .read_parquet_files(&leaf_files, read_schema, is_not_null_pred)?
             .map_ok(|batch| ActionsBatch::new(batch, false));
         Ok(Self {
             processor,
