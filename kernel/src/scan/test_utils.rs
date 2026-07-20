@@ -108,6 +108,21 @@ pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngine
     ArrowEngineData::try_from_engine_data(parsed).unwrap()
 }
 
+// A batch containing only a Remove action, parsed with the schema provided. Under an add-only
+// read schema this projects to a null `add`, so its parquet row group carries an all-null
+// `add.path` and is skippable by an `add.path IS NOT NULL` predicate.
+pub(crate) fn remove_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+    let handler = SyncJsonHandler::new(None);
+    let json_strings: StringArray = vec![
+        r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635}}"#,
+    ]
+        .into();
+    let parsed = handler
+        .parse_json(string_array_to_engine_data(json_strings), output_schema)
+        .unwrap();
+    ArrowEngineData::try_from_engine_data(parsed).unwrap()
+}
+
 // A batch with a Remove action and a partition column (`date`). The Remove has
 // `partitionValues: {"date": "2017-12-10"}` but the transform reads from `add.*` columns,
 // so the Remove's partition values are not visible to the data skipping filter.

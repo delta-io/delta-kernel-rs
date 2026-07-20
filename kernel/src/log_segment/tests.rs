@@ -29,7 +29,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
-    add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
+    add_batch_simple, add_batch_with_remove, remove_only_batch, sidecar_batch_with_given_paths,
     sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
@@ -1362,6 +1362,144 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+/// A checkpoint part whose only row is a Remove action projects to a null `add` under the add-only
+/// scan checkpoint schema. `read_actions_with_projected_checkpoint_actions` derives an
+/// `add.path IS NOT NULL` predicate from that schema, which skips the part's row group so the scan
+/// never materializes the tombstone.
+///
+/// The contrast is what proves the predicate does the skipping: reading the same part with no
+/// predicate yields the null-`add` row, but reading through the derived predicate yields nothing.
+#[tokio::test]
+async fn test_scan_checkpoint_read_skips_all_remove_part() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Real checkpoints store removes with the full file-action schema; the add column is null.
+    add_checkpoint_to_store(
+        &store,
+        remove_only_batch(get_commit_schema().clone()),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    // Baseline: with no predicate the part's single (null-`add`) row group is read.
+    let unfiltered = log_segment.create_checkpoint_stream(
+        &engine,
+        CHECKPOINT_READ_SCHEMA.clone(),
+        None, // meta_predicate
+        None, // stats_schema
+        None, // partition_schema
+    )?;
+    let unfiltered_rows: usize = unfiltered
+        .actions
+        .map_ok(|batch| batch.actions.len())
+        .fold_ok(0, std::ops::Add::add)?;
+    assert_eq!(
+        unfiltered_rows, 1,
+        "without a predicate the all-remove part yields its null-add row"
+    );
+
+    // The scan's add-only checkpoint read derives `add.path IS NOT NULL`, skipping the row group.
+    // There are no commit files, so the resulting stream is empty.
+    let mut filtered = log_segment
+        .read_actions_with_projected_checkpoint_actions(
+            &engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+        )?
+        .actions;
+    assert!(
+        filtered.next().is_none(),
+        "all-remove checkpoint part must be skipped by the add.path IS NOT NULL predicate"
+    );
+
+    Ok(())
+}
+
+/// A checkpoint row group that mixes Adds and a Remove has non-null `add.path` values, so the
+/// derived `add.path IS NOT NULL` predicate must NOT skip it. This guards against an
+/// over-aggressive predicate silently dropping live Adds (or resurrecting a removed file by
+/// dropping the group that also proves the file gone).
+#[tokio::test]
+async fn test_scan_checkpoint_read_keeps_mixed_add_remove_part() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // One row group holding [remove c001, add c001, add c000, metaData].
+    add_checkpoint_to_store(
+        &store,
+        add_batch_with_remove(get_commit_schema().clone()),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    let iter = log_segment
+        .read_actions_with_projected_checkpoint_actions(
+            &engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+        )?
+        .actions;
+
+    let mut add_paths: Vec<String> = Vec::new();
+    for batch in iter {
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(&*batch?.actions)?;
+        add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
+    }
+    add_paths.sort();
+    assert_eq!(
+        add_paths,
+        vec![
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string(),
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet".to_string(),
+        ],
+        "the mixed row group must be kept, surfacing both Adds"
+    );
 
     Ok(())
 }
@@ -4267,8 +4405,14 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         Expression::column(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])).is_not_null(),
     )),
 )]
+#[case::add_field(
+    schema! { nullable (ADD_NAME): {} },
+    Some(Arc::new(
+        Expression::column(ColumnName::new([ADD_NAME, "path"])).is_not_null(),
+    )),
+)]
 #[case::unknown_field_returns_none(
-    StructType::new_unchecked([StructField::nullable(ADD_NAME, StructType::new_unchecked([]))]),
+    StructType::new_unchecked([StructField::nullable(REMOVE_NAME, StructType::new_unchecked([]))]),
     None,
 )]
 #[case::multiple_known_fields(
@@ -4284,7 +4428,7 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 #[case::known_and_unknown_field_returns_none(
     StructType::new_unchecked([
         StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
-        StructField::nullable(ADD_NAME, StructType::new_unchecked([])),
+        StructField::nullable(REMOVE_NAME, StructType::new_unchecked([])),
     ]),
     None,
 )]

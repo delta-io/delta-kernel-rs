@@ -784,11 +784,14 @@ fn test_replay_for_scan_metadata() {
     let scan = snapshot.scan_builder().build().unwrap();
     let result = scan.replay_for_scan_metadata(&engine).unwrap();
     let data: Vec<_> = result.actions.try_collect().unwrap();
-    // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
-    // could be skipped when looking for adds/removes.
+    // The add-only checkpoint read schema derives an `add.path IS NOT NULL` skipping predicate,
+    // so checkpoint parts whose only row is a non-Add action (a null `add.path`) are skipped.
+    // The 5 single-row parts are: txn, metaData, protocol, add, txn. The metaData and protocol
+    // parts carry an all-null `add.path` column and are skipped; the two txn parts physically omit
+    // the `add.path` column (no stats to skip on) and are conservatively kept, as is the add part.
     //
     // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
-    assert_eq!(data.len(), 5);
+    assert_eq!(data.len(), 3);
 }
 
 #[test]
