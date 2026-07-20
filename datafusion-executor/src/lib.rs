@@ -12,8 +12,10 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
 use delta_kernel::Engine;
 
+mod expression;
 mod scalar;
 
+pub use expression::to_datafusion_expr;
 pub use scalar::kernel_to_df_scalar;
 
 /// Executes kernel declarative plans on DataFusion.
