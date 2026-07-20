@@ -10,8 +10,8 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, MAX_VALUES,
-    METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    schema_contains_file_actions, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA,
+    MAX_VALUES, METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::{column_name, ColumnName};
@@ -130,8 +130,19 @@ pub(crate) struct LogSegment {
 /// For `txn`, this is effective because all app ids end up in a single checkpoint part when
 /// partitioned by `add.path` as the Delta spec requires. Filtering by a specific app id is not
 /// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
+///
+/// For `add`, an `add.path IS NOT NULL` predicate drops a checkpoint's Remove tombstones, which
+/// project to a null `add` under an add-only read schema. Scan log replay already discards
+/// checkpoint removes without deduplicating on them (`skip_removes = !is_log_batch`), so filtering
+/// them out at the parquet layer changes no survivor and lets the reader skip all-remove row
+/// groups. This makes the predicate safe only for a reader that ignores checkpoint removes: it is
+/// emitted for an add-only checkpoint read schema, while a multi-action schema that also names
+/// `remove` (checkpoint write, log compaction) has no identifying column for `remove` and
+/// short-circuits to `None` below, preserving tombstones. Commit reads use a separate schema, so
+/// removes in commits are unaffected.
 fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
     match action_name {
+        ADD_NAME => Some(column_name!(ADD_NAME, "path")),
         METADATA_NAME => Some(column_name!(METADATA_NAME, "id")),
         PROTOCOL_NAME => Some(column_name!(PROTOCOL_NAME, "minReaderVersion")),
         SET_TRANSACTION_NAME => Some(column_name!(SET_TRANSACTION_NAME, "appId")),
