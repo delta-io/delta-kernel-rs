@@ -19,8 +19,9 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    add_commit, column_mapping_fixtures as fixtures, create_table_and_load_snapshot,
-    engine_store_setup, test_table_setup, test_table_setup_mt, write_batch_to_table,
+    add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
+    create_table_and_load_snapshot, engine_store_setup, test_table_setup, test_table_setup_mt,
+    write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -926,6 +927,71 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         .to_string();
     assert!(
         msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
+        "unexpected error: {msg}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let field = StructField::nullable("new_col", DataType::INTEGER).add_metadata([(
+        ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+        MetadataValue::String("42".to_string()),
+    )]);
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let default = reloaded_schema
+        .field("new_col")
+        .expect("new_col must exist after ALTER")
+        .column_default()?
+        .expect("CURRENT_DEFAULT metadata must survive ALTER");
+    assert_eq!(default.raw_sql(), "42");
+
+    let txn = reloaded.transaction(committer(), engine.as_ref())?;
+    assert!(
+        txn.top_level_column_defaults()?.is_empty(),
+        "default metadata must remain inert without allowColumnDefaults",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (store, engine, table_url) = engine_store_setup("alter_column_defaults", None);
+    let table_url = create_test_table(
+        store,
+        table_url,
+        simple_schema(),
+        &[],
+        true,
+        vec![],
+        vec!["allowColumnDefaults"],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+    let msg = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("new_col", DataType::STRING))
+        .build(&engine, committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled"),
         "unexpected error: {msg}",
     );
 
