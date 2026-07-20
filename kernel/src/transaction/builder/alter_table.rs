@@ -174,6 +174,7 @@ impl AlterTableTransactionBuilder<Modifying> {
                 "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
             ));
         }
+        // TODO(#2630): Support ALTER TABLE on tables with column defaults.
         if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
             return Err(Error::unsupported(
                 "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",

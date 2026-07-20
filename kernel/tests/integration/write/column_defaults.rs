@@ -5,17 +5,21 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT};
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
-use delta_kernel::expressions::Scalar;
+use delta_kernel::expressions::{ColumnName, Scalar};
+use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{
     schema_ref, ArrayType, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
     StructType,
 };
-use delta_kernel::table_features::TableFeature;
+use delta_kernel::table_features::{
+    get_any_level_column_physical_name, ColumnMappingMode, TableFeature,
+};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
@@ -24,10 +28,12 @@ use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExe
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
     copy_directory, create_default_engine, create_table, engine_store_setup, get_column,
-    insert_data, read_actions_from_commit, read_scan, schema_with_column_defaults, test_read,
-    test_table_setup, test_table_setup_mt, write_batch_to_table, LoggingTest,
+    insert_data, read_actions_from_commit, read_scan, resolve_field, schema_with_column_defaults,
+    test_read, test_table_setup, test_table_setup_mt, write_batch_to_table, LoggingTest,
 };
 use url::Url;
+
+use crate::common::write_utils::load_existing_single_file_checkpoint_path;
 
 async fn setup_unpartitioned_table(
     name: &str,
@@ -111,18 +117,32 @@ fn assert_top_level_default(
     Ok(())
 }
 
-fn assert_no_column_default_metadata(field: &StructField) {
+fn assert_no_column_default_metadata(schema: &StructType, path: &[&str]) {
+    let display = path.join(".");
+    let field = resolve_field(schema, path)
+        .unwrap_or_else(|error| panic!("checkpoint schema must contain '{display}': {error}"));
     assert!(
         field
             .get_config_value(&ColumnMetadataKey::CurrentDefault)
             .is_none(),
-        "checkpoint-derived field '{}' must not carry CURRENT_DEFAULT metadata",
-        field.name(),
+        "checkpoint-derived field '{display}' must not carry CURRENT_DEFAULT metadata",
     );
-    if let DataType::Struct(nested) = field.data_type() {
-        for child in nested.fields() {
-            assert_no_column_default_metadata(child);
-        }
+}
+
+fn assert_checkpoint_parsed_columns_have_no_column_defaults(
+    checkpoint_schema: &StructType,
+    data_column: &str,
+    partition_column: &str,
+) {
+    assert_no_column_default_metadata(
+        checkpoint_schema,
+        &["add", "partitionValues_parsed", partition_column],
+    );
+    for stats_field in [MIN_VALUES, MAX_VALUES, NULL_COUNT] {
+        assert_no_column_default_metadata(
+            checkpoint_schema,
+            &["add", "stats_parsed", stats_field, data_column],
+        );
     }
 }
 
@@ -679,6 +699,21 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     assert_top_level_default(&snapshot, engine.as_ref(), "c", Scalar::Integer(42))?;
     assert_top_level_default(&snapshot, engine.as_ref(), "p", Scalar::Integer(7))?;
+    let column_mapping_mode = column_mapping_mode.parse::<ColumnMappingMode>()?;
+    let physical_name = |logical: &str| -> String {
+        get_any_level_column_physical_name(
+            snapshot.schema().as_ref(),
+            &ColumnName::new([logical]),
+            column_mapping_mode,
+        )
+        .expect("top-level column must have a physical name")
+        .into_inner()
+        .into_iter()
+        .next()
+        .expect("top-level physical column path must not be empty")
+    };
+    let data_column = physical_name("c");
+    let partition_column = physical_name("p");
 
     let data_schema = StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
@@ -700,6 +735,8 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
     )
     .await?;
 
+    // Check the engine-facing schema because the Parquet writer does not preserve arbitrary
+    // Arrow field metadata.
     let checkpoint_writer = post_commit_snapshot
         .clone()
         .create_checkpoint_writer(engine.as_ref())?;
@@ -712,21 +749,25 @@ async fn test_column_default_round_trips_with_column_mapping_and_checkpoint(
     for batch in checkpoint_data {
         batch?;
     }
-    let checkpoint_output_schema = StructType::try_from_arrow(checkpoint_batch.schema())?;
-    let add_field = checkpoint_output_schema
-        .field("add")
-        .expect("checkpoint output must contain add actions");
-    let DataType::Struct(add_schema) = add_field.data_type() else {
-        panic!("checkpoint add field must be a struct");
-    };
-    for parsed_field in ["partitionValues_parsed", "stats_parsed"] {
-        let field = add_schema
-            .field(parsed_field)
-            .unwrap_or_else(|| panic!("checkpoint add field must contain {parsed_field}"));
-        assert_no_column_default_metadata(field);
-    }
+    let checkpoint_data_schema = StructType::try_from_arrow(checkpoint_batch.schema())?;
+    assert_checkpoint_parsed_columns_have_no_column_defaults(
+        &checkpoint_data_schema,
+        &data_column,
+        &partition_column,
+    );
 
+    let checkpoint_version = post_commit_snapshot.version();
     post_commit_snapshot.checkpoint(engine.as_ref(), None)?;
+    let checkpoint_path =
+        load_existing_single_file_checkpoint_path(&table_path, checkpoint_version);
+    let checkpoint_reader =
+        ParquetRecordBatchReaderBuilder::try_new(fs::File::open(checkpoint_path)?)?;
+    let checkpoint_file_schema = StructType::try_from_arrow(checkpoint_reader.schema().clone())?;
+    assert_checkpoint_parsed_columns_have_no_column_defaults(
+        &checkpoint_file_schema,
+        &data_column,
+        &partition_column,
+    );
 
     let reloaded_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let reloaded_table_schema = reloaded_snapshot.schema();
