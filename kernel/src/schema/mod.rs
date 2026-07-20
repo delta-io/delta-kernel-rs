@@ -1794,9 +1794,12 @@ fn validate_crs(crs: &str) -> DeltaResult<()> {
             "CRS '{crs}' must not have leading or trailing whitespace"
         ))
     );
-    let (authority, code) = crs.split_once(':').ok_or_else(|| {
-        Error::invalid_geo_params(format!("CRS '{crs}' must be in 'AUTHORITY:CODE' format"))
-    })?;
+    // Exactly one colon: reject both missing (`EPSG4326`) and extra (`EPSG:4326:extra`) colons.
+    let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
+        return Err(Error::invalid_geo_params(format!(
+            "CRS '{crs}' must be in 'AUTHORITY:CODE' format"
+        )));
+    };
     require!(
         !authority.is_empty(),
         Error::invalid_geo_params(format!(
@@ -2744,7 +2747,9 @@ mod tests {
             ":CRS84",
             " EPSG:4326",
             "EPSG:4326 ",
-            " EPSG:4326 "
+            " EPSG:4326 ",
+            "EPSG:4326:extra",
+            "a:b:c"
         )]
         crs: &str,
     ) {
