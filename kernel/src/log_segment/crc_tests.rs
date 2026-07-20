@@ -22,7 +22,7 @@ use crate::object_store::ObjectStoreExt as _;
 use crate::path::ParsedLogPath;
 use crate::snapshot::{IncrementalReplay, SnapshotBuilder, SnapshotRef};
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, Snapshot};
+use crate::{DeltaResult, Engine, Snapshot, Version};
 
 // ============================================================================
 // Expected values
@@ -397,6 +397,20 @@ impl BuiltCrcTest {
         let log_segment =
             LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
         log_segment.build_crc_from_base(&self.engine, base)
+    }
+
+    /// Run `pick_latest_base_crc` against a directly-listed `LogSegment`, using `in_memory_base`.
+    fn pick_latest_base_crc(
+        &self,
+        in_memory_base: Option<&Arc<Crc>>,
+    ) -> DeltaResult<Option<Version>> {
+        let storage = self.engine.storage_handler();
+        let log_root = self.url.join("_delta_log/").unwrap();
+        let log_segment =
+            LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None)?;
+        Ok(log_segment
+            .pick_latest_base_crc(&self.engine, in_memory_base)
+            .map(|c| c.version))
     }
 
     /// Read the on-disk CRC at `version` from this test's log.
@@ -1213,7 +1227,39 @@ async fn test_stale_crc_advanced_only_within_replay_budget(
         .await;
     let snapshot = built.snapshot_latest_with_replay(mode);
     assert_eq!(snapshot.version(), 3);
-    assert_eq!(snapshot.crc().map(|c| c.version), expected_crc_version);
+    assert_eq!(
+        snapshot.crc_at_version().map(|c| c.version),
+        expected_crc_version
+    );
+}
+
+// A base exactly at the checkpoint version is kept (its tail is (ckpt, end]); a base below it is
+// dropped. Guards the `>=` vs `>` seam in `pick_latest_base_crc`.
+#[tokio::test]
+async fn test_pick_latest_base_crc_keeps_base_at_checkpoint_drops_below() {
+    let built = CrcReadTest::new()
+        .v2_checkpoint(2, protocol_a(), metadata_a())
+        .commit(3, [commit_info(DEFAULT_OPERATION, None)])
+        .build()
+        .await;
+    let base_at_ckpt = Arc::new(Crc {
+        version: 2,
+        ..Default::default()
+    });
+    let base_below_ckpt = Arc::new(Crc {
+        version: 1,
+        ..Default::default()
+    });
+    assert_eq!(
+        built.pick_latest_base_crc(Some(&base_at_ckpt)).unwrap(),
+        Some(2),
+        "a base exactly at the checkpoint version must be retained"
+    );
+    assert_eq!(
+        built.pick_latest_base_crc(Some(&base_below_ckpt)).unwrap(),
+        None,
+        "a base below the checkpoint version must be dropped"
+    );
 }
 
 // ============================================================================
