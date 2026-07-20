@@ -496,6 +496,27 @@ impl ScanLogReplayProcessor {
         );
         Ok((transformed, selection_vector))
     }
+
+    fn record_active_add_files(
+        &self,
+        selection_vector: &[bool],
+        active_add_file_sizes: &[u64],
+    ) -> DeltaResult<()> {
+        require!(
+            selection_vector.len() == active_add_file_sizes.len(),
+            Error::internal_error(format!(
+                "selection vector length {} != active Add file sizes length {}",
+                selection_vector.len(),
+                active_add_file_sizes.len()
+            ))
+        );
+        for (selected, size) in selection_vector.iter().zip(active_add_file_sizes) {
+            if *selected {
+                self.metrics.record_active_add_file(*size);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
@@ -507,6 +528,7 @@ struct AddRemoveDedupVisitor<'a, D: Deduplicator> {
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    active_add_file_sizes: Vec<u64>,
     metrics: &'a ScanMetrics,
 }
 
@@ -517,11 +539,13 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
         state_info: Arc<StateInfo>,
         metrics: &'a ScanMetrics,
     ) -> AddRemoveDedupVisitor<'a, D> {
+        let active_add_file_sizes = vec![0; selection_vector.len()];
         AddRemoveDedupVisitor {
             deduplicator,
             selection_vector,
             state_info,
             row_transform_exprs: Vec::new(),
+            active_add_file_sizes,
             metrics,
         }
     }
@@ -608,7 +632,7 @@ impl<'a, D: Deduplicator> AddRemoveDedupVisitor<'a, D> {
                 self.row_transform_exprs.push(patch_expr);
             }
         }
-        self.metrics.record_active_add_file(size);
+        self.active_add_file_sizes[row] = size;
         Ok(true)
     }
 }
@@ -887,7 +911,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_SIZE_INDEX,
             Self::ADD_DV_START_INDEX,
         )?;
-        let (dedup_selection, row_transform_exprs) = {
+        let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
                 selection_vector,
@@ -895,7 +919,11 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 &self.metrics,
             );
             visitor.visit_rows_of(actions.as_ref())?;
-            (visitor.selection_vector, visitor.row_transform_exprs)
+            (
+                visitor.selection_vector,
+                visitor.row_transform_exprs,
+                visitor.active_add_file_sizes,
+            )
         };
 
         // Step 3: Return transformed batch with updated selection vector
@@ -908,11 +936,18 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 .filter(|(_, selected)| **selected)
                 .map(|(row, _)| row_transform_exprs.get(row).cloned().flatten())
                 .collect();
+            let active_add_file_sizes = dedup_selection
+                .iter()
+                .zip(active_add_file_sizes)
+                .filter_map(|(selected, size)| (*selected).then_some(size))
+                .collect::<Vec<_>>();
             let actions = actions.apply_selection_vector(dedup_selection)?;
             let (transformed, selection_vector) =
                 self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+            self.record_active_add_files(&selection_vector, &active_add_file_sizes)?;
             ScanMetadata::try_new(transformed, selection_vector, row_transform_exprs)?
         } else {
+            self.record_active_add_files(&dedup_selection, &active_add_file_sizes)?;
             ScanMetadata::try_new(transformed_result?, dedup_selection, row_transform_exprs)?
         };
         self.metrics
@@ -968,7 +1003,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             Self::ADD_DV_START_INDEX,
             Self::REMOVE_DV_START_INDEX,
         );
-        let (dedup_selection, row_transform_exprs) = {
+        let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
                 selection_vector,
@@ -976,7 +1011,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 &self.metrics,
             );
             visitor.visit_rows_of(actions.as_ref())?;
-            (visitor.selection_vector, visitor.row_transform_exprs)
+            (
+                visitor.selection_vector,
+                visitor.row_transform_exprs,
+                visitor.active_add_file_sizes,
+            )
         };
 
         // Step 4: Return transformed batch with updated selection vector
@@ -987,11 +1026,18 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 .filter(|(_, selected)| **selected)
                 .map(|(row, _)| row_transform_exprs.get(row).cloned().flatten())
                 .collect();
+            let active_add_file_sizes = dedup_selection
+                .iter()
+                .zip(active_add_file_sizes)
+                .filter_map(|(selected, size)| (*selected).then_some(size))
+                .collect::<Vec<_>>();
             let actions = actions.apply_selection_vector(dedup_selection)?;
             let (transformed, selection_vector) =
                 self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+            self.record_active_add_files(&selection_vector, &active_add_file_sizes)?;
             ScanMetadata::try_new(transformed, selection_vector, row_transform_exprs)?
         } else {
+            self.record_active_add_files(&dedup_selection, &active_add_file_sizes)?;
             ScanMetadata::try_new(transformed_result?, dedup_selection, row_transform_exprs)?
         };
         self.metrics
