@@ -1834,10 +1834,6 @@ fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
                 Scalar::decimal(bits, dt.precision(), dt.scale())
                     .expect("test seed produced invalid decimal")
             }
-            // Void, interval, and geo (when the `geo-type-in-dev` feature is enabled) are not valid
-            // partition column types. A catch-all keeps this helper independent of the geo cargo
-            // feature -- gating a `Geometry | Geography` arm would go out of sync whenever a
-            // dependent enables `delta_kernel/geo-type-in-dev` without `test_utils`'s passthrough.
             other => panic!("{other:?} is not a valid partition column type"),
         },
         other => panic!("partition columns must be primitive types, got: {other:?}"),
