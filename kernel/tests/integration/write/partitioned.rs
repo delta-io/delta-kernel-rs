@@ -789,8 +789,8 @@ async fn create_interval_partitioned_table(
     let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
     let table_url = Url::from_directory_path(table_path)
         .map_err(|_| "table_path should be a valid file URL")?;
-    let mut reader_features = vec!["intervalType-preview"];
-    let mut writer_features = vec!["intervalType-preview"];
+    let mut reader_features = vec![];
+    let mut writer_features = vec![];
     if materialize_partition_columns {
         writer_features.push("materializePartitionColumns");
     }
