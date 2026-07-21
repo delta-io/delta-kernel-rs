@@ -1,7 +1,27 @@
-//! A typed wrapper around Delta's `CURRENT_DEFAULT` column metadata
+//! A typed wrapper around Delta's `CURRENT_DEFAULT` column metadata.
+//!
+//! # Invariants
+//!
+//! The rules Kernel applies to column defaults, and where each comes from. This applies to
+//! [`ColumnDefault::new`], [`validate_column_defaults_metadata`], and the IcebergCompatV3 warnings
+//! in [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
+//! divergences are called out as such.
+//!
+//! - `CURRENT_DEFAULT` metadata must be a string.
+//! - A Variant column must default to NULL; a non-NULL variant default is rejected.
+//! - A non-NULL default on an Array, Map, or Struct column is protocol-legal but kernel cannot
+//!   materialize it, so it is tolerated and surfaced via raw SQL (`to_scalar` returns `None`).
+//! - Defaults may appear on nested struct fields, not just top-level columns, so validation
+//!   descends into nested fields. Kernel only *writes* top-level defaults (a kernel limitation),
+//!   but *loads* a snapshot of a table authored elsewhere that carries nested defaults.
+//! - Parsing is best-effort: unparseable SQL (e.g. `current_timestamp()`) is not an error; the
+//!   connector falls back to the raw SQL.
+//! - On an IcebergCompatV3 table, kernel warns when its parser cannot verify that a default is a
+//!   literal.
 
 use crate::expressions::{parse_sql, Expression, Scalar};
-use crate::schema::DataType;
+use crate::schema::{DataType, StructField, StructType};
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
 
 /// A column-level default parsed from the `CURRENT_DEFAULT` metadata key of a
@@ -32,15 +52,15 @@ impl<'a> ColumnDefault<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `data_type` is non-primitive (Array, Map, Struct, or Variant) and
-    /// `raw_sql` is not `NULL` (case-insensitive).
+    /// Returns an [`Error::schema`] when `data_type` is a Variant and `raw_sql` is not `NULL`
+    /// (case-insensitive). A non-`NULL` default on an Array, Map, or Struct column is accepted;
+    /// the kernel cannot parse it, so [`to_scalar`](Self::to_scalar) returns `None`.
     pub(crate) fn new(raw_sql: String, data_type: &'a DataType) -> DeltaResult<Self> {
         let is_null = raw_sql.trim().eq_ignore_ascii_case("null");
-        // Spark only allows a non-primitive column default when it is NULL; match that behavior.
-        if data_type.as_primitive_opt().is_none() && !is_null {
-            return Err(Error::generic(format!(
-                "non-null column default for non-primitive type {data_type:?} is not \
-                 supported, got {raw_sql:?}"
+
+        if matches!(data_type, DataType::Variant(_)) && !is_null {
+            return Err(Error::schema(format!(
+                "a Variant column's default must be NULL, got {raw_sql:?}"
             )));
         }
         let parsed_sql = parse_sql(&raw_sql, data_type).ok();
@@ -78,6 +98,132 @@ impl<'a> ColumnDefault<'a> {
             ))),
         }
     }
+
+    /// Returns `true` iff the default parsed to a literal expression.
+    ///
+    /// Returns `false` for SQL the kernel could not parse (e.g. arithmetic or function calls). Note
+    /// that NULL parses to a literal, so this is `true` for a NULL default regardless of the
+    /// column type.
+    pub(crate) fn is_kernel_parsable_literal(&self) -> bool {
+        matches!(self.parsed_sql, Some(Expression::Literal(_)))
+    }
+}
+
+/// Walks a schema and returns the parsed [`ColumnDefault`] of every field carrying
+/// a `CURRENT_DEFAULT`, descending through nested structs, arrays, and maps (see the nesting
+/// invariant in the module docs). Each default is paired with a human-readable path.
+///
+/// The path is a dot-joined string intended only for error messages.
+///
+/// # Errors
+///
+/// Propagates any error from
+/// [`StructField::column_default`](crate::schema::StructField::column_default): a `CURRENT_DEFAULT`
+/// whose value is not a string, or a non-`NULL` default on a Variant column.
+pub(crate) fn try_collect_column_defaults(
+    schema: &StructType,
+) -> DeltaResult<Vec<(String, ColumnDefault<'_>)>> {
+    let mut collector = ColumnDefaultCollector {
+        path: Vec::new(),
+        defaults: Vec::new(),
+    };
+    collector.transform_struct(schema)?;
+    Ok(collector.defaults)
+}
+
+/// Recursive [`SchemaTransform`] that gathers every field's column default with its display path.
+///
+/// Container element types have no metadata of their own, so the array/map hooks only push a
+/// synthetic path segment before recursing toward any nested struct.
+struct ColumnDefaultCollector<'a> {
+    path: Vec<String>,
+    defaults: Vec<(String, ColumnDefault<'a>)>,
+}
+
+impl<'a> ColumnDefaultCollector<'a> {
+    /// Recurse into a container element type under a synthetic path `segment`
+    /// (`element` for arrays, `key`/`value` for maps).
+    fn descend(&mut self, segment: &str, element: &'a DataType) -> DeltaResult<()> {
+        self.path.push(segment.to_string());
+        let result = self.transform(element);
+        self.path.pop();
+        result
+    }
+}
+
+impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
+    transform_output_type!(|'a, T| DeltaResult<()>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> DeltaResult<()> {
+        self.path.push(field.name().clone());
+        if let Some(column_default) = field.column_default()? {
+            self.defaults.push((self.path.join("."), column_default));
+        }
+        let result = self.recurse_into_struct_field(field);
+        self.path.pop();
+        result
+    }
+
+    fn transform_array_element(&mut self, etype: &'a DataType) -> DeltaResult<()> {
+        self.descend("element", etype)
+    }
+
+    fn transform_map_key(&mut self, ktype: &'a DataType) -> DeltaResult<()> {
+        self.descend("key", ktype)
+    }
+
+    fn transform_map_value(&mut self, vtype: &'a DataType) -> DeltaResult<()> {
+        self.descend("value", vtype)
+    }
+
+    fn transform_variant(&mut self, _stype: &'a StructType) -> DeltaResult<()> {
+        Ok(())
+    }
+}
+
+/// Validates the column-default metadata on a table's logical schema (see [Errors](#errors)).
+///
+/// Run eagerly at [`TableConfiguration`] construction so an invalid table is rejected at load.
+/// Inspects nested fields as well as top-level columns; see [`try_collect_column_defaults`].
+///
+/// This does not couple defaults to the `allowColumnDefaults` feature: a `CURRENT_DEFAULT`
+/// present without the feature is orphaned metadata, which is allowed (see the module docs).
+///
+/// [`TableConfiguration`]: crate::table_configuration::TableConfiguration
+///
+/// # Errors
+///
+/// Propagates any error from [`try_collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is
+/// not a string, or a non-NULL default on a Variant column.
+pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<()> {
+    try_collect_column_defaults(schema)?;
+    Ok(())
+}
+
+/// A nullable field named `name` carrying `raw_sql` as its `CURRENT_DEFAULT` metadata.
+///
+/// Shared across the crate's column-default unit tests (here, `schema`, and `transaction`).
+#[cfg(test)]
+pub(crate) fn field_with_default(
+    name: &str,
+    data_type: impl Into<DataType>,
+    raw_sql: &str,
+) -> StructField {
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    StructField::nullable(name, data_type).add_metadata([(
+        ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+        MetadataValue::String(raw_sql.to_string()),
+    )])
+}
+
+/// A nullable field named `name` whose `CURRENT_DEFAULT` metadata is a non-string value (corrupt).
+#[cfg(test)]
+pub(crate) fn field_with_invalid_default(name: &str) -> StructField {
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    StructField::nullable(name, DataType::INTEGER).add_metadata([(
+        ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+        MetadataValue::Number(7),
+    )])
 }
 
 #[cfg(test)]
@@ -90,6 +236,11 @@ mod tests {
 
     fn struct_ty() -> DataType {
         DataType::try_struct_type([StructField::nullable("a", DataType::INTEGER)]).unwrap()
+    }
+
+    /// A struct type whose single field `inner` carries an integer default.
+    fn struct_with_inner_default() -> DataType {
+        DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap()
     }
 
     fn date_days(year: i32, month: u32, day: u32) -> i32 {
@@ -143,19 +294,15 @@ mod tests {
     #[case::non_primitive_array(
         "ARRAY(1)",
         DataType::from(ArrayType::new(DataType::INTEGER, true)),
-        Expect::NewErr("not supported")
+        Expect::Unparsable
     )]
     #[case::non_primitive_map(
         "MAP('k', 1)",
         DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
-        Expect::NewErr("not supported")
+        Expect::Unparsable
     )]
-    #[case::non_primitive_struct("STRUCT(1)", struct_ty(), Expect::NewErr("not supported"))]
-    #[case::non_primitive_variant(
-        "1",
-        DataType::unshredded_variant(),
-        Expect::NewErr("not supported")
-    )]
+    #[case::non_primitive_struct("STRUCT(1)", struct_ty(), Expect::Unparsable)]
+    #[case::non_null_variant("1", DataType::unshredded_variant(), Expect::NewErr("Variant"))]
     fn column_default_from_new(
         #[case] raw_sql: &str,
         #[case] data_type: DataType,
@@ -185,6 +332,69 @@ mod tests {
                 panic!("unexpected outcome for {raw_sql:?}: {result:?} vs {expect:?}")
             }
         }
+    }
+
+    /// Validation is independent of the `allowColumnDefaults` feature: it checks only that the
+    /// metadata is well-formed (string-typed, primitive-or-NULL), never whether the feature is
+    /// enabled. `None` expects `Ok`; `Some(needle)` expects an error containing `needle`.
+    #[rstest]
+    #[case::well_formed_default(
+        vec![
+            field_with_default("c", DataType::INTEGER, "42"),
+            StructField::nullable("no_default", DataType::STRING),
+        ],
+        None
+    )]
+    #[case::no_defaults(vec![StructField::nullable("c", DataType::INTEGER)], None)]
+    #[case::non_string_metadata(vec![field_with_invalid_default("c")], Some("non-string"))]
+    #[case::non_null_default_on_array_tolerated(
+        vec![field_with_default("arr", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")],
+        None
+    )]
+    #[case::non_null_default_on_variant_rejected(
+        vec![field_with_default("v", DataType::unshredded_variant(), "1")],
+        Some("Variant")
+    )]
+    #[case::nested_default(
+        vec![StructField::nullable(
+            "s",
+            DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap(),
+        )],
+        None
+    )]
+    fn validate_column_defaults_cases(
+        #[case] fields: Vec<StructField>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let schema = StructType::try_new(fields).unwrap();
+        match (validate_column_defaults_metadata(&schema), expected_error) {
+            (Ok(()), None) => {}
+            (Err(e), Some(needle)) => assert!(e.to_string().contains(needle), "got: {e}"),
+            (result, expected) => panic!("unexpected outcome: {result:?} vs {expected:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::array_element(
+        DataType::from(ArrayType::new(struct_with_inner_default(), true)),
+        ["arr", "element", "inner"]
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(DataType::STRING, struct_with_inner_default(), true)),
+        ["arr", "value", "inner"]
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(struct_with_inner_default(), DataType::INTEGER, true)),
+        ["arr", "key", "inner"]
+    )]
+    fn collect_nested_container_default_path(
+        #[case] container: DataType,
+        #[case] expected_path: [&str; 3],
+    ) {
+        let schema = StructType::try_new([StructField::nullable("arr", container)]).unwrap();
+        let defaults = try_collect_column_defaults(&schema).unwrap();
+        let [(path, _)] = defaults.try_into().expect("exactly one default");
+        assert_eq!(path, expected_path.join("."));
     }
 
     #[test]

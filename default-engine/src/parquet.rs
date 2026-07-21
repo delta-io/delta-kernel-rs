@@ -195,12 +195,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        physical_schema: &StructType,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
         // Collect statistics before writing (includes numRecords)
-        let stats = collect_stats(record_batch, stats_columns)?;
+        let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new_with_options(
@@ -259,6 +260,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
                 &write_context.write_dir(),
                 data,
                 write_context.stats_columns(),
+                write_context.physical_schema().as_ref(),
             )
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
@@ -628,6 +630,10 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+
+    fn long_schema(name: &str) -> StructType {
+        StructType::new_unchecked([StructField::nullable(name, DataType::LONG)])
+    }
 
     /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
     /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates
@@ -1051,9 +1057,15 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 
@@ -1130,10 +1142,16 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(
+                    &Url::parse("memory:///data").unwrap(),
+                    data,
+                    &[],
+                    &physical_schema,
+                )
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
@@ -1712,8 +1730,14 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
         let metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 

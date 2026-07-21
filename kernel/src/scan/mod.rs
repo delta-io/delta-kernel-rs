@@ -27,6 +27,8 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::nodes::FileType;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -965,8 +967,14 @@ impl Scan {
     fn declarative_metadata_scan_plan(&self) -> DeltaResult<Option<crate::plans::ir::plan::Plan>> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+        // A checkpoint's parts share one format, so at most one of the json / parquet part lists is
+        // populated.
         let (json_checkpoint_files, parquet_checkpoint_files) =
-            log_segment.checkpoint_version_tagged_scan_files()?;
+            match log_segment.checkpoint_version_tagged_scan_files()? {
+                Some((FileType::Json, files)) => (files, vec![]),
+                Some((FileType::Parquet, files)) => (vec![], files),
+                None => (vec![], vec![]),
+            };
         scan_plan::build_metadata_scan_plan(
             &self.state_info,
             commit_files,

@@ -8,12 +8,49 @@ mod utils;
 use std::sync::Arc;
 
 pub use committer::UCCommitter;
-use delta_kernel::{Engine, LogPath, Snapshot, Version};
-use itertools::Itertools;
+use delta_kernel::{DeltaResult, Engine, Error, LogPath, Snapshot, Version};
 use tracing::debug;
-use unity_catalog_delta_client_api::{CommitsRequest, GetCommitsClient};
+use unity_catalog_delta_client_api::{Commit, CommitsRequest, GetCommitsClient};
 use url::Url;
 pub use utils::{get_final_required_properties_for_uc, get_required_properties_for_disk};
+
+/// Convert catalog-provided [`Commit`]s into kernel [`LogPath`]s for
+/// `Snapshot::builder_for(..).with_log_tail(..)`.
+///
+/// Sorts commits by version because they may arrive out of order. Normalizes `table_root`
+/// with a trailing `/` for staged-commit path resolution.
+///
+/// # Errors
+///
+/// Returns an error if a commit's `file_size` is negative (does not fit in `FileSize`) or if
+/// [`LogPath::staged_commit`] rejects the resolved path.
+pub(crate) fn log_tail_from_commits(
+    commits: &[Commit],
+    mut table_root: Url,
+) -> DeltaResult<Vec<LogPath>> {
+    if !table_root.path().ends_with('/') {
+        table_root.set_path(&format!("{}/", table_root.path()));
+    }
+    let mut sorted: Vec<&Commit> = commits.iter().collect();
+    sorted.sort_by_key(|c| c.version);
+    sorted
+        .into_iter()
+        .map(|c| {
+            let file_size = c.file_size.try_into().map_err(|_| {
+                Error::generic(format!(
+                    "commit file_size {} does not fit in FileSize",
+                    c.file_size
+                ))
+            })?;
+            LogPath::staged_commit(
+                table_root.clone(),
+                &c.file_name,
+                c.file_modification_timestamp,
+                file_size,
+            )
+        })
+        .collect()
+}
 
 /// The [UCKernelClient] provides a high-level interface to interact with Delta Tables stored in
 /// Unity Catalog. It is a lightweight wrapper around a [GetCommitsClient].
@@ -68,48 +105,21 @@ impl<'a, C: GetCommitsClient> UCKernelClient<'a, C> {
             start_version: Some(0),
             end_version: version.and_then(|v| v.try_into().ok()),
         };
-        let mut commits = self.get_commits_client.get_commits(req).await?;
-        if let Some(commits) = commits.commits.as_mut() {
-            commits.sort_by_key(|c| c.version)
-        }
+        let commits = self.get_commits_client.get_commits(req).await?;
 
         // The catalog always returns the latest ratified version. Use it as the
         // max_catalog_version for snapshot building, and as the effective version when no
         // explicit time-travel version is requested.
         let max_catalog_version: Version = commits.latest_table_version.try_into()?;
 
-        // consume the UC Commit and hand back a delta_kernel LogPath
-        let mut table_url = Url::parse(&table_uri)?;
-        // add trailing slash
-        if !table_url.path().ends_with('/') {
-            // NB: we push an empty segment which effectively adds a trailing slash
-            table_url
-                .path_segments_mut()
-                .map_err(|_| "Cannot modify URL path segments")?
-                .push("");
-        }
-        let commits: Vec<_> = commits
-            .commits
-            .unwrap_or_default()
-            .into_iter()
-            .map(
-                |c| -> Result<LogPath, Box<dyn std::error::Error + Send + Sync>> {
-                    LogPath::staged_commit(
-                        table_url.clone(),
-                        &c.file_name,
-                        c.file_modification_timestamp,
-                        c.file_size.try_into()?,
-                    )
-                    .map_err(|e| e.into())
-                },
-            )
-            .try_collect()?;
+        let table_url = Url::parse(&table_uri)?;
+        let log_tail = log_tail_from_commits(&commits.commits.unwrap_or_default(), table_url)?;
 
-        debug!("commits for kernel: {:?}\n", commits);
+        debug!("commits for kernel: {:?}\n", log_tail);
 
-        let mut builder = Snapshot::builder_for(table_url)
+        let mut builder = Snapshot::builder_for(&table_uri)
             .with_max_catalog_version(max_catalog_version)
-            .with_log_tail(commits);
+            .with_log_tail(log_tail);
 
         if let Some(v) = version {
             builder = builder.at_version(v);
@@ -132,6 +142,7 @@ mod tests {
     };
     use delta_kernel::transaction::CommitResult;
     use delta_kernel_default_engine::DefaultEngineBuilder;
+    use rstest::rstest;
     use tracing::info;
     use unity_catalog_delta_client_api::{Commit, InMemoryCommitsClient, Operation, TableData};
     use unity_catalog_delta_rest_client::models::TablesResponse;
@@ -385,5 +396,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("log_tail must be sorted and contiguous"));
+    }
+
+    #[rstest]
+    #[case::missing_trailing_slash("memory:///my_table")]
+    #[case::has_trailing_slash("memory:///my_table/")]
+    fn log_tail_from_commits_sorts_and_normalizes(#[case] table_root: &str) {
+        let names = [
+            "00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+            "00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+            "00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        ];
+        // Insert out of order: 2, 0, 1.
+        let commits = vec![
+            Commit::new(2, 0, names[2], 100, 0),
+            Commit::new(0, 0, names[0], 100, 0),
+            Commit::new(1, 0, names[1], 100, 0),
+        ];
+        let normalized = Url::parse("memory:///my_table/").unwrap();
+
+        let log_tail = log_tail_from_commits(&commits, Url::parse(table_root).unwrap()).unwrap();
+
+        let expected: Vec<LogPath> = names
+            .iter()
+            .map(|name| LogPath::staged_commit(normalized.clone(), name, 0, 100).unwrap())
+            .collect();
+        assert_eq!(log_tail, expected);
+    }
+
+    #[test]
+    fn log_tail_from_commits_empty_commits_is_empty() {
+        let table_root = Url::parse("memory:///my_table/").unwrap();
+        assert!(log_tail_from_commits(&[], table_root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn log_tail_from_commits_rejects_negative_file_size() {
+        let commits = vec![Commit::new(
+            0,
+            0,
+            "00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+            -1,
+            0,
+        )];
+        let table_root = Url::parse("memory:///my_table/").unwrap();
+
+        let err = log_tail_from_commits(&commits, table_root).unwrap_err();
+
+        assert!(err.to_string().contains("does not fit in FileSize"));
     }
 }

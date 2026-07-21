@@ -19,15 +19,15 @@ pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
+    StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-#[cfg(feature = "column-defaults-in-dev")]
-mod column_default;
-#[cfg(feature = "column-defaults-in-dev")]
+pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
+pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -521,10 +521,9 @@ impl StructField {
     ///
     /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
     /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
-    /// - `Err(_)` -- present but malformed: either not a [`MetadataValue::String`] (the protocol
-    ///   defines `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected
-    ///   by [`ColumnDefault`] (e.g. a non-NULL default on a non-primitive type).
-    #[cfg(feature = "column-defaults-in-dev")]
+    /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
+    ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
+    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
     pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
         let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
             None => return Ok(None),
@@ -628,8 +627,8 @@ impl StructField {
     /// metadata if present, otherwise returns the logical name.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// [`crate::table_configuration::TableConfiguration::try_new`]. In `None` mode a stale
+    /// annotation may still be present (it is ignored, and the logical name is returned).
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
         match column_mapping_mode {
@@ -721,8 +720,11 @@ impl StructField {
     /// Otherwise, the field's logical name is used.
     ///
     /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
-    /// missing when column mapping is enabled, present when disabled, or wrong type), or if a
-    /// metadata column is encountered (metadata columns should not participate in column mapping).
+    /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
+    /// encountered (metadata columns should not participate in column mapping). When column
+    /// mapping is disabled, a stale annotation is tolerated (resolved by logical name and dropped
+    /// from the physical metadata); CREATE / ALTER reject it via a separate strict validation pass
+    /// instead.
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]
@@ -746,8 +748,8 @@ impl StructField {
     /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
     ///
     /// NOTE: Caller affirms that `self` was already validated by
-    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`], to ensure that
-    /// annotations are always and only present when column mapping mode is enabled.
+    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`]. In `None` mode a
+    /// stale annotation may be present; this drops the column-mapping keys regardless.
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
@@ -1853,6 +1855,12 @@ impl PrimitiveType {
         Ok(DecimalType::try_new(precision, scale)?.into())
     }
 
+    /// Returns whether this is one of the ANSI interval primitive types.
+    #[internal_api]
+    pub(crate) fn is_interval(&self) -> bool {
+        matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
+    }
+
     /// Returns `true` if this primitive type can be widened to the `target` type.
     ///
     /// Widening rules:
@@ -2308,6 +2316,29 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
+/// What a [`MakePhysical`] walk does with each field. The two modes bundle the physical-rewrite
+/// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
+/// a mapping-disabled table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MakePhysicalMode {
+    /// Rewrite each field to its physical name + metadata (the read/build path). A stale
+    /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
+    /// physical metadata.
+    Rewrite,
+    /// Validate annotations only, without rewriting (the strict write-path check). A stale
+    /// annotation in `None` mode is rejected.
+    ValidateStrict,
+}
+
+impl MakePhysicalMode {
+    fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
+        match self {
+            Self::Rewrite => StaleAnnotationPolicy::Ignore,
+            Self::ValidateStrict => StaleAnnotationPolicy::Reject,
+        }
+    }
+}
+
 pub(crate) struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
@@ -2320,9 +2351,9 @@ pub(crate) struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
-    /// When `true`, skips the physical-name + metadata rewrite, only validates the column
-    /// mapping annotations.
-    validation_only: bool,
+    /// Whether this walk rewrites fields to physical form or only validates (see
+    /// [`MakePhysicalMode`]).
+    mode: MakePhysicalMode,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -2331,17 +2362,18 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
-            validation_only: false,
+            mode: MakePhysicalMode::Rewrite,
         }
     }
 
-    /// Walks `schema` and validates its column-mapping annotations.
+    /// Walks `schema` and validates its column-mapping annotations, rejecting stale annotations
+    /// left over on a column-mapping-disabled table.
     pub(crate) fn validate_schema_column_mapping(
         mode: ColumnMappingMode,
         schema: &'a StructType,
     ) -> DeltaResult<()> {
         let mut walker = Self {
-            validation_only: true,
+            mode: MakePhysicalMode::ValidateStrict,
             ..Self::new(mode)
         };
         walker.transform_struct(schema).map(|_| ())
@@ -2384,6 +2416,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
             field,
             self.column_mapping_mode,
+            self.mode.stale_annotation_policy(),
             &self.logical_path,
             Some(&mut self.seen_ids),
             self.sibling_names_stack.last_mut(),
@@ -2395,7 +2428,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
         self.transform_inner(field.name(), |this| {
             let field = this.recurse_into_struct_field(field)?;
-            if this.validation_only {
+            if this.mode == MakePhysicalMode::ValidateStrict {
                 return Ok(field);
             }
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
@@ -2834,10 +2867,40 @@ mod tests {
     }
 
     #[test]
-    fn test_make_physical_rejects_annotated_fields_when_column_mapping_disabled() {
+    fn test_make_physical_tolerates_stale_annotations_when_column_mapping_disabled() {
+        // A table can carry `delta.columnMapping.*` annotations after mapping was enabled and then
+        // disabled. They are inert while mapping is off, so `make_physical` (the read path)
+        // tolerates them: the field keeps its logical name and the CM keys are dropped from the
+        // physical metadata, leaving a schema indistinguishable from a table that never had them.
         let data = example_schema_metadata();
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert!(field.make_physical(ColumnMappingMode::None).is_err());
+        let physical = field.make_physical(ColumnMappingMode::None).unwrap();
+
+        assert_eq!(physical.name, "e");
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        // Non-column-mapping metadata is untouched.
+        assert!(physical.metadata.contains_key("delta.identity.start"));
+
+        // The nested leaf `d` is likewise tolerated: logical name kept, CM keys dropped.
+        let DataType::Array(atype) = &physical.data_type else {
+            panic!("Expected an Array");
+        };
+        let DataType::Struct(stype) = atype.element_type() else {
+            panic!("Expected a Struct");
+        };
+        let leaf = stype.fields().next().unwrap();
+        assert_eq!(leaf.name, "d");
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
     }
 
     #[test]
@@ -4180,17 +4243,9 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "column-defaults-in-dev")]
     mod column_default_method {
         use super::*;
-
-        /// A nullable field named `c` carrying `raw_sql` as its `CURRENT_DEFAULT`.
-        fn field_with_default(data_type: DataType, raw_sql: &str) -> StructField {
-            StructField::nullable("c", data_type).add_metadata([(
-                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-                MetadataValue::String(raw_sql.to_string()),
-            )])
-        }
+        use crate::schema::column_default::field_with_default;
 
         #[test]
         fn returns_none_when_no_current_default() {
@@ -4221,7 +4276,7 @@ mod tests {
             #[case] raw_sql: &str,
             #[case] parsable: bool,
         ) {
-            let field = field_with_default(data_type.clone(), raw_sql);
+            let field = field_with_default("c", data_type.clone(), raw_sql);
             let column_default = field
                 .column_default()
                 .unwrap()
@@ -4231,15 +4286,35 @@ mod tests {
             assert_eq!(column_default.to_scalar().unwrap().is_some(), parsable);
         }
 
+        #[rstest]
+        #[case::array(DataType::from(ArrayType::new(DataType::INTEGER, true)), "ARRAY(1)")]
+        #[case::map(
+            DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            "MAP('a', 1)"
+        )]
+        fn non_null_default_on_container_is_tolerated(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+        ) {
+            let field = field_with_default("c", data_type.clone(), raw_sql);
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            // Kernel cannot parse a non-primitive default, so it surfaces via raw SQL.
+            assert_eq!(column_default.raw_sql(), raw_sql);
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap(), None);
+        }
+
         #[test]
-        fn non_null_default_on_non_primitive_errors() {
-            let data_type = DataType::from(ArrayType::new(DataType::INTEGER, true));
-            let field = field_with_default(data_type, "ARRAY(1)");
+        fn non_null_default_on_variant_errors() {
+            let field = field_with_default("v", DataType::unshredded_variant(), "1");
             let err = field
                 .column_default()
-                .expect_err("non-NULL default on a non-primitive type must error")
+                .expect_err("a non-NULL default on a Variant column must error")
                 .to_string();
-            assert!(err.contains("not supported"), "got: {err}");
+            assert!(err.contains("Variant"), "got: {err}");
         }
     }
 

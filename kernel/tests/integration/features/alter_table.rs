@@ -13,13 +13,15 @@ use delta_kernel::schema::{
     StructType,
 };
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
-    column_mapping_fixtures as fixtures, create_table_and_load_snapshot, test_table_setup,
-    test_table_setup_mt, write_batch_to_table,
+    add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
+    create_table_and_load_snapshot, engine_store_setup, test_table_setup, test_table_setup_mt,
+    write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -805,41 +807,104 @@ async fn chain_add_column_and_set_nullable(
     Ok(())
 }
 
-fn field_with_stray_cm_id(name: &str, ty: DataType) -> StructField {
+fn field_with_stray_key(name: &str, key: &ColumnMetadataKey, ty: DataType) -> StructField {
     let mut f = StructField::nullable(name, ty);
-    f.metadata.insert(
-        ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-        MetadataValue::Number(99),
-    );
+    f.metadata
+        .insert(key.as_ref().to_string(), MetadataValue::Number(99));
     f
 }
 
-/// On a non-CM table, `apply_schema_operations` doesn't reject stray CM metadata up front --
-/// `StructType::make_physical` (run from `TableConfiguration::try_new_with_schema`) is the
-/// gate. This test locks in that downstream rejection, including for nested annotations.
+/// On a clean non-CM table, an ALTER that adds a column carrying stray CM metadata has that
+/// metadata stripped (the commit introduces it into a previously-clean table), rather than
+/// rejected -- matching delta-spark. Parametrized over each detected key and over placement
+/// (top-level vs nested in a struct).
 #[rstest]
-#[case::top_level(field_with_stray_cm_id("tainted", DataType::STRING))]
-#[case::nested_in_struct(StructField::nullable(
-    "outer",
-    StructType::try_new(vec![field_with_stray_cm_id("inner", DataType::STRING)]).unwrap(),
-))]
+#[case::top_level(false)]
+#[case::nested_in_struct(true)]
 #[tokio::test]
-async fn add_column_with_stray_cm_metadata_on_non_cm_table_fails(
-    #[case] field: StructField,
+async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
+    #[case] nested: bool,
+    #[values(
+        ColumnMetadataKey::ColumnMappingId,
+        ColumnMetadataKey::ColumnMappingPhysicalName,
+        ColumnMetadataKey::ColumnMappingNestedIds,
+        ColumnMetadataKey::ParquetFieldId,
+        ColumnMetadataKey::ParquetFieldNestedIds
+    )]
+    key: ColumnMetadataKey,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let snapshot =
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
-    let err = snapshot
+    let (field, stripped_path): (StructField, Vec<String>) = if nested {
+        let outer = StructField::nullable(
+            "outer",
+            StructType::try_new(vec![field_with_stray_key("inner", &key, DataType::STRING)])?,
+        );
+        (outer, vec!["outer".to_string(), "inner".to_string()])
+    } else {
+        (
+            field_with_stray_key("tainted", &key, DataType::STRING),
+            vec!["tainted".to_string()],
+        )
+    };
+
+    snapshot
         .alter_table()
         .add_column(field)
-        .build(engine.as_ref(), committer())
-        .unwrap_err();
-    let msg = err.to_string();
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // Reload from disk so we assert on the persisted schemaString, not the in-memory config.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let leaf = reloaded_schema.field_at_path(&stripped_path);
     assert!(
-        msg.contains("column mapping") || msg.contains("columnMapping"),
-        "error should mention column mapping, got: {msg}"
+        leaf.get_config_value(&key).is_none(),
+        "stray {} at {stripped_path:?} should be stripped",
+        key.as_ref()
+    );
+    Ok(())
+}
+
+/// The ALTER strip is `None`-mode-only. Adding a column with pre-populated column-mapping metadata
+/// preserves it when mapping is enabled (`id` / `name`, delta-spark's
+/// `assignColumnIdAndPhysicalName` keeps existing ids) and strips it only in `None` mode.
+#[rstest]
+#[case::none(ColumnMappingMode::None, &[], false)]
+#[case::id(ColumnMappingMode::Id, &[("delta.columnMapping.mode", "id")], true)]
+#[case::name(ColumnMappingMode::Name, &[("delta.columnMapping.mode", "name")], true)]
+#[tokio::test]
+async fn add_column_strip_is_none_mode_only(
+    #[case] expected_mode: ColumnMappingMode,
+    #[case] properties: &[(&str, &str)],
+    #[case] annotation_kept: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
+    assert_eq!(
+        snapshot.table_configuration().column_mapping_mode(),
+        expected_mode
+    );
+
+    // A well-formed id+physicalName pair so enabled modes have valid metadata to preserve.
+    let field = fixtures::cm_field("added", 99, "phys-added", DataType::STRING);
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let added = reloaded.schema().field("added").unwrap().clone();
+    assert_eq!(
+        added.column_mapping_id().is_some(),
+        annotation_kept,
+        "column mapping id under {expected_mode:?} mode"
     );
     Ok(())
 }
@@ -862,6 +927,71 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         .to_string();
     assert!(
         msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
+        "unexpected error: {msg}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let field = StructField::nullable("new_col", DataType::INTEGER).add_metadata([(
+        ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+        MetadataValue::String("42".to_string()),
+    )]);
+
+    snapshot
+        .alter_table()
+        .add_column(field)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let reloaded_schema = reloaded.schema();
+    let default = reloaded_schema
+        .field("new_col")
+        .expect("new_col must exist after ALTER")
+        .column_default()?
+        .expect("CURRENT_DEFAULT metadata must survive ALTER");
+    assert_eq!(default.raw_sql(), "42");
+
+    let txn = reloaded.transaction(committer(), engine.as_ref())?;
+    assert!(
+        txn.top_level_column_defaults()?.is_empty(),
+        "default metadata must remain inert without allowColumnDefaults",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (store, engine, table_url) = engine_store_setup("alter_column_defaults", None);
+    let table_url = create_test_table(
+        store,
+        table_url,
+        simple_schema(),
+        &[],
+        true,
+        vec![],
+        vec!["allowColumnDefaults"],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+    let msg = snapshot
+        .alter_table()
+        .add_column(StructField::nullable("new_col", DataType::STRING))
+        .build(&engine, committer())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled"),
         "unexpected error: {msg}",
     );
 
@@ -1092,6 +1222,69 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
     assert!(
         err.contains("Duplicate column mapping ID") && err.contains(&existing_id.to_string()),
         "expected duplicate-id error naming id {existing_id}, got: {err}"
+    );
+    Ok(())
+}
+
+/// A mapping-disabled table that already carries residual `delta.columnMapping.*` annotations is
+/// left untouched by an ALTER: the pre-existing annotation on `value` survives, and whatever the
+/// added column carries is persisted verbatim -- kernel strips only annotations a commit newly
+/// introduces into a *clean* table, so an already-dirty table is never rewritten (matching
+/// delta-spark). The clean-table strip is covered by
+/// `add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped`.
+///
+/// Cases: adding a clean column (stays clean) and adding a stray-annotated column (annotation
+/// left in place, not stripped).
+#[rstest]
+#[case::clean_column(StructField::nullable("added", DataType::STRING), None)]
+#[case::introduced_stray(
+    field_with_stray_key("added", &ColumnMetadataKey::ColumnMappingId, DataType::STRING),
+    Some(99)
+)]
+#[tokio::test]
+async fn add_column_on_stale_table_leaves_schema_untouched(
+    #[case] added_field: StructField,
+    #[case] expected_added_cm_id: Option<i64>,
+) -> DeltaResult<()> {
+    let (store, engine, table_url) = engine_store_setup("alter_stale_cm", None);
+
+    // `value` carries a stale id; protocol omits columnMapping and no mode is set (resolves to
+    // None) -- residual annotations already on the table.
+    let stale_schema = StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::INTEGER)
+            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(2))]),
+    ])?;
+    let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?).unwrap();
+    // v0 written directly to bypass create_table validation (which strips stale annotations).
+    let v0 = format!(
+        r#"{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}
+{{"metaData":{{"id":"alter-stale-cm","format":{{"provider":"parquet","options":{{}}}},"schemaString":{escaped},"partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}
+"#
+    );
+    add_commit(table_url.as_str(), store.as_ref(), 0, v0)
+        .await
+        .unwrap();
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    snapshot
+        .alter_table()
+        .add_column(added_field)
+        .build(&engine, committer())?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    // Reload from disk so we assert on the persisted schemaString, not the in-memory config.
+    let reloaded = Snapshot::builder_for(table_url).build(&engine)?;
+    let schema = reloaded.schema();
+
+    // The pre-existing annotation on the untouched `value` field survives verbatim.
+    assert_eq!(schema.field("value").unwrap().column_mapping_id(), Some(2));
+    // The added column is persisted verbatim -- clean stays clean, stray annotation is left in
+    // place (not stripped, because the table was already dirty).
+    assert_eq!(
+        schema.field("added").unwrap().column_mapping_id(),
+        expected_added_cm_id
     );
     Ok(())
 }

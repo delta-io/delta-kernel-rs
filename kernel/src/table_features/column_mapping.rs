@@ -3,10 +3,12 @@
 //! This module provides:
 //! - Read-side: Mode detection and schema validation
 //! - Write-side: Schema transformation for assigning IDs and physical names
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
+use tracing::debug;
 use uuid::Uuid;
 
 use super::TableFeature;
@@ -112,6 +114,22 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
     MakePhysical::validate_schema_column_mapping(mode, schema)
 }
 
+/// How to treat a stale `delta.columnMapping.*` annotation found on a field while column mapping
+/// is disabled ([`ColumnMappingMode::None`]).
+///
+/// A table can carry residual annotations while mapping is off. They are inert -- physical names
+/// resolve to logical names -- so reads tolerate them (matching delta-spark, which ignores them in
+/// `NoMapping` mode). CREATE / ALTER strip the annotations a write newly introduces (so kernel
+/// never *originates* a table in that shape), but leave residual ones already on the table in
+/// place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleAnnotationPolicy {
+    /// Ignore a stale annotation and resolve the field by its logical name.
+    Ignore,
+    /// Reject a stale annotation with a schema error.
+    Reject,
+}
+
 /// Validates a field's column mapping annotations and extracts the physical name and column
 /// mapping id. If `seen_ids` is provided, also checks that this field's
 /// `delta.columnMapping.id` is globally unique. If `current_field_siblings` is provided, also
@@ -124,14 +142,18 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 /// `delta.columnMapping.physicalName` (string) and `delta.columnMapping.id` (number) annotation.
 /// Returns the physical name and `Some(id)`.
 ///
-/// When disabled (`None`), neither annotation should be present. Returns the logical field name
-/// and `None`. In `None` mode no dedup is performed (the returned "physical name" is just the
-/// logical field name and is only schema-unique within its parent struct, not globally).
+/// When disabled (`None`), a stale annotation is handled per `stale_policy`:
+/// [`StaleAnnotationPolicy::Ignore`] resolves the field by its logical name (returning the logical
+/// name and `None`), while [`StaleAnnotationPolicy::Reject`] errors. Either way, in `None` mode no
+/// dedup is performed (the returned "physical name" is just the logical field name and is only
+/// schema-unique within its parent struct, not globally).
 ///
 /// # Parameters
 ///
 /// - `field`: The field to validate.
 /// - `mode`: Column mapping mode.
+/// - `stale_policy`: In `None` mode, whether to ignore or reject a stale `delta.columnMapping.*`
+///   annotation. Unused when mapping is enabled.
 /// - `parent_field_logical_path`: The field's parent path, used to render full paths in error
 ///   messages (e.g. parent `&["a", "b"]` and field `c` renders as `a.b.c`).
 /// - `seen_ids`: Global map of `delta.columnMapping.id` -> first claimer logical name. `None` skips
@@ -144,7 +166,8 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 /// - The field is a metadata column carrying any CM annotation.
 /// - CM is enabled but `delta.columnMapping.physicalName` is missing or non-string.
 /// - CM is enabled but `delta.columnMapping.id` is missing or non-numeric.
-/// - CM is disabled but either annotation is present.
+/// - CM is disabled, `stale_policy` is [`StaleAnnotationPolicy::Reject`], and either annotation is
+///   present.
 /// - `seen_ids` is provided and the current field's `delta.columnMapping.id` is already in the map.
 ///   Example rejection (two fields share `delta.columnMapping.id=1`):
 ///
@@ -171,6 +194,7 @@ pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) 
 pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
     field: &'a StructField,
     mode: ColumnMappingMode,
+    stale_policy: StaleAnnotationPolicy,
     parent_field_logical_path: &[&'a str],
     seen_ids: Option<&mut HashMap<i64, &'a str>>,
     current_field_siblings: Option<&mut HashMap<&'a str, &'a str>>,
@@ -216,12 +240,15 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
                 logical_field_path(),
             )));
         }
-        (ColumnMappingMode::None, Some(_)) => {
-            return Err(Error::schema(format!(
-                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
-                logical_field_path(),
-            )));
-        }
+        (ColumnMappingMode::None, Some(_)) => match stale_policy {
+            StaleAnnotationPolicy::Ignore => field.name(),
+            StaleAnnotationPolicy::Reject => {
+                return Err(Error::schema(format!(
+                    "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                    logical_field_path(),
+                )));
+            }
+        },
     };
 
     let annotation = ColumnMetadataKey::ColumnMappingId.as_ref();
@@ -242,12 +269,15 @@ pub(crate) fn validate_and_extract_column_mapping_annotations<'a>(
                 logical_field_path(),
             )));
         }
-        (ColumnMappingMode::None, Some(_)) => {
-            return Err(Error::schema(format!(
-                "Column mapping is not enabled but field '{}' is annotated with {annotation}",
-                logical_field_path(),
-            )));
-        }
+        (ColumnMappingMode::None, Some(_)) => match stale_policy {
+            StaleAnnotationPolicy::Ignore => None,
+            StaleAnnotationPolicy::Reject => {
+                return Err(Error::schema(format!(
+                    "Column mapping is not enabled but field '{}' is annotated with {annotation}",
+                    logical_field_path(),
+                )));
+            }
+        },
     };
 
     // CM-disabled mode synthesizes `physical_name = field.name()`, which only has to be unique
@@ -704,6 +734,104 @@ impl<'a> SchemaTransform<'a> for MaxColumnId {
     }
 }
 
+/// The field-metadata keys that are meaningful only when column mapping is enabled. The detector
+/// [`schema_has_column_mapping_metadata`] and the stripper [`drop_column_mapping_metadata`] both
+/// key off this exact set, matching the `COLUMN_MAPPING_METADATA_KEYS` delta-spark strips and
+/// detects together.
+const COLUMN_MAPPING_METADATA_KEYS: &[ColumnMetadataKey] = &[
+    ColumnMetadataKey::ColumnMappingId,
+    ColumnMetadataKey::ColumnMappingPhysicalName,
+    ColumnMetadataKey::ColumnMappingNestedIds,
+    ColumnMetadataKey::ParquetFieldId,
+    ColumnMetadataKey::ParquetFieldNestedIds,
+];
+
+/// Returns whether any field in `schema` (recursively) carries any [`COLUMN_MAPPING_METADATA_KEYS`]
+/// annotation. Detection is by key presence (not value type), so a malformed annotation still
+/// counts -- the detector and [`drop_column_mapping_metadata`] must agree on what "carries column
+/// mapping metadata" means, else a write could strip a field the detector deemed clean (or persist
+/// one it missed).
+pub(crate) fn schema_has_column_mapping_metadata(schema: &StructType) -> bool {
+    struct HasCmMetadata(bool);
+    impl<'a> SchemaTransform<'a> for HasCmMetadata {
+        transform_output_type!(|'a, T| ());
+        fn transform_struct_field(&mut self, field: &'a StructField) {
+            // Once a match is found the answer can't change, so skip the per-field key scan (and
+            // recursion) for the rest of the walk. The `SchemaTransform` trait has no early-exit
+            // hook, so nodes are still visited; this just short-circuits the work at each.
+            if self.0 {
+                return;
+            }
+            if COLUMN_MAPPING_METADATA_KEYS
+                .iter()
+                .any(|key| field.metadata.contains_key(key.as_ref()))
+            {
+                self.0 = true;
+                return;
+            }
+            self.recurse_into_struct_field(field)
+        }
+    }
+    let mut visitor = HasCmMetadata(false);
+    visitor.transform_struct(schema);
+    visitor.0
+}
+
+/// Strips the stray column-mapping annotations a write introduces into a previously-clean table,
+/// returning `Some(stripped_schema)` when a strip is needed and `None` when `candidate` can be
+/// persisted as-is.
+///
+/// A strip is needed only when `candidate` carries column-mapping annotations that the pre-write
+/// schema did not -- i.e. the write is introducing them into a clean table, so persisting
+/// `candidate` verbatim would originate a self-inconsistent table. When the pre-write schema
+/// already carried residual annotations they are left in place (matching delta-spark, which strips
+/// only annotations a commit newly introduces); `None` is returned.
+///
+/// Callers MUST gate this on `ColumnMappingMode::None`: with mapping enabled the annotations are
+/// load-bearing and must never be stripped. `current_has_cm` is whether the pre-write schema
+/// carried any column-mapping metadata (always `false` for CREATE, which has no prior schema);
+/// passing the bool rather than the schema lets ALTER avoid cloning its pre-alter schema.
+/// `candidate` is the schema the write would otherwise persist.
+pub(crate) fn strip_stray_column_mapping_metadata(
+    current_has_cm: bool,
+    candidate: &StructType,
+) -> Option<StructType> {
+    (!current_has_cm && schema_has_column_mapping_metadata(candidate)).then(|| {
+        debug!(
+            "Column mapping is disabled; stripping newly-introduced `delta.columnMapping.*` \
+             annotations from the schema before persisting."
+        );
+        drop_column_mapping_metadata(candidate)
+    })
+}
+
+/// Removes every [`COLUMN_MAPPING_METADATA_KEYS`] annotation from every field in `schema`
+/// (recursively), leaving all other field metadata intact.
+pub(crate) fn drop_column_mapping_metadata(schema: &StructType) -> StructType {
+    struct DropCmMetadata;
+    impl<'a> SchemaTransform<'a> for DropCmMetadata {
+        transform_output_type!(|'a, T| Cow<'a, T>);
+        fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+            let data_type = self.transform(&field.data_type);
+            let mut metadata = field.metadata.clone();
+            let mut had_cm = false;
+            for key in COLUMN_MAPPING_METADATA_KEYS {
+                had_cm |= metadata.remove(key.as_ref()).is_some();
+            }
+            match data_type {
+                Cow::Borrowed(_) if !had_cm => Cow::Borrowed(field),
+                data_type => Cow::Owned(StructField {
+                    name: field.name.clone(),
+                    data_type: data_type.into_owned(),
+                    nullable: field.is_nullable(),
+                    metadata,
+                }),
+            }
+        }
+    }
+    DropCmMetadata.transform_struct(schema).into_owned()
+}
+
 /// Translates a logical [`ColumnName`] to physical. It can be top level or nested.
 ///
 /// Uses `StructType::walk_column_fields` to walk the column path through nested structs,
@@ -939,6 +1067,9 @@ mod tests {
             });
     }
 
+    // `validate_schema_column_mapping` is the strict validator: a stale annotation on a
+    // mapping-disabled table is rejected. The lenient path (used by reads) is covered by
+    // `test_validate_and_extract_tolerates_stale_annotations_when_disabled`.
     #[test]
     fn test_column_mapping_disabled() {
         let schema = create_schema(None, None, None, None);
@@ -954,6 +1085,61 @@ mod tests {
         validate_schema_column_mapping(&schema, ColumnMappingMode::None).expect_err("field name");
     }
 
+    /// A field carrying a stale `delta.columnMapping.*` annotation while mapping is disabled is
+    /// tolerated under [`StaleAnnotationPolicy::Ignore`] (the read path) -- it resolves to the
+    /// logical name with no id -- and rejected under [`StaleAnnotationPolicy::Reject`] (the write
+    /// path).
+    #[rstest::rstest]
+    #[case::physical_name_only(None, Some("col-abc"))]
+    #[case::id_only(Some(7), None)]
+    #[case::both(Some(7), Some("col-abc"))]
+    fn test_validate_and_extract_tolerates_stale_annotations_when_disabled(
+        #[case] stale_id: Option<i64>,
+        #[case] stale_physical_name: Option<&str>,
+    ) {
+        let mut metadata: Vec<(&str, MetadataValue)> = Vec::new();
+        if let Some(id) = stale_id {
+            metadata.push((
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ));
+        }
+        if let Some(name) = stale_physical_name {
+            metadata.push((
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(name.to_string()),
+            ));
+        }
+        let field = StructField::not_null("stale", DataType::INTEGER).with_metadata(metadata);
+
+        // Ignore: resolves to the logical name, no id.
+        let (physical_name, id) = validate_and_extract_column_mapping_annotations(
+            &field,
+            ColumnMappingMode::None,
+            StaleAnnotationPolicy::Ignore,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(physical_name, "stale");
+        assert_eq!(id, None);
+
+        // Reject: errors, naming the field.
+        assert_result_error_with_message(
+            validate_and_extract_column_mapping_annotations(
+                &field,
+                ColumnMappingMode::None,
+                StaleAnnotationPolicy::Reject,
+                &[],
+                None,
+                None,
+            )
+            .map(|_| ()),
+            "Column mapping is not enabled but field 'stale'",
+        );
+    }
+
     #[test]
     fn test_annotation_validation_reaches_struct_fields_in_map_value() {
         let unannotated =
@@ -965,6 +1151,129 @@ mod tests {
         )]);
         validate_schema_column_mapping(&schema, ColumnMappingMode::Id)
             .expect_err("missing annotation on struct field inside map value");
+    }
+
+    /// Every key in `COLUMN_MAPPING_METADATA_KEYS` counts as column-mapping metadata, whether it
+    /// sits on a top-level field or a nested struct leaf.
+    #[rstest::rstest]
+    fn test_schema_has_column_mapping_metadata_detects_each_key(
+        #[values(
+            ColumnMetadataKey::ColumnMappingId,
+            ColumnMetadataKey::ColumnMappingPhysicalName,
+            ColumnMetadataKey::ColumnMappingNestedIds,
+            ColumnMetadataKey::ParquetFieldId,
+            ColumnMetadataKey::ParquetFieldNestedIds
+        )]
+        key: ColumnMetadataKey,
+    ) {
+        // Top-level field carrying only this key.
+        let top_level = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
+            .add_metadata([(key.as_ref(), MetadataValue::Number(1))])]);
+        assert!(schema_has_column_mapping_metadata(&top_level));
+
+        // Same key on a nested struct leaf (clean top level).
+        let nested = StructType::new_unchecked([StructField::nullable(
+            "outer",
+            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)
+                .add_metadata([(key.as_ref(), MetadataValue::Number(1))])]),
+        )]);
+        assert!(schema_has_column_mapping_metadata(&nested));
+    }
+
+    #[test]
+    fn test_schema_has_column_mapping_metadata_edge_cases() {
+        // Clean schema -> false.
+        let clean = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+        assert!(!schema_has_column_mapping_metadata(&clean));
+
+        // Detection is by key presence, not value type: a wrong-typed id still counts (it must, so
+        // the stripper -- which removes by presence -- never leaves a key the detector deemed
+        // absent).
+        let wrong_typed =
+            StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)
+                .add_metadata([(
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::String("not-a-number".to_string()),
+                )])]);
+        assert!(schema_has_column_mapping_metadata(&wrong_typed));
+    }
+
+    #[test]
+    fn test_drop_column_mapping_metadata() {
+        // Top-level annotated field also carrying an unrelated key; nested annotated leaf.
+        let annotated_top = StructField::nullable("a", DataType::INTEGER).add_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("col-a".to_string()),
+            ),
+            ("delta.identity.start", MetadataValue::Number(7)),
+        ]);
+        let schema = StructType::new_unchecked([
+            annotated_top,
+            StructField::nullable(
+                "outer",
+                StructType::new_unchecked([make_cm_field("leaf", 2, DataType::INTEGER)]),
+            ),
+        ]);
+
+        let stripped = drop_column_mapping_metadata(&schema);
+        assert!(!schema_has_column_mapping_metadata(&stripped));
+
+        // Unrelated metadata is preserved.
+        let a = stripped.field("a").unwrap();
+        assert!(a.column_mapping_id().is_none());
+        assert!(!a.has_physical_name_annotation());
+        assert_eq!(
+            a.metadata().get("delta.identity.start"),
+            Some(&MetadataValue::Number(7))
+        );
+
+        // Nested leaf is stripped too.
+        let DataType::Struct(outer) = stripped.field("outer").unwrap().data_type() else {
+            panic!("expected struct");
+        };
+        assert!(outer.field("leaf").unwrap().column_mapping_id().is_none());
+    }
+
+    #[test]
+    fn test_drop_column_mapping_metadata_strips_array_and_map_nested_leaves() {
+        // Annotated struct leaves living inside an array element and a map value.
+        let elem = StructType::new_unchecked([make_cm_field("in_arr", 3, DataType::INTEGER)]);
+        let val = StructType::new_unchecked([make_cm_field("in_map", 4, DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([
+            StructField::nullable("arr", ArrayType::new(elem, true)),
+            StructField::nullable("m", MapType::new(DataType::STRING, val, true)),
+        ]);
+        assert!(schema_has_column_mapping_metadata(&schema));
+
+        let stripped = drop_column_mapping_metadata(&schema);
+        assert!(!schema_has_column_mapping_metadata(&stripped));
+    }
+
+    #[test]
+    fn test_strip_stray_column_mapping_metadata() {
+        // Mode gating lives at the call sites; this helper only decides strip-vs-leave from the
+        // current-vs-candidate comparison.
+        let clean = StructType::new_unchecked([StructField::nullable("a", DataType::INTEGER)]);
+        let annotated = StructType::new_unchecked([make_cm_field("a", 1, DataType::INTEGER)]);
+
+        // CREATE (no prior schema) introducing annotations -> stripped.
+        let stripped = strip_stray_column_mapping_metadata(false, &annotated)
+            .expect("newly-introduced annotations should be stripped");
+        assert!(!schema_has_column_mapping_metadata(&stripped));
+
+        // ALTER on a clean table introducing annotations -> stripped.
+        assert!(strip_stray_column_mapping_metadata(false, &annotated).is_some());
+
+        // ALTER on an already-annotated table -> left in place (no strip).
+        assert!(strip_stray_column_mapping_metadata(true, &annotated).is_none());
+
+        // Candidate carries no annotations -> nothing to strip.
+        assert!(strip_stray_column_mapping_metadata(false, &clean).is_none());
     }
 
     fn make_cm_field(name: &str, id: i64, data_type: impl Into<DataType>) -> StructField {

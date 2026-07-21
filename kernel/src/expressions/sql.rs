@@ -16,6 +16,11 @@ use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
 
+#[cfg(feature = "check-constraints-in-dev")]
+mod parser;
+#[cfg(feature = "check-constraints-in-dev")]
+mod token;
+
 /// Parse a SQL string into an [`Expression`] that yields a value of the given [`DataType`]
 /// (e.g. the type of the column whose default is being parsed).
 ///

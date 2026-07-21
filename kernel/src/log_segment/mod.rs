@@ -14,7 +14,7 @@ use crate::actions::{
     METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
-use crate::expressions::ColumnName;
+use crate::expressions::{column_name, ColumnName};
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -25,7 +25,7 @@ use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
-use crate::plans::ir::nodes::ScanFile;
+use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
@@ -118,9 +118,9 @@ pub(crate) struct LogSegment {
 
     /// The retained `_last_checkpoint` hint, if one was read when this segment was built. The hint
     /// may describe a different checkpoint than the one this segment selected, so for validated
-    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_schema`] /
-    /// [`Self::checkpoint_sidecars`] accessors built on it). Read this field directly only when
-    /// the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
+    /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_hint_schema`] /
+    /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
+    /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
@@ -132,10 +132,10 @@ pub(crate) struct LogSegment {
 /// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
 fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
     match action_name {
-        METADATA_NAME => Some(ColumnName::new([METADATA_NAME, "id"])),
-        PROTOCOL_NAME => Some(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])),
-        SET_TRANSACTION_NAME => Some(ColumnName::new([SET_TRANSACTION_NAME, "appId"])),
-        DOMAIN_METADATA_NAME => Some(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])),
+        METADATA_NAME => Some(column_name!(METADATA_NAME, "id")),
+        PROTOCOL_NAME => Some(column_name!(PROTOCOL_NAME, "minReaderVersion")),
+        SET_TRANSACTION_NAME => Some(column_name!(SET_TRANSACTION_NAME, "appId")),
+        DOMAIN_METADATA_NAME => Some(column_name!(DOMAIN_METADATA_NAME, "domain")),
         _ => None,
     }
 }
@@ -273,21 +273,22 @@ impl LogSegment {
     /// The checkpoint schema from the `_last_checkpoint` hint, when the hint describes the selected
     /// checkpoint (see [`Self::checkpoint_hint`]) and carried a `checkpointSchema`. `None`
     /// otherwise -- the caller then reads the checkpoint footer instead.
-    pub(crate) fn checkpoint_schema(&self) -> Option<SchemaRef> {
+    pub(crate) fn checkpoint_hint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
     }
 
     /// The hint's sidecar references, when it describes the selected checkpoint (see
     /// [`Self::checkpoint_hint`]). `None` if there is no matching hint or it omitted
-    /// `sidecarFiles`; `Some(&[])` if the hint listed none. A non-empty slice identifies a manifest
-    /// checkpoint whose file actions live in those sidecars.
+    /// `sidecarFiles`; `Some(empty)` if the hint listed none (a definitive inline leaf). A
+    /// non-empty list identifies a manifest checkpoint whose file actions live in those
+    /// sidecars.
     #[allow(unused)] // consumed by the scan-shape checkpoint classifier
-    pub(crate) fn checkpoint_sidecars(&self) -> Option<&[Sidecar]> {
+    pub(crate) fn checkpoint_hint_sidecars(&self) -> Option<&Vec<Sidecar>> {
         self.checkpoint_hint()?
             .v2_checkpoint
             .as_ref()?
             .sidecar_files
-            .as_deref()
+            .as_ref()
     }
 
     /// Succinct summary string for logging purposes.
@@ -830,21 +831,29 @@ impl LogSegment {
         Self::version_tagged_scan_files(&self.find_commit_cover_paths())
     }
 
-    /// Returns checkpoint-part files tagged with file-constant `version`, split by format into
-    /// `(json_parts, parquet_parts)`. V2 checkpoints may be UUID-named JSON, so callers must route
-    /// each part to the matching scan operator rather than assuming parquet.
+    /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
+    /// [`FileType`] they share, or `None` when there is no checkpoint. A V2 checkpoint may be
+    /// UUID-named JSON, so the caller routes the parts to the matching scan operator by `FileType`.
+    ///
+    /// All checkpoint parts of a version share one format (`validate_checkpoint_parts` rejects a
+    /// mixed set), so a single `FileType` describes the whole group -- making a json/parquet mix
+    /// unrepresentable in the return type.
+    ///
+    /// [`FileType`]: crate::plans::ir::nodes::FileType
     #[cfg(feature = "declarative-plans")]
     pub(crate) fn checkpoint_version_tagged_scan_files(
         &self,
-    ) -> DeltaResult<(Vec<ScanFile>, Vec<ScanFile>)> {
-        let (json, parquet): (Vec<_>, Vec<_>) = self
-            .listed
-            .checkpoint_parts
-            .iter()
-            .partition(|part| part.extension == "json");
-        let json = Self::version_tagged_scan_files(json)?;
-        let parquet = Self::version_tagged_scan_files(parquet)?;
-        Ok((json, parquet))
+    ) -> DeltaResult<Option<(FileType, Vec<ScanFile>)>> {
+        let parts = &self.listed.checkpoint_parts;
+        let Some(first) = parts.first() else {
+            return Ok(None);
+        };
+        let file_type = if first.is_json() {
+            FileType::Json
+        } else {
+            FileType::Parquet
+        };
+        Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
@@ -866,7 +875,7 @@ impl LogSegment {
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
-        let hint_schema = self.checkpoint_schema();
+        let hint_schema = self.checkpoint_hint_schema();
 
         // All parts of a multi-part checkpoint belong to the same table version and follow
         // the same V1 spec, so reading any one part's schema is sufficient.
@@ -1241,7 +1250,7 @@ impl LogSegment {
     }
 
     /// Schema to read just the sidecar column from a checkpoint file.
-    fn sidecar_read_schema() -> SchemaRef {
+    pub(crate) fn sidecar_read_schema() -> SchemaRef {
         static SIDECAR_SCHEMA: LazyLock<SchemaRef> =
             lazy_schema_ref! { nullable SIDECAR_NAME: (Sidecar::to_schema()) };
         SIDECAR_SCHEMA.clone()

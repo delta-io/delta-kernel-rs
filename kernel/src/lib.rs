@@ -90,6 +90,8 @@ pub mod actions;
 pub mod checkpoint;
 pub mod commit_range;
 pub mod committer;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod content_tree;
 #[cfg(feature = "internal-api")]
 pub mod crc;
 #[cfg(not(feature = "internal-api"))]
@@ -168,6 +170,9 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
+#[cfg(feature = "internal-api")]
+pub mod log_segment_files;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment_files;
 
 pub mod history_manager;

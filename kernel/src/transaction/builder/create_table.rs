@@ -27,8 +27,10 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
     find_max_column_id_in_schema, get_any_level_column_physical_name,
-    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz, ColumnMappingMode,
-    TableFeature, SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
+    get_column_mapping_mode_from_properties, schema_contains_interval_type,
+    schema_contains_timestamp_ntz, strip_stray_column_mapping_metadata,
+    validate_interval_type_feature_support_on_write, ColumnMappingMode, TableFeature,
+    SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
     TableProperties, APPEND_ONLY, CHECKPOINT_INTERVAL, CHECKPOINT_WRITE_STATS_AS_JSON,
@@ -88,6 +90,9 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
     TableFeature::IcebergCompatV3,
+    // Connectors can pre-enable intervalType-preview before adding interval columns. CREATE TABLE
+    // also auto-enables it when the schema contains an interval type.
+    TableFeature::IntervalTypePreview,
 ];
 
 /// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
@@ -245,8 +250,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values must be
-///    representable as directory-path strings)
+/// 4. Of a supported primitive type (Struct, Array, Map, and intervals are rejected because the
+///    Delta protocol does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -283,10 +288,17 @@ fn validate_partition_columns(
             Error::generic(format!("Partition column '{col}' not found in schema"))
         })?;
 
-        if !matches!(field.data_type(), DataType::Primitive(_)) {
+        let DataType::Primitive(primitive_type) = field.data_type() else {
             return Err(Error::generic(format!(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
+                field.data_type()
+            )));
+        };
+        if primitive_type.is_interval() {
+            return Err(Error::generic(format!(
+                "Partition column '{col}' has unsupported interval type '{}'. \
+                 Interval types are not supported for partition columns.",
                 field.data_type()
             )));
         }
@@ -377,6 +389,21 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds the `intervalType-preview` feature to the protocol when the schema contains
+/// interval columns anywhere in the schema tree (top-level, nested structs, arrays, maps).
+fn auto_enable_interval_type_if_in_schema(
+    schema: &SchemaRef,
+    validated: &mut ValidatedTableProperties,
+) {
+    if schema_contains_interval_type(schema) {
+        add_feature_to_lists(
+            TableFeature::IntervalTypePreview,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -891,12 +918,23 @@ impl CreateTableTransactionBuilder {
         let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
-        let (effective_schema, column_mapping_mode) =
+        let (mut effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
+
+        // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
+        // any annotation the caller supplied is newly introduced (see
+        // `strip_stray_column_mapping_metadata`).
+        if column_mapping_mode == ColumnMappingMode::None {
+            // A new table has no prior schema, so nothing was carried in (`current_has_cm =
+            // false`).
+            if let Some(stripped) = strip_stray_column_mapping_metadata(false, &effective_schema) {
+                effective_schema = Arc::new(stripped);
+            }
+        }
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
@@ -910,6 +948,7 @@ impl CreateTableTransactionBuilder {
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        auto_enable_interval_type_if_in_schema(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
@@ -944,6 +983,7 @@ impl CreateTableTransactionBuilder {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        validate_interval_type_feature_support_on_write(&table_configuration)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
@@ -1321,6 +1361,26 @@ mod tests {
         },
         &[TableFeature::TimestampWithoutTimezone],
     )]
+    #[case::interval_top_level(
+        Arc::new(StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable("iv", DataType::INTERVAL_YEAR_MONTH),
+        ])),
+        &[TableFeature::IntervalTypePreview],
+    )]
+    #[case::interval_nested(
+        Arc::new(StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::nullable(
+                "nested",
+                StructType::new_unchecked([StructField::nullable(
+                    "inner_iv",
+                    DataType::INTERVAL_DAY_TIME,
+                )]),
+            ),
+        ])),
+        &[TableFeature::IntervalTypePreview],
+    )]
     #[case::both_variant_and_ntz(
         Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
@@ -1345,6 +1405,7 @@ mod tests {
 
         maybe_enable_variant_type(&schema, &mut validated);
         maybe_enable_timestamp_ntz(&schema, &mut validated);
+        auto_enable_interval_type_if_in_schema(&schema, &mut validated);
 
         for feature in expected_features {
             assert!(
@@ -1635,6 +1696,39 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("non-primitive type"));
+    }
+
+    #[rstest::rstest]
+    fn test_validate_partition_columns_interval_types_rejected(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
+        #[values(false, true)] nested: bool,
+    ) {
+        let (field, column) = if nested {
+            (
+                StructField::not_null(
+                    "nested",
+                    StructType::new_unchecked([StructField::not_null("col", data_type)]),
+                ),
+                ColumnName::new(["nested", "col"]),
+            )
+        } else {
+            (
+                StructField::not_null("col", data_type),
+                ColumnName::new(["col"]),
+            )
+        };
+        let schema =
+            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER), field]);
+
+        let error = validate_partition_columns(&schema, &[column])
+            .expect_err("interval partition columns must be rejected")
+            .to_string();
+        if nested {
+            assert!(error.contains("must be a top-level column"));
+        } else {
+            assert!(error.contains("unsupported interval type"));
+            assert!(error.contains("partition columns"));
+        }
     }
 
     #[rstest::rstest]

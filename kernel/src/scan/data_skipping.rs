@@ -19,6 +19,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
 
@@ -221,6 +222,75 @@ impl DataSkippingFilter {
         })
     }
 
+    /// Builds a filter over raw `{ add, remove, ... }` action batches, parsing file stats from
+    /// the JSON `add.stats` string. This is the shape used by log-replay paths that skip
+    /// *before* transforming actions (the change-data-feed path and the incremental scan),
+    /// unlike the scan path which reads pre-parsed `stats_parsed` from transformed batches.
+    ///
+    /// The stats schema is derived from the predicate's column references via
+    /// [`TableConfiguration::build_expected_stats_schemas`], matching the write side exactly;
+    /// references outside the table's stats columns fold to NULL (keeping the file). Partition
+    /// values are parsed from the raw `add.partitionValues` string map with
+    /// [`Expression::map_to_struct`], so predicates over partition columns prune too.
+    ///
+    /// Returns `None` (equivalent to keep-all) when the predicate is ineligible for data skipping
+    /// (references no stats columns, or fails evaluator construction).
+    ///
+    /// Pruning applies only to Add rows: Remove and cdc rows (null `add.path`) are never pruned,
+    /// guarded by the `add.path IS NOT NULL` `is_add` expression wired in below. Callers on the
+    /// change-data-feed path rely on this so tombstones survive a non-matching predicate.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for creating evaluators.
+    /// - `physical_predicate`: The predicate, already lowered to physical column names.
+    /// - `table_configuration`: Source of the stats schema, partition schema, and stats-column
+    ///   gate.
+    /// - `input_schema`: Schema of the raw action batches passed to [`apply()`](Self::apply).
+    pub(crate) fn for_raw_action_batch(
+        engine: &dyn Engine,
+        physical_predicate: PredicateRef,
+        table_configuration: &TableConfiguration,
+        input_schema: SchemaRef,
+    ) -> Option<Self> {
+        // Predicate refs become the `requested_physical_columns` filter; refs outside
+        // `physical_stats_columns` fold to NULL via the gate below. Clustering columns are
+        // deliberately not required here (see the scan path and #2588): loading clustering
+        // domain metadata would require a separate scan of the log, which this filter avoids.
+        let predicate_refs: Vec<ColumnName> = physical_predicate
+            .references()
+            .into_iter()
+            .cloned()
+            .collect();
+        let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
+        let physical_stats_schema = table_configuration
+            .build_expected_stats_schemas(None, Some(&predicate_refs))
+            .ok()?
+            .physical;
+        let partition_schema = table_configuration.predicate_partition_schema(&predicate_refs);
+
+        // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
+        // from the raw `add.partitionValues` string map, and identify Add rows by
+        // `add.path IS NOT NULL` (raw batches keep the nested layout).
+        let stats_expr = Arc::new(Expr::parse_json(
+            column_expr!("add.stats"),
+            physical_stats_schema.clone(),
+        ));
+        let partition_expr = Arc::new(Expr::map_to_struct(column_expr!("add.partitionValues")));
+        let is_add_expr = Arc::new(Pred::is_not_null(column_expr!("add.path")).into());
+        Self::new(
+            engine,
+            Some(physical_predicate),
+            Some(&physical_stats_schema),
+            stats_expr,
+            partition_schema.as_ref(),
+            partition_expr,
+            is_add_expr,
+            input_schema,
+            &physical_stats_columns,
+            None,
+        )
+    }
+
     /// Builds the unified schema and extraction expression from separate data stats and partition
     /// value inputs. Returns `None` if neither stats nor partition values are available.
     ///
@@ -368,7 +438,7 @@ pub(crate) fn as_checkpoint_skipping_predicate(
         .iter()
         .map(String::as_str)
         .collect();
-    NullGuardedDataSkippingPredicateCreator {
+    CheckpointDataSkippingPredicateCreator {
         partition_columns,
         stats_columns: physical_stats_columns,
     }
@@ -504,7 +574,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             None
         } else {
             Some(Expr::from(
-                ColumnName::new(["stats_parsed", MIN_VALUES]).join(col),
+                column_name!("stats_parsed", MIN_VALUES).join(col),
             ))
         }
     }
@@ -519,7 +589,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             None
         } else {
             Some(Expr::from(
-                ColumnName::new(["stats_parsed", MAX_VALUES]).join(col),
+                column_name!("stats_parsed", MAX_VALUES).join(col),
             ))
         }
     }
@@ -557,7 +627,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 
     /// Retrieves the row count statistic.
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(Expr::from(ColumnName::new(["stats_parsed", NUM_RECORDS])))
+        Some(column_expr!("stats_parsed", NUM_RECORDS))
     }
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
@@ -645,10 +715,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     }
 }
 
-/// Like [`DataSkippingPredicateCreator`] but adds IS NULL guards on stat column references
-/// for safe parquet row group filtering. Partition columns are excluded since their values
-/// live in `add.partitionValues_parsed`, not `add.stats_parsed`.
-struct NullGuardedDataSkippingPredicateCreator<'a> {
+/// Like [`DataSkippingPredicateCreator`] but adds IS NULL guards on stat column references for safe
+/// parquet row group filtering in checkpoint/sidecar files. Partition columns are excluded since
+/// their values live in `add.partitionValues_parsed`, not `add.stats_parsed`.
+struct CheckpointDataSkippingPredicateCreator<'a> {
     partition_columns: HashSet<&'a str>,
     /// Physical leaf paths whose stats are present in `stats_parsed`. Same contract as
     /// `DataSkippingPredicateCreator::stats_columns`. Must match the column set used to
@@ -656,7 +726,7 @@ struct NullGuardedDataSkippingPredicateCreator<'a> {
     stats_columns: &'a HashSet<ColumnName>,
 }
 
-impl NullGuardedDataSkippingPredicateCreator<'_> {
+impl CheckpointDataSkippingPredicateCreator<'_> {
     /// Returns true if the column is a partition column (no stats in `stats_parsed`).
     fn is_partition_column(&self, col: &ColumnName) -> bool {
         let path = col.path();
@@ -669,7 +739,7 @@ impl NullGuardedDataSkippingPredicateCreator<'_> {
     }
 }
 
-impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<'_> {
+impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'_> {
     type Output = Pred;
     type ColumnStat = Expr;
 
@@ -684,7 +754,7 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
         {
             return None;
         }
-        Some(Expr::from(ColumnName::new([MIN_VALUES]).join(col)))
+        Some(Expr::from(column_name!(MIN_VALUES).join(col)))
     }
 
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
@@ -705,7 +775,7 @@ impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<
     }
 
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(Expr::from(ColumnName::new([NUM_RECORDS])))
+        Some(column_expr!(NUM_RECORDS))
     }
 
     /// Compares a column's max stat against a literal value, adjusting for timestamp

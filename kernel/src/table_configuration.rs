@@ -23,14 +23,16 @@ use crate::scan::data_skipping::stats_schema::{
 };
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
-use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
+use crate::schema::{
+    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+};
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
-    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
+    validate_interval_type_feature_support_on_write, validate_timestamp_ntz_feature_support,
+    ColumnMappingMode, EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation,
+    TableFeature, LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -217,12 +219,10 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
+        // default on a Variant column).
+        validate_column_defaults_metadata(&table_config.logical_schema)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
-
-        // TODO(#2630): Validate column-default metadata here so a table that declares a
-        // `CURRENT_DEFAULT` without the `allowColumnDefaults` feature, or with malformed default
-        // metadata, is rejected eagerly as corrupted rather than lazily in
-        // `Transaction::column_defaults`.
 
         Ok(table_config)
     }
@@ -354,9 +354,8 @@ impl TableConfiguration {
     }
 
     /// Stats-column set for `DataSkippingFilter`'s predicate-rewrite gate. The gate tests
-    /// every column reference in the rewritten predicate against this set, so the two
-    /// callers (`StateInfo::try_new` and `table_changes_action_iter`) share this entry
-    /// point to keep their gate input in lockstep.
+    /// every column reference in the rewritten predicate against this set; every data-skipping
+    /// call site shares this entry point so their gate input stays in lockstep.
     pub(crate) fn physical_stats_columns_set(
         &self,
         required_columns: Option<&[ColumnName]>,
@@ -396,6 +395,35 @@ impl TableConfiguration {
             })
             .collect();
         Some(Arc::new(StructType::new_unchecked(partition_fields)))
+    }
+
+    /// Typed physical partition schema for `DataSkippingFilter`, narrowed to the partition
+    /// columns referenced by `predicate_refs` (physical leaf names) with every field forced
+    /// nullable.
+    ///
+    /// Returns `None` when the table has no partition columns or the predicate references none;
+    /// the filter then treats partitions as unavailable and folds partition predicates to
+    /// keep-all. Every retained field is nullable because a `MapToStruct` over `partitionValues`
+    /// yields null for a missing key or the protocol's empty-string-is-null rule, which a
+    /// non-nullable field would reject.
+    pub(crate) fn predicate_partition_schema(
+        &self,
+        predicate_refs: &[ColumnName],
+    ) -> Option<SchemaRef> {
+        let referenced: HashSet<&str> = predicate_refs
+            .iter()
+            .filter_map(|c| match c.path() {
+                [name] => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let nullable_fields: Vec<StructField> = self
+            .build_partition_values_parsed_schema()?
+            .fields()
+            .filter(|f| referenced.contains(f.name().as_str()))
+            .map(|f| StructField::nullable(f.name(), f.data_type().clone()))
+            .collect();
+        (!nullable_fields.is_empty()).then(|| Arc::new(StructType::new_unchecked(nullable_fields)))
     }
 
     /// Returns the logical schema excluding partition columns.
@@ -460,7 +488,6 @@ impl TableConfiguration {
     ///
     /// Use this over [`logical_schema`](Self::logical_schema) when callers need to derive
     /// `&self`-bound borrows from the schema (e.g. `&DataType` of a field).
-    #[cfg(feature = "column-defaults-in-dev")]
     pub(crate) fn logical_schema_ref(&self) -> &SchemaRef {
         &self.logical_schema
     }
@@ -699,6 +726,10 @@ impl TableConfiguration {
             ));
         }
 
+        // Validate interval support only on write paths. Reads of legacy featureless interval
+        // tables must keep working, so this is not validated at construction time.
+        validate_interval_type_feature_support_on_write(self)?;
+
         Ok(())
     }
 
@@ -884,9 +915,9 @@ mod test {
         TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::{
-        TableProperties, COLUMN_MAPPING_MODE, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V2,
-        ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS, ENABLE_ROW_TRACKING,
-        ROW_TRACKING_SUSPENDED,
+        TableProperties, COLUMN_MAPPING_MODE, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
+        ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
+        ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
@@ -1690,6 +1721,18 @@ mod test {
             config.ensure_operation_supported(Operation::Write),
             r#"Feature 'typeWidening' is not supported for writes"#,
         );
+    }
+
+    // With the gate on, intervalType-preview tables are fully supported: readable via Scan and
+    // CDF, and writable. Gated because `INTERVAL_TYPE_PREVIEW_INFO` is `NotSupported` without the
+    // flag.
+    #[cfg(feature = "interval-type-in-dev")]
+    #[test]
+    fn test_ensure_operation_supported_interval_type_all_operations() {
+        let config = create_mock_table_config(&[], &[TableFeature::IntervalTypePreview]);
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
     #[test]
@@ -2540,6 +2583,121 @@ mod test {
             Some(msg) => assert_result_error_with_message(result, msg),
             None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
         }
+    }
+
+    // `validate_feature_requirements` reads only `feature_requirements`, which is compiled
+    // regardless of the `adaptive-metadata-in-dev` gate, so these cases run in the default build.
+    // See the adaptiveMetadata RFC (delta-io/delta#6978) for the enablement rules being checked.
+    #[rstest]
+    #[case::all_satisfied(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        None
+    )]
+    // Column mapping enabled but in `name` mode -> the `id`-mode Custom check fires.
+    #[case::cm_name_mode_rejected(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Name),
+        all_adaptive_metadata_deps(),
+        Some("column mapping in 'id' mode")
+    )]
+    // Column mapping feature absent entirely -> the `Enabled(ColumnMapping)` arm fires first.
+    #[case::column_mapping_not_supported(
+        all_adaptive_metadata_props(),
+        None,
+        adaptive_metadata_deps_without(TableFeature::ColumnMapping),
+        Some("requires 'columnMapping' to be enabled")
+    )]
+    #[case::row_tracking_not_enabled(
+        adaptive_metadata_props_without(ENABLE_ROW_TRACKING),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'rowTracking' to be enabled")
+    )]
+    #[case::domain_metadata_not_supported(
+        all_adaptive_metadata_props(),
+        Some(ColumnMappingMode::Id),
+        adaptive_metadata_deps_without(TableFeature::DomainMetadata),
+        Some("requires 'domainMetadata' to be enabled")
+    )]
+    #[case::deletion_vectors_not_enabled(
+        adaptive_metadata_props_without(ENABLE_DELETION_VECTORS),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'deletionVectors' to be enabled")
+    )]
+    #[case::in_commit_timestamp_not_enabled(
+        adaptive_metadata_props_without(ENABLE_IN_COMMIT_TIMESTAMPS),
+        Some(ColumnMappingMode::Id),
+        all_adaptive_metadata_deps(),
+        Some("requires 'inCommitTimestamp' to be enabled")
+    )]
+    fn test_adaptive_metadata_feature_requirements(
+        #[case] props: Vec<(&str, &str)>,
+        #[case] cm_mode: Option<ColumnMappingMode>,
+        #[case] deps: Vec<TableFeature>,
+        #[case] expected_error_substring: Option<&str>,
+    ) {
+        // Reader+writer features (adaptiveMetadata-preview itself, columnMapping, deletionVectors)
+        // must appear in both protocol lists to count as supported.
+        let reader_features: Vec<TableFeature> =
+            std::iter::once(TableFeature::AdaptiveMetadataPreview)
+                .chain(
+                    deps.iter()
+                        .filter(|f| f.feature_type() == FeatureType::ReaderWriter)
+                        .cloned(),
+                )
+                .collect();
+        let writer_features: Vec<TableFeature> =
+            std::iter::once(TableFeature::AdaptiveMetadataPreview)
+                .chain(deps.iter().cloned())
+                .collect();
+        let config =
+            create_mock_table_config_with_cm(&props, cm_mode, &reader_features, &writer_features);
+        let result = config.validate_feature_requirements(&TableFeature::AdaptiveMetadataPreview);
+        match expected_error_substring {
+            Some(msg) => assert_result_error_with_message(result, msg),
+            None => assert!(result.is_ok(), "expected Ok, got {result:?}"),
+        }
+    }
+
+    /// The table properties that enable adaptiveMetadata-preview's property-gated dependencies.
+    fn all_adaptive_metadata_props() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (ENABLE_ROW_TRACKING, "true"),
+            (ENABLE_DELETION_VECTORS, "true"),
+            (ENABLE_IN_COMMIT_TIMESTAMPS, "true"),
+        ]
+    }
+
+    /// The adaptiveMetadata-preview enabling properties with `excluded` removed, to drive the
+    /// "dependency not enabled" requirement checks.
+    fn adaptive_metadata_props_without(excluded: &str) -> Vec<(&'static str, &'static str)> {
+        all_adaptive_metadata_props()
+            .into_iter()
+            .filter(|(k, _)| *k != excluded)
+            .collect()
+    }
+
+    /// The full set of adaptiveMetadata-preview dependency features.
+    fn all_adaptive_metadata_deps() -> Vec<TableFeature> {
+        vec![
+            TableFeature::ColumnMapping,
+            TableFeature::DeletionVectors,
+            TableFeature::RowTracking,
+            TableFeature::DomainMetadata,
+            TableFeature::InCommitTimestamp,
+        ]
+    }
+
+    /// The adaptiveMetadata-preview dependencies with `excluded` removed, to drive the
+    /// "dependency not supported" requirement checks.
+    fn adaptive_metadata_deps_without(excluded: TableFeature) -> Vec<TableFeature> {
+        all_adaptive_metadata_deps()
+            .into_iter()
+            .filter(|f| *f != excluded)
+            .collect()
     }
 
     // IcebergCompatV1/V2/V3 are pairwise mutually exclusive.

@@ -7,12 +7,16 @@ pub use column_mapping::ColumnMappingMode;
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
     column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
-    validate_column_mapping_id,
+    validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
-pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
+pub(crate) use interval_type::{
+    schema_contains_interval_type, validate_interval_type_feature_support_on_write,
+};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -30,6 +34,7 @@ use crate::{DeltaResult, Error};
 
 mod column_mapping;
 mod iceberg_compat;
+mod interval_type;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -124,9 +129,6 @@ pub(crate) enum TableFeature {
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
     /// Column Default Values.
-    ///
-    /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
-    /// the `column-defaults-in-dev` cargo feature.
     AllowColumnDefaults,
 
     ///////////////////////////
@@ -142,6 +144,15 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
+    /// ANSI interval types, in preview pending RFC ratification (`intervalType-preview`).
+    ///
+    /// TODO(#2840): intervalType support is gated by the `interval-type-in-dev` cargo feature.
+    /// Connectors may enable this protocol feature explicitly. It is not auto-enabled from schema
+    /// contents so tables created for legacy interoperability remain readable by connectors that
+    /// predate the feature.
+    #[strum(serialize = "intervalType-preview")]
+    #[serde(rename = "intervalType-preview")]
+    IntervalTypePreview,
     /// timestamps without timezone support
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
@@ -165,6 +176,12 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    /// Iceberg V4 adaptive metadata tree as the table's native content metadata format.
+    ///
+    /// TODO(#2866): gated by the `adaptive-metadata-in-dev` cargo feature until fully supported.
+    #[strum(serialize = "adaptiveMetadata-preview")]
+    #[serde(rename = "adaptiveMetadata-preview")]
+    AdaptiveMetadataPreview,
 
     #[serde(untagged)]
     #[strum(default)]
@@ -245,10 +262,7 @@ pub(crate) enum FeatureRequirement {
     NotSupported(TableFeature),
     /// Feature must NOT be enabled (may be supported but property must not activate it)
     NotEnabled(TableFeature),
-    /// Custom validation logic. Currently unused, but already integrated into the
-    /// validation pipeline(`TableConfiguration::validate_feature_requirements`), so kept for
-    /// future use.
-    #[allow(dead_code)]
+    /// Custom validation logic run against the protocol and table properties.
     Custom(fn(&Protocol, &TableProperties) -> DeltaResult<()>),
 }
 
@@ -437,7 +451,6 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
 /// Attention in the future:
 /// - Geo types: when supported, they must not be usable as partition columns on IcebergCompatV3
 ///   tables.
-/// - Column defaults: when supported, only literal expressions are allowed.
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
 /// - Timestamp parquet encoding: when kernel can write INT96 or INT64, IcebergCompatV3 tables must
 ///   always use INT64; INT96 is forbidden.
@@ -483,15 +496,11 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#2630): drop the gate once column-defaults is fully supported.
 static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "column-defaults-in-dev")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "column-defaults-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -550,6 +559,17 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+static INTERVAL_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "interval-type-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "interval-type-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -633,6 +653,35 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// Dependencies per the adaptiveMetadata RFC (delta-io/delta#6978) "Table Feature Enablement"
+// section. Enforcement is covered by `test_adaptive_metadata_feature_requirements`.
+// TODO(#2866): drop the `adaptive-metadata-in-dev` gate once adaptiveMetadata is fully supported.
+static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[
+        FeatureRequirement::Enabled(TableFeature::ColumnMapping),
+        FeatureRequirement::Custom(|_protocol, properties| {
+            require!(
+                properties.column_mapping_mode == Some(ColumnMappingMode::Id),
+                Error::invalid_protocol(
+                    "Feature 'adaptiveMetadata-preview' requires column mapping in 'id' mode"
+                )
+            );
+            Ok(())
+        }),
+        FeatureRequirement::Enabled(TableFeature::RowTracking),
+        FeatureRequirement::Enabled(TableFeature::DomainMetadata),
+        FeatureRequirement::Enabled(TableFeature::DeletionVectors),
+        FeatureRequirement::Enabled(TableFeature::InCommitTimestamp),
+    ],
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 /// By definition, kernel cannot know how to handle unknown features and must assume they're always
 /// enabled if supported in protocol. However, the read path ignores all writer-only features,
 /// including unknown ones. Unknown features are never inferred from legacy protocol versions.
@@ -656,6 +705,7 @@ impl TableFeature {
             | TableFeature::CatalogOwnedPreview
             | TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
+            | TableFeature::IntervalTypePreview
             | TableFeature::TimestampWithoutTimezone
             | TableFeature::TypeWidening
             | TableFeature::TypeWideningPreview
@@ -664,7 +714,8 @@ impl TableFeature {
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShredding
-            | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
+            | TableFeature::VariantShreddingPreview
+            | TableFeature::AdaptiveMetadataPreview => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -722,6 +773,7 @@ impl TableFeature {
             TableFeature::CatalogOwnedPreview => &CATALOG_OWNED_PREVIEW_INFO,
             TableFeature::ColumnMapping => &COLUMN_MAPPING_INFO,
             TableFeature::DeletionVectors => &DELETION_VECTORS_INFO,
+            TableFeature::IntervalTypePreview => &INTERVAL_TYPE_PREVIEW_INFO,
             TableFeature::TimestampWithoutTimezone => &TIMESTAMP_WITHOUT_TIMEZONE_INFO,
             TableFeature::TypeWidening => &TYPE_WIDENING_INFO,
             TableFeature::TypeWideningPreview => &TYPE_WIDENING_PREVIEW_INFO,
@@ -731,6 +783,7 @@ impl TableFeature {
             TableFeature::VariantTypePreview => &VARIANT_TYPE_PREVIEW_INFO,
             TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
+            TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
             TableFeature::Unknown(_) => &UNKNOWN_FEATURE_INFO,
@@ -971,6 +1024,30 @@ mod tests {
         .unwrap(),
         ExpectRead::Ok
     )]
+    // adaptiveMetadata-preview is gated by the `adaptive-metadata-in-dev` cargo feature: readable
+    // only when the flag is on, otherwise rejected as unsupported.
+    #[cfg_attr(
+        feature = "adaptive-metadata-in-dev",
+        case::adaptive_metadata_supported(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Ok
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "adaptive-metadata-in-dev"),
+        case::adaptive_metadata_gated_off(
+            Protocol::try_new_modern(
+                [TableFeature::AdaptiveMetadataPreview],
+                [TableFeature::AdaptiveMetadataPreview],
+            )
+            .unwrap(),
+            ExpectRead::Unsupported
+        )
+    )]
     fn validate_protocol_for_read(#[case] protocol: Protocol, #[case] expected: ExpectRead) {
         let result = ensure_table_can_be_read(&protocol);
         match expected {
@@ -983,6 +1060,28 @@ mod tests {
                 matches!(result, Err(Error::Unsupported(_))),
                 "expected Unsupported, got: {result:?}"
             ),
+        }
+    }
+
+    /// A table that declares `intervalType-preview` in its reader features is readable exactly when
+    /// kernel support is compiled in (the `interval-type-in-dev` gate); otherwise the read is
+    /// refused.
+    #[test]
+    fn test_read_protocol_with_interval_type_feature() {
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::IntervalTypePreview],
+            [TableFeature::IntervalTypePreview],
+        )
+        .unwrap();
+        let result = ensure_table_can_be_read(&protocol);
+        if cfg!(feature = "interval-type-in-dev") {
+            result
+                .expect("intervalType-preview table must be readable when the feature is enabled");
+        } else {
+            assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "intervalType-preview read must be Unsupported when the feature is off, got: {result:?}"
+            );
         }
     }
 
@@ -1010,6 +1109,7 @@ mod tests {
                 TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
                 TableFeature::ColumnMapping => "columnMapping",
                 TableFeature::DeletionVectors => "deletionVectors",
+                TableFeature::IntervalTypePreview => "intervalType-preview",
                 TableFeature::TimestampWithoutTimezone => "timestampNtz",
                 TableFeature::TypeWidening => "typeWidening",
                 TableFeature::TypeWideningPreview => "typeWidening-preview",
@@ -1019,6 +1119,7 @@ mod tests {
                 TableFeature::VariantTypePreview => "variantType-preview",
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
+                TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };

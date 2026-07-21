@@ -465,8 +465,11 @@ mod tests {
 
     pub fn generate_batch_with_id(start_i: i32) -> Result<RecordBatch, ArrowError> {
         generate_batch(vec![
-            ("id", vec![start_i, start_i + 1, start_i + 2].into_array()),
-            ("val", vec!["a", "b", "c"].into_array()),
+            (
+                "id",
+                vec![start_i, start_i + 1, start_i + 2].into_arrow_array(),
+            ),
+            ("val", vec!["a", "b", "c"].into_arrow_array()),
         ])
     }
 

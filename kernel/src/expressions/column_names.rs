@@ -234,7 +234,7 @@ impl Display for ColumnName {
 }
 
 // Simple column names contain only simple chars, and do not need to be wrapped in backticks.
-fn is_simple_char(c: char) -> bool {
+pub(crate) fn is_simple_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
@@ -341,8 +341,12 @@ fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     Ok(name)
 }
 
-/// Parses a field name escaped with backticks, e.g. "`ab``c``d`".
-fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
+/// Parses a field name escaped with backticks, e.g. "`ab``c``d`", returning its unescaped logical
+/// name. The caller must have already consumed the opening backtick. Shared with the
+/// check-constraint tokenizer ([`crate::expressions::sql`]) so backtick-quoted column references
+/// parse identically.
+/// Examples: `col` -> col;  `ab `` -> ``ab``. Returns an error if there is no closing backtick.
+pub(crate) fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     let mut name = String::new();
     loop {
         match chars.next() {
@@ -358,37 +362,81 @@ fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     Ok(name)
 }
 
+/// Validates a single column segment at compile time, returning it unchanged when valid. Used by
+/// the `column_name!` proc macro for non-literal segment expressions; the macro unwraps the result
+/// in a const context so an invalid segment surfaces as a compile error.
+#[doc(hidden)]
+pub const fn __require_valid_simple_column_segment(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !b.is_ascii_alphanumeric() && b != b'_' {
+            return None;
+        }
+        i += 1;
+    }
+    Some(s)
+}
+
 /// Creates a nested column name whose field names are all simple column names (containing only
-/// alphanumeric characters and underscores), delimited by dots. This macro is provided as a
-/// convenience for the common case where the caller knows the column name contains only simple
-/// field names and that splitting by periods is safe:
+/// alphanumeric characters and underscores).
+///
+/// Each **string-literal** argument is treated as a dot-separated path and split into segments, so
+/// multiple literals concatenate into a single path:
 ///
 /// ```
 /// # use delta_kernel::expressions::{column_name, ColumnName};
 /// assert_eq!(column_name!("a.b.c"), ColumnName::new(["a", "b", "c"]));
+/// assert_eq!(column_name!("a.b", "c.d"), ColumnName::new(["a", "b", "c", "d"]));
 /// ```
 ///
-/// To avoid accidental misuse, the argument must be a string literal, so the compiler can validate
-/// the safety conditions. Thus, the following uses would fail to compile:
+/// Every **constant** argument is taken as a single segment (never split on `.`; its value is not
+/// visible at the call site, so a `.` is rejected):
+///
+/// ```
+/// # use delta_kernel::expressions::{column_name, ColumnName};
+/// const VERSION: &str = "version";
+/// assert_eq!(column_name!(VERSION), ColumnName::new(["version"]));
+/// assert_eq!(column_name!(VERSION, "a.b"), ColumnName::new(["version", "a", "b"]));
+/// ```
+///
+/// The following would fail to compile:
 ///
 /// ```fail_compile
 /// # use delta_kernel::expressions::column_name;
 /// let s = "a.b";
-/// let name = column_name!(s); // not a string literal
+/// let name = column_name!(s); // not a constant
 /// ```
 ///
 /// ```fail_compile
-/// # use delta_kernel::expressions::simple_column_name;
-/// let name = simple_column_name!("a b"); // non-alphanumeric character
+/// # use delta_kernel::expressions::column_name;
+/// const BAD: &str = "a.b";
+/// let name = column_name!(BAD); // dots not allowed in constant segments
+/// ```
+///
+/// ```fail_compile
+/// # use delta_kernel::expressions::column_name;
+/// let name = column_name!("a b"); // non-alphanumeric character in path
+/// ```
+///
+/// ```fail_compile
+/// # use delta_kernel::expressions::column_name;
+/// let name = column_name!("a..b"); // empty segment
 /// ```
 // NOTE: Macros are only public if exported, which defines them at the root of the crate. But we
 // don't want it there. So, we export a hidden macro and pub use it here where we actually want it.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __column_name {
-    ( $($name:tt)* ) => {
-        $crate::expressions::ColumnName::new($crate::delta_kernel_derive::parse_column_name!($($name)*))
-    };
+    ( $($segments:tt)+ ) => {{
+        const SEGMENTS: &[&str] =
+            $crate::delta_kernel_derive::column_name_segments!($($segments)+);
+        $crate::expressions::ColumnName::new(SEGMENTS.iter().copied())
+    }};
 }
 #[doc(inline)]
 pub use __column_name as column_name;
@@ -514,8 +562,6 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod test {
-    use delta_kernel_derive::parse_column_name;
-
     use super::*;
 
     impl ColumnName {
@@ -524,14 +570,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_parse_column_name_macros() {
-        assert_eq!(parse_column_name!("a"), ["a"]);
-
-        assert_eq!(parse_column_name!("a"), ["a"]);
-        assert_eq!(parse_column_name!("a.b"), ["a", "b"]);
-        assert_eq!(parse_column_name!("a.b.c"), ["a", "b", "c"]);
-    }
+    const TEST_ADD: &str = "add";
+    const TEST_STATS: &str = "stats";
 
     #[test]
     fn test_column_name_macros() {
@@ -542,7 +582,27 @@ mod test {
         assert_eq!(column_name!("a.b"), ColumnName::new(["a", "b"]));
         assert_eq!(column_name!("a.b.c"), ColumnName::new(["a", "b", "c"]));
 
-        assert_eq!(joined_column_name!("a", "b"), ColumnName::new(["a", "b"]));
+        // Every string literal is split on dots, so multiple literals concatenate into one path.
+        assert_eq!(
+            column_name!("a.b", "c.d"),
+            ColumnName::new(["a", "b", "c", "d"])
+        );
+
+        assert_eq!(column_name!(TEST_ADD), ColumnName::new(["add"]));
+        assert_eq!(
+            column_name!(TEST_ADD, TEST_STATS),
+            ColumnName::new(["add", "stats"])
+        );
+        assert_eq!(
+            column_name!(TEST_ADD, "parsed"),
+            ColumnName::new(["add", "parsed"])
+        );
+        // A constant segment mixed with a dotted literal path.
+        assert_eq!(
+            column_name!(TEST_ADD, "a.b"),
+            ColumnName::new(["add", "a", "b"])
+        );
+
         assert_eq!(joined_column_name!("a", "b"), ColumnName::new(["a", "b"]));
 
         assert_eq!(

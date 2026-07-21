@@ -15,8 +15,9 @@ use crate::crc::Crc;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::ColumnName;
 use crate::log_replay::ActionsBatch;
-use crate::metrics::events::PROTOCOL_METADATA_LOADED_SPAN;
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::ProtocolMetadataSource;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder};
 #[cfg(feature = "declarative-plans")]
@@ -26,24 +27,21 @@ use crate::{DeltaResult, Engine, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
-    /// Returns an error if either is missing.
+    /// Returns an error if either is missing, and the [`ProtocolMetadataSource`] describing how
+    /// P&M was resolved.
     ///
     /// This is the checked variant of [`Self::read_protocol_metadata_opt`], used for fresh
     /// snapshot creation where both Protocol and Metadata must exist.
-    ///
-    /// Reports metrics: `ProtocolMetadataLoadSuccess` or `ProtocolMetadataLoadFailure`.
-    #[instrument(name = PROTOCOL_METADATA_LOADED_SPAN, err, fields(report, operation_id = %metric_context.operation_id, is_catalog_managed = metric_context.is_catalog_managed, correlation_id = metric_context.correlation_id.as_deref().unwrap_or("")), skip(engine, crc))]
     pub(crate) fn read_protocol_metadata(
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-        metric_context: SnapshotLoadMetricContext,
-    ) -> DeltaResult<(Metadata, Protocol)> {
+    ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
-            (Some(m), Some(p)) => Ok((m, p)),
-            (None, Some(_)) => Err(Error::MissingMetadata),
-            (Some(_), None) => Err(Error::MissingProtocol),
-            (None, None) => Err(Error::MissingMetadataAndProtocol),
+            (Some(m), Some(p), source) => Ok((m, p, source)),
+            (None, Some(_), _) => Err(Error::MissingMetadata),
+            (Some(_), None, _) => Err(Error::MissingProtocol),
+            (None, None, _) => Err(Error::MissingMetadataAndProtocol),
         }
     }
 
@@ -61,11 +59,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         crc: Option<&Arc<Crc>>,
-    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>, ProtocolMetadataSource)> {
         // Case 1: If CRC at target version, use it directly and exit early.
         if let Some(crc) = crc.filter(|c| c.version == self.end_version) {
             info!("P&M from CRC at target version {}", self.end_version);
-            return Ok((Some(crc.metadata.clone()), Some(crc.protocol.clone())));
+            return Ok((
+                Some(crc.metadata.clone()),
+                Some(crc.protocol.clone()),
+                ProtocolMetadataSource::CrcAtTarget,
+            ));
         }
 
         // We didn't return above, so we need to do log replay to find P&M.
@@ -88,7 +90,11 @@ impl LogSegment {
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
-                return Ok((metadata_opt, protocol_opt));
+                return Ok((
+                    metadata_opt,
+                    protocol_opt,
+                    ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+                ));
             }
 
             // Case 2(b): P&M incomplete from pruned replay, use the CRC.
@@ -98,11 +104,17 @@ impl LogSegment {
             return Ok((
                 metadata_opt.or_else(|| Some(crc.metadata.clone())),
                 protocol_opt.or_else(|| Some(crc.protocol.clone())),
+                ProtocolMetadataSource::CrcSeededPmOnlyReplay,
             ));
         }
 
         // Case 3: Full P&M log replay.
-        self.replay_for_pm(engine)
+        let (metadata_opt, protocol_opt) = self.replay_for_pm(engine)?;
+        Ok((
+            metadata_opt,
+            protocol_opt,
+            ProtocolMetadataSource::FullReplay,
+        ))
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
@@ -110,9 +122,11 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        // With `declarative-plans`, replay P&M through the declarative plan, falling back to legacy
+        // replay on any plan failure while the plan path is experimental.
         #[cfg(feature = "declarative-plans")]
         let actions_batches = self.read_pm_batches_via_plan(engine).or_else(|err| {
-            info!("declarative P&M plan unavailable, using legacy replay: {err}");
+            info!("declarative P&M plan failed, using legacy replay: {err}");
             self.read_pm_batches(engine)
                 .map(|batches| Box::new(batches) as _)
         })?;
@@ -149,17 +163,26 @@ impl LogSegment {
         };
 
         let commit_files = self.commit_cover_version_tagged_scan_files()?;
-        let (json_checkpoint, parquet_checkpoint) = self.checkpoint_version_tagged_scan_files()?;
-        let plan = PlanBuilder::union_all([
-            PlanBuilder::scan_json(commit_files, &["version"], Arc::clone(&versioned_schema))?,
-            PlanBuilder::scan_json(json_checkpoint, &["version"], Arc::clone(&versioned_schema))?,
-            PlanBuilder::scan_parquet(parquet_checkpoint, &["version"], versioned_schema)?,
-        ])?
-        .aggregate_ungrouped(|a| {
-            a.max_non_null_by(ColumnName::new([PROTOCOL_NAME]), column_name!("version"))
-                .max_non_null_by(ColumnName::new([METADATA_NAME]), column_name!("version"))
-        })?
-        .build()?;
+        let commits = PlanBuilder::scan_json(commit_files, &["version"], versioned_schema.clone())?;
+
+        // A checkpoint's parts share one format; scan them with the matching operator.
+        let checkpoint = self
+            .checkpoint_version_tagged_scan_files()?
+            .map(|(file_type, checkpoint_files)| {
+                let scan = match file_type {
+                    FileType::Json => PlanBuilder::scan_json,
+                    FileType::Parquet => PlanBuilder::scan_parquet,
+                };
+                scan(checkpoint_files, &["version"], versioned_schema.clone())
+            })
+            .transpose()?;
+
+        let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
+            .aggregate_ungrouped(|a| {
+                a.max_non_null_by(ColumnName::new([PROTOCOL_NAME]), column_name!("version"))
+                    .max_non_null_by(ColumnName::new([METADATA_NAME]), column_name!("version"))
+            })?
+            .build()?;
 
         // NOTE: The plan dedupes all actions, so mark all results as coming from checkpoint
         let batches = engine
