@@ -65,12 +65,12 @@ pub enum KernelError {
     ParseIntervalError = 36,
     ChangeDataFeedUnsupported = 37,
     ChangeDataFeedIncompatibleSchema = 38,
-    RowTrackingChangeFeedUnsupported = 44,
     InvalidCheckpoint = 39,
     LiteralExpressionTransformError = 40,
     CheckpointWriteError = 41,
     SchemaError = 42,
     LogHistoryError = 43,
+    RowTrackingChangeFeedUnsupported = 44,
 }
 
 impl From<Error> for KernelError {

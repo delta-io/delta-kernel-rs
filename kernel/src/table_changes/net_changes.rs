@@ -68,15 +68,8 @@ pub(super) fn collapse_net_changes(
         }
     }
 
-    // Pair each surviving action with its path (the map key) so the output can be sorted
-    // deterministically without re-deriving the path from a side.
     let mut out: Vec<(String, TableChangesFileAction)> = Vec::with_capacity(by_path.len());
     for (path, sides) in by_path {
-        // Ordering on `(commit_version, is_add)` is unique per side within a path: the Delta
-        // protocol guarantees at most one add and one remove of a given path per commit, and a
-        // remove sorts before an add at the same version. So the earliest/latest sides are
-        // well-defined. Every path slot is created with an immediate push, so `sides` is never
-        // empty; an empty slot would be an internal inconsistency.
         let key = |s: &&Side| (s.file.commit_version, s.is_add);
         let (Some(earliest), Some(latest)) =
             (sides.iter().min_by_key(key), sides.iter().max_by_key(key))
@@ -90,37 +83,25 @@ pub(super) fn collapse_net_changes(
         let first_remove = (!earliest.is_add).then(|| earliest.file.clone());
         let last_add = latest.is_add.then(|| latest.file.clone());
         let action = match (first_remove, last_add) {
-            // Net delete: only a remove boundary.
             (Some(remove), None) => TableChangesFileAction {
                 add: None,
                 remove: Some(remove),
             },
-            // Net insert: only an add boundary.
             (None, Some(add)) => TableChangesFileAction {
                 add: Some(add),
                 remove: None,
             },
-            // Net update: the boundaries carry different DVs. Emit both sides grouped -- the
-            // pre-image remove and the post-image add -- for the connector to read each under its
-            // own DV and reconcile by row id. A pair that differs only structurally (same logical
-            // deletions, relocated DV) is let through here; the connector's row-level
-            // reconciliation is the authoritative carry-over check downstream.
             (Some(remove), Some(add)) if remove.deletion_vector != add.deletion_vector => {
                 TableChangesFileAction {
                     add: Some(add),
                     remove: Some(remove),
                 }
             }
-            // Added-then-removed in range (both None), or a same-DV carry-over rewrite: net no
-            // change.
             (Some(_), Some(_)) | (None, None) => continue,
         };
         out.push((path, action));
     }
 
-    // The path map has no defined iteration order; each path yields at most one action, so the path
-    // is a unique, deterministic sort key. An unstable sort suffices and avoids the stable sort's
-    // extra work.
     out.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     Ok(out.into_iter().map(|(_, action)| action).collect())
 }

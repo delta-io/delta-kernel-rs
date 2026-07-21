@@ -284,9 +284,6 @@ impl LogReplayScanner {
                 );
             }
 
-            // If metadata is updated, check that the feature the change feed relies on is still
-            // enabled across the range: ChangeDataFeed for the cdc-file path, RowTracking for the
-            // row-tracking path.
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&mode.required_feature()),
@@ -294,8 +291,6 @@ impl LogReplayScanner {
                 );
             }
 
-            // If protocol is updated, check that reading is still supported. The per-mode error
-            // mapping lives in `CdfMode::protocol_support_error`.
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
@@ -472,11 +467,10 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                     self.remove_dvs
                         .insert(path.to_string(), DvInfo { deletion_vector });
                 }
-            } else if getters[9].get_str(i, "cdc.path")?.is_some() {
-                // A cdc action supersedes add and remove actions only in change-data-feed mode.
-                if self.mode == CdfMode::ChangeDataFeed {
-                    *self.has_cdc_action = true;
-                }
+            } else if getters[9].get_str(i, "cdc.path")?.is_some()
+                && self.mode.uses_change_data_files()
+            {
+                *self.has_cdc_action = true;
             }
         }
         Ok(())

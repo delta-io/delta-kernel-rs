@@ -340,10 +340,7 @@ impl Error {
         expected: &StructType,
         actual: &StructType,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(
-            expected.to_string(),
-            actual.to_string(),
-        )
+        Self::ChangeDataFeedIncompatibleSchema(expected.to_string(), actual.to_string())
     }
 
     /// Creates an incompatible-schema error that identifies the version of `actual`.

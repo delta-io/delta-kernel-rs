@@ -9,7 +9,6 @@ use test_utils::LoggingTest;
 use super::{
     table_changes_action_iter, table_changes_action_iter_with_mode, TableChangesScanMetadata,
 };
-use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
@@ -19,6 +18,9 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
+use crate::table_changes::test_utils::{
+    row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
+};
 use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
@@ -60,29 +62,7 @@ fn metadata_action(schema: SchemaRef, configuration: HashMap<String, String>) ->
 
 /// Helper to create a Metadata action with row tracking enabled
 fn metadata_with_row_tracking(schema: SchemaRef) -> Action {
-    metadata_action(
-        schema,
-        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
-    )
-}
-
-fn get_row_tracking_table_config(table_root: &url::Url) -> TableConfiguration {
-    let metadata = Metadata::try_new(
-        None,
-        None,
-        get_schema(),
-        vec![],
-        0,
-        HashMap::from([(ENABLE_ROW_TRACKING.to_string(), "true".to_string())]),
-    )
-    .unwrap();
-    // RowTracking is a writer feature that requires DomainMetadata support.
-    let protocol = Protocol::try_new_modern(
-        TableFeature::EMPTY_LIST,
-        [TableFeature::RowTracking, TableFeature::DomainMetadata],
-    )
-    .unwrap();
-    TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
+    Action::Metadata(row_tracking_metadata(schema))
 }
 
 /// Runs row-tracking log replay over all commits of `mock_table` against the given end schema.
@@ -93,7 +73,7 @@ fn execute_row_tracking(
 ) -> DeltaResult<Vec<TableChangesScanMetadata>> {
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)?.into_iter();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-    let table_config = get_row_tracking_table_config(&table_root_url);
+    let table_config = row_tracking_table_config(table_root_url, get_schema());
     table_changes_action_iter_with_mode(
         engine,
         &table_config,
@@ -427,7 +407,9 @@ async fn row_tracking_unavailable_midstream_fails(#[case] properties: &[(&str, &
 }
 
 fn nested_id_type(value_type: DataType) -> DataType {
-    DataType::from(StructType::new_unchecked([StructField::nullable("value", value_type)]))
+    DataType::from(StructType::new_unchecked([StructField::nullable(
+        "value", value_type,
+    )]))
 }
 
 #[rstest]
@@ -466,8 +448,8 @@ async fn row_tracking_schema_compatibility(
             commit_has_year,
         ))])
         .await;
-    let res = execute_row_tracking(engine, &mock_table, schema(end_id_type, end_has_year))
-        .map(|_| ());
+    let res =
+        execute_row_tracking(engine, &mock_table, schema(end_id_type, end_has_year)).map(|_| ());
     if expect_compatible {
         assert!(
             res.is_ok(),
@@ -479,6 +461,41 @@ async fn row_tracking_schema_compatibility(
             "expected incompatible-schema error, got {res:?}"
         );
     }
+}
+
+#[rstest]
+#[case::widen_nullability(false, true, true)]
+#[case::tighten_nullability(true, false, false)]
+fn row_tracking_schema_compatibility_checks_nullability(
+    #[case] candidate_nullable: bool,
+    #[case] read_nullable: bool,
+    #[case] expected: bool,
+) {
+    let schema =
+        |nullable| StructType::new_unchecked([StructField::new("id", DataType::INTEGER, nullable)]);
+    assert_eq!(
+        CdfMode::RowTracking
+            .schemas_compatible(&schema(candidate_nullable), &schema(read_nullable),),
+        expected
+    );
+}
+
+#[rstest]
+#[case::nullable(true, true)]
+#[case::non_nullable(false, false)]
+fn row_tracking_schema_compatibility_requires_new_columns_to_be_nullable(
+    #[case] new_column_nullable: bool,
+    #[case] expected: bool,
+) {
+    let candidate = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+    let read_schema = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::new("new_column", DataType::STRING, new_column_nullable),
+    ]);
+    assert_eq!(
+        CdfMode::RowTracking.schemas_compatible(&candidate, &read_schema),
+        expected
+    );
 }
 
 // Test that unsupported protocol features added mid-stream are rejected
@@ -509,6 +526,32 @@ async fn unsupported_protocol_feature_midstream() {
         .await;
 
     assert_midstream_failure(engine, &mock_table);
+}
+
+#[tokio::test]
+async fn row_tracking_protocol_failure_preserves_the_underlying_error() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    let unknown = TableFeature::unknown("unsupportedFeature");
+    mock_table
+        .commit([Action::Protocol(
+            Protocol::try_new_modern(
+                [unknown.clone()],
+                [
+                    unknown,
+                    TableFeature::RowTracking,
+                    TableFeature::DomainMetadata,
+                ],
+            )
+            .unwrap(),
+        )])
+        .await;
+
+    let result = execute_row_tracking(engine, &mock_table, get_schema()).map(|_| ());
+    assert!(
+        matches!(&result, Err(Error::Unsupported(_))),
+        "expected the protocol support error, got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -852,20 +895,8 @@ async fn dv() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
-    let deletion_vector1 = DeletionVectorDescriptor {
-        storage_type: DeletionVectorStorageType::PersistedRelative,
-        path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
-        offset: Some(1),
-        size_in_bytes: 36,
-        cardinality: 2,
-    };
-    let deletion_vector2 = DeletionVectorDescriptor {
-        storage_type: DeletionVectorStorageType::PersistedRelative,
-        path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
-        offset: Some(1),
-        size_in_bytes: 38,
-        cardinality: 3,
-    };
+    let deletion_vector1 = test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2);
+    let deletion_vector2 = test_deletion_vector("U5OWRz5k%CFT.Td}yCPW", 3);
     // - fake_path_1 undergoes a restore. All rows are restored, so the deletion vector is removed.
     // - All remaining rows of fake_path_2 are deleted
     mock_table
@@ -920,13 +951,7 @@ async fn dv() {
 async fn data_skipping_filter() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
-    let deletion_vector = Some(DeletionVectorDescriptor {
-        storage_type: DeletionVectorStorageType::PersistedRelative,
-        path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
-        offset: Some(1),
-        size_in_bytes: 36,
-        cardinality: 2,
-    });
+    let deletion_vector = Some(test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2));
     mock_table
         .commit([
             // Remove/Add pair with max value id = 6
@@ -1379,20 +1404,8 @@ async fn print_table_info_post_phase1_has_dv() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
-    let deletion_vector1 = DeletionVectorDescriptor {
-        storage_type: DeletionVectorStorageType::PersistedRelative,
-        path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
-        offset: Some(1),
-        size_in_bytes: 36,
-        cardinality: 2,
-    };
-    let deletion_vector2 = DeletionVectorDescriptor {
-        storage_type: DeletionVectorStorageType::PersistedRelative,
-        path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
-        offset: Some(1),
-        size_in_bytes: 38,
-        cardinality: 3,
-    };
+    let deletion_vector1 = test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2);
+    let deletion_vector2 = test_deletion_vector("U5OWRz5k%CFT.Td}yCPW", 3);
     // - fake_path_1 undergoes a restore. All rows are restored, so the deletion vector is removed.
     // - All remaining rows of fake_path_2 are deleted
     mock_table
