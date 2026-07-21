@@ -536,18 +536,27 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
-struct PrefixColumns {
-    prefix: ColumnName,
-}
+/// Prefixes the column references produced by the checkpoint skipping predicate creator to match
+/// the checkpoint's physical layout. Stats references (`minValues`/`maxValues`/`nullCount`/
+/// `numRecords`) live under `add.stats_parsed`; partition references (`partitionValues_parsed.*`,
+/// emitted for cast-on-partition comparisons) live under `add` directly. Routing by the leading
+/// path segment keeps a single pass over the predicate.
+struct PrefixCheckpointColumns;
 
-impl<'a> ExpressionTransform<'a> for PrefixColumns {
+impl<'a> ExpressionTransform<'a> for PrefixCheckpointColumns {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
-        Cow::Owned(self.prefix.join(name))
+        let is_partition = name
+            .path()
+            .first()
+            .is_some_and(|f| f == "partitionValues_parsed");
+        let prefix = if is_partition {
+            ColumnName::new(["add"])
+        } else {
+            ColumnName::new(["add", "stats_parsed"])
+        };
+        Cow::Owned(prefix.join(name))
     }
 }
 
@@ -1013,21 +1022,26 @@ impl Scan {
         };
         self.state_info.physical_stats_schema.as_ref()?;
 
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        // The predicate uses physical column names, so partition detection needs physical names
+        // too. `physical_partition_schema` carries them whenever the predicate references a
+        // partition column; the logical fallback is equivalent under identity column mapping.
+        let partition_columns: Vec<String> =
+            match self.state_info.physical_partition_schema.as_ref() {
+                Some(schema) => schema.fields().map(|f| f.name().to_string()).collect(),
+                None => self
+                    .snapshot
+                    .table_configuration()
+                    .metadata()
+                    .partition_columns()
+                    .to_vec(),
+            };
         let skipping_pred = as_checkpoint_skipping_predicate(
             predicate,
-            partition_columns,
+            &partition_columns,
             &self.state_info.physical_stats_columns,
         )?;
 
-        let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
-        };
-        let prefixed = prefixer.transform_pred(&skipping_pred);
+        let prefixed = PrefixCheckpointColumns.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
     }
 

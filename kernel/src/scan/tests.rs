@@ -1096,18 +1096,28 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 }
 
 #[test]
-fn test_prefix_columns_simple() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A simple binary predicate: x > 100
-    let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).into_owned();
+fn test_prefix_checkpoint_columns_data_column() {
+    // A data-column stat reference routes under add.stats_parsed.
+    let pred = Pred::gt(column_expr!("minValues.x"), Expr::literal(100i64));
+    let result = PrefixCheckpointColumns.transform_pred(&pred).into_owned();
 
-    // The column reference should now be add.stats_parsed.x
     let refs: Vec<_> = result.references().into_iter().collect();
     assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
+    assert_eq!(*refs[0], column_name!("add.stats_parsed.minValues.x"));
+}
+
+#[test]
+fn test_prefix_checkpoint_columns_partition_column() {
+    // A partition-value reference routes under add directly, not add.stats_parsed.
+    let pred = Pred::gt(
+        column_expr!("partitionValues_parsed.p"),
+        Expr::literal(100i64),
+    );
+    let result = PrefixCheckpointColumns.transform_pred(&pred).into_owned();
+
+    let refs: Vec<_> = result.references().into_iter().collect();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(*refs[0], column_name!("add.partitionValues_parsed.p"));
 }
 
 #[test]
@@ -1144,6 +1154,44 @@ fn test_build_actions_meta_predicate_with_predicate() {
             "Column reference should have 'stats_parsed' as second element: {col_ref}"
         );
     }
+}
+
+/// A cast over a partition column must resolve to that column's *physical* name under column
+/// mapping, since the meta predicate is in physical names. The `category` partition column has
+/// physical name `col-6dc68f07-...`, so the rewrite references
+/// `add.partitionValues_parsed.col-6dc68f07-...`, not the logical `category`. The predicate also
+/// touches the `value` data column so a stats schema exists (else the meta predicate is skipped).
+#[test]
+fn test_build_actions_meta_predicate_partition_cast_uses_physical_name() {
+    let (_engine, snapshot) = without_transforms_snapshot("./tests/data/partition_cm/name/");
+    let category_physical = "col-6dc68f07-711d-4f00-8bd6-1f5bc698e8ad";
+
+    let predicate = Arc::new(Pred::and(
+        Pred::gt(
+            Expr::cast(column_expr!("category"), DataType::LONG),
+            Expr::literal(100i64),
+        ),
+        Pred::gt(column_expr!("value"), Expr::literal(0i32)),
+    ));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+
+    let meta_pred = scan
+        .build_actions_meta_predicate()
+        .expect("cast over a partition column should produce a meta predicate");
+    let refs: Vec<_> = meta_pred.references().into_iter().cloned().collect();
+    assert!(
+        refs.contains(&ColumnName::new([
+            "add",
+            "partitionValues_parsed",
+            category_physical
+        ])),
+        "partition cast must reference the physical partition column under \
+         add.partitionValues_parsed, got {refs:?}"
+    );
 }
 
 #[test]
@@ -1294,14 +1342,15 @@ impl CheckpointParquetBuilder {
     }
 }
 
-/// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
+/// Builds a checkpoint skipping predicate and prefixes column references for the checkpoint layout.
 fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let stats = all_referenced_columns(pred);
     let skipping_pred = as_checkpoint_skipping_predicate(pred, &[], &stats)?;
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    Some(prefixer.transform_pred(&skipping_pred).into_owned())
+    Some(
+        PrefixCheckpointColumns
+            .transform_pred(&skipping_pred)
+            .into_owned(),
+    )
 }
 
 /// Applies a meta predicate as a row group filter and returns the total rows read.

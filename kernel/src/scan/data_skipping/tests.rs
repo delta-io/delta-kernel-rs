@@ -417,7 +417,7 @@ fn test_all_null_pruning_all_comparison_ops(#[case] pred: Pred) {
 
 #[test]
 fn test_timestamp_stats_enabled() {
-    let empty = HashMap::new();
+    let empty = HashSet::new();
     let stats_columns: HashSet<ColumnName> = [column_name!("timestamp_col")].into_iter().collect();
     let creator = DataSkippingPredicateCreator {
         partition_columns: &empty,
@@ -688,10 +688,10 @@ fn test_partition_columns() -> HashSet<String> {
     ["part_col".to_string()].into()
 }
 
-/// `CAST(part_col AS INTEGER)`, the cast expression the partition-cast pushdown tests compare
-/// against (an integer target is the only cast-prunable target -- see `is_cast_prunable_target`).
-fn cast_part_int() -> Expr {
-    Expr::cast(column_expr!("part_col"), DataType::INTEGER)
+/// `CAST(part_col AS DATE)`, the cast expression the checkpoint partition-cast tests compare
+/// against.
+fn cast_part_date() -> Expr {
+    Expr::cast(column_expr!("part_col"), DataType::DATE)
 }
 
 /// Helper to build a resolver for mixed partition + data stats evaluation.
@@ -745,168 +745,119 @@ fn test_partition_column_rewrite() {
     );
 }
 
-/// A `CAST(<partition_col> AS INTEGER) <op> <literal>` predicate rewrites to a comparison on
-/// `CAST(partitionValues_parsed.<col> AS INTEGER)`, guarded so Remove rows are never filtered. The
-/// same cast over a data column is not supported (data stats aren't exact), so it folds out.
-#[test]
-fn test_cast_partition_column_rewrite() {
+/// The in-memory path must never prune on a cast: arrow evaluates the predicate but a different
+/// engine may match the rows, and their cast semantics can disagree. Every cast folds to keep, for
+/// both partition and data columns and any target. (Casts prune on the checkpoint path instead,
+/// where pruner == matcher -- see `test_checkpoint_cast_*`.)
+#[rstest]
+#[case::partition_date(Expr::cast(column_expr!("part_col"), DataType::DATE), Scalar::Date(20185))]
+#[case::partition_int(Expr::cast(column_expr!("part_col"), DataType::INTEGER), Scalar::from(20185i32))]
+#[case::data_date(Expr::cast(column_expr!("data_col"), DataType::DATE), Scalar::Date(20185))]
+#[case::data_int(Expr::cast(column_expr!("data_col"), DataType::INTEGER), Scalar::from(20185i32))]
+fn test_in_memory_cast_never_prunes(#[case] cast_expr: Expr, #[case] val: Scalar) {
     let partition_columns = test_partition_columns();
-
-    let pred = Pred::eq(cast_part_int(), Scalar::from(20185i32));
-    let skipping_pred = as_data_skipping_predicate_with_partitions(&pred, &partition_columns);
-    assert_eq!(
-        skipping_pred.as_ref().map(|p| p.to_string()),
-        Some(
-            "OR(NOT(Column(is_add)), CAST(Column(partitionValues_parsed.part_col) AS integer) = 20185)"
-                .to_string()
-        ),
-        "cast over a partition column should compare the cast partition value, got {skipping_pred:?}"
-    );
-
-    // The same cast over a data column has no exact value to cast, so it is unsupported (keep).
-    let cast_data = Expr::cast(column_expr!("data_col"), DataType::INTEGER);
-    let pred = Pred::eq(cast_data, Scalar::from(20185i32));
+    let pred = Pred::eq(cast_expr, val);
     assert_eq!(
         as_data_skipping_predicate_with_partitions(&pred, &partition_columns),
         None,
-        "cast over a data column should not produce a skipping predicate"
+        "in-memory path must never prune on a cast, got a skipping predicate for {pred}"
     );
 }
 
-/// Only a string partition column is cast-pruned. Casting a non-string partition column (here a
-/// DATE column to LONG) is not the protocol's string-parse direction and could disagree with the
-/// engine's cast, so it folds out (keep) rather than risk skipping a matching file.
+/// A `CAST(<partition_col> AS target)` rewrites to a guarded comparison on
+/// `CAST(partitionValues_parsed.<col> AS target)`; a cast over a data column folds out.
 #[test]
-fn test_cast_non_string_partition_column_not_pruned() {
-    let partition_columns = HashMap::from_iter([("part_col".to_string(), DataType::DATE)]);
-    let cast_part = Expr::cast(column_expr!("part_col"), DataType::LONG);
-    let pred = Pred::eq(cast_part, Scalar::from(20185i64));
-    let stats_columns = all_referenced_columns(&pred);
-    let creator = DataSkippingPredicateCreator::new(&partition_columns, &stats_columns);
+fn test_checkpoint_cast_partition_column_rewrite() {
+    let partition_columns = vec!["part_col".to_string()];
+    let pred = Pred::eq(cast_part_date(), Scalar::Date(20185));
+    let stats = all_referenced_columns(&pred);
+    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats);
     assert_eq!(
-        creator.eval(&pred),
+        skipping_pred.as_ref().map(|p| p.to_string()),
+        Some(
+            "OR(CAST(Column(partitionValues_parsed.part_col) AS date) IS NULL, \
+             CAST(Column(partitionValues_parsed.part_col) AS date) = 20185)"
+                .to_string()
+        ),
+        "checkpoint cast over a partition column should compare the guarded cast value, got {skipping_pred:?}"
+    );
+
+    // The same cast over a data column has no exact value to cast, so it folds out (keep).
+    let cast_data = Expr::cast(column_expr!("data_col"), DataType::DATE);
+    let pred = Pred::eq(cast_data, Scalar::Date(20185));
+    let stats = all_referenced_columns(&pred);
+    assert_eq!(
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats),
         None,
-        "casting a non-string partition column must not produce a skipping predicate"
+        "checkpoint cast over a data column should not produce a skipping predicate"
     );
 }
 
-/// The direct (scalar) evaluator casts the exact string partition value and compares it, so it can
-/// keep or prune a file by evaluating `CAST(part AS INTEGER) = <int>` against the partition value.
-#[test]
-fn test_cast_partition_direct_eval() {
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("part_col"),
-        Scalar::from("42"),
-    )]));
-
-    // Matching value: keep (TRUE).
-    let pred = Pred::eq(cast_part_int(), Scalar::from(42i32));
-    assert_eq!(resolver.eval_pred(&pred, false), TRUE);
-
-    // Non-matching value: prune (FALSE).
-    let pred = Pred::eq(cast_part_int(), Scalar::from(43i32));
-    assert_eq!(resolver.eval_pred(&pred, false), FALSE);
-}
-
-/// The rewrite fires for every order/equality operator, including the commuted `<literal> op
-/// CAST(<col>)` form (operator swapped so the cast column stays on the left).
+/// Every order/equality operator produces the guarded `OR(CAST(...) IS NULL, cmp)` form, including
+/// the commuted `<literal> op CAST(<col>)` leg (operator swapped so the cast column stays left).
 #[rstest]
 #[case::eq(
-    Pred::eq(cast_part_int(), Scalar::from(20185i32)),
-    "OR(NOT(Column(is_add)), CAST(Column(partitionValues_parsed.part_col) AS integer) = 20185)"
+    Pred::eq(cast_part_date(), Scalar::Date(20185)),
+    "OR(CAST(Column(partitionValues_parsed.part_col) AS date) IS NULL, \
+     CAST(Column(partitionValues_parsed.part_col) AS date) = 20185)"
 )]
 #[case::lt(
-    Pred::lt(cast_part_int(), Scalar::from(20185i32)),
-    "OR(NOT(Column(is_add)), CAST(Column(partitionValues_parsed.part_col) AS integer) < 20185)"
+    Pred::lt(cast_part_date(), Scalar::Date(20185)),
+    "OR(CAST(Column(partitionValues_parsed.part_col) AS date) IS NULL, \
+     CAST(Column(partitionValues_parsed.part_col) AS date) < 20185)"
 )]
 #[case::gt(
-    Pred::gt(cast_part_int(), Scalar::from(20185i32)),
-    "OR(NOT(Column(is_add)), CAST(Column(partitionValues_parsed.part_col) AS integer) > 20185)"
+    Pred::gt(cast_part_date(), Scalar::Date(20185)),
+    "OR(CAST(Column(partitionValues_parsed.part_col) AS date) IS NULL, \
+     CAST(Column(partitionValues_parsed.part_col) AS date) > 20185)"
 )]
 #[case::lt_commuted(
-    Pred::lt(Scalar::from(20185i32), cast_part_int()),
-    "OR(NOT(Column(is_add)), CAST(Column(partitionValues_parsed.part_col) AS integer) > 20185)"
+    Pred::lt(Scalar::Date(20185), cast_part_date()),
+    "OR(CAST(Column(partitionValues_parsed.part_col) AS date) IS NULL, \
+     CAST(Column(partitionValues_parsed.part_col) AS date) > 20185)"
 )]
 #[case::gt_commuted(
-    Pred::gt(Scalar::from(20185i32), cast_part_int()),
-    "OR(NOT(Column(is_add)), CAST(Column(partitionValues_parsed.part_col) AS integer) < 20185)"
+    Pred::gt(Scalar::Date(20185), cast_part_date()),
+    "OR(CAST(Column(partitionValues_parsed.part_col) AS date) IS NULL, \
+     CAST(Column(partitionValues_parsed.part_col) AS date) < 20185)"
 )]
-fn test_cast_partition_rewrite_ops(#[case] pred: Pred, #[case] expected: &str) {
-    let partition_columns = test_partition_columns();
+fn test_checkpoint_cast_partition_rewrite_ops(#[case] pred: Pred, #[case] expected: &str) {
+    let partition_columns = vec!["part_col".to_string()];
+    let stats = all_referenced_columns(&pred);
     assert_eq!(
-        as_data_skipping_predicate_with_partitions(&pred, &partition_columns)
-            .map(|p| p.to_string()),
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).map(|p| p.to_string()),
         Some(expected.to_string()),
         "rewrite mismatch for {pred}"
     );
 }
 
-/// The direct evaluator exercises the commuted (`<literal> op CAST`) and inverted
-/// (`NOT(CAST op <literal>)`) operator legs, confirming the operator swap and inversion keep vs
-/// prune correctly. `part_col` resolves to the string `"42"` (integer 42).
+/// Evaluates the comparison the rewrite embeds against the exact partition value: a match keeps, a
+/// non-match prunes, and a null or unparseable value casts to NULL (never a skip). The outer
+/// `CAST(...) IS NULL` guard (see the rewrite-shape tests) keeps those NULL rows under an engine's
+/// SQL-WHERE semantics, where a bare NULL would otherwise drop the row.
 #[rstest]
-// Commuted: 41 < 42 -> keep; 43 < 42 is false -> prune.
-#[case::lt_commuted_keep(Pred::lt(Scalar::from(41i32), cast_part_int()), TRUE)]
-#[case::lt_commuted_prune(Pred::lt(Scalar::from(43i32), cast_part_int()), FALSE)]
-// Commuted: 41 > 42 is false -> prune.
-#[case::gt_commuted_prune(Pred::gt(Scalar::from(41i32), cast_part_int()), FALSE)]
-// Inverted: NOT(42 < 43) -> prune; NOT(42 < 41) -> keep.
-#[case::not_lt_prune(Pred::not(Pred::lt(cast_part_int(), Scalar::from(43i32))), FALSE)]
-#[case::not_lt_keep(Pred::not(Pred::lt(cast_part_int(), Scalar::from(41i32))), TRUE)]
-// Inverted equality: NOT(42 = 42) -> prune; NOT(42 = 43) -> keep.
-#[case::not_eq_prune(Pred::not(Pred::eq(cast_part_int(), Scalar::from(42i32))), FALSE)]
-#[case::not_eq_keep(Pred::not(Pred::eq(cast_part_int(), Scalar::from(43i32))), TRUE)]
-fn test_cast_partition_direct_eval_ops(#[case] pred: Pred, #[case] expected: Option<bool>) {
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("part_col"),
-        Scalar::from("42"),
-    )]));
-    assert_eq!(
-        resolver.eval_pred(&pred, false),
-        expected,
-        "eval mismatch for {pred}"
+#[case::match_keep(Scalar::from("2025-04-14"), TRUE)]
+#[case::no_match_prune(Scalar::from("2025-04-15"), FALSE)]
+#[case::null_keep(Scalar::Null(DataType::STRING), NULL)]
+#[case::unparseable_keep(Scalar::from("not-a-date"), NULL)]
+fn test_checkpoint_cast_comparison_eval(#[case] part_val: Scalar, #[case] expected: Option<bool>) {
+    // 2025-04-14 is day 20192 since the epoch.
+    let comparison = Pred::eq(
+        Expr::cast(
+            column_expr!("partitionValues_parsed.part_col"),
+            DataType::DATE,
+        ),
+        Scalar::Date(20192),
     );
-}
-
-/// Pushdown is refused unless the source is a string partition column cast to an integer target
-/// *and* the comparison literal already matches that target. A literal whose type differs from the
-/// cast target (which would make the arrow comparison kernel error and abort the scan), and the
-/// timezone-sensitive `date`/`timestamp` targets (arrow parses an offset-bearing string via UTC,
-/// which can disagree with an engine's cast), all fold to keep.
-#[rstest]
-// Long literal against an INTEGER target: mismatched types -> keep.
-#[case::int_target_long_literal(
-    Pred::eq(Expr::cast(column_expr!("part_col"), DataType::INTEGER), Scalar::from(5i64))
-)]
-// Timezone-sensitive DATE target -> keep.
-#[case::date_target(
-    Pred::eq(Expr::cast(column_expr!("part_col"), DataType::DATE), Scalar::Date(20185))
-)]
-// Timezone-sensitive TIMESTAMP target -> keep.
-#[case::timestamp_target(
-    Pred::eq(Expr::cast(column_expr!("part_col"), DataType::TIMESTAMP), Scalar::Timestamp(0))
-)]
-fn test_cast_partition_not_pruned(#[case] pred: Pred) {
-    let partition_columns = test_partition_columns();
-    assert_eq!(
-        as_data_skipping_predicate_with_partitions(&pred, &partition_columns),
-        None,
-        "unsound cast pushdown must fold to keep, got a skipping predicate for {pred}"
-    );
-}
-
-/// An unparseable or NULL partition value must evaluate the cast comparison to NULL (keep the
-/// file), never FALSE (which would silently drop a matching file).
-#[rstest]
-#[case::unparseable(Scalar::from("not-an-int"))]
-#[case::null_value(Scalar::Null(DataType::STRING))]
-fn test_cast_partition_unparseable_keeps(#[case] part_val: Scalar) {
     let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("part_col"),
+        column_name!("partitionValues_parsed.part_col"),
         part_val,
     )]));
-    let pred = Pred::eq(cast_part_int(), Scalar::from(42i32));
-    assert_eq!(resolver.eval_pred(&pred, false), NULL);
+    assert_eq!(
+        resolver.eval(&comparison),
+        expected,
+        "eval mismatch for {comparison}"
+    );
 }
 
 #[rstest]
@@ -1676,7 +1627,6 @@ fn stats_columns_gate_rewrite(
     #[case] stats: HashSet<ColumnName>,
     #[case] expected: &str,
 ) {
-    let partition_columns = string_partition_columns(&partition_columns);
     let result =
         as_sql_data_skipping_predicate_with_stats_columns(&pred, &partition_columns, &stats)
             .expect("SQL-WHERE rewrite always returns Some for these cases");
