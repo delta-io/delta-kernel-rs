@@ -85,7 +85,7 @@ mod tests {
 
     fn make_handler() -> PlanBasedParquetHandler {
         PlanBasedParquetHandler::new(
-            Arc::new(SyncPlanExecutor::new()),
+            Arc::new(SyncPlanExecutor::default()),
             SyncEngine::new().parquet_handler(),
         )
     }
