@@ -479,10 +479,16 @@ impl DomainMetadataVisitor {
             .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
     }
 
-    pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
-        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to
-        // filter
-        self.domain_metadatas.retain(|_, dm| !dm.removed);
+    pub(crate) fn into_domain_metadatas(self) -> DomainMetadataMap {
+        let mut domain_metadatas = self.into_domain_metadatas_including_tombstones();
+        domain_metadatas.retain(|_, dm| !dm.removed);
+        domain_metadatas
+    }
+
+    /// The newest-wins map with tombstones (`removed == true`) retained. Callers that reconcile
+    /// against a base map need the tombstones so a removal in a newer commit can suppress a domain
+    /// the base holds. [`Self::into_domain_metadatas`] strips them for the common case.
+    pub(crate) fn into_domain_metadatas_including_tombstones(self) -> DomainMetadataMap {
         self.domain_metadatas
     }
 }

@@ -648,6 +648,22 @@ impl Snapshot {
                 }
             }
         }
+        // A stale but authoritative (`Complete`) CRC roots a tail-only scan over the commits after
+        // it, skipping the checkpoint. A `Partial` base is not authoritative for misses, so it
+        // falls through to the full scan below.
+        if let Some(base) = self.base_crc() {
+            if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
+                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
+                    base.version,
+                    base_active,
+                    domains,
+                    engine,
+                )?;
+                record_metric(false, rooted.len());
+                return Ok(rooted);
+            }
+        }
+
         // Fallback: scan the log_segment from scratch.
         // TODO: a Partial cache already covers the commits read during snapshot load. A
         //       miss search could skip that range and only scan the older commits, then
