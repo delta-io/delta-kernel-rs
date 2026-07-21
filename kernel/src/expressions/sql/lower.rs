@@ -49,24 +49,11 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
     let Comparison { op, left, right } = comparison;
     let left = resolve_operand(left, schema)?;
     let right = resolve_operand(right, schema)?;
-    // Reject non-primitive columns: the engine cannot compare nested types (see the fn doc), and
-    // this is the only place that catches a column on its own. `parse_sql("NULL", <struct>)`
-    // succeeds (NULL is valid for any type), so without this `nested = NULL` would lower silently;
-    // `nested = 0` is already caught by `parse_sql` rejecting a non-primitive literal target.
-    for operand in [&left, &right] {
-        if let ResolvedOperand::Column {
-            canonical,
-            data_type,
-        } = operand
-        {
-            if !matches!(data_type, DataType::Primitive(_)) {
-                return Err(Error::generic(format!(
-                    "CHECK constraint can only compare primitive-typed columns, but '{}' has type {data_type:?}",
-                    canonical.join(".")
-                )));
-            }
-        }
-    }
+    // `nested = NULL` would otherwise lower silently: `parse_sql("NULL", <struct>)` succeeds (NULL
+    // is valid for any type), so the primitive-only check must run on the column operand here.
+    // (`nested = 0` is already caught by `parse_sql` rejecting a non-primitive literal target.)
+    left.ensure_comparable()?;
+    right.ensure_comparable()?;
     // A literal is typed from the column on the other side, so at least one operand must be a
     // column.
     let (left_expr, right_expr) = match (left, right) {
@@ -176,6 +163,28 @@ enum ResolvedOperand {
         data_type: DataType,
     },
     Literal(String),
+}
+
+impl ResolvedOperand {
+    /// Reject an operand the engine cannot compare. Only a column carries a type to check here (a
+    /// literal is typed later from the column on the other side, so it is a deliberate no-op); the
+    /// engine cannot compare nested types, so a non-primitive column is rejected. See [`lower`].
+    fn ensure_comparable(&self) -> DeltaResult<()> {
+        let Self::Column {
+            canonical,
+            data_type,
+        } = self
+        else {
+            return Ok(());
+        };
+        if !matches!(data_type, DataType::Primitive(_)) {
+            return Err(Error::generic(format!(
+                "CHECK constraint can only compare primitive-typed columns, but '{}' has type {data_type:?}",
+                canonical.join(".")
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Resolve an operand against `schema`, walking a column path at most once: a column yields its
