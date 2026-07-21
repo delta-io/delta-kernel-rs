@@ -438,7 +438,7 @@ pub(crate) fn as_checkpoint_skipping_predicate(
         .iter()
         .map(String::as_str)
         .collect();
-    NullGuardedDataSkippingPredicateCreator {
+    CheckpointDataSkippingPredicateCreator {
         partition_columns,
         stats_columns: physical_stats_columns,
     }
@@ -715,10 +715,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     }
 }
 
-/// Like [`DataSkippingPredicateCreator`] but adds IS NULL guards on stat column references
-/// for safe parquet row group filtering. Partition columns are excluded since their values
-/// live in `add.partitionValues_parsed`, not `add.stats_parsed`.
-struct NullGuardedDataSkippingPredicateCreator<'a> {
+/// Like [`DataSkippingPredicateCreator`] but adds IS NULL guards on stat column references for safe
+/// parquet row group filtering in checkpoint/sidecar files. Partition columns are excluded since
+/// their values live in `add.partitionValues_parsed`, not `add.stats_parsed`.
+struct CheckpointDataSkippingPredicateCreator<'a> {
     partition_columns: HashSet<&'a str>,
     /// Physical leaf paths whose stats are present in `stats_parsed`. Same contract as
     /// `DataSkippingPredicateCreator::stats_columns`. Must match the column set used to
@@ -726,7 +726,7 @@ struct NullGuardedDataSkippingPredicateCreator<'a> {
     stats_columns: &'a HashSet<ColumnName>,
 }
 
-impl NullGuardedDataSkippingPredicateCreator<'_> {
+impl CheckpointDataSkippingPredicateCreator<'_> {
     /// Returns true if the column is a partition column (no stats in `stats_parsed`).
     fn is_partition_column(&self, col: &ColumnName) -> bool {
         let path = col.path();
@@ -739,7 +739,7 @@ impl NullGuardedDataSkippingPredicateCreator<'_> {
     }
 }
 
-impl DataSkippingPredicateEvaluator for NullGuardedDataSkippingPredicateCreator<'_> {
+impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'_> {
     type Output = Pred;
     type ColumnStat = Expr;
 
