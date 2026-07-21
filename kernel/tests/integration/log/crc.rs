@@ -2359,8 +2359,9 @@ impl Engine for ParquetForbiddenEngine {
 
 /// Builds checkpoint@10, commits to v20, and a CRC at v15. Loaded with the default
 /// `Disabled` replay so the v15 CRC is retained as a stale base (`crc_at_version()` is `None`).
-/// Seeds three domains covering the reconcile table:
+/// Seeds four domains covering every reconcile arm:
 /// - `dom_before` set at v5 and never touched again (base stands),
+/// - `dom_updated` set at v6 then re-set at v16 (tail config overrides the base),
 /// - `dom_after` set at v18 (new in the tail),
 /// - `dom_removed` set at v8 then tombstoned at v17 (tail removal shadows the base).
 async fn setup_stale_crc_dm_table<E: TaskExecutor>(
@@ -2387,7 +2388,11 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
             .with_data_change(true);
         txn = match v {
             5 => txn.with_domain_metadata("dom_before".to_string(), "cfg_before".to_string()),
+            6 => txn.with_domain_metadata("dom_updated".to_string(), "cfg_updated".to_string()),
             8 => txn.with_domain_metadata("dom_removed".to_string(), "cfg_removed".to_string()),
+            16 => {
+                txn.with_domain_metadata("dom_updated".to_string(), "cfg_updated_v16".to_string())
+            }
             17 => txn.with_domain_metadata_removed("dom_removed".to_string()),
             18 => txn.with_domain_metadata("dom_after".to_string(), "cfg_after".to_string()),
             _ => txn,
@@ -2410,11 +2415,13 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
 }
 
 #[rstest]
-#[case::filtered_present("dom_before", Some("cfg_before"))]
-#[case::filtered_tail_added("dom_after", Some("cfg_after"))]
-#[case::filtered_tail_removed("dom_removed", None)]
+#[case::base_stands("dom_before", Some("cfg_before"))]
+#[case::tail_overrides_base("dom_updated", Some("cfg_updated_v16"))]
+#[case::tail_added("dom_after", Some("cfg_after"))]
+#[case::tail_removed("dom_removed", None)]
+#[case::never_existed("dom_missing", None)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dm_query_roots_in_stale_complete_crc_skips_checkpoint(
+async fn test_dm_query_rooted_in_stale_complete_crc_filtered(
     #[case] domain: &str,
     #[case] expected: Option<&str>,
 ) -> DeltaResult<()> {
@@ -2425,21 +2432,80 @@ async fn test_dm_query_roots_in_stale_complete_crc_skips_checkpoint(
     assert_eq!(fresh.version(), 20);
     assert!(fresh.crc_at_version().is_none());
 
-    // The rooted scan reads only the commit tail (16..=20), never the v10 parquet checkpoint.
+    // ParquetForbiddenEngine proves the rooted scan reads only the commit tail (16..=20), never
+    // the v10 parquet checkpoint.
     let forbidden = ParquetForbiddenEngine {
         inner: engine.clone(),
     };
-
     assert_eq!(
         fresh.get_domain_metadata(domain, &forbidden)?,
         expected.map(str::to_string)
     );
 
-    // The unfiltered query resolves the whole active set through the same rooted path.
-    let all = fresh.get_all_domain_metadata(&forbidden)?;
-    let mut domains: Vec<_> = all.iter().map(|dm| dm.domain().to_string()).collect();
-    domains.sort();
-    assert_eq!(domains, ["dom_after", "dom_before"]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dm_query_rooted_in_stale_complete_crc_unfiltered() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    setup_stale_crc_dm_table(&engine, &table_path).await?;
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 20);
+    assert!(fresh.crc_at_version().is_none());
+
+    let forbidden = ParquetForbiddenEngine {
+        inner: engine.clone(),
+    };
+    let active: HashMap<_, _> = fresh
+        .get_all_domain_metadata(&forbidden)?
+        .into_iter()
+        .map(|dm| (dm.domain().to_string(), dm.configuration().to_string()))
+        .collect();
+    assert_eq!(
+        active,
+        HashMap::from([
+            ("dom_before".to_string(), "cfg_before".to_string()),
+            ("dom_updated".to_string(), "cfg_updated_v16".to_string()),
+            ("dom_after".to_string(), "cfg_after".to_string()),
+        ])
+    );
+
+    Ok(())
+}
+
+// A single multi-domain filter must resolve each domain independently through the reconcile:
+// base fallback, tail override, tail add, tail tombstone, and a never-existed domain in one call.
+// This is the shape the real caller (Transaction::get_domain_metadatas_internal) uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dm_query_rooted_in_stale_complete_crc_multi_domain_filter() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    setup_stale_crc_dm_table(&engine, &table_path).await?;
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let forbidden = ParquetForbiddenEngine {
+        inner: engine.clone(),
+    };
+    let filter = HashSet::from([
+        "dom_before",
+        "dom_updated",
+        "dom_after",
+        "dom_removed",
+        "dom_missing",
+    ]);
+    let got: HashMap<_, _> = fresh
+        .get_domain_metadatas_internal(&forbidden, Some(&filter))?
+        .into_iter()
+        .map(|(domain, dm)| (domain, dm.configuration().to_string()))
+        .collect();
+    assert_eq!(
+        got,
+        HashMap::from([
+            ("dom_before".to_string(), "cfg_before".to_string()),
+            ("dom_updated".to_string(), "cfg_updated_v16".to_string()),
+            ("dom_after".to_string(), "cfg_after".to_string()),
+        ])
+    );
 
     Ok(())
 }

@@ -485,9 +485,8 @@ impl DomainMetadataVisitor {
         domain_metadatas
     }
 
-    /// The newest-wins map with tombstones (`removed == true`) retained. Callers that reconcile
-    /// against a base map need the tombstones so a removal in a newer commit can suppress a domain
-    /// the base holds. [`Self::into_domain_metadatas`] strips them for the common case.
+    /// The newest-wins domain-metadata map, retaining tombstones (`removed == true`).
+    /// [`Self::into_domain_metadatas`] returns the same map with tombstones stripped.
     pub(crate) fn into_domain_metadatas_including_tombstones(self) -> DomainMetadataMap {
         self.domain_metadatas
     }

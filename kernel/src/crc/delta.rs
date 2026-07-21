@@ -117,19 +117,12 @@ impl Crc {
             self.metadata = m;
         }
 
-        // Apply the delta onto the CRC's existing map: upsert each non-removed entry
-        // (newest wins), drop each tombstone. The variant (Complete or Partial) stays the
+        // Apply the delta onto the CRC's existing map. The variant (Complete or Partial) stays the
         // same since a delta never changes whether the base was authoritative.
         let map = match &mut self.domain_metadata_state {
             DomainMetadataState::Complete(m) | DomainMetadataState::Partial(m) => m,
         };
-        for (domain, dm) in delta.domain_metadata {
-            if dm.is_removed() {
-                map.remove(&domain);
-            } else {
-                map.insert(domain, dm);
-            }
-        }
+        merge_domain_metadata(map, delta.domain_metadata);
 
         // Apply the delta onto the CRC's existing map: upsert each entry (newest wins).
         // The variant (Complete or Partial) stays the same since a delta never changes whether
@@ -151,6 +144,21 @@ impl Crc {
 
         self.version = new_version;
         self
+    }
+}
+
+/// Fold newest-wins domain-metadata entries (tombstones retained) onto `base`: a tombstone
+/// (`is_removed()`) drops the domain, any other entry upserts it.
+pub(crate) fn merge_domain_metadata(
+    base: &mut HashMap<String, DomainMetadata>,
+    entries: impl IntoIterator<Item = (String, DomainMetadata)>,
+) {
+    for (domain, dm) in entries {
+        if dm.is_removed() {
+            base.remove(&domain);
+        } else {
+            base.insert(domain, dm);
+        }
     }
 }
 

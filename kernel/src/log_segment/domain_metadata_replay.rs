@@ -1,7 +1,8 @@
 //! Domain metadata replay logic for [`LogSegment`].
 //!
-//! This module contains the method that performs a log replay to extract the latest domain
-//! metadata actions from a [`LogSegment`].
+//! Two entry points: [`LogSegment::scan_domain_metadatas`] replays the whole log for the latest
+//! domain metadata, and [`LogSegment::scan_domain_metadatas_rooted_in_crc`] scans only the commits
+//! after an authoritative stale CRC and reconciles them against its active-domain map.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,6 +11,7 @@ use tracing::instrument;
 use super::LogSegment;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, LOG_DOMAIN_METADATA_SCHEMA};
+use crate::crc::merge_domain_metadata;
 use crate::log_replay::ActionsBatch;
 use crate::{DeltaResult, Engine, RowVisitor as _, Version};
 
@@ -66,13 +68,7 @@ impl LogSegment {
             // Unfiltered: merge the whole tail onto the base, dropping tombstoned domains.
             None => {
                 let mut active = base_active.clone();
-                for (domain, dm) in tail {
-                    if dm.is_removed() {
-                        active.remove(&domain);
-                    } else {
-                        active.insert(domain, dm);
-                    }
-                }
+                merge_domain_metadata(&mut active, tail);
                 active
             }
         };
@@ -108,9 +104,13 @@ impl LogSegment {
                 .collect::<HashSet<String>>()
         });
         let mut visitor = DomainMetadataVisitor::new(domain_filter);
+        // If a specific set of domains is requested then we can terminate log replay early as
+        // soon as all requested domains have been found. If all domains are requested then we
+        // are forced to replay the entire log.
         for actions in self.read_domain_metadata_batches(engine)? {
             let domain_metadatas = actions?.actions;
             visitor.visit_rows_of(domain_metadatas.as_ref())?;
+            // if all requested domains have been found, terminate early
             if visitor.filter_found() {
                 break;
             }

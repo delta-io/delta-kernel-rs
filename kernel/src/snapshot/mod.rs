@@ -649,8 +649,9 @@ impl Snapshot {
             }
         }
         // A stale but authoritative (`Complete`) CRC roots a tail-only scan over the commits after
-        // it, skipping the checkpoint. A `Partial` base is not authoritative for misses, so it
-        // falls through to the full scan below.
+        // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
+        // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
+        // scan and falls through to the full replay below.
         if let Some(base) = self.base_crc() {
             if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
                 let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
