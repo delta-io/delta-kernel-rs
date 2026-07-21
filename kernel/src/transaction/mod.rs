@@ -1771,9 +1771,9 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::utils::test_utils::{
-        install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
-        test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
-        valid_add_file_batch, CapturingReporter,
+        create_valid_add_file_batch, install_thread_local_metrics_reporter, load_test_table,
+        string_array_to_engine_data, test_schema_flat, test_schema_nested, test_schema_with_array,
+        test_schema_with_map, CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -2679,7 +2679,7 @@ mod tests {
     // validate_blind_append tests
     // ============================================================================
     fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
-        let batch = valid_add_file_batch(false /* all_nullable */);
+        let batch = create_valid_add_file_batch(false /* all_nullable */);
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 

@@ -375,7 +375,6 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// A commit is rejected when a staged `add` action is missing a required field.
 #[tokio::test]
 async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();

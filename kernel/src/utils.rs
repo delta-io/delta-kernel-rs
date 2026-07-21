@@ -388,7 +388,7 @@ pub(crate) mod test_utils {
     /// Build an addFile with all required fields populated.
     ///
     /// When `all_nullable` is true, every field is marked nullable.
-    pub(crate) fn valid_add_file_batch(all_nullable: bool) -> RecordBatch {
+    pub(crate) fn create_valid_add_file_batch(all_nullable: bool) -> RecordBatch {
         let schema = if all_nullable {
             let fields = BASE_ADD_FILES_SCHEMA
                 .fields()
