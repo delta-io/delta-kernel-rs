@@ -718,8 +718,8 @@ async fn interval_partition_values_do_not_prune_files(
         schema,
         &["period"],
         true,
-        vec!["intervalType-preview"],
-        vec!["intervalType-preview"],
+        vec![],
+        vec![],
     )
     .await?;
     add_commit(
