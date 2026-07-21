@@ -296,12 +296,23 @@ mod tests {
         "price <= 10",
         Predicate::le(col("price"), Expression::literal(10i32))
     )]
-    // A DECIMAL literal whose scale matches the column lowers; `parse_scalar` requires an exact
-    // scale match, so the literal must be written with the column's scale (`10.00`, not `10`). The
-    // scale-mismatch case is rejected below.
+    // A DECIMAL literal is padded up to the column's scale (matching Spark), so `10.00`, `10`, and
+    // `0`/`0.5` against DECIMAL(10,2) all lower -- the unscaled value is scaled by `10^(2-s)`.
     #[case::decimal_matching_scale(
         "cost <= 10.00",
         Predicate::le(col("cost"), Expression::literal(decimal_scalar(1000, 10, 2)))
+    )]
+    #[case::decimal_integer_literal_padded(
+        "cost <= 10",
+        Predicate::le(col("cost"), Expression::literal(decimal_scalar(1000, 10, 2)))
+    )]
+    #[case::decimal_zero_padded(
+        "cost >= 0",
+        Predicate::ge(col("cost"), Expression::literal(decimal_scalar(0, 10, 2)))
+    )]
+    #[case::decimal_lower_scale_padded(
+        "cost >= 0.5",
+        Predicate::ge(col("cost"), Expression::literal(decimal_scalar(50, 10, 2)))
     )]
     // Literal forms across the primitive type matrix, each typed from its column. Exercises the
     // tokenizer's bareword (`TRUE`), fractional-number, typed-literal (`DATE '...'`), and binary
@@ -478,11 +489,11 @@ mod tests {
     #[case::string_literal_for_numeric_column("amount = 'foo'")]
     #[case::quoted_number_for_numeric_column("amount = '10'")]
     #[case::literal_out_of_range_for_column("price = 9999999999")]
-    // A DECIMAL literal must match the column's scale exactly (`parse_scalar` does not pad), so an
-    // integer or wrong-scale literal against a DECIMAL(10,2) column is rejected where Spark would
-    // read `0` as `0.00` (see the `sql` module doc). `cost <= 10.00` lowers.
-    #[case::decimal_integer_literal_scale_mismatch("cost >= 0")]
-    #[case::decimal_wrong_scale_literal("cost >= 0.5")]
+    // A DECIMAL literal is padded UP to the column's scale, but never reduced (that would drop
+    // precision), so a literal with more fractional digits than the column (scale 3 vs DECIMAL's 2)
+    // is rejected. A value exceeding the column's precision is likewise rejected.
+    #[case::decimal_literal_scale_exceeds_column("cost >= 0.123")]
+    #[case::decimal_literal_exceeds_precision("cost >= 999999999.99")]
     // A FLOAT column against any literal not exactly representable in f32 is rejected: kernel
     // compares at f32 while Spark widens the column to f64, disagreeing silently. This covers
     // fractional/exponent literals, out-of-i64 integers, AND in-i64 integers past 2^24 that round

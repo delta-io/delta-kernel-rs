@@ -14,10 +14,9 @@
 //!
 //! In cases where kernel cannot match Spark semantics, kernel errors out rather than guess
 //! (fail-closed, never a silent wrong answer); how an un-lowerable constraint is then handled is
-//! the calling API's contract, not this module's. One notable such gap: a decimal literal must
-//! match the column's scale exactly (`parse_scalar` does not pad), so `amount >= 0` on a
-//! `DECIMAL(10,2)` column is rejected where Spark would read `0` as `0.00`. Padding the literal's
-//! scale to the column would recover these.
+//! the calling API's contract, not this module's. One notable such gap: a FLOAT column compared
+//! against a literal that is not exactly representable in f32 is rejected, because kernel compares
+//! at f32 while Spark widens the column to f64 (see `type_literal_from_column` in `sql::lower`).
 
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::expressions::Predicate;
@@ -467,6 +466,18 @@ mod tests {
             DecimalData::try_new(-1234567, DecimalType::try_new(10, 2).unwrap()).unwrap()
         ),
     )]
+    // A literal with fewer fractional digits than the column is padded up to the column's scale
+    // (matching Spark): `0` -> `0.00`, `1.2` -> `1.20`.
+    #[case(
+        "0",
+        decimal_type(10, 2),
+        Scalar::Decimal(DecimalData::try_new(0, DecimalType::try_new(10, 2).unwrap()).unwrap()),
+    )]
+    #[case(
+        "1.2",
+        decimal_type(5, 2),
+        Scalar::Decimal(DecimalData::try_new(120, DecimalType::try_new(5, 2).unwrap()).unwrap()),
+    )]
     fn parses_basic_literals(#[case] sql: &str, #[case] ty: DataType, #[case] expected: Scalar) {
         let got = parse_sql(sql, &ty).unwrap();
         assert_eq!(got, Expression::literal(expected));
@@ -619,8 +630,6 @@ mod tests {
     #[case("now()", DataType::TIMESTAMP)]
     #[case("1 + 1", DataType::INTEGER)]
     #[case("concat('a', 'b')", DataType::STRING)]
-    #[case("0", decimal_type(10, 2))] // parse_scalar requires the literal's scale to match exactly
-    #[case("1.2", decimal_type(5, 2))]
     fn currently_unsupported_valid_sql(#[case] sql: &str, #[case] ty: DataType) {
         let result = parse_sql(sql, &ty);
         assert!(
