@@ -859,8 +859,9 @@ impl PrimitiveType {
             }
         };
 
-        // `exp` is untrusted (parsed from `raw`), so a pathological exponent near i128::MIN would
-        // overflow a plain `frac_digits - exp`; fail with checked_sub.
+        // `exp` is untrusted (parsed from `raw`): a plain `frac_digits - exp` overflows i128 for
+        // `exp <= i128::MIN + frac_digits` (subtracting a large-magnitude negative). checked_sub
+        // turns that into a parse error instead of a panic.
         let scale = frac_digits.checked_sub(exp).ok_or_else(parse_error)?;
         let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
         require!(scale == dtype.scale(), parse_error());
