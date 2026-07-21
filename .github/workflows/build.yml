@@ -207,14 +207,6 @@ jobs:
           - macOS-latest
           - ubuntu-latest
           - windows-latest
-        # Run the suite in two feature configs: the full --all-features build, and a
-        # no-declarative-plans build that.
-        # TODO: Remove the duplicate run once P&M plan is enabled by default.
-        scope:
-          - name: all-features
-            args: "--workspace --all-features"
-          - name: no-declarative-plans
-            args: "-p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,interval-type-in-dev,default-engine-base"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
@@ -234,9 +226,16 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: test
-        run: cargo nextest run --locked ${{ matrix.scope.args }} -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+        run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
       - name: doc tests
-        run: cargo test --locked ${{ matrix.scope.args }} --doc
+        run: cargo test --locked --workspace --all-features --doc
+      # Also run kernel + acceptance WITHOUT declarative-plans so the
+      # cfg(not(feature = "declarative-plans")) paths get exercised. Enumerates every kernel
+      # feature except declarative-plans.
+      - name: test (no declarative-plans)
+        run: cargo nextest run --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,interval-type-in-dev,default-engine-base -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: doc tests (no declarative-plans)
+        run: cargo test --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,interval-type-in-dev,default-engine-base --doc
       - name: trybuild tests
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
