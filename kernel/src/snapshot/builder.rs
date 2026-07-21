@@ -48,9 +48,6 @@ pub struct SnapshotBuilder {
     /// Opaque, caller-supplied id recorded on this build's metric events. Not interpreted by
     /// kernel; set via [`with_correlation_id`](Self::with_correlation_id).
     correlation_id: Option<Arc<str>>,
-    /// How much log this build reads: `Full` for a fresh snapshot, `Incremental` for an update of
-    /// an existing one. Set by the constructor and recorded on the load metric events.
-    load_type: LogSegmentLoadType,
 }
 
 /// Controls whether kernel replays commits to advance a stale base CRC (the existing snapshot's
@@ -112,7 +109,6 @@ impl SnapshotBuilder {
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
-            load_type: LogSegmentLoadType::Full,
         }
     }
 
@@ -126,7 +122,6 @@ impl SnapshotBuilder {
             incremental_replay: IncrementalReplay::default(),
             operation_id: MetricId::new(),
             correlation_id: None,
-            load_type: LogSegmentLoadType::Incremental,
         }
     }
 
@@ -246,9 +241,16 @@ impl SnapshotBuilder {
             incremental_replay,
             operation_id,
             correlation_id,
-            load_type,
         } = self;
 
+        // A build from a table root is a fresh, full log listing; a build from an existing snapshot
+        // reuses that snapshot's log root and lists only the commits above it (`table_root` is
+        // None).
+        let load_type = if table_root.is_some() {
+            LogSegmentLoadType::Full
+        } else {
+            LogSegmentLoadType::Incremental
+        };
         let metric_context = SnapshotLoadMetricContext {
             operation_id,
             is_catalog_managed: max_catalog_version.is_some(),

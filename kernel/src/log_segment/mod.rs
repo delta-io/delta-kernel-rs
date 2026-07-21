@@ -220,19 +220,6 @@ impl LogSegment {
                 None
             };
 
-        // A CRC describes the table state at its version, so it can never predate the checkpoint.
-        if let (Some(crc), Some(checkpoint_version)) =
-            (&listed_files.latest_crc_file, checkpoint_version)
-        {
-            require!(
-                crc.version >= checkpoint_version,
-                Error::internal_error(format!(
-                    "CRC file version {} is older than checkpoint version {checkpoint_version}",
-                    crc.version
-                ))
-            );
-        }
-
         validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
@@ -240,17 +227,11 @@ impl LogSegment {
             end_version,
         )?;
         validate_latest_commit_file(&listed_files, effective_version)?;
-
-        // A CRC describes the table state at its version, so it can never postdate the segment.
-        if let Some(crc) = &listed_files.latest_crc_file {
-            require!(
-                crc.version <= effective_version,
-                Error::internal_error(format!(
-                    "CRC file version {} is newer than log segment version {effective_version}",
-                    crc.version
-                ))
-            );
-        }
+        validate_crc(
+            listed_files.latest_crc_file.as_ref(),
+            checkpoint_version,
+            effective_version,
+        )?;
 
         let log_segment = LogSegment {
             end_version: effective_version,
@@ -1556,5 +1537,34 @@ fn validate_latest_commit_file(
             ))
         );
     }
+    Ok(())
+}
+
+/// A CRC describes the table state at its version, so it must sit within the segment: at or above
+/// the checkpoint (when present) and at or below the end version.
+fn validate_crc(
+    crc: Option<&ParsedLogPath>,
+    checkpoint_version: Option<Version>,
+    effective_version: Version,
+) -> DeltaResult<()> {
+    let Some(crc) = crc else {
+        return Ok(());
+    };
+    if let Some(checkpoint_version) = checkpoint_version {
+        require!(
+            crc.version >= checkpoint_version,
+            Error::internal_error(format!(
+                "CRC file version {} is older than checkpoint version {checkpoint_version}",
+                crc.version
+            ))
+        );
+    }
+    require!(
+        crc.version <= effective_version,
+        Error::internal_error(format!(
+            "CRC file version {} is newer than log segment version {effective_version}",
+            crc.version
+        ))
+    );
     Ok(())
 }

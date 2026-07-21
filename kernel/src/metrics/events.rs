@@ -354,6 +354,8 @@ impl LogSegmentLoadType {
 }
 
 /// A log segment was listed and assembled for a snapshot.
+///
+/// All fields are set at emit time (creation attrs).
 #[derive(Debug, Clone)]
 pub struct LogSegmentLoadSuccess {
     pub operation_id: MetricId,
@@ -367,7 +369,7 @@ pub struct LogSegmentLoadSuccess {
     pub num_compaction_files: u64,
     /// How many versions behind the segment's end version the latest on-disk CRC file is:
     /// `None` if there is no CRC file, `Some(0)` if one sits at the end version, `Some(n)` if it
-    /// is `n` versions stale.
+    /// is `n` versions behind.
     pub crc_versions_behind: Option<u64>,
     pub duration: Duration,
 }
