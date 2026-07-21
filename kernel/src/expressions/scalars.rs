@@ -903,7 +903,7 @@ impl PrimitiveType {
 // physical integer (i32 months / i64 microseconds), so these parsers convert literals to
 // their physical representation.
 //
-// The DAY TO SECOND spelling has not been checked against Spark.
+// Currently, there's no DAT test for DAY TO SECOND partition values.
 // TODO: Unify SQL literal parsing with `expressions/sql.rs`.
 
 /// Extracts the quoted body and field range of an ANSI interval literal.
