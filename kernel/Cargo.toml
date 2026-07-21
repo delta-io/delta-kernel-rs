@@ -74,7 +74,7 @@ features = ["chrono-tz", "ffi", "json"]
 optional = true
 [dependencies.parquet_58]
 package = "parquet"
-version = "58"
+version = "58.1"
 features = ["async", "object_store"]
 optional = true
 
@@ -116,10 +116,6 @@ schema-diff = []
 
 # Declarative plan IR (experimental).
 declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored"]
-
-# Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
-# work. TODO(#2630): remove once full column-defaults support ships.
-column-defaults-in-dev = []
 
 # Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
 # work: the SQL predicate parser and, later, `checkConstraints` write enforcement. Remove once

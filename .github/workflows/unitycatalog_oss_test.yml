@@ -3,7 +3,7 @@ name: unity-catalog-oss-test
 # Runs the gated `unity-catalog-delta-rest-client` live integration tests against a real Unity
 # Catalog OSS server (built from a pinned commit). Exercises the read-only `get_config` handshake
 # (needs no table) and `load_table` against a table seeded via the Delta-Commits (legacy) API
-# before the test step.
+# before the test step, plus the mutating create tests (UC_CREATE) against the ephemeral server.
 on:
   push:
     branches: [main, "release/**"]
@@ -88,6 +88,7 @@ jobs:
           UC_TEST_CATALOG: unity
           UC_TEST_SCHEMA: default
           UC_TEST_TABLE: smoke_test_table
+          UC_CREATE: "1"
         run: cargo nextest run --locked -p unity-catalog-delta-rest-client --features integration-test -E 'test(live_)'
 
       - name: Stop Unity Catalog server
