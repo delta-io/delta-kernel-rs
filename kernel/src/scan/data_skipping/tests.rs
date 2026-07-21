@@ -419,10 +419,7 @@ fn test_all_null_pruning_all_comparison_ops(#[case] pred: Pred) {
 fn test_timestamp_stats_enabled() {
     let empty = HashSet::new();
     let stats_columns: HashSet<ColumnName> = [column_name!("timestamp_col")].into_iter().collect();
-    let creator = DataSkippingPredicateCreator {
-        partition_columns: &empty,
-        stats_columns: &stats_columns,
-    };
+    let creator = DataSkippingPredicateCreator::new(&empty, &stats_columns);
     let col = &column_name!("timestamp_col");
 
     assert!(
@@ -496,7 +493,7 @@ fn test_checkpoint_skipping_semantic(
     let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
     let stats = all_referenced_columns(&pred);
     let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
-    let resolver = HashMap::from_iter([(column_name!("maxValues.x"), max_val)]);
+    let resolver = HashMap::from_iter([(column_name!("stats_parsed.maxValues.x"), max_val)]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
 }
@@ -506,8 +503,10 @@ fn test_checkpoint_skipping_semantic(
 #[test]
 fn test_checkpoint_skipping_null_guard_vs_regular() {
     let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
-    let resolver =
-        HashMap::from_iter([(column_name!("maxValues.x"), Scalar::Null(DataType::INTEGER))]);
+    let resolver = HashMap::from_iter([(
+        column_name!("stats_parsed.maxValues.x"),
+        Scalar::Null(DataType::INTEGER),
+    )]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
 
     let stats = all_referenced_columns(&pred);
@@ -546,8 +545,14 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
 
     // Both stats present and both allow pruning -> skip
     let resolver = HashMap::from_iter([
-        (column_name!("maxValues.col_a"), Scalar::from(50)),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
+        (
+            column_name!("stats_parsed.maxValues.col_a"),
+            Scalar::from(50),
+        ),
+        (
+            column_name!("stats_parsed.minValues.col_b"),
+            Scalar::from(60),
+        ),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
@@ -559,10 +564,13 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     // col_a stats null, but col_b stats alone are enough to prune -> still skip
     let resolver = HashMap::from_iter([
         (
-            column_name!("maxValues.col_a"),
+            column_name!("stats_parsed.maxValues.col_a"),
             Scalar::Null(DataType::INTEGER),
         ),
-        (column_name!("minValues.col_b"), Scalar::from(60)),
+        (
+            column_name!("stats_parsed.minValues.col_b"),
+            Scalar::from(60),
+        ),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
@@ -574,10 +582,13 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
     // col_a stats null and col_b doesn't allow pruning -> keep
     let resolver = HashMap::from_iter([
         (
-            column_name!("maxValues.col_a"),
+            column_name!("stats_parsed.maxValues.col_a"),
             Scalar::Null(DataType::INTEGER),
         ),
-        (column_name!("minValues.col_b"), Scalar::from(30)),
+        (
+            column_name!("stats_parsed.minValues.col_b"),
+            Scalar::from(30),
+        ),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
@@ -601,7 +612,7 @@ fn test_checkpoint_skipping_timestamp_adjustment(
     let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
     assert_eq!(
         skipping_pred.to_string(),
-        "OR(Column(maxValues.ts_col) IS NULL, Column(maxValues.ts_col) > 999001)"
+        "OR(Column(stats_parsed.maxValues.ts_col) IS NULL, Column(stats_parsed.maxValues.ts_col) > 999001)"
     );
 
     // EQ: max stat leg should use adjusted literal
@@ -610,8 +621,8 @@ fn test_checkpoint_skipping_timestamp_adjustment(
     let skipping_pred = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
     assert_eq!(
         skipping_pred.to_string(),
-        "AND(OR(Column(minValues.ts_col) IS NULL, NOT(Column(minValues.ts_col) > 1000000)), \
-         OR(Column(maxValues.ts_col) IS NULL, NOT(Column(maxValues.ts_col) < 999001)))"
+        "AND(OR(Column(stats_parsed.minValues.ts_col) IS NULL, NOT(Column(stats_parsed.minValues.ts_col) > 1000000)), \
+         OR(Column(stats_parsed.maxValues.ts_col) IS NULL, NOT(Column(stats_parsed.maxValues.ts_col) < 999001)))"
     );
 }
 
@@ -1537,8 +1548,8 @@ fn mixed_and_non_stat_arm_still_prunes_via_stat_arm() {
     );
 }
 
-/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint-pushdown
-/// (NullGuarded) creator, which adds an `IS NULL` guard on each stat ref for safe parquet
+/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint
+/// creator, which adds an `IS NULL` guard on each stat ref for safe parquet
 /// row-group filtering. The non-stat arm still folds to NULL.
 #[test]
 fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
@@ -1550,6 +1561,6 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
     let result = as_checkpoint_skipping_predicate(&pred, &[], &stats).unwrap();
     assert_eq!(
         result.to_string(),
-        "AND(OR(Column(maxValues.stat) IS NULL, Column(maxValues.stat) > 100), null)"
+        "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, Column(stats_parsed.maxValues.stat) > 100), null)"
     );
 }
