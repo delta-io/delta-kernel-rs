@@ -79,6 +79,7 @@ fn workload_benchmarks(c: &mut Criterion) {
                         name,
                         snapshot_construction_spec,
                         config.snapshot_builder,
+                        config.incremental_crc_replay,
                         &workload.table_info,
                         runtime.clone(),
                     )
