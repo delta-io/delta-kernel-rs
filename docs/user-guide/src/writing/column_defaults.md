@@ -1,60 +1,33 @@
-# Column Defaults
+# Column defaults
 
-A column default is a SQL expression stored in a field's column metadata within the table schema.
-It supplies a value when a write omits that column or provides the `DEFAULT` keyword for it. A
-value explicitly supplied by the write, including `NULL`, is not replaced by the default.
+A **column default** is a SQL expression stored in a field's column metadata within the table
+schema. It supplies a value when a write omits that column or provides the `DEFAULT` keyword for
+it. A value explicitly supplied by the write, including `NULL`, is not replaced by the default.
 
-Column defaults are a writer feature because the writer materializes the evaluated value into
-each new data file. A writer must apply the current default whenever its input omits a column that
-declares one or requests `DEFAULT` for that column. Readers then see ordinary stored values and do
-not need special default evaluation logic.
+Writers materialize evaluated defaults in new data files, so readers need no default-evaluation
+logic.
 
 Before reading the writing sections below, make sure you understand
 [Appending Data](./append.md).
 
-## Accessing column defaults
-
-| API | When to use it |
-|-----|----------------|
-| `Transaction::top_level_column_defaults()` | Discover defaults while preparing an ordinary table write. Names are logical names. |
-| `StructField::column_default()` | Inspect one field directly or traverse a schema that may contain nested defaults. |
-| `ColumnDefault::raw_sql()` | Surface the stored metadata or obtain the original SQL for connector-side evaluation. |
-| `ColumnDefault::to_scalar()` | Ask Kernel to parse a supported literal into a typed `Scalar` for materialization. |
-| `ColumnDefault::data_type()` | Obtain the declared result type for validation or materialization. |
-
-If your connector only needs to surface column-default metadata, use `raw_sql()`. It returns the
-original SQL expression stored in the schema without requiring Kernel to understand it. Do not
-use `to_scalar()` for metadata display: that method is intended for writers that want Kernel to
-parse a literal for materialization, and it returns `None` when Kernel cannot parse the SQL.
-
-Prefer the transaction method for normal writes. It checks that `allowColumnDefaults` is enabled
-and gives you the top-level logical names expected by the write path. Use the field method only
-when you intentionally need to inspect a specific field or recurse through a nested schema.
-
-## Protocol requirements
-
-The Delta protocol describes the behavior in
-[Default Columns](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#default-columns).
-The feature has these protocol requirements:
-
-- The table lists `allowColumnDefaults` in its writer features. See the
-  [table-feature registry](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#valid-feature-names-in-table-features).
-- Each declared expression is stored as `CURRENT_DEFAULT` in the field's
-  [column metadata](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-metadata).
-- Writers must materialize the current default when the input row omits the column or uses the
-  `DEFAULT` keyword.
-
-> [!IMPORTANT]
-> Kernel currently supports writing to tables that already declare column defaults. The
-> `create_table()` builder cannot enable `allowColumnDefaults`, and `alter_table()` cannot add or
-> change a default. Create or alter the table with another Delta client before using Kernel to
-> write data to it.
-
 ## Discovering defaults for a write
 
-Use `Transaction::top_level_column_defaults()` as the main entry point when preparing a write.
-It returns a map from logical column name to `ColumnDefault` for every top-level column that
-declares a default.
+Before assembling logical data, call `Transaction::top_level_column_defaults()`. It returns a map
+from logical column name to `ColumnDefault` for every top-level column that declares one. The map
+is empty when the table does not enable `allowColumnDefaults`, so orphaned default metadata is not
+applied during writes.
+
+Writers must materialize each returned default when an input row omits the column or uses the
+`DEFAULT` keyword. See the Delta protocol's
+[Default Columns](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#default-columns)
+section for wire-level rules.
+
+> [!NOTE]
+> Kernel can write to tables that already declare column defaults. The `create_table()` builder
+> cannot enable `allowColumnDefaults`, and `alter_table()` rejects every alteration on a table
+> with the feature enabled. Use another Delta client to create or alter such a table.
+
+The following example assumes `age INTEGER DEFAULT 18` is the table's only top-level default.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -79,20 +52,25 @@ for (column_name, default) in transaction.top_level_column_defaults()? {
 # }
 ```
 
+The function prints:
+
+```text
+Materialize age from the literal Integer(18)
+```
+
 `to_scalar()` returns `Some(Scalar)` when Kernel can parse the default SQL as a supported literal.
 It returns `None` only when Kernel cannot parse that SQL; `None` does not mean the stored
 expression is invalid. Use `raw_sql()` to access the original SQL, then evaluate it with your
 connector's SQL engine using `data_type()` as the expected result type.
 
-An empty map means either no top-level column has a default or the table does not enable
-`allowColumnDefaults`. Kernel does not surface orphaned `CURRENT_DEFAULT` metadata when the
-feature is disabled.
+If your connector only needs to display column-default metadata, use `raw_sql()` directly rather
+than asking Kernel to parse it with `to_scalar()`.
 
 ## Materializing defaults
 
-Discovering a default does not change the input data. For each omitted column or column marked
-with `DEFAULT`, your connector must produce an array containing the evaluated default and insert
-it into the logical data before the normal write transformation.
+`DEFAULT` is a connector-planning marker, not an `EngineData` value. Resolve omitted columns and
+`DEFAULT` before constructing logical `EngineData`, and preserve an explicitly supplied `NULL`.
+Discovering a default does not modify the input data.
 
 Prepare data in this order:
 
@@ -101,9 +79,15 @@ Prepare data in this order:
 2. Look up those logical names in `top_level_column_defaults()`.
 3. Evaluate each matching default once per write when the expression is constant, or once per row
    when the expression's semantics require it.
-4. Materialize an array with the table field's data type and the input batch's row count.
-5. Insert the arrays into the logical data in table-schema order.
-6. Apply `WriteContext::logical_to_physical()` and write the physical data as described in
+4. For each defaulted partition column, convert the result to a `Scalar` and combine it with the
+   explicitly supplied partition values. If the values vary by row, group rows by the complete
+   partition-value map.
+5. For a partitioned table, call `partitioned_write_context()` with the complete map for each row
+   group. For an unpartitioned table, call `unpartitioned_write_context()` once.
+6. For each defaulted non-partition column, materialize an array with the current batch's row
+   count. Insert these arrays in `write_context.logical_schema()` order; that schema excludes
+   partition columns.
+7. Apply `WriteContext::logical_to_physical()` and write the physical data as described in
    [Appending Data](./append.md#writing-parquet-files).
 
 If an omitted column has no default, apply the same missing-column behavior your connector uses
@@ -112,10 +96,9 @@ missing required field. Column defaults do not override an explicitly supplied v
 
 ## Parser and type limitations
 
-Kernel's SQL parser is intentionally limited. It supports `NULL` and supported literal forms for
-primitive types. It does not currently evaluate general SQL expressions such as arithmetic or
-function calls. For example, `current_timestamp()` remains available through `raw_sql()`, but
-`to_scalar()` returns `None`.
+Kernel's SQL parser supports `NULL` and supported literal forms for primitive types. It does not
+evaluate general SQL expressions such as arithmetic or function calls. For example,
+`current_timestamp()` remains available through `raw_sql()`, but `to_scalar()` returns `None`.
 
 The following type-specific rules also apply:
 
@@ -125,21 +108,21 @@ The following type-specific rules also apply:
   cannot materialize them.
 - `NULL` can be parsed for any column type.
 
-Treat `to_scalar() == None` as a request for connector-side evaluation, not as evidence that the
-stored expression is invalid. Kernel may simply lack support for that SQL form.
-
 ## Nested defaults
 
-The Delta protocol permits defaults on nested struct fields. Kernel validates nested defaults
-when it loads a snapshot, but `top_level_column_defaults()` intentionally returns only top-level
-columns.
+The Delta protocol permits defaults on nested struct fields, and Kernel validates nested defaults
+when it loads a snapshot. However, `top_level_column_defaults()` intentionally returns only
+top-level columns.
 
-If your connector supports omitting nested fields, recursively walk `Snapshot::schema()` and call
+`StructField::column_default()` exposes raw field metadata and does not check whether the table
+enables `allowColumnDefaults`. Do not use it to drive a write unless your connector independently
+verifies the feature. If your connector cannot verify the feature, reject writes that omit nested
+fields instead of applying values from raw metadata.
+
+After verifying the feature, recursively walk `Snapshot::schema()` and call
 `StructField::column_default()` on each field. Container elements do not carry field metadata, so
-continue into struct fields inside arrays and maps when traversing the schema.
-
-Kernel does not provide a helper that materializes nested defaults into your input data. Your
-connector must rebuild the affected struct values while preserving the logical schema.
+continue into struct fields inside arrays and maps. Kernel does not materialize nested defaults;
+your connector must rebuild affected struct values while preserving the logical schema.
 
 ## Iceberg compatibility v3
 
@@ -162,23 +145,8 @@ Iceberg compatibility v3 also enables column mapping. The defaults returned by
 logical data before the write context applies column mapping and other physical-schema
 transformations.
 
-## Current limitations
-
-Keep these boundaries in mind when adding column-default support to a connector:
-
-- Kernel discovers and parses defaults but never modifies your input data.
-- Kernel cannot currently define, change, or remove defaults.
-- The transaction API exposes only top-level defaults.
-- Nested materialization is connector-owned.
-- General SQL evaluation is connector-owned.
-- Iceberg compatibility v3 expressions that Kernel cannot verify require connector validation.
-
-These limitations make `top_level_column_defaults()` a discovery API rather than a complete
-default-application pipeline. Your connector remains responsible for producing logical data that
-matches the table schema before writing Parquet files.
-
 ## What's next
 
 - [Writing to Partitioned Tables](./partitioned_writes.md) explains how logical data and
   partition values become physical files.
-- [Altering a Table](./alter_table.md) covers the schema changes Kernel currently supports.
+- [Altering a Table](./alter_table.md) covers the schema changes available through Kernel.
