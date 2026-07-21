@@ -41,8 +41,10 @@ use crate::{DeltaResult, Error};
 ///   column holding `-0.0` can silently disagree, affecting even the DOUBLE and FLOAT-vs-FLOAT
 ///   cases that lower here. The enforcement layer must normalize signed zero (Spark's
 ///   `NormalizeFloatingNumbers`) before evaluating, or reject float equality outright.
-/// - String collation: kernel compares bytewise; a non-default collation (e.g. `UTF8_LCASE`) would
-///   compare differently under Spark.
+/// - String collation: kernel compares bytewise (Spark's default `UTF8_BINARY`). Collation is not
+///   yet in the Delta spec or kernel; if adopted (see the collated-string-type RFC), a non-default
+///   collation (e.g. `UTF8_LCASE`) would need a collation-aware engine compare, and a reject arm
+///   here until then.
 pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult<Predicate> {
     let Comparison { op, left, right } = comparison;
     let left = resolve_operand(left, schema)?;
