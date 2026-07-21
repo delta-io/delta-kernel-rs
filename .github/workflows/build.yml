@@ -229,6 +229,13 @@ jobs:
         run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
       - name: doc tests
         run: cargo test --locked --workspace --all-features --doc
+      # Also run kernel + acceptance WITHOUT declarative-plans so the
+      # cfg(not(feature = "declarative-plans")) paths get exercised. Enumerates every kernel
+      # feature except declarative-plans.
+      - name: test (no declarative-plans)
+        run: cargo nextest run --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,interval-type-in-dev,default-engine-base -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+      - name: doc tests (no declarative-plans)
+        run: cargo test --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,interval-type-in-dev,default-engine-base --doc
       - name: trybuild tests
         if: steps.filter.outputs.ffi == 'true'
         run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code

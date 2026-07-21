@@ -34,6 +34,8 @@ pub use credentials::{
 };
 pub use error::{Error, Result};
 pub use models::{
-    CatalogConfig, Commit, CommitRequest, CommitsRequest, CommitsResponse, DeltaTableRequirement,
-    DeltaTableUpdate, LoadTableResponse, Protocol, TableMetadata, UpdateTableRequest,
+    CatalogConfig, Commit, CommitRequest, CommitsRequest, CommitsResponse,
+    CreateStagingTableRequest, CreateStagingTableResponse, CreateTableRequest,
+    DeltaTableRequirement, DeltaTableUpdate, LoadTableResponse, Protocol, TableMetadata,
+    UpdateTableRequest,
 };

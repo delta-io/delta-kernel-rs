@@ -48,8 +48,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
-    Version,
+    version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
+    IntoEngineData, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -1253,8 +1253,7 @@ impl<S> Transaction<S> {
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
-        let commit_version = i64::try_from(commit_version)
-            .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
+        let commit_version = version_as_i64(commit_version)?;
 
         if row_tracking_supported {
             self.generate_adds_with_row_tracking(engine, commit_version)
