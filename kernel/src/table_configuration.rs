@@ -24,15 +24,16 @@ use crate::scan::data_skipping::stats_schema::{
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    schema_contains_interval_type, schema_has_invariants, validate_column_defaults_metadata,
+    SchemaRef, StructField, StructType,
 };
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_interval_type_feature_support_on_write, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation,
-    TableFeature, LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
+    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -674,10 +675,22 @@ impl TableConfiguration {
     /// - For `Write` operations: checks writer version and writer features
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
+        self.validate_interval_type_support()?;
         match operation {
             Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
             Operation::Write => self.ensure_write_supported(),
         }
+    }
+
+    pub(crate) fn validate_interval_type_support(&self) -> DeltaResult<()> {
+        require!(
+            cfg!(feature = "interval-type-in-dev")
+                || !schema_contains_interval_type(&self.logical_schema()),
+            Error::unsupported(
+                "Using interval columns requires the 'interval-type-in-dev' cargo feature"
+            )
+        );
+        Ok(())
     }
 
     /// Internal helper for read operations (Scan, Cdf)
@@ -725,10 +738,6 @@ impl TableConfiguration {
                 "Column invariants are not yet supported",
             ));
         }
-
-        // Validate interval support only on write paths. Reads of legacy featureless interval
-        // tables must keep working, so this is not validated at construction time.
-        validate_interval_type_feature_support_on_write(self)?;
 
         Ok(())
     }
@@ -920,8 +929,9 @@ mod test {
         ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
     };
     use crate::utils::test_utils::{
-        assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
-        test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
+        assert_result_error_with_message, make_test_tc, test_schema_flat,
+        test_schema_flat_with_column_mapping, test_schema_nested,
+        test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,
         test_schema_with_map_and_column_mapping,
     };
@@ -1723,16 +1733,42 @@ mod test {
         );
     }
 
-    // With the gate on, intervalType-preview tables are fully supported: readable via Scan and
-    // CDF, and writable. Gated because `INTERVAL_TYPE_PREVIEW_INFO` is `NotSupported` without the
-    // flag.
-    #[cfg(feature = "interval-type-in-dev")]
+    #[rstest]
+    fn test_interval_type_support_gate(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+        #[values(false, true)] nested: bool,
+        #[values(Operation::Scan, Operation::Cdf, Operation::Write)] operation: Operation,
+    ) {
+        let interval_field = if nested {
+            StructField::nullable(
+                "nested",
+                StructType::new_unchecked([StructField::nullable("inner_iv", interval)]),
+            )
+        } else {
+            StructField::nullable("iv", interval)
+        };
+        let schema = StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            interval_field,
+        ]);
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+        let config = make_test_tc(schema, protocol, []).unwrap();
+
+        let result = config.ensure_operation_supported(operation);
+        if cfg!(feature = "interval-type-in-dev") {
+            result.expect("interval operations must be allowed when support is enabled");
+        } else {
+            assert_result_error_with_message(result, "interval-type-in-dev");
+        }
+    }
+
     #[test]
-    fn test_ensure_operation_supported_interval_type_all_operations() {
-        let config = create_mock_table_config(&[], &[TableFeature::IntervalTypePreview]);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
-        assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+    fn test_interval_type_support_gate_ignores_non_interval_schema() {
+        let config = create_mock_table_config(&[], &[]);
+        config
+            .validate_interval_type_support()
+            .expect("non-interval schemas must not require interval support");
     }
 
     #[test]

@@ -78,12 +78,8 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
-- `interval-type-in-dev` -- ANSI interval type support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `intervalType-preview` reader-writer feature. CREATE TABLE
-  auto-enables the table feature when the schema contains an interval column. With the cargo
-  feature off, creating or writing any table with interval columns is blocked, as are reads and
-  writes of tables listing `intervalType-preview`. Reads of legacy featureless interval tables
-  (which never declare the table feature) remain supported.
+- `interval-type-in-dev` -- ANSI interval type support (experimental, in development). With the
+  cargo feature off, creating, reading, or writing tables with interval columns is blocked.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -267,9 +263,9 @@ is the source of truth. Key concepts:
   `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
   `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
-  `columnMapping`, `deletionVectors`, `intervalType-preview`, `timestampNtz`, `typeWidening`,
-  `v2Checkpoint`, `vacuumProtocolCheck`, `variantShredding`, `variantShredding-preview`,
-  `variantType`, `variantType-preview`
+  `columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
+  `vacuumProtocolCheck`, `variantShredding`, `variantShredding-preview`, `variantType`,
+  `variantType-preview`
 
 Keep this list updated when new protocol features are added to kernel.
 

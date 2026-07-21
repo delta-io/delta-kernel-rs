@@ -1594,6 +1594,27 @@ pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
     NonNullFieldChecker.transform_struct(schema).is_err()
 }
 
+/// Returns whether `schema` contains an ANSI interval type at any nesting level.
+pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
+    fn data_type_contains_interval_type(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Primitive(primitive) => primitive.is_interval(),
+            DataType::Array(array) => data_type_contains_interval_type(array.element_type()),
+            DataType::Struct(inner) | DataType::Variant(inner) => {
+                schema_contains_interval_type(inner)
+            }
+            DataType::Map(map) => {
+                data_type_contains_interval_type(map.key_type())
+                    || data_type_contains_interval_type(map.value_type())
+            }
+        }
+    }
+
+    schema
+        .fields()
+        .any(|field| data_type_contains_interval_type(field.data_type()))
+}
+
 /// Normalizes column name field names to match the casing in the schema.
 ///
 /// Walks each field name through the schema's struct hierarchy, replacing user-provided
@@ -3341,6 +3362,36 @@ mod tests {
     #[case::variant_skipped(variant_only_schema(), false)]
     fn test_schema_contains_non_null_fields(#[case] schema: StructType, #[case] expected: bool) {
         assert_eq!(schema_contains_non_null_fields(&schema), expected);
+    }
+
+    #[rstest]
+    fn test_schema_contains_interval_type(
+        #[values(PrimitiveType::IntervalYearMonth, PrimitiveType::IntervalDayTime)]
+        interval: PrimitiveType,
+        #[values(false, true)] nested: bool,
+    ) {
+        let interval = DataType::Primitive(interval);
+        let interval_field = if nested {
+            StructField::nullable(
+                "nested",
+                StructType::new_unchecked([StructField::nullable("inner_iv", interval)]),
+            )
+        } else {
+            StructField::nullable("iv", interval)
+        };
+        let schema = StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            interval_field,
+        ]);
+
+        assert!(schema_contains_interval_type(&schema));
+    }
+
+    #[test]
+    fn test_schema_without_interval_type() {
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+
+        assert!(!schema_contains_interval_type(&schema));
     }
 
     #[test]
