@@ -15,13 +15,13 @@ use crate::crc::Crc;
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::ColumnName;
 use crate::log_replay::ActionsBatch;
+use crate::metrics::ProtocolMetadataSource;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::{Operation, PlanBuilder};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
-use crate::metrics::ProtocolMetadataSource;
 use crate::schema::schema_ref;
 use crate::{DeltaResult, Engine, Error};
 
@@ -122,17 +122,16 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // The declarative P&M plan is not yet the default. It stays compiled and type-checked (see
-        // `read_pm_batches_via_plan`) but disabled behind an always-false cfg (`any()`) until a
-        // followup makes it the default; legacy replay runs for now. TODO(#2874-followup).
-        #[cfg(all(feature = "declarative-plans", any()))]
+        // With `declarative-plans`, replay P&M through the declarative plan, falling back to legacy
+        // replay on any plan failure while the plan path is experimental.
+        #[cfg(feature = "declarative-plans")]
         let actions_batches = self.read_pm_batches_via_plan(engine).or_else(|err| {
             info!("declarative P&M plan failed, using legacy replay: {err}");
             self.read_pm_batches(engine)
                 .map(|batches| Box::new(batches) as _)
         })?;
 
-        #[cfg(not(all(feature = "declarative-plans", any())))]
+        #[cfg(not(feature = "declarative-plans"))]
         let actions_batches = self.read_pm_batches(engine)?;
 
         let mut metadata_opt = None;
@@ -152,10 +151,7 @@ impl LogSegment {
         Ok((metadata_opt, protocol_opt))
     }
 
-    // Disabled on the snapshot-load path (see `replay_for_pm`); kept compiled and type-checked
-    // until a followup makes the declarative P&M plan the default. TODO(#2874-followup).
     #[cfg(feature = "declarative-plans")]
-    #[allow(dead_code)]
     fn read_pm_batches_via_plan(
         &self,
         engine: &dyn Engine,
