@@ -1,13 +1,30 @@
 //! Conversion from a kernel [`Expression`] to a DataFusion [`Expr`].
 //!
 //! One match arm per [`Expression`] variant, each recursing on its children. Leaf arms
-//! (`Literal`, `Column`) bottom out directly; compound arms (`Binary`, `Variadic`, `Struct`)
-//! rebuild the equivalent DataFusion node from converted children.
+//! (`Literal`, `Column`) bottom out directly; compound arms (`Binary`, `Variadic`) rebuild the
+//! equivalent DataFusion node from converted children.
 //!
 //! This conversion is **untyped**: it maps an expression to its natural DataFusion shape with no
-//! target output field. Arms that can only be lowered against a target schema -- casts, JSON
-//! parsing, map-to-struct reshaping, sparse struct patches -- return [`Error::unsupported`] until
-//! the typed `Project`-node compiler that supplies that context is wired up.
+//! target output field. It still takes the input schema, but only to fail fast: a column reference
+//! is validated against it (the path must resolve through nested structs) and then lowered to a
+//! `col(..)`/`get_field(..)` chain. DataFusion would resolve that chain against the upstream schema
+//! during plan analysis regardless; validating here turns a dangling reference into a clear error
+//! at conversion time instead of a late, less-legible analysis failure.
+//!
+//! The variants group by why they are or are not lowerable in this untyped conversion:
+//!
+//! 1. **Natural type** (`Literal`, `Column`, `Binary`, `Variadic`): self-describing; lowered here.
+//! 2. **Predicate** (`Predicate`): a boolean-valued predicate used as a value. Deferred to the
+//!    predicate-conversion branch, which supplies the `Predicate -> Expr` converter.
+//! 3. **Typed** (`Struct`, `MapToStruct`, `StructPatch`): lowerable only against a target output
+//!    schema -- for field *names* (`Struct`) and/or field *types* (`MapToStruct`, `StructPatch`) --
+//!    which this untyped conversion does not carry. Deferred to the typed `Project`-node compiler.
+//! 4. **ParseJson**: carries its own `output_schema`, so it is not blocked on a target schema. It
+//!    is unsupported because DataFusion core has no stock JSON-string -> struct parser; lowering it
+//!    needs a custom UDF that mirrors kernel's `parse_json` decoder, which is not yet wired up.
+//! 5. **Terminal** (`Unary(ToJson)`, `Opaque`, `Unknown`): no faithful untyped lowering. `ToJson`
+//!    needs a UDF kernel has not wired; `Opaque` is engine-defined and understood only through its
+//!    trait methods; `Unknown` has no semantics to lower (kernel forbids interpreting it).
 //!
 //! An `impl TryFrom<&Expression> for Expr` is impossible here: both types are foreign to this
 //! crate, so the orphan rule forbids it. Hence a free function.
@@ -17,57 +34,77 @@ use datafusion::functions::core::expr_fn::{coalesce, get_field};
 use datafusion::functions_nested::expr_fn::make_array;
 use datafusion::logical_expr::{binary_expr, lit, Expr, Operator};
 use delta_kernel::expressions::{
-    BinaryExpression, BinaryExpressionOp, ColumnName, Expression, VariadicExpression,
-    VariadicExpressionOp,
+    BinaryExpression, BinaryExpressionOp, ColumnName, Expression, UnaryExpressionOp,
+    VariadicExpression, VariadicExpressionOp,
 };
+use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
 use crate::scalar::kernel_to_df_scalar;
 
-/// Converts a kernel [`Expression`] into the equivalent DataFusion [`Expr`].
+/// Converts a kernel [`Expression`] into the equivalent DataFusion [`Expr`], validating column
+/// references against `input_schema` (the name-resolution scope: a column path must resolve
+/// through the nested structs of this schema).
 ///
 /// # Errors
 ///
-/// Returns [`Error::unsupported`] for expressions that have no untyped DataFusion equivalent:
+/// Returns an error for a column reference that does not resolve against `input_schema`, and
+/// [`Error::unsupported`] for expressions that have no untyped DataFusion equivalent:
 /// engine-defined (`Opaque`) or opaque-to-both (`Unknown`) expressions, the `ToJson` unary op,
-/// the embedded-predicate arm (until the predicate converter lands), and the schema-dependent
-/// arms (`Struct`, `ParseJson`, `MapToStruct`, `StructPatch`). Also propagates any error from
-/// converting a child scalar (e.g. an interval literal, which has no Arrow representation) or an
-/// empty column reference.
-pub fn to_datafusion_expr(expr: &Expression) -> DeltaResult<Expr> {
+/// the embedded-predicate arm (until the predicate converter lands), the schema-dependent arms
+/// (`Struct`, `MapToStruct`, `StructPatch`), and `ParseJson` (which lacks a stock DataFusion
+/// lowering, not a schema). Also propagates any error from converting a child scalar (e.g. an
+/// interval literal, which has no Arrow representation).
+pub fn to_datafusion_expr(expr: &Expression, input_schema: &StructType) -> DeltaResult<Expr> {
     match expr {
+        // === 1. Natural type: self-describing, lowered here ===
         Expression::Literal(scalar) => Ok(lit(kernel_to_df_scalar(scalar)?)),
-        Expression::Column(name) => column_to_expr(name),
-        Expression::Binary(binary) => binary_to_expr(binary),
-        Expression::Variadic(variadic) => variadic_to_expr(variadic),
-        // A boolean-valued predicate used where a value is expected. Wired up by the
-        // predicate-conversion branch, which supplies the `Predicate -> Expr` converter.
+        Expression::Column(name) => column_to_expr(name, input_schema),
+        Expression::Binary(binary) => binary_to_expr(binary, input_schema),
+        Expression::Variadic(variadic) => variadic_to_expr(variadic, input_schema),
+
+        // === 2. Predicate: a boolean-valued predicate used where a value is expected ===
+        // Wired up by the predicate-conversion branch, which supplies the `Predicate -> Expr`
+        // converter.
         Expression::Predicate(_) => Err(Error::unsupported(
             "converting an embedded Predicate expression is not yet supported",
         )),
-        Expression::Unary(_) => Err(Error::unsupported(
-            "converting the ToJson expression is not yet supported",
+
+        // === 3. Typed: lowerable only against a target output schema ===
+        // `Struct` needs the schema for its field *names*; `MapToStruct` and `StructPatch` need it
+        // for the field *types* that drive their reshape. This untyped conversion carries none, so
+        // all three defer to the typed `Project`-node compiler.
+        Expression::Struct(_, _)
+        | Expression::MapToStruct(_)
+        | Expression::StructPatch(_) => Err(Error::unsupported(
+            "converting schema-dependent expressions (Struct, MapToStruct, StructPatch) requires \
+             a typed projection context",
         )),
-        // Engine-defined and opaque-to-both expressions cannot round-trip through a DataFusion
-        // logical plan: kernel only understands them through their trait methods.
+
+        // === 4. ParseJson: self-typed, but no stock DataFusion lowering ===
+        // Unlike the typed arms above, `ParseJson` carries its own output schema, so it needs no
+        // external context. It is unsupported only because DataFusion core has no stock expression
+        // for typed JSON parsing -- lowering it requires a custom scalar UDF mirroring kernel's
+        // `parse_json` decoder, which is not yet wired up.
+        Expression::ParseJson(_) => Err(Error::unsupported(
+            "converting a ParseJson expression requires a custom JSON-parsing UDF, not yet wired up",
+        )),
+
+        // === 5. Terminal: no faithful untyped lowering ===
+        Expression::Unary(u) => match u.op {
+            // `ToJson` needs a UDF kernel has not wired up.
+            UnaryExpressionOp::ToJson => Err(Error::unsupported(
+                "converting the ToJson expression is not yet supported",
+            )),
+        },
+        // Engine-defined; kernel understands it only through its trait methods.
         Expression::Opaque(_) => Err(Error::unsupported(
             "cannot convert an engine-defined Opaque expression",
         )),
+        // No semantics to lower: kernel forbids interpreting an Unknown expression.
         Expression::Unknown(name) => Err(Error::unsupported(format!(
             "cannot convert Unknown expression {name:?}"
         ))),
-        // These lower correctly only against a target output schema, which the untyped conversion
-        // does not carry, so they are deferred to the typed `Project`-node compiler. `Struct` is
-        // deferred too: its field values are self-contained, but its field *names* live in the
-        // target schema, and a struct built here would only ever be re-labelled by that compiler
-        // -- so lowering it in isolation produces a value nothing executes as-is.
-        Expression::Struct(_, _)
-        | Expression::ParseJson(_)
-        | Expression::MapToStruct(_)
-        | Expression::StructPatch(_) => Err(Error::unsupported(
-            "converting schema-dependent expressions (Struct, ParseJson, MapToStruct, \
-             StructPatch) requires a typed projection context",
-        )),
     }
 }
 
@@ -75,14 +112,21 @@ pub fn to_datafusion_expr(expr: &Expression) -> DeltaResult<Expr> {
 /// becomes `get_field(get_field(col("a"), "b"), "c")`. A single-segment path is just the root
 /// column.
 ///
+/// The path is first resolved against `input_schema` so a dangling reference fails here rather than
+/// later during DataFusion plan analysis. The resolved field is not otherwise used: the emitted
+/// `col(..)`/`get_field(..)` chain is nameless and DataFusion re-resolves it against the upstream
+/// schema.
+///
 /// # Errors
 ///
-/// Returns [`Error::unsupported`] for an empty column path, which has no column to root on.
-fn column_to_expr(name: &ColumnName) -> DeltaResult<Expr> {
+/// Returns an error for an empty path, a segment that names no field, or an intermediate segment
+/// whose field is not a struct (all surfaced by [`StructType::field_at`]).
+fn column_to_expr(name: &ColumnName, input_schema: &StructType) -> DeltaResult<Expr> {
+    input_schema.field_at(name)?;
     let mut path = name.iter();
     let root = path
         .next()
-        .ok_or_else(|| Error::unsupported("cannot convert an empty column reference"))?;
+        .ok_or_else(|| Error::generic("cannot convert an empty column reference"))?;
     let root = Expr::Column(Column::new_unqualified(root));
     Ok(path.fold(root, get_field))
 }
@@ -90,25 +134,25 @@ fn column_to_expr(name: &ColumnName) -> DeltaResult<Expr> {
 /// Lowers an arithmetic binary expression (`Plus`/`Minus`/`Multiply`/`Divide`) to an
 /// `Expr::BinaryExpr`. Comparison and `IN` operators are modeled as predicates, not expressions,
 /// so they never reach this arm.
-fn binary_to_expr(binary: &BinaryExpression) -> DeltaResult<Expr> {
+fn binary_to_expr(binary: &BinaryExpression, input_schema: &StructType) -> DeltaResult<Expr> {
     let op = match binary.op {
         BinaryExpressionOp::Plus => Operator::Plus,
         BinaryExpressionOp::Minus => Operator::Minus,
         BinaryExpressionOp::Multiply => Operator::Multiply,
         BinaryExpressionOp::Divide => Operator::Divide,
     };
-    let left = to_datafusion_expr(&binary.left)?;
-    let right = to_datafusion_expr(&binary.right)?;
+    let left = to_datafusion_expr(&binary.left, input_schema)?;
+    let right = to_datafusion_expr(&binary.right, input_schema)?;
     Ok(binary_expr(left, op, right))
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`,
 /// each over the converted arguments.
-fn variadic_to_expr(variadic: &VariadicExpression) -> DeltaResult<Expr> {
+fn variadic_to_expr(variadic: &VariadicExpression, input_schema: &StructType) -> DeltaResult<Expr> {
     let args = variadic
         .exprs
         .iter()
-        .map(to_datafusion_expr)
+        .map(|e| to_datafusion_expr(e, input_schema))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(match variadic.op {
         VariadicExpressionOp::Coalesce => coalesce(args),
@@ -119,14 +163,34 @@ fn variadic_to_expr(variadic: &VariadicExpression) -> DeltaResult<Expr> {
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::{column_expr, Expression as Expr_};
-    use delta_kernel::schema::DataType;
+    use delta_kernel::schema::{DataType, StructField, StructType};
     use rstest::rstest;
 
     use super::*;
 
-    /// Lowers an expression and renders it as a DataFusion `Display` string for comparison.
+    /// Name-resolution scope for these tests: `a: { b: { c: long } }`, plus top-level `b` and `x`.
+    fn test_schema() -> StructType {
+        StructType::try_new([
+            StructField::nullable(
+                "a",
+                StructType::try_new([StructField::nullable(
+                    "b",
+                    StructType::try_new([StructField::nullable("c", DataType::LONG)]).unwrap(),
+                )])
+                .unwrap(),
+            ),
+            StructField::nullable("b", DataType::LONG),
+            StructField::nullable("x", DataType::LONG),
+        ])
+        .unwrap()
+    }
+
+    /// Lowers an expression against [`test_schema`] and renders it as a DataFusion `Display`
+    /// string.
     fn lower(expr: Expr_) -> String {
-        to_datafusion_expr(&expr).unwrap().to_string()
+        to_datafusion_expr(&expr, &test_schema())
+            .unwrap()
+            .to_string()
     }
 
     #[rstest]
@@ -177,23 +241,14 @@ mod tests {
         assert_eq!(lower(kernel), "make_array(Int64(1), Int64(2))");
     }
 
-    #[test]
-    fn struct_is_deferred_to_typed_projection() {
-        // A struct's field values are convertible, but its field names come from the target
-        // schema this untyped conversion does not carry, so `Struct` is deferred to the typed
-        // `Project` compiler rather than lowered to an anonymously-named `struct(..)`.
-        let kernel = Expr_::struct_from([column_expr!("a"), Expr_::literal(1i64)]);
-        to_datafusion_expr(&kernel).unwrap_err();
-    }
-
-    #[test]
-    fn embedded_predicate_is_unsupported() {
-        let kernel = Expr_::Predicate(Box::new(column_expr!("a").is_null()));
-        to_datafusion_expr(&kernel).unwrap_err();
-    }
-
-    #[test]
-    fn unknown_expression_is_unsupported() {
-        to_datafusion_expr(&Expr_::Unknown("mystery".into())).unwrap_err();
+    /// A column reference that does not resolve against the input schema fails at conversion time,
+    /// not later during DataFusion analysis. Covers each `field_at` failure mode.
+    #[rstest]
+    #[case::empty(Expr_::Column(ColumnName::new(Vec::<String>::new())))]
+    #[case::unknown_root(Expr_::column(["nope"]))]
+    #[case::unknown_nested(Expr_::column(["a", "b", "missing"]))]
+    #[case::descend_into_non_struct(Expr_::column(["x", "y"]))]
+    fn unresolved_column_is_an_error(#[case] kernel: Expr_) {
+        to_datafusion_expr(&kernel, &test_schema()).unwrap_err();
     }
 }
