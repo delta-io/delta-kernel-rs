@@ -386,16 +386,14 @@ pub fn evaluate_expression(
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
             let target = ArrowDataType::try_from_kernel(&c.target)?;
-            // Safe cast semantics: an unrepresentable value becomes NULL rather than erroring,
-            // matching SQL `CAST` / lenient partition-value parsing. Arrow's `cast` default nulls
-            // per-value failures, but errors outright on a type pair it has no cast for; degrade
-            // that to an all-NULL column so an unsupported cast keeps (rather than fails) the scan.
-            let casted = if can_cast_types(input.data_type(), &target) {
+            // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
+            // that to an all-NULL column so an unsupported cast keeps the file.
+            let output = if can_cast_types(input.data_type(), &target) {
                 cast(&input, &target)?
             } else {
                 new_null_array(&target, input.len())
             };
-            validate_array_type(casted, result_type)
+            validate_array_type(output, result_type)
         }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
@@ -3205,8 +3203,7 @@ mod tests {
 
     #[test]
     fn test_cast_unsupported_type_pair_yields_null() {
-        // Arrow has no cast from Boolean to Date. Rather than erroring (which would abort the
-        // scan), the cast degrades to an all-NULL column so the file is kept.
+        // Arrow has no cast from Boolean to Date; the cast degrades to an all-NULL column.
         let schema = ArrowSchema::new(vec![ArrowField::new("flag", ArrowDataType::Boolean, true)]);
         let flags = BooleanArray::from(vec![Some(true), Some(false)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flags)]).unwrap();

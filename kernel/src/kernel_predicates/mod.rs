@@ -128,9 +128,9 @@ pub trait KernelPredicateEvaluator {
 
     /// A (possibly inverted) comparison between `CAST(<col> AS target)` and a scalar, e.g.
     /// `CAST(<col> AS DATE) < <value>`. The scalar is always on the right (the caller commutes the
-    /// operator for `<value> op CAST(<col>)`). Unsupported by default so evaluators that cannot
-    /// reason about a cast conservatively keep the file; a per-row evaluator that resolves the
-    /// column to its exact value can override it.
+    /// operator for `<value> op CAST(<col>)`). Unsupported by default so a cast never drives file
+    /// pruning. A per-row evaluator that resolves the column to its exact value can override it; a
+    /// range-based evaluator can only do so soundly when the cast preserves order over the range.
     fn eval_pred_cast(
         &self,
         _op: BinaryPredicateOp,
@@ -309,19 +309,18 @@ pub trait KernelPredicateEvaluator {
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
             },
-            // `CAST(<col> AS target) op <value>` for a bare column child, e.g.
-            // `CAST(<col> AS DATE) < <value>`.
             (Cast(c), Literal(val)) => match c.expr.as_ref() {
                 Column(col) => self.eval_pred_cast(op, col, &c.target, val, inverted),
                 _ => None,
             },
             (Literal(val), Cast(c)) => match c.expr.as_ref() {
-                // Commute so the cast column is on the left, mirroring the `Literal op Column` arm.
+                // Commute so the cast column is on the left.
                 Column(col) => match op {
                     LessThan => self.eval_pred_cast(GreaterThan, col, &c.target, val, inverted),
                     GreaterThan => self.eval_pred_cast(LessThan, col, &c.target, val, inverted),
                     Equal => self.eval_pred_cast(Equal, col, &c.target, val, inverted),
-                    Distinct | In => None,
+                    Distinct => self.eval_pred_cast(Distinct, col, &c.target, val, inverted),
+                    In => None, // arg order is semantically important
                 },
                 _ => None,
             },
@@ -692,15 +691,13 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
 
 /// Casts a scalar following SQL `CAST` semantics: a string source is parsed into a primitive target
 /// via [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
-/// already of the target type passes through. An unparseable string yields `Scalar::Null` (never
-/// TRUE against a comparison).
+/// already of the target type passes through. An unparseable string yields `Scalar::Null`.
 ///
-/// `parse_scalar` accepts a strict subset of the formats the arrow evaluation path accepts (e.g.
-/// arrow parses the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is
-/// only ever more conservative than arrow: a form it rejects becomes NULL, never a differing
-/// non-null value. It is deliberately narrower than a full cast -- any source/target combination
-/// other than string-to-primitive or an identity pass-through yields `None`, and it does not
-/// attempt numeric/temporal casts (e.g. `Long -> Int`) that the arrow path can perform.
+/// Only string-to-primitive and identity conversions are handled; any other source/target
+/// combination yields `None`, including numeric/temporal casts like `Long -> Int` that the arrow
+/// path can perform. The accepted string formats are a strict subset of arrow's (e.g. arrow parses
+/// the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is only ever
+/// more conservative than arrow: a form it rejects becomes NULL, never a differing non-null value.
 fn cast_scalar(value: Scalar, target: &DataType) -> Option<Scalar> {
     if value.data_type() == *target {
         return Some(value);

@@ -280,12 +280,8 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
-/// An expression that casts a child expression to a target type, following SQL `CAST` semantics.
-///
-/// A value that cannot be represented in the target type evaluates to NULL rather than erroring,
-/// matching how partition values are parsed to their declared type. The arrow evaluation path
-/// casts to any arrow-representable target, yielding an all-NULL column for a type pair arrow
-/// cannot cast.
+/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
+/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
