@@ -17,9 +17,9 @@ use crate::{DeltaResult, Error};
 /// Lower a parsed [`Comparison`] into a kernel [`Predicate`], resolving each operand against
 /// `schema`.
 ///
-/// Kernel can only lower a comparison it can evaluate to the *same* boolean Spark would; anything
-/// else is rejected so the caller treats the constraint as not-kernel-parsable
-/// (connector-enforced). The resolved operands must therefore satisfy all of:
+/// Kernel only lowers a comparison it can evaluate to the *same* boolean the writer would;
+/// anything else returns `Err` (what the caller does with an un-lowerable constraint is the
+/// caller's contract, not this function's). The resolved operands must therefore satisfy all of:
 /// - at least one operand is a column, so a literal can be typed from it;
 /// - every column operand is primitive-typed (struct/array/map have no scalar comparison);
 /// - the two operands share a single comparison type, because the engine compares only matching
@@ -131,30 +131,30 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
 /// FLOAT-column cases where kernel would silently disagree with Spark.
 ///
 /// Kernel types a literal from the compared column, so against a FLOAT column it narrows the
-/// literal to f32 and compares at f32. Spark instead types the literal on its own and coerces to a
-/// common type; whether the FLOAT column stays f32 or is widened to f64 depends on the literal's
-/// Spark type:
-/// - INT/LONG literal (an integer in i64 range): the common type is FLOAT, so Spark casts the
-///   *literal* to f32 and compares at f32 -- identical compare *width* to kernel, so safe to lower.
-///   (The signed-zero divergence in [`lower`]'s doc is orthogonal: it is about the column's stored
-///   value, not the literal's type, and applies to any float comparison regardless of this gate.)
-/// - DECIMAL/DOUBLE literal (has a `.`/exponent, or an integer beyond i64): the common type is
-///   DOUBLE, so Spark widens the *column* to f64 and compares at f64. For a literal not exactly
-///   representable in f32 (e.g. `0.1`) this reaches the opposite result from kernel's f32 compare,
-///   silently. Kernel has no cast expression and the engine cannot compare f32 to f64, so it cannot
-///   reproduce Spark's widening; these are left to the connector.
+/// literal to f32 and compares at f32. Spark (ANSI, the DBR / Spark-4 default) instead widens the
+/// *column* to f64 for any numeric literal and compares at f64. The two agree only when the literal
+/// is exactly representable in f32: an integer qualifies iff it round-trips through f32 unchanged
+/// (`v as f32 as i64 == v`), which fails past 2^24 even well within i64 range (e.g. `16777217`
+/// rounds to `16777216.0`). Any literal with a `.`/exponent, or an out-of-i64 integer, is likewise
+/// not gated in and is rejected -- left to the connector.
 ///
-/// `NULL` is allowed (a null comparison involves no f32/f64 rounding). The i64 gate is exactly
-/// Spark's INT/LONG-vs-DECIMAL literal boundary, and is intentionally conservative: an f32-exact
-/// exponent literal like `1e3` would in fact agree, but is still rejected rather than
-/// special-cased. Only FLOAT is affected; a DOUBLE column already compares at f64, matching Spark.
+/// Kernel has no cast expression and cannot compare f32 to f64, so it cannot reproduce Spark's
+/// widening. `NULL` is allowed (a null comparison involves no f32/f64 rounding). Only FLOAT is
+/// affected; a DOUBLE column already compares at f64, matching Spark. (The signed-zero divergence
+/// in [`lower`]'s doc is orthogonal: it is about the column's stored value, and applies to any
+/// float comparison regardless of this gate.)
+// TODO(#2896): once kernel has a cast expression, lower `cast(col AS DOUBLE) <op> lit` and drop
+// this gate, matching Spark's f64 compare for every literal.
 fn type_literal_from_column(raw: &str, column_type: &DataType) -> DeltaResult<Expression> {
     let is_null = raw.eq_ignore_ascii_case("null");
-    let is_int_or_long_literal = raw.parse::<i64>().is_ok();
-    if column_type == &DataType::FLOAT && !is_null && !is_int_or_long_literal {
+    // A FLOAT column narrows the literal to f32, but Spark widens the column to f64, so the two
+    // compares agree only when the literal is f32-exact. For an integer that means round-tripping
+    // through f32 unchanged (which also rejects out-of-i64 integers, since those fail to parse).
+    let is_f32_exact_int = raw.parse::<i64>().is_ok_and(|v| v as f32 as i64 == v);
+    if column_type == &DataType::FLOAT && !is_null && !is_f32_exact_int {
         return Err(Error::generic(format!(
-            "CHECK constraint comparing a FLOAT column against the literal '{raw}' is not supported: \
-             Spark widens the column to DOUBLE (compares at f64) while kernel compares at f32"
+            "CHECK constraint comparing a FLOAT column against the literal '{raw}' is not \
+             supported: kernel compares at f32 while Spark (ANSI) widens the column to f64"
         )));
     }
     parse_sql(raw, column_type)
@@ -178,34 +178,19 @@ enum ResolvedOperand {
 fn resolve_operand(operand: &Operand, schema: &StructType) -> DeltaResult<ResolvedOperand> {
     match operand {
         Operand::Literal(raw) => Ok(ResolvedOperand::Literal(raw.clone())),
-        Operand::Column(column) => {
-            let (canonical, data_type) = resolve_column(column, schema)?;
-            Ok(ResolvedOperand::Column {
-                canonical,
-                data_type,
-            })
-        }
+        Operand::Column(column) => resolve_column(column, schema),
     }
 }
 
-/// Resolve a (case-insensitive) column reference against `schema`, returning the *canonical* path
-/// (the schema's stored field names) and the leaf field's type. The canonical names are what the
-/// engine sees in the logical batch, so the emitted column reference must use them rather than the
-/// as-written casing.
-fn resolve_column(
-    column: &ColumnName,
-    schema: &StructType,
-) -> DeltaResult<(Vec<String>, DataType)> {
-    let fields = schema.fields_of_path_by(column, |parent, name| {
-        parent
-            .fields()
-            .find(|f| f.name().eq_ignore_ascii_case(name))
-    })?;
-    let canonical = Vec::from_iter(fields.iter().map(|f| f.name().to_string());
-    let leaf = fields
-        .last()
-        .ok_or_else(|| Error::generic("CHECK constraint references an empty column path"))?;
-    Ok((canonical, leaf.data_type().clone()))
+/// Resolve a (case-insensitive) column reference against `schema` into a [`ResolvedOperand`],
+/// carrying the *canonical* (schema-cased) path and the leaf field's type. See
+/// [`StructType::resolve_path_ci`] for why the canonical casing matters.
+fn resolve_column(column: &ColumnName, schema: &StructType) -> DeltaResult<ResolvedOperand> {
+    let (canonical, leaf) = schema.resolve_path_ci(column)?;
+    Ok(ResolvedOperand::Column {
+        canonical,
+        data_type: leaf.data_type().clone(),
+    })
 }
 
 #[cfg(test)]
@@ -238,6 +223,7 @@ mod tests {
             StructField::nullable("ts", DataType::TIMESTAMP),
             StructField::nullable("tsn", DataType::TIMESTAMP_NTZ),
             StructField::nullable("cost", DataType::decimal(10, 2).unwrap()),
+            StructField::nullable("cost2", DataType::decimal(12, 4).unwrap()),
             StructField::nullable(
                 "nested",
                 DataType::try_struct_type([StructField::nullable("inner", DataType::LONG)])
@@ -363,8 +349,9 @@ mod tests {
     #[case::column_vs_column("amount2 < amount", Predicate::lt(col("amount2"), col("amount")))]
     #[case::float_column_vs_column("weight < height", Predicate::lt(col("weight"), col("height")))]
     #[case::literal_on_left("0 < amount", Predicate::lt(Expression::literal(0i64), col("amount")))]
-    // An INT/LONG-range literal against a FLOAT column is safe: Spark casts the literal to f32 and
-    // compares at f32, exactly as kernel does (only fractional/DOUBLE/`>i64` literals diverge).
+    // An f32-exact integer literal against a FLOAT column lowers: kernel's f32 compare matches
+    // Spark's f64 compare because the value survives the narrowing. Non-f32-exact ints diverge and
+    // are rejected below.
     #[case::float_column_vs_int_literal(
         "weight > 0",
         Predicate::gt(col("weight"), Expression::literal(Scalar::Float(0.0)))
@@ -441,9 +428,13 @@ mod tests {
     #[case::two_nulls("NULL = NULL")]
     #[case::unknown_column("nope > 0")]
     // Cross-type column-vs-column comparisons are rejected: the engine compares only matching types
-    // (no coercion), while Spark coerces to a common type. Same-type pairs lower (see above).
+    // (no coercion), while Spark coerces to a common type. Same-type pairs lower (see above). The
+    // check is on the full `DataType`, so mismatched decimal precision/scale and TIMESTAMP vs
+    // TIMESTAMP_NTZ are rejected too.
     #[case::cross_type_int_long_columns("price < amount")]
     #[case::cross_type_float_double_columns("weight < ratio")]
+    #[case::cross_type_decimal_scale_columns("cost < cost2")]
+    #[case::cross_type_timestamp_ntz_columns("ts < tsn")]
     // Non-primitive (struct/array/map) columns have no scalar comparison and are rejected on either
     // side of the operator -- symmetric with the literal path, which rejects non-primitive targets.
     #[case::struct_column_vs_struct_column("nested = nested")]
@@ -459,15 +450,18 @@ mod tests {
     // read `0` as `0.00`. Left to the connector (see the `sql` module doc). `cost <= 10.00` lowers.
     #[case::decimal_integer_literal_scale_mismatch("cost >= 0")]
     #[case::decimal_wrong_scale_literal("cost >= 0.5")]
-    // A FLOAT column against a DECIMAL/DOUBLE literal (a `.`/exponent, or an integer beyond i64) is
-    // rejected: Spark widens the column to f64 while kernel compares at f32, disagreeing silently
-    // for an f32-inexact literal. The exponent and `>i64` cases are rejected conservatively even
-    // though they would happen to agree; INT/LONG-range literals are allowed (see above).
+    // A FLOAT column against any literal not exactly representable in f32 is rejected: kernel
+    // compares at f32 while Spark widens the column to f64, disagreeing silently. This covers
+    // fractional/exponent literals, out-of-i64 integers, AND in-i64 integers past 2^24 that round
+    // when narrowed to f32 (`16777217` -> `16777216.0`) -- the fail-open the old i64-only gate let
+    // through. `weight = 0.5` (f32-exact) is still rejected: conservatively, only integers are
+    // gated in, since a fractional literal's raw text may not round-trip its intended value.
     #[case::float_column_inexact_decimal_literal("weight = 0.1")]
     #[case::float_column_decimal_literal_on_left("0.1 < weight")]
     #[case::float_column_f32_exact_decimal_literal("weight = 0.5")]
     #[case::float_column_exponent_literal("weight = 1e3")]
     #[case::float_column_integer_beyond_i64("weight > 99999999999999999999")]
+    #[case::float_column_non_f32_exact_int("weight = 16777217")]
     // Malformed input.
     #[case::unterminated_string("name = 'oops")]
     #[case::bang_without_eq("amount ! 0")]

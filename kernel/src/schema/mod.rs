@@ -1069,24 +1069,35 @@ impl StructType {
         Ok(result)
     }
 
-    /// Like [`fields_of_path`](Self::fields_of_path), but with a caller-provided field name
-    /// resolver (e.g. a case-insensitive one) -- the collecting sibling of
-    /// [`visit_fields_of_path_by`](Self::visit_fields_of_path_by).
+    /// Resolves a column path case-insensitively (Delta's field-matching rule), returning the
+    /// schema's *canonical* (stored-cased) path segments alongside the leaf [`StructField`]. The
+    /// canonical names -- not the caller's as-written casing -- are what the engine sees in the
+    /// logical batch, so an emitted column reference must use them.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
     /// a struct type.
     #[cfg(feature = "check-constraints-in-dev")]
-    pub(crate) fn fields_of_path_by<'a, F>(
+    pub(crate) fn resolve_path_ci<'a>(
         &'a self,
         col: &ColumnName,
-        find_field: F,
-    ) -> DeltaResult<Vec<&'a StructField>>
-    where
-        F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
-    {
-        let mut result = Vec::with_capacity(col.path().len());
-        self.visit_fields_of_path_by(col, find_field, |f| result.push(f))?;
-        Ok(result)
+    ) -> DeltaResult<(Vec<String>, &'a StructField)> {
+        let mut canonical = Vec::with_capacity(col.path().len());
+        let mut leaf = None;
+        self.visit_fields_of_path_by(
+            col,
+            |parent, name| {
+                parent
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(name))
+            },
+            |f| {
+                canonical.push(f.name().to_string());
+                leaf = Some(f);
+            },
+        )?;
+        // visit_fields_of_path_by errors on an empty path, so it always visits >= 1 field.
+        let leaf = leaf.ok_or_else(|| Error::generic("empty column path"))?;
+        Ok((canonical, leaf))
     }
 
     /// Visits all fields along the given column path, using a caller-provided field name resolver.

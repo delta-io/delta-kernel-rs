@@ -12,9 +12,9 @@
 //! the supported SQL surface grows, options include moving parsing behind the
 //! [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 //!
-//! Kernel errors out rather than guess, in cases where kernel cannot match Spark semantics, so the constraint is
-//! left to the connector (fail-closed, never a silent wrong answer). One notable such gap: a
-//! decimal literal must match the column's scale exactly (`parse_scalar` does not pad), so
+//! Kernel errors out rather than guess, in cases where kernel cannot match Spark semantics, so the
+//! constraint is left to the connector (fail-closed, never a silent wrong answer). One notable such
+//! gap: a decimal literal must match the column's scale exactly (`parse_scalar` does not pad), so
 //! `amount >= 0` on a `DECIMAL(10,2)` column is rejected where Spark would read `0` as `0.00`.
 //! Padding the literal's scale to the column would recover these.
 
@@ -58,16 +58,17 @@ mod token;
 ///
 /// Returns an error for any input the kernel cannot lower. Two distinct conditions currently share
 /// the one error channel, and a caller may want to treat them differently:
-/// - *Not kernel-parsable* -- grammar or types the kernel cannot yet lower but Spark accepts
-///   (junctions, functions, arithmetic, `IN`/`BETWEEN`, type-incompatible literals, the
-///   FLOAT-vs-DECIMAL/DOUBLE-literal rejection). The constraint is well-formed; the connector can
-///   still enforce it.
+/// - *Not kernel-parsable* -- a well-formed constraint whose grammar or types the kernel cannot yet
+///   lower faithfully (junctions, functions, arithmetic, `IN`/`BETWEEN`, type-incompatible
+///   literals, an f32-inexact literal against a FLOAT column). Kernel simply declines to enforce
+///   it.
 /// - *Invalid constraint* -- a column reference absent from `schema`. A stored constraint is
 ///   validated against the schema at `ADD CONSTRAINT` time, so this signals corrupt metadata (or a
-///   wrong schema view) rather than a lowering gap; the connector cannot enforce it either.
+///   wrong schema view) rather than a lowering gap.
 ///
-/// Both surface as `Error::generic` today; the taxonomy is documented here so a future caller
-/// (#2896) can decide fall-back-to-connector vs hard-fail without string-matching messages.
+/// Both surface as `Error::generic` today; the taxonomy is noted here so a future caller (#2896)
+/// can distinguish them without string-matching messages. What a caller *does* with each -- fall
+/// back to its own enforcement, hard-fail, etc. -- is that caller's contract, not this function's.
 #[cfg(feature = "check-constraints-in-dev")]
 // TODO(#2896): remove once check-constraints discovery calls this; no in-crate caller until then.
 #[allow(dead_code)]
