@@ -144,7 +144,7 @@ pub mod utils;
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::{try_parse_uri, CollectInto};
+pub use utils::{try_parse_uri, CollectInto, FoldWithOption};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:

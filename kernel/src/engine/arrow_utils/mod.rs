@@ -30,6 +30,7 @@ use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
+use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::schema::types::SchemaDescriptor;
@@ -246,22 +247,17 @@ pub(crate) fn fixup_parquet_read(
 * (as an arrow StructArray) at that level and index. The `ReorderIndex::index` field of the element
 * is the position that the column should appear in the final output.
 
-* The algorithm has three parts, handled by `get_requested_indices`, `generate_mask` and
+* The algorithm has two parts, handled by [`parquet_read_plan`] and
 * `reorder_struct_array` respectively.
 
-* `get_requested_indices` generates indices to select, along with reordering information:
-* 1. Loop over each field in parquet_schema, keeping track of how many physical fields (i.e. leaf
-*    columns) we have seen so far
-* 2. If a requested field matches the physical field, push the index of the field onto the mask.
-
-* 3. Also push a ReorderIndex element that indicates where this item should be in the final output,
-*    and if it needs any transformation (i.e. casting, create null column)
-* 4. If a nested element (struct/map/list) is encountered, recurse into it, pushing indices onto
-*    the same vector, but producing a new reorder level, which is added to the parent with a `Nested`
-*    transform
-*
-* `generate_mask` is simple, and just calls `ProjectionMask::leaves` in the parquet crate with the
-* indices computed by `get_requested_indices`
+* [`parquet_read_plan`] matches the requested schema against the file's Arrow logical schema to
+* produce a [`ReorderIndex`] tree for post-decode fixup and an optional parquet [`ProjectionMask`]
+* when column pruning applies. Internally this walks the file schema to collect physical leaf ordinals
+* and reorder steps:
+* 1. Loop over each field in the file Arrow schema, tracking physical leaf columns seen so far
+* 2. If a requested field matches, push the leaf ordinal onto the mask index list
+* 3. Push a [`ReorderIndex`] for output position and any transform (cast, missing column, etc.)
+* 4. For nested struct/map/list fields, recurse into children
 *
 * `reorder_struct_array` handles reordering and data transforms:
 * 1. First check if we need to do any transformations (see doc comment for
@@ -308,8 +304,6 @@ pub(crate) fn fixup_parquet_read(
 *    x
 *  c
 *
-* The mask is [1, 3, 4, 5] because a, b, and y don't contribute to the column indices.
-*
 * The reorder tree is:
 * [
 *   // col a is at position 0 in the struct array, and should be moved to position 1
@@ -320,6 +314,10 @@ pub(crate) fn fixup_parquet_read(
 *   // col c is at position 2 in the struct array, and should stay there
 *   { index: 2 }
 * ]
+*
+* The mask is [1, 3, 4, 5] because a, b, and y don't contribute to the column indices.
+* [`parquet_read_plan`] returns `(reorder_tree, Some(mask))`; the mask is `None` when every file
+* leaf is selected.
 */
 
 /// Reordering is specified as a tree. Each level is a vec of `ReorderIndex`s. Each element's
@@ -785,43 +783,41 @@ fn match_parquet_fields<'k, 'p>(
         })
 }
 
-/// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This returns
-/// a tuple of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
-/// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
-/// parquet file, and simply contains an entry for each index we wish to select from the parquet
-/// file set to the index of the requested column in the parquet. `reorder_indices` is used for
-/// re-ordering. See the documentation for [`ReorderIndex`] to understand what each element in the
-/// returned array means.
+/// Produce parquet column projection and post-decode reordering for a file read.
+///
+/// Returns `(reorder_indices, mask)` where `mask` is `None` when every file leaf is selected.
+/// Uses [`ArrowReaderMetadata::schema`] for logical column matching and
+/// [`ArrowReaderMetadata::parquet_schema`] for the physical [`ProjectionMask`].
 #[internal_api]
-pub(crate) fn get_requested_indices(
+pub(crate) fn parquet_read_plan(
     requested_schema: &SchemaRef,
-    parquet_schema: &ArrowSchemaRef,
+    file_metadata: &ArrowReaderMetadata,
+) -> DeltaResult<(Vec<ReorderIndex>, Option<ProjectionMask>)> {
+    let (indices, reorder) = get_requested_indices(requested_schema, file_metadata.schema())?;
+    let mask = generate_mask(file_metadata.parquet_schema(), &indices);
+    Ok((reorder, mask))
+}
+
+fn get_requested_indices(
+    requested_schema: &SchemaRef,
+    file_arrow_schema: &ArrowSchemaRef,
 ) -> DeltaResult<(Vec<usize>, Vec<ReorderIndex>)> {
     let mut mask_indices = vec![];
     let (_, reorder_indexes) = get_indices(
         0,
         requested_schema,
-        parquet_schema.fields(),
+        file_arrow_schema.fields(),
         &mut mask_indices,
     )?;
     Ok((mask_indices, reorder_indexes))
 }
 
-/// Create a mask that will only select the specified indices from the parquet. `indices` can be
-/// computed from a [`Schema`] using [`get_requested_indices`]
-#[internal_api]
-pub(crate) fn generate_mask(
-    _requested_schema: &SchemaRef,
-    _parquet_schema: &ArrowSchemaRef,
-    parquet_physical_schema: &SchemaDescriptor,
+fn generate_mask(
+    file_parquet_schema: &SchemaDescriptor,
     indices: &[usize],
 ) -> Option<ProjectionMask> {
-    // TODO: Determine if it's worth checking if we're selecting everything and returning None in
-    // that case
-    Some(ProjectionMask::leaves(
-        parquet_physical_schema,
-        indices.to_owned(),
-    ))
+    (indices.len() != file_parquet_schema.num_columns())
+        .then(|| ProjectionMask::leaves(file_parquet_schema, indices.to_owned()))
 }
 
 /// Check if an ordering requires transforming the data in any way. This is true if the indices are
@@ -1499,8 +1495,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray, Int32Array,
-        Int32Builder, Int64Array, MapArray, MapBuilder, StringArray, StringBuilder, StructArray,
-        StructBuilder,
+        Int32Builder, Int64Array, LargeStringArray, MapArray, MapBuilder, NullArray, StringArray,
+        StringBuilder, StringViewArray, StructArray, StructBuilder,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -1508,6 +1504,11 @@ mod tests {
         Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use crate::parquet::basic::{Encoding, Type as PhysicalType};
+    use crate::parquet::file::metadata::ColumnChunkMetaData;
+    use crate::parquet::schema::types::{SchemaDescriptor, Type};
     use crate::schema::{
         schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
         MetadataValue, StructField, StructType,
@@ -1580,10 +1581,6 @@ mod tests {
 
     /// Helper function to create mock row group metadata for testing
     fn create_mock_row_group(num_rows: i64) -> RowGroupMetaData {
-        use crate::parquet::basic::{Encoding, Type as PhysicalType};
-        use crate::parquet::file::metadata::ColumnChunkMetaData;
-        use crate::parquet::schema::types::Type;
-
         // Create a minimal schema descriptor
         let schema = Arc::new(SchemaDescriptor::new(Arc::new(
             Type::group_type_builder("schema")
@@ -1684,9 +1681,6 @@ mod tests {
     #[test]
     fn test_parse_json_large_string_array() {
         // See issue#1923: parse_json should handle LargeStringArray (64-bit offsets)
-        use crate::arrow::array::LargeStringArray;
-        use crate::engine::arrow_data::ArrowEngineData;
-
         let large_strings = LargeStringArray::from(vec![
             Some(r#"{"a": 1, "b": "hello"}"#),
             None,
@@ -1712,9 +1706,6 @@ mod tests {
 
     #[test]
     fn test_parse_json_string_view_array() {
-        use crate::arrow::array::StringViewArray;
-        use crate::engine::arrow_data::ArrowEngineData;
-
         let view_strings = StringViewArray::from(vec![
             Some(r#"{"a": 1, "b": "hello"}"#),
             None,
@@ -1740,8 +1731,6 @@ mod tests {
 
     #[test]
     fn test_parse_json_rejects_non_string_array() {
-        use crate::engine::arrow_data::ArrowEngineData;
-
         let int_array = Int32Array::from(vec![1, 2, 3]);
         let field = Arc::new(ArrowField::new("s", ArrowDataType::Int32, true));
         let schema = Arc::new(ArrowSchema::new(vec![field]));
@@ -1978,6 +1967,20 @@ mod tests {
         for col in batch.columns() {
             assert_eq!(col.null_count(), 3);
         }
+    }
+
+    #[test]
+    fn generate_mask_skips_full_file_projection() {
+        let fields = (0..3).map(|i| {
+            let name = format!("col_{i}");
+            let builder = Type::primitive_type_builder(&name, PhysicalType::INT32);
+            Arc::new(builder.build().unwrap())
+        });
+        let builder = Type::group_type_builder("schema").with_fields(fields.collect());
+        let footer = SchemaDescriptor::new(Arc::new(builder.build().unwrap()));
+
+        assert_eq!(generate_mask(&footer, &[0, 1, 2]), None);
+        assert!(generate_mask(&footer, &[0, 1]).is_some());
     }
 
     #[test]
@@ -3648,27 +3651,23 @@ mod tests {
 
     #[test]
     fn test_arrow_broken_nested_null_masks() {
-        use crate::arrow::datatypes::{DataType, Field, Schema};
-        use crate::engine::arrow_utils::fix_nested_null_masks;
-        use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
         // Parse some JSON into a nested schema
-        let schema = Arc::new(Schema::new(vec![Field::new(
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "outer",
-            DataType::Struct(ArrowFields::from(vec![
-                Field::new(
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new(
                     "inner_nullable",
-                    DataType::Struct(ArrowFields::from(vec![
-                        Field::new("leaf_non_null", DataType::Int32, false),
-                        Field::new("leaf_nullable", DataType::Int32, true),
+                    ArrowDataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("leaf_non_null", ArrowDataType::Int32, false),
+                        ArrowField::new("leaf_nullable", ArrowDataType::Int32, true),
                     ])),
                     true,
                 ),
-                Field::new(
+                ArrowField::new(
                     "inner_non_null",
-                    DataType::Struct(ArrowFields::from(vec![
-                        Field::new("leaf_non_null", DataType::Int32, false),
-                        Field::new("leaf_nullable", DataType::Int32, true),
+                    ArrowDataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("leaf_non_null", ArrowDataType::Int32, false),
+                        ArrowField::new("leaf_nullable", ArrowDataType::Int32, true),
                     ])),
                     false,
                 ),
@@ -4261,13 +4260,9 @@ mod tests {
     /// a null buffer, so the propagation must skip it without panicking.
     #[test]
     fn test_nested_null_masks_with_null_array_child() {
-        use crate::arrow::array::NullArray;
-        use crate::arrow::datatypes::{DataType, Field};
-        use crate::engine::arrow_utils::fix_nested_null_masks;
-
         // Build: struct<val: int32, void_col: null> with 4 rows, parent null at row 0
-        let int_field = Field::new("val", DataType::Int32, true);
-        let null_field = Field::new("void_col", DataType::Null, true);
+        let int_field = ArrowField::new("val", ArrowDataType::Int32, true);
+        let null_field = ArrowField::new("void_col", ArrowDataType::Null, true);
         let fields = ArrowFields::from(vec![int_field, null_field]);
 
         let int_col: ArrowArrayRef = Arc::new(Int32Array::from(vec![
@@ -4283,7 +4278,7 @@ mod tests {
         let sa = StructArray::new(fields.clone(), vec![int_col, null_col], Some(parent_nulls));
 
         // Wrap in an outer struct (as fix_nested_null_masks expects a top-level StructArray)
-        let outer_field = Field::new("outer", DataType::Struct(fields), true);
+        let outer_field = ArrowField::new("outer", ArrowDataType::Struct(fields), true);
         let outer = StructArray::new(
             ArrowFields::from(vec![outer_field]),
             vec![Arc::new(sa)],
@@ -4298,7 +4293,7 @@ mod tests {
         assert_eq!(inner.len(), 4);
 
         let void_col = inner.column(1);
-        assert_eq!(*void_col.data_type(), DataType::Null);
+        assert_eq!(*void_col.data_type(), ArrowDataType::Null);
         assert_eq!(void_col.len(), 4);
         // NullArray has no null bitmap, so null_count() returns 0 in Arrow even though
         // all values are conceptually null. Verify the quirk explicitly.

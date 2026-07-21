@@ -11,8 +11,7 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{reader_options, writer_options};
@@ -31,7 +30,7 @@ use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
     DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -461,32 +460,21 @@ async fn open_parquet_file(
     };
 
     let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?;
-    let parquet_schema = metadata.schema();
-    let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone());
-    if let Some(mask) = generate_mask(
-        &table_schema,
-        parquet_schema,
-        builder.parquet_schema(),
-        &indices,
-    ) {
-        builder = builder.with_projection(mask)
-    }
+    let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
-    // Only create RowIndexBuilder if row indexes are actually needed
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+        .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-    // Filter row groups and row indexes if a predicate is provided
-    if let Some(ref predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-    }
-    if let Some(limit) = limit {
-        builder = builder.with_limit(limit)
-    }
+    let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+        .fold_with(mask, ParquetRecordBatchStreamBuilder::with_projection)
+        .fold_with(predicate, |builder, predicate| {
+            builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+        })
+        .fold_with(limit, ParquetRecordBatchStreamBuilder::with_limit)
+        .with_batch_size(batch_size);
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-    let stream = builder.with_batch_size(batch_size).build()?;
+    let stream = builder.build()?;
 
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
@@ -539,34 +527,19 @@ impl FileOpener for PresignedUrlOpener {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
             let metadata = ArrowReaderMetadata::load(&reader, reader_options())?;
-            let parquet_schema = metadata.schema();
-            let (indices, requested_ordering) =
-                get_requested_indices(&table_schema, parquet_schema)?;
+            let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
-            let mut builder =
-                ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata.clone());
-            if let Some(mask) = generate_mask(
-                &table_schema,
-                parquet_schema,
-                builder.parquet_schema(),
-                &indices,
-            ) {
-                builder = builder.with_projection(mask)
-            }
-
-            // Only create RowIndexBuilder if row indexes are actually needed
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-                .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+                .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-            // Filter row groups and row indexes if a predicate is provided
-            if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-            }
-            if let Some(limit) = limit {
-                builder = builder.with_limit(limit)
-            }
-
-            let reader = builder.with_batch_size(batch_size).build()?;
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata)
+                .fold_with(mask, ParquetRecordBatchReaderBuilder::with_projection)
+                .fold_with(predicate, |builder, predicate| {
+                    builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+                })
+                .fold_with(limit, ParquetRecordBatchReaderBuilder::with_limit)
+                .with_batch_size(batch_size)
+                .build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
