@@ -30,9 +30,7 @@ use unity_catalog_delta_rest_client::{
 };
 use url::Url;
 
-use crate::registry::{
-    ParallelScan, ReadConfig, SnapshotBuilderConfig, SnapshotConstructionConfig,
-};
+use crate::registry::{ParallelScan, ReadConfig, SnapshotBuilderConfig};
 
 /// Delta table property indicating catalog-managed support.
 const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
@@ -54,6 +52,22 @@ pub fn configured_benchmark_name(
     config_name: &str,
 ) -> String {
     format!("{}/{case_name}/{config_name}", table_info.name)
+}
+
+/// Builds a snapshot-construction benchmark name.
+///
+/// `table_info` supplies the human-readable table name, `case_name` identifies the workload spec,
+/// and `config_name` supplies the optional registered-config suffix. The returned name remains
+/// unsuffixed when `config_name` is `None`, preserving legacy names for unregistered workloads.
+pub fn snapshot_benchmark_name(
+    table_info: &TableInfo,
+    case_name: &str,
+    config_name: Option<&str>,
+) -> String {
+    match config_name {
+        Some(config_name) => configured_benchmark_name(table_info, case_name, config_name),
+        None => benchmark_name(table_info, case_name),
+    }
 }
 
 fn build_engine(
@@ -118,30 +132,36 @@ impl SnapshotStrategy {
     }
 }
 
-fn validate_snapshot_construction_config(
+fn validate_snapshot_versions(
     snapshot_spec: &SnapshotConstructionSpec,
-    config: &SnapshotConstructionConfig,
-    table_info: &TableInfo,
-    is_catalog_managed: bool,
+    snapshot_builder: &SnapshotBuilderConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let SnapshotBuilderConfig::From { version } = config.snapshot_builder else {
+    let SnapshotBuilderConfig::From { version } = snapshot_builder else {
         return Ok(());
     };
-    if is_catalog_managed {
+    if let Some(time_travel) = snapshot_spec.time_travel.as_ref() {
+        validate_base_precedes_target(*version, time_travel.as_version()?)?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot_strategy(
+    snapshot_builder: &SnapshotBuilderConfig,
+    is_catalog_managed: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if is_catalog_managed && matches!(snapshot_builder, SnapshotBuilderConfig::From { .. }) {
         return Err("Snapshot::builder_from is unsupported for catalog-managed benchmarks".into());
     }
+    Ok(())
+}
 
-    let target_version = match snapshot_spec.time_travel.as_ref() {
-        Some(time_travel) => time_travel.as_version()?,
-        None => table_info
-            .log_info
-            .num_commits
-            .checked_sub(1)
-            .ok_or("Snapshot construction requires at least one table commit")?,
-    };
-    if version >= target_version {
+fn validate_base_precedes_target(
+    base_version: u64,
+    target_version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if base_version >= target_version {
         return Err(format!(
-            "Base snapshot version {version} must be below target version {target_version}"
+            "Base snapshot version {base_version} must be below target version {target_version}"
         )
         .into());
     }
@@ -420,24 +440,32 @@ pub struct SnapshotConstructionRunner {
 }
 
 impl SnapshotConstructionRunner {
+    /// Prepares a snapshot-construction benchmark and state excluded from timing.
+    ///
+    /// `name` is the Criterion benchmark identifier, `snapshot_spec` selects the target version,
+    /// `snapshot_builder` selects fresh or incremental construction, `table_info` identifies the
+    /// table, and `runtime` executes asynchronous setup work. Incremental benchmarks load their
+    /// base snapshot during setup.
+    ///
+    /// Returns a runner whose [`WorkloadRunner::execute`] method performs only the measured
+    /// snapshot construction.
+    ///
+    /// Returns an error when the table cannot be resolved, incremental construction is
+    /// unsupported, or the configured base version does not precede the target version.
     pub fn setup(
         name: String,
         snapshot_spec: &SnapshotConstructionSpec,
-        config: SnapshotConstructionConfig,
+        snapshot_builder: SnapshotBuilderConfig,
         table_info: &TableInfo,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        validate_snapshot_versions(snapshot_spec, &snapshot_builder)?;
         let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
         let is_catalog_managed =
             matches!(&snapshot_strategy, SnapshotStrategy::CatalogManaged { .. });
-        validate_snapshot_construction_config(
-            snapshot_spec,
-            &config,
-            table_info,
-            is_catalog_managed,
-        )?;
+        validate_snapshot_strategy(&snapshot_builder, is_catalog_managed)?;
 
-        let source = match config.snapshot_builder {
+        let source = match snapshot_builder {
             SnapshotBuilderConfig::For => SnapshotConstructionSource::Fresh(snapshot_strategy),
             SnapshotBuilderConfig::From { version } => {
                 let base_time_travel = TimeTravel::Version {
@@ -448,6 +476,12 @@ impl SnapshotConstructionRunner {
                     &runtime,
                     Some(&base_time_travel),
                 )?;
+                if snapshot_spec.time_travel.is_none() {
+                    let target_version = Snapshot::builder_from(existing_snapshot.clone())
+                        .build(engine.as_ref())?
+                        .version();
+                    validate_base_precedes_target(version, target_version)?;
+                }
                 SnapshotConstructionSource::Existing(existing_snapshot)
             }
         };
@@ -496,9 +530,11 @@ mod tests {
     use std::sync::LazyLock;
 
     use delta_kernel_workloads::models::{ReadSpec, Spec, TableInfo, TimeTravel, Workload};
+    use rstest::rstest;
+    use test_utils::copy_directory;
 
     use super::*;
-    use crate::registry::{default_snapshot_construction_config, BenchRegistry};
+    use crate::registry::BenchRegistry;
     use crate::utils::load_all_workloads;
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
@@ -578,6 +614,19 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_benchmark_names_preserve_legacy_and_suffix_registered_configs() {
+        let table_info = test_table_info();
+        assert_eq!(
+            snapshot_benchmark_name(&table_info, "snapshotLatest", None),
+            "basic_partitioned/snapshotLatest"
+        );
+        assert_eq!(
+            snapshot_benchmark_name(&table_info, "snapshotLatest", Some("fresh")),
+            "basic_partitioned/snapshotLatest/fresh"
+        );
+    }
+
+    #[test]
     fn test_read_metadata_runner_serial() {
         let runner = ReadMetadataRunner::setup(
             configured_benchmark_name(&test_table_info(), "testCase", "serial"),
@@ -622,48 +671,21 @@ mod tests {
         }
     }
 
-    fn from_snapshot_config(version: u64) -> SnapshotConstructionConfig {
-        SnapshotConstructionConfig {
-            name: format!("from{version}"),
-            snapshot_builder: SnapshotBuilderConfig::From { version },
-        }
+    fn from_snapshot_config(version: u64) -> SnapshotBuilderConfig {
+        SnapshotBuilderConfig::From { version }
     }
 
     #[test]
-    fn test_snapshot_construction_runner_setup() {
+    fn test_fresh_snapshot_construction_runner() {
         let runner = SnapshotConstructionRunner::setup(
             benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
-            default_snapshot_construction_config(),
-            &test_table_info(),
-            test_runtime(),
-        );
-        assert!(runner.is_ok());
-    }
-
-    #[test]
-    fn test_snapshot_construction_runner_name() {
-        let runner = SnapshotConstructionRunner::setup(
-            benchmark_name(&test_table_info(), "testCase"),
-            &test_snapshot_spec(),
-            default_snapshot_construction_config(),
+            SnapshotBuilderConfig::For,
             &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
         assert_eq!(runner.name(), "basic_partitioned/testCase");
-    }
-
-    #[test]
-    fn test_snapshot_construction_runner_execute() {
-        let runner = SnapshotConstructionRunner::setup(
-            benchmark_name(&test_table_info(), "testCase"),
-            &test_snapshot_spec(),
-            default_snapshot_construction_config(),
-            &test_table_info(),
-            test_runtime(),
-        )
-        .expect("setup should succeed");
         assert!(runner.execute().is_ok());
     }
 
@@ -680,16 +702,25 @@ mod tests {
         assert!(runner.execute().is_ok());
     }
 
-    #[test]
-    fn test_snapshot_construction_rejects_base_at_explicit_target() {
+    #[rstest]
+    #[case(Some(0), 0)]
+    #[case(None, 1)]
+    fn test_snapshot_construction_rejects_base_at_target(
+        #[case] target_version: Option<i64>,
+        #[case] base_version: u64,
+    ) {
         let spec = SnapshotConstructionSpec {
-            time_travel: Some(TimeTravel::Version { version: 0 }),
+            time_travel: target_version.map(|version| TimeTravel::Version { version }),
             expected: None,
         };
         let err = SnapshotConstructionRunner::setup(
-            configured_benchmark_name(&test_table_info(), "testCase", "from0"),
+            configured_benchmark_name(
+                &test_table_info(),
+                "testCase",
+                &format!("from{base_version}"),
+            ),
             &spec,
-            from_snapshot_config(0),
+            from_snapshot_config(base_version),
             &test_table_info(),
             test_runtime(),
         )
@@ -700,20 +731,58 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_construction_rejects_base_at_latest_target() {
-        let table_info = test_table_info();
-        let latest_version = table_info.log_info.num_commits - 1;
-        let err = SnapshotConstructionRunner::setup(
-            configured_benchmark_name(&table_info, "testCase", "fromLatest"),
+    fn snapshot_from_latest_uses_actual_version_instead_of_commit_count() {
+        let mut table_info = test_table_info();
+        table_info.log_info.num_commits = 1;
+        let runner = SnapshotConstructionRunner::setup(
+            configured_benchmark_name(&table_info, "testCase", "from0"),
             &test_snapshot_spec(),
-            from_snapshot_config(latest_version),
+            from_snapshot_config(0),
             &table_info,
             test_runtime(),
         )
-        .err()
-        .expect("setup should reject a base at the latest version")
-        .to_string();
-        assert!(err.contains("must be below target version"), "got: {err}");
+        .expect("setup should use the actual latest snapshot version");
+        assert!(runner.execute().is_ok());
+    }
+
+    #[test]
+    fn snapshot_from_rejects_catalog_managed_config() {
+        let error = validate_snapshot_strategy(&from_snapshot_config(0), true)
+            .expect_err("catalog-managed builder_from must be rejected");
+        assert!(error.to_string().contains("catalog-managed"));
+    }
+
+    #[test]
+    fn snapshot_from_honors_explicit_target_before_latest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../kernel/tests/data/basic_partitioned"
+        ));
+        copy_directory(source, temp.path()).unwrap();
+        std::fs::write(
+            temp.path().join("_delta_log/00000000000000000002.json"),
+            "not valid json\n",
+        )
+        .unwrap();
+
+        let mut table_info = test_table_info();
+        table_info.table_path = Some(Url::from_directory_path(temp.path()).unwrap());
+        table_info.log_info.num_commits = 3;
+        let spec = SnapshotConstructionSpec {
+            time_travel: Some(TimeTravel::Version { version: 1 }),
+            expected: None,
+        };
+        let runner = SnapshotConstructionRunner::setup(
+            configured_benchmark_name(&table_info, "snapshotVersion1", "from0"),
+            &spec,
+            from_snapshot_config(0),
+            &table_info,
+            test_runtime(),
+        )
+        .expect("setup should succeed");
+
+        runner.execute().expect("version 2 must not be read");
     }
 
     /// Guards the checked-in `bench-registry.json` so a malformed edit or a duplicate config name
@@ -805,24 +874,19 @@ mod tests {
                         .snapshot_configs(workload)
                         .expect("snapshot workload must have snapshot configs")
                         .expect("registered snapshot workload must resolve configs");
-                    let target_version = match spec.time_travel.as_ref() {
-                        Some(time_travel) => time_travel
+                    if let Some(time_travel) = spec.time_travel.as_ref() {
+                        let target_version = time_travel
                             .as_version()
-                            .expect("snapshot workload target must be a version"),
-                        None => workload
-                            .table_info
-                            .log_info
-                            .num_commits
-                            .checked_sub(1)
-                            .expect("snapshot workload must contain at least one commit"),
-                    };
-                    for config in &configs {
-                        if let SnapshotBuilderConfig::From { version } = config.snapshot_builder {
-                            assert!(
-                                version < target_version,
-                                "registry base version {version} must be below target version \
-                                 {target_version} for '{table}/{case}'"
-                            );
+                            .expect("snapshot workload target must be a version");
+                        for config in &configs {
+                            if let SnapshotBuilderConfig::From { version } = config.snapshot_builder
+                            {
+                                assert!(
+                                    version < target_version,
+                                    "registry base version {version} must be below target version \
+                                     {target_version} for '{table}/{case}'"
+                                );
+                            }
                         }
                     }
                     configs.len()
@@ -904,7 +968,7 @@ mod tests {
         let runner = SnapshotConstructionRunner::setup(
             benchmark_name(&test_table_info(), "testCase"),
             &spec,
-            default_snapshot_construction_config(),
+            SnapshotBuilderConfig::For,
             &test_table_info(),
             test_runtime(),
         )

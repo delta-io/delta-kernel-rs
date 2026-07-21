@@ -45,13 +45,13 @@ pub enum ParallelScan {
     },
 }
 
-/// A snapshot-construction config: snapshot builder and CRC replay parameters.
+/// Configuration for a snapshot-construction benchmark.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotConstructionConfig {
     /// Name appended to the configured benchmark identifier.
     pub name: String,
-    /// Whether to build from the table root or from a prebuilt snapshot.
+    /// Snapshot construction source.
     pub snapshot_builder: SnapshotBuilderConfig,
 }
 
@@ -67,7 +67,7 @@ pub fn default_snapshot_construction_config() -> SnapshotConstructionConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum SnapshotBuilderConfig {
-    /// Build a fresh snapshot from the table root.
+    /// Build a fresh snapshot using the table's resolved loading strategy.
     For,
     /// Build from a snapshot preconstructed at `version` outside the timed loop.
     From {
@@ -77,6 +77,7 @@ pub enum SnapshotBuilderConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+// The variants must remain structurally disjoint because serde selects them by required fields.
 #[serde(untagged)]
 enum HarnessConfig {
     Read(ReadConfig),
@@ -406,6 +407,18 @@ mod tests {
         let error = registry.validate(&[workload]).unwrap_err().to_string();
         assert!(
             error.contains("provides read configs for a snapshot-construction workload"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn workload_validation_rejects_snapshot_configs_for_read_workload() {
+        let registry = registry_from_str(FULL_REGISTRY);
+        let workload = read_workload("v2", "snapshotLatest");
+
+        let error = registry.validate(&[workload]).unwrap_err().to_string();
+        assert!(
+            error.contains("provides snapshot-construction configs for a read workload"),
             "got: {error}"
         );
     }
