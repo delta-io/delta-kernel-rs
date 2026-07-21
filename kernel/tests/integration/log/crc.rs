@@ -2297,3 +2297,185 @@ async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() 
 
     Ok(())
 }
+
+// ============================================================================
+// Domain metadata rooted in a stale (but authoritative) CRC
+// ============================================================================
+
+/// Engine that delegates every handler to an inner engine, except `read_parquet_files`, which
+/// panics. A domain-metadata query reads only JSON commits; the sole parquet read on the path is
+/// the V1 checkpoint. So this proves the checkpoint is never read: it passes when the query roots
+/// in a stale CRC and scans only the commit tail, and panics when it falls through to a full scan.
+struct ParquetForbiddenEngine {
+    inner: Arc<dyn Engine>,
+}
+
+struct ParquetForbiddenHandler {
+    inner: Arc<dyn delta_kernel::ParquetHandler>,
+}
+
+impl delta_kernel::ParquetHandler for ParquetForbiddenHandler {
+    fn read_parquet_files(
+        &self,
+        _files: &[delta_kernel::FileMeta],
+        _physical_schema: delta_kernel::schema::SchemaRef,
+        _predicate: Option<delta_kernel::PredicateRef>,
+    ) -> DeltaResult<delta_kernel::FileDataReadResultIterator> {
+        panic!("read_parquet_files called: the checkpoint must not be read on the rooted path");
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: Url,
+        data: delta_kernel::DeltaResultIteratorStatic<Box<dyn delta_kernel::EngineData>>,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(
+        &self,
+        file: &delta_kernel::FileMeta,
+    ) -> DeltaResult<delta_kernel::ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+}
+
+impl Engine for ParquetForbiddenEngine {
+    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
+        self.inner.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn delta_kernel::JsonHandler> {
+        self.inner.json_handler()
+    }
+    fn parquet_handler(&self) -> Arc<dyn delta_kernel::ParquetHandler> {
+        Arc::new(ParquetForbiddenHandler {
+            inner: self.inner.parquet_handler(),
+        })
+    }
+}
+
+/// Builds checkpoint@10, commits to v20, and a CRC at v15. Loaded with the default
+/// `Disabled` replay so the v15 CRC is retained as a stale base (`crc_at_version()` is `None`).
+/// Seeds three domains covering the reconcile table:
+/// - `dom_before` set at v5 and never touched again (base stands),
+/// - `dom_after` set at v18 (new in the tail),
+/// - `dom_removed` set at v8 then tombstoned at v17 (tail removal shadows the base).
+async fn setup_stale_crc_dm_table<E: TaskExecutor>(
+    engine: &Arc<DefaultEngine<E>>,
+    table_path: &str,
+) -> DeltaResult<()> {
+    let schema = schema_ref! { nullable "id": INTEGER };
+    let mut snap = create_table(table_path, schema, "test_engine")
+        .with_table_properties([("delta.feature.domainMetadata", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    for v in 1..=20i64 {
+        let arrow_schema = TryFromKernel::try_from_kernel(snap.schema().as_ref())?;
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(Int32Array::from(vec![v as i32]))],
+        )
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+        let mut txn = snap
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_operation("WRITE".to_string())
+            .with_data_change(true);
+        txn = match v {
+            5 => txn.with_domain_metadata("dom_before".to_string(), "cfg_before".to_string()),
+            8 => txn.with_domain_metadata("dom_removed".to_string(), "cfg_removed".to_string()),
+            17 => txn.with_domain_metadata_removed("dom_removed".to_string()),
+            18 => txn.with_domain_metadata("dom_after".to_string(), "cfg_after".to_string()),
+            _ => txn,
+        };
+        let write_context = txn.unpartitioned_write_context()?;
+        let adds = engine
+            .write_parquet(&ArrowEngineData::new(batch), &write_context)
+            .await?;
+        txn.add_files(adds);
+        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+        if v == 10 {
+            snap = snap.checkpoint(engine.as_ref(), None)?.1;
+        }
+        if v == 15 {
+            snap.write_checksum(engine.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::filtered_present("dom_before", Some("cfg_before"))]
+#[case::filtered_tail_added("dom_after", Some("cfg_after"))]
+#[case::filtered_tail_removed("dom_removed", None)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dm_query_roots_in_stale_complete_crc_skips_checkpoint(
+    #[case] domain: &str,
+    #[case] expected: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    setup_stale_crc_dm_table(&engine, &table_path).await?;
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 20);
+    assert!(fresh.crc_at_version().is_none());
+
+    // The rooted scan reads only the commit tail (16..=20), never the v10 parquet checkpoint.
+    let forbidden = ParquetForbiddenEngine {
+        inner: engine.clone(),
+    };
+
+    assert_eq!(
+        fresh.get_domain_metadata(domain, &forbidden)?,
+        expected.map(str::to_string)
+    );
+
+    // The unfiltered query resolves the whole active set through the same rooted path.
+    let all = fresh.get_all_domain_metadata(&forbidden)?;
+    let mut domains: Vec<_> = all.iter().map(|dm| dm.domain().to_string()).collect();
+    domains.sort();
+    assert_eq!(domains, ["dom_after", "dom_before"]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    setup_stale_crc_dm_table(&engine, &table_path).await?;
+
+    // Strip domainMetadata from the v15 CRC so it reloads as Partial: not authoritative, so the
+    // query must not take the rooted path.
+    strip_field_from_crc(&table_path, 15, "domainMetadata");
+
+    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(fresh.version(), 20);
+    assert!(fresh.crc_at_version().is_none());
+
+    // Results are still correct via the full scan (with the real engine).
+    assert_eq!(
+        fresh.get_domain_metadata("dom_before", engine.as_ref())?,
+        Some("cfg_before".to_string())
+    );
+    assert_eq!(
+        fresh.get_domain_metadata("dom_removed", engine.as_ref())?,
+        None
+    );
+
+    // A full scan reads the v10 checkpoint, so the parquet-forbidden engine panics: this proves
+    // the Partial base did NOT take the rooted (checkpoint-skipping) path.
+    let forbidden = ParquetForbiddenEngine {
+        inner: engine.clone(),
+    };
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fresh.get_domain_metadata("dom_before", &forbidden).ok()
+    }))
+    .is_err());
+
+    Ok(())
+}
