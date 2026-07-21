@@ -193,12 +193,13 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 /// - Reading must be supported for every commit in the range: every enabled reader feature must be
 ///   supported by the kernel. The supported read features will be expanded in the future to cover
 ///   more delta table features.
-/// - Change Data Feed must be enabled for the entire range with the `delta.enableChangeDataFeed`
-///   table property set to `true`.
-/// - The schema for each commit must be compatible with the end schema. This means that all the
-///   same fields and their nullability are the same. Schema compatibility will be expanded in the
-///   future to allow compatible schemas that are not the exact same.
-///   See issue [#523](https://github.com/delta-io/delta-kernel-rs/issues/523)
+/// - [`TableChanges::try_new`] requires Change Data Feed to remain enabled and requires exact
+///   schema equality.
+/// - [`TableChanges::try_new_row_tracking_cdf_listing`] requires row tracking to remain enabled. It
+///   allows additive nullable columns and relaxed nullability, but rejects datatype changes.
+///
+/// Construction validates the range boundaries. Intermediate metadata and protocol updates are
+/// validated when the transaction log is replayed by the scan or listing operation.
 ///
 ///  # Examples
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
@@ -261,12 +262,14 @@ impl TableChanges {
 
     /// Creates a listing-only change feed from row-tracking metadata.
     ///
-    /// This path requires `delta.enableRowTracking` throughout the requested range and ignores
-    /// `_change_data` files. [`TableChanges::scan_file_listing`] returns the `add` and `remove`
-    /// actions whose data must be reconciled by row ID.
+    /// This path requires `delta.enableRowTracking` and ignores `_change_data` files.
+    /// [`TableChanges::scan_file_listing`] returns the `add` and `remove` actions whose data must
+    /// be reconciled by row ID.
     ///
-    /// Every enabled reader feature must be supported by Kernel. Each schema in the range must be
-    /// readable using the end-version logical schema.
+    /// Construction validates the range boundaries. [`TableChanges::scan_file_listing`] validates
+    /// intermediate metadata and protocol updates while replaying the range. Every enabled reader
+    /// feature must be supported by Kernel, and each schema must be readable using the end-version
+    /// logical schema without datatype widening.
     ///
     /// # Parameters
     ///
@@ -278,9 +281,9 @@ impl TableChanges {
     ///
     /// # Errors
     ///
-    /// Returns an error if the range cannot be loaded, row tracking is unavailable within the
-    /// range, an enabled reader feature is unsupported, or a schema is incompatible with the
-    /// end-version schema.
+    /// Returns an error if the range cannot be loaded or a boundary has unavailable row tracking,
+    /// unsupported reader features, or an incompatible schema. Errors from intermediate versions
+    /// are returned by [`TableChanges::scan_file_listing`].
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn try_new_row_tracking_cdf_listing(

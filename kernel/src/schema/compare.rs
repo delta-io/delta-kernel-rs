@@ -538,6 +538,34 @@ mod tests {
     }
 
     #[rstest]
+    #[case::array(
+        DataType::from(ArrayType::new(DataType::INTEGER, false)),
+        DataType::from(ArrayType::new(DataType::LONG, false))
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(DataType::INTEGER, DataType::STRING, false)),
+        DataType::from(MapType::new(DataType::LONG, DataType::STRING, false))
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, false)),
+        DataType::from(MapType::new(DataType::STRING, DataType::LONG, false))
+    )]
+    fn type_widening_in_complex_types(
+        #[case] source: DataType,
+        #[case] target: DataType,
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
+        let result = mode.can_read_as(&source, &target);
+        match mode {
+            ComparisonMode::AllowTypeWidening => assert!(result.is_ok()),
+            ComparisonMode::ForbidTypeWidening => {
+                assert!(matches!(result, Err(Error::TypeMismatch)))
+            }
+        }
+    }
+
+    #[rstest]
     fn incompatible_type_change(
         #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
         mode: ComparisonMode,
