@@ -163,13 +163,14 @@ pub(crate) async fn add_checkpoint_to_store(
     write_parquet_to_store(store, path, data).await
 }
 
-/// Writes a _delta_log parquet checkpoint where each batch becomes its own row group. Flushing
-/// after every batch forces a row-group boundary, so a test can place e.g. an all-remove group
-/// next to an all-add group in a single file. All batches must share the same Arrow schema.
-async fn add_multi_row_group_checkpoint_to_store(
+/// Writes a parquet file where each batch becomes its own row group. Flushing after every batch
+/// forces a row-group boundary. All batches must share the same Arrow schema. `path` is relative
+/// to the store root (e.g. `_delta_log/..` for a checkpoint, `_delta_log/_sidecars/..` for a
+/// sidecar).
+async fn write_multi_row_group_parquet_to_store(
     store: &Arc<InMemory>,
     row_groups: Vec<Box<dyn EngineData>>,
-    filename: &str,
+    path: &str,
 ) -> DeltaResult<()> {
     let batches = row_groups
         .into_iter()
@@ -189,9 +190,7 @@ async fn add_multi_row_group_checkpoint_to_store(
     }
     writer.close()?;
 
-    store
-        .put(&Path::from(format!("_delta_log/{filename}")), buffer.into())
-        .await?;
+    store.put(&Path::from(path), buffer.into()).await?;
     Ok(())
 }
 
@@ -1406,7 +1405,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 ///
 /// Each case writes one checkpoint parquet file with one row group per supplied batch. A baseline
 /// read with no predicate materializes every row, confirming the rows physically exist -- so the
-/// smaller filtered row count is attributable to row-group skipping, not a missing fixture. The
+/// smaller post-pruning row count is attributable to row-group skipping, not a missing fixture. The
 /// multi-row-group case places an all-remove group next to an all-add group to guard against a
 /// per-row-group regression that would wrongly drop the adjacent live Adds.
 #[rstest]
@@ -1433,7 +1432,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 #[tokio::test]
 async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
     #[case] row_groups: Vec<Box<dyn EngineData>>,
-    #[case] expected_filtered_rows: usize,
+    #[case] expected_rows_after_pruning: usize,
     #[case] expected_survivor_adds: &[&str],
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1442,7 +1441,12 @@ async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
     let checkpoint_name = "00000000000000000001.checkpoint.parquet";
     // Real checkpoints store removes with the full file-action schema; the add column is null.
     let total_rows: usize = row_groups.iter().map(|batch| batch.len()).sum();
-    add_multi_row_group_checkpoint_to_store(&store, row_groups, checkpoint_name).await?;
+    write_multi_row_group_parquet_to_store(
+        &store,
+        row_groups,
+        &format!("_delta_log/{checkpoint_name}"),
+    )
+    .await?;
 
     let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
     let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
@@ -1489,17 +1493,17 @@ async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
         )?
         .actions;
 
-    let mut filtered_rows = 0;
+    let mut rows_after_pruning = 0;
     let mut add_paths: Vec<String> = Vec::new();
     for batch in filtered {
         let batch = batch?.actions;
-        filtered_rows += batch.len();
+        rows_after_pruning += batch.len();
         let mut visitor = AddVisitor::default();
         visitor.visit_rows_of(&*batch)?;
         add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
     }
     assert_eq!(
-        filtered_rows, expected_filtered_rows,
+        rows_after_pruning, expected_rows_after_pruning,
         "all-remove row groups must be skipped, so only kept groups' rows are materialized"
     );
 
@@ -1512,6 +1516,92 @@ async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
     assert_eq!(
         add_paths, expected,
         "kept row groups must surface every live Add and no others"
+    );
+
+    Ok(())
+}
+
+/// The derived `add.path IS NOT NULL` predicate reaches a V2 checkpoint's sidecar reads, which
+/// share the add-only checkpoint schema. A sidecar row group holding only Remove tombstones has an
+/// all-null `add.path` and is skipped, while the adjacent all-add group is kept, so its live Adds
+/// still surface.
+#[tokio::test]
+async fn test_scan_checkpoint_read_skips_all_remove_sidecar_row_groups() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    // Sidecar with an all-remove row group next to an all-add group (c000, c002).
+    let sidecar_name = "sidecarfile.parquet";
+    write_multi_row_group_parquet_to_store(
+        &store,
+        vec![
+            remove_only_batch(get_commit_schema().clone()) as _,
+            adds_only_batch(get_commit_schema().clone()) as _,
+        ],
+        &format!("_delta_log/_sidecars/{sidecar_name}"),
+    )
+    .await?;
+    let sidecar_size = get_file_size(&store, &format!("_delta_log/_sidecars/{sidecar_name}")).await;
+
+    let checkpoint_name = "00000000000000000001.checkpoint.parquet";
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![(sidecar_name, sidecar_size)],
+            get_all_actions_schema().clone(),
+        ),
+        checkpoint_name,
+    )
+    .await?;
+    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    // The main checkpoint file carries only sidecar references (null `add.path`) and is skipped;
+    // sidecar discovery reads it separately with no predicate, so the refs are still found.
+    let filtered = log_segment
+        .read_actions_with_projected_checkpoint_actions(
+            &engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+        )?
+        .actions;
+
+    let mut rows_after_pruning = 0;
+    let mut add_paths: Vec<String> = Vec::new();
+    for batch in filtered {
+        let batch = batch?.actions;
+        rows_after_pruning += batch.len();
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(&*batch)?;
+        add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
+    }
+    assert_eq!(
+        rows_after_pruning, 2,
+        "the all-remove sidecar row group must be skipped, leaving only the all-add group"
+    );
+
+    add_paths.sort();
+    assert_eq!(
+        add_paths,
+        vec![
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string(),
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c002.snappy.parquet".to_string(),
+        ],
+        "the kept sidecar row group must surface every live Add and no others"
     );
 
     Ok(())
