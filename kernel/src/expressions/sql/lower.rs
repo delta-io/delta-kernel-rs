@@ -21,7 +21,11 @@ use crate::{DeltaResult, Error};
 /// anything else returns `Err` (what the caller does with an un-lowerable constraint is the
 /// caller's contract, not this function's). The resolved operands must therefore satisfy all of:
 /// - at least one operand is a column, so a literal can be typed from it;
-/// - every column operand is primitive-typed (struct/array/map have no scalar comparison);
+/// - every column operand is primitive-typed. Spark does support `=`/`<=>` on struct/array/map
+///   (only ordering is primitive-only), but kernel's engine cannot: the default engine's comparison
+///   routes through arrow's `cmp` kernels, which error on nested types. Lowering a complex-type
+///   equality would therefore fail at *evaluation*, so we reject it up front until the engine gains
+///   nested comparison (via `make_comparator`).
 /// - the two operands share a single comparison type, because the engine compares only matching
 ///   types (no implicit numeric coercion) -- see [`type_literal_from_column`] (FLOAT-vs-literal)
 ///   and the column-vs-column arm (cross-type columns).
@@ -43,9 +47,10 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
     let Comparison { op, left, right } = comparison;
     let left = resolve_operand(left, schema)?;
     let right = resolve_operand(right, schema)?;
-    // Reject non-primitive columns explicitly: `parse_sql("NULL", <struct>)` succeeds (NULL is
-    // valid for any type), so without this check `nested = NULL` would lower silently. (`nested =
-    // 0` is already caught by `parse_sql`, which rejects a non-primitive literal target.)
+    // Reject non-primitive columns: the engine cannot compare nested types (see the fn doc), and
+    // this is the only place that catches a column on its own. `parse_sql("NULL", <struct>)`
+    // succeeds (NULL is valid for any type), so without this `nested = NULL` would lower silently;
+    // `nested = 0` is already caught by `parse_sql` rejecting a non-primitive literal target.
     for operand in [&left, &right] {
         if let ResolvedOperand::Column {
             canonical,
@@ -75,9 +80,9 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
         ) => {
             // The engine compares only matching Arrow types -- it applies no numeric coercion (it
             // would error on e.g. INT vs LONG). Spark instead coerces both columns to a common type
-            // and compares there, so a cross-type comparison kernel cannot reproduce is rejected
-            // (left to the connector). The check is on the full `DataType`, so it also rejects
-            // mismatched decimal precision/scale and TIMESTAMP vs TIMESTAMP_NTZ.
+            // and compares there, so a cross-type comparison kernel cannot reproduce is rejected.
+            // The check is on the full `DataType`, so it also rejects mismatched decimal
+            // precision/scale and TIMESTAMP vs TIMESTAMP_NTZ.
             if l_type != r_type {
                 return Err(Error::generic(format!(
                     "CHECK constraint comparing columns of different types is not supported: \
@@ -136,7 +141,7 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
 /// is exactly representable in f32: an integer qualifies iff it round-trips through f32 unchanged
 /// (`v as f32 as i64 == v`), which fails past 2^24 even well within i64 range (e.g. `16777217`
 /// rounds to `16777216.0`). Any literal with a `.`/exponent, or an out-of-i64 integer, is likewise
-/// not gated in and is rejected -- left to the connector.
+/// not gated in and is rejected.
 ///
 /// Kernel has no cast expression and cannot compare f32 to f64, so it cannot reproduce Spark's
 /// widening. `NULL` is allowed (a null comparison involves no f32/f64 rounding). Only FLOAT is
@@ -401,8 +406,8 @@ mod tests {
         );
     }
 
-    /// Not-kernel-parsable inputs: everything outside the single-comparison grammar must error, so
-    /// the caller treats the constraint as not-kernel-parsable (connector-enforced / fail-closed).
+    /// Not-kernel-parsable inputs: everything outside the single-comparison grammar must error
+    /// (fail-closed), so the caller can treat the constraint as not-kernel-parsable.
     /// Covers boolean junctions, parentheses, `IS [NOT] NULL`, multi-operand predicates
     /// (`IN`/`BETWEEN`/`LIKE`), functions, arithmetic, comparisons with no column,
     /// type-incompatible literals (kernel applies no implicit casts), and malformed input.
@@ -447,7 +452,7 @@ mod tests {
     #[case::literal_out_of_range_for_column("price = 9999999999")]
     // A DECIMAL literal must match the column's scale exactly (`parse_scalar` does not pad), so an
     // integer or wrong-scale literal against a DECIMAL(10,2) column is rejected where Spark would
-    // read `0` as `0.00`. Left to the connector (see the `sql` module doc). `cost <= 10.00` lowers.
+    // read `0` as `0.00` (see the `sql` module doc). `cost <= 10.00` lowers.
     #[case::decimal_integer_literal_scale_mismatch("cost >= 0")]
     #[case::decimal_wrong_scale_literal("cost >= 0.5")]
     // A FLOAT column against any literal not exactly representable in f32 is rejected: kernel

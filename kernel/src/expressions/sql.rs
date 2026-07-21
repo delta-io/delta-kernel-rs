@@ -12,11 +12,12 @@
 //! the supported SQL surface grows, options include moving parsing behind the
 //! [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
 //!
-//! Kernel errors out rather than guess, in cases where kernel cannot match Spark semantics, so the
-//! constraint is left to the connector (fail-closed, never a silent wrong answer). One notable such
-//! gap: a decimal literal must match the column's scale exactly (`parse_scalar` does not pad), so
-//! `amount >= 0` on a `DECIMAL(10,2)` column is rejected where Spark would read `0` as `0.00`.
-//! Padding the literal's scale to the column would recover these.
+//! In cases where kernel cannot match Spark semantics, kernel errors out rather than guess
+//! (fail-closed, never a silent wrong answer); how an un-lowerable constraint is then handled is
+//! the calling API's contract, not this module's. One notable such gap: a decimal literal must
+//! match the column's scale exactly (`parse_scalar` does not pad), so `amount >= 0` on a
+//! `DECIMAL(10,2)` column is rejected where Spark would read `0` as `0.00`. Padding the literal's
+//! scale to the column would recover these.
 
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::expressions::Predicate;
