@@ -1,11 +1,13 @@
 //! Add-file validations.
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 /// Column indices, matching the order in [`MANDATORY_ADD_FILE_COLUMNS`].
@@ -18,17 +20,26 @@ static MANDATORY_ADD_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
 impl StagedDataValidator {
-    /// Creates a validator that validates every staged add-file row.
-    pub(crate) fn staged_add_file() -> Self {
+    /// Creates a validator for required add-file values and `partitionValues` keys.
+    ///
+    /// [`TableConfiguration::physical_partition_columns`]: crate::table_configuration::TableConfiguration::physical_partition_columns
+    pub(crate) fn staged_add_file(physical_partition_columns: Vec<String>) -> Self {
         StagedDataValidator::new(
             &MANDATORY_ADD_FILE_COLUMNS,
-            vec![Box::new(AddFileRequiredFields)],
+            vec![
+                Box::new(AddFileRequiredFields),
+                Box::new(AddFilePartitionColumnsValidation {
+                    physical_partition_columns: physical_partition_columns.into_iter().collect(),
+                }),
+            ],
         )
     }
 }
 
-/// Validates that every staged add-file row has its protocol-required fields (`path`,
-/// `partitionValues`, `size`, `modificationTime`) present.
+/// Validates the presence of protocol-required fields and basic value constraints for a staged
+/// add-file row.
+///
+/// Required fields must be present, `path` must be non-empty, and `size` must be non-negative.
 pub(crate) struct AddFileRequiredFields;
 
 fn require_add_file_field<T>(value: Option<T>, path: &str, field: &str) -> DeltaResult<T> {
@@ -69,6 +80,47 @@ impl Validation for AddFileRequiredFields {
     }
 }
 
+/// Validates that each staged add-file's `partitionValues` keys exactly match the table's partition
+/// columns (compared as physical names). Both a missing and an unexpected key are rejected.
+pub(crate) struct AddFilePartitionColumnsValidation {
+    physical_partition_columns: HashSet<String>,
+}
+
+impl Validation for AddFilePartitionColumnsValidation {
+    fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let path: &str = getters[PATH]
+            .get_opt(row, "path")?
+            .ok_or_else(|| Error::missing_data("AddFile is missing required field 'path'"))?;
+
+        let actual_keys_vec: Vec<&str> = getters[PARTITION_VALUES]
+            .get_map(row, "partitionValues")?
+            .map_or_else(Vec::new, |map| map.keys().collect());
+        let actual_keys_set: HashSet<&str> = actual_keys_vec.iter().copied().collect();
+        let expected_keys_set = &self.physical_partition_columns;
+        let keys_match = actual_keys_set.len() == expected_keys_set.len()
+            && actual_keys_set
+                .iter()
+                .all(|key| expected_keys_set.contains(*key));
+
+        require!(
+            actual_keys_vec.len() == actual_keys_set.len(),
+            Error::invalid_partition_values(format!(
+                "AddFile for '{path}' has duplicate partition column names in partitionValues: \
+                 {actual_keys_vec:?}"
+            ))
+        );
+
+        require!(
+            keys_match,
+            Error::invalid_partition_values(format!(
+                "AddFile for '{path}' has partitionValues keys {actual_keys_vec:?}, but the table's \
+                 physical partition columns are {expected_keys_set:?}"
+            ))
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -76,8 +128,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{new_null_array, Array, ArrayRef, Int64Array, StringArray};
+    use crate::arrow::array::{
+        new_null_array, Array, ArrayRef, Int64Array, MapBuilder, StringArray, StringBuilder,
+    };
     use crate::arrow::compute::{concat, concat_batches};
+    use crate::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::ColumnName;
@@ -122,8 +177,54 @@ mod tests {
             .expect("failed to rebuild add-file batch after replacing a column")
     }
 
-    fn add_validator() -> StagedDataValidator {
-        StagedDataValidator::staged_add_file()
+    /// Returns nullable add-file rows with `partitionValues` replaced by the given values.
+    /// A `None` value stores a present key with a null value.
+    fn add_files_with_partition_values(
+        partition_values: &[&[(&str, Option<&str>)]],
+    ) -> RecordBatch {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for entries in partition_values {
+            for (key, value) in *entries {
+                builder.keys().append_value(key);
+                match value {
+                    Some(v) => builder.values().append_value(v),
+                    None => builder.values().append_null(),
+                }
+            }
+            builder
+                .append(true)
+                .expect("failed to append partition-values map row");
+        }
+        let map: ArrayRef = Arc::new(builder.finish());
+
+        let batch = nullable_add_files(partition_values.len());
+        let schema = batch.schema();
+        let index = schema
+            .index_of("partitionValues")
+            .expect("add-file schema should contain partitionValues");
+        let mut fields = schema.fields().to_vec();
+        fields[index] = Arc::new(ArrowField::new(
+            "partitionValues",
+            map.data_type().clone(),
+            true,
+        ));
+        let mut columns = batch.columns().to_vec();
+        columns[index] = map;
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+            .expect("failed to rebuild add-file batch with partition values")
+    }
+
+    fn add_file_validator(physical_partition_columns: &[&str]) -> StagedDataValidator {
+        StagedDataValidator::staged_add_file(
+            physical_partition_columns
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+    }
+
+    fn as_engine_data(batch: RecordBatch) -> [Box<dyn EngineData>; 1] {
+        [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>]
     }
 
     /// Guards the invariant that the column-index consts match the leaf order of
@@ -146,8 +247,9 @@ mod tests {
 
     #[test]
     fn required_fields_present_ok() {
-        let adds = [Box::new(ArrowEngineData::new(nullable_add_file())) as Box<dyn EngineData>];
-        add_validator().validate(&adds).unwrap();
+        add_file_validator(&[] /* physical_partition_columns */)
+            .validate(&as_engine_data(nullable_add_file()))
+            .unwrap();
     }
 
     #[rstest]
@@ -160,9 +262,9 @@ mod tests {
         #[values(0, 1, 2)] invalid_row: usize,
     ) {
         let batch = set_field_as_null(&nullable_add_files(3), field, invalid_row);
-        let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
         assert_result_error_with_message(
-            add_validator().validate(&adds),
+            add_file_validator(&[] /* physical_partition_columns */)
+                .validate(&as_engine_data(batch)),
             &format!("missing required field '{field}'"),
         );
     }
@@ -174,8 +276,11 @@ mod tests {
             "path",
             Arc::new(StringArray::from(vec![""])),
         );
-        let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        assert_result_error_with_message(add_validator().validate(&adds), "path must not be empty");
+        assert_result_error_with_message(
+            add_file_validator(&[] /* physical_partition_columns */)
+                .validate(&as_engine_data(batch)),
+            "path must not be empty",
+        );
     }
 
     #[test]
@@ -185,9 +290,9 @@ mod tests {
             "size",
             Arc::new(Int64Array::from(vec![-1])),
         );
-        let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
         assert_result_error_with_message(
-            add_validator().validate(&adds),
+            add_file_validator(&[] /* physical_partition_columns */)
+                .validate(&as_engine_data(batch)),
             "size must be non-negative",
         );
     }
@@ -204,7 +309,76 @@ mod tests {
             "modificationTime",
             Arc::new(Int64Array::from(vec![-1])),
         );
-        let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        add_validator().validate(&adds).unwrap();
+        add_file_validator(&[] /* physical_partition_columns */)
+            .validate(&as_engine_data(batch))
+            .unwrap();
+    }
+
+    #[test]
+    fn partition_values_exact_match_ok() {
+        let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", Some("b"))]]);
+        add_file_validator(&["p1", "p2"] /* physical_partition_columns */)
+            .validate(&as_engine_data(batch))
+            .unwrap();
+    }
+
+    #[test]
+    fn partition_value_null_still_counts_as_present() {
+        // A partition column present with a null value satisfies the key-set check.
+        let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", None)]]);
+        add_file_validator(&["p1", "p2"] /* physical_partition_columns */)
+            .validate(&as_engine_data(batch))
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case::missing_second_partition_column(
+        &[("p1", Some("a")), ("p2", Some("b")), ("p3", Some("c"))],
+        &[("p1", Some("a")), ("p3", Some("c"))],
+        &["p1", "p2", "p3"],
+        "partitionValues keys"
+    )]
+    #[case::missing_third_partition_column(
+        &[("p1", Some("a")), ("p2", Some("b")), ("p3", Some("c"))],
+        &[("p1", Some("a")), ("p2", Some("b"))],
+        &["p1", "p2", "p3"],
+        "partitionValues keys"
+    )]
+    #[case::extra_partition_columns(
+        &[("p1", Some("a")), ("p2", Some("b"))],
+        &[("p1", Some("a")), ("p2", Some("b")), ("p3", Some("c"))],
+        &["p1", "p2"],
+        "partitionValues keys"
+    )]
+    #[case::duplicate_partition_column(
+        &[("p1", Some("a")), ("p2", Some("b"))],
+        &[("p1", Some("a")), ("p1", Some("b")), ("p2", Some("c"))],
+        &["p1", "p2"],
+        "duplicate partition column names"
+    )]
+    fn partition_column_mismatch_rejected(
+        #[case] valid_partition_values: &[(&str, Option<&str>)],
+        #[case] invalid_partition_values: &[(&str, Option<&str>)],
+        #[case] physical_partition_columns: &[&str],
+        #[case] expected_error: &str,
+        #[values(0, 1, 2)] invalid_row_index: usize,
+    ) {
+        let mut partition_values = [valid_partition_values; 3];
+        partition_values[invalid_row_index] = invalid_partition_values;
+        let batch = add_files_with_partition_values(&partition_values);
+        assert_result_error_with_message(
+            add_file_validator(physical_partition_columns).validate(&as_engine_data(batch)),
+            expected_error,
+        );
+    }
+
+    #[test]
+    fn unpartitioned_table_rejects_partition_values() {
+        let batch = add_files_with_partition_values(&[&[("stray", Some("x"))]]);
+        assert_result_error_with_message(
+            add_file_validator(&[] /* physical_partition_columns */)
+                .validate(&as_engine_data(batch)),
+            "partitionValues keys",
+        );
     }
 }

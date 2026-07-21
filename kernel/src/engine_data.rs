@@ -195,6 +195,13 @@ impl<'a> MapItem<'a> {
         self.values.is_valid(idx).then(|| self.values.value(idx))
     }
 
+    /// Returns the map's keys in storage order, including keys whose value is null. Unlike
+    /// [`MapItem::materialize`], which drops null-valued entries, this exposes the full key set.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + 'a {
+        let keys = self.keys;
+        self.offsets.clone().map(move |idx| keys.value(idx))
+    }
+
     pub fn materialize(&self) -> HashMap<String, String> {
         let mut ret = HashMap::with_capacity(self.offsets.len());
         for idx in self.offsets.clone() {
@@ -836,5 +843,33 @@ mod tests {
         #[case] expected: Vec<usize>,
     ) {
         assert_eq!(collect_indices(row_count, selection), expected);
+    }
+
+    #[test]
+    fn map_item_keys_includes_null_valued_keys() {
+        // Map { "a" => "1", "b" => null }: `keys()` must expose both keys, while `materialize()`
+        // (and `get`) drop the null-valued entry.
+        let keys = StringArray::from(vec!["a", "b"]);
+        let values = StringArray::from(vec![Some("1"), None]);
+        let map = MapItem::new(&keys, &values, 0..2);
+
+        let mut seen: Vec<&str> = map.keys().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec!["a", "b"]);
+
+        assert_eq!(map.get("a"), Some("1"));
+        assert_eq!(map.get("b"), None);
+        assert_eq!(
+            map.materialize(),
+            HashMap::from([("a".to_string(), "1".to_string())])
+        );
+    }
+
+    #[test]
+    fn map_item_keys_empty() {
+        let keys = StringArray::from(Vec::<&str>::new());
+        let values = StringArray::from(Vec::<&str>::new());
+        let map = MapItem::new(&keys, &values, 0..0);
+        assert_eq!(map.keys().count(), 0);
     }
 }
