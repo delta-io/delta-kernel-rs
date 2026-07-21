@@ -79,7 +79,8 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
 - `interval-type-in-dev` -- ANSI interval type support (experimental, in development). With the
-  cargo feature off, creating, reading, or writing tables with interval columns is blocked.
+  cargo feature off, creating or writing tables with interval columns is blocked; reads are
+  unaffected.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost

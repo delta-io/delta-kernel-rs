@@ -672,16 +672,18 @@ impl TableConfiguration {
     /// the protocol's features are all supported for the requested operation type.
     ///
     /// - For `Scan` and `Cdf` operations: checks reader version and reader features
-    /// - For `Write` operations: checks writer version and writer features
+    /// - For `Write` operations: checks writer version and writer features, and requires the
+    ///   `interval-type-in-dev` cargo feature when the schema contains interval columns
     #[internal_api]
     pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
-        self.validate_interval_type_support()?;
         match operation {
             Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
             Operation::Write => self.ensure_write_supported(),
         }
     }
 
+    /// Errors if the schema contains an ANSI interval type without the
+    /// `interval-type-in-dev` cargo feature; enforced on writes only.
     pub(crate) fn validate_interval_type_support(&self) -> DeltaResult<()> {
         require!(
             cfg!(feature = "interval-type-in-dev")
@@ -707,6 +709,8 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
+        self.validate_interval_type_support()?;
+
         // Version check: kernel supports writer versions
         // MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION
         require!(
@@ -1756,7 +1760,7 @@ mod test {
         let config = make_test_tc(schema, protocol, []).unwrap();
 
         let result = config.ensure_operation_supported(operation);
-        if cfg!(feature = "interval-type-in-dev") {
+        if operation != Operation::Write || cfg!(feature = "interval-type-in-dev") {
             result.expect("interval operations must be allowed when support is enabled");
         } else {
             assert_result_error_with_message(result, "interval-type-in-dev");

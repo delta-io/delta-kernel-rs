@@ -1,4 +1,4 @@
-//! Reader-side behavior for the `interval-type-in-dev` cargo feature.
+//! Reader-side behavior for ANSI interval columns.
 
 use std::sync::Arc;
 
@@ -21,26 +21,14 @@ async fn build_scan_over_interval_table(
     Ok(())
 }
 
-/// Interval columns are scannable exactly when the cargo feature is compiled in.
 #[tokio::test]
-async fn test_scan_interval_table_respects_kernel_support_gate(
+async fn test_scan_interval_table_is_not_gated_by_cargo_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (name, interval) in [
         ("interval_read_ym", DataType::INTERVAL_YEAR_MONTH),
         ("interval_read_dt", DataType::INTERVAL_DAY_TIME),
     ] {
-        let result = build_scan_over_interval_table(name, interval).await;
-        if cfg!(feature = "interval-type-in-dev") {
-            result?;
-        } else {
-            let err = result
-                .expect_err("scanning an interval table must be blocked when support is off")
-                .to_string();
-            assert!(
-                err.contains("interval-type-in-dev"),
-                "error must explain the missing cargo feature; got: {err}",
-            );
-        }
+        build_scan_over_interval_table(name, interval).await?;
     }
     Ok(())
 }
