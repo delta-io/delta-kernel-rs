@@ -53,7 +53,13 @@ async fn test_write_partitioned_normal_values_roundtrip(
         normal_partition_values()?,
     )
     .await?;
-    assert_eq!(snapshot.table_configuration().partition_columns().len(), 13);
+    assert_eq!(
+        snapshot
+            .table_configuration()
+            .logical_partition_columns()
+            .len(),
+        13
+    );
 
     // ===== Step 2: Validate add.path structure in the commit log JSON. =====
     let (add, rel_path) = read_single_add(&table_path, 1)?;

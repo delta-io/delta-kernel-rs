@@ -29,7 +29,7 @@ fn test_create_table_partitioned_basic(#[case] partition_col: &str) -> DeltaResu
     assert_eq!(snapshot.version(), 0);
 
     // Partition column should be stored matching the casing in the schema
-    let partition_cols = snapshot.table_configuration().partition_columns();
+    let partition_cols = snapshot.table_configuration().logical_partition_columns();
     assert_eq!(partition_cols, &["date"]);
 
     let clustering = snapshot.get_physical_clustering_columns(engine.as_ref())?;

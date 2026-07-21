@@ -417,9 +417,11 @@ impl<S> Transaction<S> {
         // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
-        // Validate required fields for addFile.
-        write_validation::StagedDataValidator::staged_add_file()
-            .validate(&self.add_files_metadata)?;
+        // Validate required fields and partition-column completeness for addFile.
+        write_validation::StagedDataValidator::staged_add_file(
+            self.effective_table_config.physical_partition_columns(),
+        )
+        .validate(&self.add_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
@@ -957,7 +959,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         {
             let partition_cols: HashSet<&str> = self
                 .effective_table_config
-                .partition_columns()
+                .logical_partition_columns()
                 .iter()
                 .map(String::as_str)
                 .collect();
@@ -990,7 +992,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     /// Returns the logical partition column names for this table.
     pub fn logical_partition_columns(&self) -> &[String] {
-        self.effective_table_config.partition_columns()
+        self.effective_table_config.logical_partition_columns()
     }
 
     /// Returns the column default for every top-level column in this table's logical schema that
@@ -1054,7 +1056,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
             physical_schema: table_config.physical_write_schema(),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
-            logical_partition_columns: table_config.partition_columns().to_vec(),
+            logical_partition_columns: table_config.logical_partition_columns().to_vec(),
             randomize_file_prefixes: props.should_randomize_file_prefixes(),
             random_prefix_length: props.random_prefix_length(),
         }))
