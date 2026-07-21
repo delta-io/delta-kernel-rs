@@ -71,6 +71,11 @@ jobs:
           components: rustfmt
       - name: format
         run: cargo +nightly fmt -- --check
+      # datafusion-executor is a separate workspace (see its Cargo.toml), so the root fmt above
+      # does not reach it. Check it explicitly.
+      - name: format datafusion-executor
+        working-directory: datafusion-executor
+        run: cargo +nightly fmt -- --check
 
   msrv:
     runs-on: ubuntu-latest
@@ -428,3 +433,29 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # datafusion-executor is its own workspace (it pins kernel to arrow-58 to match DataFusion,
+  # while the root workspace uses arrow-59; see datafusion-executor/Cargo.toml). The --workspace
+  # jobs above therefore never touch it, so it needs a dedicated job to build, lint, and test it.
+  datafusion-executor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install minimal stable with clippy
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: datafusion-executor
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: build and lint with clippy
+        working-directory: datafusion-executor
+        run: |
+          cargo build --locked
+          cargo clippy --locked --tests -- -D warnings
+      - name: test
+        working-directory: datafusion-executor
+        run: cargo test --locked

@@ -20,15 +20,16 @@ version range (`incremental_scan`).
 > arrow majors at once (arrow-59 winning by precedence), linking DataFusion's arrow-58 types
 > against kernel's arrow-59 -- a diamond that breaks the build. Its own `[workspace]` resolves the
 > kernel dep in isolation on arrow-58. Consequence: the `--workspace` commands below do NOT touch
-> it, and it is built/tested on its own (from its directory, or with `--manifest-path`).
+> it, and it is built/tested on its own by cd-ing into its directory.
 
 ```bash
 # Build
 cargo build --workspace --all-features
 
-# Build & test the datafusion_executor crate (separate workspace, see note above)
-cargo build --manifest-path datafusion-executor/Cargo.toml
-cargo test --manifest-path datafusion-executor/Cargo.toml
+# Build & test the datafusion_executor crate. It has its own [workspace] (see note above), so cd
+# into it and cargo picks it up automatically. The subshell keeps the cd from leaking out.
+(cd datafusion-executor && cargo build)
+(cd datafusion-executor && cargo test)
 
 # Run all tests (prefer nextest over cargo test)
 cargo nextest run --workspace --all-features
