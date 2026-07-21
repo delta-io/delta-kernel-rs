@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use delta_kernel_benchmarks::registry::BenchRegistry;
+use delta_kernel_benchmarks::registry::{default_snapshot_construction_config, BenchRegistry};
 use delta_kernel_benchmarks::runners::{
     benchmark_name, configured_benchmark_name, create_read_runner, SnapshotConstructionRunner,
     WorkloadRunner,
@@ -65,15 +65,38 @@ fn workload_benchmarks(c: &mut Criterion) {
                 }
             }
             Spec::SnapshotConstruction(snapshot_construction_spec) => {
-                let name = benchmark_name(&workload.table_info, case_name);
-                let runner = SnapshotConstructionRunner::setup(
-                    name,
-                    snapshot_construction_spec,
-                    &workload.table_info,
-                    runtime.clone(),
-                )
-                .expect("Failed to create snapshot construction runner");
-                run_benchmark(c, &runner, &reporter);
+                let configs = registry
+                    .snapshot_configs(workload)
+                    .expect("Registry entry must contain snapshot-construction configs");
+                if let Some(configs) = configs {
+                    for config in configs {
+                        let name = configured_benchmark_name(
+                            &workload.table_info,
+                            case_name,
+                            &config.name,
+                        );
+                        let runner = SnapshotConstructionRunner::setup(
+                            name,
+                            snapshot_construction_spec,
+                            config,
+                            &workload.table_info,
+                            runtime.clone(),
+                        )
+                        .expect("Failed to create snapshot construction runner");
+                        run_benchmark(c, &runner, &reporter);
+                    }
+                } else {
+                    let name = benchmark_name(&workload.table_info, case_name);
+                    let runner = SnapshotConstructionRunner::setup(
+                        name,
+                        snapshot_construction_spec,
+                        default_snapshot_construction_config(),
+                        &workload.table_info,
+                        runtime.clone(),
+                    )
+                    .expect("Failed to create snapshot construction runner");
+                    run_benchmark(c, &runner, &reporter);
+                }
             }
         }
     }
