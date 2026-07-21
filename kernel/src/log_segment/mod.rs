@@ -2,6 +2,7 @@
 //! files.
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -240,6 +241,17 @@ impl LogSegment {
         )?;
         validate_latest_commit_file(&listed_files, effective_version)?;
 
+        // A CRC describes the table state at its version, so it can never postdate the segment.
+        if let Some(crc) = &listed_files.latest_crc_file {
+            require!(
+                crc.version <= effective_version,
+                Error::internal_error(format!(
+                    "CRC file version {} is newer than log segment version {effective_version}",
+                    crc.version
+                ))
+            );
+        }
+
         let log_segment = LogSegment {
             end_version: effective_version,
             checkpoint_version,
@@ -345,25 +357,32 @@ impl LogSegment {
         let log_segment =
             build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
-        emit_log_segment_load(
-            &metric_context,
-            log_segment.listed.ascending_commit_files.len() as u64,
-            log_segment.listed.checkpoint_parts.len() as u64,
-            log_segment.listed.ascending_compaction_files.len() as u64,
-            log_segment.crc_versions_behind(),
-            start.elapsed(),
-        );
+        log_segment.emit_load(&metric_context, start.elapsed());
         Ok(log_segment)
+    }
+
+    /// Emit a `LogSegmentLoadSuccess` for this assembled segment, reporting its file counts and
+    /// CRC staleness. Callers time the load and pass the elapsed `duration`.
+    pub(crate) fn emit_load(&self, metric_context: &SnapshotLoadMetricContext, duration: Duration) {
+        emit_log_segment_load(
+            metric_context,
+            self.listed.ascending_commit_files.len() as u64,
+            self.listed.checkpoint_parts.len() as u64,
+            self.listed.ascending_compaction_files.len() as u64,
+            self.crc_versions_behind(),
+            duration,
+        );
     }
 
     /// How many versions behind `end_version` the latest on-disk CRC file is, for the
     /// `LogSegmentLoad` metric: `None` if there is no CRC file, else `end_version - crc.version`
-    /// (`Some(0)` when a CRC sits at the end version).
+    /// (`Some(0)` when a CRC sits at the end version). `try_new` enforces `crc.version <=
+    /// end_version`, so the subtraction never underflows.
     pub(crate) fn crc_versions_behind(&self) -> Option<u64> {
         self.listed
             .latest_crc_file
             .as_ref()
-            .map(|crc| self.end_version.saturating_sub(crc.version))
+            .map(|crc| self.end_version - crc.version)
     }
 
     // factored out for testing

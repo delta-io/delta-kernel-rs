@@ -11,7 +11,7 @@ use super::{IncrementalReplay, Snapshot};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
-    emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
+    emit_log_segment_load_failure, emit_protocol_metadata_load,
     emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
 };
 use crate::path::ParsedLogPath;
@@ -133,22 +133,10 @@ impl Snapshot {
             tracing::Span::current().record("version", existing_snapshot_version);
         }
 
-        // Check for new commits (and CRC).
-        let segment_load_start = std::time::Instant::now();
-        let emit_segment_load = |ctx: &SnapshotLoadMetricContext, segment: &LogSegment| {
-            emit_log_segment_load(
-                ctx,
-                segment.listed.ascending_commit_files.len() as u64,
-                segment.listed.checkpoint_parts.len() as u64,
-                segment.listed.ascending_compaction_files.len() as u64,
-                segment.crc_versions_behind(),
-                segment_load_start.elapsed(),
-            );
-        };
-
         // List and assemble the new segment as one fallible unit so a load failure emits exactly
         // once here. A propagated `Err` is a genuine load failure; the returned `NewSegment` is
         // not.
+        let segment_load_start = std::time::Instant::now();
         let (combined_log_segment, new_end_version) = match Self::build_new_segment(
             engine,
             existing_log_segment,
@@ -169,7 +157,7 @@ impl Snapshot {
                 return Self::reuse_promoting_built_as_latest(&existing_snapshot, built_as_latest);
             }
             NewSegment::Rebuild(new_log_segment) => {
-                emit_segment_load(&metric_context, &new_log_segment);
+                new_log_segment.emit_load(&metric_context, segment_load_start.elapsed());
                 let snapshot = Self::try_new_from_log_segment(
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
@@ -184,7 +172,7 @@ impl Snapshot {
                 combined_log_segment,
                 new_end_version,
             } => {
-                emit_segment_load(&metric_context, &combined_log_segment);
+                combined_log_segment.emit_load(&metric_context, segment_load_start.elapsed());
                 (combined_log_segment, new_end_version)
             }
         };
@@ -504,7 +492,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::{
-        LogSegmentLoadPurpose, LogSegmentLoadSuccess, MetricEvent, MetricId,
+        LogSegmentLoadSuccess, LogSegmentLoadType, MetricEvent, MetricId,
         ProtocolMetadataLoadSuccess, ProtocolMetadataSource,
     };
     use crate::object_store::memory::InMemory;
@@ -590,18 +578,18 @@ mod tests {
         Ok(())
     }
 
-    struct IncrementalSnapshotTestContext {
+    struct IncrementalTestContext {
         store: Arc<InMemory>,
         url: Url,
         engine: Arc<SyncEngine>,
     }
 
-    fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalSnapshotTestContext> {
+    fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalTestContext> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
 
-        Ok(IncrementalSnapshotTestContext { store, url, engine })
+        Ok(IncrementalTestContext { store, url, engine })
     }
 
     /// Compares two Snapshots field-by-field. LogSegment fields are compared individually,
@@ -1982,10 +1970,10 @@ mod tests {
         let events = reporter.events();
         let pm = protocol_metadata_load(&events);
         assert_eq!(pm.source, expected_source);
-        assert_eq!(pm.load_purpose, LogSegmentLoadPurpose::FreshSnapshot);
+        assert_eq!(pm.load_type, LogSegmentLoadType::Full);
 
         let seg = log_segment_load(&events);
-        assert_eq!(seg.load_purpose, LogSegmentLoadPurpose::FreshSnapshot);
+        assert_eq!(seg.load_type, LogSegmentLoadType::Full);
         // The v0-v3 table has 4 commits, no checkpoint or compaction.
         assert_eq!(seg.num_commit_files, 4);
         assert_eq!(seg.num_checkpoint_files, 0);
@@ -2058,9 +2046,9 @@ mod tests {
         let events = reporter.events();
         let pm = protocol_metadata_load(&events);
         assert_eq!(pm.source, expected_source);
-        assert_eq!(pm.load_purpose, LogSegmentLoadPurpose::IncrementalSnapshot);
+        assert_eq!(pm.load_type, LogSegmentLoadType::Incremental);
         let seg = log_segment_load(&events);
-        assert_eq!(seg.load_purpose, LogSegmentLoadPurpose::IncrementalSnapshot);
+        assert_eq!(seg.load_type, LogSegmentLoadType::Incremental);
         Ok(())
     }
 
@@ -2182,12 +2170,14 @@ mod tests {
         assert!(result.is_err());
 
         let events = reporter.events();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, MetricEvent::LogSegmentLoadFailure(_))),
-            "expected a LogSegmentLoadFailure"
-        );
+        let failure = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+                _ => None,
+            })
+            .expect("expected a LogSegmentLoadFailure");
+        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
         assert!(
             !events
                 .iter()
@@ -2198,7 +2188,7 @@ mod tests {
     }
 
     // Case D.1 (checkpoint strictly ahead of the base) rebuilds via the fresh emitter, but the
-    // load was requested incrementally, so both events must still report IncrementalSnapshot.
+    // load was requested incrementally, so both events must still report Incremental.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_incremental_rebuild_reports_incremental_purpose() -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
@@ -2224,12 +2214,12 @@ mod tests {
 
         let events = reporter.events();
         assert_eq!(
-            log_segment_load(&events).load_purpose,
-            LogSegmentLoadPurpose::IncrementalSnapshot
+            log_segment_load(&events).load_type,
+            LogSegmentLoadType::Incremental
         );
         assert_eq!(
-            protocol_metadata_load(&events).load_purpose,
-            LogSegmentLoadPurpose::IncrementalSnapshot
+            protocol_metadata_load(&events).load_type,
+            LogSegmentLoadType::Incremental
         );
         Ok(())
     }
