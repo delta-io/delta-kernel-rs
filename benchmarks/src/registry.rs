@@ -53,6 +53,8 @@ pub struct SnapshotConstructionConfig {
     pub name: String,
     /// Snapshot construction source.
     pub snapshot_builder: SnapshotBuilderConfig,
+    /// Incremental CRC replay policy applied to snapshot construction.
+    pub incremental_crc_replay: IncrementalCrcReplay,
 }
 
 /// The built-in fresh snapshot-construction config.
@@ -60,6 +62,7 @@ pub fn default_snapshot_construction_config() -> SnapshotConstructionConfig {
     SnapshotConstructionConfig {
         name: "fresh".into(),
         snapshot_builder: SnapshotBuilderConfig::For,
+        incremental_crc_replay: IncrementalCrcReplay::Disabled,
     }
 }
 
@@ -74,6 +77,21 @@ pub enum SnapshotBuilderConfig {
         /// Version of the preconstructed base snapshot.
         version: u64,
     },
+}
+
+/// Controls whether stale CRC state is advanced during snapshot construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum IncrementalCrcReplay {
+    /// Never advance a stale CRC.
+    Disabled,
+    /// Advance a stale CRC when it is within the configured commit budget.
+    UpToCommits {
+        /// Maximum number of commits between the CRC and target snapshot.
+        num_commits: u64,
+    },
+    /// Advance a stale CRC regardless of distance.
+    Unlimited,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -318,11 +336,20 @@ mod tests {
             "snapshotLatest": [
                 {
                     "name": "fresh",
-                    "snapshotBuilder": "for"
+                    "snapshotBuilder": "for",
+                    "incrementalCrcReplay": "disabled"
                 },
                 {
-                    "name": "from199",
-                    "snapshotBuilder": { "from": { "version": 199 } }
+                    "name": "from199IncrementalCrc",
+                    "snapshotBuilder": { "from": { "version": 199 } },
+                    "incrementalCrcReplay": {
+                        "upToCommits": { "numCommits": 5 }
+                    }
+                },
+                {
+                    "name": "freshUnlimitedCrc",
+                    "snapshotBuilder": "for",
+                    "incrementalCrcReplay": "unlimited"
                 }
             ]
         }
@@ -333,7 +360,7 @@ mod tests {
         let registry = registry_from_str(FULL_REGISTRY);
         assert_eq!(registry.tables.len(), 1);
         assert_eq!(registry.tables["v2"]["readMetadataLatest"].len(), 2);
-        assert_eq!(registry.tables["v2"]["snapshotLatest"].len(), 2);
+        assert_eq!(registry.tables["v2"]["snapshotLatest"].len(), 3);
     }
 
     #[test]
@@ -362,6 +389,14 @@ mod tests {
         assert_eq!(
             configs[1].snapshot_builder,
             SnapshotBuilderConfig::From { version: 199 }
+        );
+        assert_eq!(
+            configs[1].incremental_crc_replay,
+            IncrementalCrcReplay::UpToCommits { num_commits: 5 }
+        );
+        assert_eq!(
+            configs[2].incremental_crc_replay,
+            IncrementalCrcReplay::Unlimited
         );
     }
 
@@ -461,7 +496,8 @@ mod tests {
                 { "name": "read", "parallelScan": "disabled" },
                 {
                     "name": "snapshot",
-                    "snapshotBuilder": "for"
+                    "snapshotBuilder": "for",
+                    "incrementalCrcReplay": "disabled"
                 }
             ] }
         }"#;

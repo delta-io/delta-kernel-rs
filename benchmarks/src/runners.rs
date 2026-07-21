@@ -14,6 +14,7 @@ use std::sync::Arc;
 use delta_kernel::expressions::PredicateRef;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata, StatsOptions};
+use delta_kernel::snapshot::IncrementalReplay;
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
@@ -26,7 +27,7 @@ use unity_catalog_delta_client_api::Operation;
 use unity_catalog_delta_client_default::{ClientConfig, UCClient};
 use url::Url;
 
-use crate::registry::{ParallelScan, ReadConfig, SnapshotBuilderConfig};
+use crate::registry::{IncrementalCrcReplay, ParallelScan, ReadConfig, SnapshotBuilderConfig};
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
@@ -96,16 +97,24 @@ impl SnapshotStrategy {
         engine: &dyn Engine,
         runtime: &tokio::runtime::Runtime,
         time_travel: Option<&TimeTravel>,
+        incremental_replay: IncrementalReplay,
     ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
         match self {
             SnapshotStrategy::Standard { url } => {
-                let mut builder = Snapshot::builder_for(url.clone());
+                let mut builder = Snapshot::builder_for(url.clone())
+                    .with_incremental_crc_replay(incremental_replay);
                 if let Some(tt) = time_travel {
                     builder = builder.at_version(tt.as_version()?);
                 }
                 Ok(builder.build(engine)?)
             }
             SnapshotStrategy::CatalogManaged { table_name, client } => {
+                if incremental_replay != IncrementalReplay::Disabled {
+                    return Err(
+                        "Incremental CRC replay is unsupported for catalog-managed snapshots"
+                            .into(),
+                    );
+                }
                 let (catalog, schema, table) = parse_three_part_name(table_name)?;
                 let resp = runtime
                     .block_on(client.load_table(catalog, schema, table))
@@ -130,6 +139,16 @@ fn parse_three_part_name(name: &str) -> Result<(&str, &str, &str), Box<dyn std::
     }
 }
 
+impl From<IncrementalCrcReplay> for IncrementalReplay {
+    fn from(value: IncrementalCrcReplay) -> Self {
+        match value {
+            IncrementalCrcReplay::Disabled => Self::Disabled,
+            IncrementalCrcReplay::UpToCommits { num_commits } => Self::UpToCommits(num_commits),
+            IncrementalCrcReplay::Unlimited => Self::Unlimited,
+        }
+    }
+}
+
 fn validate_snapshot_versions(
     snapshot_spec: &SnapshotConstructionSpec,
     snapshot_builder: &SnapshotBuilderConfig,
@@ -145,8 +164,12 @@ fn validate_snapshot_versions(
 
 fn validate_snapshot_strategy(
     snapshot_builder: &SnapshotBuilderConfig,
+    incremental_crc_replay: IncrementalCrcReplay,
     is_catalog_managed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if is_catalog_managed && incremental_crc_replay != IncrementalCrcReplay::Disabled {
+        return Err("Incremental CRC replay is unsupported for catalog-managed snapshots".into());
+    }
     if is_catalog_managed && matches!(snapshot_builder, SnapshotBuilderConfig::From { .. }) {
         return Err("Snapshot::builder_from is unsupported for catalog-managed benchmarks".into());
     }
@@ -280,8 +303,12 @@ impl ReadMetadataRunner {
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
-        let snapshot =
-            strategy.load_snapshot(engine.as_ref(), &runtime, read_spec.time_travel.as_ref())?;
+        let snapshot = strategy.load_snapshot(
+            engine.as_ref(),
+            &runtime,
+            read_spec.time_travel.as_ref(),
+            IncrementalReplay::Disabled,
+        )?;
 
         let predicate = read_spec
             .predicate
@@ -426,6 +453,7 @@ pub struct SnapshotConstructionRunner {
     runtime: Arc<tokio::runtime::Runtime>,
     source: SnapshotConstructionSource,
     time_travel: Option<TimeTravel>,
+    incremental_replay: IncrementalReplay,
     name: String,
 }
 
@@ -433,9 +461,9 @@ impl SnapshotConstructionRunner {
     /// Prepares a snapshot-construction benchmark and state excluded from timing.
     ///
     /// `name` is the Criterion benchmark identifier, `snapshot_spec` selects the target version,
-    /// `snapshot_builder` selects fresh or incremental construction, `table_info` identifies the
-    /// table, and `runtime` executes asynchronous setup work. Incremental benchmarks load their
-    /// base snapshot during setup.
+    /// `snapshot_builder` selects fresh or incremental construction, `incremental_crc_replay`
+    /// selects the CRC replay policy, `table_info` identifies the table, and `runtime` executes
+    /// asynchronous setup work. Incremental benchmarks load their base snapshot during setup.
     ///
     /// Returns a runner whose [`WorkloadRunner::execute`] method performs only the measured
     /// snapshot construction.
@@ -446,14 +474,20 @@ impl SnapshotConstructionRunner {
         name: String,
         snapshot_spec: &SnapshotConstructionSpec,
         snapshot_builder: SnapshotBuilderConfig,
+        incremental_crc_replay: IncrementalCrcReplay,
         table_info: &TableInfo,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         validate_snapshot_versions(snapshot_spec, &snapshot_builder)?;
         let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
+        let incremental_replay = incremental_crc_replay.into();
         let is_catalog_managed =
             matches!(&snapshot_strategy, SnapshotStrategy::CatalogManaged { .. });
-        validate_snapshot_strategy(&snapshot_builder, is_catalog_managed)?;
+        validate_snapshot_strategy(
+            &snapshot_builder,
+            incremental_crc_replay,
+            is_catalog_managed,
+        )?;
 
         let source = match snapshot_builder {
             SnapshotBuilderConfig::For => SnapshotConstructionSource::Fresh(snapshot_strategy),
@@ -465,9 +499,11 @@ impl SnapshotConstructionRunner {
                     engine.as_ref(),
                     &runtime,
                     Some(&base_time_travel),
+                    incremental_replay,
                 )?;
                 if snapshot_spec.time_travel.is_none() {
                     let target_version = Snapshot::builder_from(existing_snapshot.clone())
+                        .with_incremental_crc_replay(incremental_replay)
                         .build(engine.as_ref())?
                         .version();
                     validate_base_precedes_target(version, target_version)?;
@@ -481,6 +517,7 @@ impl SnapshotConstructionRunner {
             runtime,
             source,
             time_travel: snapshot_spec.time_travel.clone(),
+            incremental_replay,
             name,
         })
     }
@@ -494,9 +531,11 @@ impl WorkloadRunner for SnapshotConstructionRunner {
                     self.engine.as_ref(),
                     &self.runtime,
                     self.time_travel.as_ref(),
+                    self.incremental_replay,
                 )?,
             SnapshotConstructionSource::Existing(existing_snapshot) => {
-                let mut builder = Snapshot::builder_from(existing_snapshot.clone());
+                let mut builder = Snapshot::builder_from(existing_snapshot.clone())
+                    .with_incremental_crc_replay(self.incremental_replay);
                 if let Some(time_travel) = self.time_travel.as_ref() {
                     builder = builder.at_version(time_travel.as_version()?);
                 }
@@ -671,6 +710,7 @@ mod tests {
             benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
             SnapshotBuilderConfig::For,
+            IncrementalCrcReplay::Disabled,
             &test_table_info(),
             test_runtime(),
         )
@@ -685,6 +725,7 @@ mod tests {
             configured_benchmark_name(&test_table_info(), "testCase", "from0"),
             &test_snapshot_spec(),
             from_snapshot_config(0),
+            IncrementalCrcReplay::Disabled,
             &test_table_info(),
             test_runtime(),
         )
@@ -711,6 +752,7 @@ mod tests {
             ),
             &spec,
             from_snapshot_config(base_version),
+            IncrementalCrcReplay::Disabled,
             &test_table_info(),
             test_runtime(),
         )
@@ -728,6 +770,7 @@ mod tests {
             configured_benchmark_name(&table_info, "testCase", "from0"),
             &test_snapshot_spec(),
             from_snapshot_config(0),
+            IncrementalCrcReplay::Disabled,
             &table_info,
             test_runtime(),
         )
@@ -737,8 +780,12 @@ mod tests {
 
     #[test]
     fn snapshot_from_rejects_catalog_managed_config() {
-        let error = validate_snapshot_strategy(&from_snapshot_config(0), true)
-            .expect_err("catalog-managed builder_from must be rejected");
+        let error = validate_snapshot_strategy(
+            &from_snapshot_config(0),
+            IncrementalCrcReplay::Disabled,
+            true,
+        )
+        .expect_err("catalog-managed builder_from must be rejected");
         assert!(error.to_string().contains("catalog-managed"));
     }
 
@@ -767,12 +814,40 @@ mod tests {
             configured_benchmark_name(&table_info, "snapshotVersion1", "from0"),
             &spec,
             from_snapshot_config(0),
+            IncrementalCrcReplay::Disabled,
             &table_info,
             test_runtime(),
         )
         .expect("setup should succeed");
 
         runner.execute().expect("version 2 must not be read");
+    }
+
+    #[test]
+    fn test_snapshot_construction_rejects_catalog_managed_incremental_crc() {
+        let err = validate_snapshot_strategy(
+            &SnapshotBuilderConfig::For,
+            IncrementalCrcReplay::Unlimited,
+            true,
+        )
+        .expect_err("catalog-managed incremental CRC should be rejected")
+        .to_string();
+        assert!(
+            err.contains("unsupported for catalog-managed snapshots"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_incremental_crc_replay_config_conversion() {
+        assert_eq!(
+            IncrementalReplay::from(IncrementalCrcReplay::UpToCommits { num_commits: 5 }),
+            IncrementalReplay::UpToCommits(5)
+        );
+        assert_eq!(
+            IncrementalReplay::from(IncrementalCrcReplay::Unlimited),
+            IncrementalReplay::Unlimited
+        );
     }
 
     /// Guards the checked-in `bench-registry.json` so a malformed edit or a duplicate config name
@@ -795,11 +870,11 @@ mod tests {
             read.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["serial", "parallel2"]
         );
-        for table in [
-            "crc1Col200Commits1ChkptCrc150",
-            "crc1Col200Commits1ChkptCrc195",
-            "crc1Col200Commits1ChkptCrcLatest",
-            "crc1Col200Commits1ChkptNoCrc",
+        for (table, crc_budget) in [
+            ("crc1Col200Commits1ChkptCrc150", Some(50)),
+            ("crc1Col200Commits1ChkptCrc195", Some(5)),
+            ("crc1Col200Commits1ChkptCrcLatest", None),
+            ("crc1Col200Commits1ChkptNoCrc", None),
         ] {
             let workload = registry_workload(
                 table,
@@ -819,10 +894,39 @@ mod tests {
 
             assert_eq!(config("fresh").snapshot_builder, SnapshotBuilderConfig::For);
             assert_eq!(
+                config("fresh").incremental_crc_replay,
+                IncrementalCrcReplay::Disabled
+            );
+            assert_eq!(
                 config("from199").snapshot_builder,
                 SnapshotBuilderConfig::From { version: 199 }
             );
-            assert_eq!(snapshots.len(), 2, "unexpected configs for '{table}'");
+            assert_eq!(
+                config("from199").incremental_crc_replay,
+                IncrementalCrcReplay::Disabled
+            );
+
+            if let Some(num_commits) = crc_budget {
+                let expected = IncrementalCrcReplay::UpToCommits { num_commits };
+                assert_eq!(
+                    config("freshIncrementalCrc").snapshot_builder,
+                    SnapshotBuilderConfig::For
+                );
+                assert_eq!(
+                    config("freshIncrementalCrc").incremental_crc_replay,
+                    expected
+                );
+                assert_eq!(
+                    config("from199IncrementalCrc").snapshot_builder,
+                    SnapshotBuilderConfig::From { version: 199 }
+                );
+                assert_eq!(
+                    config("from199IncrementalCrc").incremental_crc_replay,
+                    expected
+                );
+            } else {
+                assert_eq!(snapshots.len(), 2, "unexpected CRC configs for '{table}'");
+            }
         }
     }
 
@@ -959,6 +1063,7 @@ mod tests {
             benchmark_name(&test_table_info(), "testCase"),
             &spec,
             SnapshotBuilderConfig::For,
+            IncrementalCrcReplay::Disabled,
             &test_table_info(),
             test_runtime(),
         )

@@ -157,11 +157,13 @@ that belong with the source live here and reference benchmarks by name.
     "snapshotLatest": [
       {
         "name": "fresh",
-        "snapshotBuilder": "for"
+        "snapshotBuilder": "for",
+        "incrementalCrcReplay": "disabled"
       },
       {
-        "name": "from199",
-        "snapshotBuilder": { "from": { "version": 199 } }
+        "name": "from199IncrementalCrc",
+        "snapshotBuilder": { "from": { "version": 199 } },
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 5 } }
       }
     ]
   },
@@ -194,7 +196,11 @@ Config-field value forms:
   `Snapshot::builder_from` during each iteration. The base version must be strictly lower than an
   explicit target version. For a latest-target workload, setup resolves the actual latest snapshot
   version before accepting the base.
-- Catalog-managed snapshot benchmarks support only `"snapshotBuilder": "for"`.
+- `incrementalCrcReplay` (snapshot-construction configs): `"disabled"`,
+  `{ "upToCommits": { "numCommits": <n> } }`, or `"unlimited"`. The policy applies both while
+  preparing a `builder_from` base snapshot and during the timed construction.
+- Catalog-managed snapshot benchmarks support only `"snapshotBuilder": "for"` with
+  `"incrementalCrcReplay": "disabled"`.
 
 ## Workload data layout
 
