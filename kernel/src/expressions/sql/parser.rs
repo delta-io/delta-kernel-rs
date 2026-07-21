@@ -16,12 +16,13 @@ use super::token::Token;
 use crate::expressions::ColumnName;
 use crate::{DeltaResult, Error};
 
-/// An operand of a comparison: a column reference (its as-written path) or a literal (raw source
-/// text, e.g. `42`, `'foo'`, `NULL`).
+/// An operand of a comparison: a column reference (its as-written path), a literal (raw source
+/// text, e.g. `42`, `'foo'`), or `NULL`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Operand {
     Column(ColumnName),
     Literal(String),
+    Null,
 }
 
 /// A comparison operator. Kernel has no native `<=`/`>=`/`!=` predicate op; lowering composes them
@@ -113,6 +114,7 @@ impl Parser {
                 }
             }
             Some(Token::Number(raw)) | Some(Token::Literal(raw)) => Ok(Operand::Literal(raw)),
+            Some(Token::Null) => Ok(Operand::Null),
             Some(Token::Ident(first)) => self.parse_column_path(first),
             other => Err(expected("a column or literal", other)),
         }
@@ -156,6 +158,10 @@ mod tests {
 
     fn lit(s: &str) -> Operand {
         Operand::Literal(s.to_string())
+    }
+
+    fn null() -> Operand {
+        Operand::Null
     }
 
     /// Each operator token maps to its `CmpOp`, with the two operands preserved in order.
@@ -239,7 +245,7 @@ mod tests {
     #[case("ratio == .25", CmpOp::Eq, col(&["ratio"]), lit(".25"))]
     #[case("a.b.c <= 100", CmpOp::Le, col(&["a", "b", "c"]), lit("100"))]
     #[case("x != y", CmpOp::Ne, col(&["x"]), col(&["y"]))]
-    #[case("n <=> NULL", CmpOp::NullSafeEq, col(&["n"]), lit("NULL"))]
+    #[case("n <=> NULL", CmpOp::NullSafeEq, col(&["n"]), null())]
     #[case("+5 < a", CmpOp::Lt, lit("+5"), col(&["a"]))]
     #[case("status = 'active'", CmpOp::Eq, col(&["status"]), lit("'active'"))]
     fn tokenize_then_parse_yields_expected_comparison(

@@ -10,7 +10,7 @@
 
 use super::parse_sql;
 use super::parser::{CmpOp, Comparison, Operand};
-use crate::expressions::{ColumnName, Expression, Predicate};
+use crate::expressions::{ColumnName, Expression, Predicate, Scalar};
 use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
 
@@ -20,7 +20,7 @@ use crate::{DeltaResult, Error};
 /// Kernel only lowers a comparison it can evaluate to the *same* boolean the writer would;
 /// anything else returns `Err` (what the caller does with an un-lowerable constraint is the
 /// caller's contract, not this function's). The resolved operands must therefore satisfy all of:
-/// - at least one operand is a column, so a literal can be typed from it;
+/// - at least one operand is a column, so a literal or `NULL` can be typed from it;
 /// - every column operand is primitive-typed. Spark does support `=`/`<=>` on struct/array/map
 ///   (only ordering is primitive-only), but kernel's engine cannot: the default engine's comparison
 ///   routes through arrow's `cmp` kernels, which error on nested types. Lowering a complex-type
@@ -49,20 +49,21 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
     let Comparison { op, left, right } = comparison;
     let left = resolve_operand(left, schema)?;
     let right = resolve_operand(right, schema)?;
-    // `nested = NULL` would otherwise lower silently: `parse_sql("NULL", <struct>)` succeeds (NULL
-    // is valid for any type), so the primitive-only check must run on the column operand here.
-    // (`nested = 0` is already caught by `parse_sql` rejecting a non-primitive literal target.)
+    // Reject a non-primitive column up front: the column-vs-other arms below would otherwise type
+    // the other operand against the struct/array/map type (e.g. `nested = NULL` -> a valid
+    // `Scalar::Null(<struct>)`) and lower a comparison the engine cannot evaluate.
     left.ensure_comparable()?;
     right.ensure_comparable()?;
-    // A literal is typed from the column on the other side, so at least one operand must be a
-    // column.
-    let (left_expr, right_expr) = match (left, right) {
+    // A non-column operand (literal or NULL) is typed from the column on the other side, so at
+    // least one operand must be a column.
+    use ResolvedOperand::Column;
+    let (left_expr, right_expr) = match (&left, &right) {
         (
-            ResolvedOperand::Column {
+            Column {
                 canonical: l,
                 data_type: l_type,
             },
-            ResolvedOperand::Column {
+            Column {
                 canonical: r,
                 data_type: r_type,
             },
@@ -80,29 +81,29 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
                     r.join(".")
                 )));
             }
-            (Expression::column(l), Expression::column(r))
+            (Expression::column(l.clone()), Expression::column(r.clone()))
         }
         (
-            ResolvedOperand::Column {
+            Column {
                 canonical,
                 data_type,
             },
-            ResolvedOperand::Literal(raw),
+            other,
         ) => (
-            Expression::column(canonical),
-            type_literal_from_column(&raw, &data_type)?,
+            Expression::column(canonical.clone()),
+            other.type_against_column(data_type)?,
         ),
         (
-            ResolvedOperand::Literal(raw),
-            ResolvedOperand::Column {
+            other,
+            Column {
                 canonical,
                 data_type,
             },
         ) => (
-            type_literal_from_column(&raw, &data_type)?,
-            Expression::column(canonical),
+            other.type_against_column(data_type)?,
+            Expression::column(canonical.clone()),
         ),
-        (ResolvedOperand::Literal(_), ResolvedOperand::Literal(_)) => {
+        _ => {
             return Err(Error::generic(
                 "CHECK constraint comparison must reference at least one column",
             ))
@@ -133,19 +134,18 @@ pub(super) fn lower(comparison: &Comparison, schema: &StructType) -> DeltaResult
 /// not gated in and is rejected.
 ///
 /// Kernel has no cast expression and cannot compare f32 to f64, so it cannot reproduce Spark's
-/// widening. `NULL` is allowed (a null comparison involves no f32/f64 rounding). Only FLOAT is
-/// affected; a DOUBLE column already compares at f64, matching Spark. (The signed-zero divergence
-/// in [`lower`]'s doc is orthogonal: it is about the column's stored value, and applies to any
-/// float comparison regardless of this gate.)
+/// widening. Only FLOAT is affected; a DOUBLE column already compares at f64, matching Spark. (The
+/// signed-zero divergence in [`lower`]'s doc is orthogonal: it is about the column's stored value,
+/// and applies to any float comparison regardless of this gate.)
 // TODO(#2896): once kernel has a cast expression, lower `cast(col AS DOUBLE) <op> lit` and drop
 // this gate, matching Spark's f64 compare for every literal.
 fn type_literal_from_column(raw: &str, column_type: &DataType) -> DeltaResult<Expression> {
-    let is_null = raw.eq_ignore_ascii_case("null");
     // A FLOAT column narrows the literal to f32, but Spark widens the column to f64, so the two
     // compares agree only when the literal is f32-exact. For an integer that means round-tripping
     // through f32 unchanged (which also rejects out-of-i64 integers, since those fail to parse).
+    // NULL never reaches here -- it is a structural `ResolvedOperand::Null`, typed directly.
     let is_f32_exact_int = raw.parse::<i64>().is_ok_and(|v| v as f32 as i64 == v);
-    if column_type == &DataType::FLOAT && !is_null && !is_f32_exact_int {
+    if column_type == &DataType::FLOAT && !is_f32_exact_int {
         return Err(Error::generic(format!(
             "CHECK constraint comparing a FLOAT column against the literal '{raw}' is not \
              supported: kernel compares at f32 while Spark (ANSI) widens the column to f64"
@@ -155,20 +155,22 @@ fn type_literal_from_column(raw: &str, column_type: &DataType) -> DeltaResult<Ex
 }
 
 /// A comparison operand after schema resolution: a column (its canonical schema-cased path and
-/// resolved leaf type) or a not-yet-typed literal (typed by [`lower`] from the column on the other
-/// side).
+/// resolved leaf type), a not-yet-typed literal (typed by [`lower`] from the column on the other
+/// side), or `NULL` (typed from the column, like a literal, but needs no parsing).
 enum ResolvedOperand {
     Column {
         canonical: Vec<String>,
         data_type: DataType,
     },
     Literal(String),
+    Null,
 }
 
 impl ResolvedOperand {
     /// Reject an operand the engine cannot compare. Only a column carries a type to check here (a
-    /// literal is typed later from the column on the other side, so it is a deliberate no-op); the
-    /// engine cannot compare nested types, so a non-primitive column is rejected. See [`lower`].
+    /// literal or `NULL` is typed later from the column on the other side, so both are a deliberate
+    /// no-op); the engine cannot compare nested types, so a non-primitive column is rejected. See
+    /// [`lower`].
     fn ensure_comparable(&self) -> DeltaResult<()> {
         let Self::Column {
             canonical,
@@ -185,6 +187,20 @@ impl ResolvedOperand {
         }
         Ok(())
     }
+
+    /// Type a non-column operand as an [`Expression`] of `column_type` -- the type of the column on
+    /// the other side of the comparison. A `NULL` becomes a typed null (no rounding, so no
+    /// FLOAT-gate); a literal is parsed and gated by [`type_literal_from_column`]. Only called for
+    /// the non-column operand of a column-vs-other comparison, so `Column` is unreachable.
+    fn type_against_column(&self, column_type: &DataType) -> DeltaResult<Expression> {
+        match self {
+            Self::Null => Ok(Expression::literal(Scalar::Null(column_type.clone()))),
+            Self::Literal(raw) => type_literal_from_column(raw, column_type),
+            Self::Column { .. } => Err(Error::generic(
+                "internal: type_against_column called on a column operand",
+            )),
+        }
+    }
 }
 
 /// Resolve an operand against `schema`, walking a column path at most once: a column yields its
@@ -194,6 +210,7 @@ impl ResolvedOperand {
 fn resolve_operand(operand: &Operand, schema: &StructType) -> DeltaResult<ResolvedOperand> {
     match operand {
         Operand::Literal(raw) => Ok(ResolvedOperand::Literal(raw.clone())),
+        Operand::Null => Ok(ResolvedOperand::Null),
         Operand::Column(column) => resolve_column(column, schema),
     }
 }
@@ -376,9 +393,9 @@ mod tests {
         "5 < weight",
         Predicate::lt(Expression::literal(Scalar::Float(5.0)), col("weight"))
     )]
-    // A NULL literal against a FLOAT column is allowed: a null comparison involves no f32/f64
-    // rounding, so the FLOAT-widening gate exempts it (the `!is_null` guard in
-    // `type_literal_from_column`). Without the exemption this would wrongly error.
+    // NULL against a FLOAT column lowers: NULL is a structural operand typed directly as
+    // `Scalar::Null(FLOAT)`, so it never hits the f32/f64 FLOAT gate (a null compare has no
+    // rounding). Pins that NULL bypasses `type_literal_from_column`.
     #[case::float_column_vs_null(
         "weight = NULL",
         Predicate::eq(col("weight"), Expression::literal(Scalar::Null(DataType::FLOAT)))
