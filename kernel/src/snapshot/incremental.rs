@@ -578,18 +578,18 @@ mod tests {
         Ok(())
     }
 
-    struct IncrementalTestContext {
+    struct IncrementalSnapshotTestContext {
         store: Arc<InMemory>,
         url: Url,
         engine: Arc<SyncEngine>,
     }
 
-    fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalTestContext> {
+    fn setup_incremental_snapshot_test() -> DeltaResult<IncrementalSnapshotTestContext> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = Arc::new(SyncEngine::new_with_store(store.clone()));
 
-        Ok(IncrementalTestContext { store, url, engine })
+        Ok(IncrementalSnapshotTestContext { store, url, engine })
     }
 
     /// Compares two Snapshots field-by-field. LogSegment fields are compared individually,
