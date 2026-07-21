@@ -188,10 +188,13 @@ Config-field value forms:
 - `parallelScan` (read configs): `"disabled"` or `{ "enabled": { "numThreads": <n> } }` — serde
   externally-tagged, so the fieldless variant is a bare string and the parameterized variant a
   single-key object.
-- `snapshotBuilder` (snapshot-construction configs): `"for"` builds from the table root, while
+- `snapshotBuilder` (snapshot-construction configs): `"for"` performs fresh construction using
+  the table's normal loading strategy, while
   `{ "from": { "version": <n> } }` prebuilds snapshot version `n` outside the timed loop and uses
-  `Snapshot::builder_from` during each iteration.
-- Catalog-managed snapshot benchmarks currently support only `"snapshotBuilder": "for"`.
+  `Snapshot::builder_from` during each iteration. The base version must be strictly lower than an
+  explicit target version. For a latest-target workload, setup resolves the actual latest snapshot
+  version before accepting the base.
+- Catalog-managed snapshot benchmarks support only `"snapshotBuilder": "for"`.
 
 ## Workload data layout
 
@@ -312,7 +315,9 @@ Deserialized from `tableInfo.json`. Captures a human label (`name`) and `descrip
 Deserialized from a JSON file in a table's `specs/` directory. Describes a single operation to benchmark (what to do, e.g. read at version 3). Two variants are supported:
 
 - **`Read`** — scan a table at an optional version (defaults to latest). A single `Read` spec expands into one benchmark per `ReadOperation` × `ReadConfig` combination — every relevant operation and parallelism mode is benchmarked. Currently only `ReadMetadata` is implemented; `ReadData` is not yet supported.
-- **`SnapshotConstruction`** — measure the cost of building a `Snapshot` from scratch at an optional version (defaults to latest)
+- **`SnapshotConstruction`** — measure the cost of constructing a `Snapshot` at an optional target
+  version (defaults to latest). The harness config selects fresh construction or construction from
+  a prebuilt earlier snapshot.
 
 Read specs:
 ```json
@@ -359,19 +364,9 @@ Or with a specific version:
 
 The concrete unit of work that gets benchmarked. Assembled when loading workloads by pairing a `Spec` (the operation) with a `TableInfo` (the table, whose directory determines `TableInfo::registry_table_key()`) and a `case_name`. A `Spec` file on its own solely describes an operation without context of the table it is performed on; when combined with a table, it becomes a `Workload`. A single table therefore produces multiple workloads, one for each spec file in its `specs/` directory.
 
-### Harness configs
-
-`ReadConfig` specifies whether metadata scanning runs serially or in parallel and how many threads
-to use. `SnapshotConstructionConfig` selects fresh or previous-snapshot construction. Multiple
-configs can be applied to the same workload to compare modes. Which configs run for a given
-benchmark is determined by the
-[registry](#registry-bench-registryjson).
-
 ### `WorkloadRunner`
 
-Owns all pre-built state for a workload so that `execute()` measures only the target operation.
-Read runners carry the selected `ReadConfig`. Snapshot-construction runners either construct from
-the table root or reuse a configured base snapshot prepared outside the timed loop.
+Setup prepares supporting state outside the timed loop; `execute()` runs the measured operation.
 
 
 ## Source Layout
