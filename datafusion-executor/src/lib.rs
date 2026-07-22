@@ -16,7 +16,7 @@ mod expression;
 mod predicate;
 mod scalar;
 
-pub use expression::kernel_to_df_expr;
+pub use expression::{kernel_to_df_expr, kernel_to_df_expr_typed};
 pub use predicate::kernel_predicate_to_df_expr;
 pub use scalar::kernel_to_df_scalar;
 
