@@ -9,7 +9,7 @@ use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
-use super::TableChanges;
+use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
@@ -109,6 +109,14 @@ impl TableChangesScanBuilder {
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
     pub fn build(self) -> DeltaResult<TableChangesScan> {
+        // Row-tracking CDF requires row-level reconciliation by row IDs, which this
+        // scanner does not perform.
+        if self.table_changes.mode != CdfMode::ChangeDataFeed {
+            return Err(Error::unsupported(
+                "A row-tracking TableChanges cannot be scanned for data; use \
+                 TableChanges::scan_file_listing instead",
+            ));
+        }
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
         // so valid references to unprojected columns aren't rejected.

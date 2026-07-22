@@ -20,6 +20,7 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
+use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
@@ -55,6 +56,30 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    // The data-reading (`execute`) path always uses change-data-file semantics.
+    table_changes_action_iter_with_mode(
+        engine,
+        start_table_configuration,
+        commit_files,
+        table_schema,
+        physical_predicate,
+        CdfMode::ChangeDataFeed,
+    )
+}
+
+/// Replays change-feed actions according to `mode`.
+///
+/// [`CdfMode::ChangeDataFeed`] uses `AddCDCFile` actions because they contain changes recorded by
+/// the writer. [`CdfMode::RowTracking`] ignores those actions and reconstructs changes from
+/// row lineage in the data files referenced by `add` and `remove` actions.
+pub(crate) fn table_changes_action_iter_with_mode(
+    engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
+    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    table_schema: SchemaRef,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    mode: CdfMode,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     // Skip against the raw `{ add, remove, ... }` action batch: table_changes must resolve
     // deletion vector pairs before filtering, so unlike the scan path it operates on raw
     // batches with stats parsed from `add.stats` JSON.
@@ -78,6 +103,7 @@ pub(crate) fn table_changes_action_iter(
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
+                mode,
             )?;
             scanner.into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
@@ -93,19 +119,21 @@ pub(crate) fn table_changes_action_iter(
 ///    In this phase, we do the following:
 ///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
 ///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead of
-///       time whether to filter out add/remove actions.
+///       time whether to filter out add/remove actions. In [`CdfMode::RowTracking`] mode `cdc`
+///       actions are ignored entirely, so add/remove actions always drive the feed.
 ///     - Constructs the remove deletion vector map from paths belonging to `remove` actions to the
 ///       action's corresponding [`DvInfo`]. This map will be filtered to only contain paths that
 ///       exists in another `add` action _within the same commit_. We store the result in
 ///       `remove_dvs`. Deletion vector resolution affects whether a remove action is selected in
 ///       the second phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
-///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
-///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
-///       compatibility is checked through schema equality. This will be expanded in the future to
-///       allow limited schema evolution.
+///     - Ensure that the mode's required table feature remains enabled on metadata updates.
+///     - Ensure that schema updates satisfy the mode's compatibility policy. Change Data Feed mode
+///       requires equality; row-tracking mode allows additive nullable columns and relaxed
+///       nullability, but rejects datatype changes.
+///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
 ///
-/// Note: We check the protocol, change data feed enablement, and schema compatibility in phase 1
+/// Note: We check the protocol, mode-specific table feature, and schema compatibility in phase 1
 /// in order to detect errors and fail early.
 ///
 /// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
@@ -114,12 +142,6 @@ pub(crate) fn table_changes_action_iter(
 /// to check the table property for deletion vector enablement.
 ///
 /// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
-///
-/// TODO: When the kernel supports in-commit timestamps, we will also have to inspect CommitInfo
-/// actions to find the timestamp. These are generated when incommit timestamps is enabled.
-/// This must be done in the first phase because the second phase lazily transforms engine data with
-/// an extra timestamp column. Thus, the timestamp must be known ahead of time.
-/// See https://github.com/delta-io/delta-kernel-rs/issues/559
 ///
 /// 2. Scan file generation phase [`LogReplayScanner::into_scan_batches`]: This iterates over every
 ///    action in the commit, and generates [`TableChangesScanMetadata`]. It does so by transforming
@@ -140,15 +162,7 @@ struct LogReplayScanner {
     remove_dvs: HashMap<String, DvInfo>,
     // The commit file that this replay scanner will operate on.
     commit_file: ParsedLogPath,
-    // The timestamp associated with this commit. This is the file modification time
-    // from the commit's [`FileMeta`].
-    //
-    //
-    // TODO when incommit timestamps are supported: If there is a [`CommitInfo`] with a timestamp
-    // generated by in-commit timestamps, that timestamp will be used instead.
-    //
-    // Note: This will be used once an expression is introduced to transform the engine data in
-    // [`TableChangesScanMetadata`]
+    // The in-commit timestamp when enabled, or the commit file modification time otherwise.
     timestamp: i64,
 }
 
@@ -167,6 +181,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
+        mode: CdfMode,
     ) -> DeltaResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
 
@@ -206,6 +221,7 @@ impl LogReplayScanner {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
+                mode,
             };
             visitor.visit_rows_of(actions.as_ref())?;
 
@@ -216,12 +232,14 @@ impl LogReplayScanner {
 
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
-                // Currently, schema compatibility is defined as having equal schema types. In the
-                // future, more permisive schema evolution will be supported.
-                // See: https://github.com/delta-io/delta-kernel-rs/issues/523
+                // Compatibility is evaluated against the end version's logical schema.
                 require!(
-                    table_schema.as_ref() == &schema,
-                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
+                    mode.schemas_compatible(&schema, table_schema.as_ref()),
+                    Error::change_data_feed_incompatible_schema_at_version(
+                        table_schema,
+                        &schema,
+                        commit_file.version
+                    )
                 );
             }
 
@@ -253,19 +271,17 @@ impl LogReplayScanner {
                 );
             }
 
-            // If metadata is updated, check if Change Data Feed is enabled
             if has_metadata_update {
                 require!(
-                    table_configuration.is_feature_enabled(&TableFeature::ChangeDataFeed),
-                    Error::change_data_feed_unsupported(commit_file.version)
+                    table_configuration.is_feature_enabled(&mode.required_feature()),
+                    mode.feature_disabled_error(commit_file.version)
                 );
             }
 
-            // If protocol is updated, check if Change Data Feed is supported
             if has_protocol_update {
                 table_configuration
                     .ensure_operation_supported(Operation::Cdf)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
+                    .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -373,6 +389,7 @@ struct PreparePhaseVisitor<'a> {
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
+    mode: CdfMode,
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> SchemaRef {
@@ -437,7 +454,9 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                     self.remove_dvs
                         .insert(path.to_string(), DvInfo { deletion_vector });
                 }
-            } else if getters[9].get_str(i, "cdc.path")?.is_some() {
+            } else if getters[9].get_str(i, "cdc.path")?.is_some()
+                && self.mode.uses_change_data_files()
+            {
                 *self.has_cdc_action = true;
             }
         }
