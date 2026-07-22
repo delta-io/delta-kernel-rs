@@ -76,15 +76,12 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{Int64Array, StringArray};
-    use crate::arrow::compute::concat_batches;
+    use crate::arrow::array::{new_null_array, Array, ArrayRef, Int64Array, StringArray};
+    use crate::arrow::compute::{concat, concat_batches};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::ColumnName;
-    use crate::utils::test_utils::{
-        assert_result_error_with_message, create_valid_add_file_batch, replace_record_batch_column,
-        set_record_batch_field_as_null,
-    };
+    use crate::utils::test_utils::{assert_result_error_with_message, create_valid_add_file_batch};
     use crate::EngineData;
 
     fn nullable_add_file() -> RecordBatch {
@@ -95,6 +92,34 @@ mod tests {
         let batch = nullable_add_file();
         concat_batches(&batch.schema(), &vec![batch; row_count])
             .expect("failed to concatenate rows into a multi-row add-file batch")
+    }
+
+    /// Return `batch` with `field` set to null at `row`.
+    fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
+        let schema = batch.schema();
+        let index = schema.index_of(field).expect("field in schema");
+        let mut columns = batch.columns().to_vec();
+        let column = &columns[index];
+        let null = new_null_array(schema.field(index).data_type(), 1);
+        let slices = [
+            column.slice(0, row),
+            null,
+            column.slice(row + 1, batch.num_rows() - row - 1),
+        ];
+        let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
+        columns[index] = concat(&arrays)
+            .expect("failed to replace the selected add-file field with a null value");
+        RecordBatch::try_new(schema, columns)
+            .expect("failed to rebuild add-file batch after replacing a field value with null")
+    }
+
+    fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
+        let schema = batch.schema();
+        let index = schema.index_of(field).expect("field not found in schema");
+        let mut columns = batch.columns().to_vec();
+        columns[index] = column;
+        RecordBatch::try_new(schema, columns)
+            .expect("failed to rebuild add-file batch after replacing a column")
     }
 
     fn add_validator() -> StagedDataValidator {
@@ -134,7 +159,7 @@ mod tests {
         #[case] field: &str,
         #[values(0, 1, 2)] invalid_row: usize,
     ) {
-        let batch = set_record_batch_field_as_null(&nullable_add_files(3), field, invalid_row);
+        let batch = set_field_as_null(&nullable_add_files(3), field, invalid_row);
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
         assert_result_error_with_message(
             add_validator().validate(&adds),
@@ -144,7 +169,7 @@ mod tests {
 
     #[test]
     fn empty_path_rejected() {
-        let batch = replace_record_batch_column(
+        let batch = replace_column(
             &nullable_add_file(),
             "path",
             Arc::new(StringArray::from(vec![""])),
@@ -155,7 +180,7 @@ mod tests {
 
     #[test]
     fn negative_size_rejected() {
-        let batch = replace_record_batch_column(
+        let batch = replace_column(
             &nullable_add_file(),
             "size",
             Arc::new(Int64Array::from(vec![-1])),
@@ -169,12 +194,12 @@ mod tests {
 
     #[test]
     fn zero_size_and_negative_modification_time_accepted() {
-        let batch = replace_record_batch_column(
+        let batch = replace_column(
             &nullable_add_file(),
             "size",
             Arc::new(Int64Array::from(vec![0])),
         );
-        let batch = replace_record_batch_column(
+        let batch = replace_column(
             &batch,
             "modificationTime",
             Arc::new(Int64Array::from(vec![-1])),

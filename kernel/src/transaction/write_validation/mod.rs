@@ -12,12 +12,14 @@ use crate::expressions::ColumnName;
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::{DeltaResult, EngineData};
 
-/// A single row-level validation whose getters follow the validator's configured column order.
+/// A single row-level validation.
 pub(crate) trait Validation {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()>;
 }
 
-/// Runs a set of [`Validation`]s over batches sharing one staged-data schema.
+/// Runs a set of [`Validation`]s over staged-data batches. One [`StagedDataValidator`] per
+/// staged-data schema, i.e. one each for the `Transaction`'s `add_files_metadata`,
+/// `remove_files_metadata`, and `dv_matched_files`.
 ///
 /// `columns_and_types` is the shared set of column names and types for one staged-data schema;
 /// every [`Validation`] sees the full getter list and reads the columns it needs.

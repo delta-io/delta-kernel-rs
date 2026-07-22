@@ -237,11 +237,10 @@ pub(crate) mod test_utils {
         get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
     };
     use crate::arrow::array::{
-        new_empty_array, new_null_array, Array, ArrayRef, Int64Array, MapArray, RecordBatch,
-        StringArray, StructArray,
+        new_empty_array, new_null_array, ArrayRef, Int64Array, MapArray, RecordBatch, StringArray,
+        StructArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
-    use crate::arrow::compute::concat;
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
@@ -426,26 +425,6 @@ pub(crate) mod test_utils {
             })
             .collect();
         RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid add-file batch")
-    }
-
-    pub(crate) fn set_record_batch_field_as_null(
-        batch: &RecordBatch,
-        field: &str,
-        row: usize,
-    ) -> RecordBatch {
-        let schema = batch.schema();
-        let index = schema.index_of(field).expect("field in schema");
-        let mut columns = batch.columns().to_vec();
-        let column = &columns[index];
-        let null = new_null_array(schema.field(index).data_type(), 1);
-        let slices = [
-            column.slice(0, row),
-            null,
-            column.slice(row + 1, batch.num_rows() - row - 1),
-        ];
-        let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
-        columns[index] = concat(&arrays).expect("replace field with null");
-        RecordBatch::try_new(schema, columns).expect("rebuild batch with null field")
     }
 
     pub(crate) fn replace_record_batch_column(
