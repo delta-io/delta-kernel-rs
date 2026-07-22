@@ -321,9 +321,10 @@ struct StatsColumnIndices {
 /// returns `None` for any stat whose column contains null values in the row group (checked via
 /// the column's own null count in the parquet footer).
 ///
-/// Partition columns are handled separately: their footer min/max of
-/// `add.partitionValues_parsed.<col>` can be used directly without null guarding, because parquet
-/// footer stats ignore null values (which may appear for non-add action rows).
+/// Partition columns read their footer min/max of `add.partitionValues_parsed.<col>` directly, with
+/// no null guard: a caller must exclude row groups whose partition column holds a null (a non-Add
+/// row), since footer min/max ignore that null and an unguarded range check could prune a group
+/// that still holds the row.
 #[allow(dead_code)]
 pub(crate) struct CheckpointRowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,

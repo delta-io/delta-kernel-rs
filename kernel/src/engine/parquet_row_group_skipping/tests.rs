@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::sync::{Arc, LazyLock};
 
+use rstest::rstest;
+
 use super::*;
 use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
@@ -20,6 +22,7 @@ use crate::parquet::data_type::{ByteArray, FixedLenByteArray};
 use crate::parquet::file::properties::WriterProperties;
 use crate::parquet::file::reader::FileReader;
 use crate::parquet::file::serialized_reader::SerializedFileReader;
+use crate::scan::data_skipping::as_checkpoint_meta_predicate;
 use crate::{DeltaResult, Predicate};
 
 /// Empty partition column set for tests that don't need partition columns.
@@ -1086,6 +1089,73 @@ fn checkpoint_filter_partition_is_null_prunes_when_all_values_present() {
     assert_eq!(filter.eval_sql_where(&predicate), Some(false));
 }
 
+// Pins the unguarded `CheckpointRowGroupFilter` contract: footer min/max ignore a null-partition
+// sibling, so a non-matching value prunes a group that still holds it. Callers must pre-exclude
+// such groups; `reader_keeps_null_partition_groups` covers the safe production path.
+#[test]
+fn checkpoint_filter_partition_unguarded_prunes_group_with_null_sibling() {
+    // Row 0: add file, partition = "b"; Row 1: non-add, partition = null.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), None],
+        &[Some(100), None],
+        &[Some(0), None],
+        &["x"],
+        Some(&[Some("b"), None]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+
+    // Matching value -> keep (footer range is ["b","b"], ignoring the null).
+    assert!(CheckpointRowGroupFilter::apply(
+        row_group,
+        &Predicate::eq(column_name!("part_col"), Scalar::from("b")),
+        &partition_columns
+    ));
+    // Non-matching value outside the footer range -> prune. The unguarded filter drops the group
+    // despite its null-partition sibling; only sound because callers must pre-exclude such groups.
+    assert!(!CheckpointRowGroupFilter::apply(
+        row_group,
+        &Predicate::eq(column_name!("part_col"), Scalar::from("z")),
+        &partition_columns
+    ));
+}
+
+// A row group spanning multiple partition values (footer min != max) must keep any predicate whose
+// target falls within [min, max] and prune only when the target is provably outside the range.
+#[test]
+fn checkpoint_filter_partition_range_min_lt_max() {
+    // Footer partition range ["a","c"] across three add rows.
+    let tmp = write_checkpoint_parquet(
+        &[Some(10), Some(20), Some(30)],
+        &[Some(100), Some(200), Some(300)],
+        &[Some(0), Some(0), Some(0)],
+        &["x"],
+        Some(&[Some("a"), Some("b"), Some("c")]),
+    );
+    let metadata = checkpoint_row_group_metadata(&tmp);
+    let row_group = metadata.row_group(0);
+    let partition_columns: HashSet<String> = ["part_col".to_string()].into();
+    let col = column_name!("part_col");
+
+    // (predicate, expected keep)
+    let cases = [
+        (Predicate::eq(col.clone(), Scalar::from("b")), true), // in range
+        (Predicate::eq(col.clone(), Scalar::from("0")), false), // below min
+        (Predicate::eq(col.clone(), Scalar::from("z")), false), // above max
+        (Predicate::ne(col.clone(), Scalar::from("b")), true), // range spans other values
+        (Predicate::gt(col.clone(), Scalar::from("a")), true), // max "c" > "a"
+        (Predicate::gt(col.clone(), Scalar::from("d")), false), // max "c" not > "d"
+    ];
+    for (predicate, keep) in cases {
+        assert_eq!(
+            CheckpointRowGroupFilter::apply(row_group, &predicate, &partition_columns),
+            keep,
+            "{predicate:?}"
+        );
+    }
+}
+
 #[test]
 fn checkpoint_filter_multi_row_group_skipping() {
     // Build schema: add.stats_parsed.{minValues,maxValues,nullCount}.x (INT64)
@@ -1203,4 +1273,268 @@ fn checkpoint_filter_nested_struct_column_stats() {
         &predicate,
         &NO_PARTITIONS
     ));
+}
+
+// ============================================================================
+// End-to-end row-group I/O reduction tests.
+//
+// The tests above assert the skip/keep *decision* (`CheckpointRowGroupFilter::apply`). These tests
+// exercise the whole PRODUCTION path: a user predicate is rewritten by
+// `as_checkpoint_meta_predicate` (exactly as `build_actions_meta_predicate` does) and applied
+// through the generic `with_row_group_filter` the default engine uses for checkpoint reads.
+// The fixture carries one add file per row with a unique `id`, so the surviving `id`s reveal which
+// row groups were actually read.
+// ============================================================================
+
+/// One add file's checkpoint stats: a unique `id`, a data column `x` (min/max), and a partition
+/// value (`None` writes a real parquet null, modelling a non-Add row whose partition value is
+/// null).
+struct RgSpec {
+    id: i64,
+    x_min: i64,
+    x_max: i64,
+    part: Option<&'static str>,
+}
+
+/// Writes a checkpoint parquet carrying `add.stats_parsed.{minValues,maxValues,nullCount}.{id,x}`
+/// and `add.partitionValues_parsed.part`, with one row group per `group` (a `flush` after each
+/// forces the boundary). A single-row group models one add file; a multi-row group models an add
+/// file sharing a row group with a null-partition sibling.
+fn write_checkpoint(groups: &[&[RgSpec]]) -> tempfile::NamedTempFile {
+    let id_field = Arc::new(Field::new("id", ArrowDataType::Int64, true));
+    let x_field = Arc::new(Field::new("x", ArrowDataType::Int64, true));
+    let stat_cols = Fields::from(vec![id_field.clone(), x_field.clone()]);
+    let stat_struct_field = |name| {
+        Arc::new(Field::new(
+            name,
+            ArrowDataType::Struct(stat_cols.clone()),
+            true,
+        ))
+    };
+    let min_field = stat_struct_field(MIN_VALUES);
+    let max_field = stat_struct_field(MAX_VALUES);
+    let nc_field = stat_struct_field(NULL_COUNT);
+    let stats_field = Arc::new(Field::new(
+        "stats_parsed",
+        ArrowDataType::Struct(Fields::from(vec![
+            min_field.clone(),
+            max_field.clone(),
+            nc_field.clone(),
+        ])),
+        true,
+    ));
+    let part_field = Arc::new(Field::new("part", ArrowDataType::Utf8, true));
+    let pv_field = Arc::new(Field::new(
+        "partitionValues_parsed",
+        ArrowDataType::Struct(Fields::from(vec![part_field.clone()])),
+        true,
+    ));
+    let add_field = Arc::new(Field::new(
+        "add",
+        ArrowDataType::Struct(Fields::from(vec![stats_field.clone(), pv_field.clone()])),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![add_field]));
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mut writer =
+        ArrowWriter::try_new(tmp.as_file().try_clone().unwrap(), schema.clone(), None).unwrap();
+    let stat_struct = |ids: &[i64], xs: &[i64]| {
+        StructArray::from(vec![
+            (
+                id_field.clone(),
+                Arc::new(Int64Array::from(ids.to_vec())) as _,
+            ),
+            (
+                x_field.clone(),
+                Arc::new(Int64Array::from(xs.to_vec())) as _,
+            ),
+        ])
+    };
+    for group in groups {
+        let ids: Vec<i64> = group.iter().map(|s| s.id).collect();
+        let x_mins: Vec<i64> = group.iter().map(|s| s.x_min).collect();
+        let x_maxs: Vec<i64> = group.iter().map(|s| s.x_max).collect();
+        let zeros: Vec<i64> = group.iter().map(|_| 0).collect();
+        let parts: Vec<Option<&str>> = group.iter().map(|s| s.part).collect();
+        let stats_struct = StructArray::from(vec![
+            (min_field.clone(), Arc::new(stat_struct(&ids, &x_mins)) as _),
+            (max_field.clone(), Arc::new(stat_struct(&ids, &x_maxs)) as _),
+            (nc_field.clone(), Arc::new(stat_struct(&zeros, &zeros)) as _),
+        ]);
+        let pv_struct = StructArray::from(vec![(
+            part_field.clone(),
+            Arc::new(StringArray::from(parts)) as _,
+        )]);
+        let add_struct = StructArray::from(vec![
+            (stats_field.clone(), Arc::new(stats_struct) as _),
+            (pv_field.clone(), Arc::new(pv_struct) as _),
+        ]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(add_struct)]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+    }
+    writer.close().unwrap();
+    tmp
+}
+
+/// Rewrites `pred` (referencing physical partition/data column names) into the checkpoint
+/// meta-predicate the production path applies, then reads `tmp` through `with_row_group_filter` and
+/// returns the sorted `id`s of the add rows whose row group survived. An ineligible predicate
+/// (`None` from the rewrite) reads every row group, matching production.
+fn surviving_ids(
+    tmp: &tempfile::NamedTempFile,
+    pred: &Predicate,
+    partition_columns: &[&str],
+    stats_columns: &[&str],
+) -> Vec<i64> {
+    let partitions: HashSet<ColumnName> = partition_columns
+        .iter()
+        .map(|s| ColumnName::new([*s]))
+        .collect();
+    let stats: HashSet<ColumnName> = stats_columns
+        .iter()
+        .map(|s| ColumnName::new([*s]))
+        .collect();
+    let meta = as_checkpoint_meta_predicate(pred, &partitions, &stats);
+
+    let file = File::open(tmp.path()).unwrap();
+    let mut builder =
+        crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap();
+    if let Some(meta) = &meta {
+        builder = builder.with_row_group_filter(meta, None);
+    }
+    let mut ids: Vec<i64> = builder
+        .build()
+        .unwrap()
+        .map(Result::unwrap)
+        .flat_map(|batch| {
+            let add = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let stats = struct_field(add, "stats_parsed");
+            let min = struct_field(&stats, MIN_VALUES);
+            let id = min
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            id.iter().flatten().collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn struct_field(parent: &StructArray, name: &str) -> StructArray {
+    parent
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .clone()
+}
+
+fn rg(id: i64, x_min: i64, x_max: i64, part: Option<&'static str>) -> RgSpec {
+    RgSpec {
+        id,
+        x_min,
+        x_max,
+        part,
+    }
+}
+
+/// Standard fixture: four single-row row groups.
+///   id=1: x [0,10] part="a" | id=2: x [100,110] part="b"
+///   id=3: x [200,210] part="a" | id=4: x [900,910] part="c"
+fn standard_multi_rg() -> tempfile::NamedTempFile {
+    write_checkpoint(&[
+        &[rg(1, 0, 10, Some("a"))],
+        &[rg(2, 100, 110, Some("b"))],
+        &[rg(3, 200, 210, Some("a"))],
+        &[rg(4, 900, 910, Some("c"))],
+    ])
+}
+
+/// Row-group pruning across predicate shapes, driven through the production rewrite + reader.
+/// `part` is the partition column, `x` a data-stat column. Each case lists the surviving `id`s.
+#[rstest]
+#[case::stats_gt(Predicate::gt(column_name!("x"), Scalar::from(150i64)), vec![3, 4])]
+#[case::stats_le(Predicate::le(column_name!("x"), Scalar::from(110i64)), vec![1, 2])]
+#[case::stats_all_kept(Predicate::ge(column_name!("x"), Scalar::from(0i64)), vec![1, 2, 3, 4])]
+#[case::partition_eq(Predicate::eq(column_name!("part"), Scalar::from("a")), vec![1, 3])]
+#[case::partition_lt(Predicate::lt(column_name!("part"), Scalar::from("b")), vec![1, 3])]
+#[case::partition_all_pruned(Predicate::eq(column_name!("part"), Scalar::from("z")), vec![])]
+#[case::and_stats_and_partition(
+    Predicate::and(
+        Predicate::eq(column_name!("part"), Scalar::from("a")),
+        Predicate::gt(column_name!("x"), Scalar::from(150i64)),
+    ),
+    vec![3]
+)]
+#[case::or_stats_or_partition(
+    Predicate::or(
+        Predicate::eq(column_name!("part"), Scalar::from("c")),
+        Predicate::gt(column_name!("x"), Scalar::from(150i64)),
+    ),
+    vec![3, 4]
+)]
+// IS NULL prunes every group (all partition values present); IS NOT NULL can't prune (a non-Add
+// row also has a null value), so every group is kept.
+#[case::partition_is_null(Predicate::is_null(column_name!("part")), vec![])]
+#[case::partition_is_not_null(Predicate::is_not_null(column_name!("part")), vec![1, 2, 3, 4])]
+fn reader_skips_expected_row_groups(#[case] pred: Predicate, #[case] expected: Vec<i64>) {
+    let tmp = standard_multi_rg();
+    assert_eq!(
+        surviving_ids(&tmp, &pred, &["part"], &["x"]),
+        expected,
+        "{pred:?}"
+    );
+}
+
+/// Soundness under null partition values: a null leaf marks a non-Add row (or a null-valued Add),
+/// which the IS NULL guard must never let a value comparison prune, while IS NULL itself keeps only
+/// groups that actually contain a null. Each case is `(groups, predicate, surviving ids)`.
+#[rstest]
+// IS NULL keeps only the group with a null partition value (id=2), prunes the all-present groups.
+#[case::is_null_keeps_only_null_group(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None)], &[rg(3, 200, 210, Some("c"))]],
+    Predicate::is_null(column_name!("part")),
+    vec![2],
+)]
+// An add file sharing a group with a null-partition sibling is kept even when the value is
+// excluded: without the guard the footer range ["a","a"] would prune it under `part = "z"`.
+#[case::mixed_group_with_null_sibling_kept(
+    &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, None)] as &[RgSpec]],
+    Predicate::eq(column_name!("part"), Scalar::from("z")),
+    vec![1, 2],
+)]
+// An all-null group (only non-Add rows) is never pruned by a value comparison -- dropping it would
+// remove tombstones from checkpoint replay. The footer carries no partition min/max for it.
+#[case::all_null_group_kept_under_eq(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Predicate::eq(column_name!("part"), Scalar::from("z")),
+    vec![2, 3],
+)]
+#[case::all_null_group_kept_under_gt(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Predicate::gt(column_name!("part"), Scalar::from("m")),
+    vec![2, 3],
+)]
+fn reader_keeps_null_partition_groups(
+    #[case] groups: &[&[RgSpec]],
+    #[case] pred: Predicate,
+    #[case] expected: Vec<i64>,
+) {
+    let tmp = write_checkpoint(groups);
+    assert_eq!(
+        surviving_ids(&tmp, &pred, &["part"], &["x"]),
+        expected,
+        "{pred:?}"
+    );
 }
