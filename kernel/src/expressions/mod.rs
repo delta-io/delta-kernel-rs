@@ -280,6 +280,16 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
+/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
+/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CastExpression {
+    /// The expression whose value is cast.
+    pub expr: Box<Expression>,
+    /// The type the value is cast to.
+    pub target: DataType,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JunctionPredicate {
     /// The operator.
@@ -413,6 +423,8 @@ pub enum Expression {
     /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
     /// [`MapToStructExpression`] for how values are parsed.
     MapToStruct(MapToStructExpression),
+    /// Cast a child expression to a target type. See [`CastExpression`].
+    Cast(CastExpression),
 }
 
 /// A SQL predicate.
@@ -557,6 +569,15 @@ impl MapToStructExpression {
     pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
+        }
+    }
+}
+
+impl CastExpression {
+    pub(crate) fn new(expr: impl Into<Expression>, target: DataType) -> Self {
+        Self {
+            expr: Box::new(expr.into()),
+            target,
         }
     }
 }
@@ -744,6 +765,12 @@ impl Expression {
     /// and to null for every other type. See [`MapToStructExpression`] for the full contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
+    }
+
+    /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
+    /// values become NULL). See [`CastExpression`].
+    pub fn cast(expr: impl Into<Expression>, target: DataType) -> Self {
+        Self::Cast(CastExpression::new(expr, target))
     }
 }
 
@@ -1024,6 +1051,7 @@ impl Display for Expression {
                 )
             }
             MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
 }
@@ -1133,7 +1161,7 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+    use super::{column_expr, column_pred, DataType, Expression as Expr, Predicate as Pred};
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1157,6 +1185,10 @@ mod tests {
             (
                 Expr::array([column_expr!("x"), column_expr!("y"), Expr::literal(0)]),
                 "ARRAY(Column(x), Column(y), 0)",
+            ),
+            (
+                Expr::cast(column_expr!("x"), DataType::DATE),
+                "CAST(Column(x) AS date)",
             ),
         ];
 
@@ -1360,6 +1392,17 @@ mod tests {
                 column_expr!("b"),
                 Expression::literal("default"),
             ]);
+            assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        #[case::column(Expression::cast(column_expr!("part"), DataType::DATE))]
+        #[case::literal(Expression::cast(Expression::literal("2025-01-01"), DataType::DATE))]
+        #[case::nested(Expression::cast(
+            Expression::cast(column_expr!("part"), DataType::STRING),
+            DataType::INTEGER,
+        ))]
+        fn test_cast_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
         }
 

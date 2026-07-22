@@ -18,7 +18,9 @@ use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{
+    and_kleene, can_cast_types, cast, is_not_null, is_null, not, or_kleene,
+};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
@@ -381,6 +383,18 @@ pub fn evaluate_expression(
         (MapToStruct(_), dt) => Err(Error::Generic(format!(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
         ))),
+        (Cast(c), result_type) => {
+            let input = evaluate_expression(&c.expr, batch, None)?;
+            let target = ArrowDataType::try_from_kernel(&c.target)?;
+            // Arrow errors (rather than nulls per-value) on a type pair it cannot cast; degrade
+            // that to an all-NULL column so an unsupported cast keeps the file.
+            let output = if can_cast_types(input.data_type(), &target) {
+                cast(&input, &target)?
+            } else {
+                new_null_array(&target, input.len())
+            };
+            validate_array_type(output, result_type)
+        }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
 }
@@ -3157,5 +3171,48 @@ mod tests {
             .column(0)
             .as_primitive::<Int32Type>();
         assert_eq!(row2_inner.value(0), 30);
+    }
+
+    #[test]
+    fn test_cast_string_to_date() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("part", ArrowDataType::Utf8, true)]);
+        // Row 1 is unparseable and row 2 is null; both must become NULL under safe-cast semantics.
+        let parts = StringArray::from(vec![Some("2025-04-11"), Some("not-a-date"), None]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(parts)]).unwrap();
+
+        let expr = Expr::cast(column_expr!("part"), DataType::DATE);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+
+        let dates = result.as_primitive::<Date32Type>();
+        assert_eq!(dates.value(0), 20189); // 2025-04-11 is 20189 days after the unix epoch
+        assert!(dates.is_null(1));
+        assert!(dates.is_null(2));
+    }
+
+    #[test]
+    fn test_cast_result_type_validated() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("part", ArrowDataType::Utf8, true)]);
+        let parts = StringArray::from(vec![Some("2025-04-11")]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(parts)]).unwrap();
+
+        let expr = Expr::cast(column_expr!("part"), DataType::DATE);
+        // The declared result type must match the cast target.
+        assert!(evaluate_expression(&expr, &batch, Some(&DataType::LONG)).is_err());
+        assert!(evaluate_expression(&expr, &batch, Some(&DataType::DATE)).is_ok());
+    }
+
+    #[test]
+    fn test_cast_unsupported_type_pair_yields_null() {
+        // Arrow has no cast from Boolean to Date; the cast degrades to an all-NULL column.
+        let schema = ArrowSchema::new(vec![ArrowField::new("flag", ArrowDataType::Boolean, true)]);
+        let flags = BooleanArray::from(vec![Some(true), Some(false)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(flags)]).unwrap();
+
+        let expr = Expr::cast(column_expr!("flag"), DataType::DATE);
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.null_count(), 2);
+        assert_eq!(result.data_type(), &ArrowDataType::Date32);
     }
 }
