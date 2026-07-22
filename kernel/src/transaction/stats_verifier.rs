@@ -233,7 +233,7 @@ fn is_stat_present<'b>(
         )),
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
-            Err(Error::internal_error(format!(
+            Err(Error::unsupported(format!(
                 "Unsupported data type for stats presence check: {data_type}"
             )))
         }

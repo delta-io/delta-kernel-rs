@@ -1844,7 +1844,9 @@ pub enum EdgeInterpolationAlgorithm {
     Karney,
 }
 
-/// A geometry column type with an associated coordinate reference system (CRS)
+/// A geometry column type with an associated coordinate reference system (CRS).
+///
+/// Serializes as `geometry(<crs>)`, e.g. `geometry(EPSG:4326)`.
 #[cfg(feature = "geo-type-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeometryType {
@@ -1875,6 +1877,8 @@ impl Display for GeometryType {
 }
 
 /// Geography column type with an associated CRS and edge interpolation algorithm.
+///
+/// Serializes as `geography(<crs>, <algorithm>)`, e.g. `geography(EPSG:4326, spherical)`.
 #[cfg(feature = "geo-type-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GeographyType {

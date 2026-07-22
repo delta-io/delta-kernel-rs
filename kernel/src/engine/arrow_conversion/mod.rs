@@ -371,8 +371,6 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
                     PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
-                    // Geometry/Geography are not yet supported by the default engine. They are
-                    // representable in a kernel schema but no engine operation materializes them.
                     #[cfg(feature = "geo-type-in-dev")]
                     PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
                         Err(ArrowError::SchemaError(format!(
@@ -685,6 +683,16 @@ mod tests {
     #[rstest]
     #[case(geometry_type("EPSG:4326"))]
     #[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
+    #[case(DataType::from(StructType::try_new([StructField::nullable(
+        "g",
+        geometry_type("EPSG:4326"),
+    )]).unwrap()))]
+    #[case(DataType::from(ArrayType::new(geometry_type("EPSG:4326"), true)))]
+    #[case(DataType::from(MapType::new(
+        DataType::STRING,
+        geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        true,
+    )))]
     fn test_geo_type_arrow_conversion_unsupported(#[case] dt: DataType) {
         let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
         let err = result.unwrap_err();
