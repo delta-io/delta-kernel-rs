@@ -157,14 +157,14 @@ async fn commit_validates_staged_remove_fields(
     assert_eq!(batch.num_rows(), 3);
     let field_index = batch.schema().index_of(modification.field)?;
     let mut columns = batch.columns().to_vec();
-    let invalid_value = match modification.string_value {
+    let modified_value = match modification.string_value {
         Some(value) => Arc::new(StringArray::from(vec![value])) as ArrayRef,
         None => new_null_array(batch.schema().field(field_index).data_type(), 1),
     };
     let column = batch.column(field_index);
     let slices = [
         column.slice(0, modification.modified_row_index),
-        invalid_value,
+        modified_value,
         column.slice(
             modification.modified_row_index + 1,
             batch.num_rows() - modification.modified_row_index - 1,
