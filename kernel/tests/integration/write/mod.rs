@@ -2,6 +2,7 @@
 
 mod append;
 mod cdf;
+mod check_constraints;
 mod clustered;
 mod column_defaults;
 mod column_mapping;

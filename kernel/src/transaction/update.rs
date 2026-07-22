@@ -105,6 +105,10 @@ impl Transaction {
             data_change: true,
             engine_commit_info: None,
             is_blind_append: false,
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraints_acknowledged: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "check-constraints-in-dev")]
+            parsed_check_constraints: std::sync::OnceLock::new(),
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,

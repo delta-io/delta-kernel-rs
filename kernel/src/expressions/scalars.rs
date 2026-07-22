@@ -859,16 +859,29 @@ impl PrimitiveType {
             }
         };
 
-        // we can assume this won't underflow since `frac_digits` is at minimum 0, and exp is at
-        // most i128::MAX, and 0-i128::MAX doesn't underflow
-        let scale = frac_digits - exp;
-        let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
-        require!(scale == dtype.scale(), parse_error());
+        // The literal's own scale. `exp` is untrusted (parsed from `raw`): a plain
+        // `frac_digits - exp` overflows i128 for `exp <= i128::MIN + frac_digits` (subtracting a
+        // large-magnitude negative), so checked_sub turns that into a parse error, not a panic.
+        let literal_scale = frac_digits.checked_sub(exp).ok_or_else(parse_error)?;
         let int: i128 = match frac_part {
             None => int_part.parse()?,
             Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
         };
-        Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
+        // Pad the literal up to the column's scale, matching Spark's coercion (it reads `0` as
+        // `0.00` against a `DECIMAL(_, 2)` column): multiply the unscaled value by `10^pad`.
+        // Reducing scale would drop precision, so a literal scale exceeding the column's is
+        // rejected (`pad < 0`). `checked_*` reject a `pad` or scaled value too large to
+        // represent.
+        let pad = i128::from(dtype.scale())
+            .checked_sub(literal_scale)
+            .filter(|pad| *pad >= 0)
+            .ok_or_else(parse_error)?;
+        let scaled = u32::try_from(pad)
+            .ok()
+            .and_then(|pad| 10i128.checked_pow(pad))
+            .and_then(|factor| int.checked_mul(factor))
+            .ok_or_else(parse_error)?;
+        Ok(Scalar::Decimal(DecimalData::try_new(scaled, dtype)?))
     }
 }
 
@@ -1008,6 +1021,13 @@ mod tests {
         assert_decimal("1234.5E-4", 12345, 5, 5)?;
         assert_decimal("-0", 0, 1, 0)?;
         assert_decimal("12.000000000000000000", 12000000000000000000, 38, 18)?;
+        // A literal with fewer fractional digits than the column is padded up to the column's
+        // scale (matching Spark): the unscaled value is multiplied by 10^(column_scale -
+        // lit_scale).
+        assert_decimal("0", 0, 10, 2)?; // 0 -> 0.00
+        assert_decimal("10", 1000, 10, 2)?; // 10 -> 10.00
+        assert_decimal("0.5", 50, 10, 2)?; // 0.5 -> 0.50
+        assert_decimal("-1.2", -1200, 10, 3)?; // -1.2 -> -1.200 (sign preserved)
         Ok(())
     }
 
@@ -1042,6 +1062,8 @@ mod tests {
         expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 1, 0);
         // scale will be too small to fit in i8
         expect_fail_parse("0.E170141183460469231731687303715884105727", 1, 0);
+        // exp == i128::MIN: `frac_digits - exp` would overflow i128; must fail closed, not panic
+        expect_fail_parse("1E-170141183460469231731687303715884105728", 1, 0);
     }
 
     #[test]

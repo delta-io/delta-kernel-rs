@@ -1069,6 +1069,37 @@ impl StructType {
         Ok(result)
     }
 
+    /// Resolves a column path case-insensitively (Delta's field-matching rule), returning the
+    /// schema's *canonical* (stored-cased) path segments alongside the leaf [`StructField`]. The
+    /// canonical names -- not the caller's as-written casing -- are what the engine sees in the
+    /// logical batch, so an emitted column reference must use them.
+    ///
+    /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
+    /// a struct type.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(crate) fn resolve_path_ci<'a>(
+        &'a self,
+        col: &ColumnName,
+    ) -> DeltaResult<(Vec<String>, &'a StructField)> {
+        let mut canonical = Vec::with_capacity(col.path().len());
+        let mut leaf = None;
+        self.visit_fields_of_path_by(
+            col,
+            |parent, name| {
+                parent
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(name))
+            },
+            |f| {
+                canonical.push(f.name().to_string());
+                leaf = Some(f);
+            },
+        )?;
+        // visit_fields_of_path_by errors on an empty path, so it always visits >= 1 field.
+        let leaf = leaf.ok_or_else(|| Error::generic("empty column path"))?;
+        Ok((canonical, leaf))
+    }
+
     /// Visits all fields along the given column path, using a caller-provided field name resolver.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
