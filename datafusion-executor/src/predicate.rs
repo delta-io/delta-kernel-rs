@@ -2,7 +2,7 @@
 //!
 //! One match arm per [`Predicate`] variant. Every arm bottoms out in expression conversion:
 //! comparisons and `IS NULL` wrap converted operands, junctions fold converted child predicates,
-//! and a bare boolean expression delegates straight to [`to_datafusion_expr`]. Kernel models the
+//! and a bare boolean expression delegates straight to [`kernel_to_df_expr`]. Kernel models the
 //! derived comparators (`<=`, `>=`, `!=`) as `Not` of a primitive op rather than as distinct
 //! operators, so correctness of those cases rides on the [`Predicate::Not`] arm, not on any
 //! `LtEq`/`GtEq`/`NotEq` mapping here.
@@ -16,28 +16,34 @@ use delta_kernel::expressions::{
     BinaryPredicate, BinaryPredicateOp, Expression, JunctionPredicate, JunctionPredicateOp,
     Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
+use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
-use crate::expression::to_datafusion_expr;
-use crate::scalar::to_datafusion_scalar;
+use crate::expression::kernel_to_df_expr;
+use crate::scalar::kernel_to_df_scalar;
 
-/// Converts a kernel [`Predicate`] into a boolean-valued DataFusion [`Expr`].
+/// Converts a kernel [`Predicate`] into a boolean-valued DataFusion [`Expr`], validating column
+/// references against `input_schema` (threaded to the expression converter).
 ///
 /// # Errors
 ///
 /// Returns [`Error::unsupported`] for engine-defined (`Opaque`) or opaque-to-both (`Unknown`)
 /// predicates -- neither can round-trip through a DataFusion logical plan, and lowering an
 /// `Unknown` to a NULL/false literal would silently drop rows from a filter. Also propagates any
-/// error from converting a child expression (e.g. an interval literal, which has no Arrow
-/// representation) and rejects an `IN` predicate whose right side is not a literal array.
-pub fn to_datafusion_predicate(pred: &Predicate) -> DeltaResult<Expr> {
+/// error from converting a child expression (an unresolved column reference, or an interval
+/// literal, which has no Arrow representation) and rejects an `IN` predicate whose right side is
+/// not a literal array.
+pub fn to_datafusion_predicate(pred: &Predicate, input_schema: &StructType) -> DeltaResult<Expr> {
     match pred {
         // A boolean-valued expression standing in as a predicate: convert it as-is.
-        Predicate::BooleanExpression(expr) => to_datafusion_expr(expr),
-        Predicate::Not(inner) => Ok(Expr::Not(Box::new(to_datafusion_predicate(inner)?))),
-        Predicate::Unary(unary) => unary_to_expr(unary),
-        Predicate::Binary(binary) => binary_to_expr(binary),
-        Predicate::Junction(junction) => junction_to_expr(junction),
+        Predicate::BooleanExpression(expr) => kernel_to_df_expr(expr, input_schema),
+        Predicate::Not(inner) => Ok(Expr::Not(Box::new(to_datafusion_predicate(
+            inner,
+            input_schema,
+        )?))),
+        Predicate::Unary(unary) => unary_to_expr(unary, input_schema),
+        Predicate::Binary(binary) => binary_to_expr(binary, input_schema),
+        Predicate::Junction(junction) => junction_to_expr(junction, input_schema),
         // Engine-defined and opaque-to-both predicates cannot round-trip through a DataFusion
         // logical plan: kernel only understands them through their trait methods, and lowering an
         // Unknown to a literal would change filter semantics (dropping rows).
@@ -52,8 +58,8 @@ pub fn to_datafusion_predicate(pred: &Predicate) -> DeltaResult<Expr> {
 
 /// Lowers a unary predicate. `IsNull` is the only variant; `IS NOT NULL` reaches the converter as
 /// `Not(Unary(IsNull))` and is handled by the [`Predicate::Not`] arm.
-fn unary_to_expr(unary: &UnaryPredicate) -> DeltaResult<Expr> {
-    let expr = to_datafusion_expr(&unary.expr)?;
+fn unary_to_expr(unary: &UnaryPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
+    let expr = kernel_to_df_expr(&unary.expr, input_schema)?;
     Ok(match unary.op {
         UnaryPredicateOp::IsNull => Expr::IsNull(Box::new(expr)),
     })
@@ -62,16 +68,16 @@ fn unary_to_expr(unary: &UnaryPredicate) -> DeltaResult<Expr> {
 /// Lowers a binary predicate. `Distinct` maps to the null-safe [`Operator::IsDistinctFrom`]; `In`
 /// is special-cased to an `Expr::InList`. Kernel has no `<=`/`>=`/`!=` operators -- those arrive
 /// wrapped in `Not`, so only the three primitive comparisons need mapping here.
-fn binary_to_expr(binary: &BinaryPredicate) -> DeltaResult<Expr> {
+fn binary_to_expr(binary: &BinaryPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
     let op = match binary.op {
-        BinaryPredicateOp::In => return in_to_expr(&binary.left, &binary.right),
+        BinaryPredicateOp::In => return in_to_expr(&binary.left, &binary.right, input_schema),
         BinaryPredicateOp::Equal => Operator::Eq,
         BinaryPredicateOp::LessThan => Operator::Lt,
         BinaryPredicateOp::GreaterThan => Operator::Gt,
         BinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
     };
-    let left = to_datafusion_expr(&binary.left)?;
-    let right = to_datafusion_expr(&binary.right)?;
+    let left = kernel_to_df_expr(&binary.left, input_schema)?;
+    let right = kernel_to_df_expr(&binary.right, input_schema)?;
     Ok(binary_expr(left, op, right))
 }
 
@@ -83,7 +89,11 @@ fn binary_to_expr(binary: &BinaryPredicate) -> DeltaResult<Expr> {
 /// # Errors
 ///
 /// Returns [`Error::unsupported`] if the right operand is not a literal array.
-fn in_to_expr(value: &Expression, list: &Expression) -> DeltaResult<Expr> {
+fn in_to_expr(
+    value: &Expression,
+    list: &Expression,
+    input_schema: &StructType,
+) -> DeltaResult<Expr> {
     let Expression::Literal(Scalar::Array(array)) = list else {
         return Err(Error::unsupported(
             "converting an IN predicate requires a literal array on the right-hand side",
@@ -92,9 +102,9 @@ fn in_to_expr(value: &Expression, list: &Expression) -> DeltaResult<Expr> {
     let elements = array
         .array_elements()
         .iter()
-        .map(|scalar| Ok(lit(to_datafusion_scalar(scalar)?)))
+        .map(|scalar| Ok(lit(kernel_to_df_scalar(scalar)?)))
         .collect::<DeltaResult<Vec<_>>>()?;
-    let value = to_datafusion_expr(value)?;
+    let value = kernel_to_df_expr(value, input_schema)?;
     Ok(Expr::InList(InList::new(Box::new(value), elements, false)))
 }
 
@@ -102,7 +112,7 @@ fn in_to_expr(value: &Expression, list: &Expression) -> DeltaResult<Expr> {
 /// chain of `Expr::BinaryExpr`. An empty junction lowers to the operator's identity literal
 /// (`AND` of nothing is `true`, `OR` of nothing is `false`), matching how kernel normalizes empty
 /// junctions at construction.
-fn junction_to_expr(junction: &JunctionPredicate) -> DeltaResult<Expr> {
+fn junction_to_expr(junction: &JunctionPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
     let (op, identity) = match junction.op {
         JunctionPredicateOp::And => (Operator::And, true),
         JunctionPredicateOp::Or => (Operator::Or, false),
@@ -111,8 +121,8 @@ fn junction_to_expr(junction: &JunctionPredicate) -> DeltaResult<Expr> {
     let Some(first) = preds.next() else {
         return Ok(lit(identity));
     };
-    preds.try_fold(to_datafusion_predicate(first)?, |acc, next| {
-        Ok(binary_expr(acc, op, to_datafusion_predicate(next)?))
+    preds.try_fold(to_datafusion_predicate(first, input_schema)?, |acc, next| {
+        Ok(binary_expr(acc, op, to_datafusion_predicate(next, input_schema)?))
     })
 }
 
@@ -121,14 +131,26 @@ mod tests {
     use delta_kernel::expressions::{
         column_expr, ArrayData, Expression as Expr_, Predicate as Pred,
     };
-    use delta_kernel::schema::{ArrayType, DataType};
+    use delta_kernel::schema::{ArrayType, DataType, StructField};
     use rstest::rstest;
 
     use super::*;
 
-    /// Lowers a predicate and renders it as a DataFusion `Display` string for comparison.
+    /// Name-resolution scope for these tests: top-level `a`, `b`, `c`, all `long`.
+    fn test_schema() -> StructType {
+        StructType::try_new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+        ])
+        .unwrap()
+    }
+
+    /// Lowers a predicate against [`test_schema`] and renders it as a DataFusion `Display` string.
     fn lower(pred: Pred) -> String {
-        to_datafusion_predicate(&pred).unwrap().to_string()
+        to_datafusion_predicate(&pred, &test_schema())
+            .unwrap()
+            .to_string()
     }
 
     #[rstest]
@@ -226,6 +248,6 @@ mod tests {
 
     #[test]
     fn unknown_predicate_is_unsupported() {
-        to_datafusion_predicate(&Pred::Unknown("mystery".into())).unwrap_err();
+        to_datafusion_predicate(&Pred::Unknown("mystery".into()), &test_schema()).unwrap_err();
     }
 }
