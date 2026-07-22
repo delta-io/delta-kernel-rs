@@ -72,6 +72,10 @@ const FILE_SIZE: &str = "size";
 const NUM_RECORDS: &str = "num_records";
 const DV: &str = "dv";
 
+/// The `sidecar` action's byte-size sub-field. Distinct from the [`FILE_SIZE`] output column: the
+/// sidecar action names it `sizeInBytes` (see [`Sidecar`](crate::actions::Sidecar)).
+const SIDECAR_SIZE_IN_BYTES: &str = "sizeInBytes";
+
 /// The version-tagged read schema for a log file set: `add` (+ `remove` for commits) plus the
 /// file-constant `version` column.
 fn json_read_schema(include_remove: bool) -> SchemaRef {
@@ -121,6 +125,11 @@ fn parquet_read_schema(
 
 /// The subset of file action fields that uniquely identifies a logical file in the log, used for
 /// deduplication of adds and removes during log replay.
+///
+/// Mirrors the canonical `deletionVector` shape: the struct is nullable (a file may have no
+/// deletion vector), but when present its `storageType` / `pathOrInlineDv` are non-null. A DV-less
+/// file action yields a *null* `deletionVector` struct, not one with null leaves (see
+/// [`file_action_key_expr`]).
 static FILE_ACTION_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
     let schema = schema! {
         nullable "path": STRING,
@@ -135,14 +144,22 @@ static FILE_ACTION_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
 
 /// Build a struct-valued file action key from leaf expressions which differ per arm: coalesced
 /// across add/remove for commits, add-only for checkpoints.
+///
+/// The `deletionVector` sub-struct is null for a file with no deletion vector (guarded on
+/// `storageType`, which is non-null exactly when a DV is present), so its non-null `storageType` /
+/// `pathOrInlineDv` leaves are only materialized when the struct itself is present.
 fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
+    let storage_type = key_col_expr(column_name!("deletionVector.storageType"));
     Expr::struct_from([
         key_col_expr(column_name!("path")),
-        Expr::struct_from([
-            key_col_expr(column_name!("deletionVector.storageType")),
-            key_col_expr(column_name!("deletionVector.pathOrInlineDv")),
-            key_col_expr(column_name!("deletionVector.offset")),
-        ]),
+        Expr::struct_with_nullability_from(
+            [
+                storage_type.clone(),
+                key_col_expr(column_name!("deletionVector.pathOrInlineDv")),
+                key_col_expr(column_name!("deletionVector.offset")),
+            ],
+            Expr::from_pred(storage_type.is_not_null()),
+        ),
     ])
 }
 
@@ -194,8 +211,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                 }
             }
             None => {
+                // The canonical `partitionValues` is non-null, but with no partition schema we
+                // null it out, so the field must become nullable to match.
+                let field = StructField::nullable(PARTITION_VALUES, partition_values_map_type());
                 let expr = Expr::null_literal(partition_values_map_type());
-                self.replace_expr_at(add, PARTITION_VALUES, expr)
+                self.replace_at(add, PARTITION_VALUES, field, expr)
             }
         }
     }
@@ -215,14 +235,18 @@ fn reparsed_add_field(
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<StructField> {
+    // `partitionValues` is non-null in the canonical add schema, but `reparse_add` always retypes
+    // it to a nullable field (parsed struct when a partition schema exists, null literal
+    // otherwise).
+    let partition_field = match partition_schema {
+        Some(ps) => StructField::nullable(PARTITION_VALUES, ps.as_ref().clone()),
+        None => StructField::nullable(PARTITION_VALUES, partition_values_map_type()),
+    };
     let patch = SchemaStructPatchBuilder::new()
         .fold_with(stats_schema, |patch, ss| {
             patch.replace(STATS, StructField::nullable(STATS, ss.as_ref().clone()))
         })
-        .fold_with(partition_schema, |patch, ps| {
-            let field = StructField::nullable(PARTITION_VALUES, ps.as_ref().clone());
-            patch.replace(PARTITION_VALUES, field)
-        });
+        .replace(PARTITION_VALUES, partition_field);
     Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
 }
 
@@ -289,7 +313,7 @@ fn sidecar_actions(
         .project(
             Expr::struct_from([
                 col!(SIDECAR_NAME, FILE_PATH),
-                col!(SIDECAR_NAME, FILE_SIZE),
+                col!(SIDECAR_NAME, SIDECAR_SIZE_IN_BYTES),
                 Expr::null_literal(DataType::LONG),
                 Expr::null_literal(DeletionVectorDescriptor::to_schema().into()),
                 col!(VERSION),

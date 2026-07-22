@@ -22,9 +22,8 @@ use super::read_files_arrow;
 use super::storage::SyncStorageHandler;
 use crate::arrow::array::{
     new_null_array, Array, ArrayRef, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
-    UInt32Array,
 };
-use crate::arrow::compute::{concat, filter_record_batch, take};
+use crate::arrow::compute::{filter_record_batch, interleave};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -339,13 +338,13 @@ fn eval_semi_join(
 ) -> DeltaResult<Vec<RecordBatch>> {
     let mut build_keys = HashSet::new();
     for batch in build {
-        build_keys.extend(row_keys(batch, &join.build_keys)?);
+        build_keys.extend(batch_to_rows(batch, &join.build_keys)?);
     }
 
     probe
         .iter()
         .map(|batch| {
-            let keep = row_keys(batch, &join.probe_keys)?
+            let keep = batch_to_rows(batch, &join.probe_keys)?
                 .into_iter()
                 .map(|key| join.inverted != build_keys.contains(&key));
             Ok(filter_record_batch(batch, &BooleanArray::from_iter(keep))?)
@@ -401,9 +400,8 @@ fn eval_aggregate(aggregate: &Aggregate, input: &[RecordBatch]) -> DeltaResult<V
     Ok(vec![batch])
 }
 
-type WinningRow = (usize, usize, i64);
-type GroupWinners = Vec<(OwnedRow, WinningRow)>;
-type WinnerRuns = Vec<(usize, UInt32Array)>;
+/// The winning input cell for a group: `(batch index, row index)` into `input`.
+type Winner = (usize, usize);
 
 fn eval_grouped_max_non_null_by(
     aggregate: &Aggregate,
@@ -419,58 +417,53 @@ fn eval_grouped_max_non_null_by(
     }
     let value_name = simple_column_name(value)?;
     let key_name = simple_column_name(key)?;
-    let mut best = HashMap::<OwnedRow, WinningRow>::new();
+    // Track the winning cell and its key per group as batches stream by.
+    let mut best = HashMap::<OwnedRow, (Winner, i64)>::new();
     for (batch_idx, batch) in input.iter().enumerate() {
         let values = extract_column(batch, &[value_name])?;
         let keys = extract_column(batch, &[key_name])?;
         let keys = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
             Error::unsupported("SyncPlanExecutor max_non_null_by with non-LONG key")
         })?;
-        let group_keys = row_keys(batch, &aggregate.group_by)?;
+        let group_keys = batch_to_rows(batch, &aggregate.group_by)?;
         for (row, group) in group_keys.iter().enumerate().take(batch.num_rows()) {
             if values.is_null(row) || keys.is_null(row) {
                 continue;
             }
             let candidate = keys.value(row);
-            if matches!(best.get(group), Some((_, _, best_key)) if candidate <= *best_key) {
+            if matches!(best.get(group), Some((_, best_key)) if candidate <= *best_key) {
                 continue;
             }
-            best.insert(group.clone(), (batch_idx, row, candidate));
+            best.insert(group.clone(), ((batch_idx, row), candidate));
         }
     }
 
-    let runs = winner_runs(Vec::from_iter(best));
+    // One winning cell per group; every output column is gathered at these same cells.
+    let winners: Vec<Winner> = best.into_values().map(|(winner, _)| winner).collect();
     let mut columns = Vec::with_capacity(aggregate.schema.fields().len());
     for group_by in &aggregate.group_by {
-        let name = simple_column_name(group_by)?;
-        columns.push(take_winners(input, &runs, name)?);
+        columns.push(gather_winners(
+            input,
+            &winners,
+            simple_column_name(group_by)?,
+        )?);
     }
-    columns.push(take_winners(input, &runs, value_name)?);
+    columns.push(gather_winners(input, &winners, value_name)?);
 
     let output_schema = Arc::new(aggregate.schema.as_ref().try_into_arrow()?);
     Ok(vec![RecordBatch::try_new(output_schema, columns)?])
 }
 
-fn winner_runs(groups: GroupWinners) -> WinnerRuns {
-    let mut runs = HashMap::<usize, Vec<Option<u32>>>::new();
-    for (_, (batch_idx, row, _)) in groups {
-        runs.entry(batch_idx).or_default().push(Some(row as u32));
-    }
-    runs.into_iter()
-        .map(|(batch_idx, rows)| (batch_idx, UInt32Array::from(rows)))
-        .collect()
-}
-
-fn take_winners(input: &[RecordBatch], runs: &WinnerRuns, name: &str) -> DeltaResult<ArrayRef> {
-    let arrays: Vec<ArrayRef> = runs
+/// Gathers column `name` at each winning `(batch, row)` cell into a single array, preserving the
+/// order of `winners`. Uses [`interleave`] so cells from different input batches are collected in
+/// one pass.
+fn gather_winners(input: &[RecordBatch], winners: &[Winner], name: &str) -> DeltaResult<ArrayRef> {
+    let columns: Vec<ArrayRef> = input
         .iter()
-        .map(|(batch_idx, rows)| {
-            let values = extract_column(&input[*batch_idx], &[name])?;
-            take(values.as_ref(), rows, None).map_err(Error::from)
-        })
+        .map(|batch| extract_column(batch, &[name]))
         .try_collect()?;
-    let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
-    Ok(concat(&refs)?)
+    let refs: Vec<&dyn Array> = columns.iter().map(|a| a.as_ref()).collect();
+    Ok(interleave(&refs, winners)?)
 }
 
 /// The `value` from the input row with the greatest `key`, considering only rows where both
@@ -478,8 +471,9 @@ fn take_winners(input: &[RecordBatch], runs: &WinnerRuns, name: &str) -> DeltaRe
 /// winning value, or NULL (typed by `output_type`) when no row qualifies.
 ///
 /// Extraction is deferred: the winning `(column, row)` is tracked as batches stream by, then sliced
-/// once at the end -- avoiding a per-candidate copy of the (possibly struct-typed) value. Grouped
-/// aggregation would generalize this to one `arrow::compute::take` over the winning indices.
+/// once at the end -- avoiding a per-candidate copy of the (possibly struct-typed) value. The
+/// grouped case ([`eval_grouped_max_non_null_by`]) generalizes this, gathering one winning cell per
+/// group with [`interleave`].
 ///
 /// [`Agg::max_non_null_by`]: crate::plans::ir::nodes::Agg::max_non_null_by
 fn max_non_null_by(
@@ -523,16 +517,18 @@ fn simple_column_name(name: &ColumnName) -> DeltaResult<&str> {
     }
 }
 
-fn row_keys(batch: &RecordBatch, columns: &[ColumnName]) -> DeltaResult<Vec<OwnedRow>> {
+fn batch_to_rows(batch: &RecordBatch, columns: &[ColumnName]) -> DeltaResult<Vec<OwnedRow>> {
     let arrays: Vec<_> = columns
         .iter()
         .map(|name| extract_column(batch, name.path()))
         .try_collect()?;
-    let fields = arrays
+    // Constructing RowConverter requires a `SortField`. We initialize default, unsorted field for
+    // each column.
+    let sort_fields = arrays
         .iter()
         .map(|array| SortField::new(array.data_type().clone()))
         .collect();
-    let converter = RowConverter::new(fields)?;
+    let converter = RowConverter::new(sort_fields)?;
     let rows = converter.convert_columns(&arrays)?;
     Ok(rows.iter().map(|row| row.owned()).collect())
 }
