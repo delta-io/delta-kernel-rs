@@ -9,14 +9,14 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, column_name, joined_column_expr, BinaryPredicateOp, ColumnName,
-    Expression as Expr, ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef,
-    Predicate as Pred, PredicateRef, Scalar,
+    column_expr, column_name, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
+    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
+use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
@@ -60,7 +60,7 @@ pub(crate) fn all_referenced_columns(pred: &Pred) -> HashSet<ColumnName> {
 #[cfg(test)]
 pub(crate) fn as_data_skipping_predicate_with_partitions(
     pred: &Pred,
-    partition_columns: &HashSet<String>,
+    partition_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
     DataSkippingPredicateCreator::new(partition_columns, &stats_columns).eval(pred)
@@ -71,7 +71,7 @@ pub(crate) fn as_data_skipping_predicate_with_partitions(
 #[cfg(test)]
 fn as_sql_data_skipping_predicate(
     pred: &Pred,
-    partition_columns: &HashSet<String>,
+    partition_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     let stats_columns = all_referenced_columns(pred);
     as_sql_data_skipping_predicate_with_stats_columns(pred, partition_columns, &stats_columns)
@@ -82,7 +82,7 @@ fn as_sql_data_skipping_predicate(
 /// junction-fold into NULL literals.
 pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     pred: &Pred,
-    partition_columns: &HashSet<String>,
+    partition_columns: &HashSet<ColumnName>,
     stats_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
@@ -308,9 +308,9 @@ impl DataSkippingFilter {
         physical_partition_schema: Option<&SchemaRef>,
         partition_expr: ExpressionRef,
         is_add_expr: ExpressionRef,
-    ) -> Option<(SchemaRef, ExpressionRef, HashSet<String>)> {
-        let partition_columns: HashSet<String> = physical_partition_schema
-            .map(|s| s.fields().map(|f| f.name().to_string()).collect())
+    ) -> Option<(SchemaRef, ExpressionRef, HashSet<ColumnName>)> {
+        let partition_columns: HashSet<ColumnName> = physical_partition_schema
+            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
             .unwrap_or_default();
 
         let stats_field =
@@ -432,14 +432,13 @@ impl DataSkippingFilter {
 /// field.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
-    physical_partition_columns: &[String],
+    physical_partition_columns: &HashSet<ColumnName>,
     physical_stats_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
-    let partition_columns: HashSet<String> = physical_partition_columns.iter().cloned().collect();
     CheckpointDataSkippingPredicateCreator {
         data_skipping_columns: DataSkippingColumns {
-            physical_partition_columns: &partition_columns,
-            stats_columns: physical_stats_columns,
+            physical_partition_columns,
+            physical_stats_columns,
         },
     }
     .eval(pred)
@@ -503,6 +502,12 @@ fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
     }
 }
 
+/// The `partitionValues_parsed.<col>` reference holding a partition column's exact value, which
+/// serves as both its min and max stat. `col` is a top-level physical partition name.
+fn partition_value_expr(col: &ColumnName) -> Expr {
+    Expr::from(ColumnName::new([PARTITION_VALUES_PARSED_NAME]).join(col))
+}
+
 /// A column carries min/max stats iff it's a primitive whose type supports min/max skipping.
 /// Boolean / Binary, Array, Map, and Variant leaves carry nullCount only. Struct columns
 /// have no per-struct stats; only their primitive leaves do, recursively.
@@ -514,25 +519,24 @@ fn has_min_max_stats(data_type: &DataType) -> bool {
 
 /// Column metadata shared by the data-skipping predicate creators.
 struct DataSkippingColumns<'a> {
-    /// Physical names of partition columns. Stats for these come from
-    /// `partitionValues_parsed.<col>` (exact values) instead of min/max ranges; each creator
-    /// applies its own partition policy.
-    physical_partition_columns: &'a HashSet<String>,
+    /// Physical names of partition columns (always single-segment: Delta partition columns are
+    /// top-level). Stats for these come from `partitionValues_parsed.<col>` (exact values) instead
+    /// of min/max ranges; each creator applies its own partition policy.
+    physical_partition_columns: &'a HashSet<ColumnName>,
     /// Physical leaf paths whose stats are present in `stats_parsed` (honors
     /// `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, and required
     /// columns). Must match the column set used to build `physical_stats_schema`; otherwise the
     /// rewritten predicate references columns absent from the unified schema.
-    stats_columns: &'a HashSet<ColumnName>,
+    physical_stats_columns: &'a HashSet<ColumnName>,
 }
 
 impl DataSkippingColumns<'_> {
     fn is_partition_column(&self, col: &ColumnName) -> bool {
-        let path = col.path();
-        path.len() == 1 && self.physical_partition_columns.contains(path[0].as_str())
+        self.physical_partition_columns.contains(col)
     }
 
     fn is_stats_column(&self, col: &ColumnName) -> bool {
-        self.stats_columns.contains(col)
+        self.physical_stats_columns.contains(col)
     }
 
     /// Data column -> `stats_parsed.minValues.<col>`, or `None` when unindexed or not
@@ -571,11 +575,14 @@ struct DataSkippingPredicateCreator<'a> {
 }
 
 impl<'a> DataSkippingPredicateCreator<'a> {
-    fn new(partition_columns: &'a HashSet<String>, stats_columns: &'a HashSet<ColumnName>) -> Self {
+    fn new(
+        physical_partition_columns: &'a HashSet<ColumnName>,
+        physical_stats_columns: &'a HashSet<ColumnName>,
+    ) -> Self {
         Self {
             data_skipping_columns: DataSkippingColumns {
-                physical_partition_columns: partition_columns,
-                stats_columns,
+                physical_partition_columns,
+                physical_stats_columns,
             },
         }
     }
@@ -603,7 +610,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     /// outside the stat-columns set or whose type is not min/max-eligible.
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
-            Some(joined_column_expr!("partitionValues_parsed", col))
+            Some(partition_value_expr(col))
         } else {
             self.data_skipping_columns.data_min_stat(col, data_type)
         }
@@ -614,7 +621,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     /// type is not min/max-eligible.
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
-            Some(joined_column_expr!("partitionValues_parsed", col))
+            Some(partition_value_expr(col))
         } else {
             self.data_skipping_columns.data_max_stat(col, data_type)
         }
@@ -665,7 +672,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     ) -> Option<Pred> {
         // Detect partition columns by the prefix set in get_min_stat/get_max_stat.
         let is_partition = matches!(&col, Expr::Column(name)
-            if name.path().first().is_some_and(|f| f == "partitionValues_parsed"));
+            if name.path().first().is_some_and(|f| f == PARTITION_VALUES_PARSED_NAME));
         let cmp = comparison_predicate(ord, col, val, inverted);
         Some(if is_partition {
             self.guard_for_removes(cmp)
@@ -687,7 +694,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     /// For data columns, uses nullCount stats.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         if self.is_partition_column(col) {
-            let pv_expr = joined_column_expr!("partitionValues_parsed", col);
+            let pv_expr = partition_value_expr(col);
             let pred = if inverted {
                 Pred::is_not_null(pv_expr)
             } else {
