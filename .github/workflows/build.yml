@@ -71,8 +71,7 @@ jobs:
           components: rustfmt
       - name: format
         run: cargo +nightly fmt -- --check
-      # datafusion-executor is a separate workspace (see its Cargo.toml), so the root fmt above
-      # does not reach it. Check it explicitly.
+      # Separate workspace; the root fmt above does not reach it. See datafusion-executor/Cargo.toml.
       - name: format datafusion-executor
         working-directory: datafusion-executor
         run: cargo +nightly fmt -- --check
@@ -434,9 +433,7 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  # datafusion-executor is its own workspace (it pins kernel to arrow-58 to match DataFusion,
-  # while the root workspace uses arrow-59; see datafusion-executor/Cargo.toml). The --workspace
-  # jobs above therefore never touch it, so it needs a dedicated job to build, lint, and test it.
+  # Separate workspace; the --workspace jobs above never touch it. See datafusion-executor/Cargo.toml.
   datafusion-executor:
     runs-on: ubuntu-latest
     steps:
