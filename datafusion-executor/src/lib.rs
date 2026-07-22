@@ -14,7 +14,7 @@ use delta_kernel::Engine;
 
 mod scalar;
 
-pub use scalar::to_datafusion_scalar;
+pub use scalar::kernel_to_df_scalar;
 
 /// Executes kernel declarative plans on DataFusion.
 ///
