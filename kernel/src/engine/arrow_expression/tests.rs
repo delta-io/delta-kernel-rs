@@ -25,7 +25,9 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
+use crate::schema::{
+    ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType, StructField, StructType,
+};
 use crate::utils::test_utils::assert_result_error_with_message;
 use crate::EvaluationHandlerExtension as _;
 
@@ -1321,6 +1323,64 @@ fn test_evaluator_mixed_string_types_struct_expression() {
         .unwrap()
         .evaluate(&engine_data)
         .unwrap();
+}
+
+/// The kernel-internal `SessionTimezone` annotation drives offset-less resolution but must never
+/// surface in engine-visible output: the full evaluator (which applies the output schema to Arrow)
+/// resolves the value in the zone yet strips the key from the result field's metadata.
+#[test]
+fn map_to_struct_session_timezone_resolves_but_does_not_leak() {
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    builder.keys().append_value("ts");
+    builder.values().append_value("2024-01-15 16:00:00");
+    builder.append(true).unwrap();
+    let map_array = builder.finish();
+    let input_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "pv",
+        MapType::new(KernelDataType::STRING, KernelDataType::STRING, true),
+    )]));
+    let arrow_input = Schema::new(vec![Field::new("pv", map_array.data_type().clone(), true)]);
+    let engine_data = ArrowEngineData::new(
+        RecordBatch::try_new(Arc::new(arrow_input), vec![Arc::new(map_array)]).unwrap(),
+    );
+
+    let ts_field = StructField::nullable("ts", KernelDataType::TIMESTAMP).add_metadata([(
+        ColumnMetadataKey::SessionTimezone.as_ref().to_string(),
+        "America/New_York".to_string(),
+    )]);
+    let output_type = KernelDataType::from(StructType::new_unchecked([ts_field]));
+
+    let handler = ArrowEvaluationHandler;
+    let result = handler
+        .new_expression_evaluator(
+            input_schema,
+            Arc::new(Expr::map_to_struct(col!("pv"))),
+            output_type,
+        )
+        .unwrap()
+        .evaluate(&engine_data)
+        .unwrap();
+    // A struct output type is flattened to top-level batch columns, so `ts` is column 0.
+    let batch = result.try_into_record_batch().unwrap();
+
+    // Resolved in the session zone: 16:00 EST -> 21:00 UTC.
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<crate::arrow::array::TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(ts.value(0), 1_705_352_400_000_000);
+
+    // The internal key is stripped from the output field's Arrow metadata.
+    assert!(
+        !batch
+            .schema()
+            .field(0)
+            .metadata()
+            .contains_key(ColumnMetadataKey::SessionTimezone.as_ref()),
+        "SessionTimezone must not leak into engine-visible output, got: {:?}",
+        batch.schema().field(0).metadata()
+    );
 }
 
 // helper to build a RecordBatch via `create_many` and assert it equals `expected`

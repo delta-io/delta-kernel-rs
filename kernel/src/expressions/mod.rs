@@ -546,7 +546,14 @@ impl ParseJsonExpression {
 /// - Parse errors are propagated (indicating a broken table)
 /// - Duplicate map keys are resolved by taking the rightmost entry
 ///
+/// The target schema governs how each value parses, including the session zone used to resolve
+/// offset-less `TIMESTAMP` leaves: a `TIMESTAMP` field carrying
+/// [`ColumnMetadataKey::SessionTimezone`] metadata resolves offset-less values in that zone (an
+/// explicit `Z`/offset still pins the instant), and without it they resolve as UTC. The expression
+/// itself carries no zone.
+///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+/// [`ColumnMetadataKey::SessionTimezone`]: crate::schema::ColumnMetadataKey::SessionTimezone
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructExpression {
     /// The expression that evaluates to a `Map<String, String>` column.

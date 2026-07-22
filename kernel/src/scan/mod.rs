@@ -191,11 +191,15 @@ impl StatsOptions {
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
 /// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// when present, otherwise from parsing the string map; see [`Self::with_session_timezone`] for the
+/// case where a session zone forces reparsing from the map even when the native column exists.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
+    /// Session timezone for resolving offset-less `TIMESTAMP` partition value strings; `None` =
+    /// UTC. See [`Self::with_session_timezone`] for the full contract and scope.
+    pub(crate) session_timezone: Option<String>,
 }
 
 impl PartitionValuesOptions {
@@ -209,7 +213,56 @@ impl PartitionValuesOptions {
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
+            session_timezone: None,
         }
+    }
+
+    /// Resolve offset-less `TIMESTAMP` partition value strings in `tz` (an IANA name like
+    /// `America/New_York` or a fixed offset like `+05:00`) instead of UTC. A partition value
+    /// carrying an explicit `Z`/offset honors that offset regardless, and `TIMESTAMP_NTZ` columns
+    /// are always zone-independent. Prefer an IANA name over a fixed offset when the writer's zone
+    /// observes DST: a fixed offset silently produces instants an hour off for the part of the year
+    /// the writer was on the other offset.
+    ///
+    /// The zone is parsed only when the table has a `TIMESTAMP` partition column (the only case it
+    /// applies to), so an invalid zone fails the scan at evaluation time on such tables and is
+    /// otherwise inert.
+    ///
+    /// An offset-less value whose wall-clock time is nonexistent or ambiguous in `tz` (the gap or
+    /// fold of a DST transition) fails the scan rather than resolving to a chosen offset. Fixed
+    /// offsets have no DST and are never affected.
+    ///
+    /// # Scope
+    ///
+    /// The zone governs `partitionValues_parsed` (the typed output struct requested via
+    /// [`Self::with_struct`] and the partition-pruning column derived from it), whether that struct
+    /// is reconstructed from a JSON commit's string map or from a checkpoint. On a checkpoint with
+    /// a native `partitionValues_parsed` column, the frozen leaf bakes the writer's zone
+    /// (kernel resolves offset-less values as UTC on write) and cannot be corrected in place,
+    /// so when the table has a `TIMESTAMP` partition column kernel bypasses the frozen column
+    /// and reparses from the raw `partitionValues` map in `tz`. Tables without a `TIMESTAMP`
+    /// partition column keep the native fast path, since every other partition type resolves
+    /// identically regardless of zone.
+    ///
+    /// # Known limitation
+    ///
+    /// The materialized logical partition column surfaced in scan output is built in core kernel
+    /// (arrow-free, no timezone database, via [`PrimitiveType::parse_scalar`]) and always resolves
+    /// offset-less `TIMESTAMP` values as UTC, ignoring `tz`. A lost timezone cannot be recovered by
+    /// conservative widening the way truncated stat bounds can (there is no safe direction: the
+    /// true instant could lie at any offset), so kernel leaves this path as-is rather than
+    /// approximating. As a result, under a non-UTC `tz` the pruning column (in `tz`) and the
+    /// materialized partition column (UTC) can resolve the same offset-less value to different
+    /// instants. An engine that both pushes a partition predicate down to kernel and re-applies
+    /// a residual filter against the materialized column can keep a file yet drop all its rows,
+    /// or vice versa. Engines consuming `partitionValues_parsed` directly are unaffected.
+    /// Aligning the materialized column and the checkpoint write path with `tz` is tracked as a
+    /// follow-up.
+    ///
+    /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
+    pub fn with_session_timezone(mut self, tz: impl Into<String>) -> Self {
+        self.session_timezone = Some(tz.into());
+        self
     }
 }
 
@@ -684,6 +737,7 @@ impl Scan {
     fn partition_values_options(&self) -> log_replay::ScanPartitionValuesOptions {
         log_replay::ScanPartitionValuesOptions {
             parsed_struct: self.partition_values.parsed_struct,
+            session_timezone: self.partition_values.session_timezone.clone(),
         }
     }
 
