@@ -17,4 +17,4 @@ delta_kernel = { path = "../kernel", version = "0.26.0", default-features = fals
   "arrow-58",
   "default-engine-base",
 ] }
-datafusion = "53"
+datafusion = "54"
