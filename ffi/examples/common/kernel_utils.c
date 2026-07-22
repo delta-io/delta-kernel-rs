@@ -115,7 +115,8 @@ void print_metric(MetricEvent event) {
     PM_U64(lsls, num_commit_files);
     PM_U64(lsls, num_checkpoint_files);
     PM_U64(lsls, num_compaction_files);
-    PM_BOOL(lsls, has_latest_crc_file);
+    PM_BOOL(lsls, has_crc);
+    PM_U64(lsls, crc_versions_behind);
     PM_END;
     return;
 
