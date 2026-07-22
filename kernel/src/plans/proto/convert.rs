@@ -969,6 +969,8 @@ mod tests {
     use rstest::rstest;
     use url::Url;
 
+    #[cfg(feature = "geo-type-in-dev")]
+    use super::EdgeAlgo;
     use crate::expressions::{
         lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
@@ -2194,7 +2196,12 @@ mod tests {
         #[case] algorithm: EdgeInterpolationAlgorithm,
         #[case] proto_tag: i32,
     ) {
-        assert_eq!(super::EdgeAlgo::from(&algorithm) as i32, proto_tag);
+        assert_eq!(EdgeAlgo::from(&algorithm) as i32, proto_tag);
+        let proto = EdgeAlgo::try_from(proto_tag).unwrap();
+        assert_eq!(
+            EdgeInterpolationAlgorithm::try_from(proto).unwrap(),
+            algorithm
+        );
     }
 
     #[rstest]
