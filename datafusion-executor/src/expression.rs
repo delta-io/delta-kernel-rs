@@ -1,4 +1,9 @@
 //! Conversion from a kernel [`Expression`] to a DataFusion [`Expr`].
+//!
+//! Untyped: it maps an expression to its natural DataFusion shape with no target output field.
+//! The input schema is taken only to fail fast on unresolvable column references.
+//!
+//! A free function rather than `impl TryFrom`: both types are foreign to this crate (orphan rule).
 
 use datafusion::common::Column;
 use datafusion::functions::core::expr_fn::{coalesce, get_field_path};
@@ -11,6 +16,7 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
+use crate::predicate::to_datafusion_predicate;
 use crate::scalar::kernel_to_df_scalar;
 
 /// Converts a kernel [`Expression`] into the equivalent DataFusion [`Expr`].
@@ -25,10 +31,8 @@ pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaR
         Expression::Binary(binary) => kernel_binary_expr_to_df_expr(binary, input_schema),
         Expression::Variadic(variadic) => kernel_variadic_to_df_expr(variadic, input_schema),
 
-        // TODO: wire up in the predicate-conversion PR (needs the `Predicate -> Expr` converter).
-        Expression::Predicate(_) => Err(Error::unsupported(
-            "converting an embedded Predicate expression is not yet supported",
-        )),
+        // A boolean-valued predicate used as a value: lowers to a boolean DataFusion `Expr`.
+        Expression::Predicate(pred) => to_datafusion_predicate(pred, input_schema),
 
         // TODO: wire up once this function takes an output schema (`Struct` needs it for field
         // names; `MapToStruct`/`StructPatch` for field types). Each arm's lowering follows later.
@@ -186,6 +190,12 @@ mod tests {
     fn array_lowers_to_make_array_call() {
         let kernel = Expr_::array([Expr_::literal(1i64), Expr_::literal(2i64)]);
         assert_eq!(lower(kernel), "make_array(Int64(1), Int64(2))");
+    }
+
+    #[test]
+    fn embedded_predicate_delegates_to_predicate_converter() {
+        let kernel = Expr_::Predicate(Box::new(column_expr!("b").is_null()));
+        assert_eq!(lower(kernel), "b IS NULL");
     }
 
     /// A column reference that does not resolve against the input schema fails at conversion time,
