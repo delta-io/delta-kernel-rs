@@ -326,6 +326,8 @@ pub(crate) mod test_utils {
         schema, schema_ref, ArrayType, ColumnMetadataKey, DataType as KernelDataType, MapType,
         MetadataValue, SchemaRef, StructField, StructType,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType, PrimitiveType};
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
     /// construct a delta log used for testing.
@@ -1155,6 +1157,19 @@ pub(crate) mod test_utils {
                 ),
             ])
         }
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    pub(crate) fn geometry_type(crs: &str) -> KernelDataType {
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new(crs).unwrap())).into()
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    pub(crate) fn geography_type(
+        crs: &str,
+        algorithm: EdgeInterpolationAlgorithm,
+    ) -> KernelDataType {
+        PrimitiveType::Geography(Box::new(GeographyType::try_new(crs, algorithm).unwrap())).into()
     }
 }
 
