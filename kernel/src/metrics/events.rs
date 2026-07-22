@@ -254,6 +254,7 @@ impl MetricEvent {
                 operation_id: e.operation_id,
                 table_type: e.table_type,
                 correlation_id: e.correlation_id,
+                load_type: e.load_type,
             }),
             Self::TransactionCommitSuccess(e) => {
                 Self::TransactionCommitFailure(TransactionCommitFailure {
@@ -654,6 +655,7 @@ pub struct SnapshotBuildSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 
     // === Set during span lifetime ===
     pub version: u64,
@@ -670,6 +672,7 @@ impl SnapshotBuildSuccess {
             operation_id: MetricId::from_attrs(attrs),
             table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
             correlation_id: correlation_id_from_attrs(attrs),
+            load_type: load_type_from_attrs(attrs),
             version: 0,
             duration: Duration::default(),
         }
@@ -694,13 +697,15 @@ impl fmt::Display for SnapshotBuildSuccess {
             operation_id,
             table_type,
             correlation_id,
+            load_type,
             version,
             duration,
         } = self;
         write!(
             f,
             "SnapshotBuildSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, version={version}, duration={duration:?})"
+             correlation_id={correlation_id:?}, load_type={load_type}, version={version}, \
+             duration={duration:?})"
         )
     }
 }
@@ -717,14 +722,15 @@ pub struct SnapshotBuildFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 }
 
 impl fmt::Display for SnapshotBuildFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?})",
-            self.operation_id, self.table_type, self.correlation_id
+            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?}, load_type={})",
+            self.operation_id, self.table_type, self.correlation_id, self.load_type
         )
     }
 }
@@ -1335,6 +1341,22 @@ pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<st
         fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
     }
     let mut v = CorrelationIdVisitor::default();
+    attrs.record(&mut v);
+    v.0
+}
+
+pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType {
+    #[derive(Default)]
+    struct V(LogSegmentLoadType);
+    impl Visit for V {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "load_type" {
+                self.0 = LogSegmentLoadType::parse_or_unknown(value);
+            }
+        }
+        fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+    }
+    let mut v = V::default();
     attrs.record(&mut v);
     v.0
 }
@@ -1986,6 +2008,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: Some("snap-req-3".into()),
+            load_type: LogSegmentLoadType::Incremental,
             version: 0,
             duration: Duration::default(),
         };
@@ -1995,5 +2018,6 @@ mod tests {
             panic!("expected SnapshotBuildFailure");
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
+        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
     }
 }

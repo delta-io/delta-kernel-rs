@@ -453,6 +453,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
+            load_type: LogSegmentLoadType::Full,
             version: 0,
             duration: dur(),
         }));
@@ -626,6 +627,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: None,
+            load_type: LogSegmentLoadType::Full,
         }));
         assert_eq!(reporter.snapshot_completions.get(), 0);
     }

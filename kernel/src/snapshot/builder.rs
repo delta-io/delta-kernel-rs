@@ -214,7 +214,7 @@ impl SnapshotBuilder {
     #[instrument(
         name = SNAPSHOT_COMPLETED_SPAN,
         skip_all,
-        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or("")),
+        fields(path = %self.table_path(), report, version = tracing::field::Empty, operation_id = %self.operation_id, is_catalog_managed = self.max_catalog_version.is_some(), correlation_id = self.correlation_id.as_deref().unwrap_or(""), load_type = self.load_type().as_ref()),
         err
     )]
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
@@ -231,6 +231,8 @@ impl SnapshotBuilder {
             self.max_catalog_version
         );
 
+        let load_type = self.load_type();
+
         // Destructure self so fields can be moved independently
         let Self {
             table_root,
@@ -243,14 +245,6 @@ impl SnapshotBuilder {
             correlation_id,
         } = self;
 
-        // A build from a table root is a fresh, full log listing; a build from an existing snapshot
-        // reuses that snapshot's log root and lists only the commits above it (`table_root` is
-        // None).
-        let load_type = if table_root.is_some() {
-            LogSegmentLoadType::Full
-        } else {
-            LogSegmentLoadType::Incremental
-        };
         let metric_context = SnapshotLoadMetricContext {
             operation_id,
             is_catalog_managed: max_catalog_version.is_some(),
@@ -430,6 +424,16 @@ impl SnapshotBuilder {
                     .map(|s| s.table_root().as_str())
             })
             .unwrap_or("unknown")
+    }
+
+    /// A build from a table root is a fresh, full log listing; a build from an existing snapshot
+    /// reuses that snapshot's log root and lists only the commits above it (`table_root` is None).
+    fn load_type(&self) -> LogSegmentLoadType {
+        if self.table_root.is_some() {
+            LogSegmentLoadType::Full
+        } else {
+            LogSegmentLoadType::Incremental
+        }
     }
 
     fn target_version_str(&self) -> String {

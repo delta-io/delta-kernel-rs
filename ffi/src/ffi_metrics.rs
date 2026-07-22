@@ -394,6 +394,7 @@ impl MetricEvent {
                 table_type,
                 version,
                 duration,
+                ..
             }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -405,6 +406,7 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                ..
             }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
