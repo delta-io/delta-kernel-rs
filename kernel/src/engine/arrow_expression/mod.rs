@@ -218,6 +218,10 @@ impl Scalar {
                     "Interval is not supported as scalar yet.",
                 ));
             }
+            #[cfg(feature = "geo-type-in-dev")]
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                return Err(Error::unsupported("Geo is not supported as scalar yet."));
+            }
         }
         Ok(())
     }

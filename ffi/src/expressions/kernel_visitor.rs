@@ -516,6 +516,13 @@ impl NullTypeTag {
                 // case, so this arm is a defensive fallback rather than part of the normal
                 // void-column path.
                 PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
+                // A geometry/geography's coordinate reference system string doesn't fit the
+                // (tag, u8, u8) payload, so map to the NonPrimitive sentinel. See #2949 for
+                // real geo FFI support.
+                #[cfg(feature = "geo-type-in-dev")]
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                    (Self::NonPrimitive, 0, 0)
+                }
             },
             _ => (Self::NonPrimitive, 0, 0),
         }

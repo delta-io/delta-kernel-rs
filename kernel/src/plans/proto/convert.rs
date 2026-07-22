@@ -4,6 +4,8 @@ use super::plan::agg as proto_agg;
 use super::schema::data_type::Kind as DataTypeKind;
 use super::schema::metadata_value::Value as MetadataValueKind;
 use super::schema::primitive_type::Kind as PrimitiveTypeKind;
+#[cfg(feature = "geo-type-in-dev")]
+use super::schema::EdgeInterpolationAlgorithm as EdgeAlgo;
 use super::schema::SimplePrimitiveType as Simple;
 use super::{
     expressions as proto_expr, operation as proto_op, plan as proto_plan, schema as proto_schema,
@@ -25,6 +27,8 @@ use crate::schema::{
     ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 use crate::{DeltaResult, Error, FileMeta, FileSlice};
 
 // === Helpers ===
@@ -630,6 +634,14 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Timestamp => PrimitiveTypeKind::Simple(Simple::Timestamp as i32),
             PrimitiveType::TimestampNtz => PrimitiveTypeKind::Simple(Simple::TimestampNtz as i32),
             PrimitiveType::Decimal(decimal) => PrimitiveTypeKind::Decimal((*decimal).into()),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geometry(geometry) => {
+                PrimitiveTypeKind::Geometry(geometry.as_ref().into())
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geography(geography) => {
+                PrimitiveTypeKind::Geography(geography.as_ref().into())
+            }
             PrimitiveType::Void => PrimitiveTypeKind::Simple(Simple::Void as i32),
             PrimitiveType::IntervalYearMonth => {
                 PrimitiveTypeKind::Simple(Simple::IntervalYearMonth as i32)
@@ -647,6 +659,38 @@ impl From<DecimalType> for proto_schema::DecimalType {
         proto_schema::DecimalType {
             precision: u32::from(decimal.precision()),
             scale: u32::from(decimal.scale()),
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&GeometryType> for proto_schema::GeometryType {
+    fn from(geometry: &GeometryType) -> Self {
+        proto_schema::GeometryType {
+            crs: geometry.crs().to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&GeographyType> for proto_schema::GeographyType {
+    fn from(geography: &GeographyType) -> Self {
+        proto_schema::GeographyType {
+            crs: geography.crs().to_string(),
+            algorithm: EdgeAlgo::from(geography.algorithm()) as i32,
+        }
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl From<&EdgeInterpolationAlgorithm> for EdgeAlgo {
+    fn from(algorithm: &EdgeInterpolationAlgorithm) -> Self {
+        match algorithm {
+            EdgeInterpolationAlgorithm::Spherical => EdgeAlgo::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty => EdgeAlgo::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas => EdgeAlgo::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer => EdgeAlgo::Andoyer,
+            EdgeInterpolationAlgorithm::Karney => EdgeAlgo::Karney,
         }
     }
 }
@@ -794,6 +838,22 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                 }
             }
             PrimitiveTypeKind::Decimal(decimal) => PrimitiveType::Decimal(decimal.try_into()?),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveTypeKind::Geometry(geometry) => {
+                PrimitiveType::Geometry(Box::new(geometry.try_into()?))
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveTypeKind::Geography(geography) => {
+                PrimitiveType::Geography(Box::new(geography.try_into()?))
+            }
+            // The proto oneof always carries the geo variants, but kernel only knows how to decode
+            // them when the geo feature is enabled.
+            #[cfg(not(feature = "geo-type-in-dev"))]
+            PrimitiveTypeKind::Geometry(_) | PrimitiveTypeKind::Geography(_) => {
+                return Err(Error::schema(
+                    "geometry/geography types require the 'geo-type-in-dev' feature",
+                ))
+            }
         };
         Ok(primitive)
     }
@@ -808,6 +868,50 @@ impl TryFrom<proto_schema::DecimalType> for DecimalType {
         let scale = u8::try_from(proto.scale)
             .map_err(|_| Error::invalid_decimal(format!("scale out of range: {}", proto.scale)))?;
         DecimalType::try_new(precision, scale)
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl TryFrom<proto_schema::GeometryType> for GeometryType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::GeometryType) -> DeltaResult<Self> {
+        GeometryType::try_new(&proto.crs)
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl TryFrom<proto_schema::GeographyType> for GeographyType {
+    type Error = Error;
+    fn try_from(proto: proto_schema::GeographyType) -> DeltaResult<Self> {
+        let algorithm = EdgeAlgo::try_from(proto.algorithm)
+            .map_err(|_| {
+                Error::invalid_geo_params(format!(
+                    "unknown EdgeInterpolationAlgorithm value: {}",
+                    proto.algorithm
+                ))
+            })?
+            .try_into()?;
+        GeographyType::try_new(&proto.crs, algorithm)
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl TryFrom<EdgeAlgo> for EdgeInterpolationAlgorithm {
+    type Error = Error;
+    fn try_from(proto: EdgeAlgo) -> DeltaResult<Self> {
+        let algorithm = match proto {
+            EdgeAlgo::Spherical => EdgeInterpolationAlgorithm::Spherical,
+            EdgeAlgo::Vincenty => EdgeInterpolationAlgorithm::Vincenty,
+            EdgeAlgo::Thomas => EdgeInterpolationAlgorithm::Thomas,
+            EdgeAlgo::Andoyer => EdgeInterpolationAlgorithm::Andoyer,
+            EdgeAlgo::Karney => EdgeInterpolationAlgorithm::Karney,
+            EdgeAlgo::Unspecified => {
+                return Err(Error::invalid_geo_params(
+                    "EdgeInterpolationAlgorithm is unspecified",
+                ))
+            }
+        };
+        Ok(algorithm)
     }
 }
 
@@ -867,6 +971,8 @@ mod tests {
     use rstest::rstest;
     use url::Url;
 
+    #[cfg(feature = "geo-type-in-dev")]
+    use super::EdgeAlgo;
     use crate::expressions::{
         lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
@@ -891,6 +997,8 @@ mod tests {
         ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
         StructField, StructType,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::{DeltaResult, FileMeta, FileSlice};
 
     // === Test helpers ===
@@ -2048,6 +2156,54 @@ mod tests {
         assert_data_type_round_trips(DataType::Primitive(
             PrimitiveType::decimal(precision, scale).unwrap(),
         ));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(GeometryType::try_new("OGC:CRS84").unwrap())]
+    #[case(GeometryType::try_new("EPSG:4326").unwrap())]
+    fn round_trip_geometry(#[case] geometry: GeometryType) {
+        assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geometry(Box::new(
+            geometry,
+        ))));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    fn round_trip_geography(
+        #[values("OGC:CRS84", "EPSG:4326")] crs: &str,
+        #[values(
+            EdgeInterpolationAlgorithm::Spherical,
+            EdgeInterpolationAlgorithm::Vincenty,
+            EdgeInterpolationAlgorithm::Thomas,
+            EdgeInterpolationAlgorithm::Andoyer,
+            EdgeInterpolationAlgorithm::Karney
+        )]
+        algorithm: EdgeInterpolationAlgorithm,
+    ) {
+        let geography = GeographyType::try_new(crs, algorithm).unwrap();
+        assert_data_type_round_trips(DataType::Primitive(PrimitiveType::Geography(Box::new(
+            geography,
+        ))));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(EdgeInterpolationAlgorithm::Spherical, 1)]
+    #[case(EdgeInterpolationAlgorithm::Vincenty, 2)]
+    #[case(EdgeInterpolationAlgorithm::Thomas, 3)]
+    #[case(EdgeInterpolationAlgorithm::Andoyer, 4)]
+    #[case(EdgeInterpolationAlgorithm::Karney, 5)]
+    fn edge_algo_proto_discriminant_is_stable(
+        #[case] algorithm: EdgeInterpolationAlgorithm,
+        #[case] proto_tag: i32,
+    ) {
+        assert_eq!(EdgeAlgo::from(&algorithm) as i32, proto_tag);
+        let proto = EdgeAlgo::try_from(proto_tag).unwrap();
+        assert_eq!(
+            EdgeInterpolationAlgorithm::try_from(proto).unwrap(),
+            algorithm
+        );
     }
 
     #[rstest]

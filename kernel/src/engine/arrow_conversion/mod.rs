@@ -371,6 +371,12 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
                     PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
                     PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
+                    #[cfg(feature = "geo-type-in-dev")]
+                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                        Err(ArrowError::SchemaError(format!(
+                            "Geo types are not yet supported in the default engine: {p}"
+                        )))
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
@@ -658,15 +664,40 @@ mod tests {
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::EdgeInterpolationAlgorithm;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+        StructType,
     };
     use crate::transforms::{transform_output_type, SchemaTransform};
     use crate::utils::test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
         complex_nested_with_field_ids,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::utils::test_utils::{geography_type, geometry_type};
     use crate::DeltaResult;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(geometry_type("EPSG:4326"))]
+    #[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
+    #[case(DataType::from(StructType::try_new([StructField::nullable(
+        "g",
+        geometry_type("EPSG:4326"),
+    )]).unwrap()))]
+    #[case(DataType::from(ArrayType::new(geometry_type("EPSG:4326"), true)))]
+    #[case(DataType::from(MapType::new(
+        DataType::STRING,
+        geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        true,
+    )))]
+    fn test_geo_type_arrow_conversion_unsupported(#[case] dt: DataType) {
+        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        let err = result.unwrap_err();
+        assert!(matches!(err, ArrowError::SchemaError(_)), "got: {err:?}");
+    }
 
     #[test]
     fn test_metadata_string_conversion() -> DeltaResult<()> {
