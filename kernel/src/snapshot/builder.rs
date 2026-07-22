@@ -626,13 +626,15 @@ mod tests {
             .build(engine.as_ref())
             .is_err());
 
-        assert!(
-            reporter
-                .events()
-                .iter()
-                .any(|e| matches!(e, MetricEvent::LogSegmentLoadFailure(_))),
-            "expected LogSegmentLoadFailure when the log has no commits"
-        );
+        let events = reporter.events();
+        let failure = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+                _ => None,
+            })
+            .expect("expected LogSegmentLoadFailure when the log has no commits");
+        assert_eq!(failure.load_type, LogSegmentLoadType::Full);
         Ok(())
     }
 

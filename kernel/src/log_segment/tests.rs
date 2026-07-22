@@ -2170,6 +2170,32 @@ fn test_try_new_crc_newer_than_end_version_is_err() {
 }
 
 #[test]
+fn test_try_new_crc_older_than_checkpoint_is_err() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000004.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000004.json",
+            )),
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000003.checkpoint.parquet",
+            )],
+            latest_crc_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.crc"
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
 fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(

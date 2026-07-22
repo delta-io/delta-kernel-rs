@@ -2,7 +2,6 @@
 //! files.
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -338,25 +337,8 @@ impl LogSegment {
         let log_segment =
             build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
-        log_segment.emit_load_success(&metric_context, start.elapsed());
+        emit_log_segment_load(&metric_context, &log_segment, start.elapsed());
         Ok(log_segment)
-    }
-
-    /// Emit a `LogSegmentLoadSuccess` for this assembled segment, reporting its file counts and
-    /// CRC staleness. Callers time the load and pass the elapsed `duration`.
-    pub(crate) fn emit_load_success(
-        &self,
-        metric_context: &SnapshotLoadMetricContext,
-        duration: Duration,
-    ) {
-        emit_log_segment_load(
-            metric_context,
-            self.listed.ascending_commit_files.len() as u64,
-            self.listed.checkpoint_parts.len() as u64,
-            self.listed.ascending_compaction_files.len() as u64,
-            self.crc_versions_behind(),
-            duration,
-        );
     }
 
     /// How many versions behind `end_version` the latest on-disk CRC file is, for the

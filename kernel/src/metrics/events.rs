@@ -25,6 +25,8 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::log_segment::LogSegment;
+
 // ====================================================================
 // MetricId
 // ====================================================================
@@ -375,8 +377,7 @@ pub struct LogSegmentLoadSuccess {
 impl LogSegmentLoadSuccess {
     pub(crate) const SPAN_NAME: &'static str = LOG_SEGMENT_LOADED_SPAN;
 
-    /// `crc_versions_behind` rides the flat span as an i64 because the span field set has no
-    /// `Option`: `None` (no CRC file) encodes as a negative sentinel that decodes back to `None`.
+    /// Span field for CRC staleness. `None` (no CRC file) encodes as `-1`.
     const CRC_VERSIONS_BEHIND_FIELD: &'static str = "crc_versions_behind";
 
     fn encode_crc_versions_behind(v: Option<u64>) -> i64 {
@@ -387,8 +388,7 @@ impl LogSegmentLoadSuccess {
         u64::try_from(v).ok()
     }
 
-    /// The all-unset seed that [`Self::from_attrs`] fills in as span fields arrive. Each field
-    /// here is the value used when its span field is absent.
+    /// The default seed [`Self::from_attrs`] populates from span fields.
     fn empty() -> Self {
         Self {
             operation_id: MetricId::nil(),
@@ -1706,13 +1706,12 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
     );
 }
 
-/// Emit a [`MetricEvent::LogSegmentLoadSuccess`]. Call once per log-segment load, on success.
+/// Emit a [`MetricEvent::LogSegmentLoadSuccess`] for `segment`, reporting its file counts and CRC
+/// staleness. Call once per log-segment load, on success; callers time the load and pass
+/// `duration`.
 pub(crate) fn emit_log_segment_load(
     ctx: &SnapshotLoadMetricContext,
-    num_commit_files: u64,
-    num_checkpoint_files: u64,
-    num_compaction_files: u64,
-    crc_versions_behind: Option<u64>,
+    segment: &LogSegment,
     duration: Duration,
 ) {
     tracing::span!(
@@ -1723,11 +1722,11 @@ pub(crate) fn emit_log_segment_load(
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
         load_type = ctx.load_type.as_ref(),
-        num_commit_files,
-        num_checkpoint_files,
-        num_compaction_files,
+        num_commit_files = segment.listed.ascending_commit_files.len() as u64,
+        num_checkpoint_files = segment.listed.checkpoint_parts.len() as u64,
+        num_compaction_files = segment.listed.ascending_compaction_files.len() as u64,
         crc_versions_behind =
-            LogSegmentLoadSuccess::encode_crc_versions_behind(crc_versions_behind),
+            LogSegmentLoadSuccess::encode_crc_versions_behind(segment.crc_versions_behind()),
         duration_ns = duration.as_nanos() as u64,
     );
 }
@@ -1906,6 +1905,18 @@ mod tests {
         #[case] expected: LogSegmentLoadType,
     ) {
         assert_eq!(LogSegmentLoadType::parse_or_unknown(value), expected);
+    }
+
+    #[rstest]
+    #[case::none(None)]
+    #[case::zero(Some(0))]
+    #[case::some(Some(7))]
+    fn crc_versions_behind_sentinel_round_trips(#[case] v: Option<u64>) {
+        let encoded = LogSegmentLoadSuccess::encode_crc_versions_behind(v);
+        assert_eq!(
+            LogSegmentLoadSuccess::decode_crc_versions_behind(encoded),
+            v
+        );
     }
 
     #[rstest]

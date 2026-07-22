@@ -11,27 +11,22 @@ use super::{IncrementalReplay, Snapshot};
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
-    emit_log_segment_load_failure, emit_protocol_metadata_load,
+    emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
     emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
 };
 use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
 
-/// A successfully assembled outcome of the listing phase of an incremental update. The failure
-/// outcomes are `Err`s from [`Snapshot::build_new_segment`] (including the requested version being
-/// unavailable), so the caller emits the load-failure metric once on `Err` and matches these
-/// variants for the non-failure paths.
+/// The assembled outcome of the listing phase of an incremental update. Listing/assembly
+/// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
 enum NewSegment {
     /// No new segment to build; the caller returns the existing snapshot unchanged (cases C.2, E).
     Unchanged,
     /// A checkpoint ahead of the existing snapshot requires a full rebuild from it (case D.1).
     Rebuild(LogSegment),
     /// New commits merged into the existing segment; ready for incremental P&M (case F, D.2 -> F).
-    Combined {
-        combined_log_segment: LogSegment,
-        new_end_version: Version,
-    },
+    Combined(LogSegment),
 }
 
 impl Snapshot {
@@ -147,7 +142,11 @@ impl Snapshot {
                 return Self::reuse_promoting_built_as_latest(&existing_snapshot, built_as_latest);
             }
             NewSegment::Rebuild(new_log_segment) => {
-                new_log_segment.emit_load_success(&metric_context, segment_load_start.elapsed());
+                emit_log_segment_load(
+                    &metric_context,
+                    &new_log_segment,
+                    segment_load_start.elapsed(),
+                );
                 let snapshot = Self::try_new_from_log_segment(
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
@@ -158,12 +157,13 @@ impl Snapshot {
                 );
                 return Ok(Arc::new(snapshot?));
             }
-            NewSegment::Combined {
-                combined_log_segment,
-                new_end_version,
-            } => {
-                combined_log_segment
-                    .emit_load_success(&metric_context, segment_load_start.elapsed());
+            NewSegment::Combined(combined_log_segment) => {
+                emit_log_segment_load(
+                    &metric_context,
+                    &combined_log_segment,
+                    segment_load_start.elapsed(),
+                );
+                let new_end_version = combined_log_segment.end_version;
                 (combined_log_segment, new_end_version)
             }
         };
@@ -403,10 +403,7 @@ impl Snapshot {
             new_checkpoint_hint,
         )?;
 
-        Ok(NewSegment::Combined {
-            combined_log_segment,
-            new_end_version,
-        })
+        Ok(NewSegment::Combined(combined_log_segment))
     }
 
     /// Reuse `existing`, promoting its `built_as_latest` flag to `true` if this build confirmed
@@ -2224,7 +2221,7 @@ mod tests {
     // Case D.1 (checkpoint strictly ahead of the base) rebuilds via the fresh emitter, but the
     // load was requested incrementally, so both events must still report Incremental.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_rebuild_reports_incremental_purpose() -> DeltaResult<()> {
+    async fn test_incremental_rebuild_reports_incremental_load_type() -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
         setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?;
 
