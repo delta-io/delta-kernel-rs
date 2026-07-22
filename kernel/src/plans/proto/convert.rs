@@ -2183,6 +2183,20 @@ mod tests {
         ))));
     }
 
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(EdgeInterpolationAlgorithm::Spherical, 1)]
+    #[case(EdgeInterpolationAlgorithm::Vincenty, 2)]
+    #[case(EdgeInterpolationAlgorithm::Thomas, 3)]
+    #[case(EdgeInterpolationAlgorithm::Andoyer, 4)]
+    #[case(EdgeInterpolationAlgorithm::Karney, 5)]
+    fn edge_algo_proto_discriminant_is_stable(
+        #[case] algorithm: EdgeInterpolationAlgorithm,
+        #[case] proto_tag: i32,
+    ) {
+        assert_eq!(super::EdgeAlgo::from(&algorithm) as i32, proto_tag);
+    }
+
     #[rstest]
     #[case(DataType::from(ArrayType::new(DataType::INTEGER, true)))]
     #[case(DataType::from(ArrayType::new(DataType::STRING, false)))]

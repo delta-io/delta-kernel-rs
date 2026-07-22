@@ -72,6 +72,6 @@ tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
 
-# Experimental, temporary, test-only feature flag guarding the in-progress geospatial
-# (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
+# Experimental, in-development feature flag gating in-progress geospatial
+# (geometry/geography) type support. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]

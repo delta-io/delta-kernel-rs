@@ -1782,9 +1782,10 @@ fn default_true() -> bool {
     true
 }
 
-/// Validates that a CRS is in AUTHORITY:CODE form: contains a colon, has non-empty text
-/// before and after it, and has no leading or trailing whitespace. Validating the value
-/// against the full set of recognized CRSes is future work.
+/// Validates that a CRS (Coordinate Reference System) identifier is in `AUTHORITY:CODE` form,
+/// e.g. `"EPSG:4326"` or `"OGC:CRS84"`: a non-empty authority and code separated by a single
+/// colon, no comma, and no surrounding whitespace. Validating the value against the full set of
+/// recognized CRSes is future work.
 #[cfg(feature = "geo-type-in-dev")]
 fn validate_crs(crs: &str) -> DeltaResult<()> {
     require!(
@@ -1792,6 +1793,10 @@ fn validate_crs(crs: &str) -> DeltaResult<()> {
         Error::invalid_geo_params(format!(
             "CRS '{crs}' must not have leading or trailing whitespace"
         ))
+    );
+    require!(
+        !crs.contains(','),
+        Error::invalid_geo_params(format!("CRS '{crs}' must not contain a comma"))
     );
 
     let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
@@ -1816,19 +1821,25 @@ fn validate_crs(crs: &str) -> DeltaResult<()> {
 /// Algorithm used to interpolate edges between two vertices of a geography path.
 #[cfg(feature = "geo-type-in-dev")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, EnumString, StrumDisplay)]
+#[strum(ascii_case_insensitive)]
 pub enum EdgeInterpolationAlgorithm {
+    /// Edges are interpolated as geodesics on a sphere.
     #[strum(serialize = "spherical")]
     Spherical,
 
+    /// Vincenty's formulae for geodesics on an ellipsoid.
     #[strum(serialize = "vincenty")]
     Vincenty,
 
+    /// Thomas's approximation for geodesics on an ellipsoid.
     #[strum(serialize = "thomas")]
     Thomas,
 
+    /// Andoyer's approximation for geodesics on an ellipsoid.
     #[strum(serialize = "andoyer")]
     Andoyer,
 
+    /// Karney's algorithm for geodesics on an ellipsoid.
     #[strum(serialize = "karney")]
     Karney,
 }
@@ -1973,11 +1984,11 @@ pub enum PrimitiveType {
     Decimal(DecimalType),
     /// Geometry column with an associated coordinate reference system (CRS).
     #[cfg(feature = "geo-type-in-dev")]
-    #[serde(serialize_with = "serialize_geometry", untagged)]
+    #[serde(serialize_with = "serialize_geotype", untagged)]
     Geometry(Box<GeometryType>),
     /// Geography column with an associated CRS and edge interpolation algorithm.
     #[cfg(feature = "geo-type-in-dev")]
-    #[serde(serialize_with = "serialize_geography", untagged)]
+    #[serde(serialize_with = "serialize_geotype", untagged)]
     Geography(Box<GeographyType>),
 }
 
@@ -2054,19 +2065,11 @@ fn serialize_decimal<S: serde::Serializer>(
 }
 
 #[cfg(feature = "geo-type-in-dev")]
-fn serialize_geometry<S: serde::Serializer>(
-    gtype: &GeometryType,
+fn serialize_geotype<T: std::fmt::Display, S: serde::Serializer>(
+    value: &T,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&gtype.to_string())
-}
-
-#[cfg(feature = "geo-type-in-dev")]
-fn serialize_geography<S: serde::Serializer>(
-    gtype: &GeographyType,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&gtype.to_string())
+    serializer.serialize_str(&value.to_string())
 }
 
 fn serialize_variant<S: serde::Serializer>(
@@ -2152,7 +2155,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             }
             #[cfg(feature = "geo-type-in-dev")]
             geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
-                let crs = &geo_str[9..geo_str.len() - 1];
+                let crs = &geo_str["geometry(".len()..geo_str.len() - 1];
                 GeometryType::try_new(crs.trim())
                     .map(Box::new)
                     .map(PrimitiveType::Geometry)
@@ -2160,7 +2163,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             }
             #[cfg(feature = "geo-type-in-dev")]
             geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
-                let inner = &geo_str[10..geo_str.len() - 1];
+                let inner = &geo_str["geography(".len()..geo_str.len() - 1];
                 // Kernel accepts only the canonical serialized form that every writer emits:
                 //   geography(<crs>, <algorithm>)
                 // TODO: reevaluate whether accepting padded input like
@@ -2702,6 +2705,16 @@ mod tests {
         geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
         "geography(EPSG:4326, karney)"
     )]
+    #[case(
+        "geography(EPSG:4326, SPHERICAL)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        "geography(EPSG:4326, spherical)"
+    )]
+    #[case(
+        "geography(EPSG:4326, Vincenty)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty),
+        "geography(EPSG:4326, vincenty)"
+    )]
     fn test_geo_round_trip(
         #[case] type_str: &str,
         #[case] expected: PrimitiveType,
@@ -2749,7 +2762,8 @@ mod tests {
             "EPSG:4326 ",
             " EPSG:4326 ",
             "EPSG:4326:extra",
-            "a:b:c"
+            "a:b:c",
+            "EPSG:1,2"
         )]
         crs: &str,
     ) {

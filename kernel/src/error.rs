@@ -185,7 +185,6 @@ pub enum Error {
     InvalidDecimal(String),
 
     /// Invalid CRS or other parameter for a Geometry / Geography type
-    #[cfg(feature = "geo-type-in-dev")]
     #[error("Invalid geo parameters: {0}")]
     InvalidGeoParams(String),
 

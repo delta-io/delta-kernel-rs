@@ -666,27 +666,25 @@ mod tests {
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::EdgeInterpolationAlgorithm;
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
         StructType,
     };
-    #[cfg(feature = "geo-type-in-dev")]
-    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
     use crate::transforms::{transform_output_type, SchemaTransform};
     use crate::utils::test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
         complex_nested_with_field_ids,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::utils::test_utils::{geography_type, geometry_type};
     use crate::DeltaResult;
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
-    #[case(DataType::Primitive(PrimitiveType::Geometry(Box::new(
-        GeometryType::try_new("EPSG:4326").unwrap()
-    ))))]
-    #[case(DataType::Primitive(PrimitiveType::Geography(Box::new(
-        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap()
-    ))))]
+    #[case(geometry_type("EPSG:4326"))]
+    #[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
     fn test_geo_type_arrow_conversion_unsupported(#[case] dt: DataType) {
         let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
         let err = result.unwrap_err();
