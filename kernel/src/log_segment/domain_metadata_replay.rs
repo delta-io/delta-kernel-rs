@@ -36,13 +36,14 @@ impl LogSegment {
     }
 
     /// Answer a domain-metadata query rooted in an authoritative (`Complete`) but stale CRC's
-    /// `base_active` map at `base_version`, scanning ONLY the commits in `(base_version, end]`.
+    /// `base_active` map at `base_version`, scanning ONLY the commits in
+    /// `(base_version, self.end_version]`.
     ///
     /// The checkpoint and every commit at/below `base_version` are skipped via
     /// [`Self::segment_after_version`]. For each domain the newest action in the tail wins; a tail
-    /// tombstone means the domain is absent at `end` even when `base_active` holds it. A domain the
-    /// tail never mentions falls back to `base_active`. `domains == None` answers all active
-    /// domains; `Some(filter)` answers only the requested ones. Returned maps never contain
+    /// tombstone means the domain is absent at `self.end_version` even when `base_active` holds it.
+    /// A domain the tail never mentions falls back to `base_active`. `domains == None` answers all
+    /// active domains; `Some(filter)` answers only the requested ones. Returned maps never contain
     /// tombstones.
     pub(crate) fn scan_domain_metadatas_rooted_in_crc(
         &self,
