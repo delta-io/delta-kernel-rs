@@ -1299,7 +1299,7 @@ fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let stats = all_referenced_columns(pred);
     let skipping_pred = as_checkpoint_skipping_predicate(pred, &[], &stats)?;
     let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
+        prefix: ColumnName::new(["add"]),
     };
     Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }
