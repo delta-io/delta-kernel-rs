@@ -23,9 +23,7 @@ members = [
 # - read-table-single-threaded
 # - write-table
 #
-# `datafusion-executor` is intentionally NOT a member: it declares its own [workspace] so its
-# kernel dependency resolves in isolation on arrow-58 (DataFusion 53's arrow), free of the
-# workspace-wide arrow-59 feature unification. See datafusion-executor/Cargo.toml.
+# `datafusion-executor` is intentionally NOT a member; it is a separate workspace. See CLAUDE.md.
 resolver = "3"
 
 [workspace.package]

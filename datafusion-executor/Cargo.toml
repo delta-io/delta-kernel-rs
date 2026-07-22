@@ -9,12 +9,7 @@ readme = "README.md"
 version = "0.26.0"
 rust-version = "1.88"
 
-# This crate is its OWN workspace, deliberately excluded from the root workspace. DataFusion 53
-# tracks arrow-58 while kernel's default is arrow-59; if this crate were a root member, Cargo
-# feature unification would compile kernel with both arrow majors at once (arrow-59 winning by
-# precedence), linking DataFusion's arrow-58 types against kernel's arrow-59 -- a diamond that
-# breaks the build. A separate workspace resolves this crate's kernel dep in isolation, so kernel
-# gets arrow-58 only. Mirrors the `integration-tests` crate. See ../CLAUDE.md.
+# Separate workspace (kernel arrow-58 vs the root workspace's arrow-59). See ../CLAUDE.md.
 [workspace]
 
 [dependencies]
