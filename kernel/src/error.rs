@@ -219,6 +219,14 @@ pub enum Error {
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
 
+    /// Row tracking (`delta.enableRowTracking`) must be enabled for the entire version range of a
+    /// row-tracking change feed, but it is not enabled at the given version.
+    #[error(
+        "Row tracking (delta.enableRowTracking) must be enabled for the entire row-tracking change \
+         feed range, but it is not enabled at version {0}"
+    )]
+    RowTrackingChangeFeedUnsupported(Version),
+
     #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
     ChangeDataFeedIncompatibleSchema(String, String),
 
@@ -331,11 +339,28 @@ impl Error {
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
     }
+    /// Creates an [`Error::RowTrackingChangeFeedUnsupported`] for the given version, used when row
+    /// tracking is not enabled at some point in a row-tracking change feed's version range.
+    pub(crate) fn row_tracking_change_feed_unsupported(version: impl Into<Version>) -> Self {
+        Self::RowTrackingChangeFeedUnsupported(version.into())
+    }
     pub(crate) fn change_data_feed_incompatible_schema(
         expected: &StructType,
         actual: &StructType,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+        Self::ChangeDataFeedIncompatibleSchema(expected.to_string(), actual.to_string())
+    }
+
+    /// Creates an incompatible-schema error that identifies the version of `actual`.
+    pub(crate) fn change_data_feed_incompatible_schema_at_version(
+        expected: &StructType,
+        actual: &StructType,
+        version: Version,
+    ) -> Self {
+        Self::ChangeDataFeedIncompatibleSchema(
+            expected.to_string(),
+            format!("schema at version {version}: {actual}"),
+        )
     }
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {

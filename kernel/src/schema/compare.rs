@@ -27,12 +27,10 @@ use crate::utils::require;
 
 /// The nullability flag of a schema's field. This can be compared with a read schema field's
 /// nullability flag using [`Nullable::can_read_as`].
-#[allow(unused)]
 #[derive(Clone, Copy)]
 pub(crate) struct Nullable(bool);
 
 /// Represents the ways a schema comparison can fail.
-#[allow(unused)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error("The nullability was tightened for a field")]
@@ -50,22 +48,34 @@ pub(crate) enum Error {
 }
 
 /// A [`std::result::Result`] that has the schema comparison [`Error`] as the error variant.
-#[allow(unused)]
 pub(crate) type SchemaComparisonResult = Result<(), Error>;
 
 /// Represents a schema compatibility check for the type. If `self` can be read as `read_type`,
 /// this function returns `Ok(())`. Otherwise, this function returns `Err`.
-///
-/// TODO (Oussama): Remove the `allow(unused)` once this is used in CDF.
-#[allow(unused)]
 pub(crate) trait SchemaComparison {
-    fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult;
+    fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
+        self.can_read_as_internal(read_type, true)
+    }
+
+    fn can_read_as_without_type_widening(&self, read_type: &Self) -> SchemaComparisonResult {
+        self.can_read_as_internal(read_type, false)
+    }
+
+    fn can_read_as_internal(
+        &self,
+        read_type: &Self,
+        allow_type_widening: bool,
+    ) -> SchemaComparisonResult;
 }
 
 impl SchemaComparison for Nullable {
     /// Represents a nullability comparison between two schemas' fields. Returns true if the
     /// read nullability is the same or wider than the nullability of self.
-    fn can_read_as(&self, read_nullable: &Nullable) -> SchemaComparisonResult {
+    fn can_read_as_internal(
+        &self,
+        read_nullable: &Nullable,
+        _allow_type_widening: bool,
+    ) -> SchemaComparisonResult {
         // The case to avoid is when the column is nullable, but the read schema specifies the
         // column as non-nullable. So we avoid the case where !read_nullable && nullable
         // Hence we check that !(!read_nullable && existing_nullable)
@@ -81,10 +91,16 @@ impl SchemaComparison for StructField {
     ///     1. The read schema field mustn't be non-nullable if this [`StructField`] is nullable.
     ///     2. The both this field and `read_field` must have the same name.
     ///     3. You can read this data type as the `read_field`'s data type.
-    fn can_read_as(&self, read_field: &Self) -> SchemaComparisonResult {
-        Nullable(self.nullable).can_read_as(&Nullable(read_field.nullable))?;
+    fn can_read_as_internal(
+        &self,
+        read_field: &Self,
+        allow_type_widening: bool,
+    ) -> SchemaComparisonResult {
+        Nullable(self.nullable)
+            .can_read_as_internal(&Nullable(read_field.nullable), allow_type_widening)?;
         require!(self.name() == read_field.name(), Error::FieldNameMismatch);
-        self.data_type().can_read_as(read_field.data_type())?;
+        self.data_type()
+            .can_read_as_internal(read_field.data_type(), allow_type_widening)?;
         Ok(())
     }
 }
@@ -96,7 +112,11 @@ impl SchemaComparison for StructType {
     ///     3. If a field in `read_type` is not present in this struct, then it must be nullable.
     ///     4. Both [`StructTypes`] must be valid schemas. No two fields of a struct may share a
     ///        name that only differs by case.
-    fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
+    fn can_read_as_internal(
+        &self,
+        read_type: &Self,
+        allow_type_widening: bool,
+    ) -> SchemaComparisonResult {
         let lowercase_field_map: HashMap<String, &StructField> = self
             .fields
             .iter()
@@ -123,7 +143,9 @@ impl SchemaComparison for StructType {
         }
         for read_field in read_type.fields() {
             match lowercase_field_map.get(&read_field.name().to_lowercase()) {
-                Some(existing_field) => existing_field.can_read_as(read_field)?,
+                Some(existing_field) => {
+                    existing_field.can_read_as_internal(read_field, allow_type_widening)?
+                }
                 None => {
                     // Note: Delta spark does not perform the following check. Hence it ignores
                     // non-null fields that exist in the read schema that aren't in this schema.
@@ -145,28 +167,41 @@ impl SchemaComparison for DataType {
     ///        [`Nullable::can_read_as`]
     ///
     /// [`PrimitiveType::can_widen_to`]: super::PrimitiveType::can_widen_to
-    fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
+    fn can_read_as_internal(
+        &self,
+        read_type: &Self,
+        allow_type_widening: bool,
+    ) -> SchemaComparisonResult {
         match (self, read_type) {
             (Self::Array(self_array), Self::Array(read_array)) => {
-                Nullable(self_array.contains_null())
-                    .can_read_as(&Nullable(read_array.contains_null()))?;
+                Nullable(self_array.contains_null()).can_read_as_internal(
+                    &Nullable(read_array.contains_null()),
+                    allow_type_widening,
+                )?;
                 self_array
                     .element_type()
-                    .can_read_as(read_array.element_type())?;
+                    .can_read_as_internal(read_array.element_type(), allow_type_widening)?;
             }
             (Self::Struct(self_struct), Self::Struct(read_struct)) => {
-                self_struct.can_read_as(read_struct)?
+                self_struct.can_read_as_internal(read_struct, allow_type_widening)?
             }
             (Self::Map(self_map), Self::Map(read_map)) => {
-                Nullable(self_map.value_contains_null())
-                    .can_read_as(&Nullable(read_map.value_contains_null()))?;
-                self_map.key_type().can_read_as(read_map.key_type())?;
-                self_map.value_type().can_read_as(read_map.value_type())?;
+                Nullable(self_map.value_contains_null()).can_read_as_internal(
+                    &Nullable(read_map.value_contains_null()),
+                    allow_type_widening,
+                )?;
+                self_map
+                    .key_type()
+                    .can_read_as_internal(read_map.key_type(), allow_type_widening)?;
+                self_map
+                    .value_type()
+                    .can_read_as_internal(read_map.value_type(), allow_type_widening)?;
             }
             // Exact match
             (a, b) if a == b => {}
             // Type widening: smaller primitive types can be read as larger ones
-            (Self::Primitive(a), Self::Primitive(b)) if a.can_widen_to(b) => {}
+            (Self::Primitive(a), Self::Primitive(b))
+                if allow_type_widening && a.can_widen_to(b) => {}
             // Any other type change is incompatible
             _ => return Err(Error::TypeMismatch),
         };
@@ -178,8 +213,33 @@ impl SchemaComparison for DataType {
 mod tests {
     use rstest::rstest;
 
-    use crate::schema::compare::{Error, SchemaComparison};
-    use crate::schema::{schema, DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::compare::{Error, SchemaComparison, SchemaComparisonResult};
+    use crate::schema::{
+        schema, ArrayType, DataType, MapType, PrimitiveType, StructField, StructType,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ComparisonMode {
+        AllowTypeWidening,
+        ForbidTypeWidening,
+    }
+
+    impl ComparisonMode {
+        fn can_read_as<T: SchemaComparison>(
+            self,
+            existing: &T,
+            read: &T,
+        ) -> SchemaComparisonResult {
+            match self {
+                Self::AllowTypeWidening => existing.can_read_as(read),
+                Self::ForbidTypeWidening => existing.can_read_as_without_type_widening(read),
+            }
+        }
+
+        fn allows_type_widening(self) -> bool {
+            self == Self::AllowTypeWidening
+        }
+    }
 
     #[test]
     fn can_read_is_reflexive() {
@@ -195,8 +255,11 @@ mod tests {
 
         assert!(schema.can_read_as(&schema).is_ok());
     }
-    #[test]
-    fn add_nullable_column_to_map_key_and_value() {
+    #[rstest]
+    fn add_nullable_column_to_map_key_and_value(
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
         let existing_schema = schema! {
             not_null "map": {
                 { not_null "id": LONG, nullable "name": STRING }
@@ -211,7 +274,7 @@ mod tests {
             },
         };
 
-        assert!(existing_schema.can_read_as(&read_schema).is_ok());
+        assert!(mode.can_read_as(&existing_schema, &read_schema).is_ok());
     }
     #[test]
     fn map_value_becomes_non_nullable_fails() {
@@ -319,8 +382,11 @@ mod tests {
         // Read `b` as `a`. `a` is missing a column that is present in `b`.
         assert!(matches!(b.can_read_as(&a), Err(Error::MissingColumn)));
     }
-    #[test]
-    fn differ_by_non_nullable_column() {
+    #[rstest]
+    fn differ_by_non_nullable_column(
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
         let a = StructType::new_unchecked([
             StructField::new("id", DataType::LONG, false),
             StructField::new("name", DataType::STRING, false),
@@ -336,12 +402,15 @@ mod tests {
 
         // Read `a` as `b`. `b` has an extra non-nullable column.
         assert!(matches!(
-            a.can_read_as(&b),
+            mode.can_read_as(&a, &b),
             Err(Error::NewNonNullableColumn)
         ));
 
         // Read `b` as `a`. `a` is missing a column that is present in `b`.
-        assert!(matches!(b.can_read_as(&a), Err(Error::MissingColumn)));
+        assert!(matches!(
+            mode.can_read_as(&b, &a),
+            Err(Error::MissingColumn)
+        ));
     }
 
     #[test]
@@ -371,27 +440,41 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn type_widening_integer() {
-        // byte -> short -> int -> long
-        assert!(DataType::BYTE.can_read_as(&DataType::SHORT).is_ok());
-        assert!(DataType::BYTE.can_read_as(&DataType::INTEGER).is_ok());
-        assert!(DataType::BYTE.can_read_as(&DataType::LONG).is_ok());
-        assert!(DataType::SHORT.can_read_as(&DataType::INTEGER).is_ok());
-        assert!(DataType::SHORT.can_read_as(&DataType::LONG).is_ok());
-        assert!(DataType::INTEGER.can_read_as(&DataType::LONG).is_ok());
+    #[rstest]
+    #[case::byte_to_short(DataType::BYTE, DataType::SHORT)]
+    #[case::byte_to_integer(DataType::BYTE, DataType::INTEGER)]
+    #[case::byte_to_long(DataType::BYTE, DataType::LONG)]
+    #[case::short_to_integer(DataType::SHORT, DataType::INTEGER)]
+    #[case::short_to_long(DataType::SHORT, DataType::LONG)]
+    #[case::integer_to_long(DataType::INTEGER, DataType::LONG)]
+    #[case::float_to_double(DataType::FLOAT, DataType::DOUBLE)]
+    #[case::timestamp_to_timestamp_ntz(DataType::TIMESTAMP, DataType::TIMESTAMP_NTZ)]
+    #[case::timestamp_ntz_to_timestamp(DataType::TIMESTAMP_NTZ, DataType::TIMESTAMP)]
+    fn primitive_type_widening(
+        #[case] source: DataType,
+        #[case] target: DataType,
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
+        assert_eq!(
+            mode.can_read_as(&source, &target).is_ok(),
+            mode.allows_type_widening()
+        );
+    }
 
-        // Cannot narrow types
+    #[rstest]
+    #[case::long_to_integer(DataType::LONG, DataType::INTEGER)]
+    #[case::integer_to_short(DataType::INTEGER, DataType::SHORT)]
+    #[case::short_to_byte(DataType::SHORT, DataType::BYTE)]
+    #[case::double_to_float(DataType::DOUBLE, DataType::FLOAT)]
+    fn primitive_type_narrowing_is_rejected(
+        #[case] source: DataType,
+        #[case] target: DataType,
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
         assert!(matches!(
-            DataType::LONG.can_read_as(&DataType::INTEGER),
-            Err(Error::TypeMismatch)
-        ));
-        assert!(matches!(
-            DataType::INTEGER.can_read_as(&DataType::SHORT),
-            Err(Error::TypeMismatch)
-        ));
-        assert!(matches!(
-            DataType::SHORT.can_read_as(&DataType::BYTE),
+            mode.can_read_as(&source, &target),
             Err(Error::TypeMismatch)
         ));
     }
@@ -431,20 +514,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn type_widening_float() {
-        // float -> double
-        assert!(DataType::FLOAT.can_read_as(&DataType::DOUBLE).is_ok());
-
-        // Cannot narrow
-        assert!(matches!(
-            DataType::DOUBLE.can_read_as(&DataType::FLOAT),
-            Err(Error::TypeMismatch)
-        ));
-    }
-
-    #[test]
-    fn type_widening_in_struct() {
+    #[rstest]
+    fn type_widening_in_struct(
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
         let source = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("value", DataType::FLOAT, true),
@@ -454,29 +528,61 @@ mod tests {
             StructField::new("value", DataType::DOUBLE, true),
         ]);
 
-        // Can widen types in struct fields
-        assert!(source.can_read_as(&target).is_ok());
+        assert_eq!(
+            mode.can_read_as(&source, &target).is_ok(),
+            mode.allows_type_widening()
+        );
 
-        // Cannot narrow
         assert!(matches!(
-            target.can_read_as(&source),
+            mode.can_read_as(&target, &source),
             Err(Error::TypeMismatch)
         ));
     }
 
-    #[test]
-    fn incompatible_type_change() {
+    #[rstest]
+    #[case::array(
+        DataType::from(ArrayType::new(DataType::INTEGER, false)),
+        DataType::from(ArrayType::new(DataType::LONG, false))
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(DataType::INTEGER, DataType::STRING, false)),
+        DataType::from(MapType::new(DataType::LONG, DataType::STRING, false))
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, false)),
+        DataType::from(MapType::new(DataType::STRING, DataType::LONG, false))
+    )]
+    fn type_widening_in_complex_types(
+        #[case] source: DataType,
+        #[case] target: DataType,
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
+        let result = mode.can_read_as(&source, &target);
+        match mode {
+            ComparisonMode::AllowTypeWidening => assert!(result.is_ok()),
+            ComparisonMode::ForbidTypeWidening => {
+                assert!(matches!(result, Err(Error::TypeMismatch)))
+            }
+        }
+    }
+
+    #[rstest]
+    fn incompatible_type_change(
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
         // Cannot change between incompatible types
         assert!(matches!(
-            DataType::STRING.can_read_as(&DataType::INTEGER),
+            mode.can_read_as(&DataType::STRING, &DataType::INTEGER),
             Err(Error::TypeMismatch)
         ));
         assert!(matches!(
-            DataType::INTEGER.can_read_as(&DataType::STRING),
+            mode.can_read_as(&DataType::INTEGER, &DataType::STRING),
             Err(Error::TypeMismatch)
         ));
         assert!(matches!(
-            DataType::BOOLEAN.can_read_as(&DataType::INTEGER),
+            mode.can_read_as(&DataType::BOOLEAN, &DataType::INTEGER),
             Err(Error::TypeMismatch)
         ));
     }
