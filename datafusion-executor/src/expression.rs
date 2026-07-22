@@ -16,15 +16,14 @@ use crate::scalar::kernel_to_df_scalar;
 /// Converts a kernel [`Expression`] into the equivalent DataFusion [`Expr`].
 ///
 /// # Errors
-///
 /// Returns an error for a column that does not resolve against `input_schema`, and
 /// [`Error::unsupported`] for arms with no untyped DataFusion equivalent (see the `TODO`s below).
-pub fn to_datafusion_expr(expr: &Expression, input_schema: &StructType) -> DeltaResult<Expr> {
+pub fn kernel_to_datafusion_expr(expr: &Expression, input_schema: &StructType) -> DeltaResult<Expr> {
     match expr {
         Expression::Literal(scalar) => Ok(lit(kernel_to_df_scalar(scalar)?)),
-        Expression::Column(name) => column_to_expr(name, input_schema),
-        Expression::Binary(binary) => binary_to_expr(binary, input_schema),
-        Expression::Variadic(variadic) => variadic_to_expr(variadic, input_schema),
+        Expression::Column(name) => kernel_column_to_df_expr(name, input_schema),
+        Expression::Binary(binary) => kernel_binary_expr_to_df_expr(binary, input_schema),
+        Expression::Variadic(variadic) => kernel_variadic_to_df_expr(variadic, input_schema),
 
         // TODO: wire up in the predicate-conversion PR (needs the `Predicate -> Expr` converter).
         Expression::Predicate(_) => Err(Error::unsupported(
@@ -63,7 +62,7 @@ pub fn to_datafusion_expr(expr: &Expression, input_schema: &StructType) -> Delta
 /// Lowers a column reference to a nested field access, e.g. `a.b.c` becomes a single
 /// `get_field(col("a"), "b", "c")` call. The path is resolved against `input_schema` (via
 /// [`StructType::field_at`]) to fail fast, but the resolved field is otherwise unused.
-fn column_to_expr(name: &ColumnName, input_schema: &StructType) -> DeltaResult<Expr> {
+fn kernel_column_to_df_expr(name: &ColumnName, input_schema: &StructType) -> DeltaResult<Expr> {
     input_schema.field_at(name)?;
     let mut path = name.iter();
     let root = path
@@ -82,25 +81,25 @@ fn column_to_expr(name: &ColumnName, input_schema: &StructType) -> DeltaResult<E
 /// Lowers an arithmetic binary expression (`Plus`/`Minus`/`Multiply`/`Divide`) to an
 /// `Expr::BinaryExpr`. Comparison and `IN` operators are modeled as predicates, not expressions,
 /// so they never reach this arm.
-fn binary_to_expr(binary: &BinaryExpression, input_schema: &StructType) -> DeltaResult<Expr> {
+fn kernel_binary_expr_to_df_expr(binary: &BinaryExpression, input_schema: &StructType) -> DeltaResult<Expr> {
     let op = match binary.op {
         BinaryExpressionOp::Plus => Operator::Plus,
         BinaryExpressionOp::Minus => Operator::Minus,
         BinaryExpressionOp::Multiply => Operator::Multiply,
         BinaryExpressionOp::Divide => Operator::Divide,
     };
-    let left = to_datafusion_expr(&binary.left, input_schema)?;
-    let right = to_datafusion_expr(&binary.right, input_schema)?;
+    let left = kernel_to_datafusion_expr(&binary.left, input_schema)?;
+    let right = kernel_to_datafusion_expr(&binary.right, input_schema)?;
     Ok(binary_expr(left, op, right))
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`,
 /// each over the converted arguments.
-fn variadic_to_expr(variadic: &VariadicExpression, input_schema: &StructType) -> DeltaResult<Expr> {
+fn kernel_variadic_to_df_expr(variadic: &VariadicExpression, input_schema: &StructType) -> DeltaResult<Expr> {
     let args = variadic
         .exprs
         .iter()
-        .map(|e| to_datafusion_expr(e, input_schema))
+        .map(|e| kernel_to_datafusion_expr(e, input_schema))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(match variadic.op {
         VariadicExpressionOp::Coalesce => coalesce(args),
@@ -136,7 +135,7 @@ mod tests {
     /// Lowers an expression against [`test_schema`] and renders it as a DataFusion `Display`
     /// string.
     fn lower(expr: Expr_) -> String {
-        to_datafusion_expr(&expr, &test_schema())
+        kernel_to_datafusion_expr(&expr, &test_schema())
             .unwrap()
             .to_string()
     }
@@ -197,6 +196,6 @@ mod tests {
     #[case::unknown_nested(Expr_::column(["a", "b", "missing"]))]
     #[case::descend_into_non_struct(Expr_::column(["x", "y"]))]
     fn unresolved_column_is_an_error(#[case] kernel: Expr_) {
-        to_datafusion_expr(&kernel, &test_schema()).unwrap_err();
+        kernel_to_datafusion_expr(&kernel, &test_schema()).unwrap_err();
     }
 }
