@@ -23,7 +23,9 @@ impl StagedDataValidator {
     /// Creates a validator for required add-file values and `partitionValues` keys.
     ///
     /// [`TableConfiguration::physical_partition_columns`]: crate::table_configuration::TableConfiguration::physical_partition_columns
-    pub(crate) fn staged_add_file(physical_partition_columns: Vec<String>) -> Self {
+    pub(crate) fn staged_add_file(
+        physical_partition_columns: impl IntoIterator<Item = String>,
+    ) -> Self {
         StagedDataValidator::new(
             &MANDATORY_ADD_FILE_COLUMNS,
             vec![
@@ -81,7 +83,7 @@ impl Validation for AddFileRequiredFields {
 }
 
 /// Validates that each staged add-file's `partitionValues` keys exactly match the table's partition
-/// columns (compared as physical names). Both a missing and an unexpected key are rejected.
+/// columns (compared as physical names). Missing, unexpected, and duplicate keys are rejected.
 pub(crate) struct AddFilePartitionColumnsValidation {
     physical_partition_columns: HashSet<String>,
 }
@@ -216,10 +218,7 @@ mod tests {
 
     fn add_file_validator(physical_partition_columns: &[&str]) -> StagedDataValidator {
         StagedDataValidator::staged_add_file(
-            physical_partition_columns
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            physical_partition_columns.iter().map(|s| s.to_string()),
         )
     }
 
@@ -324,7 +323,6 @@ mod tests {
 
     #[test]
     fn partition_value_null_still_counts_as_present() {
-        // A partition column present with a null value satisfies the key-set check.
         let batch = add_files_with_partition_values(&[&[("p1", Some("a")), ("p2", None)]]);
         add_file_validator(&["p1", "p2"] /* physical_partition_columns */)
             .validate(&as_engine_data(batch))
@@ -366,9 +364,15 @@ mod tests {
         let mut partition_values = [valid_partition_values; 3];
         partition_values[invalid_row_index] = invalid_partition_values;
         let batch = add_files_with_partition_values(&partition_values);
-        assert_result_error_with_message(
-            add_file_validator(physical_partition_columns).validate(&as_engine_data(batch)),
-            expected_error,
+        let error = add_file_validator(physical_partition_columns)
+            .validate(&as_engine_data(batch))
+            .expect_err("invalid partition values should be rejected");
+        let Error::InvalidPartitionValues(message) = error else {
+            panic!("expected InvalidPartitionValues, got {error:?}");
+        };
+        assert!(
+            message.contains(expected_error),
+            "expected error message to contain {expected_error:?}, got {message:?}"
         );
     }
 

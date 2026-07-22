@@ -549,10 +549,9 @@ impl TableConfiguration {
     }
 
     /// The physical partition columns of this table (empty if unpartitioned).
-    pub(crate) fn physical_partition_columns(&self) -> Vec<String> {
+    pub(crate) fn physical_partition_columns(&self) -> impl Iterator<Item = String> + '_ {
         self.physical_partition_fields()
             .map(|(_, physical_name)| physical_name.to_owned())
-            .collect()
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
@@ -572,6 +571,9 @@ impl TableConfiguration {
         self.logical_partition_columns()
             .iter()
             .filter_map(move |name| {
+                // SAFETY: Construction already validates that every partition column exists in
+                // the schema. Keep this iterator infallible for a simpler return type, with a
+                // defensive warning if the invariant is violated.
                 let field = self.logical_schema.field(name);
                 if field.is_none() {
                     warn!("Partition column '{name}' not found in table schema");
@@ -2120,7 +2122,10 @@ mod test {
             [],
         );
 
-        assert_eq!(config.physical_partition_columns(), expected);
+        assert_eq!(
+            config.physical_partition_columns().collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
