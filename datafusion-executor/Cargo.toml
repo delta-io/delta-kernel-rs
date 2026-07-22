@@ -9,7 +9,6 @@ readme = "README.md"
 version = "0.26.0"
 rust-version = "1.88"
 
-# Separate workspace (kernel arrow-58 vs the root workspace's arrow-59). See ../CLAUDE.md.
 [workspace]
 
 [dependencies]

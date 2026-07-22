@@ -22,8 +22,6 @@ members = [
 # - read-table-multi-threaded
 # - read-table-single-threaded
 # - write-table
-#
-# `datafusion-executor` is intentionally NOT a member; it is a separate workspace. See CLAUDE.md.
 resolver = "3"
 
 [workspace.package]
