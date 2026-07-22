@@ -71,3 +71,9 @@ declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "de
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
+
+# Install a tracking global allocator that maintains process-wide live-bytes and peak-bytes
+# counters for the kernel's native heap, readable via the `peak_off_heap_bytes` /
+# `current_off_heap_bytes` / `reset_peak_off_heap_bytes` FFI functions. Off by default so
+# pure-Rust consumers keep the system allocator with zero overhead.
+alloc-tracking = []

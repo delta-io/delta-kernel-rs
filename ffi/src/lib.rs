@@ -47,6 +47,19 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+// The module (and its FFI getters below) compile unconditionally so the exported C ABI is the same
+// regardless of build flags. The counters only move when the tracking allocator is actually
+// installed as the global allocator, which happens only under `alloc-tracking`; otherwise they
+// stay at zero and the getters report zero.
+pub mod alloc_stats;
+
+// Install the tracking allocator as the global allocator for the whole cdylib so that every Rust
+// allocation the kernel performs is accounted for. Gated behind `alloc-tracking` to keep the
+// system allocator (and zero overhead) for consumers that do not need native-memory stats.
+#[cfg(feature = "alloc-tracking")]
+#[global_allocator]
+static GLOBAL_ALLOC: alloc_stats::TrackingAlloc = alloc_stats::TrackingAlloc;
+
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
@@ -291,6 +304,37 @@ impl<'a> TryFromStringSlice<'a> for &'a str {
 /// Allow engines to allocate strings of their own type. the contract of calling a passed allocate
 /// function is that `kernel_str` is _only_ valid until the return from this function
 pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> NullableCvoid;
+
+// === Off-heap (native) memory statistics ===
+//
+// These read the process-global counters maintained by the tracking allocator (see
+// [`alloc_stats`]). They are only meaningful when the library is built with the `alloc-tracking`
+// feature; otherwise they return zero. The counters cover the kernel's entire Rust-allocated
+// native heap (excluding C-library/`mmap` allocations and allocator overhead) and are shared
+// across all concurrent operations in the process, so `peak_off_heap_bytes` is an executor-wide
+// high-water mark rather than a per-operation figure.
+
+/// Peak native bytes ever simultaneously live in the kernel, since the library was loaded or the
+/// last call to [`reset_peak_off_heap_bytes`]. Returns 0 if built without `alloc-tracking`.
+#[no_mangle]
+pub extern "C" fn peak_off_heap_bytes() -> u64 {
+    alloc_stats::peak_bytes()
+}
+
+/// Native bytes currently live (allocated but not yet freed) in the kernel. Returns 0 if built
+/// without `alloc-tracking`.
+#[no_mangle]
+pub extern "C" fn current_off_heap_bytes() -> u64 {
+    alloc_stats::current_bytes()
+}
+
+/// Reset the peak high-water mark down to the current live-bytes value, letting a caller establish
+/// a baseline before an operation. Because the counters are process-global, callers must serialize
+/// resets against the operations they intend to measure. No-op if built without `alloc-tracking`.
+#[no_mangle]
+pub extern "C" fn reset_peak_off_heap_bytes() {
+    alloc_stats::reset_peak()
+}
 
 /// An opaque type that rust will understand as a string. This can be obtained by calling
 /// [`allocate_kernel_string`] with a [`KernelStringSlice`]
