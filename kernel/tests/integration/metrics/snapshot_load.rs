@@ -296,7 +296,10 @@ async fn crc_at_prior_version_roots_replay_at_crc_for_both_modes(
     let snap = Snapshot::builder_for(table_url)
         .with_incremental_crc_replay(mode)
         .build(&measure_engine)?;
-    assert_eq!(snap.crc().map(|c| c.version), expected_crc_version);
+    assert_eq!(
+        snap.crc_at_version().map(|c| c.version),
+        expected_crc_version
+    );
 
     assert_eq!(reporter.snapshot_completions.get(), 1);
     assert_eq!(reporter.log_segment_loads.get(), 1);

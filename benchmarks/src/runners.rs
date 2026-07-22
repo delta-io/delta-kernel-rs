@@ -21,8 +21,7 @@ use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::UCKernelClient;
 use delta_kernel_workloads::models::{
-    ParallelScan, ReadConfig, ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo,
-    TimeTravel,
+    ReadOperation, ReadSpec, SnapshotConstructionSpec, TableInfo, TimeTravel,
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use unity_catalog_delta_client_api::{Error as UcApiError, Operation};
@@ -31,12 +30,28 @@ use unity_catalog_delta_rest_client::{
 };
 use url::Url;
 
+use crate::registry::{ParallelScan, ReadConfig};
+
 /// Delta table property indicating catalog-managed support.
 const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
+}
+
+/// Builds `{table}/{case}` from `table_info.name` and `case_name`.
+pub fn benchmark_name(table_info: &TableInfo, case_name: &str) -> String {
+    format!("{}/{case_name}", table_info.name)
+}
+
+/// Builds `{table}/{case}/{config}` from `table_info.name`, `case_name`, and `config_name`.
+pub fn configured_benchmark_name(
+    table_info: &TableInfo,
+    case_name: &str,
+    config_name: &str,
+) -> String {
+    format!("{}/{case_name}/{config_name}", table_info.name)
 }
 
 fn build_engine(
@@ -216,10 +231,10 @@ pub struct ReadMetadataRunner {
 
 impl ReadMetadataRunner {
     pub fn setup(
-        table_info: &TableInfo,
-        case_name: &str,
+        name: String,
         read_spec: &ReadSpec,
         config: ReadConfig,
+        table_info: &TableInfo,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (engine, strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
@@ -232,8 +247,6 @@ impl ReadMetadataRunner {
             .map(|sql| parse_predicate(sql, &snapshot.schema()))
             .transpose()?
             .map(Arc::new);
-
-        let name = format!("{}/{}/{}", table_info.name, case_name, config.name,);
 
         let thread_pool = match &config.parallel_scan {
             ParallelScan::Enabled { num_threads } => {
@@ -343,18 +356,19 @@ impl WorkloadRunner for ReadMetadataRunner {
     }
 }
 
-/// Factory function that creates the appropriate read runner for a given operation and config
+/// Factory function that creates the appropriate read runner for a given operation and config.
+/// `name` is the full benchmark identifier (`{table_name}/{case}/{config}`).
 pub fn create_read_runner(
-    table_info: &TableInfo,
-    case_name: &str,
+    name: String,
     read_spec: &ReadSpec,
     operation: ReadOperation,
     config: ReadConfig,
+    table_info: &TableInfo,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Box<dyn WorkloadRunner>, Box<dyn std::error::Error>> {
     match operation {
         ReadOperation::ReadMetadata => Ok(Box::new(ReadMetadataRunner::setup(
-            table_info, case_name, read_spec, config, runtime,
+            name, read_spec, config, table_info, runtime,
         )?)),
         ReadOperation::ReadData => Err("ReadDataRunner not yet implemented".into()),
     }
@@ -370,13 +384,11 @@ pub struct SnapshotConstructionRunner {
 
 impl SnapshotConstructionRunner {
     pub fn setup(
-        table_info: &TableInfo,
-        case_name: &str,
+        name: String,
         snapshot_spec: &SnapshotConstructionSpec,
+        table_info: &TableInfo,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let name = format!("{}/{}", table_info.name, case_name,);
-
         let (engine, snapshot_strategy) = resolve_snapshot_strategy(table_info, runtime.clone())?;
 
         Ok(Self {
@@ -407,13 +419,16 @@ impl WorkloadRunner for SnapshotConstructionRunner {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::slice;
     use std::sync::LazyLock;
 
-    use delta_kernel_workloads::models::{
-        ParallelScan, ReadConfig, ReadSpec, TableInfo, TimeTravel,
-    };
+    use delta_kernel_workloads::models::{ReadSpec, Spec, TableInfo, TimeTravel, Workload};
 
     use super::*;
+    use crate::registry::BenchRegistry;
+    use crate::utils::load_all_workloads;
 
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: LazyLock<Arc<tokio::runtime::Runtime>> = LazyLock::new(|| {
@@ -481,12 +496,23 @@ mod tests {
     }
 
     #[test]
+    fn configured_benchmark_name_uses_human_readable_table_name() {
+        let mut table_info = test_table_info();
+        table_info.name = "Human readable table".to_string();
+
+        assert_eq!(
+            configured_benchmark_name(&table_info, "testCase", "serial"),
+            "Human readable table/testCase/serial"
+        );
+    }
+
+    #[test]
     fn test_read_metadata_runner_serial() {
         let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "serial"),
             &test_read_spec(),
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -497,10 +523,10 @@ mod tests {
     #[test]
     fn test_read_metadata_runner_parallel() {
         let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "parallel2"),
             &test_read_spec(),
             parallel_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -518,9 +544,9 @@ mod tests {
     #[test]
     fn test_snapshot_construction_runner_setup() {
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
+            &test_table_info(),
             test_runtime(),
         );
         assert!(runner.is_ok());
@@ -529,9 +555,9 @@ mod tests {
     #[test]
     fn test_snapshot_construction_runner_name() {
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -541,23 +567,84 @@ mod tests {
     #[test]
     fn test_snapshot_construction_runner_execute() {
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
         assert!(runner.execute().is_ok());
     }
 
+    /// Guards the checked-in `bench-registry.json` so a malformed edit or a duplicate config name
+    /// fails fast in `cargo test` rather than only when the harness runs.
+    #[test]
+    fn checked_in_registry_loads_and_validates() {
+        let path = format!("{}/bench-registry.json", env!("CARGO_MANIFEST_DIR"));
+        let registry = BenchRegistry::load_from_path(Path::new(&path))
+            .expect("checked-in bench-registry.json must load");
+        let mut table_info = test_table_info();
+        table_info.table_info_dir = PathBuf::from("10kAdds0CommitsSinceChkpt1V2Chkpt");
+        let workload = Workload {
+            table_info,
+            case_name: "readMetadataLatest".to_string(),
+            spec: Spec::Read(test_read_spec()),
+        };
+        registry
+            .validate(slice::from_ref(&workload))
+            .expect("checked-in bench-registry.json must validate");
+        let read = registry.read_configs(&workload).unwrap();
+        assert_eq!(
+            read.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["serial", "parallel2"]
+        );
+    }
+
+    /// Every registry key must name a real read workload. A key miss silently falls back to the
+    /// serial default, so a stale/typo'd key would otherwise be invisible until the harness runs.
+    /// Skips when the downloaded workload archive is absent (e.g. offline unit runs).
+    #[test]
+    fn checked_in_registry_keys_match_real_workloads() {
+        let Ok(workloads) = load_all_workloads() else {
+            return; // workload archive not downloaded -- nothing to cross-check
+        };
+        let workload_by_key: HashMap<(&str, &str), &Workload> = workloads
+            .iter()
+            .map(|w| {
+                (
+                    (
+                        w.table_info
+                            .registry_table_key()
+                            .expect("loaded workloads must have a registry table key"),
+                        w.case_name.as_str(),
+                    ),
+                    w,
+                )
+            })
+            .collect();
+
+        let path = format!("{}/bench-registry.json", env!("CARGO_MANIFEST_DIR"));
+        let registry = BenchRegistry::load_from_path(Path::new(&path))
+            .expect("checked-in bench-registry.json must load");
+        registry
+            .validate(&workloads)
+            .expect("registry configs must match workload types");
+
+        for (table, case) in registry.keys() {
+            workload_by_key.get(&(table, case)).unwrap_or_else(|| {
+                panic!("registry key '{table}/{case}' matches no workload (stale or typo'd?)")
+            });
+        }
+    }
+
     #[test]
     fn test_create_read_runner_read_metadata() {
         let runner = create_read_runner(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "serial"),
             &test_read_spec(),
             ReadOperation::ReadMetadata,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("create_read_runner should succeed");
@@ -569,10 +656,10 @@ mod tests {
         let mut spec = test_read_spec();
         spec.predicate = Some("letter = 'a'".to_string());
         let runner = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "test_case",
+            configured_benchmark_name(&test_table_info(), "test_case", "serial"),
             &spec,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");
@@ -584,10 +671,10 @@ mod tests {
         let mut spec = test_read_spec();
         spec.predicate = Some("a LIKE '%foo'".to_string());
         let result = ReadMetadataRunner::setup(
-            &test_table_info(),
-            "test_case",
+            configured_benchmark_name(&test_table_info(), "test_case", "serial"),
             &spec,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         );
         assert!(result.is_err());
@@ -596,11 +683,11 @@ mod tests {
     #[test]
     fn test_create_read_runner_read_data_unimplemented() {
         let result = create_read_runner(
-            &test_table_info(),
-            "testCase",
+            configured_benchmark_name(&test_table_info(), "testCase", "serial"),
             &test_read_spec(),
             ReadOperation::ReadData,
             serial_config(),
+            &test_table_info(),
             test_runtime(),
         );
         assert!(result.is_err());
@@ -620,9 +707,9 @@ mod tests {
             expected: None,
         };
         let runner = SnapshotConstructionRunner::setup(
-            &test_table_info(),
-            "testCase",
+            benchmark_name(&test_table_info(), "testCase"),
             &spec,
+            &test_table_info(),
             test_runtime(),
         )
         .expect("setup should succeed");

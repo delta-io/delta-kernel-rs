@@ -24,9 +24,13 @@ use crate::metrics::events::LOG_SEGMENT_LOADED_SPAN;
 use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
+#[cfg(feature = "declarative-plans")]
+use crate::Scalar;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
     StorageHandler, Version,
@@ -762,6 +766,13 @@ impl LogSegment {
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
+        self.find_commit_cover_paths()
+            .into_iter()
+            .map(|path| path.location)
+            .collect()
+    }
+
+    fn find_commit_cover_paths(&self) -> Vec<ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
@@ -793,10 +804,56 @@ impl LogSegment {
             }
             debug!("Provisionally selecting {next:?}");
             last_pushed = Some(next);
-            selected_files.push(next.location.clone());
+            selected_files.push(next.clone());
         }
         selected_files.reverse();
         selected_files
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn version_tagged_scan_files<'a>(
+        paths: impl IntoIterator<Item = &'a ParsedLogPath>,
+    ) -> DeltaResult<Vec<ScanFile>> {
+        paths
+            .into_iter()
+            .map(|path| {
+                Ok(ScanFile {
+                    meta: path.location.clone(),
+                    file_constants: vec![Scalar::Long(path.version_as_i64()?)],
+                })
+            })
+            .collect()
+    }
+
+    /// Returns commit-cover files tagged with file-constant `version`.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> DeltaResult<Vec<ScanFile>> {
+        Self::version_tagged_scan_files(&self.find_commit_cover_paths())
+    }
+
+    /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
+    /// [`FileType`] they share, or `None` when there is no checkpoint. A V2 checkpoint may be
+    /// UUID-named JSON, so the caller routes the parts to the matching scan operator by `FileType`.
+    ///
+    /// All checkpoint parts of a version share one format (`validate_checkpoint_parts` rejects a
+    /// mixed set), so a single `FileType` describes the whole group -- making a json/parquet mix
+    /// unrepresentable in the return type.
+    ///
+    /// [`FileType`]: crate::plans::ir::nodes::FileType
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_version_tagged_scan_files(
+        &self,
+    ) -> DeltaResult<Option<(FileType, Vec<ScanFile>)>> {
+        let parts = &self.listed.checkpoint_parts;
+        let Some(first) = parts.first() else {
+            return Ok(None);
+        };
+        let file_type = if first.is_json() {
+            FileType::Json
+        } else {
+            FileType::Parquet
+        };
+        Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.

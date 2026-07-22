@@ -1311,6 +1311,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "itertools 0.14.0",
+ "rstest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1383,9 +1384,11 @@ dependencies = [
  "flate2",
  "object_store 0.12.5",
  "rayon",
+ "serde",
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "test_utils",
  "tokio",
  "unity-catalog-delta-client-api",
@@ -1486,6 +1489,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlparser",
+ "tempfile",
  "url",
 ]
 

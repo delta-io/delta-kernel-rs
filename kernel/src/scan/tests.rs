@@ -1299,7 +1299,7 @@ fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
     let stats = all_referenced_columns(pred);
     let skipping_pred = as_checkpoint_skipping_predicate(pred, &[], &stats)?;
     let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
+        prefix: ColumnName::new(["add"]),
     };
     Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }
@@ -1331,14 +1331,12 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 #[rstest]
 #[case::comparison(
     Pred::gt(column_expr!("id"), Expr::literal(200i64)),
-    // Should skip RG2 and RG3, but https://github.com/apache/arrow-rs/issues/9451
-    Some(6), // Some(3),
+    Some(3),
     "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
 )]
 #[case::is_null(
     Pred::is_null(column_expr!("id")),
-    // Should skip RG 1 (nullCount=0), but https://github.com/apache/arrow-rs/issues/9451
-    Some(6), // Some(5),
+    Some(5),
     "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
 )]
 #[case::is_not_null(

@@ -38,10 +38,9 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
-#[cfg(feature = "column-defaults-in-dev")]
-use crate::schema::ColumnDefault;
 use crate::schema::{
-    lazy_schema_ref, ArrayType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
+    StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -49,8 +48,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
-    Version,
+    version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
+    IntoEngineData, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -1006,7 +1005,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// # Errors
     ///
     /// Propagates any error from [`StructField::column_default`].
-    #[cfg(feature = "column-defaults-in-dev")]
     pub fn top_level_column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
         if !self
             .effective_table_config
@@ -1251,8 +1249,7 @@ impl<S> Transaction<S> {
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
-        let commit_version = i64::try_from(commit_version)
-            .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
+        let commit_version = version_as_i64(commit_version)?;
 
         if row_tracking_supported {
             self.generate_adds_with_row_tracking(engine, commit_version)
@@ -2098,7 +2095,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "column-defaults-in-dev")]
     mod column_defaults {
         use super::*;
         use crate::schema::column_default::{field_with_default, field_with_invalid_default};

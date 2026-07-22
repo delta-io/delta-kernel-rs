@@ -33,9 +33,9 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
-#[cfg(feature = "column-defaults-in-dev")]
-use crate::table_features::iceberg_compat_v3_column_defaults_validation;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{
+    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
+};
 use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
@@ -80,7 +80,6 @@ impl Transaction {
 
         // Surface IcebergCompatV3 interoperability risks without rejecting tables based on
         // kernel parser limitations.
-        #[cfg(feature = "column-defaults-in-dev")]
         if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
             iceberg_compat_v3_column_defaults_validation(&effective_table_config)?;
         }
