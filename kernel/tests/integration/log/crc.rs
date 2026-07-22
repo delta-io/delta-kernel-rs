@@ -15,6 +15,7 @@ use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Engine, FileStats, Version};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
@@ -2045,18 +2046,32 @@ async fn commit_with_dm_and_txn<E: TaskExecutor>(
     engine: &Arc<DefaultEngine<E>>,
     v: i64,
 ) -> DeltaResult<SnapshotRef> {
+    commit_data(snapshot, engine, v, |txn| {
+        txn.with_domain_metadata("domain".to_string(), format!("value_{v}"))
+            .with_transaction_id("app".to_string(), v)
+    })
+    .await
+}
+
+/// Commit one data file at version `v`, letting `customize` attach the version-specific actions
+/// (domain metadata, set transactions, removals) to the WRITE transaction.
+async fn commit_data<E: TaskExecutor>(
+    snapshot: SnapshotRef,
+    engine: &Arc<DefaultEngine<E>>,
+    v: i64,
+    customize: impl FnOnce(Transaction) -> Transaction,
+) -> DeltaResult<SnapshotRef> {
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema),
         vec![Arc::new(Int32Array::from(vec![v as i32]))],
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let mut txn = snapshot
+    let txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
         .with_operation("WRITE".to_string())
-        .with_data_change(true)
-        .with_domain_metadata("domain".to_string(), format!("value_{v}"))
-        .with_transaction_id("app".to_string(), v);
+        .with_data_change(true);
+    let mut txn = customize(txn);
     let write_context = txn.unpartitioned_write_context()?;
     let adds = engine
         .write_parquet(&ArrowEngineData::new(batch), &write_context)
@@ -2302,19 +2317,18 @@ async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() 
 // Domain metadata rooted in a stale (but authoritative) CRC
 // ============================================================================
 
-/// Engine that delegates every handler to an inner engine, except `read_parquet_files`, which
-/// panics. A domain-metadata query reads only JSON commits; the sole parquet read on the path is
-/// the V1 checkpoint. So this proves the checkpoint is never read: it passes when the query roots
-/// in a stale CRC and scans only the commit tail, and panics when it falls through to a full scan.
-struct ParquetForbiddenEngine {
+/// Delegates every handler to an inner engine, but panics on `read_parquet_files`. A
+/// domain-metadata query reads only JSON commits, so the only parquet a scan would touch is the
+/// V1 checkpoint.
+struct NoParquetReadsEngine {
     inner: Arc<dyn Engine>,
 }
 
-struct ParquetForbiddenHandler {
+struct NoParquetReadsHandler {
     inner: Arc<dyn delta_kernel::ParquetHandler>,
 }
 
-impl delta_kernel::ParquetHandler for ParquetForbiddenHandler {
+impl delta_kernel::ParquetHandler for NoParquetReadsHandler {
     fn read_parquet_files(
         &self,
         _files: &[delta_kernel::FileMeta],
@@ -2340,7 +2354,7 @@ impl delta_kernel::ParquetHandler for ParquetForbiddenHandler {
     }
 }
 
-impl Engine for ParquetForbiddenEngine {
+impl Engine for NoParquetReadsEngine {
     fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
         self.inner.evaluation_handler()
     }
@@ -2351,7 +2365,7 @@ impl Engine for ParquetForbiddenEngine {
         self.inner.json_handler()
     }
     fn parquet_handler(&self) -> Arc<dyn delta_kernel::ParquetHandler> {
-        Arc::new(ParquetForbiddenHandler {
+        Arc::new(NoParquetReadsHandler {
             inner: self.inner.parquet_handler(),
         })
     }
@@ -2376,17 +2390,7 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
         .unwrap_post_commit_snapshot();
 
     for v in 1..=20i64 {
-        let arrow_schema = TryFromKernel::try_from_kernel(snap.schema().as_ref())?;
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![Arc::new(Int32Array::from(vec![v as i32]))],
-        )
-        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-        let mut txn = snap
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string())
-            .with_data_change(true);
-        txn = match v {
+        snap = commit_data(snap, engine, v, |txn| match v {
             5 => txn.with_domain_metadata("dom_before".to_string(), "cfg_before".to_string()),
             6 => txn.with_domain_metadata("dom_updated".to_string(), "cfg_updated".to_string()),
             8 => txn.with_domain_metadata("dom_removed".to_string(), "cfg_removed".to_string()),
@@ -2396,13 +2400,8 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
             17 => txn.with_domain_metadata_removed("dom_removed".to_string()),
             18 => txn.with_domain_metadata("dom_after".to_string(), "cfg_after".to_string()),
             _ => txn,
-        };
-        let write_context = txn.unpartitioned_write_context()?;
-        let adds = engine
-            .write_parquet(&ArrowEngineData::new(batch), &write_context)
-            .await?;
-        txn.add_files(adds);
-        snap = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+        })
+        .await?;
 
         if v == 10 {
             snap = snap.checkpoint(engine.as_ref(), None)?.1;
@@ -2414,99 +2413,78 @@ async fn setup_stale_crc_dm_table<E: TaskExecutor>(
     Ok(())
 }
 
+/// The active-domain set at v20 the rooted scan must resolve, regardless of query shape.
+fn expected_active() -> HashMap<String, String> {
+    [
+        ("dom_before", "cfg_before"),
+        ("dom_updated", "cfg_updated_v16"),
+        ("dom_after", "cfg_after"),
+    ]
+    .iter()
+    .map(|(d, c)| (d.to_string(), c.to_string()))
+    .collect()
+}
+
+/// A domain-metadata query shape and its expected result against [`setup_stale_crc_dm_table`].
+enum Query {
+    /// `get_domain_metadata(domain)` for one domain.
+    One(&'static str, Option<&'static str>),
+    /// `get_domain_metadatas_internal` with a multi-domain filter (the real caller's shape).
+    Filter(&'static [&'static str]),
+    /// `get_all_domain_metadata()`.
+    All,
+}
+
+// Every query shape resolves against a stale Complete CRC by scanning only the commit tail. The
+// NoParquetReadsEngine panics if the v10 checkpoint is read, proving the checkpoint is skipped.
 #[rstest]
-#[case::base_stands("dom_before", Some("cfg_before"))]
-#[case::tail_overrides_base("dom_updated", Some("cfg_updated_v16"))]
-#[case::tail_added("dom_after", Some("cfg_after"))]
-#[case::tail_removed("dom_removed", None)]
-#[case::never_existed("dom_missing", None)]
+#[case::base_stands(Query::One("dom_before", Some("cfg_before")))]
+#[case::tail_overrides_base(Query::One("dom_updated", Some("cfg_updated_v16")))]
+#[case::tail_added(Query::One("dom_after", Some("cfg_after")))]
+#[case::tail_removed(Query::One("dom_removed", None))]
+#[case::never_existed(Query::One("dom_missing", None))]
+#[case::multi_domain_filter(Query::Filter(&[
+    "dom_before", "dom_updated", "dom_after", "dom_removed", "dom_missing",
+]))]
+#[case::unfiltered(Query::All)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dm_query_rooted_in_stale_complete_crc_filtered(
-    #[case] domain: &str,
-    #[case] expected: Option<&str>,
-) -> DeltaResult<()> {
+async fn test_dm_query_rooted_in_stale_complete_crc(#[case] query: Query) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     setup_stale_crc_dm_table(&engine, &table_path).await?;
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert_eq!(fresh.version(), 20);
-    assert!(fresh.crc_at_version().is_none());
-
-    // ParquetForbiddenEngine proves the rooted scan reads only the commit tail (16..=20), never
-    // the v10 parquet checkpoint.
-    let forbidden = ParquetForbiddenEngine {
-        inner: engine.clone(),
-    };
-    assert_eq!(
-        fresh.get_domain_metadata(domain, &forbidden)?,
-        expected.map(str::to_string)
+    assert!(
+        fresh.crc_at_version().is_none(),
+        "the stale CRC must not sit at the snapshot version"
     );
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_dm_query_rooted_in_stale_complete_crc_unfiltered() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    setup_stale_crc_dm_table(&engine, &table_path).await?;
-
-    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    assert_eq!(fresh.version(), 20);
-    assert!(fresh.crc_at_version().is_none());
-
-    let forbidden = ParquetForbiddenEngine {
+    let engine = NoParquetReadsEngine {
         inner: engine.clone(),
     };
-    let active: HashMap<_, _> = fresh
-        .get_all_domain_metadata(&forbidden)?
-        .into_iter()
-        .map(|dm| (dm.domain().to_string(), dm.configuration().to_string()))
-        .collect();
-    assert_eq!(
-        active,
-        HashMap::from([
-            ("dom_before".to_string(), "cfg_before".to_string()),
-            ("dom_updated".to_string(), "cfg_updated_v16".to_string()),
-            ("dom_after".to_string(), "cfg_after".to_string()),
-        ])
-    );
-
-    Ok(())
-}
-
-// A single multi-domain filter must resolve each domain independently through the reconcile:
-// base fallback, tail override, tail add, tail tombstone, and a never-existed domain in one call.
-// This is the shape the real caller (Transaction::get_domain_metadatas_internal) uses.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_dm_query_rooted_in_stale_complete_crc_multi_domain_filter() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    setup_stale_crc_dm_table(&engine, &table_path).await?;
-
-    let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let forbidden = ParquetForbiddenEngine {
-        inner: engine.clone(),
-    };
-    let filter = HashSet::from([
-        "dom_before",
-        "dom_updated",
-        "dom_after",
-        "dom_removed",
-        "dom_missing",
-    ]);
-    let got: HashMap<_, _> = fresh
-        .get_domain_metadatas_internal(&forbidden, Some(&filter))?
-        .into_iter()
-        .map(|(domain, dm)| (domain, dm.configuration().to_string()))
-        .collect();
-    assert_eq!(
-        got,
-        HashMap::from([
-            ("dom_before".to_string(), "cfg_before".to_string()),
-            ("dom_updated".to_string(), "cfg_updated_v16".to_string()),
-            ("dom_after".to_string(), "cfg_after".to_string()),
-        ])
-    );
-
+    match query {
+        Query::One(domain, expected) => assert_eq!(
+            fresh.get_domain_metadata(domain, &engine)?,
+            expected.map(str::to_string)
+        ),
+        Query::Filter(keys) => {
+            let filter = keys.iter().copied().collect();
+            let got: HashMap<String, String> = fresh
+                .get_domain_metadatas_internal(&engine, Some(&filter))?
+                .into_iter()
+                .map(|(domain, dm)| (domain, dm.configuration().to_string()))
+                .collect();
+            assert_eq!(got, expected_active());
+        }
+        Query::All => {
+            let all: HashMap<String, String> = fresh
+                .get_all_domain_metadata(&engine)?
+                .into_iter()
+                .map(|dm| (dm.domain().to_string(), dm.configuration().to_string()))
+                .collect();
+            assert_eq!(all, expected_active());
+        }
+    }
     Ok(())
 }
 
@@ -2533,13 +2511,13 @@ async fn test_dm_query_stale_partial_crc_falls_through_to_full_scan() -> DeltaRe
         None
     );
 
-    // A full scan reads the v10 checkpoint, so the parquet-forbidden engine panics: this proves
-    // the Partial base did NOT take the rooted (checkpoint-skipping) path.
-    let forbidden = ParquetForbiddenEngine {
+    // A full scan reads the v10 checkpoint, so NoParquetReadsEngine panics: the Partial base did
+    // NOT take the rooted (checkpoint-skipping) path.
+    let no_parquet = NoParquetReadsEngine {
         inner: engine.clone(),
     };
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fresh.get_domain_metadata("dom_before", &forbidden).ok()
+        fresh.get_domain_metadata("dom_before", &no_parquet).ok()
     }))
     .is_err());
 

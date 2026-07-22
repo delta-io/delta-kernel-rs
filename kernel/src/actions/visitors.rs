@@ -480,7 +480,7 @@ impl DomainMetadataVisitor {
     }
 
     pub(crate) fn into_domain_metadatas(self) -> DomainMetadataMap {
-        let mut domain_metadatas = self.into_domain_metadatas_including_tombstones();
+        let mut domain_metadatas = self.domain_metadatas;
         domain_metadatas.retain(|_, dm| !dm.removed);
         domain_metadatas
     }
