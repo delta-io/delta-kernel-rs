@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
@@ -245,6 +245,8 @@ pub struct Transaction<S = ExistingTable> {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // Count of files whose deletion vector was updated.
+    num_dv_updates: usize,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -335,6 +337,7 @@ impl<S> Transaction<S> {
             commit_version = self.get_commit_version(),
             num_add_files,
             num_remove_files,
+            num_dv_updates,
             add_files_bytes,
             remove_files_bytes,
             is_blind_append,
@@ -348,14 +351,6 @@ impl<S> Transaction<S> {
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
-        // Fields-only event: these feed the `txn.commit` metric via the layer's `on_event`
-        // channel. `num_dv_updates` has no other source (it is not a declared span field and
-        // gets no `span.record` below), so this event must keep its structured fields.
-        info!(
-            num_add_files = self.add_files_metadata.len(),
-            num_remove_files = self.remove_files_metadata.len(),
-            num_dv_updates = self.dv_matched_files.len(),
-        );
 
         // Some table features don't yet support removeFiles. Reject here.
         if !self.remove_files_metadata.is_empty() {
@@ -556,6 +551,7 @@ impl<S> Transaction<S> {
         let span = tracing::Span::current();
         span.record("num_add_files", file_stats.gross_add_files);
         span.record("num_remove_files", file_stats.gross_remove_files);
+        span.record("num_dv_updates", self.num_dv_updates as u64);
         span.record("add_files_bytes", file_stats.gross_add_bytes);
         span.record("remove_files_bytes", file_stats.gross_remove_bytes);
         span.record("is_blind_append", self.is_blind_append);
@@ -1014,7 +1010,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults)
         {
-            info!(
+            tracing::info!(
                 "allowColumnDefaults is not enabled; the schema may contain orphaned column-default metadata"
             );
             return Ok(HashMap::new());
