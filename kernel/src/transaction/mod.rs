@@ -246,10 +246,7 @@ pub struct Transaction<S = ExistingTable> {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
-    // Count of files whose deletion vector was updated. Unlike num_add_files/num_remove_files
-    // (derived from file_stats at commit time), a DV update lowers to a remove+add pair and so
-    // can't be distinguished from an ordinary rewrite by counting files -- we accumulate the
-    // count as update_deletion_vectors() validates each call instead.
+    // Count of files whose deletion vector was updated.
     num_dv_updates: usize,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be

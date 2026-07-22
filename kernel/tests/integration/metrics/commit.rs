@@ -16,8 +16,8 @@ use delta_kernel::{DeltaResult, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
-    begin_transaction, create_add_files_metadata, insert_data, insert_data_with,
-    install_thread_local_metrics_reporter, test_table_setup_mt,
+    assert_result_error_with_message, begin_transaction, create_add_files_metadata, insert_data,
+    insert_data_with, install_thread_local_metrics_reporter, test_table_setup_mt,
 };
 use url::Url;
 
@@ -321,6 +321,18 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
         .with_operation("UPDATE".to_string())
         .with_data_change(true);
 
+    let mut paths_with_unmatched = file_paths.clone();
+    paths_with_unmatched.push("missing.parquet".to_string());
+    let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+    assert_result_error_with_message(
+        txn.update_deletion_vectors(
+            sequential_dv_descriptors(&paths_with_unmatched),
+            scan_files.drain(..).map(Ok),
+        ),
+        "Number of matched DV files does not match number of new DV descriptors: 3 != 4",
+    );
+
+    // A failed call with an unmatched path must not contribute its three matched files.
     let mut scan_files = get_scan_files(snapshot, engine.as_ref())?;
     let dv_map = sequential_dv_descriptors(&file_paths);
     txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;

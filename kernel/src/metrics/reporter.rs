@@ -150,8 +150,7 @@ where
 
     // RUNTIME CHANNEL. on_event carries log lines, not metric writes; its only metric effect is the
     // `#[instrument(err)]` failure signal, which FailureFlipVisitor turns into the event's failure
-    // counterpart. on_record is the metric-write channel: it routes Span::record(...) updates
-    // through EventVisitor -> MetricEvent::record_u64 / record_bool / record_str.
+    // counterpart.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let Some(span) = ctx.event_span(event) else {
             return;
@@ -287,16 +286,12 @@ impl Visit for FailureFlipVisitor<'_> {
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
         // `#[instrument(err)]` emits a synthetic event with an `error` field (via Display, hence
         // record_debug) when the wrapped fn returns Err. That field name is a tracing convention,
-        // not ours; `instrument_err_event_still_flips_to_failure` guards against it drifting.
+        // not kernel's.
         if field.name() == "error" {
             *self.event = self.event.take().map(MetricEvent::into_failure);
         }
     }
 }
-
-// ====================================================================
-// Tests
-// ====================================================================
 
 #[cfg(test)]
 mod tests {
@@ -335,9 +330,9 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    // info_span! requires a string-literal name; assert it still matches the span const.
     #[test]
     fn log_event_field_inside_reporting_span_does_not_warn() {
+        // info_span! requires a string-literal name; assert it still matches the span const.
         assert_eq!(SNAPSHOT_COMPLETED_SPAN, "snap.build");
         let logs = capture_logs(|| {
             let span = info_span!(
