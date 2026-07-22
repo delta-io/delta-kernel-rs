@@ -214,7 +214,9 @@ mod tests {
     use rstest::rstest;
 
     use crate::schema::compare::{Error, SchemaComparison, SchemaComparisonResult};
-    use crate::schema::{schema, DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{
+        schema, ArrayType, DataType, MapType, PrimitiveType, StructField, StructType,
+    };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ComparisonMode {

@@ -552,6 +552,7 @@ mod tests {
     use itertools::{assert_equal, Itertools};
 
     use super::*;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField, StructType};
@@ -874,166 +875,99 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn scan_file_listing_net_changes_collapses_a_cross_commit_update() {
-        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
-        let mut mock_table = LocalMockTable::new();
-        let dv1 = test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2);
-        let dv2 = test_deletion_vector("U5OWRz5k%CFT.Td}yCPW", 3);
+    #[derive(Clone, Copy)]
+    enum DvUpdateLayout {
+        SameCommit,
+        CrossCommit,
+    }
 
-        // v0: enable row tracking and add `f` with dv1.
-        mock_table
-            .commit(
-                row_tracking_setup_actions(listing_test_schema())
-                    .into_iter()
-                    .chain([Action::Add(Add {
-                        path: "f".into(),
-                        data_change: true,
-                        size: 100,
-                        deletion_vector: Some(dv1.clone()),
-                        base_row_id: Some(0),
-                        default_row_commit_version: Some(0),
-                        ..Default::default()
-                    })]),
-            )
-            .await;
-        // v1: remove `f` (dv1) with no paired add in the same commit -> an unpaired remove.
-        mock_table
-            .commit([Action::Remove(Remove {
-                path: "f".into(),
-                data_change: true,
-                deletion_vector: Some(dv1.clone()),
-                ..Default::default()
-            })])
-            .await;
-        // v2: re-add `f` (dv2) with no paired remove in the same commit -> a bare add. Across the
-        // range the remove@v1 and this add@v2 are the two boundaries of a net update.
-        mock_table
-            .commit([Action::Add(Add {
-                path: "f".into(),
-                data_change: true,
-                size: 100,
-                deletion_vector: Some(dv2.clone()),
-                base_row_id: Some(0),
-                default_row_commit_version: Some(2),
-                ..Default::default()
-            })])
-            .await;
-
-        let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let new_table_changes = || {
-            Arc::new(
-                TableChanges::try_new_row_tracking_cdf_listing(
-                    table_root.clone(),
-                    engine.as_ref(),
-                    1,
-                    Some(2),
-                )
-                .unwrap(),
-            )
-        };
-        let listing: Vec<TableChangesFileAction> = new_table_changes()
-            .scan_file_listing(engine.clone(), TableChangesListingMode::NetChanges)
-            .unwrap()
-            .try_collect()
-            .unwrap();
-
-        // `f`'s net effect over 1..=2 is an update from dv1 to dv2, surfaced as one grouped action:
-        // the remove side is the pre-image (dv1) at the first remove (v1) and the add side the
-        // post-image (dv2) at the last add (v2). Each side carries only its own DV; the connector
-        // reconciles the two by row id.
-        assert_eq!(
-            listing.len(),
-            1,
-            "expected one grouped net update: {listing:?}"
-        );
-        let update = &listing[0];
-        let net_remove = update.remove.as_ref().expect("net update remove side");
-        assert_eq!(net_remove.commit_version, 1);
-        assert_eq!(net_remove.deletion_vector, Some(dv1.clone()));
-        let net_add = update.add.as_ref().expect("net update add side");
-        assert_eq!(net_add.commit_version, 2);
-        assert_eq!(net_add.deletion_vector, Some(dv2.clone()));
-
-        // AllChanges does NOT group a cross-commit update: the same history surfaces as two
-        // separate single-sided actions -- a delete at v1 and an insert at v2 -- since grouping is
-        // same-commit only. This is the documented mode contrast.
-        let all: Vec<TableChangesFileAction> = new_table_changes()
-            .scan_file_listing(engine, TableChangesListingMode::AllChanges)
-            .unwrap()
-            .try_collect()
-            .unwrap();
-        assert_eq!(
-            all.len(),
-            2,
-            "expected two ungrouped single-sided actions: {all:?}"
-        );
-        let all_remove = all
-            .iter()
-            .find(|fa| fa.remove.is_some())
-            .expect("a standalone remove side");
-        assert!(all_remove.add.is_none(), "remove must be single-sided");
-        assert_eq!(all_remove.remove.as_ref().unwrap().commit_version, 1);
-        let all_add = all
-            .iter()
-            .find(|fa| fa.add.is_some())
-            .expect("a standalone add side");
-        assert!(all_add.remove.is_none(), "add must be single-sided");
-        assert_eq!(all_add.add.as_ref().unwrap().commit_version, 2);
+    enum Expected {
+        Grouped {
+            remove_version: i64,
+            add_version: i64,
+        },
+        TwoSingleSided,
     }
 
     #[rstest::rstest]
-    #[case::all_changes(TableChangesListingMode::AllChanges)]
-    #[case::net_changes(TableChangesListingMode::NetChanges)]
+    #[case::same_commit_all_changes(
+        DvUpdateLayout::SameCommit,
+        TableChangesListingMode::AllChanges,
+        Expected::Grouped { remove_version: 1, add_version: 1 }
+    )]
+    #[case::same_commit_net_changes(
+        DvUpdateLayout::SameCommit,
+        TableChangesListingMode::NetChanges,
+        Expected::Grouped { remove_version: 1, add_version: 1 }
+    )]
+    #[case::cross_commit_all_changes(
+        DvUpdateLayout::CrossCommit,
+        TableChangesListingMode::AllChanges,
+        Expected::TwoSingleSided
+    )]
+    #[case::cross_commit_net_changes(
+        DvUpdateLayout::CrossCommit,
+        TableChangesListingMode::NetChanges,
+        Expected::Grouped { remove_version: 1, add_version: 2 }
+    )]
     #[tokio::test]
-    async fn scan_file_listing_groups_same_commit_dv_update(#[case] mode: TableChangesListingMode) {
+    async fn scan_file_listing_groups_dv_update(
+        #[case] layout: DvUpdateLayout,
+        #[case] mode: TableChangesListingMode,
+        #[case] expected: Expected,
+    ) {
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
         let dv1 = test_deletion_vector("vBn[lx{q8@P<9BNH/isA", 2);
         let dv2 = test_deletion_vector("U5OWRz5k%CFT.Td}yCPW", 3);
+        let remove_f = |dv: &DeletionVectorDescriptor| {
+            Action::Remove(Remove {
+                path: "f".into(),
+                data_change: true,
+                deletion_vector: Some(dv.clone()),
+                ..Default::default()
+            })
+        };
+        let add_f = |dv: &DeletionVectorDescriptor, commit_version: i64| {
+            Action::Add(Add {
+                path: "f".into(),
+                data_change: true,
+                size: 100,
+                deletion_vector: Some(dv.clone()),
+                base_row_id: Some(0),
+                default_row_commit_version: Some(commit_version),
+                ..Default::default()
+            })
+        };
 
-        // v0: enable row tracking and add `f` with dv1.
         mock_table
             .commit(
                 row_tracking_setup_actions(listing_test_schema())
                     .into_iter()
-                    .chain([Action::Add(Add {
-                        path: "f".into(),
-                        data_change: true,
-                        size: 100,
-                        deletion_vector: Some(dv1.clone()),
-                        base_row_id: Some(0),
-                        default_row_commit_version: Some(0),
-                        ..Default::default()
-                    })]),
+                    .chain([add_f(&dv1, 0)]),
             )
             .await;
-        // v1: a same-commit DV update of `f` -- remove the dv1 baseline and re-add with dv2 in the
-        // one commit. Log replay pairs these into a single grouped action carrying both sides.
-        mock_table
-            .commit([
-                Action::Remove(Remove {
-                    path: "f".into(),
-                    data_change: true,
-                    deletion_vector: Some(dv1.clone()),
-                    ..Default::default()
-                }),
-                Action::Add(Add {
-                    path: "f".into(),
-                    data_change: true,
-                    size: 100,
-                    deletion_vector: Some(dv2.clone()),
-                    base_row_id: Some(0),
-                    default_row_commit_version: Some(1),
-                    ..Default::default()
-                }),
-            ])
-            .await;
+        let end_version = match layout {
+            DvUpdateLayout::SameCommit => {
+                mock_table.commit([remove_f(&dv1), add_f(&dv2, 1)]).await;
+                1
+            }
+            DvUpdateLayout::CrossCommit => {
+                mock_table.commit([remove_f(&dv1)]).await;
+                mock_table.commit([add_f(&dv2, 2)]).await;
+                2
+            }
+        };
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_changes = Arc::new(
-            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 1, Some(1))
-                .unwrap(),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                1,
+                Some(end_version),
+            )
+            .unwrap(),
         );
         let listing: Vec<TableChangesFileAction> = table_changes
             .scan_file_listing(engine, mode)
@@ -1041,14 +975,44 @@ mod tests {
             .try_collect()
             .unwrap();
 
-        assert_eq!(listing.len(), 1, "expected one grouped action: {listing:?}");
-        let update = &listing[0];
-        let add = update.add.as_ref().expect("add side");
-        let remove = update.remove.as_ref().expect("remove side");
-        assert_eq!(add.commit_version, 1);
-        assert_eq!(add.deletion_vector, Some(dv2));
-        assert_eq!(remove.commit_version, 1);
-        assert_eq!(remove.deletion_vector, Some(dv1));
+        match expected {
+            Expected::Grouped {
+                remove_version,
+                add_version,
+            } => {
+                assert_eq!(listing.len(), 1, "expected one grouped action: {listing:?}");
+                let update = &listing[0];
+                let remove = update.remove.as_ref().expect("remove side");
+                assert_eq!(remove.commit_version, remove_version);
+                assert_eq!(remove.deletion_vector, Some(dv1));
+                let add = update.add.as_ref().expect("add side");
+                assert_eq!(add.commit_version, add_version);
+                assert_eq!(add.deletion_vector, Some(dv2));
+            }
+            Expected::TwoSingleSided => {
+                assert_eq!(
+                    listing.len(),
+                    2,
+                    "expected two ungrouped single-sided actions: {listing:?}"
+                );
+                let all_remove = listing
+                    .iter()
+                    .find(|fa| fa.remove.is_some())
+                    .expect("a standalone remove side");
+                assert!(all_remove.add.is_none(), "remove must be single-sided");
+                let all_remove = all_remove.remove.as_ref().unwrap();
+                assert_eq!(all_remove.commit_version, 1);
+                assert_eq!(all_remove.deletion_vector, Some(dv1));
+                let all_add = listing
+                    .iter()
+                    .find(|fa| fa.add.is_some())
+                    .expect("a standalone add side");
+                assert!(all_add.remove.is_none(), "add must be single-sided");
+                let all_add = all_add.add.as_ref().unwrap();
+                assert_eq!(all_add.commit_version, 2);
+                assert_eq!(all_add.deletion_vector, Some(dv2));
+            }
+        }
     }
 
     #[tokio::test]

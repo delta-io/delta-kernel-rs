@@ -110,6 +110,8 @@ pub(super) fn collapse_net_changes(
 mod tests {
     use std::collections::HashMap;
 
+    use rstest::rstest;
+
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::table_changes::net_changes::collapse_net_changes;
     use crate::table_changes::scan_file::{TableChangesFileAction, TableChangesScanFile};
@@ -255,105 +257,46 @@ mod tests {
         );
     }
 
-    /// A same-commit DV update (grouped `{add, remove}` at one commit) whose two sides carry
-    /// different DVs is a net update; `NetChanges` keeps it grouped, both sides at that commit,
-    /// each carrying only its own DV.
-    #[test]
-    fn net_changes_collapse_keeps_a_same_commit_dv_update_grouped() {
-        let dv_a = test_dv("aaaaaaaaaaaaaaaaaaaa");
-        let dv_b = test_dv("bbbbbbbbbbbbbbbbbbbb");
-        let actions = vec![paired_dv_update(
-            "update.parquet",
-            3,
-            Some(dv_b.clone()),
-            Some(dv_a.clone()),
-        )];
-
+    #[rstest]
+    #[case::same_commit_dv_update(
+        vec![paired_dv_update("update.parquet", 3, Some(test_dv("b")), Some(test_dv("a")))],
+        vec![(
+            "update.parquet".to_string(),
+            Some((3, Some(test_dv("b")))),
+            Some((3, Some(test_dv("a")))),
+        )]
+    )]
+    #[case::multi_update_chain(
+        vec![
+            paired_dv_update("f.parquet", 1, Some(test_dv("b")), Some(test_dv("a"))),
+            paired_dv_update("f.parquet", 2, Some(test_dv("c")), Some(test_dv("b"))),
+        ],
+        vec![(
+            "f.parquet".to_string(),
+            Some((2, Some(test_dv("c")))),
+            Some((1, Some(test_dv("a")))),
+        )]
+    )]
+    #[case::multi_commit_revert(
+        vec![
+            paired_dv_update("f.parquet", 1, Some(test_dv("b")), Some(test_dv("a"))),
+            paired_dv_update("f.parquet", 2, Some(test_dv("a")), Some(test_dv("b"))),
+        ],
+        vec![]
+    )]
+    #[case::copy_on_write(
+        vec![delete("old.parquet", 1, None), insert("new.parquet", 1, None)],
+        vec![
+            ("new.parquet".to_string(), Some((1, None)), None),
+            ("old.parquet".to_string(), None, Some((1, None))),
+        ]
+    )]
+    fn net_changes_collapse_reduces_paths_to_their_boundaries(
+        #[case] actions: Vec<TableChangesFileAction>,
+        #[case] expected: Vec<(String, SideSummary, SideSummary)>,
+    ) {
         let out = collapse_net_changes(actions).unwrap();
-
-        assert_eq!(
-            out.iter().map(summarize).collect::<Vec<_>>(),
-            vec![(
-                "update.parquet".to_string(),
-                Some((3, Some(dv_b))),
-                Some((3, Some(dv_a)))
-            )]
-        );
-    }
-
-    /// A path updated repeatedly across commits (dv_a -> dv_b -> dv_c) collapses to only its outer
-    /// boundaries: a grouped action with the remove side carrying the first remove's DV (dv_a) at
-    /// v1 and the add side carrying the last add's DV (dv_c) at v2. The intermediate DV never
-    /// appears.
-    #[test]
-    fn net_changes_collapse_reduces_a_multi_update_chain_to_its_outer_boundaries() {
-        let dv_a = test_dv("aaaaaaaaaaaaaaaaaaaa");
-        let dv_b = test_dv("bbbbbbbbbbbbbbbbbbbb");
-        let dv_c = test_dv("cccccccccccccccccccc");
-        let actions = vec![
-            // v1: dv_a -> dv_b.
-            paired_dv_update("f.parquet", 1, Some(dv_b.clone()), Some(dv_a.clone())),
-            // v2: dv_b -> dv_c.
-            paired_dv_update("f.parquet", 2, Some(dv_c.clone()), Some(dv_b.clone())),
-        ];
-
-        let out = collapse_net_changes(actions).unwrap();
-
-        assert_eq!(
-            out.iter().map(summarize).collect::<Vec<_>>(),
-            vec![(
-                "f.parquet".to_string(),
-                Some((2, Some(dv_c))),
-                Some((1, Some(dv_a)))
-            )]
-        );
-    }
-
-    /// A path reverted across commits (dv_a -> dv_b -> dv_a) has matching outer boundaries, so its
-    /// rows net to no change and the whole path is dropped despite the intermediate churn.
-    #[test]
-    fn net_changes_collapse_drops_a_multi_commit_revert_to_the_original_dv() {
-        let dv_a = test_dv("aaaaaaaaaaaaaaaaaaaa");
-        let dv_b = test_dv("bbbbbbbbbbbbbbbbbbbb");
-        let actions = vec![
-            // v1: dv_a -> dv_b.
-            paired_dv_update("f.parquet", 1, Some(dv_b.clone()), Some(dv_a.clone())),
-            // v2: dv_b -> dv_a (reverts to the original).
-            paired_dv_update("f.parquet", 2, Some(dv_a.clone()), Some(dv_b.clone())),
-        ];
-
-        let out = collapse_net_changes(actions).unwrap();
-
-        assert!(
-            out.is_empty(),
-            "a revert to the original DV nets to no change: {out:?}"
-        );
-    }
-
-    /// A copy-on-write update rewrites one file into a file at a *different* path (a delete of the
-    /// old path and an insert of the new). Because the collapse keys on path, the two are never
-    /// grouped -- they remain a standalone net delete and a standalone net insert, which the
-    /// connector reconciles by row id across the listing.
-    #[test]
-    fn net_changes_collapse_keeps_copy_on_write_paths_separate() {
-        let actions = vec![
-            // old.parquet existed before the range and is removed here.
-            delete("old.parquet", 1, None),
-            // new.parquet is the rewritten replacement, added at the same commit.
-            insert("new.parquet", 1, None),
-        ];
-
-        let out = collapse_net_changes(actions).unwrap();
-
-        // Two single-sided actions, not one grouped update: a delete of the old path and an insert
-        // of the new path.
-        assert_eq!(
-            out.iter().map(summarize).collect::<Vec<_>>(),
-            vec![
-                ("new.parquet".to_string(), Some((1, None)), None),
-                ("old.parquet".to_string(), None, Some((1, None))),
-            ]
-        );
+        assert_eq!(out.iter().map(summarize).collect::<Vec<_>>(), expected);
     }
 
     /// The row-tracking metadata (`base_row_id`, `default_row_commit_version`) on each boundary
