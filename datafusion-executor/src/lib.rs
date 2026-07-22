@@ -17,7 +17,7 @@ mod predicate;
 mod scalar;
 
 pub use expression::kernel_to_df_expr;
-pub use predicate::to_datafusion_predicate;
+pub use predicate::kernel_predicate_to_df_expr;
 pub use scalar::kernel_to_df_scalar;
 
 /// Executes kernel declarative plans on DataFusion.

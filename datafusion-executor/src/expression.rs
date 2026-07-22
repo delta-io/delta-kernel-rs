@@ -16,7 +16,7 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
-use crate::predicate::to_datafusion_predicate;
+use crate::predicate::kernel_predicate_to_df_expr;
 use crate::scalar::kernel_to_df_scalar;
 
 /// Converts a kernel [`Expression`] into the equivalent DataFusion [`Expr`].
@@ -30,9 +30,7 @@ pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaR
         Expression::Column(name) => kernel_column_to_df_expr(name, input_schema),
         Expression::Binary(binary) => kernel_binary_expr_to_df_expr(binary, input_schema),
         Expression::Variadic(variadic) => kernel_variadic_to_df_expr(variadic, input_schema),
-
-        // A boolean-valued predicate used as a value: lowers to a boolean DataFusion `Expr`.
-        Expression::Predicate(pred) => to_datafusion_predicate(pred, input_schema),
+        Expression::Predicate(pred) => kernel_predicate_to_df_expr(pred, input_schema),
 
         // TODO: wire up once this function takes an output schema (`Struct` needs it for field
         // names; `MapToStruct`/`StructPatch` for field types). Each arm's lowering follows later.
