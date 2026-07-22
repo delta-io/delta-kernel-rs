@@ -1013,14 +1013,18 @@ impl Scan {
         };
         self.state_info.physical_stats_schema.as_ref()?;
 
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
+        // the predicate also references physical columns, so partition detection reads the physical
+        // partition schema rather than the logical names in table metadata.
+        let partition_columns: HashSet<ColumnName> = self
+            .state_info
+            .physical_partition_schema
+            .as_ref()
+            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
+            .unwrap_or_default();
         let skipping_pred = as_checkpoint_skipping_predicate(
             predicate,
-            partition_columns,
+            &partition_columns,
             &self.state_info.physical_stats_columns,
         )?;
 
