@@ -19,7 +19,6 @@ static MANDATORY_REMOVE_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| MANDATORY_REMOVE_FILE_SCHEMA.leaves(None));
 
 impl StagedDataValidator {
-    /// Creates a validator that validates every selected staged remove-file row.
     pub(crate) fn staged_remove_file() -> Self {
         StagedDataValidator::new(
             &MANDATORY_REMOVE_FILE_COLUMNS,
@@ -61,7 +60,7 @@ mod tests {
     use crate::engine_data::FilteredEngineData;
     use crate::expressions::ColumnName;
     use crate::scan::scan_row_schema;
-    use crate::utils::test_utils::{assert_result_error_with_message, replace_record_batch_column};
+    use crate::utils::test_utils::{assert_result_error_with_message, replace_column};
 
     #[test]
     fn column_indices_match_schema_order() {
@@ -86,7 +85,7 @@ mod tests {
         let batch = nullable_staged_remove_file();
         let field_index = batch.schema().index_of(field).expect("field in schema");
         let null = new_null_array(batch.schema().field(field_index).data_type(), 1);
-        let batch = replace_record_batch_column(&batch, field, null);
+        let batch = replace_column(&batch, field, null);
         let removes = [all_rows_selected(batch)];
         remove_validator().validate_filtered(&removes).unwrap();
     }
@@ -96,8 +95,8 @@ mod tests {
         let paths = (0..3)
             .map(|row| (row != invalid_row).then_some("dummy"))
             .collect::<Vec<_>>();
-        let batch = replace_record_batch_column(
-            &nullable_staged_remove_files(3),
+        let batch = replace_column(
+            &nullable_staged_remove_files(3 /* row_count */),
             "path",
             Arc::new(StringArray::from(paths)),
         );
@@ -110,8 +109,8 @@ mod tests {
 
     #[test]
     fn missing_field_in_unselected_row_accepted() {
-        let batch = replace_record_batch_column(
-            &nullable_staged_remove_files(3),
+        let batch = replace_column(
+            &nullable_staged_remove_files(3 /* row_count */),
             "path",
             Arc::new(StringArray::from(vec![Some("dummy"), None, Some("dummy")])),
         );
@@ -126,7 +125,7 @@ mod tests {
     #[test]
     fn missing_field_in_later_batch_rejected() {
         let batch = nullable_staged_remove_file();
-        let invalid = replace_record_batch_column(
+        let invalid = replace_column(
             &batch,
             "path",
             new_null_array(batch.schema().field(0).data_type(), 1),
@@ -143,7 +142,7 @@ mod tests {
 
     #[test]
     fn empty_path_rejected() {
-        let batch = replace_record_batch_column(
+        let batch = replace_column(
             &nullable_staged_remove_file(),
             "path",
             Arc::new(StringArray::from(vec![""])),

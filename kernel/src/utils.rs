@@ -427,7 +427,7 @@ pub(crate) mod test_utils {
         RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid add-file batch")
     }
 
-    pub(crate) fn replace_record_batch_column(
+    pub(crate) fn replace_column(
         batch: &RecordBatch,
         field: &str,
         column: ArrayRef,

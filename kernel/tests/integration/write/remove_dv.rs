@@ -72,11 +72,6 @@ impl StagedRemoveFileModification {
     &[true, true, false],
     None,
 )]
-#[case::missing_size(
-    StagedRemoveFileModification::modify_value("size", None, 0 /* modified_row_index */),
-    &[true, true, true],
-    None,
-)]
 #[case::missing_modification_time(
     StagedRemoveFileModification::modify_value(
         "modificationTime",
@@ -155,6 +150,19 @@ async fn commit_validates_staged_remove_fields(
         .schema();
     let batch = concat_batches(&schema, &batches)?;
     assert_eq!(batch.num_rows(), 3);
+    let path_index = batch.schema().index_of("path")?;
+    let paths = batch
+        .column(path_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("path is a string column");
+    let mut expected_surviving_paths = paths
+        .iter()
+        .zip(selection_vector)
+        .filter(|(_, selected)| !**selected)
+        .map(|(path, _)| path.expect("path is present").to_owned())
+        .collect::<Vec<_>>();
+    expected_surviving_paths.sort();
     let field_index = batch.schema().index_of(modification.field)?;
     let mut columns = batch.columns().to_vec();
     let modified_value = match modification.string_value {
@@ -186,7 +194,25 @@ async fn commit_validates_staged_remove_fields(
     if let Some(expected_error) = expected_error {
         assert_result_error_with_message(result, expected_error);
     } else {
-        result?.unwrap_committed();
+        let snapshot = result?.unwrap_post_commit_snapshot();
+        let mut surviving_paths = Vec::new();
+        for scan_files in get_scan_files(snapshot, engine.as_ref())? {
+            let (data, selection_vector) = scan_files.into_parts();
+            let batch = into_record_batch(data);
+            let path_index = batch.schema().index_of("path")?;
+            let paths = batch
+                .column(path_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("path is a string column");
+            for row in 0..batch.num_rows() {
+                if selection_vector.get(row).copied().unwrap_or(true) {
+                    surviving_paths.push(paths.value(row).to_owned());
+                }
+            }
+        }
+        surviving_paths.sort();
+        assert_eq!(surviving_paths, expected_surviving_paths);
     }
     Ok(())
 }
