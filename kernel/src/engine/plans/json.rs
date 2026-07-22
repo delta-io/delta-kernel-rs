@@ -92,7 +92,7 @@ mod tests {
 
     fn make_handler() -> PlanBasedJsonHandler {
         PlanBasedJsonHandler::new(
-            Arc::new(SyncPlanExecutor::new()),
+            Arc::new(SyncPlanExecutor::default()),
             SyncEngine::new().json_handler(),
         )
     }
@@ -123,7 +123,7 @@ mod tests {
 
     fn make_parquet_handler() -> PlanBasedParquetHandler {
         PlanBasedParquetHandler::new(
-            Arc::new(SyncPlanExecutor::new()),
+            Arc::new(SyncPlanExecutor::default()),
             SyncEngine::new().parquet_handler(),
         )
     }
