@@ -3,9 +3,12 @@
 use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, StructField, StructType};
-use test_utils::{create_table, engine_store_setup, load_and_begin_transaction};
+use test_utils::load_and_begin_transaction;
+#[cfg(not(feature = "interval-type-in-dev"))]
+use test_utils::{create_table, engine_store_setup};
 
 /// Writing interval data is gated by the `interval-type-in-dev` cargo feature.
+#[cfg(not(feature = "interval-type-in-dev"))]
 #[tokio::test]
 async fn test_write_interval_table_gate() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -17,18 +20,15 @@ async fn test_write_interval_table_gate() -> Result<(), Box<dyn std::error::Erro
         engine_store_setup("test_interval_requires_feature", None);
     let table_url = create_table(store, table_location, schema, &[], true, vec![], vec![]).await?;
 
-    let result = load_and_begin_transaction(table_url, &engine);
-    if cfg!(feature = "interval-type-in-dev") {
-        result.expect("interval writes should be allowed when the cargo feature is enabled");
-    } else {
-        let err = result
-            .expect_err("interval writes should be blocked when the cargo feature is disabled")
-            .to_string();
-        assert!(
-            err.contains("interval-type-in-dev"),
-            "error must explain the missing cargo feature; got: {err}",
-        );
-    }
+    let transaction = load_and_begin_transaction(table_url, &engine)?;
+    let err = transaction
+        .unpartitioned_write_context()
+        .expect_err("interval write contexts should be blocked when the cargo feature is disabled")
+        .to_string();
+    assert!(
+        err.contains("interval-type-in-dev"),
+        "error must explain the missing cargo feature; got: {err}",
+    );
     Ok(())
 }
 

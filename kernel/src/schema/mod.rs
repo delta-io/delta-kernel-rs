@@ -1594,8 +1594,10 @@ pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
     NonNullFieldChecker.transform_struct(schema).is_err()
 }
 
+#[cfg(not(feature = "interval-type-in-dev"))]
 struct UsesIntervalType;
 
+#[cfg(not(feature = "interval-type-in-dev"))]
 impl<'a> SchemaTransform<'a> for UsesIntervalType {
     transform_output_type!(|'a, T| Result<(), ()>);
 
@@ -1609,6 +1611,7 @@ impl<'a> SchemaTransform<'a> for UsesIntervalType {
 }
 
 /// Returns whether `schema` contains an ANSI interval type at any nesting level.
+#[cfg(not(feature = "interval-type-in-dev"))]
 pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
     UsesIntervalType.transform_struct(schema).is_err()
 }
@@ -3362,64 +3365,62 @@ mod tests {
         assert_eq!(schema_contains_non_null_fields(&schema), expected);
     }
 
-    fn top_level_interval_schema(interval: DataType) -> StructType {
-        StructType::new_unchecked([StructField::nullable("iv", interval)])
-    }
-
-    fn nested_interval_schema(interval: DataType) -> StructType {
-        StructType::new_unchecked([StructField::nullable(
-            "nested",
-            StructType::new_unchecked([StructField::nullable("inner_iv", interval)]),
-        )])
-    }
-
-    fn array_interval_schema(interval: DataType) -> StructType {
-        StructType::new_unchecked([StructField::nullable(
-            "array",
-            ArrayType::new(interval, true),
-        )])
-    }
-
-    fn map_value_interval_schema(interval: DataType) -> StructType {
-        StructType::new_unchecked([StructField::nullable(
-            "map",
-            MapType::new(DataType::STRING, interval, true),
-        )])
-    }
-
-    fn map_key_interval_schema(interval: DataType) -> StructType {
-        StructType::new_unchecked([StructField::nullable(
-            "map",
-            MapType::new(interval, DataType::STRING, true),
-        )])
-    }
-
-    fn variant_interval_schema(_: DataType) -> StructType {
-        variant_only_schema()
-    }
-
-    #[rstest]
-    #[case::top_level(top_level_interval_schema, true)]
-    #[case::nested_struct(nested_interval_schema, true)]
-    #[case::array_element(array_interval_schema, true)]
-    #[case::map_value(map_value_interval_schema, true)]
-    #[case::map_key(map_key_interval_schema, true)]
-    #[case::variant_negative(variant_interval_schema, false)]
-    fn test_schema_contains_interval_type(
-        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
-        #[case] make_schema: fn(DataType) -> StructType,
-        #[case] expected: bool,
-    ) {
-        let schema = make_schema(interval);
-
-        assert_eq!(schema_contains_interval_type(&schema), expected);
-    }
-
+    #[cfg(not(feature = "interval-type-in-dev"))]
     #[test]
-    fn test_schema_without_interval_type() {
-        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
+    fn test_schema_contains_interval_type() {
+        for interval in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
+            let schemas = [
+                (
+                    "top-level",
+                    StructType::new_unchecked([StructField::nullable("iv", interval.clone())]),
+                ),
+                (
+                    "nested struct",
+                    StructType::new_unchecked([StructField::nullable(
+                        "nested",
+                        StructType::new_unchecked([StructField::nullable(
+                            "inner_iv",
+                            interval.clone(),
+                        )]),
+                    )]),
+                ),
+                (
+                    "array element",
+                    StructType::new_unchecked([StructField::nullable(
+                        "array",
+                        ArrayType::new(interval.clone(), true),
+                    )]),
+                ),
+                (
+                    "map value",
+                    StructType::new_unchecked([StructField::nullable(
+                        "map",
+                        MapType::new(DataType::STRING, interval.clone(), true),
+                    )]),
+                ),
+                (
+                    "map key",
+                    StructType::new_unchecked([StructField::nullable(
+                        "map",
+                        MapType::new(interval.clone(), DataType::STRING, true),
+                    )]),
+                ),
+            ];
 
-        assert!(!schema_contains_interval_type(&schema));
+            for (case, schema) in schemas {
+                assert!(
+                    schema_contains_interval_type(&schema),
+                    "expected {case} schema to contain {interval:?}"
+                );
+            }
+        }
+
+        for schema in [
+            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]),
+            variant_only_schema(),
+        ] {
+            assert!(!schema_contains_interval_type(&schema));
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::validation::validate_schema;
+use crate::schema::validation::{validate_interval_type_write_support, validate_schema};
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
     normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
@@ -963,7 +963,7 @@ impl CreateTableTransactionBuilder {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
-        table_configuration.validate_interval_type_support()?;
+        validate_interval_type_write_support(&table_configuration.logical_schema())?;
 
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(

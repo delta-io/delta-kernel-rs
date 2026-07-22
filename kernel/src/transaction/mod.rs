@@ -383,9 +383,8 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
 
-        // Validate that the schema supports data writes when files are being added.
-        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
-        // Reads and metadata-only commits are always allowed.
+        // Validate that the schema supports data writes when files are being added. Reads and
+        // metadata-only commits are always allowed.
         if !self.add_files_metadata.is_empty() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
@@ -1032,8 +1031,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Called at the top of [`partitioned_write_context`](Self::partitioned_write_context) and
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context), before any Parquet is
-    /// written, so connectors fail fast when the schema contains void placements that cannot
-    /// produce valid files (void inside Array/Map, all-void structs, all-void tables).
+    /// written, so connectors fail fast when the schema contains unsupported data types or void
+    /// placements that cannot produce valid files.
     /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
     /// that reach [`add_files`](Self::add_files) without going through a write context.
     fn validate_for_data_write(&self) -> DeltaResult<()> {
