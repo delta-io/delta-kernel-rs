@@ -22,7 +22,7 @@ use delta_kernel::history_manager::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -1273,6 +1273,49 @@ pub unsafe extern "C" fn snapshot_timestamp(
         .into_extern_result(&engine_ref)
 }
 
+/// File-level statistics for a snapshot, sourced from the snapshot's CRC.
+///
+/// Pass-by-value mirror of the scalar fields of kernel's [`FileStats`].
+// TODO: expose kernel's `FileStats` file-size histogram once it has a C-ABI-friendly
+// representation. It is a variable-length structure, so it needs a different accessor shape.
+#[derive(Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiFileStats {
+    /// Number of active `Add` file actions in this table version.
+    pub num_files: i64,
+    /// Total size of the table in bytes (sum of all active `Add` file sizes).
+    pub table_size_bytes: i64,
+}
+
+impl From<FileStats> for FfiFileStats {
+    fn from(stats: FileStats) -> Self {
+        Self {
+            num_files: stats.num_files(),
+            table_size_bytes: stats.table_size_bytes(),
+        }
+    }
+}
+
+/// Get the file-level statistics ([`FfiFileStats`]) for this snapshot from its CRC.
+///
+/// Returns [`OptionalValue::None`] when no CRC is resolved at this version (none on disk, a read
+/// failure, or the nearest on-disk CRC is stale), or its CRC does not carry complete file stats.
+/// Performs no I/O.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_file_stats(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<FfiFileStats> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .get_file_stats_if_present()
+        .map(FfiFileStats::from)
+        .into()
+}
+
 /// Selects which commit type to return for the history_manager query. FFI-safe mirror of
 /// [`HistoryCommitType`].
 #[repr(C)]
@@ -1931,6 +1974,48 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_file_stats_present() -> Result<(), Box<dyn std::error::Error>> {
+        // The crc-full fixture has a CRC at version 0 with complete file stats.
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .to_string();
+
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        assert_eq!(
+            unsafe { snapshot_file_stats(snapshot.shallow_copy()) },
+            OptionalValue::Some(FfiFileStats {
+                num_files: 10,
+                table_size_bytes: 5259
+            }),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_file_stats_absent_without_crc() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // A metadata-only table has no CRC, so file stats are absent.
+        let table_root = "memory:///test_file_stats_no_crc/";
+        let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
+
+        assert_eq!(
+            unsafe { snapshot_file_stats(snapshot.shallow_copy()) },
+            OptionalValue::None
+        );
+
+        unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
     }
