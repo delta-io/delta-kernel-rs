@@ -693,7 +693,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
 /// via [`PrimitiveType::parse_scalar`](crate::schema::PrimitiveType::parse_scalar), and a source
 /// already of the target type passes through. An unparseable string yields `Scalar::Null`.
 ///
-/// Only string-to-primitive and identity conversions are handled; any other source/target
+/// String-to-primitive, identity, and null-source conversions are handled; any other source/target
 /// combination yields `None`, including numeric/temporal casts like `Long -> Int` that the arrow
 /// path can perform. The accepted string formats are a strict subset of arrow's (e.g. arrow parses
 /// the hyphen-less `20240115` as a date but `parse_scalar` does not), so this path is only ever

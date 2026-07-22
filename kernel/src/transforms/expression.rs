@@ -510,6 +510,10 @@ impl ExpressionDepthChecker {
 impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
     transform_output_type!(|'a, T| DeltaResult<()>);
 
+    fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> DeltaResult<()> {
+        self.depth_limited(Self::recurse_into_expr_cast, expr)
+    }
+
     fn transform_expr_struct(&mut self, fields: &'a [ExpressionRef]) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
     }
@@ -1116,6 +1120,19 @@ mod tests {
         assert_eq!(check_with_call_count(5), (6, 14));
         assert_eq!(check_with_call_count(6), (6, 16));
         assert_eq!(check_with_call_count(7), (6, 16));
+    }
+
+    #[test]
+    fn test_depth_checker_counts_cast_expressions() {
+        let expr = Expr::cast(
+            Expr::cast(column_expr!("x"), DataType::INTEGER),
+            DataType::LONG,
+        );
+
+        assert_eq!(
+            ExpressionDepthChecker::check_expr_with_call_count(&expr, 0),
+            (1, 2)
+        );
     }
 
     #[test]

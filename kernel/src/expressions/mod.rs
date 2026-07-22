@@ -1395,21 +1395,15 @@ mod tests {
             assert_roundtrip(&expr);
         }
 
-        #[test]
-        fn test_cast_expression_roundtrip() {
-            let cases: Vec<Expression> = vec![
-                Expression::cast(column_expr!("part"), DataType::DATE),
-                Expression::cast(Expression::literal("2025-01-01"), DataType::DATE),
-                // Nested cast: the child is itself a cast.
-                Expression::cast(
-                    Expression::cast(column_expr!("part"), DataType::STRING),
-                    DataType::INTEGER,
-                ),
-            ];
-
-            for expr in &cases {
-                assert_roundtrip(expr);
-            }
+        #[rstest::rstest]
+        #[case::column(Expression::cast(column_expr!("part"), DataType::DATE))]
+        #[case::literal(Expression::cast(Expression::literal("2025-01-01"), DataType::DATE))]
+        #[case::nested(Expression::cast(
+            Expression::cast(column_expr!("part"), DataType::STRING),
+            DataType::INTEGER,
+        ))]
+        fn test_cast_expression_roundtrip(#[case] expr: Expression) {
+            assert_roundtrip(&expr);
         }
 
         #[rstest::rstest]
