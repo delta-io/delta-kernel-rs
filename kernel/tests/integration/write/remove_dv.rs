@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
-use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::array::{new_null_array, Int32Array, RecordBatch};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
@@ -17,11 +17,13 @@ use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    begin_transaction, copy_directory, create_default_engine, create_default_engine_mt_executor,
-    load_and_begin_transaction, read_actions_from_commit, setup_test_tables,
+    assert_result_error_with_message, begin_transaction, copy_directory, create_default_engine,
+    create_default_engine_mt_executor, into_record_batch, load_and_begin_transaction,
+    read_actions_from_commit, setup_test_tables,
 };
 use url::Url;
 
@@ -29,6 +31,53 @@ use crate::common::write_utils::{
     create_dv_table_with_files, get_scan_files, get_simple_int_schema, set_table_properties,
     write_data_and_check_result_and_stats,
 };
+
+#[rstest]
+#[case::path("path", "path")]
+#[case::partition_values("fileConstantValues", "partitionValues")]
+#[case::size("size", "size")]
+#[tokio::test]
+async fn commit_rejects_remove_missing_required_field(
+    #[case] field: &str,
+    #[case] expected_field: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = get_simple_int_schema();
+    let (table_url, engine, _store, _table_name) =
+        setup_test_tables(schema.clone(), &[], None, "remove_required_field_table")
+            .await?
+            .into_iter()
+            .next()
+            .expect("at least one test table");
+    let engine = Arc::new(engine);
+    write_data_and_check_result_and_stats(table_url.clone(), schema, engine.clone(), 1).await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan = snapshot.clone().scan_builder().build()?;
+    let scan_metadata = scan
+        .scan_metadata(engine.as_ref())?
+        .next()
+        .expect("at least one scan metadata batch")?;
+    let (data, selection_vector) = scan_metadata.scan_files.into_parts();
+    let batch = into_record_batch(data);
+    let field_index = batch.schema().index_of(field)?;
+    let mut columns = batch.columns().to_vec();
+    columns[field_index] = new_null_array(
+        batch.schema().field(field_index).data_type(),
+        batch.num_rows(),
+    );
+    let corrupted = RecordBatch::try_new(batch.schema(), columns)?;
+
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?;
+    txn.remove_files(FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(corrupted)),
+        selection_vector,
+    )?);
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref()),
+        &format!("missing required field '{expected_field}'"),
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {

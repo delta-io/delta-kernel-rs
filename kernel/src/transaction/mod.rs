@@ -427,6 +427,10 @@ impl<S> Transaction<S> {
         write_validation::StagedDataValidator::staged_add_file()
             .validate(&self.add_files_metadata)?;
 
+        // Validate required fields for RemoveFile.
+        write_validation::StagedDataValidator::staged_remove_file()
+            .validate_filtered(&self.remove_files_metadata)?;
+
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
