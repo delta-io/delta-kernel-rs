@@ -7,6 +7,7 @@ use std::sync::Arc;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::scan::StatsOptions;
 use delta_kernel::{CancellationTokenRef, Error, Snapshot};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
@@ -44,17 +45,26 @@ async fn json_only_table() -> Result<(Arc<InMemory>, &'static str), Box<dyn std:
 
 // A scan whose builder was given an already-cancelled token yields exactly one
 // `Error::Cancelled` and then ends -- it never produces a (partial) complete-looking listing.
+// Parametrized over stats mode because a predicate/stats scan takes a different replay path
+// (checkpoint parquet reads + stats parsing) than the JSON-only default, and both must honor the
+// token: `None` is the plain default (no `with_stats` call), `Some` opts into struct stats.
+#[rstest]
+#[case::json_default(None)]
+#[case::with_stats(Some(StatsOptions::all_struct()))]
 #[tokio::test]
-async fn precancelled_json_scan_yields_cancelled() -> Result<(), Box<dyn std::error::Error>> {
+async fn precancelled_scan_yields_cancelled(
+    #[case] stats: Option<StatsOptions>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, table_root) = json_only_table().await?;
     let engine = DefaultEngineBuilder::new(storage).build();
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
     let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-    let scan = snapshot
-        .scan_builder()
-        .with_cancellation_token(token)
-        .build()?;
+    let mut builder = snapshot.scan_builder().with_cancellation_token(token);
+    if let Some(stats) = stats {
+        builder = builder.with_stats(stats);
+    }
+    let scan = builder.build()?;
 
     // Cancellation surfaces as `Error::Cancelled`, never as a complete listing. It may arrive
     // either from the eager setup reads that `scan_metadata` performs (returning `Err` directly)
@@ -108,25 +118,6 @@ async fn uncancelled_json_scan_completes() -> Result<(), Box<dyn std::error::Err
     for res in scan.scan_metadata(&engine)? {
         assert!(res.is_ok(), "uncancelled token must not inject errors");
     }
-    Ok(())
-}
-
-// A predicate scan (which enables checkpoint parquet reads / stats parsing) is also cancellable:
-// a pre-cancelled token surfaces `Error::Cancelled` rather than a complete listing.
-#[tokio::test]
-async fn precancelled_scan_with_stats_yields_cancelled() -> Result<(), Box<dyn std::error::Error>> {
-    let (storage, table_root) = json_only_table().await?;
-    let engine = DefaultEngineBuilder::new(storage).build();
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-
-    let token: CancellationTokenRef = Arc::new(TestCancellationToken::cancelled());
-    let scan = snapshot
-        .scan_builder()
-        .with_stats(delta_kernel::scan::StatsOptions::all_struct())
-        .with_cancellation_token(token)
-        .build()?;
-
-    assert_cancelled(scan.scan_metadata(&engine));
     Ok(())
 }
 
