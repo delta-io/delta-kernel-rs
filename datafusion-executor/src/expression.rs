@@ -18,7 +18,7 @@ use crate::scalar::kernel_to_df_scalar;
 /// # Errors
 /// Returns an error for a column that does not resolve against `input_schema`, and
 /// [`Error::unsupported`] for arms with no untyped DataFusion equivalent (see the `TODO`s below).
-pub fn kernel_to_datafusion_expr(expr: &Expression, input_schema: &StructType) -> DeltaResult<Expr> {
+pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaResult<Expr> {
     match expr {
         Expression::Literal(scalar) => Ok(lit(kernel_to_df_scalar(scalar)?)),
         Expression::Column(name) => kernel_column_to_df_expr(name, input_schema),
@@ -88,8 +88,8 @@ fn kernel_binary_expr_to_df_expr(binary: &BinaryExpression, input_schema: &Struc
         BinaryExpressionOp::Multiply => Operator::Multiply,
         BinaryExpressionOp::Divide => Operator::Divide,
     };
-    let left = kernel_to_datafusion_expr(&binary.left, input_schema)?;
-    let right = kernel_to_datafusion_expr(&binary.right, input_schema)?;
+    let left = kernel_to_df_expr(&binary.left, input_schema)?;
+    let right = kernel_to_df_expr(&binary.right, input_schema)?;
     Ok(binary_expr(left, op, right))
 }
 
@@ -99,7 +99,7 @@ fn kernel_variadic_to_df_expr(variadic: &VariadicExpression, input_schema: &Stru
     let args = variadic
         .exprs
         .iter()
-        .map(|e| kernel_to_datafusion_expr(e, input_schema))
+        .map(|e| kernel_to_df_expr(e, input_schema))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(match variadic.op {
         VariadicExpressionOp::Coalesce => coalesce(args),
@@ -135,7 +135,7 @@ mod tests {
     /// Lowers an expression against [`test_schema`] and renders it as a DataFusion `Display`
     /// string.
     fn lower(expr: Expr_) -> String {
-        kernel_to_datafusion_expr(&expr, &test_schema())
+        kernel_to_df_expr(&expr, &test_schema())
             .unwrap()
             .to_string()
     }
@@ -196,6 +196,6 @@ mod tests {
     #[case::unknown_nested(Expr_::column(["a", "b", "missing"]))]
     #[case::descend_into_non_struct(Expr_::column(["x", "y"]))]
     fn unresolved_column_is_an_error(#[case] kernel: Expr_) {
-        kernel_to_datafusion_expr(&kernel, &test_schema()).unwrap_err();
+        kernel_to_df_expr(&kernel, &test_schema()).unwrap_err();
     }
 }
