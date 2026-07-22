@@ -2170,7 +2170,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                 let inner = &geo_str["geography(".len()..geo_str.len() - 1];
                 // Kernel accepts only the canonical serialized form that every writer emits:
                 //   geography(<crs>, <algorithm>)
-                // TODO: reevaluate whether accepting padded input like
+                // TODO(#2949): reevaluate whether accepting padded input like
                 // geography(  EPSG:4326 ,  vincenty  ) is desired.
                 match inner.split_once(',') {
                     Some((crs, algo_str)) => {
