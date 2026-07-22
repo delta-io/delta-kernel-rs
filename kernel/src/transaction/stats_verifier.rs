@@ -192,7 +192,7 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         )),
         #[cfg(feature = "geo-type-in-dev")]
         DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => Err(
-            Error::internal_error(format!("Unsupported data type for stats validation: {dt}")),
+            Error::unsupported(format!("Unsupported data type for stats validation: {dt}")),
         ),
         &DataType::VOID
         | DataType::Struct(_)
