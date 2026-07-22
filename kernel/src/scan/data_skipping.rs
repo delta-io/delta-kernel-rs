@@ -437,8 +437,8 @@ pub(crate) fn as_checkpoint_skipping_predicate(
 ) -> Option<Pred> {
     let partition_columns: HashSet<String> = physical_partition_columns.iter().cloned().collect();
     CheckpointDataSkippingPredicateCreator {
-        stats: StatColumns {
-            partition_columns: &partition_columns,
+        data_skipping_columns: DataSkippingColumns {
+            physical_partition_columns: &partition_columns,
             stats_columns: physical_stats_columns,
         },
     }
@@ -512,27 +512,23 @@ fn has_min_max_stats(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype))
 }
 
-/// Shared data-column stat-path mechanism for the two predicate creators. Maps a data column to its
-/// `stats_parsed.{minValues,maxValues,nullCount}.<col>` reference, gated on the column having
-/// collected stats. Partition-column handling differs between the creators and stays with each.
-struct StatColumns<'a> {
+/// Column metadata shared by the data-skipping predicate creators.
+struct DataSkippingColumns<'a> {
     /// Physical names of partition columns. Stats for these come from
     /// `partitionValues_parsed.<col>` (exact values) instead of min/max ranges; each creator
     /// applies its own partition policy.
-    partition_columns: &'a HashSet<String>,
+    physical_partition_columns: &'a HashSet<String>,
     /// Physical leaf paths whose stats are present in `stats_parsed` (honors
     /// `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, and required
-    /// columns). References to data columns not in this set return `None`, which
-    /// junction-folds to NULL. Must match the column set used to build
-    /// `physical_stats_schema`; otherwise the rewritten predicate references columns absent
-    /// from the unified schema.
+    /// columns). Must match the column set used to build `physical_stats_schema`; otherwise the
+    /// rewritten predicate references columns absent from the unified schema.
     stats_columns: &'a HashSet<ColumnName>,
 }
 
-impl StatColumns<'_> {
+impl DataSkippingColumns<'_> {
     fn is_partition_column(&self, col: &ColumnName) -> bool {
         let path = col.path();
-        path.len() == 1 && self.partition_columns.contains(path[0].as_str())
+        path.len() == 1 && self.physical_partition_columns.contains(path[0].as_str())
     }
 
     fn is_stats_column(&self, col: &ColumnName) -> bool {
@@ -571,21 +567,21 @@ impl StatColumns<'_> {
 /// For partition columns, rewrites to `partitionValues_parsed.*` since the partition value is
 /// the exact value for every row in the file (serving as both min and max).
 struct DataSkippingPredicateCreator<'a> {
-    stats: StatColumns<'a>,
+    data_skipping_columns: DataSkippingColumns<'a>,
 }
 
 impl<'a> DataSkippingPredicateCreator<'a> {
     fn new(partition_columns: &'a HashSet<String>, stats_columns: &'a HashSet<ColumnName>) -> Self {
         Self {
-            stats: StatColumns {
-                partition_columns,
+            data_skipping_columns: DataSkippingColumns {
+                physical_partition_columns: partition_columns,
                 stats_columns,
             },
         }
     }
 
     fn is_partition_column(&self, col: &ColumnName) -> bool {
-        self.stats.is_partition_column(col)
+        self.data_skipping_columns.is_partition_column(col)
     }
 
     /// Wraps a predicate with `OR(NOT is_add, pred)` to protect Remove rows from being
@@ -609,7 +605,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
         } else {
-            self.stats.data_min_stat(col, data_type)
+            self.data_skipping_columns.data_min_stat(col, data_type)
         }
     }
 
@@ -620,7 +616,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             Some(joined_column_expr!("partitionValues_parsed", col))
         } else {
-            self.stats.data_max_stat(col, data_type)
+            self.data_skipping_columns.data_max_stat(col, data_type)
         }
     }
 
@@ -649,13 +645,13 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         if self.is_partition_column(col) {
             None
         } else {
-            self.stats.data_nullcount_stat(col)
+            self.data_skipping_columns.data_nullcount_stat(col)
         }
     }
 
     /// Retrieves the row count statistic.
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(self.stats.rowcount_stat())
+        Some(self.data_skipping_columns.rowcount_stat())
     }
 
     /// For partition columns, wraps the comparison with `OR(NOT is_add, comparison)` so that
@@ -747,13 +743,13 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
 /// parquet row group filtering in checkpoint/sidecar files. Partition columns are excluded since
 /// their values live in `add.partitionValues_parsed`, not `add.stats_parsed`.
 struct CheckpointDataSkippingPredicateCreator<'a> {
-    stats: StatColumns<'a>,
+    data_skipping_columns: DataSkippingColumns<'a>,
 }
 
 impl CheckpointDataSkippingPredicateCreator<'_> {
     /// Returns true if the column is a partition column (no stats in `stats_parsed`).
     fn is_partition_column(&self, col: &ColumnName) -> bool {
-        self.stats.is_partition_column(col)
+        self.data_skipping_columns.is_partition_column(col)
     }
 }
 
@@ -769,25 +765,25 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         if self.is_partition_column(col) {
             return None;
         }
-        self.stats.data_min_stat(col, data_type)
+        self.data_skipping_columns.data_min_stat(col, data_type)
     }
 
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         if self.is_partition_column(col) {
             return None;
         }
-        self.stats.data_max_stat(col, data_type)
+        self.data_skipping_columns.data_max_stat(col, data_type)
     }
 
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
         if self.is_partition_column(col) {
             return None;
         }
-        self.stats.data_nullcount_stat(col)
+        self.data_skipping_columns.data_nullcount_stat(col)
     }
 
     fn get_rowcount_stat(&self) -> Option<Expr> {
-        Some(self.stats.rowcount_stat())
+        Some(self.data_skipping_columns.rowcount_stat())
     }
 
     /// Compares a column's max stat against a literal value, adjusting for timestamp
