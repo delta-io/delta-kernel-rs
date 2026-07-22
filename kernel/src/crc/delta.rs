@@ -117,7 +117,8 @@ impl Crc {
             self.metadata = m;
         }
 
-        // Apply the delta onto the CRC's existing map. The variant (Complete or Partial) stays the
+        // Apply the delta onto the CRC's existing map: upsert each non-removed entry
+        // (newest wins), drop each tombstone. The variant (Complete or Partial) stays the
         // same since a delta never changes whether the base was authoritative.
         let map = match &mut self.domain_metadata_state {
             DomainMetadataState::Complete(m) | DomainMetadataState::Partial(m) => m,
