@@ -320,9 +320,8 @@ impl fmt::Display for MetricEvent {
 
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
-/// How much of the log a load read to assemble its segment. This is the load mechanism, not the
-/// caller: distinct consumers (snapshot loads, and in the future table-changes and timestamp
-/// conversion, which read a bounded commit window) map onto the same axis.
+/// The kind of log-segment load: a full listing from the base up to the target, or an
+/// incremental listing of the commits above an existing segment.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
 )]
@@ -367,9 +366,8 @@ pub struct LogSegmentLoadSuccess {
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
     pub num_compaction_files: u64,
-    /// How many versions behind the segment's end version the latest on-disk CRC file is:
-    /// `None` if there is no CRC file, `Some(0)` if one sits at the end version, `Some(n)` if it
-    /// is `n` versions behind.
+    /// How many versions behind the segment's end version the latest on-disk CRC file is, or
+    /// `None` if there is no CRC file.
     pub crc_versions_behind: Option<u64>,
     pub duration: Duration,
 }

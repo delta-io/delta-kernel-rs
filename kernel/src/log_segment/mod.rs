@@ -338,13 +338,17 @@ impl LogSegment {
         let log_segment =
             build().inspect_err(|_| emit_log_segment_load_failure(&metric_context))?;
 
-        log_segment.emit_load(&metric_context, start.elapsed());
+        log_segment.emit_load_success(&metric_context, start.elapsed());
         Ok(log_segment)
     }
 
     /// Emit a `LogSegmentLoadSuccess` for this assembled segment, reporting its file counts and
     /// CRC staleness. Callers time the load and pass the elapsed `duration`.
-    pub(crate) fn emit_load(&self, metric_context: &SnapshotLoadMetricContext, duration: Duration) {
+    pub(crate) fn emit_load_success(
+        &self,
+        metric_context: &SnapshotLoadMetricContext,
+        duration: Duration,
+    ) {
         emit_log_segment_load(
             metric_context,
             self.listed.ascending_commit_files.len() as u64,

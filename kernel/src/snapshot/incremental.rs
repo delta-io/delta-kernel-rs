@@ -18,13 +18,11 @@ use crate::path::ParsedLogPath;
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
 
-/// Outcome of listing and assembling the new log segment during an incremental update. Listing and
-/// assembly run as one fallible unit returning this enum, so a genuine load failure (a propagated
-/// `Err`) emits the load-failure metric at exactly one call site, while these non-failure outcomes
-/// do not.
+/// A successfully assembled outcome of the listing phase of an incremental update. The failure
+/// outcomes are `Err`s from [`Snapshot::build_new_segment`] (including the requested version being
+/// unavailable), so the caller emits the load-failure metric once on `Err` and matches these
+/// variants for the non-failure paths.
 enum NewSegment {
-    /// The requested version is not in the log; the caller errors (case C.1).
-    Unavailable { requested_version: Version },
     /// No new segment to build; the caller returns the existing snapshot unchanged (cases C.2, E).
     Unchanged,
     /// A checkpoint ahead of the existing snapshot requires a full rebuild from it (case D.1).
@@ -133,9 +131,8 @@ impl Snapshot {
             tracing::Span::current().record("version", existing_snapshot_version);
         }
 
-        // List and assemble the new segment as one fallible unit so a load failure emits exactly
-        // once here. A propagated `Err` is a genuine load failure; the returned `NewSegment` is
-        // not.
+        // Assemble the new segment as one fallible unit so a load failure emits exactly once, via
+        // the `inspect_err` below.
         let segment_load_start = std::time::Instant::now();
         let (combined_log_segment, new_end_version) = match Self::build_new_segment(
             engine,
@@ -146,18 +143,11 @@ impl Snapshot {
         )
         .inspect_err(|_| emit_log_segment_load_failure(&metric_context))?
         {
-            NewSegment::Unavailable { requested_version } => {
-                return Err(Error::Generic(format!(
-                    "Requested snapshot version {requested_version} is not available: \
-                     no new commits were found after existing snapshot version \
-                     {existing_snapshot_version}"
-                )));
-            }
             NewSegment::Unchanged => {
                 return Self::reuse_promoting_built_as_latest(&existing_snapshot, built_as_latest);
             }
             NewSegment::Rebuild(new_log_segment) => {
-                new_log_segment.emit_load(&metric_context, segment_load_start.elapsed());
+                new_log_segment.emit_load_success(&metric_context, segment_load_start.elapsed());
                 let snapshot = Self::try_new_from_log_segment(
                     existing_snapshot.table_root().clone(),
                     new_log_segment,
@@ -172,7 +162,8 @@ impl Snapshot {
                 combined_log_segment,
                 new_end_version,
             } => {
-                combined_log_segment.emit_load(&metric_context, segment_load_start.elapsed());
+                combined_log_segment
+                    .emit_load_success(&metric_context, segment_load_start.elapsed());
                 (combined_log_segment, new_end_version)
             }
         };
@@ -265,14 +256,18 @@ impl Snapshot {
         if new_listed_files.ascending_commit_files().is_empty()
             && new_listed_files.checkpoint_parts().is_empty()
         {
-            return Ok(match requested_version {
+            return match requested_version {
                 // Case C.1: caller requested a specific version (necessarily >
                 // existing_snapshot_version since cases A and B were handled above), but
                 // no such commit exists in the log.
-                Some(requested_version) => NewSegment::Unavailable { requested_version },
+                Some(requested_version) => Err(Error::Generic(format!(
+                    "Requested snapshot version {requested_version} is not available: \
+                     no new commits were found after existing snapshot version \
+                     {existing_snapshot_version}"
+                ))),
                 // Case C.2: no new commits and no explicit target; latest is existing.
-                None => NewSegment::Unchanged,
-            });
+                None => Ok(NewSegment::Unchanged),
+            };
         }
 
         // create a log segment just from existing_checkpoint.version -> new_version
@@ -1899,6 +1894,7 @@ mod tests {
     // ProtocolMetadataLoad source classification
     // ============================================================================
 
+    /// Return a clone of the one event `extract` matches, asserting exactly one matches.
     fn single_event<T: Clone>(
         events: &[MetricEvent],
         extract: impl Fn(&MetricEvent) -> Option<&T>,
@@ -2167,6 +2163,44 @@ mod tests {
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
         let result = Snapshot::builder_from(base).build(ctx.engine.as_ref());
+        assert!(result.is_err());
+
+        let events = reporter.events();
+        let failure = events
+            .iter()
+            .find_map(|e| match e {
+                MetricEvent::LogSegmentLoadFailure(f) => Some(f),
+                _ => None,
+            })
+            .expect("expected a LogSegmentLoadFailure");
+        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::LogSegmentLoadSuccess(_))),
+            "no success event should fire on the failure path"
+        );
+        Ok(())
+    }
+
+    // Case C.1: requesting a version beyond the log errors and emits a LogSegmentLoadFailure,
+    // matching the fresh path (which also fails a request for an unavailable version).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_incremental_unavailable_version_emits_log_segment_load_failure() -> DeltaResult<()>
+    {
+        let ctx = setup_incremental_snapshot_test()?;
+        setup_test_table_with_commits(ctx.url.as_str(), &ctx.store, 4).await?; // v0..=v3
+        let base = Snapshot::builder_for(ctx.url.as_str())
+            .at_version(3)
+            .build(ctx.engine.as_ref())?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        // Request a version beyond the log: the listing above v3 is empty (case C.1).
+        let result = Snapshot::builder_from(base)
+            .at_version(9)
+            .build(ctx.engine.as_ref());
         assert!(result.is_err());
 
         let events = reporter.events();
