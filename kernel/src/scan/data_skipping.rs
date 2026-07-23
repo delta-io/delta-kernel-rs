@@ -418,6 +418,10 @@ impl DataSkippingFilter {
 /// values. A bare unsupported predicate returns `None`; unsupported junction arms become NULL
 /// literals to preserve three-valued logic.
 ///
+/// This applies to Parquet files that carry checkpoint Adds: V1 single-part and multi-part
+/// checkpoints, inline Adds in V2 Parquet checkpoints, and V2 sidecars. A V2 JSON checkpoint has no
+/// row groups; only its Parquet sidecars use this predicate.
+///
 /// `physical_partition_columns` may be narrowed to the predicate's references; pass an empty set
 /// for unpartitioned tables. `physical_floating_partition_columns` identifies FLOAT and DOUBLE
 /// partitions whose parquet min/max may omit NaNs. `physical_stats_columns` is the table-level

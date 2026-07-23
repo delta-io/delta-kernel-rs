@@ -501,10 +501,16 @@ fn test_checkpoint_skipping_semantic(
     expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
 }
 
-// Partition comparisons are not null-guarded. A checkpoint Remove has a null add-side partition
-// value but does not participate in scan replay, so the parquet filter may discard it.
-#[test]
-fn test_checkpoint_skipping_partition_null_value_is_unguarded() {
+// These values model the partition footer aggregate for `part_col = "B"`. A Remove-only group has
+// no min/max and is kept as unknown. When a non-matching Add with value "A" shares a group with a
+// Remove, parquet ignores the Remove's null and reports "A", allowing the whole group to be pruned.
+#[rstest]
+#[case::remove_only(Scalar::Null(DataType::STRING), NULL)]
+#[case::remove_with_non_matching_add(Scalar::from("A"), FALSE)]
+fn test_checkpoint_skipping_partition_comparison_with_remove(
+    #[case] footer_value: Scalar,
+    #[case] expected: Option<bool>,
+) {
     let partition_columns = HashSet::from([column_name!("part_col")]);
     let pred = Pred::eq(column_expr!("part_col"), Scalar::from("B"));
     let skipping_pred = as_checkpoint_skipping_predicate(
@@ -516,14 +522,10 @@ fn test_checkpoint_skipping_partition_null_value_is_unguarded() {
     .unwrap();
     let resolver = HashMap::from_iter([(
         column_name!("partitionValues_parsed.part_col"),
-        Scalar::Null(DataType::STRING),
+        footer_value,
     )]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(
-        filter.eval(&skipping_pred),
-        NULL,
-        "null partition values should not be converted to TRUE by a guard"
-    );
+    expect_eq!(filter.eval(&skipping_pred), expected, "{pred:?}");
 }
 
 // Checkpoint partition skipping across comparison operators. Each case resolves one exact per-file
@@ -589,37 +591,24 @@ fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] va
     );
 }
 
-// Partition `IS NULL` reads `partitionValues_parsed.part_col IS NULL` directly: a row group with no
-// null partition value holds only Add rows with real values, so a non-null value prunes it (FALSE).
-#[test]
-fn test_checkpoint_skipping_partition_is_null() {
-    let partition_columns = HashSet::from([column_name!("part_col")]);
-    let pred = Pred::is_null(column_expr!("part_col"));
-    let skipping_pred = as_checkpoint_skipping_predicate(
-        &pred,
-        &partition_columns,
-        &HashSet::new(),
-        &HashSet::new(),
-    )
-    .unwrap();
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        Scalar::from("x"),
-    )]));
-    expect_eq!(resolver.eval(&skipping_pred), FALSE, "{pred:?}");
-}
-
-// Partition `IS NOT NULL` checks the exact partition value and may discard checkpoint Removes,
-// whose add-side partition value is null and which do not participate in scan replay.
+// Partition null predicates read `partitionValues_parsed.part_col` directly. FALSE is the pruning
+// verdict; TRUE keeps the row group.
 #[rstest]
-#[case::null(Scalar::Null(DataType::STRING), FALSE)]
-#[case::non_null(Scalar::from("x"), TRUE)]
-fn test_checkpoint_skipping_partition_is_not_null(
+#[case::is_null_null(false, Scalar::Null(DataType::STRING), TRUE)]
+#[case::is_null_value(false, Scalar::from("x"), FALSE)]
+#[case::is_not_null_null(true, Scalar::Null(DataType::STRING), FALSE)]
+#[case::is_not_null_value(true, Scalar::from("x"), TRUE)]
+fn test_checkpoint_skipping_partition_null_predicates(
+    #[case] is_not_null: bool,
     #[case] value: Scalar,
     #[case] expected: Option<bool>,
 ) {
     let partition_columns = HashSet::from([column_name!("part_col")]);
-    let pred = Pred::is_not_null(column_expr!("part_col"));
+    let pred = if is_not_null {
+        Pred::is_not_null(column_expr!("part_col"))
+    } else {
+        Pred::is_null(column_expr!("part_col"))
+    };
     let skipping_pred = as_checkpoint_skipping_predicate(
         &pred,
         &partition_columns,

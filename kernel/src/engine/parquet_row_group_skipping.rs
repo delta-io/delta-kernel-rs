@@ -326,6 +326,13 @@ struct StatsColumnIndices {
 /// group containing a null partition leaf. This is sound for scan checkpoint reads because non-Add
 /// rows do not participate in replay and an Add with a null partition value cannot match the
 /// comparison.
+///
+/// For example, consider a row group with an Add for partition `p = "A"` whose data statistics are
+/// all null, plus a Remove whose entire `add` struct is null. The partition leaf still contains
+/// `["A", null]`, even though both rows have null data-stat leaves. Its footer min/max is therefore
+/// `"A"`, because parquet ignores the Remove's null. For `p = "B"`, pruning drops the non-matching
+/// Add and the irrelevant Remove. The null data-stat leaves remain guarded and cannot cause
+/// pruning.
 #[allow(dead_code)]
 pub(crate) struct CheckpointRowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
