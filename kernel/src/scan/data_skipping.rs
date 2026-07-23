@@ -411,8 +411,10 @@ impl DataSkippingFilter {
     }
 }
 
-/// Rewrites a predicate for parquet row group skipping in checkpoint/sidecar files.
-/// Returns `None` if the predicate is not eligible for data skipping.
+/// Rewrites a predicate for checkpoint/sidecar Parquet pushdown.
+///
+/// The result is safe for row-group skipping and exact row filtering. Returns `None` if the
+/// predicate is not eligible for data skipping.
 ///
 /// Adds IS NULL guards on each stat column reference so the parquet RowGroupFilter
 /// conservatively keeps row groups containing files with missing stats (null stat values
@@ -426,10 +428,9 @@ impl DataSkippingFilter {
 /// not `add.stats_parsed`. `physical_partition_columns` is the table's full partition list;
 /// pass an empty set for unpartitioned tables.
 ///
-/// `physical_stats_columns` restricts rewrites to columns which are expected to have stats
-/// collected; other references fold to NULL (keeps the file). Must match the column set
-/// used to build `physical_stats_schema`, otherwise the row-group filter sees a missing
-/// field.
+/// `physical_stats_columns` restricts rewrites to columns expected to have stats. Unsupported
+/// junction arms fold to TRUE; a wholly unsupported predicate returns `None`. This set must
+/// match `physical_stats_schema`.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     physical_partition_columns: &HashSet<ColumnName>,
@@ -886,19 +887,21 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         None
     }
 
-    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` →
-    /// ```text
-    /// AND(
-    ///   OR(stats_parsed.maxValues.col_a IS NULL, stats_parsed.maxValues.col_a > 100),
-    ///   OR(stats_parsed.minValues.col_b IS NULL, stats_parsed.minValues.col_b < 50)
-    /// )
-    /// ```
+    /// Combines rewritten arms, replacing unsupported arms with TRUE. This preserves supported
+    /// pruning under AND and disables pruning under OR, where the unsupported arm may match.
+    /// Exact row filters discard NULL results, so NULL is not a safe fallback here.
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionPredicateOp,
+        mut op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
+        if inverted {
+            op = op.invert();
+        }
+        Some(Pred::junction(
+            op,
+            preds.map(|pred| pred.unwrap_or_else(|| Pred::literal(true))),
+        ))
     }
 }

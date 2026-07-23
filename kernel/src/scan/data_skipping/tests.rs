@@ -1548,11 +1548,8 @@ fn mixed_and_non_stat_arm_still_prunes_via_stat_arm() {
     );
 }
 
-/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint
-/// creator, which adds an `IS NULL` guard on each stat ref for safe parquet
-/// row-group filtering. The non-stat arm still folds to NULL.
 #[test]
-fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
+fn checkpoint_pushdown_non_stat_arm_folds_to_true_literal() {
     let pred = Pred::and(
         Pred::gt(column_expr!("stat"), Scalar::from(100)),
         Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
@@ -1561,6 +1558,60 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
     let result = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
     assert_eq!(
         result.to_string(),
-        "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, Column(stats_parsed.maxValues.stat) > 100), null)"
+        "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, Column(stats_parsed.maxValues.stat) > 100), true)"
+    );
+}
+
+#[rstest]
+#[case::and_supported_true(
+    Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(150i32),
+    TRUE,
+)]
+#[case::or_supported_false(
+    Pred::or(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(50i32),
+    TRUE,
+)]
+#[case::not_and_supported_false(
+    Pred::not(Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    )),
+    column_name!("stats_parsed.minValues.stat"),
+    Scalar::from(150i32),
+    TRUE,
+)]
+#[case::not_or_supported_false(
+    Pred::not(Pred::or(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    )),
+    column_name!("stats_parsed.minValues.stat"),
+    Scalar::from(150i32),
+    FALSE,
+)]
+fn checkpoint_pushdown_unsupported_junction_semantics(
+    #[case] pred: Pred,
+    #[case] stat_column: ColumnName,
+    #[case] stat_value: Scalar,
+    #[case] expected: Option<bool>,
+) {
+    let stats = stats_cols(&["stat"]);
+    let result = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    let resolver = HashMap::from_iter([(stat_column, stat_value)]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&result),
+        expected,
+        "TRUE-folded unsupported junction semantics for {pred}"
     );
 }
