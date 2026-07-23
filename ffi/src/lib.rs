@@ -2838,9 +2838,9 @@ mod tests {
             invalid_snapshot,
             KernelError::GenericError,
             Some(concat!(
-                "Generic delta kernel error: Staged commits in log_tail require ",
-                "max_catalog_version to be set. Use with_max_catalog_version() ",
-                "when providing staged commits."
+                "Max catalog version error: Max catalog version is required when providing ",
+                "staged commits in the log tail. ",
+                "Use with_max_catalog_version()."
             )),
         );
 

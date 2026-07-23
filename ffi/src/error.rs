@@ -84,6 +84,8 @@ impl From<Error> for KernelError {
             Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
+            Error::MaxCatalogVersion(_) => KernelError::GenericError,
+            Error::LogTailVersionsNotContiguous { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
             #[cfg(feature = "default-engine-base")]
             Error::Parquet(_) => KernelError::ParquetError,
