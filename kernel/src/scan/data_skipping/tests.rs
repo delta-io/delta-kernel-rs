@@ -1548,11 +1548,12 @@ fn mixed_and_non_stat_arm_still_prunes_via_stat_arm() {
     );
 }
 
-/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint
-/// creator, which adds an `IS NULL` guard on each stat ref for safe parquet
-/// row-group filtering. The non-stat arm still folds to NULL.
+/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint creator,
+/// which adds an `IS NULL` guard on each stat ref for safe parquet row-group filtering. The
+/// non-stat arm folds to TRUE (not NULL) so the pushed predicate is sound whether the reader
+/// applies it as a row-group hint or a two-valued exact row filter.
 #[test]
-fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
+fn checkpoint_pushdown_non_stat_arm_folds_to_true_literal() {
     let pred = Pred::and(
         Pred::gt(column_expr!("stat"), Scalar::from(100)),
         Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
@@ -1561,6 +1562,32 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
     let result = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
     assert_eq!(
         result.to_string(),
-        "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, Column(stats_parsed.maxValues.stat) > 100), null)"
+        "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, Column(stats_parsed.maxValues.stat) > 100), true)"
+    );
+}
+
+/// Guards the reason for the TRUE fold. When the supported arm evaluates TRUE (keep), the
+/// whole predicate must be TRUE. The TRUE-folded unsupported arm gives `AND(TRUE, TRUE) =
+/// TRUE`; a NULL fold would give `AND(TRUE, NULL) = NULL`, which a two-valued row filter reads
+/// as false -> a dropped row -> a lost live Add. Resolving the stat isolates the fold's effect.
+#[test]
+fn checkpoint_pushdown_true_fold_does_not_poison_supported_arm() {
+    let pred = Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    );
+    let stats = stats_cols(&["stat"]);
+    let result = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    // maxValues.stat = 150 makes the supported arm `150 > 100` TRUE (keep). With a TRUE fold the
+    // predicate is TRUE; a NULL fold would collapse it to NULL (unknown), which is the bug.
+    let resolver = HashMap::from_iter([(
+        column_name!("stats_parsed.maxValues.stat"),
+        Scalar::from(150i32),
+    )]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&result),
+        TRUE,
+        "TRUE-folded unsupported arm leaves the supported arm's keep verdict intact"
     );
 }
