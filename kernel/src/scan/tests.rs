@@ -1168,31 +1168,45 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 }
 
 // Partition-only scans have no stats schema, so the partition schema must enable the rewrite.
-#[test]
-fn test_build_actions_meta_predicate_partition_only() {
+#[rstest]
+#[case::equality(Pred::eq(
+    column_expr!("modified"),
+    Expr::literal("2021-02-01"),
+), None)]
+#[case::date_cast_range(Pred::and(
+    Pred::ge(
+        Expr::cast(column_expr!("modified"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    Pred::lt(
+        Expr::cast(column_expr!("modified"), DataType::DATE),
+        Scalar::Date(20_644),
+    ),
+), Some("CAST(Column(add.partitionValues_parsed.modified) AS date)"))]
+fn test_build_actions_meta_predicate_partition_only(
+    #[case] predicate: Pred,
+    #[case] expected_cast: Option<&str>,
+) {
     // `app-txn-checkpoint` is partitioned by `modified` (string), no column mapping.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    let predicate = Arc::new(Pred::eq(
-        column_expr!("modified"),
-        Expr::literal("2021-02-01"),
-    ));
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .build()
         .unwrap();
 
-    let meta_pred = scan.build_actions_meta_predicate();
-    assert!(
-        meta_pred.is_some(),
-        "partition-only predicate should still produce a checkpoint meta-predicate"
-    );
+    let meta_pred = scan
+        .build_actions_meta_predicate()
+        .expect("partition-only predicate should produce a checkpoint meta-predicate");
+    let rendered = meta_pred.to_string();
+    if let Some(expected_cast) = expected_cast {
+        assert!(rendered.contains(expected_cast), "{rendered}");
+    }
     let refs: Vec<String> = meta_pred
-        .unwrap()
         .references()
         .into_iter()
         .map(|c| c.to_string())
@@ -1218,20 +1232,25 @@ fn test_build_actions_meta_predicate_partition_column_mapping(#[case] mode: &str
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    let predicate = Arc::new(Pred::eq(column_expr!("category"), Expr::literal("a")));
+    let predicate = Arc::new(Pred::eq(
+        Expr::cast(column_expr!("category"), DataType::DATE),
+        Scalar::Date(20_641),
+    ));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
         .build()
         .unwrap();
 
-    let meta_pred = scan.build_actions_meta_predicate();
+    let meta_pred = scan
+        .build_actions_meta_predicate()
+        .expect("partition predicate under column mapping should produce a meta-predicate");
+    let rendered = meta_pred.to_string();
     assert!(
-        meta_pred.is_some(),
-        "partition predicate under column mapping should produce a meta-predicate"
+        rendered.contains("CAST(Column(add.partitionValues_parsed"),
+        "{rendered}"
     );
     let refs: Vec<String> = meta_pred
-        .unwrap()
         .references()
         .into_iter()
         .map(|c| c.to_string())
@@ -1632,6 +1651,13 @@ fn standard_multi_rg() -> Bytes {
 #[case::partition_eq(Pred::eq(column_expr!("part"), Expr::literal("a")), vec![1, 3])]
 #[case::partition_lt(Pred::lt(column_expr!("part"), Expr::literal("b")), vec![1, 3])]
 #[case::partition_all_pruned(Pred::eq(column_expr!("part"), Expr::literal("z")), vec![])]
+#[case::partition_cast_kept(
+    Pred::eq(
+        Expr::cast(column_expr!("part"), DataType::DATE),
+        Scalar::Date(18_628),
+    ),
+    vec![1, 2, 3, 4]
+)]
 #[case::and_stats_and_partition(
     Pred::and(
         Pred::eq(column_expr!("part"), Expr::literal("a")),

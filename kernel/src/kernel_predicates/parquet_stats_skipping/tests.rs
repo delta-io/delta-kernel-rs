@@ -40,6 +40,17 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
     }
 }
 
+#[test]
+fn test_cast_stays_unknown_for_parquet_stats() {
+    let filter = UnimplementedTestFilter;
+    let pred = Pred::eq(
+        Expr::cast(column_expr!("x"), DataType::DATE),
+        Scalar::Date(19_723),
+    );
+
+    expect_eq!(filter.eval(&pred), NULL, "{pred:#?}");
+}
+
 /// Tests apply_junction and apply_scalar
 #[test]
 fn test_junctions() {
