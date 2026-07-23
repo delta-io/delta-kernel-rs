@@ -371,24 +371,14 @@ impl TableConfiguration {
     /// and field types are the actual partition column data types with their original nullability.
     /// Returns `None` if the table has no partition columns.
     pub(crate) fn build_partition_values_parsed_schema(&self) -> Option<SchemaRef> {
-        let partition_columns = self.metadata().partition_columns();
-        if partition_columns.is_empty() {
+        if self.logical_partition_columns().is_empty() {
             return None;
         }
-        let logical_schema = self.logical_schema();
-        let column_mapping_mode = self.column_mapping_mode();
-        let partition_fields: Vec<StructField> = partition_columns
-            .iter()
-            .filter_map(|col_name| {
-                let field = logical_schema.field(col_name);
-                if field.is_none() {
-                    warn!("Partition column '{col_name}' not found in table schema");
-                }
-                field
-            })
-            .map(|field: &StructField| {
+        let partition_fields: Vec<StructField> = self
+            .physical_partition_fields()
+            .map(|(field, physical_name)| {
                 StructField::new(
-                    field.physical_name(column_mapping_mode).to_owned(),
+                    physical_name.to_owned(),
                     field.data_type().clone(),
                     field.is_nullable(),
                 )
@@ -552,10 +542,16 @@ impl TableConfiguration {
         self.column_mapping_mode
     }
 
-    /// The partition columns of this table (empty if non-partitioned)
+    /// The logical partition columns of this table (empty if unpartitioned).
     #[internal_api]
-    pub(crate) fn partition_columns(&self) -> &[String] {
+    pub(crate) fn logical_partition_columns(&self) -> &[String] {
         self.metadata().partition_columns()
+    }
+
+    /// The physical partition columns of this table (empty if unpartitioned).
+    pub(crate) fn physical_partition_columns(&self) -> impl Iterator<Item = String> + '_ {
+        self.physical_partition_fields()
+            .map(|(_, physical_name)| physical_name.to_owned())
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
@@ -568,6 +564,22 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn version(&self) -> Version {
         self.version
+    }
+
+    fn physical_partition_fields(&self) -> impl Iterator<Item = (&StructField, &str)> + '_ {
+        let column_mapping_mode = self.column_mapping_mode();
+        self.logical_partition_columns()
+            .iter()
+            .filter_map(move |name| {
+                // SAFETY: Construction already validates that every partition column exists in
+                // the schema. Keep this iterator infallible for a simpler return type, with a
+                // defensive warning if the invariant is violated.
+                let field = self.logical_schema.field(name);
+                if field.is_none() {
+                    warn!("Partition column '{name}' not found in table schema");
+                }
+                field.map(|field| (field, field.physical_name(column_mapping_mode)))
+            })
     }
 
     /// Validates that all feature requirements for a given feature are satisfied.
@@ -2069,7 +2081,7 @@ mod test {
             [],
         );
 
-        assert_eq!(config.partition_columns(), ["part_a", "part_b"]);
+        assert_eq!(config.logical_partition_columns(), ["part_a", "part_b"]);
         let partition_schema = config
             .build_partition_values_parsed_schema()
             .expect("partition schema should be present");
@@ -2077,6 +2089,27 @@ mod test {
         assert!(partition_schema.field("phys_part_b").is_some());
         assert!(partition_schema.field("part_a").is_none());
         assert!(partition_schema.field("part_b").is_none());
+    }
+
+    #[rstest]
+    #[case::none("none", ["part_a", "part_b"])]
+    #[case::name("name", ["phys_part_a", "phys_part_b"])]
+    #[case::id("id", ["phys_part_a", "phys_part_b"])]
+    fn test_physical_partition_columns(
+        #[case] column_mapping_mode: &str,
+        #[case] expected: [&str; 2],
+    ) {
+        let config = create_partitioned_table_config_with_column_mapping(
+            partitioned_schema_with_column_mapping(),
+            column_mapping_mode,
+            vec!["part_a".to_string(), "part_b".to_string()],
+            [],
+        );
+
+        assert_eq!(
+            config.physical_partition_columns().collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

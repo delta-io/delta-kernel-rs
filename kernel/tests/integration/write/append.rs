@@ -4,19 +4,32 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Int32Array, StringArray};
+use delta_kernel::arrow::array::{
+    new_null_array, Array, ArrayRef, AsArray as _, Int32Array, MapBuilder, StringArray,
+    StringBuilder,
+};
+use delta_kernel::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
-use delta_kernel::{DeltaResult, Error as KernelError};
+use delta_kernel::table_features::ColumnMappingMode;
+use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
+use delta_kernel::transaction::Transaction;
+use delta_kernel::{DeltaResult, Error as KernelError, Snapshot};
 use itertools::Itertools;
+use rstest::rstest;
 use serde_json::{json, Deserializer};
-use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables, test_read};
+use test_utils::{
+    assert_result_error_with_message, into_record_batch, load_and_begin_transaction,
+    set_json_value, setup_test_tables, test_read,
+};
 
 use crate::common::write_utils::{
     check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
@@ -370,4 +383,217 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         }));
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let schema = get_simple_int_schema();
+
+    for field in ["path", "partitionValues", "size", "modificationTime"] {
+        let (table_url, engine, _store, _table_name) =
+            setup_test_tables(schema.clone(), &[], None, "required_field_table")
+                .await?
+                .into_iter()
+                .next()
+                .expect("at least one test table");
+        let engine = Arc::new(engine);
+        let mut txn =
+            load_and_begin_transaction(table_url, engine.as_ref())?.with_data_change(true);
+
+        // Produce valid `add` metadata, then null one required column so the commit must reject it.
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
+        let meta = engine
+            .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+            .await?;
+
+        let batch = into_record_batch(meta);
+        let index = batch.schema().index_of(field)?;
+
+        // The add-metadata schema declares these fields non-nullable, so rebuild the schema with
+        // the target field made nullable before inserting a null column.
+        let mut fields: Vec<ArrowField> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields[index] = fields[index].clone().with_nullable(true);
+        let nullable_schema = Arc::new(ArrowSchema::new(fields));
+        let mut columns = batch.columns().to_vec();
+        columns[index] = new_null_array(nullable_schema.field(index).data_type(), batch.num_rows());
+        let corrupted = RecordBatch::try_new(nullable_schema, columns)?;
+        txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
+
+        let err = txn
+            .commit(engine.as_ref())
+            .expect_err(&format!(
+                "commit should reject an add missing required field '{field}'"
+            ))
+            .to_string();
+        assert!(
+            err.contains(&format!("missing required field '{field}'")),
+            "field {field}: unexpected error {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::missing(None, &[AddFilePartitionKeyModify::Drop { key: "p2" }])]
+#[case::extra(None, &[AddFilePartitionKeyModify::Insert {
+    key: "p3",
+    value: "extra",
+}])]
+#[case::incorrect_name(None, &[
+    AddFilePartitionKeyModify::Drop { key: "p2" },
+    AddFilePartitionKeyModify::Insert {
+        key: "partition_2",
+        value: "6",
+    },
+])]
+#[case::logical_partition_name_when_cm_name_mode(
+    Some("name"),
+    &[
+        AddFilePartitionKeyModify::Drop { key: "p2" },
+        AddFilePartitionKeyModify::Insert { key: "p2", value: "6" },
+    ],
+)]
+#[case::logical_partition_name_when_cm_id_mode(
+    Some("id"),
+    &[
+        AddFilePartitionKeyModify::Drop { key: "p2" },
+        AddFilePartitionKeyModify::Insert { key: "p2", value: "6" },
+    ],
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_rejects_add_with_invalid_partition_keys(
+    #[case] column_mapping_mode: Option<&str>,
+    #[case] modifications: &[AddFilePartitionKeyModify<'_>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let table_schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("d", DataType::INTEGER),
+        StructField::nullable("p1", DataType::STRING),
+        StructField::nullable("p2", DataType::INTEGER),
+    ])?);
+    let (_tmp_dir, table_path, engine) = test_utils::test_table_setup_mt()?;
+    let mut builder = create_table(&table_path, table_schema, "test/1.0")
+        .with_data_layout(DataLayout::partitioned(["p1", "p2"]));
+    if let Some(mode) = column_mapping_mode {
+        builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
+    }
+    builder
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+
+    let data_schema: Arc<ArrowSchema> = Arc::new(
+        (&StructType::try_new(vec![StructField::nullable("d", DataType::INTEGER)])?)
+            .try_into_arrow()?,
+    );
+    let make_add = |txn: &Transaction, p1: &str, p2: i32| {
+        let wc = txn.partitioned_write_context(HashMap::from([
+            ("p1".to_string(), Scalar::String(p1.into())),
+            ("p2".to_string(), Scalar::Integer(p2)),
+        ]))?;
+        let data = RecordBatch::try_new(
+            data_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        futures::executor::block_on(engine.write_parquet(&ArrowEngineData::new(data), &wc))
+    };
+
+    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    let mode = snapshot
+        .table_properties()
+        .column_mapping_mode
+        .unwrap_or(ColumnMappingMode::None);
+    let logical_schema = snapshot.schema();
+    // Translate the `modifications` to the physical partition column names.
+    let modifications: Vec<_> = modifications
+        .iter()
+        .map(|modification| match *modification {
+            AddFilePartitionKeyModify::Drop { key } => {
+                let key = logical_schema
+                    .field(key)
+                    .map(|field| field.physical_name(mode))
+                    .unwrap_or(key);
+                AddFilePartitionKeyModify::Drop { key }
+            }
+            insertion => insertion,
+        })
+        .collect();
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .with_data_change(true);
+    let add = make_add(&txn, "b", 6)?;
+    let corrupted = modify_add_file_partition_keys(into_record_batch(add), &modifications);
+    txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
+    assert_result_error_with_message(txn.commit(engine.as_ref()), "partitionValues keys");
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AddFilePartitionKeyModify<'a> {
+    Drop { key: &'a str },
+    Insert { key: &'a str, value: &'a str },
+}
+
+/// Rebuilds `batch` after applying the partition-key modifications.
+fn modify_add_file_partition_keys(
+    batch: RecordBatch,
+    modifications: &[AddFilePartitionKeyModify<'_>],
+) -> RecordBatch {
+    let index = batch
+        .schema()
+        .index_of("partitionValues")
+        .expect("partitionValues field in add-file batch");
+    let map = batch.column(index).as_map();
+    let entries = map.entries();
+    let keys = entries.column(0).as_string::<i32>();
+    let values = entries.column(1).as_string::<i32>();
+    let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
+        .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
+        .collect();
+    for modification in modifications {
+        match *modification {
+            AddFilePartitionKeyModify::Drop { key } => {
+                partition_values.retain(|(existing_key, _)| *existing_key != key);
+            }
+            AddFilePartitionKeyModify::Insert { key, value } => {
+                partition_values.push((key, Some(value)));
+            }
+        }
+    }
+
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for (key, value) in partition_values {
+        builder.keys().append_value(key);
+        match value {
+            Some(v) => builder.values().append_value(v),
+            None => builder.values().append_null(),
+        }
+    }
+    builder
+        .append(true)
+        .expect("failed to append partition-values map row");
+    let new_map: ArrayRef = Arc::new(builder.finish());
+
+    let mut fields: Vec<ArrowField> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields[index] = ArrowField::new("partitionValues", new_map.data_type().clone(), true);
+    let mut columns = batch.columns().to_vec();
+    columns[index] = new_map;
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+        .expect("failed to rebuild add-file batch after modifying a partition key")
 }

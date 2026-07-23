@@ -78,6 +78,7 @@ pub mod stats_verifier;
 mod stats_verifier;
 mod update;
 mod write_context;
+mod write_validation;
 
 use stats_verifier::StatsColumnVerifier;
 use write_context::SharedWriteState;
@@ -99,7 +100,7 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_r
 /// Returns a reference to the mandatory fields in an add action.
 ///
 /// Note this does not include "dataChange" which is a required field but
-/// but should be set on the transactoin level. Getting the full schema
+/// should be set on the transaction level. Getting the full schema
 /// can be done with [`Transaction::add_files_schema`].
 pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
     &MANDATORY_ADD_FILE_SCHEMA
@@ -409,8 +410,18 @@ impl<S> Transaction<S> {
             );
         }
 
-        // Validate clustering column stats if ClusteredTable feature is enabled
+        // Validate protocol-required add-file statistics.
+        // Note: Stats validation cannot use `StagedDataValidator` because its columns and types
+        // are determined at runtime, whereas `RowVisitor::selected_column_names_and_types` must
+        // return a static projection. Consequently, stats validation makes a separate pass for
+        // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
+
+        // Validate required fields and partition-column completeness for addFile.
+        write_validation::StagedDataValidator::staged_add_file(
+            self.effective_table_config.physical_partition_columns(),
+        )
+        .validate(&self.add_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
@@ -948,7 +959,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         {
             let partition_cols: HashSet<&str> = self
                 .effective_table_config
-                .partition_columns()
+                .logical_partition_columns()
                 .iter()
                 .map(String::as_str)
                 .collect();
@@ -981,7 +992,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     /// Returns the logical partition column names for this table.
     pub fn logical_partition_columns(&self) -> &[String] {
-        self.effective_table_config.partition_columns()
+        self.effective_table_config.logical_partition_columns()
     }
 
     /// Returns the column default for every top-level column in this table's logical schema that
@@ -1045,7 +1056,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
             physical_schema: table_config.physical_write_schema(),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
-            logical_partition_columns: table_config.partition_columns().to_vec(),
+            logical_partition_columns: table_config.logical_partition_columns().to_vec(),
             randomize_file_prefixes: props.should_randomize_file_prefixes(),
             random_prefix_length: props.random_prefix_length(),
         }))
@@ -1728,7 +1739,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use ::test_utils::get_column;
+    use ::test_utils::{copy_directory, get_column};
     use rstest::rstest;
     use url::Url;
 
@@ -1757,9 +1768,9 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::utils::test_utils::{
-        install_thread_local_metrics_reporter, load_test_table, string_array_to_engine_data,
-        test_schema_flat, test_schema_nested, test_schema_with_array, test_schema_with_map,
-        CapturingReporter,
+        create_valid_add_file_batch, install_thread_local_metrics_reporter, load_test_table,
+        string_array_to_engine_data, test_schema_flat, test_schema_nested, test_schema_with_array,
+        test_schema_with_map, CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -2665,15 +2676,28 @@ mod tests {
     // validate_blind_append tests
     // ============================================================================
     fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
-        let data = string_array_to_engine_data(StringArray::from(vec!["dummy"]));
-        txn.add_files(data);
+        let batch = create_valid_add_file_batch(false /* all_nullable */);
+        txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
+    /// Build a transaction on a writable copy of the `table-without-dv-small` fixture.
     fn create_existing_table_txn(
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction, Option<tempfile::TempDir>)> {
-        let (engine, snapshot, tempdir) = load_test_table("table-without-dv-small")?;
+        let (_, source_snapshot, _source_dir) = load_test_table("table-without-dv-small")?;
+        let source = source_snapshot
+            .table_root()
+            .to_file_path()
+            .expect("fixture is a local path");
+
+        let tempdir = tempfile::tempdir().expect("temp dir");
+        let table_path = tempdir.path().join("table-without-dv-small");
+        copy_directory(&source, &table_path).expect("copy fixture");
+
+        let url = Url::from_directory_path(&table_path).expect("table url");
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-        Ok((engine, txn, tempdir))
+        Ok((engine, txn, Some(tempdir)))
     }
 
     #[test]
