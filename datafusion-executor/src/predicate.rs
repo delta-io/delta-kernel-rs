@@ -89,9 +89,7 @@ fn kernel_in_to_expr(
 }
 
 /// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
-/// left-associative [`conjunction`]/[`disjunction`] helpers. An empty junction lowers to the
-/// operator's identity literal (`AND` of nothing is `true`, `OR` of nothing is `false`), matching
-/// how kernel normalizes empty junctions at construction.
+/// left-associative [`conjunction`]/[`disjunction`] helpers.
 fn kernel_junction_to_expr(junction: &JunctionPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
     let preds = junction
         .preds
@@ -99,6 +97,7 @@ fn kernel_junction_to_expr(junction: &JunctionPredicate, input_schema: &StructTy
         .map(|pred| kernel_predicate_to_df_expr(pred, input_schema))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(match junction.op {
+        // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics
         JunctionPredicateOp::And => conjunction(preds).unwrap_or_else(|| lit(true)),
         JunctionPredicateOp::Or => disjunction(preds).unwrap_or_else(|| lit(false)),
     })
