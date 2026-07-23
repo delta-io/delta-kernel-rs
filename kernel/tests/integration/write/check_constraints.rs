@@ -1,9 +1,11 @@
-//! Integration tests for the `checkConstraints` writer feature: discovery, acknowledgment, and
-//! the commit-time gate (in development, gated by the `check-constraints-in-dev` cargo feature).
+//! Integration tests for the `checkConstraints` writer feature (in development, gated by the
+//! `check-constraints-in-dev` cargo feature): discovery, the acknowledgment/commit gate, and
+//! connector-driven enforcement.
 //!
-//! Enforcement (running a validator over each batch) lands in later work; these tests cover the
-//! contract that guards a constrained table -- a data-adding commit must acknowledge the
-//! constraints (by calling `check_constraints()`) or fail closed.
+//! Coverage spans the contract that guards a constrained table (a data-adding commit must
+//! acknowledge by calling `check_constraints()` or fail closed), the validator a connector runs
+//! over the full logical batch before partitioning, and interactions with other table features
+//! (column mapping, partitioning).
 
 use std::sync::Arc;
 
@@ -733,6 +735,57 @@ mod enabled {
             &table_url,
             Arc::new(engine),
         )?;
+        Ok(())
+    }
+
+    // === Cross-feature coverage ===
+
+    /// A table with multiple constraints, partitioned, written across multiple partition values in
+    /// one transaction. One validator (bound once) enforces every constraint over each full batch
+    /// before it is partitioned; each partition's data-only batch is then written and the whole
+    /// write commits as one version. Exercises the realistic connector loop end to end.
+    #[tokio::test]
+    async fn multiple_constraints_across_partitions_validate_and_commit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, engine) = setup_constrained_table_partitioned(
+            "test_cc_matrix",
+            &[
+                ("positive_amount", "amount > 0"),
+                ("named_a_or_b", "name != 'c'"),
+            ],
+            &["name"],
+        )
+        .await?;
+        let mut txn = begin_txn(&table_url, &engine)?;
+
+        // Acknowledge and bind one validator for the whole write.
+        let constraints = txn.check_constraints();
+        assert!(constraints.is_kernel_parsable());
+        assert_eq!(constraints.len(), 2);
+        let validator = constraints.validator(engine.evaluation_handler().as_ref())?;
+
+        // Two partitions ("a" and "b"), each a full batch validated before partitioning. The write
+        // context takes the partition value as a Scalar and the data-only (`amount`) batch.
+        for (partition, amounts) in [("a", vec![Some(1), Some(2)]), ("b", vec![Some(3)])] {
+            let names = vec![partition; amounts.len()];
+            validator.validate(&batch(amounts.clone(), names)?)?;
+            let write_context = txn.partitioned_write_context(HashMap::from([(
+                "name".to_string(),
+                Scalar::from(partition),
+            )]))?;
+            let add_files = engine
+                .write_parquet(&amount_only_batch(amounts)?, &write_context)
+                .await?;
+            txn.add_files(add_files);
+        }
+        txn.commit(&engine)?.unwrap_committed();
+
+        // A later violating batch (name == 'c') is caught by the same validator, unaffected by the
+        // committed data.
+        let err = validator
+            .validate(&batch(vec![Some(9)], vec!["c"])?)
+            .expect_err("name 'c' must violate named_a_or_b");
+        assert_err_contains(err, "named_a_or_b");
         Ok(())
     }
 }
