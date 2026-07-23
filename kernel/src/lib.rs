@@ -684,7 +684,9 @@ pub trait JsonHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it or
+    ///   omit only rows they can determine do not satisfy it. Returned data may include rows that
+    ///   do not satisfy the predicate.
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -864,14 +866,15 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
-    ///   Implementations may apply it at any granularity, including only skipping row groups, so
-    ///   callers must tolerate rows that do not satisfy the predicate.
+    /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it or
+    ///   apply it at any granularity, but may omit only rows they can determine do not satisfy it.
+    ///   Returned data may include rows that do not satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
     /// Each element of the iterator is a [`DeltaResult`] of [`EngineData`]. The [`EngineData`]
-    /// has the contents of `files` and must match the provided `physical_schema`.
+    /// contains rows from `files` after any predicate push-down and must match the provided
+    /// `physical_schema`.
     ///
     /// Note: The [`FileDataReadResultIterator`] must emit data from files in the order that `files`
     /// is given. For example if files ["a", "b"] is provided, then the engine data iterator must

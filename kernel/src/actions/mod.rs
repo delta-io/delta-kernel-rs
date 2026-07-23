@@ -63,6 +63,23 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
+/// Returns the required leaf used to identify rows containing `action_name`.
+///
+/// Returns `None` for unknown actions and actions without a required leaf. The table covers every
+/// checkpoint-projectable action, not just those a caller projects today, so callers passing any
+/// subset of the checkpoint action schema derive a correct presence predicate.
+pub(crate) fn action_presence_leaf(action_name: &str) -> Option<&'static str> {
+    match action_name {
+        ADD_NAME | REMOVE_NAME | CDC_NAME | SIDECAR_NAME => Some("path"),
+        METADATA_NAME => Some("id"),
+        PROTOCOL_NAME => Some("minReaderVersion"),
+        SET_TRANSACTION_NAME => Some("appId"),
+        DOMAIN_METADATA_NAME => Some("domain"),
+        CHECKPOINT_METADATA_NAME => Some("version"),
+        _ => None,
+    }
+}
+
 // === Sub-fields of an AddFile's `stats` struct ===
 // See the Delta protocol spec, "Per-file Statistics", and `expected_stats_schema` in
 // `scan/data_skipping/stats_schema/mod.rs` for the full semantics.
@@ -1112,6 +1129,22 @@ mod tests {
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
+
+    #[rstest]
+    #[case::add(ADD_NAME, Some("path"))]
+    #[case::remove(REMOVE_NAME, Some("path"))]
+    #[case::metadata(METADATA_NAME, Some("id"))]
+    #[case::protocol(PROTOCOL_NAME, Some("minReaderVersion"))]
+    #[case::transaction(SET_TRANSACTION_NAME, Some("appId"))]
+    #[case::cdc(CDC_NAME, Some("path"))]
+    #[case::domain_metadata(DOMAIN_METADATA_NAME, Some("domain"))]
+    #[case::checkpoint_metadata(CHECKPOINT_METADATA_NAME, Some("version"))]
+    #[case::sidecar(SIDECAR_NAME, Some("path"))]
+    #[case::witnessless_action(COMMIT_INFO_NAME, None)]
+    #[case::unknown_action("futureAction", None)]
+    fn test_action_presence_leaf(#[case] action_name: &str, #[case] expected_leaf: Option<&str>) {
+        assert_eq!(action_presence_leaf(action_name), expected_leaf);
+    }
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);

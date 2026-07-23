@@ -10,10 +10,9 @@ use url::Url;
 use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, CDC_NAME,
-    CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, LOG_METADATA_SCHEMA,
-    MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, COMMIT_INFO_NAME,
+    LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, REMOVE_NAME,
+    SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -34,13 +33,14 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths, sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
-use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
+use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
 use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, EvaluationHandler, Expression,
+    FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate,
     PredicateRef, RowVisitor, StorageHandler,
 };
 
@@ -140,17 +140,7 @@ async fn write_parquet_to_store(
     path: String,
     data: Box<dyn EngineData>,
 ) -> DeltaResult<()> {
-    let batch = ArrowEngineData::try_from_engine_data(data)?;
-    let record_batch = batch.record_batch();
-
-    let mut buffer = vec![];
-    let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
-    writer.write(record_batch)?;
-    writer.close()?;
-
-    store.put(&Path::from(path), buffer.into()).await?;
-
-    Ok(())
+    write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
@@ -164,10 +154,8 @@ pub(crate) async fn add_checkpoint_to_store(
     write_parquet_to_store(store, path, data).await
 }
 
-/// Writes a parquet file where each batch becomes its own row group. Flushing after every batch
-/// forces a row-group boundary. All batches must share the same Arrow schema. `path` is relative
-/// to the store root (e.g. `_delta_log/..` for a checkpoint, `_delta_log/_sidecars/..` for a
-/// sidecar).
+/// Writes a Parquet file with one row group per batch. All batches must share the same Arrow
+/// schema.
 async fn write_multi_row_group_parquet_to_store(
     store: &Arc<InMemory>,
     row_groups: Vec<Box<dyn EngineData>>,
@@ -179,7 +167,7 @@ async fn write_multi_row_group_parquet_to_store(
         .collect::<DeltaResult<Vec<_>>>()?;
     let schema = batches
         .first()
-        .expect("at least one row group")
+        .ok_or_else(|| Error::internal_error("at least one row group is required"))?
         .record_batch()
         .schema();
 
@@ -193,6 +181,82 @@ async fn write_multi_row_group_parquet_to_store(
 
     store.put(&Path::from(path), buffer.into()).await?;
     Ok(())
+}
+
+/// Drains a projected checkpoint action stream, returning the total materialized row count and the
+/// sorted `add.path` of every surviving Add.
+fn collect_filtered_adds(
+    filtered: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+) -> DeltaResult<(usize, Vec<String>)> {
+    let mut rows = 0;
+    let mut add_paths: Vec<String> = Vec::new();
+    for batch in filtered {
+        let batch = batch?.actions;
+        rows += batch.len();
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(&*batch)?;
+        add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
+    }
+    add_paths.sort();
+    Ok((rows, add_paths))
+}
+
+struct IgnorePredicateParquetHandler(Arc<dyn ParquetHandler>);
+
+impl ParquetHandler for IgnorePredicateParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.0.read_parquet_files(files, physical_schema, None)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: Url,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
+        self.0.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.0.read_parquet_footer(file)
+    }
+}
+
+struct IgnorePredicateEngine {
+    inner: Arc<SyncEngine>,
+    parquet_handler: Arc<IgnorePredicateParquetHandler>,
+}
+
+impl IgnorePredicateEngine {
+    fn new(inner: Arc<SyncEngine>) -> Self {
+        let parquet_handler = Arc::new(IgnorePredicateParquetHandler(inner.parquet_handler()));
+        Self {
+            inner,
+            parquet_handler,
+        }
+    }
+}
+
+impl Engine for IgnorePredicateEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.inner.storage_handler()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet_handler.clone()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
 }
 
 /// Writes all actions to a _delta_log/_sidecars file in the store and return the [`FileMeta`].
@@ -1398,19 +1462,10 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     Ok(())
 }
 
-/// The scan's add-only checkpoint read schema derives an `add.path IS NOT NULL` meta-predicate
-/// (via `checkpoint_action_projection_predicate`), letting the parquet reader skip any checkpoint
-/// row group whose `add.path` column is entirely null -- a group holding only Remove tombstones
-/// (or other non-Add actions). A group with even one live Add has a non-null `add.path` and is kept
-/// in full, so no live Add is ever dropped.
-///
-/// Each case writes one checkpoint parquet file with one row group per supplied batch. A baseline
-/// read with no predicate materializes every row, confirming the rows physically exist -- so the
-/// smaller post-pruning row count is attributable to row-group skipping, not a missing fixture. The
-/// multi-row-group case places an all-remove group next to an all-add group to guard against a
-/// per-row-group regression that would wrongly drop the adjacent live Adds.
 #[rstest]
 #[case::all_remove_part_skipped(vec![remove_only_batch(get_commit_schema().clone()) as _], 0, &[])]
+// The single row group holds a live Add, so the whole batch is kept: all 4 rows
+// (`add_batch_with_remove` = 1 remove + 2 adds + 1 metadata) survive.
 #[case::mixed_add_remove_part_kept(
     vec![add_batch_with_remove(get_commit_schema().clone()) as _],
     4,
@@ -1431,13 +1486,20 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     ],
 )]
 #[tokio::test]
-async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
+async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     #[case] row_groups: Vec<Box<dyn EngineData>>,
     #[case] expected_rows_after_pruning: usize,
     #[case] expected_survivor_adds: &[&str],
+    #[values(false, true)] ignore_predicate: bool,
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+    let ignore_predicate_engine = IgnorePredicateEngine::new(sync_engine.clone());
+    let engine: &dyn Engine = if ignore_predicate {
+        &ignore_predicate_engine
+    } else {
+        sync_engine.as_ref()
+    };
 
     let checkpoint_name = "00000000000000000001.checkpoint.parquet";
     // Real checkpoints store removes with the full file-action schema; the add column is null.
@@ -1465,7 +1527,7 @@ async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
 
     // Baseline: with no predicate every row group is read, so all rows are materialized.
     let unfiltered = log_segment.create_checkpoint_stream(
-        &engine,
+        engine,
         CHECKPOINT_READ_SCHEMA.clone(),
         None, // meta_predicate
         None, // stats_schema
@@ -1480,12 +1542,12 @@ async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
         "without a predicate every checkpoint row is materialized"
     );
 
-    // The scan's add-only checkpoint read derives `add.path IS NOT NULL`. All-remove row groups are
-    // skipped while groups holding a live Add are kept. There are no commit files, so only
-    // surviving checkpoint rows appear.
+    // The projected checkpoint read derives `add.path IS NOT NULL`. Engines may use it to skip
+    // all-remove row groups or ignore it and return extra rows; both paths must surface the same
+    // Adds.
     let filtered = log_segment
         .read_actions_with_projected_checkpoint_actions(
-            &engine,
+            engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
             None, // meta_predicate
@@ -1494,21 +1556,14 @@ async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
         )?
         .actions;
 
-    let mut rows_after_pruning = 0;
-    let mut add_paths: Vec<String> = Vec::new();
-    for batch in filtered {
-        let batch = batch?.actions;
-        rows_after_pruning += batch.len();
-        let mut visitor = AddVisitor::default();
-        visitor.visit_rows_of(&*batch)?;
-        add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
-    }
-    assert_eq!(
-        rows_after_pruning, expected_rows_after_pruning,
-        "all-remove row groups must be skipped, so only kept groups' rows are materialized"
-    );
+    let (rows_after_pruning, add_paths) = collect_filtered_adds(filtered)?;
+    let expected_materialized_rows = if ignore_predicate {
+        total_rows
+    } else {
+        expected_rows_after_pruning
+    };
+    assert_eq!(rows_after_pruning, expected_materialized_rows);
 
-    add_paths.sort();
     let mut expected: Vec<String> = expected_survivor_adds
         .iter()
         .map(|s| s.to_string())
@@ -1516,22 +1571,29 @@ async fn test_scan_checkpoint_read_skips_all_remove_row_groups(
     expected.sort();
     assert_eq!(
         add_paths, expected,
-        "kept row groups must surface every live Add and no others"
+        "predicate handling must surface every live Add and no others"
     );
 
     Ok(())
 }
 
-/// The derived `add.path IS NOT NULL` predicate reaches a V2 checkpoint's sidecar reads, which
-/// share the add-only checkpoint schema. A sidecar row group holding only Remove tombstones has an
-/// all-null `add.path` and is skipped, while the adjacent all-add group is kept, so its live Adds
-/// still surface.
+#[rstest]
+#[case::row_group_skipping(false, 2)]
+#[case::predicate_ignored(true, 5)]
 #[tokio::test]
-async fn test_scan_checkpoint_read_skips_all_remove_sidecar_row_groups() -> DeltaResult<()> {
+async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
+    #[case] ignore_predicate: bool,
+    #[case] expected_materialized_rows: usize,
+) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+    let ignore_predicate_engine = IgnorePredicateEngine::new(sync_engine.clone());
+    let engine: &dyn Engine = if ignore_predicate {
+        &ignore_predicate_engine
+    } else {
+        sync_engine.as_ref()
+    };
 
-    // Sidecar with an all-remove row group next to an all-add group (c000, c002).
     let sidecar_name = "sidecarfile.parquet";
     write_multi_row_group_parquet_to_store(
         &store,
@@ -1568,11 +1630,11 @@ async fn test_scan_checkpoint_read_skips_all_remove_sidecar_row_groups() -> Delt
         None,
     )?;
 
-    // The main checkpoint file carries only sidecar references (null `add.path`) and is skipped;
-    // sidecar discovery reads it separately with no predicate, so the refs are still found.
+    // Sidecar discovery reads the manifest without a predicate, so pruning its null-`add.path`
+    // rows from the projected action stream cannot hide sidecar references.
     let filtered = log_segment
         .read_actions_with_projected_checkpoint_actions(
-            &engine,
+            engine,
             COMMIT_READ_SCHEMA.clone(),
             CHECKPOINT_READ_SCHEMA.clone(),
             None, // meta_predicate
@@ -1581,21 +1643,12 @@ async fn test_scan_checkpoint_read_skips_all_remove_sidecar_row_groups() -> Delt
         )?
         .actions;
 
-    let mut rows_after_pruning = 0;
-    let mut add_paths: Vec<String> = Vec::new();
-    for batch in filtered {
-        let batch = batch?.actions;
-        rows_after_pruning += batch.len();
-        let mut visitor = AddVisitor::default();
-        visitor.visit_rows_of(&*batch)?;
-        add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
-    }
+    let (rows_after_pruning, add_paths) = collect_filtered_adds(filtered)?;
     assert_eq!(
-        rows_after_pruning, 2,
-        "the all-remove sidecar row group must be skipped, leaving only the all-add group"
+        rows_after_pruning, expected_materialized_rows,
+        "materialized rows must reflect whether the engine applies the predicate"
     );
 
-    add_paths.sort();
     assert_eq!(
         add_paths,
         vec![
@@ -4485,30 +4538,6 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 
 #[rstest::rstest]
 #[case::empty_schema(StructType::new_unchecked([]), None)]
-#[case::metadata_field(
-    schema! { nullable (METADATA_NAME): {} },
-    Some(Arc::new(
-        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
-    )),
-)]
-#[case::protocol_field(
-    schema! { nullable (PROTOCOL_NAME): {} },
-    Some(Arc::new(
-        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
-    )),
-)]
-#[case::txn_field(
-    schema! { nullable (SET_TRANSACTION_NAME): {} },
-    Some(Arc::new(
-        Expression::column(ColumnName::new([SET_TRANSACTION_NAME, "appId"])).is_not_null(),
-    )),
-)]
-#[case::domain_metadata_field(
-    schema! { nullable (DOMAIN_METADATA_NAME): {} },
-    Some(Arc::new(
-        Expression::column(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])).is_not_null(),
-    )),
-)]
 #[case::add_field(
     schema! { nullable (ADD_NAME): {} },
     Some(Arc::new(
@@ -4516,27 +4545,9 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     )),
 )]
 #[case::remove_field(
-    StructType::new_unchecked([StructField::nullable(REMOVE_NAME, StructType::new_unchecked([]))]),
+    schema! { nullable (REMOVE_NAME): {} },
     Some(Arc::new(
         Expression::column(ColumnName::new([REMOVE_NAME, "path"])).is_not_null(),
-    )),
-)]
-#[case::cdc_field(
-    schema! { nullable (CDC_NAME): {} },
-    Some(Arc::new(
-        Expression::column(ColumnName::new([CDC_NAME, "path"])).is_not_null(),
-    )),
-)]
-#[case::checkpoint_metadata_field(
-    schema! { nullable (CHECKPOINT_METADATA_NAME): {} },
-    Some(Arc::new(
-        Expression::column(ColumnName::new([CHECKPOINT_METADATA_NAME, "version"])).is_not_null(),
-    )),
-)]
-#[case::sidecar_field(
-    schema! { nullable (SIDECAR_NAME): {} },
-    Some(Arc::new(
-        Expression::column(ColumnName::new([SIDECAR_NAME, "path"])).is_not_null(),
     )),
 )]
 #[case::action_without_required_leaf_returns_none(
@@ -4553,10 +4564,17 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         Expression::column(ColumnName::new([REMOVE_NAME, "path"])).is_not_null(),
     ))),
 )]
-#[case::known_and_unknown_field_returns_none(
+#[case::witness_and_witnessless_field_returns_none(
     StructType::new_unchecked([
         StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
         StructField::nullable(COMMIT_INFO_NAME, StructType::new_unchecked([])),
+    ]),
+    None,
+)]
+#[case::known_and_unknown_field_returns_none(
+    StructType::new_unchecked([
+        StructField::nullable(ADD_NAME, StructType::new_unchecked([])),
+        StructField::nullable("futureAction", StructType::new_unchecked([])),
     ]),
     None,
 )]
