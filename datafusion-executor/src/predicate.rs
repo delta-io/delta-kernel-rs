@@ -1,6 +1,7 @@
 //! Conversion from a kernel [`Predicate`] to a boolean-valued DataFusion [`Expr`].
 
 use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::utils::{conjunction, disjunction};
 use datafusion::logical_expr::{binary_expr, lit, Expr, Operator};
 use delta_kernel::expressions::{
     BinaryPredicate, BinaryPredicateOp, Expression, JunctionPredicate, JunctionPredicateOp,
@@ -87,18 +88,19 @@ fn kernel_in_to_expr(
     Ok(Expr::InList(InList::new(Box::new(value), elements, false)))
 }
 
-/// Lowers a junction (`And`/`Or`).
+/// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
+/// left-associative [`conjunction`]/[`disjunction`] helpers. An empty junction lowers to the
+/// operator's identity literal (`AND` of nothing is `true`, `OR` of nothing is `false`), matching
+/// how kernel normalizes empty junctions at construction.
 fn kernel_junction_to_expr(junction: &JunctionPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
-    let (op, identity) = match junction.op {
-        JunctionPredicateOp::And => (Operator::And, true),
-        JunctionPredicateOp::Or => (Operator::Or, false),
-    };
-    let mut preds = junction.preds.iter();
-    let Some(first) = preds.next() else {
-        return Ok(lit(identity));
-    };
-    preds.try_fold(kernel_predicate_to_df_expr(first, input_schema)?, |acc, next| {
-        Ok(binary_expr(acc, op, kernel_predicate_to_df_expr(next, input_schema)?))
+    let preds = junction
+        .preds
+        .iter()
+        .map(|pred| kernel_predicate_to_df_expr(pred, input_schema))
+        .collect::<DeltaResult<Vec<_>>>()?;
+    Ok(match junction.op {
+        JunctionPredicateOp::And => conjunction(preds).unwrap_or_else(|| lit(true)),
+        JunctionPredicateOp::Or => disjunction(preds).unwrap_or_else(|| lit(false)),
     })
 }
 
