@@ -686,7 +686,10 @@ pub trait JsonHandler: AsAny {
     /// - `physical_schema` - Select list of columns to read from the JSON file.
     /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. If
     ///   applied, a row may be omitted only when the predicate evaluates to false or null for that
-    ///   row. Returned data is not guaranteed to satisfy the predicate.
+    ///   row. Unsupported subexpressions and references with no matching physical or generated
+    ///   value must remain unknown and must not fail the read. A missing reference remains unknown
+    ///   for pruning even if schema reconciliation synthesizes a NULL output column. Returned data
+    ///   is not guaranteed to satisfy the predicate.
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -868,7 +871,10 @@ pub trait ParquetHandler: AsAny {
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
     /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. A
     ///   file, row group, or row may be omitted only when the predicate cannot evaluate to true for
-    ///   any row in that unit. Returned data is not guaranteed to satisfy the predicate.
+    ///   any row in that unit. Unsupported subexpressions and references with no matching physical
+    ///   or generated value must remain unknown and must not fail the read. A missing reference
+    ///   remains unknown for pruning even if schema reconciliation synthesizes a NULL output column.
+    ///   Returned data is not guaranteed to satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].

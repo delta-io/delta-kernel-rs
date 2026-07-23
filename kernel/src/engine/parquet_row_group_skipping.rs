@@ -33,9 +33,9 @@ pub(crate) trait ParquetRowGroupSkipping {
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
 
-    /// Like [`with_row_group_filter`](Self::with_row_group_filter), but for checkpoint and sidecar
-    /// parquet files where statistics are nested under `add.stats_parsed.*` and partition values
-    /// under `add.partitionValues_parsed.*`.
+    /// Filters checkpoint and sidecar row groups based on matching Add actions. Callers that need
+    /// non-Add actions must protect those rows separately. Statistics are nested under
+    /// `add.stats_parsed.*`, with partition values under `add.partitionValues_parsed.*`.
     ///
     /// The `predicate` uses physical column names (e.g. `x > 10`, or `col-abc-123 > 10` under
     /// column mapping), and the filter internally maps them to the checkpoint's nested stats
@@ -321,9 +321,11 @@ struct StatsColumnIndices {
 /// returns `None` for any stat whose column contains null values in the row group (checked via
 /// the column's own null count in the parquet footer).
 ///
-/// Partition columns are handled separately: their footer min/max of
-/// `add.partitionValues_parsed.<col>` can be used directly without null guarding, because parquet
-/// footer stats ignore null values (which may appear for non-add action rows).
+/// Partition columns read their footer min/max of `add.partitionValues_parsed.<col>` directly,
+/// without a null guard. Footer min/max ignore nulls, so a non-matching comparison may prune a row
+/// group containing a null partition leaf. This is sound for scan checkpoint reads because non-Add
+/// rows do not participate in replay and an Add with a null partition value cannot match the
+/// comparison.
 #[allow(dead_code)]
 pub(crate) struct CheckpointRowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,

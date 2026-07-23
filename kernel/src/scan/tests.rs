@@ -21,7 +21,7 @@ use crate::expressions::{
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_meta_predicate};
+use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
     self, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
@@ -1167,10 +1167,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     );
 }
 
-// A partition-only predicate must still produce a checkpoint meta-predicate that references
-// `add.partitionValues_parsed.<col>`, so partition values can drive checkpoint row-group skipping.
-// Regression: a partition-only predicate has no `stats_parsed` schema (partitions have no data
-// stats), so the meta-predicate must not be gated off just because data stats are absent.
+// Partition-only scans have no stats schema, so the partition schema must enable the rewrite.
 #[test]
 fn test_build_actions_meta_predicate_partition_only() {
     // `app-txn-checkpoint` is partitioned by `modified` (string), no column mapping.
@@ -1207,11 +1204,9 @@ fn test_build_actions_meta_predicate_partition_only() {
     );
 }
 
-// Under column mapping (both name and id modes), the checkpoint meta-predicate must reference the
-// PHYSICAL partition column name (partitionValues_parsed is keyed by physical name in the
-// checkpoint), not the logical name. Regression: partition detection used logical
-// `metadata().partition_columns()` against a physical predicate, so it never matched under column
-// mapping and partition skipping silently disabled.
+// Under column mapping, `partitionValues_parsed` is keyed by the physical partition name, so the
+// checkpoint meta-predicate must reference that physical name (not the logical one) in both name
+// and id mapping modes.
 #[rstest]
 #[case::name_mode("name")]
 #[case::id_mode("id")]
@@ -1363,7 +1358,16 @@ impl CheckpointParquetBuilder {
 
 /// Builds a checkpoint meta-predicate scoped under `add`, mirroring `build_actions_meta_predicate`.
 fn build_checkpoint_meta_predicate(pred: &Pred) -> Option<Pred> {
-    as_checkpoint_meta_predicate(pred, &HashSet::new(), &all_referenced_columns(pred))
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        pred,
+        &HashSet::new(),
+        &HashSet::new(),
+        &all_referenced_columns(pred),
+    )?;
+    let mut prefixer = PrefixColumns {
+        prefix: ColumnName::new(["add"]),
+    };
+    Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }
 
 /// Applies a meta predicate as a row group filter and returns the total rows read.

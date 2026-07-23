@@ -494,46 +494,26 @@ fn test_checkpoint_skipping_semantic(
 ) {
     let pred = Pred::gt(column_expr!("x"), Scalar::from(100));
     let stats = all_referenced_columns(&pred);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
     let resolver = HashMap::from_iter([(column_name!("stats_parsed.maxValues.x"), max_val)]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
 }
 
-// A partition-only equality resolves against the exact `partitionValues_parsed` value: a matching
-// value keeps the row group, an out-of-range value prunes it.
-#[rstest]
-#[case::below("A", FALSE, "part='A', pred part='B' -> skip")]
-#[case::match_("B", TRUE, "part='B', pred part='B' -> keep")]
-#[case::above("C", FALSE, "part='C', pred part='B' -> skip")]
-fn test_checkpoint_skipping_partition_column(
-    #[case] part_val: &str,
-    #[case] expected: Option<bool>,
-    #[case] description: &str,
-) {
-    let partition_columns = HashSet::from([column_name!("part_col")]);
-    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("B"));
-    // Partition columns are not part of the stats-columns set.
-    let stats = HashSet::new();
-    let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
-    let resolver = HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        Scalar::from(part_val),
-    )]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
-}
-
-// The IS NULL guard on a partition comparison keeps a row group whose partition value is null (a
-// non-Add row such as a Remove). Without the guard, `part_col = 'B'` would resolve to FALSE against
-// a null value and wrongly prune the row group, dropping the tombstone from log replay.
+// Partition comparisons are not null-guarded. A checkpoint Remove has a null add-side partition
+// value but does not participate in scan replay, so the parquet filter may discard it.
 #[test]
-fn test_checkpoint_skipping_partition_null_value_kept() {
+fn test_checkpoint_skipping_partition_null_value_is_unguarded() {
     let partition_columns = HashSet::from([column_name!("part_col")]);
     let pred = Pred::eq(column_expr!("part_col"), Scalar::from("B"));
-    let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new()).unwrap();
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
     let resolver = HashMap::from_iter([(
         column_name!("partitionValues_parsed.part_col"),
         Scalar::Null(DataType::STRING),
@@ -541,20 +521,19 @@ fn test_checkpoint_skipping_partition_null_value_kept() {
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
         filter.eval(&skipping_pred),
-        TRUE,
-        "null partition value (non-Add row) must be kept by the IS NULL guard"
+        NULL,
+        "null partition values should not be converted to TRUE by a guard"
     );
 }
 
-// Checkpoint partition skipping across comparison operators, modeling a row group whose add files
-// all share one partition value (min == max -- the canonical partition case). The rewrite reads
-// `partitionValues_parsed.part_col` as both min and max, so a single resolved value drives an exact
-// verdict. (Range footers where min != max are exercised by the real-parquet
-// CheckpointRowGroupFilter tests and the e2e integration tests.) Skip (FALSE) exactly when the
-// value cannot match.
+// Checkpoint partition skipping across comparison operators. Each case resolves one exact per-file
+// partition value from `partitionValues_parsed.part_col`, which serves as both min and max. The
+// rewritten comparison returns FALSE exactly when that value cannot satisfy the original predicate.
 #[rstest]
-#[case::eq_miss(Pred::eq(column_expr!("part_col"), Scalar::from("m")), "b", FALSE)]
+// Value fixed at "b"; the literal sits below, on, or above it.
+#[case::eq_lit_above(Pred::eq(column_expr!("part_col"), Scalar::from("m")), "b", FALSE)]
 #[case::eq_hit(Pred::eq(column_expr!("part_col"), Scalar::from("b")), "b", TRUE)]
+#[case::eq_lit_below(Pred::eq(column_expr!("part_col"), Scalar::from("a")), "b", FALSE)]
 #[case::neq_miss(Pred::ne(column_expr!("part_col"), Scalar::from("b")), "b", FALSE)]
 #[case::neq_hit(Pred::ne(column_expr!("part_col"), Scalar::from("m")), "b", TRUE)]
 #[case::lt_miss(Pred::lt(column_expr!("part_col"), Scalar::from("a")), "b", FALSE)]
@@ -571,7 +550,8 @@ fn test_checkpoint_skipping_partition_range_ops(
     let partition_columns = HashSet::from([column_name!("part_col")]);
     let stats = HashSet::new();
     let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new(), &stats)
+            .unwrap();
     let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
         column_name!("partitionValues_parsed.part_col"),
         Scalar::from(value),
@@ -583,14 +563,45 @@ fn test_checkpoint_skipping_partition_range_ops(
     );
 }
 
+#[rstest]
+#[case::float(Scalar::Float(1.0))]
+#[case::double(Scalar::Double(1.0))]
+#[case::integer_literal(Scalar::from(1))]
+fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] value: Scalar) {
+    let partition_columns = HashSet::from([column_name!("part_col")]);
+    let pred = Pred::ne(column_expr!("part_col"), value.clone());
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &partition_columns,
+        &HashSet::new(),
+    )
+    .unwrap();
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        value,
+    )]));
+
+    expect_eq!(
+        resolver.eval(&skipping_pred),
+        NULL,
+        "parquet footer min/max exclude NaN partition values"
+    );
+}
+
 // Partition `IS NULL` reads `partitionValues_parsed.part_col IS NULL` directly: a row group with no
 // null partition value holds only Add rows with real values, so a non-null value prunes it (FALSE).
 #[test]
 fn test_checkpoint_skipping_partition_is_null() {
     let partition_columns = HashSet::from([column_name!("part_col")]);
     let pred = Pred::is_null(column_expr!("part_col"));
-    let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new()).unwrap();
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
     let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
         column_name!("partitionValues_parsed.part_col"),
         Scalar::from("x"),
@@ -598,16 +609,29 @@ fn test_checkpoint_skipping_partition_is_null() {
     expect_eq!(resolver.eval(&skipping_pred), FALSE, "{pred:?}");
 }
 
-// Partition `IS NOT NULL` can't prune: a non-Add row also has a null partition value, so proving
-// the value is non-null would drop those rows. It produces no skipping predicate (#1873).
-#[test]
-fn test_checkpoint_skipping_partition_is_not_null_never_prunes() {
+// Partition `IS NOT NULL` checks the exact partition value and may discard checkpoint Removes,
+// whose add-side partition value is null and which do not participate in scan replay.
+#[rstest]
+#[case::null(Scalar::Null(DataType::STRING), FALSE)]
+#[case::non_null(Scalar::from("x"), TRUE)]
+fn test_checkpoint_skipping_partition_is_not_null(
+    #[case] value: Scalar,
+    #[case] expected: Option<bool>,
+) {
     let partition_columns = HashSet::from([column_name!("part_col")]);
-    let pred = Pred::not(Pred::is_null(column_expr!("part_col")));
-    assert!(
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new()).is_none(),
-        "partition IS NOT NULL must not produce a skipping predicate"
-    );
+    let pred = Pred::is_not_null(column_expr!("part_col"));
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        value,
+    )]));
+    expect_eq!(resolver.eval(&skipping_pred), expected, "{pred:?}");
 }
 
 // When the checkpoint lacks `partitionValues_parsed` (older writer), the meta-predicate still
@@ -621,9 +645,11 @@ fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
         Pred::eq(column_expr!("part_col"), Scalar::from("B")),
         Pred::lt(column_expr!("part_col"), Scalar::from("B")),
         Pred::is_null(column_expr!("part_col")),
+        Pred::is_not_null(column_expr!("part_col")),
     ] {
         let skipping_pred =
-            as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
+            as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new(), &stats)
+                .unwrap();
         let filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
         expect_eq!(
             filter.eval(&skipping_pred),
@@ -633,19 +659,18 @@ fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
     }
 }
 
-// Mixed partition + data predicates. Each arm prunes independently against its own stats
-// (`partitionValues_parsed.part_col` = "b", footer range ['a','c'];
-// `stats_parsed.maxValues.data_col`). AND skips when EITHER arm proves no match; OR skips only when
-// BOTH prove no match.
+// Mixed partition + data predicates. Each arm prunes independently against its own stat: the exact
+// `partitionValues_parsed.part_col` value and the `stats_parsed.maxValues.data_col` range. AND
+// skips when EITHER arm proves no match; OR skips only when BOTH prove no match.
 #[rstest]
 // part_col = 'b' AND data_col > 100
-#[case::and_partition_prunes(true, "z", 500, FALSE)] // partition out of range -> skip
-#[case::and_data_prunes(true, "b", 40, FALSE)] // data max below threshold -> skip
-#[case::and_both_keep(true, "b", 500, TRUE)] // both match -> keep
+#[case::and_partition_prunes(true, "z", 500, FALSE)]
+#[case::and_data_prunes(true, "b", 40, FALSE)]
+#[case::and_both_keep(true, "b", 500, TRUE)]
 // part_col = 'b' OR data_col > 100
-#[case::or_both_miss(false, "z", 40, FALSE)] // both miss -> skip
-#[case::or_partition_keeps(false, "b", 40, TRUE)] // partition matches -> keep
-#[case::or_data_keeps(false, "z", 500, TRUE)] // data matches -> keep
+#[case::or_both_miss(false, "z", 40, FALSE)]
+#[case::or_partition_keeps(false, "b", 40, TRUE)]
+#[case::or_data_keeps(false, "z", 500, TRUE)]
 fn test_checkpoint_skipping_mixed_partition_and_data(
     #[case] is_and: bool,
     #[case] part_val: &str,
@@ -662,7 +687,8 @@ fn test_checkpoint_skipping_mixed_partition_and_data(
         Pred::or(part, data)
     };
     let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new(), &stats)
+            .unwrap();
     let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([
         (
             column_name!("partitionValues_parsed.part_col"),
@@ -677,19 +703,19 @@ fn test_checkpoint_skipping_mixed_partition_and_data(
 }
 
 // Partition timestamp columns are exact (never truncated), so unlike data-column timestamps they
-// get NO 999us max-stat adjustment. `part_ts > T` compares against the exact value T (not T-999),
-// under the IS NULL guard that keeps non-Add rows.
+// get NO 999us max-stat adjustment. `part_ts > T` compares against the exact value T (not T-999)
+// without a null guard.
 #[test]
 fn test_checkpoint_skipping_partition_timestamp_no_truncation_adjustment() {
     let partition_columns = HashSet::from([column_name!("part_ts")]);
     let stats = HashSet::new();
     let pred = Pred::gt(column_expr!("part_ts"), Scalar::Timestamp(1_000_000));
     let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
+        as_checkpoint_skipping_predicate(&pred, &partition_columns, &HashSet::new(), &stats)
+            .unwrap();
     assert_eq!(
         skipping_pred.to_string(),
-        "OR(Column(partitionValues_parsed.part_ts) IS NULL, \
-         Column(partitionValues_parsed.part_ts) > 1000000)",
+        "Column(partitionValues_parsed.part_ts) > 1000000",
         "partition timestamp must not get the 999us data-column truncation adjustment"
     );
 }
@@ -706,7 +732,8 @@ fn test_checkpoint_skipping_null_guard_vs_regular() {
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
 
     let stats = all_referenced_columns(&pred);
-    let guarded = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    let guarded =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
     expect_eq!(
         filter.eval(&guarded),
         TRUE,
@@ -737,7 +764,8 @@ fn test_checkpoint_skipping_conjunction_partial_null_stats() {
         Pred::lt(column_expr!("col_b"), Scalar::from(50)),
     );
     let stats = all_referenced_columns(&pred);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
 
     // Both stats present and both allow pruning -> skip
     let resolver = HashMap::from_iter([
@@ -805,7 +833,8 @@ fn test_checkpoint_skipping_timestamp_adjustment(
     // GT: should produce OR(maxValues.ts_col IS NULL, maxValues.ts_col > 999001)
     let pred = Pred::gt(col.clone(), timestamp.clone());
     let stats = all_referenced_columns(&pred);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
     assert_eq!(
         skipping_pred.to_string(),
         "OR(Column(stats_parsed.maxValues.ts_col) IS NULL, \
@@ -815,7 +844,8 @@ fn test_checkpoint_skipping_timestamp_adjustment(
     // EQ: max stat leg should use adjusted literal
     let pred = Pred::eq(col.clone(), timestamp.clone());
     let stats = all_referenced_columns(&pred);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
     assert_eq!(
         skipping_pred.to_string(),
         "AND(OR(Column(stats_parsed.minValues.ts_col) IS NULL, \
@@ -1356,7 +1386,8 @@ fn multiple_partition_columns_rewrite_and_evaluation() {
 fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
     let pred = Pred::and_from([Pred::unknown("unsupported")]);
     let stats = all_referenced_columns(&pred);
-    let skipping_pred = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats);
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats);
     assert!(
         skipping_pred.is_none(),
         "Single unsupported predicate in a junction should disable pushdown, got: {skipping_pred:?}"
@@ -1757,21 +1788,11 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
         Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
     );
     let stats = stats_cols(&["stat"]);
-    let result = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
+    let result =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
     assert_eq!(
         result.to_string(),
         "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, \
          Column(stats_parsed.maxValues.stat) > 100), null)"
     );
-}
-
-#[test]
-fn prefix_columns_scopes_reference_under_root() {
-    let mut prefixer = PrefixColumns::new(column_name!("add", "stats_parsed"));
-    let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).into_owned();
-
-    let refs: Vec<_> = result.references().into_iter().collect();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
 }

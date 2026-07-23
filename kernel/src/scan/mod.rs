@@ -10,7 +10,7 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
-use self::data_skipping::as_checkpoint_meta_predicate;
+use self::data_skipping::as_checkpoint_skipping_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -536,6 +536,21 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
+/// Prefixes all column references in a predicate with a fixed path. The checkpoint path prefixes
+/// stat expressions that already carry their `stats_parsed.*` root (e.g. `stats_parsed.minValues.x
+/// > 100`) with `add`, yielding `add.stats_parsed.minValues.x > 100`.
+struct PrefixColumns {
+    prefix: ColumnName,
+}
+
+impl<'a> ExpressionTransform<'a> for PrefixColumns {
+    transform_output_type!(|'a, T| Cow<'a, T>);
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
+        Cow::Owned(self.prefix.join(name))
+    }
+}
+
 struct ApplyColumnMappings {
     column_mappings: HashMap<ColumnName, ColumnName>,
 }
@@ -984,12 +999,14 @@ impl Scan {
     /// data-column references become `add.stats_parsed.{minValues,maxValues,nullCount}.<col>` and
     /// partition references become `add.partitionValues_parsed.<col>`, so the parquet reader's row
     /// group filter can use footer statistics to skip row groups that cannot contain matching
-    /// files. See [`as_checkpoint_meta_predicate`] for the rewrite and its IS NULL guards.
+    /// files. See [`as_checkpoint_skipping_predicate`] for the rewrite and its data-stat IS NULL
+    /// guards.
     ///
     /// Returns `None` if the scan has no predicate, if neither a data-column stats schema nor a
     /// partition schema is available, or if the predicate is a bare unsupported expression (e.g.
-    /// column-column comparison). Junctions with unsupported arms replace them with a NULL literal
-    /// to conservatively prevent pruning.
+    /// column-column comparison). Junctions represent unsupported arms with a NULL literal,
+    /// preserving three-valued logic while allowing independently decisive supported arms to
+    /// prune.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
@@ -1006,18 +1023,29 @@ impl Scan {
         // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
         // the predicate also references physical columns, so partition detection reads the physical
         // partition schema rather than the logical names in table metadata.
-        let partition_columns: HashSet<ColumnName> = self
-            .state_info
-            .physical_partition_schema
-            .as_ref()
-            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
-            .unwrap_or_default();
-        let meta_predicate = as_checkpoint_meta_predicate(
+        let mut partition_columns = HashSet::new();
+        let mut floating_partition_columns = HashSet::new();
+        if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
+            for field in schema.fields() {
+                let column = ColumnName::new([field.name()]);
+                if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
+                    floating_partition_columns.insert(column.clone());
+                }
+                partition_columns.insert(column);
+            }
+        }
+        let skipping_pred = as_checkpoint_skipping_predicate(
             predicate,
             &partition_columns,
+            &floating_partition_columns,
             &self.state_info.physical_stats_columns,
         )?;
-        Some(Arc::new(meta_predicate))
+
+        let mut prefixer = PrefixColumns {
+            prefix: ColumnName::new(["add"]),
+        };
+        let prefixed = prefixer.transform_pred(&skipping_pred);
+        Some(Arc::new(prefixed.into_owned()))
     }
 
     /// Start a parallel scan metadata processing for the table.
