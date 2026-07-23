@@ -725,8 +725,11 @@ pub(crate) struct CommitInfo {
     /// An arbitrary string that identifies the operation associated with this commit. This is
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
     pub(crate) operation: Option<String>,
-    /// Map of arbitrary string key-value pairs that provide additional information about the
-    /// operation. This is specified by the engine. For now this is always empty on write.
+    /// Map of arbitrary key-value pairs that provide additional information about the operation.
+    /// The Delta protocol specifies commitInfo as "any valid JSON-formatted data", so values
+    /// may include nulls and non-string primitives. Null values are dropped from the map
+    /// during materialization; non-string primitives are coerced to strings by the JSON reader.
+    #[allow_null_container_values]
     pub(crate) operation_parameters: Option<HashMap<String, String>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
