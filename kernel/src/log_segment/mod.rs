@@ -10,12 +10,11 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    schema_contains_file_actions, Sidecar, ADD_NAME, CDC_NAME, CHECKPOINT_METADATA_NAME,
-    DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, PROTOCOL_NAME,
-    REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, MAX_VALUES,
+    MIN_VALUES, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -121,30 +120,16 @@ pub(crate) struct LogSegment {
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
-/// Returns a required leaf whose non-nullness identifies a row containing `action_name`.
-///
-/// Actions without a required leaf cannot provide a reliable presence witness. For example, every
-/// `commitInfo` leaf is optional, so a valid action could have no non-null leaf.
+/// Returns the column whose non-nullness identifies a row containing `action_name`.
 fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
-    match action_name {
-        ADD_NAME => Some(column_name!(ADD_NAME, "path")),
-        REMOVE_NAME => Some(column_name!(REMOVE_NAME, "path")),
-        METADATA_NAME => Some(column_name!(METADATA_NAME, "id")),
-        PROTOCOL_NAME => Some(column_name!(PROTOCOL_NAME, "minReaderVersion")),
-        SET_TRANSACTION_NAME => Some(column_name!(SET_TRANSACTION_NAME, "appId")),
-        CDC_NAME => Some(column_name!(CDC_NAME, "path")),
-        DOMAIN_METADATA_NAME => Some(column_name!(DOMAIN_METADATA_NAME, "domain")),
-        CHECKPOINT_METADATA_NAME => Some(column_name!(CHECKPOINT_METADATA_NAME, "version")),
-        SIDECAR_NAME => Some(column_name!(SIDECAR_NAME, "path")),
-        _ => None,
-    }
+    action_presence_leaf(action_name).map(|leaf| ColumnName::new([action_name, leaf]))
 }
 
 /// Builds a checkpoint row-group predicate that retains every action requested by `schema`.
 ///
 /// Each requested action contributes an `IS NOT NULL` presence witness, and the witnesses are
-/// joined with `OR`. Returns `None` if any field lacks a reliable witness because such an action
-/// could occupy a row group that the resulting predicate would otherwise skip.
+/// joined with `OR`. Returns `None` if the schema is empty, or if any field lacks a reliable
+/// witness (an action that could occupy a row group the resulting predicate would otherwise skip).
 fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<PredicateRef> {
     let columns: Vec<ColumnName> = schema
         .fields()
@@ -702,6 +687,8 @@ impl LogSegment {
     /// files. It is _NOT_ the query's data predicate, but a hint for skipping irrelevant data.
     /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
     /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
+    /// The combined predicate is only a skipping hint: the reader may return rows that do not
+    /// satisfy it, so downstream log replay must tolerate them.
     #[internal_api]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
@@ -717,9 +704,9 @@ impl LogSegment {
         // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
         // checkpoint parquet row groups without any relevant action type can be skipped.
         // TODO: The semantics of `meta_predicate` will change in a follow-up PR.
-        let is_not_null_pred = checkpoint_action_projection_predicate(&checkpoint_read_schema);
-        let effective_predicate = match (is_not_null_pred, meta_predicate) {
-            (None, x) | (x, None) => x,
+        let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
+        let checkpoint_predicate = match (projection_predicate, meta_predicate) {
+            (None, predicate) | (predicate, None) => predicate,
             (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
         };
 
@@ -730,7 +717,7 @@ impl LogSegment {
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            effective_predicate,
+            checkpoint_predicate,
             stats_schema,
             partition_schema,
         )?;

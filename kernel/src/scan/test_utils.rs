@@ -20,8 +20,8 @@ use crate::table_features::ColumnMappingMode;
 use crate::utils::test_utils::string_array_to_engine_data;
 use crate::JsonHandler;
 
-// Parses JSON action strings into a batch with the given schema. The schema is provided as null
-// columns affect equality checks.
+// Parses JSON action strings into a batch using the given schema (null columns affect equality
+// checks).
 fn parse_batch(json: &[&str], output_schema: SchemaRef) -> Box<ArrowEngineData> {
     let handler = SyncJsonHandler::new(None);
     let json_strings: StringArray = json.to_vec().into();
@@ -111,9 +111,7 @@ pub(crate) fn remove_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData
     )
 }
 
-// A batch of two Add actions (no other action types), parsed with the schema provided. Every row
-// has a non-null `add.path`, so this builds an all-add row group that survives an
-// `add.path IS NOT NULL` filter.
+// A batch of two Add actions (no other action types), parsed with the schema provided.
 pub(crate) fn adds_only_batch(output_schema: SchemaRef) -> Box<ArrowEngineData> {
     parse_batch(
         &[
