@@ -67,6 +67,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    /// An error involving the maximum catalog-ratified version when building a snapshot.
+    #[error("Max catalog version error: {0}")]
+    MaxCatalogVersion(String),
+
     /// Some kind of [`std::io::Error`]
     #[error(transparent)]
     IOError(std::io::Error),
