@@ -929,14 +929,12 @@ mod scan_builder_tests {
 
     use std::ffi::c_void;
 
-    use rstest::rstest;
     use test_utils::{actions_to_string, TestAction};
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
-        scan_builder_with_partition_values, scan_builder_with_predicate, scan_builder_with_schema,
-        scan_builder_with_stats, scan_logical_schema, EnginePredicate, EngineSchema,
-        FfiPartitionValuesOptions, FfiStatsOptions,
+        scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
+        EnginePredicate, EngineSchema,
     };
     use crate::error::KernelError;
     use crate::expressions::kernel_visitor::{
@@ -1192,46 +1190,6 @@ mod scan_builder_tests {
         unsafe { free_engine(engine) };
     }
 
-    #[rstest]
-    #[case::json_only(FfiStatsOptions::JsonOnly)]
-    #[case::all_struct(FfiStatsOptions::AllStruct)]
-    #[case::all(FfiStatsOptions::All)]
-    #[case::none(FfiStatsOptions::None)]
-    #[tokio::test]
-    async fn test_scan_builder_accepts_stats_options(#[case] options: FfiStatsOptions) {
-        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
-            .await
-            .unwrap();
-
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        let builder = unsafe { scan_builder_with_stats(builder, options) };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-
-        unsafe { free_scan(scan) };
-        unsafe { free_snapshot(snapshot) };
-        unsafe { free_engine(engine) };
-    }
-
-    #[rstest]
-    #[case::string_map_only(FfiPartitionValuesOptions::StringMapOnly)]
-    #[case::with_struct(FfiPartitionValuesOptions::WithStruct)]
-    #[tokio::test]
-    async fn test_scan_builder_accepts_partition_values_options(
-        #[case] options: FfiPartitionValuesOptions,
-    ) {
-        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
-            .await
-            .unwrap();
-
-        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        let builder = unsafe { scan_builder_with_partition_values(builder, options) };
-        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
-
-        unsafe { free_scan(scan) };
-        unsafe { free_snapshot(snapshot) };
-        unsafe { free_engine(engine) };
-    }
-
     #[tokio::test]
     async fn test_free_scan_builder_without_build() {
         let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
@@ -1253,6 +1211,7 @@ mod scan_metadata_arrow_tests {
     use delta_kernel::arrow::array::{
         Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
     };
+    use rstest::rstest;
     use test_utils::{actions_to_string, TestAction};
 
     use super::{
@@ -1383,8 +1342,17 @@ mod scan_metadata_arrow_tests {
         }
     }
 
+    #[rstest]
+    #[case::json_only(FfiStatsOptions::JsonOnly, false, true)]
+    #[case::all_struct(FfiStatsOptions::AllStruct, true, true)]
+    #[case::all(FfiStatsOptions::All, true, true)]
+    #[case::none(FfiStatsOptions::None, false, false)]
     #[tokio::test]
-    async fn all_struct_stats_adds_parsed_stats_to_arrow_metadata() {
+    async fn stats_options_control_arrow_metadata(
+        #[case] options: FfiStatsOptions,
+        #[case] expect_parsed: bool,
+        #[case] expect_json: bool,
+    ) {
         let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
             TestAction::Metadata,
             TestAction::Add("file1.parquet".into()),
@@ -1392,7 +1360,7 @@ mod scan_metadata_arrow_tests {
         .await
         .unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        let builder = unsafe { scan_builder_with_stats(builder, FfiStatsOptions::AllStruct) };
+        let builder = unsafe { scan_builder_with_stats(builder, options) };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         let iter = unsafe {
             ok_or_panic(scan_metadata_iter_init(
@@ -1405,48 +1373,66 @@ mod scan_metadata_arrow_tests {
         assert!(!ptr.is_null());
         let (batch, selection_vector, _transforms) = unsafe { import_arrow_result(ptr) };
         let row = only_selected_row(&selection_vector);
-        let stats = batch
-            .column_by_name("stats_parsed")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(!stats.is_null(row));
 
-        let num_records = stats
-            .column_by_name("numRecords")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let min_values = stats
-            .column_by_name("minValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        let max_values = stats
-            .column_by_name("maxValues")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        let min_id = min_values
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let max_id = max_values
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
+        // Verify schema columns match SCAN_ROW_SCHEMA.
+        let schema = batch.schema();
+        assert!(schema.field_with_name("stats").is_ok());
+        assert_eq!(
+            schema.field_with_name("stats_parsed").is_ok(),
+            expect_parsed
+        );
 
-        assert_eq!(num_records.value(row), 2);
-        assert_eq!(min_id.value(row), 1);
-        assert_eq!(max_id.value(row), 3);
+        // Verify stats JSON is present if requested.
+        let stats_json = batch
+            .column_by_name("stats")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(!stats_json.is_null(row), expect_json);
+
+        // Verify stats_parsed is present if requested.
+        let stats = batch.column_by_name("stats_parsed");
+        assert_eq!(stats.is_some(), expect_parsed);
+        if let Some(stats) = stats {
+            let stats = stats.as_any().downcast_ref::<StructArray>().unwrap();
+            assert!(!stats.is_null(row));
+
+            let num_records = stats
+                .column_by_name("numRecords")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let min_values = stats
+                .column_by_name("minValues")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let max_values = stats
+                .column_by_name("maxValues")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let min_id = min_values
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let max_id = max_values
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+
+            assert_eq!(num_records.value(row), 2);
+            assert_eq!(min_id.value(row), 1);
+            assert_eq!(max_id.value(row), 3);
+        }
 
         unsafe {
             free_scan_metadata_iter(iter);
@@ -1456,8 +1442,14 @@ mod scan_metadata_arrow_tests {
         }
     }
 
+    #[rstest]
+    #[case::string_map_only(FfiPartitionValuesOptions::StringMapOnly, false)]
+    #[case::with_struct(FfiPartitionValuesOptions::WithStruct, true)]
     #[tokio::test]
-    async fn struct_partition_values_adds_parsed_partition_values_to_arrow_metadata() {
+    async fn partition_values_options_control_arrow_metadata(
+        #[case] options: FfiPartitionValuesOptions,
+        #[case] expect_parsed: bool,
+    ) {
         let actions = format!(
             "{}\n{}",
             test_utils::METADATA_WITH_PARTITION_COLS,
@@ -1465,9 +1457,7 @@ mod scan_metadata_arrow_tests {
         );
         let (engine, snapshot) = setup_snapshot(actions).await.unwrap();
         let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
-        let builder = unsafe {
-            scan_builder_with_partition_values(builder, FfiPartitionValuesOptions::WithStruct)
-        };
+        let builder = unsafe { scan_builder_with_partition_values(builder, options) };
         let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
         let iter = unsafe {
             ok_or_panic(scan_metadata_iter_init(
@@ -1480,20 +1470,32 @@ mod scan_metadata_arrow_tests {
         assert!(!ptr.is_null());
         let (batch, selection_vector, _transforms) = unsafe { import_arrow_result(ptr) };
         let row = only_selected_row(&selection_vector);
-        let partition_values = batch
-            .column_by_name("partitionValues_parsed")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(!partition_values.is_null(row));
-        let val = partition_values
-            .column_by_name("val")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(val.value(row), "a");
+
+        // Verify schema columns match SCAN_ROW_SCHEMA.
+        let schema = batch.schema();
+        assert!(schema.field_with_name("fileConstantValues").is_ok());
+        assert_eq!(
+            schema.field_with_name("partitionValues_parsed").is_ok(),
+            expect_parsed
+        );
+
+        // Verify partitionValues_parsed is present if requested.
+        let partition_values = batch.column_by_name("partitionValues_parsed");
+        assert_eq!(partition_values.is_some(), expect_parsed);
+        if let Some(partition_values) = partition_values {
+            let partition_values = partition_values
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert!(!partition_values.is_null(row));
+            let val = partition_values
+                .column_by_name("val")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(val.value(row), "a");
+        }
 
         unsafe {
             free_scan_metadata_iter(iter);
