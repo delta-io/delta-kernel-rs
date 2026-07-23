@@ -261,6 +261,54 @@ fn reparsed_add_field(
     Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
 }
 
+/// Build the normalized commit JSON arm.
+fn json_arm(
+    commit_files: Vec<ScanFile>,
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+) -> DeltaResult<PlanBuilder> {
+    // SQL equivalent:
+    //
+    // SELECT STRUCT(
+    //          add.* EXCEPT (stats, partitionValues),
+    //          FROM_JSON(add.stats, stats_schema) AS stats,
+    //          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
+    //        ) AS add,
+    //        remove, version, add.path IS NOT NULL AS is_add,
+    //        file_key(COALESCE(add, remove)) AS key
+    // FROM json_commits
+    // WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
+    PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
+        .filter(Predicate::or(
+            col!("add.path").is_not_null(),
+            col!("remove.path").is_not_null(),
+        ))?
+        .project_patch(|patch| {
+            // Commits never carry source-native parsed columns, so normalize from the raw
+            // encodings.
+            patch
+                .reparse_add(
+                    stats_schema,
+                    partition_schema,
+                    /* read_stats_parsed */ false,
+                    /* read_partition_values_parsed */ false,
+                )
+                .append(
+                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                    Expr::from(col!("add.path").is_not_null()),
+                )
+                .append(
+                    FILE_ACTION_KEY_FIELD.clone(),
+                    file_action_key_expr(|col| {
+                        Expr::coalesce([
+                            joined_column_expr!("add", col),
+                            joined_column_expr!("remove", col),
+                        ])
+                    }),
+                )
+        })
+}
+
 /// Read the checkpoint root parts for their `sidecar` references, then [`Load`] the referenced
 /// sidecar files as parquet file actions. `root_parts` share one [`FileType`] (a checkpoint version
 /// is homogeneous), so the root is scanned once with the matching operator. `action_schema` is the
@@ -305,9 +353,8 @@ fn sidecar_actions(
     sidecar_files.load(load)
 }
 
-/// Build the raw checkpoint file-action arm, driven by the resolved [`CheckpointShape`]. Returns
-/// `{ add, version }` rows, including compatible source-native parsed columns requested by the
-/// caller. When there is no checkpoint, returns an absent relation with the raw action schema.
+/// Build the normalized checkpoint file-action arm, driven by the resolved [`CheckpointShape`].
+/// When there is no checkpoint, returns an absent relation with the normalized action schema.
 ///
 /// A checkpoint version is homogeneous, so `checkpoint` carries a single [`FileType`] and one part
 /// list. `shape` selects which relation actually holds the file actions:
@@ -316,20 +363,22 @@ fn sidecar_actions(
 /// - [`CheckpointType::Manifest`]: the root parts hold only sidecar references; the referenced
 ///   sidecar files (always parquet) hold the actions.
 ///
-/// The stats schemas used by the caller play two different roles:
+/// The stats schemas play two different roles:
 /// - The scan's [`StateInfo::physical_stats_schema`] is the downstream reparse target.
 /// - `shape.parsed_stats_schema` is what the checkpoint *source* actually carries. When `Some`, the
-///   read schema includes an `add.stats_parsed` column for downstream normalization. It also drives
-///   the sidecar [`Load`]'s read schema, so the Load never references a column the sidecars lack.
+///   read schema includes an `add.stats_parsed` column. It also drives the sidecar [`Load`]'s read
+///   schema, so the Load never references a column the sidecars lack.
 fn checkpoint_arm(
     checkpoint: Option<(FileType, Vec<ScanFile>)>,
     shape: &CheckpointShape,
     log_root: &Url,
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
     source_partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
     let source_stats_schema = shape.parsed_stats_schema.as_ref();
 
-    match (&shape.checkpoint_type, checkpoint) {
+    let actions = match (&shape.checkpoint_type, checkpoint) {
         (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
             let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
             PlanBuilder::scan_parquet(parts, &[VERSION], schema)
@@ -347,7 +396,41 @@ fn checkpoint_arm(
         (CheckpointType::None, _) | (_, None) => {
             PlanBuilder::values(json_read_schema(false), vec![])
         }
-    }
+    }?;
+
+    // SQL equivalent:
+    //
+    // SELECT STRUCT(
+    //          add.* EXCEPT (
+    //            stats, stats_parsed, partitionValues, partitionValues_parsed
+    //          ),
+    //          COALESCE(
+    //            add.stats_parsed, FROM_JSON(add.stats, stats_schema)
+    //          ) AS stats,
+    //          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
+    //        ) AS add,
+    //        version, file_key(add) AS key
+    // FROM checkpoint_actions
+    // WHERE add.path IS NOT NULL
+    actions
+        .filter(col!("add.path").is_not_null())?
+        .project_patch(|patch| {
+            patch
+                .reparse_add(
+                    stats_schema,
+                    partition_schema,
+                    /* read_stats_parsed */ source_stats_schema.is_some(),
+                    /* read_partition_values_parsed */ source_partition_schema.is_some(),
+                )
+                .append(
+                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                    Expr::from(col!("add.path").is_not_null()),
+                )
+                .append(
+                    FILE_ACTION_KEY_FIELD.clone(),
+                    file_action_key_expr(|col| joined_column_expr!("add", col)),
+                )
+        })
 }
 
 /// The plan-level pruning filter derived from the scan's physical predicate, re-rooted under the
@@ -440,37 +523,19 @@ pub(crate) fn build_metadata_scan_plan(
     let add_field = reparsed_add_field(stats_schema, partition_schema)?;
     let output_schema = schema_ref! { (&add_field) };
 
-    // Dedup the commit rows to the newest action per file identity. Wrap `add` in a never-null
-    // struct so `max_non_null_by` still observes remove rows, then unwrap it afterward.
-    let deduped_commit = PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
-        .filter(Predicate::or(
-            col!("add.path").is_not_null(),
-            col!("remove.path").is_not_null(),
-        ))?
-        .project_patch(|patch| {
-            // Commits never carry the source-native parsed columns, so normalize from the raw
-            // encodings.
-            patch
-                .reparse_add(stats_schema, partition_schema, false, false)
-                .append(
-                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                    Expr::from(col!("add.path").is_not_null()),
-                )
-                .append(
-                    FILE_ACTION_KEY_FIELD.clone(),
-                    file_action_key_expr(|col| {
-                        Expr::coalesce([
-                            joined_column_expr!("add", col),
-                            joined_column_expr!("remove", col),
-                        ])
-                    }),
-                )
-        })?
+    // Removes must survive pruning because their partition values are optional and cannot safely
+    // participate in authoritative partition pruning.
+    let commit_actions = json_arm(commit_files, stats_schema, partition_schema)?
         .try_fold_with(prune, |p, prune| {
-            // Only prune adds: remove.partitionValues is optional and partition pruning predicates
-            // cannot safely distinguish between "missing" (never prune) and "null" (maybe prune).
             p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-        })?
+        })?;
+
+    // SELECT key, MAX_NON_NULL_BY(STRUCT(add), version).add AS add
+    // FROM commit_actions
+    // GROUP BY key
+    //
+    // The non-null wrapper ensures remove rows participate even though their inner add is null.
+    let deduped_commit = commit_actions
         .project_patch(|patch| {
             patch.replace(
                 ADD_NAME,
@@ -483,43 +548,36 @@ pub(crate) fn build_metadata_scan_plan(
         })?
         .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
 
-    // Live checkpoint adds: Commit content supersedes checkpoint content, so anti-join away every
-    // checkpoint identity a commit also touched, then project out the `{ add }`. With no
-    // checkpoint, the raw arm is absent and these transformations remain absent.
-    let checkpoint_live_adds =
-        checkpoint_arm(checkpoint, shape, &log_root, source_partition_schema)?
-            .filter(col!("add.path").is_not_null())?
-            .project_patch(|patch| {
-                patch
-                    .reparse_add(
-                        stats_schema,
-                        partition_schema,
-                        shape.parsed_stats_schema.is_some(),
-                        source_partition_schema.is_some(),
-                    )
-                    .append(
-                        StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                        Expr::from(col!("add.path").is_not_null()),
-                    )
-                    .append(
-                        FILE_ACTION_KEY_FIELD.clone(),
-                        file_action_key_expr(|col| joined_column_expr!("add", col)),
-                    )
-            })?
-            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?
-            .anti_join(
-                deduped_commit.clone(),
-                [ColumnName::new([FILE_ACTION_KEY])],
-                [ColumnName::new([FILE_ACTION_KEY])],
-            )?
-            .project(Expr::struct_from([col!("add")]), output_schema.clone())?;
+    let checkpoint_adds = checkpoint_arm(
+        checkpoint,
+        shape,
+        &log_root,
+        stats_schema,
+        partition_schema,
+        source_partition_schema,
+    )?
+    .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
 
+    // SELECT checkpoint.add
+    // FROM checkpoint_adds AS checkpoint
+    // LEFT ANTI JOIN latest_commits AS commit
+    //   ON checkpoint.key = commit.key
+    let checkpoint_live_adds = checkpoint_adds
+        .anti_join(
+            deduped_commit.clone(),
+            [ColumnName::new([FILE_ACTION_KEY])],
+            [ColumnName::new([FILE_ACTION_KEY])],
+        )?
+        .project(Expr::struct_from([col!("add")]), output_schema.clone())?;
+
+    // SELECT add FROM latest_commits WHERE add IS NOT NULL
     let commit_live_adds = deduped_commit
         .filter(col!("add").is_not_null())?
         .project(Expr::struct_from([col!("add")]), output_schema)?;
 
-    // NOTE: Both present/absent combinations of commit and checkpoint are possible, depending on
-    // e.g. whether a checkpoint exists and what got pruned away.
+    // SELECT add FROM live_commit_adds
+    // UNION ALL
+    // SELECT add FROM live_checkpoint_adds
     PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
 }
 
