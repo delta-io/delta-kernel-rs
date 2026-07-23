@@ -90,7 +90,7 @@ pub struct MacroTestStructWithInvalidOptionalAttributeTarget;
 #[cfg(doctest)]
 pub struct MacroTestStructWithInvalidFieldType;
 
-/// Verify that `#[field_id]` / `#[element_field_id]` on a list field produce the expected
+/// Verify that `#[field_id]` / `#[nested_field_id]` on a list field produce the expected
 /// `parquet.field.id` and `delta.columnMapping.nested.ids` metadata on the generated `StructField`.
 /// ```
 /// # use delta_kernel_derive::ToSchema;
@@ -98,7 +98,7 @@ pub struct MacroTestStructWithInvalidFieldType;
 /// #[derive(ToSchema)]
 /// pub struct WithFieldIds {
 ///     #[field_id = 132]
-///     #[element_field_id = 133]
+///     #[nested_field_id = 133]
 ///     split_offsets: Option<Vec<i64>>,
 /// }
 /// let schema = WithFieldIds::to_schema();
@@ -116,17 +116,17 @@ pub struct MacroTestStructWithInvalidFieldType;
 #[cfg(doctest)]
 pub struct MacroTestStructWithFieldIds;
 
-/// Verify that `#[element_field_id]` is rejected on a non-list field.
+/// Verify that `#[nested_field_id]` is rejected on a non-list field.
 /// ```compile_fail
 /// # use delta_kernel_derive::ToSchema;
 /// #[derive(ToSchema)]
-/// pub struct WithElementFieldIdOnScalar {
-///     #[element_field_id = 5]
+/// pub struct WithNestedFieldIdOnScalar {
+///     #[nested_field_id = 5]
 ///     some_name: String,
 /// }
 /// ```
 #[cfg(doctest)]
-pub struct MacroTestStructWithElementFieldIdOnScalar;
+pub struct MacroTestStructWithNestedFieldIdOnScalar;
 
 /// Verify that an out-of-range `#[field_id]` (must be `1..=i32::MAX`) is rejected.
 /// ```compile_fail
@@ -151,3 +151,21 @@ pub struct MacroTestStructWithOutOfRangeFieldId;
 /// ```
 #[cfg(doctest)]
 pub struct MacroTestStructWithMalformedFieldId;
+
+/// Verify that a `#[skip_schema]` field is excluded from the generated schema while its siblings
+/// remain.
+/// ```
+/// # use delta_kernel_derive::ToSchema;
+/// # use delta_kernel::schema::ToSchema;
+/// #[derive(ToSchema)]
+/// pub struct WithSkippedField {
+///     #[skip_schema]
+///     skipped: String,
+///     kept: i32,
+/// }
+/// let schema = WithSkippedField::to_schema();
+/// assert!(schema.field("kept").is_some());
+/// assert!(schema.field("skipped").is_none());
+/// ```
+#[cfg(doctest)]
+pub struct MacroTestStructWithSkippedField;

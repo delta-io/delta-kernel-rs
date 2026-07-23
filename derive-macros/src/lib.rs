@@ -118,23 +118,21 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 /// action (this macro allows the use of standard rust snake_case, and will convert to the correct
 /// delta schema camelCase version).
 ///
-/// If a field sets `allow_null_container_values`, it means the underlying data can contain null in
-/// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
-/// mark the value field as nullable, but those mappings will be dropped when converting to an
-/// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-///
 /// Supported field attributes:
 /// - `#[field_id = N]`: Sets the Parquet field ID for this field. `N` must be in `1..=i32::MAX`.
-/// - `#[element_field_id = N]`: Sets the Parquet field ID for the element of a list field (`Vec<T>`
+/// - `#[nested_field_id = N]`: Sets the Parquet field ID for the element of a list field (`Vec<T>`
 ///   or `Option<Vec<T>>`; rejected on any other type). Stored as `ColumnMappingNestedIds` metadata
 ///   (`{"fieldName.element": N}`) on the parent `StructField` and propagated to the inner Arrow
 ///   list element during schema conversion. `N` must be in `1..=i32::MAX`.
-/// - `#[allow_null_container_values]`: Marks the value field of a `HashMap` as nullable.
+/// - `#[allow_null_container_values]`: Marks the value field of a container as nullable, i.e. the
+///   underlying data can contain null in the values of the container (a `key` -> `null` in a
+///   `HashMap`). Those mappings will be dropped when converting to an actual rust `HashMap`.
+///   Currently this can _only_ be set on `HashMap` fields.
 /// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
 ///   derives `IntoEngineData`, from the produced engine data).
 #[proc_macro_derive(
     ToSchema,
-    attributes(allow_null_container_values, field_id, element_field_id, skip_schema)
+    attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
 )]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -249,7 +247,7 @@ fn is_list_segment(seg: &syn::PathSegment) -> bool {
 }
 
 /// Check if any of `attrs` is a bare-path attribute named `name` (e.g. `#[skip_schema]`).
-fn has_path_attr(attrs: &[Attribute], name: &str) -> bool {
+fn has_named_attr(attrs: &[Attribute], name: &str) -> bool {
     attrs.iter().any(|attr| match &attr.meta {
         Meta::Path(path) => path.is_ident(name),
         _ => false,
@@ -258,7 +256,7 @@ fn has_path_attr(attrs: &[Attribute], name: &str) -> bool {
 
 fn gen_schema_field(field: &Field) -> TokenStream {
     let name = get_schema_name(field.ident.as_ref().unwrap());
-    let have_schema_null = has_path_attr(&field.attrs, "allow_null_container_values");
+    let have_schema_null = has_named_attr(&field.attrs, "allow_null_container_values");
 
     match field.ty {
         Type::Path(ref type_path) => {
@@ -301,7 +299,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                 Ok(v) => v,
                 Err(e) => return e.to_compile_error(),
             };
-            let element_field_id = match get_named_attr_id(&field.attrs, "element_field_id") {
+            let nested_field_id = match get_named_attr_id(&field.attrs, "nested_field_id") {
                 Ok(v) => v,
                 Err(e) => return e.to_compile_error(),
             };
@@ -312,7 +310,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                 quote_spanned! { field.span() => #base_call }
             };
 
-            if let Some(elem_id) = element_field_id {
+            if let Some(elem_id) = nested_field_id {
                 // The `<field>.element` nested id is only meaningful for a list element; reject it
                 // on any other type, mirroring the allow_null_container_values guard above.
                 let is_list = type_path.path.segments.last().is_some_and(is_list_segment);
@@ -320,7 +318,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                     return Error::new(
                         field.span(),
                         format!(
-                            "Can only use element_field_id on Vec or Option<Vec> fields, not {}",
+                            "Can only use nested_field_id on Vec or Option<Vec> fields, not {}",
                             type_path.path.segments.last().map_or_else(
                                 || "<empty path>".to_string(),
                                 |seg| seg.ident.to_string()
@@ -348,7 +346,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
 }
 
 fn has_skip_schema(field: &Field) -> bool {
-    has_path_attr(&field.attrs, "skip_schema")
+    has_named_attr(&field.attrs, "skip_schema")
 }
 
 fn gen_schema_fields(data: &Data) -> TokenStream {
@@ -575,10 +573,10 @@ mod tests {
 
     #[rstest]
     // With a companion field_id, both metadata keys are emitted.
-    #[case::with_field_id("#[field_id = 132]\n#[element_field_id = 133]", true)]
+    #[case::with_field_id("#[field_id = 132]\n#[nested_field_id = 133]", true)]
     // Element id alone emits only the nested id, not ParquetFieldId.
-    #[case::without_field_id("#[element_field_id = 133]", false)]
-    fn element_field_id_on_list(#[case] attrs: &str, #[case] expect_parquet_field_id: bool) {
+    #[case::without_field_id("#[nested_field_id = 133]", false)]
+    fn nested_field_id_on_list(#[case] attrs: &str, #[case] expect_parquet_field_id: bool) {
         let input = format!("struct S {{ {attrs}\nsplit_offsets: Option<Vec<i64>> }}");
         let tokens = schema_fields_tokens(&input).unwrap();
         assert!(!tokens.contains("compile_error"), "found: {tokens}");
@@ -595,8 +593,8 @@ mod tests {
     #[rstest]
     #[case::scalar("f: String")]
     #[case::map("f: std::collections::HashMap<String, i64>")]
-    fn element_field_id_rejected_on_non_list(#[case] field: &str) {
-        let input = format!("struct S {{ #[element_field_id = 5] {field} }}");
+    fn nested_field_id_rejected_on_non_list(#[case] field: &str) {
+        let input = format!("struct S {{ #[nested_field_id = 5] {field} }}");
         let tokens = schema_fields_tokens(&input).unwrap();
         assert!(
             tokens.contains("compile_error"),
@@ -618,6 +616,43 @@ mod tests {
         assert!(
             !tokens.contains("skipped"),
             "skipped field must be absent: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::hashmap("std::collections::HashMap<String, i64>")]
+    #[case::option_hashmap("Option<std::collections::HashMap<String, i64>>")]
+    fn allow_null_container_values_on_map(#[case] ty: &str) {
+        let input = format!("struct S {{ #[allow_null_container_values] f: {ty} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(!tokens.contains("compile_error"), "found: {tokens}");
+        assert!(
+            tokens.contains("get_nullable_container_struct_field"),
+            "found: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::scalar("String")]
+    #[case::vec("Vec<i64>")]
+    fn allow_null_container_values_rejected_on_non_map(#[case] ty: &str) {
+        let input = format!("struct S {{ #[allow_null_container_values] f: {ty} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
+        );
+    }
+
+    #[rstest]
+    #[case::tuple("f: (i32, i32)")]
+    #[case::array("f: [i32; 4]")]
+    fn non_path_field_type_rejected(#[case] field: &str) {
+        let input = format!("struct S {{ {field} }}");
+        let tokens = schema_fields_tokens(&input).unwrap();
+        assert!(
+            tokens.contains("compile_error"),
+            "expected rejection, found: {tokens}"
         );
     }
 }
