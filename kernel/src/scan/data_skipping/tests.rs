@@ -500,31 +500,6 @@ fn test_checkpoint_skipping_semantic(
     expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
 }
 
-// A partition-only equality resolves against the exact `partitionValues_parsed` value: a matching
-// value keeps the row group, an out-of-range value prunes it.
-#[rstest]
-#[case::below("A", FALSE, "part='A', pred part='B' -> skip")]
-#[case::match_("B", TRUE, "part='B', pred part='B' -> keep")]
-#[case::above("C", FALSE, "part='C', pred part='B' -> skip")]
-fn test_checkpoint_skipping_partition_column(
-    #[case] part_val: &str,
-    #[case] expected: Option<bool>,
-    #[case] description: &str,
-) {
-    let partition_columns = HashSet::from([column_name!("part_col")]);
-    let pred = Pred::eq(column_expr!("part_col"), Scalar::from("B"));
-    // Partition columns are not part of the stats-columns set.
-    let stats = HashSet::new();
-    let skipping_pred =
-        as_checkpoint_skipping_predicate(&pred, &partition_columns, &stats).unwrap();
-    let resolver = HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        Scalar::from(part_val),
-    )]);
-    let filter = DefaultKernelPredicateEvaluator::from(resolver);
-    expect_eq!(filter.eval(&skipping_pred), expected, "{description}");
-}
-
 // The IS NULL guard on a partition comparison keeps a row group whose partition value is null (a
 // non-Add row such as a Remove). Without the guard, `part_col = 'B'` would resolve to FALSE against
 // a null value and wrongly prune the row group, dropping the tombstone from log replay.
@@ -546,15 +521,14 @@ fn test_checkpoint_skipping_partition_null_value_kept() {
     );
 }
 
-// Checkpoint partition skipping across comparison operators, modeling a row group whose add files
-// all share one partition value (min == max -- the canonical partition case). The rewrite reads
-// `partitionValues_parsed.part_col` as both min and max, so a single resolved value drives an exact
-// verdict. (Range footers where min != max are exercised by the real-parquet
-// CheckpointRowGroupFilter tests and the e2e integration tests.) Skip (FALSE) exactly when the
-// value cannot match.
+// Checkpoint partition skipping across comparison operators. Each case resolves one exact per-file
+// partition value from `partitionValues_parsed.part_col`, which serves as both min and max. The
+// rewritten comparison returns FALSE exactly when that value cannot satisfy the original predicate.
 #[rstest]
-#[case::eq_miss(Pred::eq(column_expr!("part_col"), Scalar::from("m")), "b", FALSE)]
+// Value fixed at "b"; the literal sits below, on, or above it.
+#[case::eq_lit_above(Pred::eq(column_expr!("part_col"), Scalar::from("m")), "b", FALSE)]
 #[case::eq_hit(Pred::eq(column_expr!("part_col"), Scalar::from("b")), "b", TRUE)]
+#[case::eq_lit_below(Pred::eq(column_expr!("part_col"), Scalar::from("a")), "b", FALSE)]
 #[case::neq_miss(Pred::ne(column_expr!("part_col"), Scalar::from("b")), "b", FALSE)]
 #[case::neq_hit(Pred::ne(column_expr!("part_col"), Scalar::from("m")), "b", TRUE)]
 #[case::lt_miss(Pred::lt(column_expr!("part_col"), Scalar::from("a")), "b", FALSE)]
@@ -633,10 +607,9 @@ fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
     }
 }
 
-// Mixed partition + data predicates. Each arm prunes independently against its own stats
-// (`partitionValues_parsed.part_col` = "b", footer range ['a','c'];
-// `stats_parsed.maxValues.data_col`). AND skips when EITHER arm proves no match; OR skips only when
-// BOTH prove no match.
+// Mixed partition + data predicates. Each arm prunes independently against its own stat: the exact
+// `partitionValues_parsed.part_col` value and the `stats_parsed.maxValues.data_col` range. AND
+// skips when EITHER arm proves no match; OR skips only when BOTH prove no match.
 #[rstest]
 // part_col = 'b' AND data_col > 100
 #[case::and_partition_prunes(true, "z", 500, FALSE)] // partition out of range -> skip
