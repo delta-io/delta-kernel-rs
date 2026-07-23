@@ -201,6 +201,23 @@ fn collect_filtered_adds(
     Ok((rows, add_paths))
 }
 
+fn collect_projected_adds(
+    log_segment: &LogSegment,
+    engine: &dyn Engine,
+) -> DeltaResult<(usize, Vec<String>)> {
+    let actions = log_segment
+        .read_actions_with_projected_checkpoint_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None,
+            None,
+            None,
+        )?
+        .actions;
+    collect_filtered_adds(actions)
+}
+
 struct IgnorePredicateParquetHandler(Arc<dyn ParquetHandler>);
 
 impl ParquetHandler for IgnorePredicateParquetHandler {
@@ -1525,38 +1542,10 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
         None,
     )?;
 
-    // Baseline: with no predicate every row group is read, so all rows are materialized.
-    let unfiltered = log_segment.create_checkpoint_stream(
-        engine,
-        CHECKPOINT_READ_SCHEMA.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
-    )?;
-    let unfiltered_rows: usize = unfiltered
-        .actions
-        .map_ok(|batch| batch.actions.len())
-        .fold_ok(0, std::ops::Add::add)?;
-    assert_eq!(
-        unfiltered_rows, total_rows,
-        "without a predicate every checkpoint row is materialized"
-    );
-
     // The projected checkpoint read derives `add.path IS NOT NULL`. Engines may use it to skip
     // all-remove row groups or ignore it and return extra rows; both paths must surface the same
     // Adds.
-    let filtered = log_segment
-        .read_actions_with_projected_checkpoint_actions(
-            engine,
-            COMMIT_READ_SCHEMA.clone(),
-            CHECKPOINT_READ_SCHEMA.clone(),
-            None, // meta_predicate
-            None, // stats_schema
-            None, // partition_schema
-        )?
-        .actions;
-
-    let (rows_after_pruning, add_paths) = collect_filtered_adds(filtered)?;
+    let (rows_after_pruning, add_paths) = collect_projected_adds(&log_segment, engine)?;
     let expected_materialized_rows = if ignore_predicate {
         total_rows
     } else {
@@ -1577,10 +1566,10 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     Ok(())
 }
 
-/// JSON checkpoints have no row groups to skip, so the derived `add.path IS NOT NULL` predicate
-/// prunes nothing: a remove tombstone stored alongside a live Add is still materialized.
+/// `SyncJsonHandler` ignores the checkpoint predicate, so replay must tolerate the returned remove
+/// row while still surfacing the live Add.
 #[tokio::test]
-async fn test_scan_checkpoint_read_keeps_all_rows_for_json_checkpoint() -> DeltaResult<()> {
+async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
 
@@ -1616,21 +1605,10 @@ async fn test_scan_checkpoint_read_keeps_all_rows_for_json_checkpoint() -> Delta
         None,
     )?;
 
-    let filtered = log_segment
-        .read_actions_with_projected_checkpoint_actions(
-            &engine,
-            COMMIT_READ_SCHEMA.clone(),
-            CHECKPOINT_READ_SCHEMA.clone(),
-            None, // meta_predicate
-            None, // stats_schema
-            None, // partition_schema
-        )?
-        .actions;
-
-    let (rows_after_pruning, add_paths) = collect_filtered_adds(filtered)?;
+    let (rows_after_pruning, add_paths) = collect_projected_adds(&log_segment, &engine)?;
     assert_eq!(
         rows_after_pruning, 2,
-        "a JSON checkpoint has no row groups to skip, so every row is materialized"
+        "SyncJsonHandler should return the unfiltered checkpoint rows"
     );
     assert_eq!(
         add_paths,
@@ -1695,18 +1673,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 
     // Sidecar discovery reads the manifest without a predicate, so pruning its null-`add.path`
     // rows from the projected action stream cannot hide sidecar references.
-    let filtered = log_segment
-        .read_actions_with_projected_checkpoint_actions(
-            engine,
-            COMMIT_READ_SCHEMA.clone(),
-            CHECKPOINT_READ_SCHEMA.clone(),
-            None, // meta_predicate
-            None, // stats_schema
-            None, // partition_schema
-        )?
-        .actions;
-
-    let (rows_after_pruning, add_paths) = collect_filtered_adds(filtered)?;
+    let (rows_after_pruning, add_paths) = collect_projected_adds(&log_segment, engine)?;
     assert_eq!(
         rows_after_pruning, expected_materialized_rows,
         "materialized rows must reflect whether the engine applies the predicate"

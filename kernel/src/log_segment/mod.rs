@@ -129,7 +129,7 @@ fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
     action_presence_leaf(action_name).map(|leaf| ColumnName::new([action_name, leaf]))
 }
 
-/// Builds a checkpoint row-group predicate that retains every action requested by `schema`.
+/// Builds a checkpoint predicate that retains every action requested by `schema`.
 ///
 /// Each requested action contributes an `IS NOT NULL` presence witness, and the witnesses are
 /// joined with `OR`. Returns `None` if the schema is empty, or if any field lacks a reliable
@@ -687,12 +687,11 @@ impl LogSegment {
     ///
     /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
-    /// `meta_predicate` is an optional expression for row group skipping in checkpoint parquet
-    /// files. It is _NOT_ the query's data predicate, but a hint for skipping irrelevant data.
-    /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
-    /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
-    /// The combined predicate is only a skipping hint: the reader may return rows that do not
-    /// satisfy it, so downstream log replay must tolerate them.
+    /// `meta_predicate` is an optional conservative predicate for checkpoint reads, not the query's
+    /// final data filter. Readers may apply it at any supported granularity or ignore it. IS NOT
+    /// NULL predicates are derived from `checkpoint_read_schema` and combined (AND) with
+    /// `meta_predicate`, so callers only need to supply query-based skipping predicates. Downstream
+    /// log replay must tolerate returned rows that do not satisfy the combined predicate.
     #[internal_api]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
@@ -705,9 +704,8 @@ impl LogSegment {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
-        // checkpoint parquet row groups without any relevant action type can be skipped.
-        // TODO: The semantics of `meta_predicate` will change in a follow-up PR.
+        // Combine the action-presence predicate with the caller's skipping predicate so readers
+        // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
         let checkpoint_predicate = match (projection_predicate, meta_predicate) {
             (None, predicate) | (predicate, None) => predicate,
