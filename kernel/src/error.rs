@@ -258,6 +258,18 @@ pub enum Error {
         expected: &'static str,
         actual: &'static str,
     },
+
+    /// A row being written violates a CHECK constraint (evaluated to `false` or `NULL`).
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[error("CHECK constraint '{name}' ({expression}) violated: {details}")]
+    CheckConstraintViolation {
+        /// The constraint's name (the suffix of its `delta.constraints.<name>` key).
+        name: String,
+        /// The constraint's SQL expression, as stored in the table configuration.
+        expression: String,
+        /// Which row violated and how (the predicate evaluated to `false` or to `NULL`).
+        details: String,
+    },
 }
 
 // Convenience constructors for Error types that take a String argument
