@@ -17,6 +17,10 @@ a marker emoji (see the threshold constants). When any benchmark lands in the
 slowest tier, the run records a regression in the file named by
 BENCH_REGRESSION_FILE (if set) so the workflow can fail the job.
 
+When a non-overridden regression is below the automatic retry threshold, the
+run records that it is retryable in BENCH_RETRY_FILE (if set). Thresholds use
+the displayed two-decimal multiplier so the retry decision matches the comment.
+
 Usage:
     critcmp base changes | python3 benchmarks/ci/parse_critcmp.py
 """
@@ -29,6 +33,7 @@ import sys
 ROCKET_THRESHOLD = 1.15
 GRAY_THRESHOLD = 1.03
 FAIL_THRESHOLD = 1.15
+RETRY_THRESHOLD = 1.50
 
 # |ratio - 1| within this renders as "1.00x" with no faster/slower suffix
 # (half of the 2-decimal display step).
@@ -213,6 +218,11 @@ def main():
     rows = parse_rows(lines)
     regressed = any(change_emoji(r['ratio']) == RED_X for r in rows)
     ignored = os.environ.get('BENCH_IGNORE_FAILURE') == 'true'
+    max_slowdown = max(
+        (round(r['ratio'], 2) for r in rows if r['ratio'] is not None and r['ratio'] > 1),
+        default=1.0,
+    )
+    retryable = regressed and not ignored and max_slowdown < RETRY_THRESHOLD
 
     print(f'## Benchmark results: {render_verdict(regressed, ignored)}')
     print("")
@@ -228,6 +238,11 @@ def main():
     if flag_path:
         with open(flag_path, 'w') as f:
             f.write('true' if regressed else 'false')
+
+    retry_path = os.environ.get('BENCH_RETRY_FILE')
+    if retry_path:
+        with open(retry_path, 'w') as f:
+            f.write('true' if retryable else 'false')
 
 if __name__ == "__main__":
     main()

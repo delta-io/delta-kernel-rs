@@ -19,10 +19,11 @@
 # in base-branch context (which has the write scope this workflow lacks under
 # pull_request from a fork).
 #
-# The run-benchmark job fails if any benchmark regresses past the fail
-# threshold in benchmarks/ci/parse_critcmp.py, unless the PR carries the
-# ignore-benchmark-failure label. The comment artifact is uploaded before that
-# gate runs, so the result table still gets posted on a gate failure.
+# The run-benchmark job reruns one fresh comparison when a non-overridden
+# regression is below RERUN_THRESHOLD, then fails if the final comparison still
+# crosses the fail threshold in benchmarks/ci/parse_critcmp.py. The comment artifact
+# is uploaded before the gate runs, so the result table still gets posted on a gate
+# failure. The ignore-benchmark-failure label bypasses both retry and failure.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
