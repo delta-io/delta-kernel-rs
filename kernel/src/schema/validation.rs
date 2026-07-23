@@ -4,6 +4,8 @@
 
 use std::collections::HashSet;
 
+#[cfg(not(feature = "interval-type-in-dev"))]
+use crate::schema::schema_contains_interval_type;
 use crate::schema::{StructField, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::SchemaTransform;
@@ -30,6 +32,24 @@ pub(crate) fn validate_schema(
     // collects errors. The return value is intentionally discarded.
     validator.transform_struct(schema);
     validator.into_result()
+}
+
+/// Validates that this build supports writing the schema's data types.
+#[cfg(feature = "interval-type-in-dev")]
+pub(crate) fn validate_interval_type_write_support(_: &StructType) -> DeltaResult<()> {
+    Ok(())
+}
+
+/// Validates that this build supports writing the schema's data types.
+#[cfg(not(feature = "interval-type-in-dev"))]
+pub(crate) fn validate_interval_type_write_support(schema: &StructType) -> DeltaResult<()> {
+    if schema_contains_interval_type(schema) {
+        return Err(Error::unsupported(
+            "Writing interval columns requires the 'interval-type-in-dev' cargo feature",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Schema visitor that validates field names, detects duplicates, and rejects
