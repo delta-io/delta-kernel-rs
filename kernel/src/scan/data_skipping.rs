@@ -426,11 +426,9 @@ impl DataSkippingFilter {
 /// not `add.stats_parsed`. `physical_partition_columns` is the table's full partition list;
 /// pass an empty set for unpartitioned tables.
 ///
-/// `physical_stats_columns` restricts rewrites to columns which are expected to have stats
-/// collected; other references fold to TRUE (keeps the file). Must match the column set
-/// used to build `physical_stats_schema`, otherwise the row-group filter sees a missing
-/// field. TRUE (rather than NULL) keeps the predicate sound whether the reader applies it as a
-/// row-group hint or an exact row filter (see `finish_eval_pred_junction` below).
+/// `physical_stats_columns` restricts rewrites to columns expected to have stats. Other
+/// references fold to TRUE to preserve rows that cannot be evaluated. This set must match
+/// `physical_stats_schema`.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     physical_partition_columns: &HashSet<ColumnName>,
@@ -887,22 +885,9 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         None
     }
 
-    /// Combines sub-predicates with AND/OR, replacing unsupported arms with TRUE. `col_a > 100
-    /// AND col_b < 50` →
-    /// ```text
-    /// AND(
-    ///   OR(stats_parsed.maxValues.col_a IS NULL, stats_parsed.maxValues.col_a > 100),
-    ///   OR(stats_parsed.minValues.col_b IS NULL, stats_parsed.minValues.col_b < 50)
-    /// )
-    /// ```
-    ///
-    /// Unlike the in-memory creator (whose result is evaluated with `eval_sql_where`
-    /// three-valued logic, where an unsupported arm can safely fold to NULL), this predicate is
-    /// pushed to the parquet reader, which may apply it as an exact row filter under ordinary
-    /// two-valued logic. A NULL there reads as false and would drop a row the arm cannot judge,
-    /// so unsupported arms fold to TRUE (keep). TRUE is neutral under both logics
-    /// (`AND(x, TRUE) = x`, `OR(x, TRUE) = TRUE`), so the predicate is sound whether the reader
-    /// skips row groups or filters rows.
+    /// Combines rewritten arms, replacing unsupported arms with TRUE. This preserves supported
+    /// pruning under AND and disables pruning under OR, where the unsupported arm may match.
+    /// Exact row filters discard NULL results, so NULL is not a safe fallback here.
     fn finish_eval_pred_junction(
         &self,
         mut op: JunctionPredicateOp,
