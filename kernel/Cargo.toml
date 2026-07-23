@@ -129,9 +129,9 @@ adaptive-metadata-in-dev = []
 geo-type-in-dev = []
 
 # Experimental, temporary feature flag guarding the in-progress ANSI interval-type work.
-# Gates `KernelSupport::Supported` for the `intervalType-preview` reader-writer table feature;
-# with the flag off, reads and writes of tables listing this feature are blocked. TODO(#2840):
-# remove once the interval-type protocol RFC is ratified and interval support fully ships.
+# With the flag off, creating and writing tables containing interval columns are blocked; reads
+# are unaffected.
+# TODO(#2840): remove once interval support fully ships.
 interval-type-in-dev = []
 
 # Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,

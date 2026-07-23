@@ -29,10 +29,10 @@ use crate::schema::{
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_interval_type_feature_support_on_write, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation,
-    TableFeature, LEGACY_WRITER_FEATURES, MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION,
-    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
+    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
+    MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
+    TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
 use crate::table_properties::TableProperties;
 use crate::transforms::SchemaTransform as _;
@@ -725,10 +725,6 @@ impl TableConfiguration {
                 "Column invariants are not yet supported",
             ));
         }
-
-        // Validate interval support only on write paths. Reads of legacy featureless interval
-        // tables must keep working, so this is not validated at construction time.
-        validate_interval_type_feature_support_on_write(self)?;
 
         Ok(())
     }
@@ -1721,18 +1717,6 @@ mod test {
             config.ensure_operation_supported(Operation::Write),
             r#"Feature 'typeWidening' is not supported for writes"#,
         );
-    }
-
-    // With the gate on, intervalType-preview tables are fully supported: readable via Scan and
-    // CDF, and writable. Gated because `INTERVAL_TYPE_PREVIEW_INFO` is `NotSupported` without the
-    // flag.
-    #[cfg(feature = "interval-type-in-dev")]
-    #[test]
-    fn test_ensure_operation_supported_interval_type_all_operations() {
-        let config = create_mock_table_config(&[], &[TableFeature::IntervalTypePreview]);
-        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
-        assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
-        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
     #[test]
