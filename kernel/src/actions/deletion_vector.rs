@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use delta_kernel::schema::derive_macro_utils::ToDataType;
-use delta_kernel_derive::ToSchema;
+use delta_kernel_derive::{internal_api, ToSchema};
 use roaring::RoaringTreemap;
 use url::Url;
 
@@ -474,18 +474,21 @@ fn slice_to_u32(buf: &[u8], endian: Endian) -> DeltaResult<u32> {
 
 /// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
 /// set, the vector will be false, and otherwise at index i the vector will be true
+#[internal_api]
 pub(crate) fn deletion_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     treemap_to_bools_with(treemap, false)
 }
 
 /// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
 /// set, the vector will be true, and otherwise at index i the vector will be false
+#[internal_api]
 pub(crate) fn selection_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     treemap_to_bools_with(treemap, true)
 }
 
 /// helper function to generate vectors of bools from treemap. If `set_bit` is `true`, this is
 /// [`selection_treemap_to_bools`]. If `set_bit` is false, this is [`deletion_treemap_to_bools`]
+#[internal_api]
 fn treemap_to_bools_with(treemap: RoaringTreemap, set_bit: bool) -> Vec<bool> {
     fn combine(high_bits: u32, low_bits: u32) -> usize {
         ((u64::from(high_bits) << 32) | u64::from(low_bits)) as usize
