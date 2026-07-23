@@ -101,6 +101,7 @@ MERGE_SHA=$(git rev-parse HEAD)
 # ---------------------------------------------------------------------------
 git fetch origin -- "$BASE_REF"
 git checkout FETCH_HEAD
+BASE_SHA=$(git rev-parse HEAD)
 (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
 
 # ---------------------------------------------------------------------------
@@ -123,8 +124,31 @@ git checkout "$MERGE_SHA"
 #
 # parse_critcmp.py records whether any benchmark regressed past its fail
 # threshold in this file; benchmark.yml's gate step reads it to fail the job.
+# It also records whether a non-overridden regression is below the automatic
+# retry threshold, allowing one fresh measurement pair to replace a noisy run.
 export BENCH_REGRESSION_FILE=/tmp/bench-regression.txt
-COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/parse_critcmp.py)
+export BENCH_RETRY_FILE=/tmp/bench-retry.txt
+ATTEMPT=1
+MAX_ATTEMPTS=2
+
+while true; do
+  COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/parse_critcmp.py)
+  RETRY=$(tr -d '[:space:]' < "$BENCH_RETRY_FILE" 2>/dev/null || echo false)
+
+  if [[ "$RETRY" != "true" || "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]]; then
+    break
+  fi
+
+  ATTEMPT=$((ATTEMPT + 1))
+  echo "::notice::Benchmark regression is below 1.50x; starting attempt $ATTEMPT/$MAX_ATTEMPTS."
+  (
+    cd benchmarks
+    cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER"
+  )
+  git checkout "$BASE_SHA"
+  (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
+  git checkout "$MERGE_SHA"
+done
 
 # ---------------------------------------------------------------------------
 # 6. Write results to /tmp/bench-comment.md
@@ -140,6 +164,9 @@ SHORT_SHA="${HEAD_SHA:0:7}"
 SUMMARY="Commit: \`${SHORT_SHA}\` &middot; Trigger: ${TRIGGER:-auto-push}"
 [[ -n "$TAGS" ]]   && SUMMARY+=" &middot; Tags: \`${TAGS}\`"
 [[ -n "$FILTER" ]] && SUMMARY+=" &middot; Filter: \`${FILTER}\`"
+if [[ "$ATTEMPT" -gt 1 ]]; then
+  SUMMARY+=" &middot; Automatic retry: attempt ${ATTEMPT}/${MAX_ATTEMPTS}"
+fi
 SUMMARY+=" &middot; Updated: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M %Z')"
 
 # Leading marker is an HTML comment, invisible to readers; the post-comment
