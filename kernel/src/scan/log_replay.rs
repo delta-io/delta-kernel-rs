@@ -42,6 +42,11 @@ pub(crate) struct ScanStatsOptions {
     /// is left null on such checkpoints; engines that consume `stats_parsed` directly
     /// avoid the per-batch `ToJson` cost.
     pub(crate) synthesize_json: bool,
+    /// Whether kernel builds an in-memory [`DataSkippingFilter`]. When false, no in-memory
+    /// pruning happens even with a predicate and stats present; the engine is expected to prune
+    /// (the predicate is still pushed to it). Independent of `skip_stats`: stats can be read and
+    /// emitted while in-memory pruning is off.
+    pub(crate) internal_data_skipping: bool,
 }
 
 impl Default for ScanStatsOptions {
@@ -49,6 +54,7 @@ impl Default for ScanStatsOptions {
         Self {
             skip_stats: false,
             synthesize_json: true,
+            internal_data_skipping: true,
         }
     }
 }
@@ -233,6 +239,7 @@ impl ScanLogReplayProcessor {
         let ScanStatsOptions {
             skip_stats,
             synthesize_json,
+            internal_data_skipping,
         } = stats_options;
 
         // Create metrics first so we can pass them to DataSkippingFilter
@@ -266,7 +273,11 @@ impl ScanLogReplayProcessor {
                 .fields()
                 .any(|f| refs.contains(&ColumnName::new([f.name()])))
         };
-        let partition_only_skip = skip_stats && predicate_references_partition();
+        // `internal_data_skipping = false` turns off all kernel in-memory pruning (data-column
+        // and partition), even when stats are read and a predicate is present. The engine prunes
+        // instead; the predicate is still pushed to it upstream in `create_checkpoint_stream`.
+        let partition_only_skip =
+            internal_data_skipping && skip_stats && predicate_references_partition();
 
         let stats_schema_for_transform = if skip_stats {
             None
@@ -277,13 +288,15 @@ impl ScanLogReplayProcessor {
         // The partition schema feeds two consumers: the DataSkippingFilter (partition pruning,
         // which survives `skip_stats` via `partition_only_skip`) and the engine-facing
         // `partitionValues_parsed` output column (requested via `parsed_struct`). Either consumer
-        // keeps the transform emitting the column.
-        let partition_schema_for_transform =
-            if partition_values_options.parsed_struct || !skip_stats || partition_only_skip {
-                state_info.physical_partition_schema.clone()
-            } else {
-                None
-            };
+        // keeps the transform emitting the column. When in-memory skipping is off the filter is
+        // not built, so only the output request keeps the column.
+        let partition_schema_for_transform = if partition_values_options.parsed_struct
+            || (internal_data_skipping && (!skip_stats || partition_only_skip))
+        {
+            state_info.physical_partition_schema.clone()
+        } else {
+            None
+        };
 
         let output_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
@@ -300,10 +313,10 @@ impl ScanLogReplayProcessor {
         //
         // Under `partition_only_skip` the filter runs with `stats_schema_for_transform = None`, so
         // it ignores the stats columns entirely: data-column arms fold to NULL (keep) and only
-        // partition arms prune.
-        let data_skipping_filter = if skip_stats && !partition_only_skip {
-            None
-        } else {
+        // partition arms prune. When `internal_data_skipping` is off the filter is never built --
+        // the engine prunes instead.
+        let build_filter = internal_data_skipping && (!skip_stats || partition_only_skip);
+        let data_skipping_filter = if build_filter {
             DataSkippingFilter::new(
                 engine,
                 physical_predicate.as_ref().map(|(p, _)| p.clone()),
@@ -318,6 +331,8 @@ impl ScanLogReplayProcessor {
                 &state_info.physical_stats_columns,
                 Some(metrics.clone()),
             )
+        } else {
+            None
         };
 
         Ok(Self {
@@ -1061,14 +1076,15 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
-        assert_transform_spec, get_simple_state_info, get_state_info, ROW_TRACKING_FEATURES,
+        assert_transform_spec, get_simple_state_info, get_state_info, get_state_info_with_stats,
+        ROW_TRACKING_FEATURES,
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
         add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, add_batch_with_remove_and_partition, run_with_validate_callback,
     };
-    use crate::scan::PhysicalPredicate;
+    use crate::scan::{PhysicalPredicate, StatsOptions};
     use crate::schema::{
         schema_ref, DataType, MetadataColumnSpec, SchemaRef, StructField, StructType,
     };
@@ -1250,6 +1266,43 @@ mod tests {
             validate_patch(transforms[1].as_ref(), 17511);
             validate_patch(transforms[3].as_ref(), 17510);
         }
+    }
+
+    // With a predicate and stats requested, `internal_data_skipping` controls whether kernel
+    // builds an in-memory `DataSkippingFilter`: enabled -> Some (kernel prunes), disabled -> None
+    // (the engine prunes; the predicate is still pushed to the reader upstream).
+    #[rstest]
+    #[case::enabled(true, true)]
+    #[case::disabled(false, false)]
+    fn internal_data_skipping_gates_the_filter(
+        #[case] internal_data_skipping: bool,
+        #[case] expect_filter: bool,
+    ) {
+        let schema: SchemaRef = schema_ref! { nullable "value": INTEGER };
+        let predicate = Arc::new(Predicate::gt(Expr::column(["value"]), Scalar::from(5)));
+        // `all_struct` keeps stats on (so `skip_stats` is false); the new flag is the only lever.
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            Some(predicate),
+            &[],
+            HashMap::new(),
+            vec![],
+            StatsOptions::all_struct(),
+        )
+        .unwrap();
+        let processor = ScanLogReplayProcessor::new(
+            &SyncEngine::new(),
+            Arc::new(state_info),
+            test_checkpoint_info(),
+            ScanStatsOptions {
+                internal_data_skipping,
+                ..Default::default()
+            },
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(processor.data_skipping_filter.is_some(), expect_filter);
     }
 
     #[test]

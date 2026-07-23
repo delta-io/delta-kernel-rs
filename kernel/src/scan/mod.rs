@@ -193,6 +193,46 @@ impl StatsOptions {
     }
 }
 
+/// Engine-facing control over kernel's internal data skipping. Pass to
+/// [`ScanBuilder::with_data_skipping`].
+///
+/// This is orthogonal to [`StatsOptions`]: `StatsOptions` decides which statistics the scan
+/// *emits*, while this decides whether kernel *prunes* files itself during log replay. An engine
+/// with its own pruning (e.g. one that applies the pushed predicate as a row-group filter or an
+/// exact row filter) can turn kernel's in-memory pruning off while still requesting stats output
+/// and still receiving the pushed checkpoint predicate.
+#[derive(Clone, Debug)]
+pub struct DataSkippingOptions {
+    /// Whether kernel builds an in-memory
+    /// [`DataSkippingFilter`](self::data_skipping::DataSkippingFilter) to prune files during
+    /// log replay. When false, kernel performs no in-memory pruning even if the scan has a
+    /// predicate; the predicate is still pushed to the engine's parquet reader so the engine
+    /// can prune at read time.
+    pub(crate) internal: bool,
+}
+
+impl DataSkippingOptions {
+    /// Kernel prunes files in-memory using the scan predicate (the default).
+    pub fn enabled() -> Self {
+        Self { internal: true }
+    }
+
+    /// Kernel performs no in-memory pruning. The scan predicate is still pushed to the engine's
+    /// parquet reader (so the engine can prune at read time), and stats output still follows
+    /// [`StatsOptions`]. Use when the engine handles its own pruning and kernel's row-by-row
+    /// filtering would be redundant (or, for a differing cast/comparison implementation, unsound).
+    pub fn disabled() -> Self {
+        Self { internal: false }
+    }
+}
+
+impl Default for DataSkippingOptions {
+    /// Kernel prunes in-memory (backward-compatible default).
+    fn default() -> Self {
+        Self::enabled()
+    }
+}
+
 /// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
 /// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
 /// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
@@ -229,6 +269,7 @@ pub struct ScanBuilder {
     logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
     stats: StatsOptions,
+    data_skipping: DataSkippingOptions,
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
     partition_values: PartitionValuesOptions,
@@ -240,6 +281,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
             .field("stats", &self.stats)
+            .field("data_skipping", &self.data_skipping)
             .field("correlation_id", &self.correlation_id)
             .field("without_row_transforms", &self.without_row_transforms)
             .field("partition_values", &self.partition_values)
@@ -255,6 +297,7 @@ impl ScanBuilder {
             logical_read_schema: None,
             predicate: None,
             stats: StatsOptions::default(),
+            data_skipping: DataSkippingOptions::default(),
             correlation_id: None,
             without_row_transforms: false,
             partition_values: PartitionValuesOptions::default(),
@@ -309,6 +352,18 @@ impl ScanBuilder {
     /// per-batch `ToJson` synthesis on parsed-stats checkpoints.
     pub fn with_stats(mut self, stats: StatsOptions) -> Self {
         self.stats = stats;
+        self
+    }
+
+    /// Configure kernel's internal data skipping. See [`DataSkippingOptions`].
+    ///
+    /// Defaults to [`DataSkippingOptions::enabled`] (kernel prunes in-memory using the scan
+    /// predicate). Pass [`DataSkippingOptions::disabled`] when the engine handles its own
+    /// pruning; kernel then does no in-memory pruning but still pushes the predicate to the
+    /// engine's parquet reader. Orthogonal to [`with_stats`](Self::with_stats): stats output is
+    /// controlled separately, so an engine can request `stats_parsed` while pruning itself.
+    pub fn with_data_skipping(mut self, data_skipping: DataSkippingOptions) -> Self {
+        self.data_skipping = data_skipping;
         self
     }
 
@@ -400,6 +455,7 @@ impl ScanBuilder {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
+            data_skipping: self.data_skipping,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
         })
@@ -661,6 +717,7 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
+    data_skipping: DataSkippingOptions,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
 }
@@ -695,6 +752,7 @@ impl Scan {
         log_replay::ScanStatsOptions {
             skip_stats: self.skip_stats(),
             synthesize_json: self.stats.synthesize_json,
+            internal_data_skipping: self.data_skipping.internal,
         }
     }
 
