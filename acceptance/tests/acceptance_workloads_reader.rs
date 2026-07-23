@@ -228,16 +228,27 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         &["cm_err_003_invalid_mode/specs/cm_err_003_invalid_mode_error"],
     ),
     (
-        "Reads corrupt/invalid commit or checkpoint without error",
+        "CRC fast path can mask corrupt/invalid commit JSON during snapshot construction",
         &[
             "corrupt_truncated_commit_json_error",
-            "cp_err_missing_protocol/specs/cp_err_missing_protocol_error",
-            "ct_corrupt_parquet/specs/ct_corrupt_parquet_error",
             "ct_invalid_json_error",
-            "dsReadCorruptCheckpoint/specs/dsReadCorruptCheckpoint_error",
             "dsReadCorruptJson_error",
+        ],
+    ),
+    (
+        "CRC or checkpoint hints can mask invalid checkpoint contents during snapshot construction",
+        &[
+            "cp_err_missing_protocol/specs/cp_err_missing_protocol_error",
+            "dsReadCorruptCheckpoint/specs/dsReadCorruptCheckpoint_error",
             "dsReadModifyCheckpoint/specs/dsReadModifyCheckpoint_error",
         ],
+    ),
+    // Keep corrupt data parquet separate from log/checkpoint corruption. Making snapshot
+    // construction validate referenced data files has a different compatibility and cost profile
+    // than failing closed on invalid Delta log state.
+    (
+        "Snapshot construction does not validate referenced data parquet files",
+        &["ct_corrupt_parquet/specs/ct_corrupt_parquet_error"],
     ),
     (
         "Does not reject duplicate actions in commit",
