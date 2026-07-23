@@ -143,7 +143,7 @@ fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
 /// Builds an IS NOT NULL predicate for row group skipping based on the action types in `schema`.
 /// Returns `None` if any top-level field in the schema is not a recognized action type, since
 /// an unknown type could have non-null rows in the same row group, making skipping unsafe.
-fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> {
+pub(crate) fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> {
     // Collect identifying columns for every field; short-circuit to None on any unknown field.
     let columns: Vec<ColumnName> = schema
         .fields()
