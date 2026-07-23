@@ -29,6 +29,8 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -964,10 +966,7 @@ impl Scan {
 
     #[cfg(feature = "declarative-plans")]
     #[allow(dead_code)]
-    fn declarative_metadata_scan_plan(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Option<crate::plans::ir::plan::Plan>> {
+    fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
