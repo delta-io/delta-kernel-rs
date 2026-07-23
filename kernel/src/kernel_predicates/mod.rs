@@ -363,9 +363,9 @@ pub trait KernelPredicateEvaluator {
 
     /// Evaluates a (possibly inverted) predicate with SQL WHERE semantics.
     ///
-    /// NOTE: A NULL literal in a boolean position is treated as unknown (not false), because
-    /// callers like `build_actions_meta_predicate` use NULL as a sentinel for unsupported arms.
-    /// Treating it as false would let `AND(supported, NULL)` incorrectly prune files.
+    /// NOTE: A NULL literal in a boolean position is treated as unknown, not false. Predicate
+    /// rewriters may use NULL as a sentinel for unsupported arms, so treating it as false could
+    /// make `AND(supported, NULL)` incorrectly prune files.
     ///
     /// By default, [`Self::eval_pred`] behaves badly for comparisons involving NULL columns
     /// (e.g. `a < 10` when `a` is NULL), because the comparison correctly evaluates to NULL, but

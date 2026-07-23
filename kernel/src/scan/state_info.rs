@@ -354,8 +354,8 @@ impl StateInfo {
         // Stats-eligible column set. Partition columns are excluded; they flow through
         // `partitionValues_parsed` instead.
         let physical_stats_columns = table_configuration.physical_stats_columns_set(None);
-        // Observability: predicate refs outside `physical_stats_columns` get folded to NULL
-        // by the gate. Surface the dropped set so an engine operator can see what got folded.
+        // Observability: predicate refs outside `physical_stats_columns` cannot produce checkpoint
+        // conditions. Surface the dropped set so an engine operator can see what is unavailable.
         // The filter walk is bounded by predicate width but still does a physical-name
         // resolution per ref, so gate it on the log level to skip the work when DEBUG is off.
         if enabled!(Level::DEBUG) && matches!(physical_predicate, PhysicalPredicate::Some(_, _)) {
@@ -369,7 +369,7 @@ impl StateInfo {
                 .collect();
             if !dropped.is_empty() {
                 debug!(
-                    "Checkpoint pushdown: predicate refs to non-stats columns folded to NULL: {:?}",
+                    "Checkpoint pushdown: predicate refs unavailable from checkpoint stats: {:?}",
                     dropped
                 );
             }
