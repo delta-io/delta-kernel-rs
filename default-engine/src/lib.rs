@@ -78,7 +78,7 @@ pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::
         return stream_future_to_iter(task_executor, stream_future);
     };
     // Race even the initial stream-producing future against cancellation.
-    let stream = match block_on_or_cancelled(&task_executor, &token, stream_future) {
+    let stream = match block_on_or_cancelled(&task_executor, token.clone(), stream_future) {
         Some(result) => result?,
         None => return Err(Error::Cancelled),
     };
@@ -93,7 +93,7 @@ pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::
 /// future completed first, or `None` if cancellation won. Fast-paths an already-cancelled token.
 pub(crate) fn block_on_or_cancelled<T, E: executor::TaskExecutor>(
     task_executor: &Arc<E>,
-    token: &CancellationTokenRef,
+    token: CancellationTokenRef,
     future: impl Future<Output = T> + Send + 'static,
 ) -> Option<T>
 where
@@ -102,9 +102,8 @@ where
     if token.is_cancelled() {
         return None;
     }
-    // Clone the `Arc` into the async block so the awaited `cancelled()` future borrows an owned
-    // local, keeping the whole future `'static` as `block_on` requires.
-    let token = token.clone();
+    // The owned `token` moves into the async block so the awaited `cancelled()` future borrows an
+    // owned local, keeping the whole future `'static` as `block_on` requires.
     task_executor.block_on(async move {
         let cancelled = token.cancelled();
         futures::pin_mut!(cancelled);
@@ -153,7 +152,7 @@ impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStrea
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut stream = self.stream.take()?;
-        match block_on_or_cancelled(&self.task_executor, &self.token, async move {
+        match block_on_or_cancelled(&self.task_executor, self.token.clone(), async move {
             let item = stream.next().await;
             (item, stream)
         }) {
@@ -580,7 +579,7 @@ mod tests {
             firing.cancel();
         });
 
-        let out: Option<i32> = block_on_or_cancelled(&executor, &ct, std::future::pending::<i32>());
+        let out: Option<i32> = block_on_or_cancelled(&executor, ct, std::future::pending::<i32>());
         assert!(out.is_none(), "cancel must win the select and yield None");
     }
 

@@ -700,10 +700,7 @@ pub trait JsonHandler: AsAny {
     ///
     /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
     /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion. The default implementation ignores the token
-    /// and delegates to [`read_json_files`](Self::read_json_files), so existing `JsonHandler`
-    /// implementations remain source-compatible; kernel still polls the token at action-batch
-    /// boundaries regardless.
+    /// rather than reading every file to completion.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_json_files_with_cancellation(
@@ -926,10 +923,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
     /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
-    /// rather than reading every file to completion. The default implementation ignores the token
-    /// and delegates to [`read_parquet_files`](Self::read_parquet_files), so existing
-    /// `ParquetHandler` implementations remain source-compatible; kernel still polls the token at
-    /// action-batch boundaries regardless.
+    /// rather than reading every file to completion.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_files_with_cancellation(
@@ -1024,9 +1018,7 @@ pub trait ParquetHandler: AsAny {
     /// Cancellation-aware variant of [`read_parquet_footer`](Self::read_parquet_footer).
     ///
     /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
-    /// and return [`Error::Cancelled`] once cancellation is observed. The default implementation
-    /// ignores the token and delegates to [`read_parquet_footer`](Self::read_parquet_footer), so
-    /// existing `ParquetHandler` implementations remain source-compatible.
+    /// and return [`Error::Cancelled`] once cancellation is observed.
     ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_footer_with_cancellation(

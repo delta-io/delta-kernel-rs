@@ -442,7 +442,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         // Race the footer read against cancellation so a cancelled request stops promptly.
         match cancellation_token {
-            Some(token) => super::block_on_or_cancelled(&self.task_executor, &token, footer_future)
+            Some(token) => super::block_on_or_cancelled(&self.task_executor, token, footer_future)
                 .unwrap_or(Err(Error::Cancelled)),
             None => self.task_executor.block_on(footer_future),
         }
