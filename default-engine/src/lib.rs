@@ -14,6 +14,7 @@ use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
+use delta_kernel::object_store::list::PaginatedListStore;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::WriteContext;
@@ -125,14 +126,27 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
 ///     .build();
 /// ```
-#[derive(Debug)]
 pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
+    /// Optional [`PaginatedListStore`] handle enabling single-directory log listing (delimiter
+    /// pushdown) on backends that support it. `None` uses the client-side fallback.
+    paginated: Option<Arc<dyn PaginatedListStore>>,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
     task_executor: E,
     /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
     /// fall back to the handlers' defaults.
     io_config: ReadIoConfig,
+}
+
+impl<E: std::fmt::Debug> std::fmt::Debug for DefaultEngineBuilder<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DefaultEngineBuilder")
+            .field("object_store", &self.object_store)
+            .field("paginated", &self.paginated.is_some())
+            .field("task_executor", &self.task_executor)
+            .field("io_config", &self.io_config)
+            .finish()
+    }
 }
 
 /// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
@@ -156,6 +170,7 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
+            paginated: None,
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
         }
@@ -164,7 +179,12 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.paginated,
+            task_executor,
+            self.io_config,
+        )
     }
 }
 
@@ -178,9 +198,22 @@ impl<E> DefaultEngineBuilder<E> {
     ) -> DefaultEngineBuilder<Arc<F>> {
         DefaultEngineBuilder {
             object_store: self.object_store,
+            paginated: self.paginated,
             task_executor,
             io_config: self.io_config,
         }
+    }
+
+    /// Enable single-level log listing (delimiter pushdown) for a store that also
+    /// implements [`PaginatedListStore`]. This is typically the same concrete
+    /// `Arc<AmazonS3>` / `Arc<GoogleCloudStorage>` / `Arc<MicrosoftAzure>` passed to [`Self::new`],
+    /// which coerces to both trait objects independently.
+    ///
+    /// Without this, log listing falls back to a recursive listing filtered to direct children
+    /// client-side, which is correct but pages through subdirectories.
+    pub fn with_paginated_list_store(mut self, paginated: Arc<dyn PaginatedListStore>) -> Self {
+        self.paginated = Some(paginated);
+        self
     }
 
     /// Set the maximum number of files read concurrently by the JSON and Parquet handlers in their
@@ -208,7 +241,12 @@ impl<E> DefaultEngineBuilder<E> {
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.paginated,
+            self.task_executor,
+            self.io_config,
+        )
     }
 }
 
@@ -226,11 +264,13 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 impl<E: TaskExecutor> DefaultEngine<E> {
     fn new_with_opts(
         object_store: Arc<DynObjectStore>,
+        paginated: Option<Arc<dyn PaginatedListStore>>,
         task_executor: Arc<E>,
         io_config: ReadIoConfig,
     ) -> Self {
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
+            paginated,
             task_executor.clone(),
         ));
 

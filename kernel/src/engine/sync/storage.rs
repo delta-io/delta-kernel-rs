@@ -53,7 +53,14 @@ impl StorageHandler for SyncStorageHandler {
                 .collect::<Vec<_>>(),
         )
         .into_iter()
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
+        // Single-directory contract: keep only direct children of `prefix`. `prefix_match` yields
+        // the path parts after `prefix`; a direct child has exactly one remaining part.
+        metas.retain(|meta| {
+            meta.location
+                .prefix_match(&prefix)
+                .is_some_and(|parts| parts.count() == 1)
+        });
         metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
         let iter = metas.into_iter().map(move |meta| {
@@ -221,10 +228,9 @@ mod tests {
         Ok(())
     }
 
-    /// `list_from` against an [`ObjectStore`] must walk subdirectories, matching the local FS
-    /// implementation that uses `read_dir` recursively.
+    /// `list_from` is single-directory: files in nested subdirectories are excluded.
     #[tokio::test]
-    async fn list_from_store_is_recursive() {
+    async fn list_from_store_is_single_directory() {
         let store = std::sync::Arc::new(InMemory::new());
         store
             .put(
@@ -253,7 +259,7 @@ mod tests {
             .iter()
             .map(|f| f.location.path().to_string())
             .collect();
-        assert_eq!(names, vec!["/a/file1.json", "/a/sub/file2.json"]);
+        assert_eq!(names, vec!["/a/file1.json"]);
     }
 
     #[test]

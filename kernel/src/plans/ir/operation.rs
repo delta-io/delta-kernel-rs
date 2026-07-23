@@ -37,7 +37,7 @@ impl Operation {
 /// is documented on the variant in terms of [`PlanResult`](crate::plans::PlanResult).
 #[derive(Debug)]
 pub enum IoOperation {
-    /// Recursively list files at the given URL.
+    /// List files directly within the parent directory of the given URL.
     ///
     /// Should return a [`PlanResult::FileMeta`](crate::plans::PlanResult::FileMeta) with one entry
     /// per file. See [`StorageHandler::list_from`] for more details on the ordering contract.
