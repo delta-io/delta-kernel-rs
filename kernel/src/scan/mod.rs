@@ -16,6 +16,8 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
@@ -27,6 +29,8 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -46,6 +50,8 @@ pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod scan_plan;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
@@ -956,6 +962,29 @@ impl Scan {
             emit_scan_metadata_completed(&event);
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[allow(dead_code)]
+    fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        let log_segment = self.snapshot.log_segment();
+        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+        let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
+        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
+        // whether the checkpoint carries a compatible parsed-stats column.
+        let plan_executor = engine.plan_executor();
+        let shape = CheckpointShape::try_new(
+            plan_executor.as_ref(),
+            &self.snapshot,
+            self.state_info.physical_stats_schema.as_ref(),
+        )?;
+        scan_plan::build_metadata_scan_plan(
+            &self.state_info,
+            commit_files,
+            checkpoint,
+            &shape,
+            log_segment.log_root.clone(),
+        )
     }
 
     // Factored out to facilitate testing

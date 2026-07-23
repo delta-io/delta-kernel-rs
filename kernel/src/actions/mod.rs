@@ -86,8 +86,10 @@ pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
 #[internal_api]
 pub(crate) const STATS_PARSED: &str = "stats_parsed";
 
+pub(crate) static ADD_SCHEMA: LazyLock<StructType> = LazyLock::new(Add::to_schema);
+
 pub(crate) static ADD_FIELD: LazyLock<StructField> =
-    LazyLock::new(|| StructField::nullable(ADD_NAME, Add::to_schema()));
+    LazyLock::new(|| StructField::nullable(ADD_NAME, ADD_SCHEMA.clone()));
 pub(crate) static REMOVE_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(REMOVE_NAME, Remove::to_schema()));
 pub(crate) static METADATA_FIELD: LazyLock<StructField> =

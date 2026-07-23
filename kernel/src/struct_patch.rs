@@ -703,6 +703,11 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         }
     }
 
+    /// Returns the schema this projection patch is applied to.
+    pub fn input_schema(&self) -> &StructType {
+        self.input_schema
+    }
+
     // === Drops (no emitted field/expression) ===
 
     /// Records a field drop. The dropped field is omitted from both the output schema and the

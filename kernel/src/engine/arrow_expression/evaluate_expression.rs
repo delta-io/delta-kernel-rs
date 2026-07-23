@@ -28,6 +28,7 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::delta_kernel_derive::internal_api;
 use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
@@ -43,7 +44,8 @@ use crate::expressions::{
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
-pub(super) trait ProvidesColumnByName {
+#[internal_api]
+pub(crate) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
 }
@@ -81,7 +83,8 @@ impl ProvidesColumnByName for StructArray {
 // }
 // ```
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-pub(super) fn extract_column(
+#[internal_api]
+pub(crate) fn extract_column(
     mut parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
 ) -> DeltaResult<ArrayRef> {
