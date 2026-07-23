@@ -10,9 +10,10 @@ use url::Url;
 use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
-    LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME,
-    REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, CDC_NAME,
+    CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME, DOMAIN_METADATA_NAME, LOG_METADATA_SCHEMA,
+    MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -1398,10 +1399,10 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 }
 
 /// The scan's add-only checkpoint read schema derives an `add.path IS NOT NULL` meta-predicate
-/// (via `schema_to_is_not_null_predicate`), letting the parquet reader skip any checkpoint row
-/// group whose `add.path` column is entirely null -- a group holding only Remove tombstones (or
-/// other non-Add actions). A group with even one live Add has a non-null `add.path` and is kept in
-/// full, so no live Add is ever dropped.
+/// (via `checkpoint_action_projection_predicate`), letting the parquet reader skip any checkpoint
+/// row group whose `add.path` column is entirely null -- a group holding only Remove tombstones
+/// (or other non-Add actions). A group with even one live Add has a non-null `add.path` and is kept
+/// in full, so no live Add is ever dropped.
 ///
 /// Each case writes one checkpoint parquet file with one row group per supplied batch. A baseline
 /// read with no predicate materializes every row, confirming the rows physically exist -- so the
@@ -4514,32 +4515,56 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         Expression::column(ColumnName::new([ADD_NAME, "path"])).is_not_null(),
     )),
 )]
-#[case::unknown_field_returns_none(
+#[case::remove_field(
     StructType::new_unchecked([StructField::nullable(REMOVE_NAME, StructType::new_unchecked([]))]),
+    Some(Arc::new(
+        Expression::column(ColumnName::new([REMOVE_NAME, "path"])).is_not_null(),
+    )),
+)]
+#[case::cdc_field(
+    schema! { nullable (CDC_NAME): {} },
+    Some(Arc::new(
+        Expression::column(ColumnName::new([CDC_NAME, "path"])).is_not_null(),
+    )),
+)]
+#[case::checkpoint_metadata_field(
+    schema! { nullable (CHECKPOINT_METADATA_NAME): {} },
+    Some(Arc::new(
+        Expression::column(ColumnName::new([CHECKPOINT_METADATA_NAME, "version"])).is_not_null(),
+    )),
+)]
+#[case::sidecar_field(
+    schema! { nullable (SIDECAR_NAME): {} },
+    Some(Arc::new(
+        Expression::column(ColumnName::new([SIDECAR_NAME, "path"])).is_not_null(),
+    )),
+)]
+#[case::action_without_required_leaf_returns_none(
+    schema! { nullable (COMMIT_INFO_NAME): {} },
     None,
 )]
-#[case::multiple_known_fields(
+#[case::add_and_remove_fields(
     StructType::new_unchecked([
-        StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
-        StructField::nullable(PROTOCOL_NAME, StructType::new_unchecked([])),
+        StructField::nullable(ADD_NAME, StructType::new_unchecked([])),
+        StructField::nullable(REMOVE_NAME, StructType::new_unchecked([])),
     ]),
     Some(Arc::new(Predicate::or(
-        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
-        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
+        Expression::column(ColumnName::new([ADD_NAME, "path"])).is_not_null(),
+        Expression::column(ColumnName::new([REMOVE_NAME, "path"])).is_not_null(),
     ))),
 )]
 #[case::known_and_unknown_field_returns_none(
     StructType::new_unchecked([
         StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
-        StructField::nullable(REMOVE_NAME, StructType::new_unchecked([])),
+        StructField::nullable(COMMIT_INFO_NAME, StructType::new_unchecked([])),
     ]),
     None,
 )]
-fn test_schema_to_is_not_null_predicate(
+fn test_checkpoint_action_projection_predicate(
     #[case] schema: StructType,
     #[case] expected: Option<PredicateRef>,
 ) {
-    assert_eq!(schema_to_is_not_null_predicate(&schema), expected);
+    assert_eq!(checkpoint_action_projection_predicate(&schema), expected);
 }
 
 /// Verify that `read_actions` correctly handles null values in map fields across all
