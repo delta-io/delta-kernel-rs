@@ -588,22 +588,23 @@ fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] va
 }
 
 #[test]
-fn test_checkpoint_skipping_floating_partition_cast_is_disabled() {
+fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
     let partition_columns = HashSet::from([column_name!("part_col")]);
     let pred = Pred::eq(
         Expr::cast(column_expr!("part_col"), DataType::INTEGER),
         Scalar::from(42),
     );
 
-    assert!(
-        as_checkpoint_skipping_predicate(
-            &pred,
-            &partition_columns,
-            &partition_columns,
-            &HashSet::new(),
-        )
-        .is_none(),
-        "parquet footer min/max exclude NaN partition values"
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &partition_columns,
+        &HashSet::new(),
+    );
+
+    assert_eq!(
+        skipping_pred.map(|pred| pred.to_string()).as_deref(),
+        Some("CAST(Column(partitionValues_parsed.part_col) AS integer) = 42")
     );
 }
 

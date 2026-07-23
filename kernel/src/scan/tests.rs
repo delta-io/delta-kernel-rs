@@ -1658,6 +1658,16 @@ fn standard_multi_rg() -> Bytes {
     ),
     vec![1, 2, 3, 4]
 )]
+#[case::partition_cast_and_stats(
+    Pred::and(
+        Pred::eq(
+            Expr::cast(column_expr!("part"), DataType::DATE),
+            Scalar::Date(18_628),
+        ),
+        Pred::gt(column_expr!("x"), Expr::literal(150i64)),
+    ),
+    vec![3, 4]
+)]
 #[case::and_stats_and_partition(
     Pred::and(
         Pred::eq(column_expr!("part"), Expr::literal("a")),

@@ -110,6 +110,11 @@ pub trait JsonHandler {
   columns should be omitted from the output to save space. The write must be atomic. If
   `overwrite` is false and the file exists, fail with an error.
 
+If a read handler applies the predicate hint, it may discard data only when conservative
+evaluation of the complete predicate proves it cannot match. JSON evaluation uses exact row
+values. Parquet footer evaluation may cast min/max only when the cast preserves those bounds.
+Unsupported expressions and missing references remain unknown and must not fail the read.
+
 ### Default implementation
 
 The `DefaultEngine` uses `arrow_json` for parsing and the `object_store` crate for I/O.

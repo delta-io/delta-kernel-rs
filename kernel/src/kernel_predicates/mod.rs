@@ -880,11 +880,12 @@ pub trait DataSkippingPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
-    /// Override hook called by the blanket [`KernelPredicateEvaluator`] implementation for CAST.
+    /// See [`KernelPredicateEvaluator::eval_pred_cast`].
     ///
-    /// `inverted` represents the outer `NOT`. Returns `None` unless evaluation uses exact values or
-    /// the cast is proven to preserve the bounds represented by [`Self::ColumnStat`].
-    fn eval_data_skipping_pred_cast(
+    /// Implementations may evaluate exact values or rewrite casts over exact-value references. A
+    /// bound-based consumer of a rewritten predicate must independently prove that the cast
+    /// preserves those bounds.
+    fn eval_pred_cast(
         &self,
         _op: BinaryPredicateOp,
         _col: &ColumnName,
@@ -1071,9 +1072,7 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         val: &Scalar,
         inverted: bool,
     ) -> Option<Self::Output> {
-        DataSkippingPredicateEvaluator::eval_data_skipping_pred_cast(
-            self, op, col, target, val, inverted,
-        )
+        DataSkippingPredicateEvaluator::eval_pred_cast(self, op, col, target, val, inverted)
     }
 
     fn eval_pred_opaque(
