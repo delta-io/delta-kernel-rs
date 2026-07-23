@@ -235,7 +235,7 @@ impl SyncPlanExecutor {
     }
 
     /// Reads files named by `input` rows. This intentionally supports only the shapes currently
-    /// emitted by prototype plans: string paths, optional LONG sizes, nullable DV (unsupported when
+    /// emitted by prototype plans: string paths, positive LONG sizes, nullable DV (unsupported when
     /// non-null), and scalar file constants.
     fn eval_load(&self, load: Load, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
         let mut files = Vec::new();
@@ -246,7 +246,7 @@ impl SyncPlanExecutor {
 
             for row in 0..batch.num_rows() {
                 if path.is_null(row) {
-                    continue;
+                    return Err(Error::generic("Load path must not be null"));
                 }
                 if dv.is_valid(row) {
                     return Err(Error::unsupported(
@@ -258,11 +258,15 @@ impl SyncPlanExecutor {
                     Some(base) => base.join(&path)?,
                     None => url::Url::parse(&path)?,
                 };
-                let size = if size.is_null(row) {
-                    0
-                } else {
-                    long_value(size.as_ref(), row)? as u64
-                };
+                if size.is_null(row) {
+                    return Err(Error::generic("Load file size must not be null"));
+                }
+                let size = long_value(size.as_ref(), row)?;
+                if size <= 0 {
+                    return Err(Error::generic("Load file size must be positive"));
+                }
+                let size = u64::try_from(size)
+                    .map_err(|_| Error::generic("Load file size must fit in a u64"))?;
                 let file_constants = load
                     .file_constant_columns
                     .iter()
@@ -535,14 +539,20 @@ fn batch_to_rows(batch: &RecordBatch, columns: &[ColumnName]) -> DeltaResult<Vec
 
 fn string_value(array: &dyn Array, row: usize) -> DeltaResult<String> {
     let Some(strings) = array.as_any().downcast_ref::<StringArray>() else {
-        return Err(Error::generic("Load path column must be STRING"));
+        return Err(Error::generic(format!(
+            "Expected STRING array, got {:?}",
+            array.data_type()
+        )));
     };
     Ok(strings.value(row).to_string())
 }
 
 fn long_value(array: &dyn Array, row: usize) -> DeltaResult<i64> {
     let Some(longs) = array.as_any().downcast_ref::<Int64Array>() else {
-        return Err(Error::generic("Load LONG column had unexpected type"));
+        return Err(Error::generic(format!(
+            "Expected LONG array, got {:?}",
+            array.data_type()
+        )));
     };
     Ok(longs.value(row))
 }
@@ -558,7 +568,7 @@ fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
         return Ok(Scalar::Long(longs.value(row)));
     }
     Err(Error::unsupported(format!(
-        "SyncPlanExecutor Load file constant type {:?}",
+        "Scalar conversion from array type {:?}",
         array.data_type()
     )))
 }

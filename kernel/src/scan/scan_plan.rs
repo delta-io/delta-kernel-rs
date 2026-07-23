@@ -12,9 +12,6 @@
 //! -- and derives everything it needs from it. The only other inputs are snapshot-derived: the log
 //! files for the metadata scan.
 //!
-//! This first cut parses stats/partition values from the **add** side only, so removes are never
-//! pruned (safe -- the `add IS NULL` guard keeps every tombstone for anti-join).
-//!
 //! [`ScanLogReplayProcessor`]: super::log_replay::ScanLogReplayProcessor
 //! [`AddRemoveDedupVisitor`]: super::log_replay::AddRemoveDedupVisitor
 //! [`Filter`]: crate::plans::ir::nodes::Filter
@@ -81,6 +78,8 @@ const SIDECAR_SIZE_IN_BYTES: &str = "sizeInBytes";
 
 /// The version-tagged read schema for a log file set: `add` (+ `remove` for commits) plus the
 /// file-constant `version` column.
+///
+/// `include_remove` is `false` for JSON leaf checkpoints and `true` for commits.
 fn json_read_schema(include_remove: bool) -> SchemaRef {
     schema_ref! {
         (&ADD_FIELD),
@@ -169,20 +168,17 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 trait ProjectionStructPatchBuilderExt<'a> {
     /// The initial JSON parse of a file action is incomplete: `stats` is a string containing a JSON
     /// literal representing the actual stats, and `partitionValues` is a string-string map. Convert
-    /// both in-place to fully parsed structs. When the source carries the already-parsed
+    /// both in-place to fully parsed structs. When the input schema carries the already-parsed
     /// counterparts (`stats_parsed` / `partitionValues_parsed`, stored in parquet checkpoints),
-    /// prefer them: `read_stats_parsed` / `read_partition_values_parsed` say which are present in
-    /// the source schema and should be coalesced ahead of the reparsed fallback.
+    /// prefer them ahead of the reparsed fallback.
     ///
-    /// `read_stats_parsed` is gated on the resolved checkpoint shape (a parquet source only has a
-    /// usable `stats_parsed` when the checkpoint actually carries a compatible one). Native parsed
-    /// partition values are deferred until the shape reports their compatibility.
+    /// The checkpoint read schema includes `stats_parsed` only when the resolved checkpoint shape
+    /// reports a compatible column. Native parsed partition values are deferred until the shape
+    /// reports their compatibility.
     fn reparse_add(
         self,
         stats_schema: Option<&SchemaRef>,
         partition_schema: Option<&SchemaRef>,
-        read_stats_parsed: bool,
-        read_partition_values_parsed: bool,
     ) -> Self;
 }
 
@@ -191,15 +187,21 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         mut self,
         stats_schema: Option<&SchemaRef>,
         partition_schema: Option<&SchemaRef>,
-        read_stats_parsed: bool,
-        read_partition_values_parsed: bool,
     ) -> Self {
+        let has_stats_parsed = self
+            .input_schema()
+            .field_at(&column_name!("add.stats_parsed"))
+            .is_ok();
+        let has_partition_values_parsed = self
+            .input_schema()
+            .field_at(&column_name!("add.partitionValues_parsed"))
+            .is_ok();
         let add = [ADD_NAME];
         self = match stats_schema {
             Some(ss) => {
                 let field = StructField::nullable(STATS, ss.as_ref().clone());
                 let expr = Expr::parse_json(col!("add.stats"), Arc::clone(ss));
-                if read_stats_parsed {
+                if has_stats_parsed {
                     let expr = Expr::coalesce([col!(ADD_NAME, STATS_PARSED), expr]);
                     self.replace_at(add, STATS, field, expr)
                         .drop_at(add, STATS_PARSED)
@@ -213,7 +215,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             Some(ps) => {
                 let field = StructField::nullable(PARTITION_VALUES, ps.as_ref().clone());
                 let expr = Expr::map_to_struct(col!("add.partitionValues"));
-                if read_partition_values_parsed {
+                if has_partition_values_parsed {
                     let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
                     self.replace_at(add, PARTITION_VALUES, field, expr)
                         .drop_at(add, PARTITION_VALUES_PARSED)
@@ -262,22 +264,23 @@ fn reparsed_add_field(
 }
 
 /// Build the normalized commit JSON arm.
-fn json_arm(
+///
+/// SQL equivalent:
+///
+/// SELECT STRUCT(
+///          add.* EXCEPT (stats, partitionValues),
+///          FROM_JSON(add.stats, stats_schema) AS stats,
+///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
+///        ) AS add,
+///        remove, version, add.path IS NOT NULL AS is_add,
+///        file_key(COALESCE(add, remove)) AS key
+/// FROM json_commits
+/// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
+fn commit_arm(
     commit_files: Vec<ScanFile>,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
-    // SQL equivalent:
-    //
-    // SELECT STRUCT(
-    //          add.* EXCEPT (stats, partitionValues),
-    //          FROM_JSON(add.stats, stats_schema) AS stats,
-    //          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
-    //        ) AS add,
-    //        remove, version, add.path IS NOT NULL AS is_add,
-    //        file_key(COALESCE(add, remove)) AS key
-    // FROM json_commits
-    // WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
     PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
         .filter(Predicate::or(
             col!("add.path").is_not_null(),
@@ -287,12 +290,7 @@ fn json_arm(
             // Commits never carry source-native parsed columns, so normalize from the raw
             // encodings.
             patch
-                .reparse_add(
-                    stats_schema,
-                    partition_schema,
-                    /* read_stats_parsed */ false,
-                    /* read_partition_values_parsed */ false,
-                )
+                .reparse_add(stats_schema, partition_schema)
                 .append(
                     StructField::not_null(IS_ADD, DataType::BOOLEAN),
                     Expr::from(col!("add.path").is_not_null()),
@@ -353,34 +351,30 @@ fn sidecar_actions(
     sidecar_files.load(load)
 }
 
-/// Build the normalized checkpoint file-action arm, driven by the resolved [`CheckpointShape`].
-/// When there is no checkpoint, returns an absent relation with the normalized action schema.
+/// Build relation containing all the add/remove actions in the checkpoint using
+/// [`CheckpointShape`]. When there is no checkpoint, returns an absent relation with the normalized
+/// action schema.
 ///
-/// A checkpoint version is homogeneous, so `checkpoint` carries a single [`FileType`] and one part
-/// list. `shape` selects which relation actually holds the file actions:
-/// - [`CheckpointType::Leaf`]: actions are inline in the root parts (classic V1, multi-part, inline
-///   V2), read directly.
-/// - [`CheckpointType::Manifest`]: the root parts hold only sidecar references; the referenced
-///   sidecar files (always parquet) hold the actions.
-///
-/// The stats schemas play two different roles:
+/// Two schemas affect the plan:
 /// - The scan's [`StateInfo::physical_stats_schema`] is the downstream reparse target.
 /// - `shape.parsed_stats_schema` is what the checkpoint *source* actually carries. When `Some`, the
 ///   read schema includes an `add.stats_parsed` column. It also drives the sidecar [`Load`]'s read
 ///   schema, so the Load never references a column the sidecars lack.
+///
+/// Native parsed partition values are not requested until [`CheckpointShape`] reports their
+/// compatibility.
 fn checkpoint_arm(
     checkpoint: Option<(FileType, Vec<ScanFile>)>,
     shape: &CheckpointShape,
     log_root: &Url,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
-    source_partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
     let source_stats_schema = shape.parsed_stats_schema.as_ref();
 
     let actions = match (&shape.checkpoint_type, checkpoint) {
         (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
+            let schema = parquet_read_schema(source_stats_schema, None)?;
             PlanBuilder::scan_parquet(parts, &[VERSION], schema)
         }
         (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
@@ -390,7 +384,7 @@ fn checkpoint_arm(
             // The root parts only reference sidecars; the sidecar files (always parquet) hold the
             // actions. The Load read schema must match what the sidecars carry, hence the
             // source-side schema.
-            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
+            let schema = parquet_read_schema(source_stats_schema, None)?;
             sidecar_actions(file_type, parts, schema, log_root)
         }
         (CheckpointType::None, _) | (_, None) => {
@@ -409,19 +403,14 @@ fn checkpoint_arm(
     //          ) AS stats,
     //          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
     //        ) AS add,
-    //        version, file_key(add) AS key
+    //        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
     // FROM checkpoint_actions
     // WHERE add.path IS NOT NULL
     actions
         .filter(col!("add.path").is_not_null())?
         .project_patch(|patch| {
             patch
-                .reparse_add(
-                    stats_schema,
-                    partition_schema,
-                    /* read_stats_parsed */ source_stats_schema.is_some(),
-                    /* read_partition_values_parsed */ source_partition_schema.is_some(),
-                )
+                .reparse_add(stats_schema, partition_schema)
                 .append(
                     StructField::not_null(IS_ADD, DataType::BOOLEAN),
                     Expr::from(col!("add.path").is_not_null()),
@@ -512,9 +501,6 @@ pub(crate) fn build_metadata_scan_plan(
 
     let stats_schema = state.physical_stats_schema.as_ref();
     let partition_schema = state.physical_partition_schema.as_ref();
-    // Native checkpoint partition values are deferred until CheckpointShape reports their schema.
-    // Normalize from the canonical string map in every arm for now.
-    let source_partition_schema: Option<&SchemaRef> = None;
     let prune = stats_skipping_predicate(state);
     let prune = prune.as_ref();
 
@@ -523,18 +509,19 @@ pub(crate) fn build_metadata_scan_plan(
     let add_field = reparsed_add_field(stats_schema, partition_schema)?;
     let output_schema = schema_ref! { (&add_field) };
 
-    // Removes must survive pruning because their partition values are optional and cannot safely
-    // participate in authoritative partition pruning.
-    let commit_actions = json_arm(commit_files, stats_schema, partition_schema)?
+    // We filter so that:
+    // * All remove actions are kept
+    // * Add actions that do not match the partition pruning or stats predicate are removed.
+    //
+    // NOTE: It is important that add actions are filtered by the partition predicate because
+    // partition filtering may not be applied on data rows. On the other hand, failing to
+    // skip based on data columns is safe because the data predicate will also be evaluated
+    // on data rows.
+    let commit_actions = commit_arm(commit_files, stats_schema, partition_schema)?
         .try_fold_with(prune, |p, prune| {
             p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
         })?;
 
-    // SELECT key, MAX_NON_NULL_BY(STRUCT(add), version).add AS add
-    // FROM commit_actions
-    // GROUP BY key
-    //
-    // The non-null wrapper ensures remove rows participate even though their inner add is null.
     let deduped_commit = commit_actions
         .project_patch(|patch| {
             patch.replace(
@@ -548,20 +535,10 @@ pub(crate) fn build_metadata_scan_plan(
         })?
         .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
 
-    let checkpoint_adds = checkpoint_arm(
-        checkpoint,
-        shape,
-        &log_root,
-        stats_schema,
-        partition_schema,
-        source_partition_schema,
-    )?
-    .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+    let checkpoint_adds =
+        checkpoint_arm(checkpoint, shape, &log_root, stats_schema, partition_schema)?
+            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
 
-    // SELECT checkpoint.add
-    // FROM checkpoint_adds AS checkpoint
-    // LEFT ANTI JOIN latest_commits AS commit
-    //   ON checkpoint.key = commit.key
     let checkpoint_live_adds = checkpoint_adds
         .anti_join(
             deduped_commit.clone(),
@@ -570,14 +547,10 @@ pub(crate) fn build_metadata_scan_plan(
         )?
         .project(Expr::struct_from([col!("add")]), output_schema.clone())?;
 
-    // SELECT add FROM latest_commits WHERE add IS NOT NULL
     let commit_live_adds = deduped_commit
         .filter(col!("add").is_not_null())?
         .project(Expr::struct_from([col!("add")]), output_schema)?;
 
-    // SELECT add FROM live_commit_adds
-    // UNION ALL
-    // SELECT add FROM live_checkpoint_adds
     PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
 }
 
