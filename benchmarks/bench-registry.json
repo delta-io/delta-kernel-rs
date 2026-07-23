@@ -4,5 +4,53 @@
       { "name": "serial",    "parallelScan": "disabled" },
       { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
     ]
+  },
+  "crc1Col200Commits1ChkptCrc150": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } }
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptCrc195": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } }
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptCrcLatest": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } }
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptNoCrc": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } }
+      }
+    ]
   }
 }

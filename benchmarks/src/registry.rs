@@ -11,12 +11,13 @@ use serde::Deserialize;
 
 // === Harness configs ===
 
-/// A read-operation config: benchmark parameters not carried in the spec JSON. Deserialized
-/// directly from a `bench-registry.json` entry.
+/// A read-operation config: benchmark parameters not carried in the spec JSON.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadConfig {
+    /// Name appended to the configured benchmark identifier.
     pub name: String,
+    /// Whether metadata scanning runs serially or in parallel.
     pub parallel_scan: ParallelScan,
 }
 
@@ -35,8 +36,68 @@ pub fn default_read_configs() -> Vec<ReadConfig> {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ParallelScan {
+    /// Run the metadata scan serially.
     Disabled,
-    Enabled { num_threads: usize },
+    /// Run the metadata scan with the configured number of worker threads.
+    Enabled {
+        /// Number of worker threads.
+        num_threads: usize,
+    },
+}
+
+/// Configuration for a snapshot-construction benchmark.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotConstructionConfig {
+    /// Name appended to the configured benchmark identifier.
+    pub name: String,
+    /// Snapshot construction source.
+    pub snapshot_builder: SnapshotBuilderConfig,
+}
+
+/// The built-in fresh snapshot-construction config.
+pub fn default_snapshot_construction_config() -> SnapshotConstructionConfig {
+    SnapshotConstructionConfig {
+        name: "fresh".into(),
+        snapshot_builder: SnapshotBuilderConfig::For,
+    }
+}
+
+/// Selects the starting point for snapshot construction.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum SnapshotBuilderConfig {
+    /// Build a fresh snapshot using the table's resolved loading strategy.
+    For,
+    /// Build from a snapshot preconstructed at `version` outside the timed loop.
+    From {
+        /// Version of the preconstructed base snapshot.
+        version: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+// The variants must remain structurally disjoint because serde selects them by required fields.
+#[serde(untagged)]
+enum HarnessConfig {
+    Read(ReadConfig),
+    SnapshotConstruction(SnapshotConstructionConfig),
+}
+
+impl HarnessConfig {
+    fn name(&self) -> &str {
+        match self {
+            Self::Read(config) => &config.name,
+            Self::SnapshotConstruction(config) => &config.name,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Read(_) => "read",
+            Self::SnapshotConstruction(_) => "snapshot-construction",
+        }
+    }
 }
 
 // === Registry ===
@@ -44,7 +105,7 @@ pub enum ParallelScan {
 /// Error type for registry loading and lookup.
 pub type RegistryResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Read harness configs keyed by table directory name and workload spec filename.
+/// Benchmark harness configs keyed by table directory name and workload spec filename.
 ///
 /// For example, this entry runs `readMetadataLatest` against the table in the
 /// `10kAdds0CommitsSinceChkpt1V2Chkpt` directory once serially and once with two scan threads:
@@ -61,11 +122,12 @@ pub type RegistryResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// ```
 ///
 /// Each configuration creates a separate Criterion benchmark whose final name segment is the
-/// configuration `name`. Read workloads absent from the registry use the built-in serial config.
+/// configuration `name`. Unregistered read workloads use the built-in serial config, while
+/// unregistered snapshot-construction workloads retain their default fresh-snapshot behavior.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(transparent)]
 pub struct BenchRegistry {
-    tables: HashMap<String, HashMap<String, Vec<ReadConfig>>>,
+    tables: HashMap<String, HashMap<String, Vec<HarnessConfig>>>,
 }
 
 impl BenchRegistry {
@@ -85,23 +147,52 @@ impl BenchRegistry {
     ///
     /// Returns an error when the workload's table directory has no valid registry key.
     pub fn read_configs(&self, workload: &Workload) -> RegistryResult<Vec<ReadConfig>> {
-        let table = workload.table_info.registry_table_key().ok_or_else(|| {
-            format!(
-                "could not derive a registry table key for workload '{}'",
-                workload.case_name
-            )
-        })?;
-        Ok(self
-            .lookup(table, &workload.case_name)
-            .map_or_else(default_read_configs, ToOwned::to_owned))
+        let (table, case) = workload_registry_key(workload)?;
+        let Some(configs) = self.lookup(table, case) else {
+            return Ok(default_read_configs());
+        };
+        configs
+            .iter()
+            .map(|config| match config {
+                HarnessConfig::Read(config) => Ok(config.clone()),
+                other => Err(config_kind_error(table, case, "read", other.kind())),
+            })
+            .collect()
+    }
+
+    /// Returns configs for a snapshot-construction workload, or `None` when it is unlisted.
+    ///
+    /// Returns an error when the workload's table directory has no valid registry key or the
+    /// registered configs are for a different operation type.
+    pub fn snapshot_configs(
+        &self,
+        workload: &Workload,
+    ) -> RegistryResult<Option<Vec<SnapshotConstructionConfig>>> {
+        let (table, case) = workload_registry_key(workload)?;
+        let Some(configs) = self.lookup(table, case) else {
+            return Ok(None);
+        };
+        configs
+            .iter()
+            .map(|config| match config {
+                HarnessConfig::SnapshotConstruction(config) => Ok(config.clone()),
+                other => Err(config_kind_error(
+                    table,
+                    case,
+                    "snapshot-construction",
+                    other.kind(),
+                )),
+            })
+            .collect::<RegistryResult<Vec<_>>>()
+            .map(Some)
     }
 
     /// Validates the registry structure and its relationship to `workloads`.
     ///
     /// Only registry entries matching a workload in `workloads` receive workload-type validation,
     /// allowing callers to validate a tag-filtered workload set. Returns an error for empty config
-    /// lists, duplicate config names, invalid workload registry keys, or read configs targeting a
-    /// non-read workload.
+    /// lists or names, duplicate names, mixed config types, invalid workload registry keys, or
+    /// configs targeting the wrong workload type.
     pub fn validate(&self, workloads: &[Workload]) -> RegistryResult<()> {
         for (table, cases) in &self.tables {
             for (case, configs) in cases {
@@ -109,37 +200,46 @@ impl BenchRegistry {
                 if configs.is_empty() {
                     return Err(format!("registry entry '{key}' has an empty config list").into());
                 }
-                let names: HashSet<_> = configs.iter().map(|config| config.name.as_str()).collect();
+                if configs.iter().any(|config| config.name().is_empty()) {
+                    return Err(format!("empty config name in '{key}'").into());
+                }
+                let names: HashSet<_> = configs.iter().map(HarnessConfig::name).collect();
                 if names.len() != configs.len() {
                     return Err(format!("registry entry '{key}' has duplicate config names").into());
                 }
-            }
-        }
-
-        for workload in workloads {
-            let table = workload.table_info.registry_table_key().ok_or_else(|| {
-                format!(
-                    "could not derive a registry table key for workload '{}'",
-                    workload.case_name
-                )
-            })?;
-            if self.lookup(table, &workload.case_name).is_some() {
-                if let Spec::SnapshotConstruction(_) = &workload.spec {
+                let expected_kind = configs[0].kind();
+                if let Some(other) = configs.iter().find(|config| config.kind() != expected_kind) {
                     return Err(format!(
-                        "registry entry '{table}/{}' provides read configs for a {} workload",
-                        workload.case_name,
-                        workload.spec.as_str()
+                        "registry entry '{key}' mixes {expected_kind} and {} configs",
+                        other.kind()
                     )
                     .into());
                 }
             }
         }
+
+        for workload in workloads {
+            let (table, case) = workload_registry_key(workload)?;
+            let Some(configs) = self.lookup(table, case) else {
+                continue;
+            };
+            let expected_kind = match &workload.spec {
+                Spec::Read(_) => "read",
+                Spec::SnapshotConstruction(_) => "snapshot-construction",
+            };
+            let actual_kind = configs[0].kind();
+            if actual_kind != expected_kind {
+                return Err(format!(
+                    "registry entry '{table}/{case}' provides {actual_kind} configs for a \
+                     {expected_kind} workload"
+                )
+                .into());
+            }
+        }
         Ok(())
     }
 
-    /// All `(table, case)` keys in the registry. Lets the harness cross-check every entry against
-    /// the loaded workloads so a stale/typo'd key (which would otherwise silently fall back to
-    /// defaults) is caught.
+    /// All `(table, case)` keys in the registry.
     pub fn keys(&self) -> impl Iterator<Item = (&str, &str)> {
         self.tables.iter().flat_map(|(table, cases)| {
             cases
@@ -148,13 +248,31 @@ impl BenchRegistry {
         })
     }
 
-    /// Looks up the config list for `"{table}/{case}"`, if the registry lists it.
-    fn lookup(&self, table: &str, case: &str) -> Option<&[ReadConfig]> {
+    fn lookup(&self, table: &str, case: &str) -> Option<&[HarnessConfig]> {
         self.tables
             .get(table)
             .and_then(|cases| cases.get(case))
             .map(Vec::as_slice)
     }
+}
+
+fn workload_registry_key(workload: &Workload) -> RegistryResult<(&str, &str)> {
+    let table = workload.table_info.registry_table_key().ok_or_else(|| {
+        format!(
+            "could not derive a registry table key for workload '{}'",
+            workload.case_name
+        )
+    })?;
+    Ok((table, &workload.case_name))
+}
+
+fn config_kind_error(
+    table: &str,
+    case: &str,
+    expected: &str,
+    actual: &str,
+) -> Box<dyn std::error::Error> {
+    format!("registry entry '{table}/{case}' contains {actual} configs, expected {expected}").into()
 }
 
 #[cfg(test)]
@@ -196,6 +314,16 @@ mod tests {
             "readMetadataLatest": [
                 { "name": "serial",    "parallelScan": "disabled" },
                 { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
+            ],
+            "snapshotLatest": [
+                {
+                    "name": "fresh",
+                    "snapshotBuilder": "for"
+                },
+                {
+                    "name": "from199",
+                    "snapshotBuilder": { "from": { "version": 199 } }
+                }
             ]
         }
     }"#;
@@ -205,6 +333,7 @@ mod tests {
         let registry = registry_from_str(FULL_REGISTRY);
         assert_eq!(registry.tables.len(), 1);
         assert_eq!(registry.tables["v2"]["readMetadataLatest"].len(), 2);
+        assert_eq!(registry.tables["v2"]["snapshotLatest"].len(), 2);
     }
 
     #[test]
@@ -223,15 +352,31 @@ mod tests {
     }
 
     #[test]
-    fn unlisted_read_benchmark_falls_back_to_serial() {
-        // An unlisted read benchmark in a populated registry and any lookup against an empty
-        // registry both fall back to the built-in serial config.
+    fn snapshot_configs_use_explicit_entry() {
+        let registry = registry_from_str(FULL_REGISTRY);
+        let configs = registry
+            .snapshot_configs(&read_workload("v2", "snapshotLatest"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(configs[0].snapshot_builder, SnapshotBuilderConfig::For);
+        assert_eq!(
+            configs[1].snapshot_builder,
+            SnapshotBuilderConfig::From { version: 199 }
+        );
+    }
+
+    #[test]
+    fn unlisted_benchmarks_use_operation_defaults() {
         for registry in [registry_from_str(FULL_REGISTRY), registry_from_str("{}")] {
             let read = registry
                 .read_configs(&read_workload("other", "readMetadataLatest"))
                 .unwrap();
             assert_eq!(read.len(), 1);
             assert_eq!(read[0].name, "serial");
+            assert!(registry
+                .snapshot_configs(&read_workload("other", "snapshotLatest"))
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -261,8 +406,38 @@ mod tests {
 
         let error = registry.validate(&[workload]).unwrap_err().to_string();
         assert!(
-            error.contains("provides read configs for a snapshotConstruction workload"),
+            error.contains("provides read configs for a snapshot-construction workload"),
             "got: {error}"
+        );
+    }
+
+    #[test]
+    fn workload_validation_rejects_snapshot_configs_for_read_workload() {
+        let registry = registry_from_str(FULL_REGISTRY);
+        let workload = read_workload("v2", "snapshotLatest");
+
+        let error = registry.validate(&[workload]).unwrap_err().to_string();
+        assert!(
+            error.contains("provides snapshot-construction configs for a read workload"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn wrong_config_type_errors_at_lookup() {
+        let registry = registry_from_str(FULL_REGISTRY);
+        let read_err = registry
+            .read_configs(&read_workload("v2", "snapshotLatest"))
+            .unwrap_err()
+            .to_string();
+        assert!(read_err.contains("expected read"), "got: {read_err}");
+        let snapshot_err = registry
+            .snapshot_configs(&read_workload("v2", "readMetadataLatest"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            snapshot_err.contains("expected snapshot-construction"),
+            "got: {snapshot_err}"
         );
     }
 
@@ -280,10 +455,26 @@ mod tests {
     }
 
     #[test]
+    fn mixed_config_types_error_at_validation() {
+        let json = r#"{
+            "t": { "c": [
+                { "name": "read", "parallelScan": "disabled" },
+                {
+                    "name": "snapshot",
+                    "snapshotBuilder": "for"
+                }
+            ] }
+        }"#;
+        let registry: BenchRegistry = serde_json::from_str(json).unwrap();
+        let err = registry.validate(&[]).unwrap_err().to_string();
+        assert!(
+            err.contains("mixes read and snapshot-construction"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn empty_config_list_errors_at_validation() {
-        // An explicit `[]` would expand to zero benchmarks, silently dropping the benchmark, so it
-        // is rejected at load rather than accepted like a missing key (which falls back to
-        // default).
         let json = r#"{ "t": { "readMetadataLatest": [] } }"#;
         let registry: BenchRegistry = serde_json::from_str(json).unwrap();
         let err = registry.validate(&[]).unwrap_err().to_string();
@@ -291,8 +482,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_config_name_errors_at_validation() {
+        let json = r#"{
+            "t": { "c": [ { "name": "", "parallelScan": "disabled" } ] }
+        }"#;
+        let registry: BenchRegistry = serde_json::from_str(json).unwrap();
+        let err = registry.validate(&[]).unwrap_err().to_string();
+        assert!(err.contains("empty config name"), "got: {err}");
+    }
+
+    #[test]
     fn malformed_entry_errors_at_load() {
-        // `parallelScn` is a typo, so the entry is not a valid read config.
         let json = r#"{
             "t": { "c": [ { "name": "x", "parallelScn": "disabled" } ] }
         }"#;
@@ -301,7 +501,6 @@ mod tests {
 
     #[test]
     fn non_object_table_entry_errors() {
-        // Each table key must map to an object of case -> config list, not a scalar.
         let result: Result<BenchRegistry, _> = serde_json::from_str(r#"{ "t": 1 }"#);
         assert!(result.is_err());
     }

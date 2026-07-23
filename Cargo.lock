@@ -1384,6 +1384,7 @@ dependencies = [
  "flate2",
  "object_store 0.12.5",
  "rayon",
+ "rstest",
  "serde",
  "serde_json",
  "sha2",
