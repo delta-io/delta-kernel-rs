@@ -874,8 +874,9 @@ pub trait ParquetHandler: AsAny {
     /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. A
     ///   file, row group, or row may be omitted only when the predicate cannot evaluate to true for
     ///   any row in that unit. CAST and NULL semantics must agree with the eventual query filter.
-    ///   Casting footer min/max is valid only when the cast preserves those bounds; otherwise the
-    ///   CAST subexpression must remain unknown and must not fail the read. Other unsupported
+    ///   An evaluator using exact row values may evaluate a compatible CAST directly. Footer
+    ///   min/max may be cast only when the cast preserves those bounds; otherwise footer evaluation
+    ///   of the CAST must remain unknown and must not fail the read. Other unsupported
     ///   subexpressions and references with no matching physical or generated value must also
     ///   remain unknown and must not fail the read. A missing reference remains unknown for pruning
     ///   even if schema reconciliation synthesizes a NULL output column. Returned data is not

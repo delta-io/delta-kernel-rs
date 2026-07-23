@@ -825,8 +825,8 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    /// Rewrites casts only over per-Add partition leaves; data-column casts return `None`.
-    fn eval_data_skipping_pred_cast(
+    /// Rewrites casts over exact per-Add partition values.
+    fn eval_pred_cast(
         &self,
         op: BinaryPredicateOp,
         col: &ColumnName,
@@ -834,7 +834,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        if !self.is_partition_column(col) || self.partition_min_max_may_omit_values(col) {
+        if !self.is_partition_column(col) {
             return None;
         }
         let ord = match op {
