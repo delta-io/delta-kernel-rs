@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Int32Array, StringArray};
+use delta_kernel::arrow::array::{new_null_array, Int32Array, StringArray};
+use delta_kernel::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
@@ -16,7 +17,9 @@ use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error as KernelError};
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
-use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables, test_read};
+use test_utils::{
+    into_record_batch, load_and_begin_transaction, set_json_value, setup_test_tables, test_read,
+};
 
 use crate::common::write_utils::{
     check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
@@ -368,6 +371,64 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
                 true,
             _ => false,
         }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let schema = get_simple_int_schema();
+
+    for field in ["path", "partitionValues", "size", "modificationTime"] {
+        let (table_url, engine, _store, _table_name) =
+            setup_test_tables(schema.clone(), &[], None, "required_field_table")
+                .await?
+                .into_iter()
+                .next()
+                .expect("at least one test table");
+        let engine = Arc::new(engine);
+        let mut txn =
+            load_and_begin_transaction(table_url, engine.as_ref())?.with_data_change(true);
+
+        // Produce valid `add` metadata, then null one required column so the commit must reject it.
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let write_context = Arc::new(txn.unpartitioned_write_context()?);
+        let meta = engine
+            .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
+            .await?;
+
+        let batch = into_record_batch(meta);
+        let index = batch.schema().index_of(field)?;
+
+        // The add-metadata schema declares these fields non-nullable, so rebuild the schema with
+        // the target field made nullable before inserting a null column.
+        let mut fields: Vec<ArrowField> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields[index] = fields[index].clone().with_nullable(true);
+        let nullable_schema = Arc::new(ArrowSchema::new(fields));
+        let mut columns = batch.columns().to_vec();
+        columns[index] = new_null_array(nullable_schema.field(index).data_type(), batch.num_rows());
+        let corrupted = RecordBatch::try_new(nullable_schema, columns)?;
+        txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
+
+        let err = txn
+            .commit(engine.as_ref())
+            .expect_err(&format!(
+                "commit should reject an add missing required field '{field}'"
+            ))
+            .to_string();
+        assert!(
+            err.contains(&format!("missing required field '{field}'")),
+            "field {field}: unexpected error {err:?}"
+        );
     }
     Ok(())
 }
