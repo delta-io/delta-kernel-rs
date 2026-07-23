@@ -65,9 +65,9 @@ pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
 /// Returns the required leaf used to identify rows containing `action_name`.
 ///
-/// Returns `None` for unknown actions and actions without a required leaf. The table covers every
-/// checkpoint-projectable action, not just those a caller projects today, so callers passing any
-/// subset of the checkpoint action schema derive a correct presence predicate.
+/// Returns `None` for unknown actions and actions without a required leaf. The table covers more
+/// actions than any single caller projects today, so callers passing any subset of their projected
+/// action schema derive a correct presence predicate.
 pub(crate) fn action_presence_leaf(action_name: &str) -> Option<&'static str> {
     match action_name {
         ADD_NAME | REMOVE_NAME | CDC_NAME | SIDECAR_NAME => Some("path"),

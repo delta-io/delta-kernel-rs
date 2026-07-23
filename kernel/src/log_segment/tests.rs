@@ -10,7 +10,7 @@ use url::Url;
 use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, COMMIT_INFO_NAME,
+    get_all_actions_schema, get_commit_schema, Add, Remove, Sidecar, ADD_NAME, COMMIT_INFO_NAME,
     LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, REMOVE_NAME,
     SIDECAR_NAME,
 };
@@ -1572,6 +1572,69 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     assert_eq!(
         add_paths, expected,
         "predicate handling must surface every live Add and no others"
+    );
+
+    Ok(())
+}
+
+/// JSON checkpoints have no row groups to skip, so the derived `add.path IS NOT NULL` predicate
+/// prunes nothing: a remove tombstone stored alongside a live Add is still materialized.
+#[tokio::test]
+async fn test_scan_checkpoint_read_keeps_all_rows_for_json_checkpoint() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let checkpoint_name =
+        "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json";
+    write_json_to_store(
+        &store,
+        vec![
+            Action::Remove(Remove {
+                path: "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+        ],
+        checkpoint_name,
+    )
+    .await?;
+
+    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    let filtered = log_segment
+        .read_actions_with_projected_checkpoint_actions(
+            &engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None, // meta_predicate
+            None, // stats_schema
+            None, // partition_schema
+        )?
+        .actions;
+
+    let (rows_after_pruning, add_paths) = collect_filtered_adds(filtered)?;
+    assert_eq!(
+        rows_after_pruning, 2,
+        "a JSON checkpoint has no row groups to skip, so every row is materialized"
+    );
+    assert_eq!(
+        add_paths,
+        vec!["part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string()],
     );
 
     Ok(())

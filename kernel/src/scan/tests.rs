@@ -784,7 +784,7 @@ fn test_replay_for_scan_metadata() {
     let scan = snapshot.scan_builder().build().unwrap();
     let result = scan.replay_for_scan_metadata(&engine).unwrap();
     let data: Vec<_> = result.actions.try_collect().unwrap();
-    // Metadata and protocol parts have all-null `add.path` statistics and are skipped. Transaction
+    // Metadata and protocol parts have an all-null `add.path` column and are skipped. Transaction
     // parts omit that column and are retained conservatively.
     assert_eq!(data.len(), 3);
 }

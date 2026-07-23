@@ -58,10 +58,8 @@ pub(crate) fn sidecar_batch_with_given_paths_and_sizes(
         .collect();
     json_strings.push(r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#.to_string());
 
-    parse_batch(
-        &json_strings.iter().map(String::as_str).collect_vec(),
-        output_schema,
-    )
+    let json_refs = json_strings.iter().map(String::as_str).collect_vec();
+    parse_batch(&json_refs, output_schema)
 }
 
 // Generates a batch with an add action.
