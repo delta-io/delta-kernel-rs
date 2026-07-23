@@ -60,10 +60,13 @@ async fn write_blocked_when_cargo_feature_off() -> Result<(), Box<dyn std::error
 mod enabled {
     use std::collections::HashMap;
 
-    use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use delta_kernel::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::DynObjectStore;
     use delta_kernel::transaction::Transaction;
-    use delta_kernel::SnapshotRef;
+    use delta_kernel::{Engine as _, SnapshotRef};
+    use itertools::Itertools as _;
     use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
     use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{create_table_with_configuration, insert_data};
@@ -131,6 +134,28 @@ mod enabled {
         );
     }
 
+    /// Builds a logical batch of the table's schema (`amount: LONG`, `name: STRING`) for validator
+    /// tests. `amounts` carries the nullable values the constraints are checked against.
+    fn batch(
+        amounts: Vec<Option<i64>>,
+        names: Vec<&str>,
+    ) -> Result<ArrowEngineData, Box<dyn std::error::Error>> {
+        let arrow_schema = Arc::new(test_schema().as_ref().try_into_arrow()?);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(amounts)),
+            Arc::new(StringArray::from(names)),
+        ];
+        Ok(ArrowEngineData::new(RecordBatch::try_new(
+            arrow_schema,
+            columns,
+        )?))
+    }
+
+    fn assert_err_contains(err: delta_kernel::Error, needle: &str) {
+        let msg = err.to_string();
+        assert!(msg.contains(needle), "expected '{needle}' in error: {msg}");
+    }
+
     #[tokio::test]
     async fn creating_a_transaction_on_a_constrained_table_does_not_require_acknowledgment(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -193,6 +218,106 @@ mod enabled {
 
         add_one_file(&mut txn)?;
         txn.commit(&engine)?.unwrap_committed();
+        Ok(())
+    }
+
+    /// A connector runs the kernel-built validator over its data before writing. A satisfying batch
+    /// passes; a `false` row and a `NULL` row (the protocol counts both as violations) each raise a
+    /// [`CheckConstraintViolation`] naming the constraint. `write_parquet` itself validates
+    /// nothing.
+    #[tokio::test]
+    async fn validator_catches_false_and_null_violations() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (table_url, engine) = setup_constrained_table(
+            "test_cc_validator_violations",
+            &[("positive_amount", "amount > 0")],
+        )
+        .await?;
+        // Calling check_constraints() is itself the acknowledgment; it also reports the set is
+        // fully kernel-parsable, so a validator binds without failing closed.
+        let txn = begin_txn(&table_url, &engine)?;
+        let constraints = txn.check_constraints();
+        assert!(constraints.is_kernel_parsable());
+        let constraint = constraints
+            .iter()
+            .exactly_one()
+            .expect("table has exactly one constraint");
+        assert!(constraint.predicate().is_some());
+
+        let handler = engine.evaluation_handler();
+
+        // All rows satisfy the constraint.
+        constraint.validate(
+            &batch(vec![Some(1), Some(5)], vec!["a", "b"])?,
+            handler.as_ref(),
+        )?;
+
+        // A `false` row violates, and the error names the constraint.
+        let err = constraint
+            .validate(
+                &batch(vec![Some(1), Some(-5)], vec!["a", "b"])?,
+                handler.as_ref(),
+            )
+            .expect_err("a negative amount must violate");
+        assert_err_contains(err, "positive_amount");
+
+        // A `NULL` predicate result also violates (only `true` passes).
+        let err = constraint
+            .validate(
+                &batch(vec![Some(1), None], vec!["a", "b"])?,
+                handler.as_ref(),
+            )
+            .expect_err("a NULL amount must violate");
+        assert_err_contains(err, "NULL");
+        Ok(())
+    }
+
+    /// Building a validator over a constraint kernel cannot parse fails closed (before any data is
+    /// written); a connector with no SQL engine of its own must refuse the write. The validator is
+    /// bound once from the acknowledged set and reused, and a typed violation carries the offending
+    /// value.
+    #[tokio::test]
+    async fn validator_binds_once_and_fails_closed_on_unparsable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, engine) = setup_constrained_table(
+            "test_cc_validator_fail_closed",
+            &[("amount_range", "amount > 0 AND amount < 100")],
+        )
+        .await?;
+        let txn = begin_txn(&table_url, &engine)?;
+        let constraints = txn.check_constraints();
+        // The junction is outside the single-comparison grammar, so the set is not fully parsable
+        // and binding a validator over it fails closed with the connector-enforced error.
+        assert!(!constraints.is_kernel_parsable());
+        let handler = engine.evaluation_handler();
+        let err = constraints
+            .validator(handler.as_ref())
+            .map(|_| ())
+            .expect_err("an unparsable constraint must fail closed");
+        assert_err_contains(err, "must enforce");
+
+        // A parsable set binds once and reports a typed violation with the offending value.
+        let (table_url, engine) = setup_constrained_table(
+            "test_cc_validator_typed_violation",
+            &[("positive_amount", "amount > 0")],
+        )
+        .await?;
+        let txn = begin_txn(&table_url, &engine)?;
+        let handler = engine.evaluation_handler();
+        let validator = txn.check_constraints().validator(handler.as_ref())?;
+        validator.validate(&batch(vec![Some(1), Some(2)], vec!["a", "b"])?)?;
+        let err = validator
+            .validate(&batch(vec![Some(1), Some(-7)], vec!["a", "b"])?)
+            .expect_err("a negative amount must violate");
+        match err {
+            delta_kernel::Error::CheckConstraintViolation {
+                name, expression, ..
+            } => {
+                assert_eq!(name, "positive_amount");
+                assert_eq!(expression, "amount > 0");
+            }
+            other => panic!("expected CheckConstraintViolation, got: {other:?}"),
+        }
         Ok(())
     }
 
