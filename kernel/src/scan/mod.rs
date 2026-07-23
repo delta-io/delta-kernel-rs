@@ -16,6 +16,8 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
@@ -27,8 +29,6 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
-#[cfg(feature = "declarative-plans")]
-use crate::plans::ir::nodes::FileType;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -964,22 +964,26 @@ impl Scan {
 
     #[cfg(feature = "declarative-plans")]
     #[allow(dead_code)]
-    fn declarative_metadata_scan_plan(&self) -> DeltaResult<Option<crate::plans::ir::plan::Plan>> {
+    fn declarative_metadata_scan_plan(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<crate::plans::ir::plan::Plan>> {
         let log_segment = self.snapshot.log_segment();
         let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-        // A checkpoint's parts share one format, so at most one of the json / parquet part lists is
-        // populated.
-        let (json_checkpoint_files, parquet_checkpoint_files) =
-            match log_segment.checkpoint_version_tagged_scan_files()? {
-                Some((FileType::Json, files)) => (files, vec![]),
-                Some((FileType::Parquet, files)) => (vec![], files),
-                None => (vec![], vec![]),
-            };
+        let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
+        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
+        // whether the checkpoint carries a compatible parsed-stats column.
+        let plan_executor = engine.plan_executor();
+        let shape = CheckpointShape::try_new(
+            plan_executor.as_ref(),
+            &self.snapshot,
+            self.state_info.physical_stats_schema.as_ref(),
+        )?;
         scan_plan::build_metadata_scan_plan(
             &self.state_info,
             commit_files,
-            json_checkpoint_files,
-            parquet_checkpoint_files,
+            checkpoint,
+            &shape,
             log_segment.log_root.clone(),
         )
     }
