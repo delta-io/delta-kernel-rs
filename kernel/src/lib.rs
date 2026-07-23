@@ -686,12 +686,10 @@ pub trait JsonHandler: AsAny {
     /// - `physical_schema` - Select list of columns to read from the JSON file.
     /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. If
     ///   applied, a file or row may be omitted only when the predicate cannot evaluate to true for
-    ///   any row in that unit. CAST conversion, failure, and NULL semantics must agree with the
-    ///   eventual query filter. JSON handlers evaluate exact row values, so footer-bound
-    ///   preservation does not apply. Unsupported subexpressions and references with no matching
-    ///   physical or generated value must remain unknown and must not fail the read. A missing
-    ///   reference remains unknown for pruning even if schema reconciliation synthesizes a NULL
-    ///   output column. Returned data is not guaranteed to satisfy the predicate.
+    ///   any row in that unit. CAST conversion, failure, and NULL semantics must match final
+    ///   filtering over exact row values. Unsupported or missing references remain unknown without
+    ///   failing the read, including references synthesized as NULL columns during schema
+    ///   reconciliation. Returned data is not guaranteed to satisfy the predicate.
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -874,13 +872,13 @@ pub trait ParquetHandler: AsAny {
     /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. A
     ///   file, row group, or row may be omitted only when the predicate cannot evaluate to true for
     ///   any row in that unit. CAST and NULL semantics must agree with the eventual query filter.
-    ///   An evaluator using exact row values may evaluate a compatible CAST directly. Footer
-    ///   min/max may be cast only when the cast preserves those bounds; otherwise footer evaluation
-    ///   of the CAST must remain unknown and must not fail the read. Other unsupported
-    ///   subexpressions and references with no matching physical or generated value must also
-    ///   remain unknown and must not fail the read. A missing reference remains unknown for pruning
-    ///   even if schema reconciliation synthesizes a NULL output column. Returned data is not
-    ///   guaranteed to satisfy the predicate.
+    ///   An evaluator using exact row values may apply the CAST directly. Footer min/max may be
+    ///   cast only when the cast preserves those bounds; otherwise footer evaluation of the CAST
+    ///   must remain unknown and must not fail the read. Other unsupported subexpressions and
+    ///   references with no matching physical or generated value must also remain unknown without
+    ///   failing the read. A missing reference remains unknown for pruning even if schema
+    ///   reconciliation synthesizes a NULL output column. Returned data is not guaranteed to
+    ///   satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].

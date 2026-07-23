@@ -746,7 +746,7 @@ fn test_checkpoint_partition_cast_reference_eval_is_conservative(#[case] partiti
 }
 
 #[test]
-fn partition_cast_does_not_disable_safe_in_memory_conjunct() {
+fn partition_cast_preserves_supported_in_memory_conjunct() {
     let partition_columns = test_partition_columns();
     let pred = Pred::and(
         Pred::ge(

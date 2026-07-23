@@ -103,17 +103,13 @@ pub trait JsonHandler {
   columns match the `output_schema`. Missing fields should produce nulls for nullable columns.
 
 - **`read_json_files`**: Data must be returned in file order (same order as the `files` slice
-  argument), and rows within a file must be in source order. The predicate is an optional hint.  The
-  engine may ignore it.
+  argument), and rows within a file must be in source order. The predicate is an optional hint that
+  the engine may ignore. If applied, evaluate exact row values conservatively; unsupported
+  expressions and missing references remain unknown.
 
 - **`write_json_file`**: Must write newline-delimited JSON (one JSON object per line). Null
   columns should be omitted from the output to save space. The write must be atomic. If
   `overwrite` is false and the file exists, fail with an error.
-
-If a read handler applies the predicate hint, it may discard data only when conservative
-evaluation of the complete predicate proves it cannot match. JSON evaluation uses exact row
-values. Parquet footer evaluation may cast min/max only when the cast preserves those bounds.
-Unsupported expressions and missing references remain unknown and must not fail the read.
 
 ### Default implementation
 
@@ -162,6 +158,10 @@ must return a column of all nulls.
 
 **Ordering**: Like `JsonHandler`, data must be returned in file order, and rows within a
 file must be in source order.
+
+**Predicate hint**: If applied, the complete predicate may discard data only when conservative
+evaluation proves it cannot match. Footer min/max may be cast only when the cast preserves their
+bounds; unsupported expressions and missing references remain unknown.
 
 **Metadata columns**: The handler must support two virtual metadata columns that are not
 stored in the Parquet file but generated at read time:
@@ -244,4 +244,3 @@ pub trait PredicateEvaluator {
 ### Default implementation
 
 The `DefaultEngine` uses Arrow compute kernels for expression evaluation.
-
