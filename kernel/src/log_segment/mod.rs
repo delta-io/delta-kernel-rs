@@ -10,8 +10,9 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    schema_contains_file_actions, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA,
-    MAX_VALUES, METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    schema_contains_file_actions, Sidecar, ADD_NAME, CDC_NAME, CHECKPOINT_METADATA_NAME,
+    DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, PROTOCOL_NAME,
+    REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::committer::CatalogCommit;
 use crate::expressions::{column_name, ColumnName};
@@ -120,37 +121,34 @@ pub(crate) struct LogSegment {
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
-/// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
-/// predicates that enable row group skipping in checkpoint parquet files.
+/// Returns a required leaf whose non-nullness identifies a row containing `action_name`.
 ///
-/// For `txn`, this is effective because all app ids end up in a single checkpoint part when
-/// partitioned by `add.path` as the Delta spec requires. Filtering by a specific app id is not
-/// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
-///
-/// For `add`, an `add.path IS NOT NULL` predicate drops a checkpoint's Remove tombstones, which
-/// project to a null `add` under an add-only read schema. This is safe because scan log replay
-/// discards checkpoint removes without deduplicating on them, so skipping all-remove row groups
-/// changes no survivor. A schema that also names `remove` (checkpoint write, log compaction) has
-/// no identifying column for it and short-circuits to `None` below, preserving tombstones.
-fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
+/// Actions without a required leaf cannot provide a reliable presence witness. For example, every
+/// `commitInfo` leaf is optional, so a valid action could have no non-null leaf.
+fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
     match action_name {
         ADD_NAME => Some(column_name!(ADD_NAME, "path")),
+        REMOVE_NAME => Some(column_name!(REMOVE_NAME, "path")),
         METADATA_NAME => Some(column_name!(METADATA_NAME, "id")),
         PROTOCOL_NAME => Some(column_name!(PROTOCOL_NAME, "minReaderVersion")),
         SET_TRANSACTION_NAME => Some(column_name!(SET_TRANSACTION_NAME, "appId")),
+        CDC_NAME => Some(column_name!(CDC_NAME, "path")),
         DOMAIN_METADATA_NAME => Some(column_name!(DOMAIN_METADATA_NAME, "domain")),
+        CHECKPOINT_METADATA_NAME => Some(column_name!(CHECKPOINT_METADATA_NAME, "version")),
+        SIDECAR_NAME => Some(column_name!(SIDECAR_NAME, "path")),
         _ => None,
     }
 }
 
-/// Builds an IS NOT NULL predicate for row group skipping based on the action types in `schema`.
-/// Returns `None` if any top-level field in the schema is not a recognized action type, since
-/// an unknown type could have non-null rows in the same row group, making skipping unsafe.
-fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> {
-    // Collect identifying columns for every field; short-circuit to None on any unknown field.
+/// Builds a checkpoint row-group predicate that retains every action requested by `schema`.
+///
+/// Each requested action contributes an `IS NOT NULL` presence witness, and the witnesses are
+/// joined with `OR`. Returns `None` if any field lacks a reliable witness because such an action
+/// could occupy a row group that the resulting predicate would otherwise skip.
+fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<PredicateRef> {
     let columns: Vec<ColumnName> = schema
         .fields()
-        .map(|f| action_identifying_column(f.name()))
+        .map(|field| action_presence_witness(field.name()))
         .collect::<Option<_>>()?;
     let mut predicates = columns
         .into_iter()
@@ -719,7 +717,7 @@ impl LogSegment {
         // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
         // checkpoint parquet row groups without any relevant action type can be skipped.
         // TODO: The semantics of `meta_predicate` will change in a follow-up PR.
-        let is_not_null_pred = schema_to_is_not_null_predicate(&checkpoint_read_schema);
+        let is_not_null_pred = checkpoint_action_projection_predicate(&checkpoint_read_schema);
         let effective_predicate = match (is_not_null_pred, meta_predicate) {
             (None, x) | (x, None) => x,
             (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),

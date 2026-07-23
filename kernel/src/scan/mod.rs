@@ -973,6 +973,9 @@ impl Scan {
                 self.build_actions_meta_predicate(),
             )
         };
+        // Scans request only Add actions from checkpoints, so the projected schema derives
+        // `add.path IS NOT NULL`. Remove tombstones in checkpoint state are irrelevant to active
+        // file replay, allowing readers to skip all-remove row groups.
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(

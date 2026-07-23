@@ -858,6 +858,8 @@ pub trait ParquetHandler: AsAny {
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    ///   Implementations may apply it at any granularity, including only skipping row groups, so
+    ///   callers must tolerate rows that do not satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
