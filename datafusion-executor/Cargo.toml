@@ -1,0 +1,23 @@
+[package]
+name = "datafusion_executor"
+description = "DataFusion-based PlanExecutor for delta_kernel declarative plans."
+edition = "2021"
+homepage = "https://delta.io"
+license = "Apache-2.0"
+repository = "https://github.com/delta-io/delta-kernel-rs"
+readme = "README.md"
+version = "0.26.0"
+rust-version = "1.88"
+
+[workspace]
+
+[dependencies]
+delta_kernel = { path = "../kernel", version = "0.26.0", default-features = false, features = [
+  "declarative-plans",
+  "arrow-58",
+  "default-engine-base",
+] }
+datafusion = "54"
+
+[dev-dependencies]
+rstest = "0.23"

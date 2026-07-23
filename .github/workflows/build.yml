@@ -71,6 +71,10 @@ jobs:
           components: rustfmt
       - name: format
         run: cargo +nightly fmt -- --check
+      # Separate workspace; the root fmt above does not reach it. See datafusion-executor/Cargo.toml.
+      - name: format datafusion-executor
+        working-directory: datafusion-executor
+        run: cargo +nightly fmt -- --check
 
   msrv:
     runs-on: ubuntu-latest
@@ -435,3 +439,27 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Separate workspace; the --workspace jobs above never touch it. See datafusion-executor/Cargo.toml.
+  datafusion-executor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install minimal stable with clippy
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: datafusion-executor
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: build and lint with clippy
+        working-directory: datafusion-executor
+        run: |
+          cargo build --locked
+          cargo clippy --locked --tests -- -D warnings
+      - name: test
+        working-directory: datafusion-executor
+        run: cargo test --locked
