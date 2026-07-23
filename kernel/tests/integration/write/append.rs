@@ -391,17 +391,18 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
         let mut txn =
             load_and_begin_transaction(table_url, engine.as_ref())?.with_data_change(true);
 
-        // Produce valid `add` metadata, then null one required column so the commit must reject it.
-        let data = RecordBatch::try_new(
+        let data = ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into_arrow()?),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )?;
+        )?);
         let write_context = Arc::new(txn.unpartitioned_write_context()?);
-        let meta = engine
-            .write_parquet(&ArrowEngineData::new(data), write_context.as_ref())
-            .await?;
 
-        let batch = into_record_batch(meta);
+        // Corrupt the addFile at the second batch.
+        let valid_meta = engine.write_parquet(&data, write_context.as_ref()).await?;
+        txn.add_files(valid_meta);
+        let to_be_corrupted_meta = engine.write_parquet(&data, write_context.as_ref()).await?;
+
+        let batch = into_record_batch(to_be_corrupted_meta);
         let index = batch.schema().index_of(field)?;
 
         // The add-metadata schema declares these fields non-nullable, so rebuild the schema with

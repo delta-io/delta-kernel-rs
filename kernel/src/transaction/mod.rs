@@ -1742,7 +1742,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    use ::test_utils::{copy_directory, get_column};
+    use ::test_utils::get_column;
     use rstest::rstest;
     use url::Url;
 
@@ -1771,9 +1771,9 @@ mod tests {
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::utils::test_utils::{
-        create_valid_add_file_batch, install_thread_local_metrics_reporter, load_test_table,
-        string_array_to_engine_data, test_schema_flat, test_schema_nested, test_schema_with_array,
-        test_schema_with_map, CapturingReporter,
+        copy_test_table, create_valid_add_file_batch, install_thread_local_metrics_reporter,
+        load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
+        test_schema_with_array, test_schema_with_map, CapturingReporter,
     };
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
@@ -2684,23 +2684,13 @@ mod tests {
     }
 
     /// Build a transaction on a writable copy of the `table-without-dv-small` fixture.
-    fn create_existing_table_txn(
-    ) -> DeltaResult<(Arc<dyn Engine>, Transaction, Option<tempfile::TempDir>)> {
-        let (_, source_snapshot, _source_dir) = load_test_table("table-without-dv-small")?;
-        let source = source_snapshot
-            .table_root()
-            .to_file_path()
-            .expect("fixture is a local path");
-
-        let tempdir = tempfile::tempdir().expect("temp dir");
-        let table_path = tempdir.path().join("table-without-dv-small");
-        copy_directory(&source, &table_path).expect("copy fixture");
-
-        let url = Url::from_directory_path(&table_path).expect("table url");
+    fn create_existing_table_txn() -> DeltaResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)>
+    {
+        let (url, tempdir) = copy_test_table("table-without-dv-small")?;
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
-        Ok((engine, txn, Some(tempdir)))
+        Ok((engine, txn, tempdir))
     }
 
     #[test]

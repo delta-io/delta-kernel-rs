@@ -141,13 +141,10 @@ mod tests {
             names[MODIFICATION_TIME],
             ColumnName::new(["modificationTime"])
         );
-        assert_eq!(names.len(), 4);
-    }
-
-    #[test]
-    fn required_fields_present_ok() {
-        let adds = [Box::new(ArrowEngineData::new(nullable_add_file())) as Box<dyn EngineData>];
-        add_validator().validate(&adds).unwrap();
+        assert_eq!(
+            names.len(),
+            [PATH, PARTITION_VALUES, SIZE, MODIFICATION_TIME].len()
+        );
     }
 
     #[rstest]
@@ -155,56 +152,61 @@ mod tests {
     #[case::partition_values("partitionValues")]
     #[case::size("size")]
     #[case::modification_time("modificationTime")]
-    fn required_field_missing_at_any_row_rejected(
+    fn required_field_missing_at_any_batch_and_row_rejected(
         #[case] field: &str,
+        #[values(0, 1, 2)] invalid_batch: usize,
         #[values(0, 1, 2)] invalid_row: usize,
     ) {
-        let batch = set_field_as_null(&nullable_add_files(3), field, invalid_row);
-        let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
+        const BATCH_COUNT: usize = 3;
+        const ROW_COUNT: usize = 3;
+
+        let adds: Vec<Box<dyn EngineData>> = (0..BATCH_COUNT)
+            .map(|batch_index| {
+                let batch = nullable_add_files(ROW_COUNT);
+                let batch = if batch_index == invalid_batch {
+                    set_field_as_null(&batch, field, invalid_row)
+                } else {
+                    batch
+                };
+                Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
+            })
+            .collect();
         assert_result_error_with_message(
             add_validator().validate(&adds),
             &format!("missing required field '{field}'"),
         );
     }
 
-    #[test]
-    fn empty_path_rejected() {
+    #[rstest]
+    #[case::valid("dummy", 1, 1, None)]
+    #[case::empty_path("", 1, 1, Some("path must not be empty"))]
+    #[case::negative_size("dummy", -1, 1, Some("size must be non-negative"))]
+    #[case::zero_size("dummy", 0, 1, None)]
+    #[case::negative_modification_time("dummy", 1, -1, None)]
+    fn add_file_values_accepted_or_rejected(
+        #[case] path: &str,
+        #[case] size: i64,
+        #[case] modification_time: i64,
+        #[case] expected_error: Option<&str>,
+    ) {
         let batch = replace_column(
             &nullable_add_file(),
             "path",
-            Arc::new(StringArray::from(vec![""])),
+            Arc::new(StringArray::from(vec![path])),
         );
-        let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        assert_result_error_with_message(add_validator().validate(&adds), "path must not be empty");
-    }
-
-    #[test]
-    fn negative_size_rejected() {
-        let batch = replace_column(
-            &nullable_add_file(),
-            "size",
-            Arc::new(Int64Array::from(vec![-1])),
-        );
-        let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        assert_result_error_with_message(
-            add_validator().validate(&adds),
-            "size must be non-negative",
-        );
-    }
-
-    #[test]
-    fn zero_size_and_negative_modification_time_accepted() {
-        let batch = replace_column(
-            &nullable_add_file(),
-            "size",
-            Arc::new(Int64Array::from(vec![0])),
-        );
+        let batch = replace_column(&batch, "size", Arc::new(Int64Array::from(vec![size])));
         let batch = replace_column(
             &batch,
             "modificationTime",
-            Arc::new(Int64Array::from(vec![-1])),
+            Arc::new(Int64Array::from(vec![modification_time])),
         );
         let adds = [Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>];
-        add_validator().validate(&adds).unwrap();
+        let result = add_validator().validate(&adds);
+
+        if let Some(expected_error) = expected_error {
+            assert_result_error_with_message(result, expected_error);
+        } else {
+            result.unwrap();
+        }
     }
 }

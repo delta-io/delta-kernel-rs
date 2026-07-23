@@ -228,7 +228,7 @@ pub(crate) mod test_utils {
     use itertools::Itertools;
     use serde::Serialize;
     use tempfile::TempDir;
-    use test_utils::{delta_path_for_version, load_test_data};
+    use test_utils::{copy_directory, delta_path_for_version, load_test_data};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::util::SubscriberInitExt as _;
     use url::Url;
@@ -1102,6 +1102,35 @@ pub(crate) mod test_utils {
         }
     }
 
+    fn resolve_test_table_path(table_name: &str) -> DeltaResult<(PathBuf, Option<TempDir>)> {
+        match load_test_data("tests/data", table_name) {
+            Ok(test_dir) => {
+                let test_path = test_dir.path().join(table_name);
+                Ok((test_path, Some(test_dir)))
+            }
+            Err(_) => {
+                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/data")
+                    .join(table_name);
+                let path = std::fs::canonicalize(path)
+                    .map_err(|e| Error::generic(format!("Failed to canonicalize path: {e}")))?;
+                Ok((path, None))
+            }
+        }
+    }
+
+    /// Copies a test-table fixture into a writable temporary directory.
+    pub(crate) fn copy_test_table(table_name: &str) -> DeltaResult<(Url, TempDir)> {
+        let (source, _source_tempdir) = resolve_test_table_path(table_name)?;
+        let tempdir = tempfile::tempdir()?;
+        let table_path = tempdir.path().join(table_name);
+        copy_directory(&source, &table_path)
+            .map_err(|e| Error::generic(format!("Failed to copy test table: {e}")))?;
+        let url = Url::from_directory_path(&table_path)
+            .map_err(|_| Error::generic("Failed to create URL from path"))?;
+        Ok((url, tempdir))
+    }
+
     /// Load a test table from tests/data directory.
     /// Tries compressed (tar.zst) first, falls back to extracted.
     /// Returns (engine, snapshot, optional tempdir). The TempDir must be kept alive
@@ -1109,27 +1138,10 @@ pub(crate) mod test_utils {
     pub(crate) fn load_test_table(
         table_name: &str,
     ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
-        // Try loading compressed table first, fall back to extracted
-        let (path, tempdir) = match load_test_data("tests/data", table_name) {
-            Ok(test_dir) => {
-                let test_path = test_dir.path().join(table_name);
-                (test_path, Some(test_dir))
-            }
-            Err(_) => {
-                // Fall back to already-extracted table
-                let manifest_dir = env!("CARGO_MANIFEST_DIR");
-                let mut path = PathBuf::from(manifest_dir);
-                path.push("tests/data");
-                path.push(table_name);
-                let path = std::fs::canonicalize(path)
-                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {e}")))?;
-                (path, None)
-            }
-        };
+        let (path, tempdir) = resolve_test_table_path(table_name)?;
 
-        // Create engine and snapshot from the resolved path
         let url = Url::from_directory_path(&path)
-            .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
+            .map_err(|_| Error::generic("Failed to create URL from path"))?;
 
         let engine = Arc::new(SyncEngine::new());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
