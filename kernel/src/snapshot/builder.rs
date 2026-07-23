@@ -329,10 +329,10 @@ impl SnapshotBuilder {
         for pair in log_tail.windows(2) {
             require!(
                 pair[0].version + 1 == pair[1].version,
-                Error::MaxCatalogVersion(format!(
-                    "Log tail versions {} and {} are not contiguous",
-                    pair[0].version, pair[1].version
-                ))
+                Error::LogTailVersionsNotContiguous {
+                    first_version: pair[0].version,
+                    second_version: pair[1].version,
+                }
             );
         }
 
@@ -1050,7 +1050,10 @@ mod tests {
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert!(matches!(
+                result,
+                Err(Error::LogTailVersionsNotContiguous { .. })
+            ));
 
             Ok(())
         }

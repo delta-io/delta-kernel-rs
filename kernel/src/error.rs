@@ -71,6 +71,15 @@ pub enum Error {
     #[error("Max catalog version error: {0}")]
     MaxCatalogVersion(String),
 
+    /// The supplied log tail contains adjacent versions that are not contiguous.
+    #[error("Log tail versions {first_version} and {second_version} are not contiguous")]
+    LogTailVersionsNotContiguous {
+        /// Earlier version in the invalid adjacent pair.
+        first_version: Version,
+        /// Later version in the invalid adjacent pair.
+        second_version: Version,
+    },
+
     /// Some kind of [`std::io::Error`]
     #[error(transparent)]
     IOError(std::io::Error),
