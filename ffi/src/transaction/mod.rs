@@ -823,9 +823,11 @@ mod tests {
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
+    #[cfg(feature = "delta-kernel-unity-catalog")]
+    use crate::snapshot_publish_with_committer;
     use crate::{
         free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
-        KernelStringSlice, NullableCvoid,
+        KernelStringSlice, NullableCvoid, OptionalValue,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -1729,7 +1731,8 @@ mod tests {
             cast_test_context, get_test_context, recover_test_context,
         };
         use crate::delta_kernel_unity_catalog::{
-            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
+            free_uc_commit_client, free_uc_committer, get_uc_commit_client, get_uc_committer,
+            CommitRequest,
         };
         use crate::{Handle, NullableCvoid, OptionalValue};
 
@@ -1860,6 +1863,60 @@ mod tests {
 
             // UC committer returns success from our mock callback
             let committed = ok_or_panic(commit_result);
+            let post_commit_snapshot =
+                match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
+                    OptionalValue::Some(snapshot) => snapshot,
+                    OptionalValue::None => {
+                        panic!("UC commit should produce a post-commit snapshot")
+                    }
+                };
+            assert_eq!(unsafe { version(post_commit_snapshot.shallow_copy()) }, 1);
+
+            let publish_committer = unsafe {
+                ok_or_panic(get_uc_committer(
+                    uc_client.shallow_copy(),
+                    kernel_string_slice!(table_id),
+                    allocate_err,
+                ))
+            };
+            let published_snapshot = ok_or_panic(unsafe {
+                snapshot_publish_with_committer(
+                    post_commit_snapshot.shallow_copy(),
+                    publish_committer.shallow_copy(),
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(unsafe { version(published_snapshot.shallow_copy()) }, 1);
+
+            let published_commit_url = table_url
+                .join("_delta_log/00000000000000000001.json")
+                .unwrap();
+            let published_commit = store
+                .get(&Path::from_url_path(published_commit_url.path()).unwrap())
+                .await?;
+            let published_content = published_commit.bytes().await?;
+            let published_actions: Vec<_> = Deserializer::from_slice(&published_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+            assert!(
+                published_actions.iter().any(|a| a.get("add").is_some()),
+                "Published commit should contain the add action"
+            );
+
+            // Second publish is a no-op when all staged commits are already published.
+            let republished_snapshot = ok_or_panic(unsafe {
+                snapshot_publish_with_committer(
+                    published_snapshot.shallow_copy(),
+                    publish_committer.shallow_copy(),
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(unsafe { version(republished_snapshot.shallow_copy()) }, 1);
+
+            unsafe { free_snapshot(republished_snapshot) };
+            unsafe { free_snapshot(published_snapshot) };
+            unsafe { free_snapshot(post_commit_snapshot) };
+            unsafe { free_uc_committer(publish_committer) };
             unsafe { free_committed_transaction(committed) };
 
             let context = recover_test_context(context).unwrap();
