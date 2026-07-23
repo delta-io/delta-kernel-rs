@@ -411,8 +411,10 @@ impl DataSkippingFilter {
     }
 }
 
-/// Rewrites a predicate for parquet row group skipping in checkpoint/sidecar files.
-/// Returns `None` if the predicate is not eligible for data skipping.
+/// Rewrites a predicate for checkpoint/sidecar Parquet pushdown.
+///
+/// The result is safe for row-group skipping and exact row filtering. Returns `None` if the
+/// predicate is not eligible for data skipping.
 ///
 /// Adds IS NULL guards on each stat column reference so the parquet RowGroupFilter
 /// conservatively keeps row groups containing files with missing stats (null stat values
@@ -426,9 +428,9 @@ impl DataSkippingFilter {
 /// not `add.stats_parsed`. `physical_partition_columns` is the table's full partition list;
 /// pass an empty set for unpartitioned tables.
 ///
-/// `physical_stats_columns` restricts rewrites to columns expected to have stats. Other
-/// references fold to TRUE to preserve rows that cannot be evaluated. This set must match
-/// `physical_stats_schema`.
+/// `physical_stats_columns` restricts rewrites to columns expected to have stats. Unsupported
+/// junction arms fold to TRUE; a wholly unsupported predicate returns `None`. This set must
+/// match `physical_stats_schema`.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     physical_partition_columns: &HashSet<ColumnName>,

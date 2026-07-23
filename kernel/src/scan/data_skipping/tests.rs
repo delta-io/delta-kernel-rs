@@ -1562,22 +1562,56 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_true_literal() {
     );
 }
 
-#[test]
-fn checkpoint_pushdown_true_fold_does_not_poison_supported_arm() {
-    let pred = Pred::and(
+#[rstest]
+#[case::and_supported_true(
+    Pred::and(
         Pred::gt(column_expr!("stat"), Scalar::from(100)),
         Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
-    );
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(150i32),
+    TRUE,
+)]
+#[case::or_supported_false(
+    Pred::or(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(50i32),
+    TRUE,
+)]
+#[case::not_and_supported_false(
+    Pred::not(Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    )),
+    column_name!("stats_parsed.minValues.stat"),
+    Scalar::from(150i32),
+    TRUE,
+)]
+#[case::not_or_supported_false(
+    Pred::not(Pred::or(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    )),
+    column_name!("stats_parsed.minValues.stat"),
+    Scalar::from(150i32),
+    FALSE,
+)]
+fn checkpoint_pushdown_unsupported_junction_semantics(
+    #[case] pred: Pred,
+    #[case] stat_column: ColumnName,
+    #[case] stat_value: Scalar,
+    #[case] expected: Option<bool>,
+) {
     let stats = stats_cols(&["stat"]);
     let result = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
-    let resolver = HashMap::from_iter([(
-        column_name!("stats_parsed.maxValues.stat"),
-        Scalar::from(150i32),
-    )]);
+    let resolver = HashMap::from_iter([(stat_column, stat_value)]);
     let filter = DefaultKernelPredicateEvaluator::from(resolver);
     expect_eq!(
         filter.eval(&result),
-        TRUE,
-        "TRUE-folded unsupported arm leaves the supported arm's keep verdict intact"
+        expected,
+        "TRUE-folded unsupported junction semantics for {pred}"
     );
 }
