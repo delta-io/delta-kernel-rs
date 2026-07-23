@@ -162,6 +162,9 @@
 //! becomes unparseable. In kernel, `escape_partition_value` takes `&str`, so Rust's type
 //! system prevents non-UTF-8 bytes from reaching the encoding layer.
 
+#[cfg(feature = "internal-api")]
+pub mod hive;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod hive;
 pub mod serialization;
 pub(crate) mod validation;

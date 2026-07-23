@@ -26,6 +26,7 @@
 
 use std::borrow::Cow;
 
+use delta_kernel_derive::internal_api;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -65,6 +66,7 @@ const HADOOP_URI_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
 /// [`build_partition_path`], as used by kernel-java and Delta-Spark. Returns
 /// [`Cow::Borrowed`] when no encoding is needed (zero allocation fast path).
 /// See the module-level documentation in [`super`] for the full pipeline.
+#[internal_api]
 pub(crate) fn uri_encode_path(hive_escaped: &str) -> Cow<'_, str> {
     utf8_percent_encode(hive_escaped, HADOOP_URI_PATH_ENCODE_SET).into()
 }
@@ -132,6 +134,7 @@ pub(crate) fn escape_partition_value(s: &str) -> Cow<'_, str> {
 /// assert_eq!(null_path, empty_path);
 /// assert_eq!(null_path, "col=__HIVE_DEFAULT_PARTITION__/");
 /// ```
+#[internal_api]
 pub(crate) fn build_partition_path(columns: &[(&str, Option<&str>)]) -> String {
     // Lower-bound capacity: exact when no escaping needed (the common case for
     // partition names and most values like dates, integers, short strings).
