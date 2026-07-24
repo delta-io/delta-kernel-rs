@@ -1,11 +1,12 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
+use evaluate_expression::{evaluate_expression_impl, evaluate_predicate, extract_column};
 use itertools::Itertools;
 use tracing::debug;
 
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
+use crate::arrow::array::timezone::Tz;
 use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -242,8 +243,34 @@ impl ArrayData {
     }
 }
 
-#[derive(Debug)]
-pub struct ArrowEvaluationHandler;
+/// Arrow-backed [`EvaluationHandler`].
+///
+/// # Session timezone
+///
+/// An offset-less `TIMESTAMP` partition value (a string with no `Z` or explicit offset, e.g.
+/// `"2024-01-15 12:00:00"`) denotes a different instant per session zone; the Delta protocol reads
+/// it in the writer's zone, which a reader cannot recover. This handler resolves such values in
+/// `session_timezone` when it evaluates `MAP_TO_STRUCT` over a partition map. `None` resolves at
+/// UTC, matching the pre-existing behavior; a string carrying an explicit offset and
+/// `TIMESTAMP_NTZ` always ignore the zone.
+///
+/// The zone is a property of the handler because it is the engine's session state: an engine that
+/// wants session-aware partition resolution builds its handler with
+/// [`ArrowEvaluationHandler::new`]. Since the handler is typically long-lived and shared, an engine
+/// serving multiple sessions must build a fresh handler per session rather than mutating one in
+/// place.
+#[derive(Debug, Default)]
+pub struct ArrowEvaluationHandler {
+    session_timezone: Option<Tz>,
+}
+
+impl ArrowEvaluationHandler {
+    /// Builds a handler that resolves offset-less `TIMESTAMP` partition values in
+    /// `session_timezone` (`None` = UTC).
+    pub fn new(session_timezone: Option<Tz>) -> Self {
+        Self { session_timezone }
+    }
+}
 
 impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
@@ -256,6 +283,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             _input_schema: schema,
             expression,
             output_type,
+            session_timezone: self.session_timezone,
         }))
     }
 
@@ -343,6 +371,9 @@ pub struct DefaultExpressionEvaluator {
     _input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
+    /// Session zone for resolving offset-less `TIMESTAMP` partition values; carried from the
+    /// [`ArrowEvaluationHandler`] that produced this evaluator. See its docs.
+    session_timezone: Option<Tz>,
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
@@ -369,11 +400,21 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                 apply_schema(&array, &self.output_type)?
             }
             (expr, output_type @ DataType::Struct(_)) => {
-                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
+                let array_ref = evaluate_expression_impl(
+                    expr,
+                    batch,
+                    Some(output_type),
+                    self.session_timezone.as_ref(),
+                )?;
                 apply_schema(&array_ref, output_type)?
             }
             (expr, output_type) => {
-                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
+                let array_ref = evaluate_expression_impl(
+                    expr,
+                    batch,
+                    Some(output_type),
+                    self.session_timezone.as_ref(),
+                )?;
                 let array_ref = apply_schema_to(&array_ref, output_type)?;
                 let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
                 let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);

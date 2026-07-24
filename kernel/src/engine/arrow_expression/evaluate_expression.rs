@@ -7,6 +7,7 @@ use chrono::Utc;
 use itertools::Itertools;
 use tracing::warn;
 
+use crate::arrow::array::timezone::Tz;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -111,6 +112,7 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
     nullability_predicate: Option<&ExpressionRef>,
+    session_tz: Option<&Tz>,
 ) -> DeltaResult<ArrayRef> {
     if fields.len() != output_schema.num_fields() {
         return Err(Error::generic(format!(
@@ -123,7 +125,9 @@ fn evaluate_struct_expression(
     let output_cols: Vec<ArrayRef> = fields
         .iter()
         .zip(output_schema.fields())
-        .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())))
+        .map(|(expr, field)| {
+            evaluate_expression_impl(expr, batch, Some(field.data_type()), session_tz)
+        })
         .try_collect()?;
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
@@ -138,7 +142,8 @@ fn evaluate_struct_expression(
         })
         .collect();
     let null_buffer = if let Some(predicate_expr) = nullability_predicate {
-        let predicate_array = evaluate_expression(predicate_expr, batch, Some(&DataType::BOOLEAN))?;
+        let predicate_array =
+            evaluate_expression_impl(predicate_expr, batch, Some(&DataType::BOOLEAN), session_tz)?;
         let bool_array = predicate_array
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -161,6 +166,7 @@ fn evaluate_struct_patch_expression(
     patch: &ExpressionStructPatch,
     batch: &RecordBatch,
     output_schema: &StructType,
+    session_tz: Option<&Tz>,
 ) -> DeltaResult<ArrayRef> {
     let mut used_field_patches = 0;
 
@@ -178,7 +184,12 @@ fn evaluate_struct_patch_expression(
 
     // Handle prepends (insertions before any field)
     for expr in &patch.prepended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+        output_cols.push(evaluate_expression_impl(
+            expr,
+            batch,
+            Some(next_output_type()?),
+            session_tz,
+        )?);
     }
 
     // Extract the input path, if any
@@ -208,7 +219,12 @@ fn evaluate_struct_patch_expression(
         // Process any insertions that come at or after this field's output position.
         if let Some(field_patch) = field_patch {
             for expr in &field_patch.insertions {
-                output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+                output_cols.push(evaluate_expression_impl(
+                    expr,
+                    batch,
+                    Some(next_output_type()?),
+                    session_tz,
+                )?);
             }
             used_field_patches += 1;
         }
@@ -228,7 +244,12 @@ fn evaluate_struct_patch_expression(
 
     // Handle appends (insertions after all input fields and field-specific insertions)
     for expr in &patch.appended_fields {
-        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
+        output_cols.push(evaluate_expression_impl(
+            expr,
+            batch,
+            Some(next_output_type()?),
+            session_tz,
+        )?);
     }
 
     // Verify we consumed all output schema fields
@@ -260,11 +281,30 @@ fn evaluate_struct_patch_expression(
     Ok(Arc::new(data))
 }
 
-/// Evaluates a kernel expression over a record batch
+/// Evaluates a kernel expression over a record batch.
+///
+/// Offset-less `TIMESTAMP` partition values (inside `MAP_TO_STRUCT`) resolve at UTC. Engines that
+/// supply a session zone use [`ArrowEvaluationHandler`], which routes through
+/// [`evaluate_expression_impl`] with the zone.
+///
+/// [`ArrowEvaluationHandler`]: super::ArrowEvaluationHandler
 pub fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
+) -> DeltaResult<ArrayRef> {
+    evaluate_expression_impl(expression, batch, result_type, None)
+}
+
+/// Evaluates a kernel expression, resolving offset-less `TIMESTAMP` partition values in
+/// `session_tz` (`None` = UTC). The zone is applied only at the `MAP_TO_STRUCT` leaf parse; every
+/// other expression ignores it. Threaded down the recursion so a `MAP_TO_STRUCT` nested inside a
+/// struct or coalesce still sees the zone.
+pub(super) fn evaluate_expression_impl(
+    expression: &Expression,
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+    session_tz: Option<&Tz>,
 ) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
@@ -276,13 +316,19 @@ pub fn evaluate_expression(
         }
         (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
         (Struct(fields, nullability), Some(DataType::Struct(output_schema))) => {
-            evaluate_struct_expression(fields, batch, output_schema, nullability.as_ref())
+            evaluate_struct_expression(
+                fields,
+                batch,
+                output_schema,
+                nullability.as_ref(),
+                session_tz,
+            )
         }
         (Struct(..), dt) => Err(Error::Generic(format!(
             "Struct expression expects a DataType::Struct result, but got {dt:?}"
         ))),
         (StructPatch(patch), Some(DataType::Struct(output_schema))) => {
-            evaluate_struct_patch_expression(patch, batch, output_schema)
+            evaluate_struct_patch_expression(patch, batch, output_schema, session_tz)
         }
         (StructPatch(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct patch expressions",
@@ -296,7 +342,7 @@ pub fn evaluate_expression(
         ))),
         (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
             None | Some(&DataType::STRING) => {
-                let input = evaluate_expression(expr, batch, None)?;
+                let input = evaluate_expression_impl(expr, batch, None, session_tz)?;
                 Ok(to_json(&input)?)
             }
             Some(data_type) => Err(Error::generic(format!(
@@ -304,8 +350,8 @@ pub fn evaluate_expression(
             ))),
         },
         (Binary(BinaryExpression { op, left, right }), _) => {
-            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            let left_arr = evaluate_expression_impl(left.as_ref(), batch, None, session_tz)?;
+            let right_arr = evaluate_expression_impl(right.as_ref(), batch, None, session_tz)?;
 
             type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
             let eval: Operation = match op {
@@ -327,7 +373,7 @@ pub fn evaluate_expression(
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
 
             for expr in exprs {
-                let array = evaluate_expression(expr, batch, result_type)?;
+                let array = evaluate_expression_impl(expr, batch, result_type, session_tz)?;
                 let null_count = array.null_count();
                 arrays.push(array);
                 // Short-circuit: if this array has no nulls, we can stop evaluating
@@ -341,7 +387,7 @@ pub fn evaluate_expression(
             Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
-            evaluate_array_expression(exprs, batch, result_type)
+            evaluate_array_expression(exprs, batch, result_type, session_tz)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -355,7 +401,8 @@ pub fn evaluate_expression(
             }
         }
         (ParseJson(p), _) => {
-            let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
+            let json_arr =
+                evaluate_expression_impl(&p.json_expr, batch, Some(&DataType::STRING), session_tz)?;
             // Coarser backstop for genuinely malformed JSON (incomplete records, unmatched
             // braces, etc.). Cell-level type-parse failures in failure-prone leaves
             // (Timestamp/Date/Decimal) are handled inside `parse_json_impl` itself, which
@@ -376,8 +423,8 @@ pub fn evaluate_expression(
             }
         }
         (MapToStruct(m), Some(DataType::Struct(output_schema))) => {
-            let map_arr = evaluate_expression(&m.map_expr, batch, None)?;
-            let result = evaluate_map_to_struct(&map_arr, output_schema)?;
+            let map_arr = evaluate_expression_impl(&m.map_expr, batch, None, session_tz)?;
+            let result = evaluate_map_to_struct(&map_arr, output_schema, session_tz)?;
             Ok(Arc::new(result) as ArrayRef)
         }
         (MapToStruct(_), dt) => Err(Error::Generic(format!(
@@ -415,6 +462,7 @@ fn evaluate_array_expression(
     exprs: &[Expression],
     batch: &RecordBatch,
     result_type: Option<&DataType>,
+    session_tz: Option<&Tz>,
 ) -> DeltaResult<ArrayRef> {
     let num_rows = batch.num_rows();
 
@@ -432,7 +480,7 @@ fn evaluate_array_expression(
 
     let element_arrays: Vec<ArrayRef> = exprs
         .iter()
-        .map(|expr| evaluate_expression(expr, batch, element_kernel_type))
+        .map(|expr| evaluate_expression_impl(expr, batch, element_kernel_type, session_tz))
         .try_collect()?;
 
     let element_type = element_arrays
@@ -916,29 +964,43 @@ pub fn coalesce_arrays(
 /// Date and timestamp use arrow's `Date32Type::parse` / `string_to_datetime`, which are much
 /// faster than `parse_scalar`'s chrono path and yield the same value for valid Delta partition
 /// values. These arrow parsers accept a superset of the canonical formats (e.g. `20240115`, or a
-/// timestamp carrying an explicit offset) and interpret no-offset timestamps as UTC, matching
-/// `parse_scalar`; spec-compliant writers only emit canonical values, so the extra leniency is
-/// harmless on the read path. All other types go through `parse_scalar`.
-fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option<Scalar>> {
+/// timestamp carrying an explicit offset); spec-compliant writers only emit canonical values, so
+/// the extra leniency is harmless on the read path. All other types go through `parse_scalar`.
+///
+/// `session_tz` sets the zone used to resolve an offset-less `TIMESTAMP` value (one with no `Z` or
+/// explicit offset). `None` resolves at UTC (today's behavior). A string carrying an explicit
+/// offset ignores the zone, and `TIMESTAMP_NTZ` is a zoneless wall-clock that always resolves at
+/// UTC. This is the point where the engine's session-timezone capability is applied.
+fn parse_partition_scalar(
+    prim: &PrimitiveType,
+    raw: &str,
+    session_tz: Option<&Tz>,
+) -> DeltaResult<Option<Scalar>> {
     if raw.is_empty() {
         return Ok(prim.empty_string_partition_cast());
     }
+    let parse_err = || Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()));
     match prim {
         PrimitiveType::Date => {
-            let days = Date32Type::parse(raw).ok_or_else(|| {
-                Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
-            })?;
+            let days = Date32Type::parse(raw).ok_or_else(parse_err)?;
             return Ok(Some(Scalar::Date(days)));
         }
         PrimitiveType::Timestamp => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
+            // Resolve an offset-less string in the engine's session zone when supplied; a string
+            // with an explicit offset pins its own instant regardless.
+            let micros = match session_tz {
+                Some(tz) => string_to_datetime(tz, raw)
+                    .map_err(|_| parse_err())?
+                    .timestamp_micros(),
+                None => string_to_datetime(&Utc, raw)
+                    .map_err(|_| parse_err())?
+                    .timestamp_micros(),
+            };
             return Ok(Some(Scalar::Timestamp(micros)));
         }
         PrimitiveType::TimestampNtz => {
             let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
+                .map_err(|_| parse_err())?
                 .timestamp_micros();
             return Ok(Some(Scalar::TimestampNtz(micros)));
         }
@@ -958,6 +1020,7 @@ fn parse_partition_scalar(prim: &PrimitiveType, raw: &str) -> DeltaResult<Option
 fn evaluate_map_to_struct(
     map_arr: &ArrayRef,
     output_schema: &StructType,
+    session_tz: Option<&Tz>,
 ) -> DeltaResult<StructArray> {
     let map_array = map_arr
         .as_any()
@@ -1038,7 +1101,7 @@ fn evaluate_map_to_struct(
             // and where the value is non-null.
             if entry_idx >= entry_start && map_values.is_valid(entry_idx as usize) {
                 let raw = map_values.value(entry_idx as usize);
-                match parse_partition_scalar(target_types[i], raw)? {
+                match parse_partition_scalar(target_types[i], raw, session_tz)? {
                     Some(scalar) => scalar.append_to(builder, 1)?,
                     None => Scalar::append_null(builder, field.data_type(), 1)?,
                 }
@@ -2373,6 +2436,93 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 1718443800000000); // 2024-06-15T09:30:00Z
+    }
+
+    /// An offset-less `TIMESTAMP` map value resolves in the engine-supplied session zone, while a
+    /// value carrying an explicit `Z` pins its own instant. With no zone (`None`), the offset-less
+    /// value resolves at UTC. This is the engine-capability path: the zone reaches
+    /// `evaluate_map_to_struct` as a parameter threaded from the handler, not from schema metadata.
+    #[rstest]
+    // Offset-less `2024-01-15 16:00:00` under America/New_York (UTC-5 in January) is 21:00Z.
+    #[case::offset_less_in_zone(
+        "2024-01-15 16:00:00",
+        Some("America/New_York"),
+        1_705_352_400_000_000
+    )]
+    // Offset-less resolves at UTC when no zone is supplied: 16:00:00 -> 16:00Z.
+    #[case::offset_less_no_zone("2024-01-15 16:00:00", None, 1_705_334_400_000_000)]
+    // Explicit `Z` ignores the session zone: 16:00Z stays 16:00Z.
+    #[case::explicit_z_ignores_zone(
+        "2024-01-15T16:00:00Z",
+        Some("America/New_York"),
+        1_705_334_400_000_000
+    )]
+    fn map_to_struct_timestamp_resolves_in_session_timezone(
+        #[case] raw: &str,
+        #[case] session_tz: Option<&str>,
+        #[case] expected_micros: i64,
+    ) {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("ts");
+        builder.values().append_value(raw);
+        builder.append(true).unwrap();
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::nullable("ts", DataType::TIMESTAMP)]);
+        let result_type = DataType::from(output_schema);
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let tz = session_tz.map(|t| t.parse::<Tz>().unwrap());
+        let result =
+            evaluate_expression_impl(&expr, &batch, Some(&result_type), tz.as_ref()).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let ts = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), expected_micros);
+    }
+
+    /// `TIMESTAMP_NTZ` is a zoneless wall-clock: it must ignore the session zone entirely and
+    /// resolve at UTC even when one is supplied.
+    #[test]
+    fn map_to_struct_timestamp_ntz_ignores_session_timezone() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("ts");
+        builder.values().append_value("2024-01-15 16:00:00");
+        builder.append(true).unwrap();
+        let map_array = builder.finish();
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "pv",
+            map_array.data_type().clone(),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap();
+
+        let output_schema = StructType::new_unchecked(vec![StructField::nullable(
+            "ts",
+            DataType::Primitive(PrimitiveType::TimestampNtz),
+        )]);
+        let result_type = DataType::from(output_schema);
+        let expr = Expr::map_to_struct(column_expr!("pv"));
+        let tz = "America/New_York".parse::<Tz>().unwrap();
+        let result =
+            evaluate_expression_impl(&expr, &batch, Some(&result_type), Some(&tz)).unwrap();
+        let structs = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let ts = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        // 16:00 wall-clock, zone ignored -> 16:00Z.
+        assert_eq!(ts.value(0), 1_705_334_400_000_000);
     }
 
     #[test]
