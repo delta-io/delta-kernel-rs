@@ -80,28 +80,43 @@ pub async fn handle_response<T>(response: Response) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let status = response.status();
-
-    if status.is_success() {
+    if response.status().is_success() {
         response.json::<T>().await.map_err(Error::from)
     } else {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        Err(error_from_response(response).await)
+    }
+}
 
-        match status {
-            StatusCode::UNAUTHORIZED => {
-                Err(unity_catalog_delta_client_api::Error::AuthenticationFailed.into())
-            }
-            StatusCode::NOT_FOUND => Err(Error::HttpStatusError {
-                status: status.as_u16(),
-                message: format!("Resource not found: {error_body}"),
-            }),
-            _ => Err(Error::HttpStatusError {
-                status: status.as_u16(),
-                message: error_body,
-            }),
+/// Handle a response that carries no body (or a body the caller ignores). Preserves the server's
+/// error message on failure without decoding the success body.
+pub async fn handle_empty_response(response: Response) -> Result<()> {
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(error_from_response(response).await)
+    }
+}
+
+/// Build an error from a non-success response, preserving the server's body and mapping
+/// authentication / not-found statuses.
+async fn error_from_response(response: Response) -> Error {
+    let status = response.status();
+    let error_body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "Unknown error".to_string());
+
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            unity_catalog_delta_client_api::Error::AuthenticationFailed.into()
         }
+        StatusCode::NOT_FOUND => Error::HttpStatusError {
+            status: status.as_u16(),
+            message: format!("Resource not found: {error_body}"),
+        },
+        _ => Error::HttpStatusError {
+            status: status.as_u16(),
+            message: error_body,
+        },
     }
 }

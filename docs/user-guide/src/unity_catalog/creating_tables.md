@@ -10,13 +10,14 @@ second set of properties back to UC to finalize registration.
 
 Before reading this page, make sure you understand
 [Creating a Table](../writing/create_table.md) and the
-[Unity Catalog integration overview](./overview.md).
+[Unity Catalog Integration overview](./overview.md).
 
 > [!WARNING]
-> Steps 1 and 5 below call UC endpoints that are not yet exposed by the Rust
-> `unity-catalog-delta-rest-client` crate. Route those calls through your
-> connector's own UC client. They are planned for inclusion in the
-> `unity-catalog-delta-client-api` crate.
+> The create flow is not yet wired end-to-end. `UCCommitter::commit` currently
+> rejects version 0 (see #2826), so Step 3 does not work yet. This page
+> documents the intended flow. In addition, Steps 1 and 5 call UC endpoints that
+> the Rust `unity-catalog-delta-rest-client` crate does not yet expose. Route
+> those through your connector's own UC client.
 
 ## Prerequisites
 
@@ -65,19 +66,25 @@ use std::sync::Arc;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::UCCommitter;
-use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCCommitsRestClient};
+use unity_catalog_delta_client_api::{Operation, TableName};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 let config = ClientConfig::build(&endpoint, &token).build()?;
 let uc_client = UCClient::new(config.clone())?;
-let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
+let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
 // Credentials. Use ReadWrite so the engine can write 000.json into storage.
-let creds = uc_client.get_credentials(&table_id, Operation::ReadWrite).await?;
+let creds = uc_client
+    .get_table_credentials("main", "default", "my_table", Operation::ReadWrite)
+    .await?;
 let engine = build_engine_with_credentials(&table_uri, &creds)?;
 
 // Build the create-table transaction with the disk-bound properties.
-let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+let committer = Box::new(UCCommitter::new(
+    update_client.clone(),
+    table_id.clone(),
+    TableName::new("main", "default", "my_table"),
+));
 let create_txn = create_table(table_uri.as_str(), Arc::new(schema), "MyApp/1.0")
     .with_table_properties(disk_props)
     .build(&engine, committer)?;
@@ -98,8 +105,8 @@ let post_commit_snapshot = match create_txn.commit(&engine)? {
 };
 ```
 
-On version 0, `UCCommitter` writes `_delta_log/00000000000000000000.json`
-directly and skips the UC commits API.
+Once wired (#2826), version 0 has `UCCommitter` write
+`_delta_log/00000000000000000000.json` directly and skip the UC commits API.
 
 See `build_engine_with_credentials` in
 [Step 4 of Reading UC Tables](./reading.md#step-4-build-an-engine-with-vended-credentials)

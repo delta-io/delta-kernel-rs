@@ -9,24 +9,31 @@
 
 #include "kernel_utils.h"
 
+// strlen("_delta_log/_staged_commits/") + 1 for the trailing NUL, the fixed prefix joined onto
+// the table URI and staged file name when building the staged commit path.
+#define STAGED_COMMITS_PREFIX_LEN 28
+
 // Context struct to hold any state needed by our client
 // This can hold connection info, auth tokens, etc.
 typedef struct UCContext {
     int call_count;
     const char* base_url;
+    // Table root (with trailing slash) the committer was created for. The UC API does not carry a
+    // table URI in the commit request, so the callback uses this to locate the staged commit file.
+    const char* table_root;
 } UCContext;
 
 
 // Check that a staging file matches what the commit info says, then remove it
-void validate_and_clean_staging_file(char* table_uri, char* file_name, Commit *commit_info) {
-  char* uri = table_uri;
+void validate_and_clean_staging_file(const char* table_uri, char* file_name, Commit *commit_info) {
+  const char* uri = table_uri;
 
   // strip 'file://' if it's present
   if(strncmp(table_uri, "file://", 7) == 0) {
     uri = uri + 7;
   }
 
-  int path_len = strlen(uri) + strlen(file_name) + 28;
+  int path_len = strlen(uri) + strlen(file_name) + STAGED_COMMITS_PREFIX_LEN;
   char path[path_len];
   snprintf(path, path_len, "%s_delta_log/_staged_commits/%s", uri, file_name);
   printf("Checking that staging file at %s is valid\n", path);
@@ -86,6 +93,10 @@ OptionalValueHandleExclusiveRustString commit_callback(
     if (request.commit_info.tag == SomeCommit) {
         Commit commit_info = request.commit_info.some;
         char* file_name = allocate_string(commit_info.file_name);
+        if (file_name == NULL) {
+            perror("Failed to allocate file name");
+            exit(-1);
+        }
 
         printf("Commit info:\n");
         printf("  Version: %" PRId64 "\n", commit_info.version);
@@ -94,7 +105,11 @@ OptionalValueHandleExclusiveRustString commit_callback(
         printf("  File size: %" PRId64 "\n", commit_info.file_size);
         printf("  File mod time: %" PRId64 "\n\n", commit_info.file_modification_timestamp);
 
-        validate_and_clean_staging_file(table_uri, file_name, &commit_info);
+        // The UC API commit request carries no table URI, so use the table root the committer
+        // was created for (stored in the context).
+        const char* staging_root =
+            (context != NULL && context->table_root != NULL) ? context->table_root : "";
+        validate_and_clean_staging_file(staging_root, file_name, &commit_info);
         free(file_name);
     }
 
@@ -118,22 +133,35 @@ int main(int argc, char* argv[])
 
     char* table_path = argv[1];
 
+    // Table root with a trailing slash, used by the commit callback to locate the staged commit
+    // file (the UC API does not echo the table URI back in the commit request).
+    char table_root[1200];
+    snprintf(table_root, sizeof(table_root), "%s/", table_path);
+
     // Initialize our UC context
     UCContext uc_context = {
         .call_count = 0,
-        .base_url = "https://uc-catalog.example.com/api/v1"
+        .base_url = "https://uc-catalog.example.com/api/v1",
+        .table_root = table_root
     };
 
     // Create a UC commit client
     NullableCvoid context = (void*)&uc_context;
     HandleSharedFfiUCCommitClient uc_client = get_uc_commit_client(context, commit_callback);
 
-    // Create a UC committer for a specific table
+    // Create a UC committer for a specific table, identified by its UUID and
+    // catalog/schema/table name.
     const char* table_id = "64dcd182-b3b4-4ee0-88e0-63c159a4121c";
     KernelStringSlice table_id_slice = { .ptr = table_id, .len = strlen(table_id) };
+    const char* catalog = "my_catalog";
+    KernelStringSlice catalog_slice = { .ptr = catalog, .len = strlen(catalog) };
+    const char* schema = "my_schema";
+    KernelStringSlice schema_slice = { .ptr = schema, .len = strlen(schema) };
+    const char* table_name = "my_table";
+    KernelStringSlice table_name_slice = { .ptr = table_name, .len = strlen(table_name) };
 
-    ExternResultHandleMutableCommitter committer_res =
-        get_uc_committer(uc_client, table_id_slice, allocate_error);
+    ExternResultHandleMutableCommitter committer_res = get_uc_committer(
+        uc_client, table_id_slice, catalog_slice, schema_slice, table_name_slice, allocate_error);
 
     if (committer_res.tag != OkHandleMutableCommitter) {
         print_error("Failed to create UC committer", (Error*)committer_res.err);
@@ -152,6 +180,7 @@ int main(int argc, char* argv[])
     if (engine_builder_res.tag != OkEngineBuilder) {
         print_error("Could not get engine builder", (Error*)engine_builder_res.err);
         free_error((Error*)engine_builder_res.err);
+        free_uc_committer(uc_committer);
         free_uc_commit_client(uc_client);
         return -1;
     }
@@ -162,6 +191,7 @@ int main(int argc, char* argv[])
     if (engine_res.tag != OkHandleSharedExternEngine) {
         print_error("Failed to build engine", (Error*)engine_res.err);
         free_error((Error*)engine_res.err);
+        free_uc_committer(uc_committer);
         free_uc_commit_client(uc_client);
         return -1;
     }
@@ -173,6 +203,7 @@ int main(int argc, char* argv[])
       print_error("Failed to get snapshot builder.", (Error*)snapshot_builder_res.err);
       free_error((Error*)snapshot_builder_res.err);
       free_engine(engine);
+      free_uc_committer(uc_committer);
       free_uc_commit_client(uc_client);
       return -1;
     }
@@ -184,6 +215,7 @@ int main(int argc, char* argv[])
       print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
       free_error((Error*)snapshot_res.err);
       free_engine(engine);
+      free_uc_committer(uc_committer);
       free_uc_commit_client(uc_client);
       return -1;
     }
@@ -199,6 +231,7 @@ int main(int argc, char* argv[])
         free_error((Error*)txn_res.err);
         free_engine(engine);
         free_uc_commit_client(uc_client);
+        free_snapshot(snapshot);
         return -1;
     }
 
@@ -218,6 +251,7 @@ int main(int argc, char* argv[])
         free_error((Error*)txn_with_info_res.err);
         free_engine(engine);
         free_uc_commit_client(uc_client);
+        free_snapshot(snapshot);
         return -1;
     }
 
@@ -230,6 +264,7 @@ int main(int argc, char* argv[])
         free_error((Error*)commit_res.err);
         free_engine(engine);
         free_uc_commit_client(uc_client);
+        free_snapshot(snapshot);
         return -1;
     }
 
