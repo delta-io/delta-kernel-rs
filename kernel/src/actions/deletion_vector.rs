@@ -254,21 +254,40 @@ impl DeletionVectorDescriptor {
         }
     }
 
+    /// Decodes a `PersistedRelative` path to its relative-path form
+    /// (`<prefix>/deletion_vector_<uuid>.bin`).
+    ///
+    /// Errors if called on a non-`PersistedRelative` descriptor, if the encoded path is shorter
+    /// than the 20-character z85 UUID suffix, or if that suffix fails to decode into a UUID.
+    pub(crate) fn relative_path(&self) -> DeltaResult<String> {
+        require!(
+            self.storage_type == DeletionVectorStorageType::PersistedRelative,
+            Error::DeletionVector(format!(
+                "relative_path is only valid for PersistedRelative, got {:?}",
+                self.storage_type
+            ))
+        );
+        // Byte-slice rather than char-slice: z85 is ASCII-only, and string slicing would panic if
+        // a non-ASCII byte boundary fell inside the trailing 20-byte window. Mirrors `try_new`.
+        let bytes = self.path_or_inline_dv.as_bytes();
+        require!(
+            bytes.len() >= 20,
+            Error::DeletionVector(format!("Invalid length {}, must be >= 20", bytes.len()))
+        );
+        let prefix_len = bytes.len() - 20;
+        let decoded = z85::decode(&bytes[prefix_len..])
+            .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
+        let uuid = uuid::Uuid::from_slice(&decoded)
+            .map_err(|err| Error::DeletionVector(err.to_string()))?;
+        let prefix = std::str::from_utf8(&bytes[..prefix_len])
+            .map_err(|_| Error::deletion_vector("DV path prefix is not valid UTF-8"))?;
+        Ok(DeletionVectorPath::relative_path(prefix, &uuid))
+    }
+
     pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
         match self.storage_type {
             DeletionVectorStorageType::PersistedRelative => {
-                let path_len = self.path_or_inline_dv.len();
-                require!(
-                    path_len >= 20,
-                    Error::DeletionVector(format!("Invalid length {path_len}, must be >= 20"))
-                );
-                let prefix_len = path_len - 20;
-                let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
-                    .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
-                let uuid = uuid::Uuid::from_slice(&decoded)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let dv_suffix =
-                    DeletionVectorPath::relative_path(&self.path_or_inline_dv[..prefix_len], &uuid);
+                let dv_suffix = self.relative_path()?;
                 let dv_path = parent
                     .join(&dv_suffix)
                     .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;

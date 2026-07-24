@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
 
+mod dv_conversion;
 pub(crate) mod stats;
 
 use std::collections::HashMap;
