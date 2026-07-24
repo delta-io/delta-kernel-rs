@@ -9,9 +9,17 @@ use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{ADD_FIELD, REMOVE_FIELD, SIDECAR_FIELD};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
-use crate::schema::{lazy_schema_ref, SchemaRef};
+use crate::schema::{lazy_schema_ref, SchemaRef, StructType};
 use crate::utils::require;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, RowVisitor};
+use crate::{
+    DeltaResult, DeltaResultIteratorStatic, Engine, Error, FileMeta, PredicateRef, RowVisitor,
+};
+
+static MANIFEST_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&SIDECAR_FIELD),
+};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
@@ -40,22 +48,44 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = lazy_schema_ref! {
-            (&ADD_FIELD),
-            (&REMOVE_FIELD),
-            (&SIDECAR_FIELD),
-        };
+        Self::try_new_with_options(
+            engine,
+            manifest,
+            log_root,
+            MANIFEST_READ_SCHEMA.clone(),
+            None,
+        )
+    }
+
+    /// Create a manifest reader with a caller-selected Add projection and parquet predicate.
+    pub(crate) fn try_new_with_options(
+        engine: Arc<dyn Engine>,
+        manifest: &ParsedLogPath,
+        log_root: Url,
+        read_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Self> {
+        let mut fields: Vec<_> = read_schema.fields().cloned().collect();
+        for field in [&REMOVE_FIELD, &SIDECAR_FIELD] {
+            if !fields
+                .iter()
+                .any(|existing| existing.name() == field.name())
+            {
+                fields.push((*field).clone());
+            }
+        }
+        let manifest_read_schema = Arc::new(StructType::try_new(fields)?);
 
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                manifest_read_schema,
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
-                None,
+                manifest_read_schema,
+                predicate,
             )?,
             extension => {
                 return Err(Error::generic(format!(

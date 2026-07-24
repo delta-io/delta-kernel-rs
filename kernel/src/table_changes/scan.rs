@@ -132,6 +132,7 @@ impl TableChangesScanBuilder {
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
             &StatsOptions::default(),
+            crate::scan::DataSkippingOptions::default(),
             &PartitionValuesOptions::default(),
             CdfTransformFieldClassifier,
         )?;

@@ -36,6 +36,25 @@ fn field_names(s: &StructArray) -> Vec<String> {
     s.fields().iter().map(|f| f.name().clone()).collect()
 }
 
+#[rstest]
+#[case::all(DataSkippingOptions::All, true, true)]
+#[case::in_memory(DataSkippingOptions::InMemory, true, false)]
+#[case::checkpoint_pushdown(DataSkippingOptions::CheckpointPushdown, false, true)]
+#[case::none(DataSkippingOptions::None, false, false)]
+fn data_skipping_options_expose_expected_capabilities(
+    #[case] options: DataSkippingOptions,
+    #[case] uses_in_memory: bool,
+    #[case] uses_checkpoint_pushdown: bool,
+) {
+    assert_eq!(options.uses_in_memory(), uses_in_memory);
+    assert_eq!(options.uses_checkpoint_pushdown(), uses_checkpoint_pushdown);
+}
+
+#[test]
+fn data_skipping_options_default_to_all() {
+    assert_eq!(DataSkippingOptions::default(), DataSkippingOptions::All);
+}
+
 #[test]
 fn test_static_skipping() {
     const NULL: Pred = Pred::null_literal();
@@ -1110,8 +1129,15 @@ fn test_prefix_columns_simple() {
     assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
 }
 
-#[test]
-fn test_build_actions_meta_predicate_with_predicate() {
+#[rstest]
+#[case::all(DataSkippingOptions::All, true)]
+#[case::in_memory(DataSkippingOptions::InMemory, false)]
+#[case::checkpoint_pushdown(DataSkippingOptions::CheckpointPushdown, true)]
+#[case::none(DataSkippingOptions::None, false)]
+fn data_skipping_mode_gates_actions_meta_predicate(
+    #[case] data_skipping: DataSkippingOptions,
+    #[case] expected: bool,
+) {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
@@ -1122,27 +1148,26 @@ fn test_build_actions_meta_predicate_with_predicate() {
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
+        .with_data_skipping(data_skipping)
         .build()
         .unwrap();
 
     let meta_pred = scan.build_actions_meta_predicate();
-    assert!(
-        meta_pred.is_some(),
-        "Should produce an actions meta predicate for a data-skipping-eligible predicate"
-    );
+    assert_eq!(meta_pred.is_some(), expected);
 
     // Verify all column references are prefixed with add.stats_parsed
-    let pred = meta_pred.unwrap();
-    for col_ref in pred.references() {
-        let path: Vec<_> = col_ref.iter().collect();
-        assert_eq!(
-            path[0], "add",
-            "Column reference should start with 'add': {col_ref}"
-        );
-        assert_eq!(
-            path[1], "stats_parsed",
-            "Column reference should have 'stats_parsed' as second element: {col_ref}"
-        );
+    if let Some(pred) = meta_pred {
+        for col_ref in pred.references() {
+            let path: Vec<_> = col_ref.iter().collect();
+            assert_eq!(
+                path[0], "add",
+                "Column reference should start with 'add': {col_ref}"
+            );
+            assert_eq!(
+                path[1], "stats_parsed",
+                "Column reference should have 'stats_parsed' as second element: {col_ref}"
+            );
+        }
     }
 }
 
@@ -1181,6 +1206,11 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     assert!(
         scan.build_actions_meta_predicate().is_none(),
         "StaticSkipAll predicate should return None"
+    );
+    assert_eq!(
+        scan.physical_predicate(),
+        Some(Arc::new(Pred::literal(false))),
+        "connectors must still receive the exact false predicate"
     );
 }
 
@@ -1394,11 +1424,16 @@ fn test_checkpoint_row_group_skipping(
     }
 }
 
-/// `StatsOptions::none()` disables data-column skipping (no stats are read). Partition pruning is
-/// a separate path that survives `none()`, but this table is unpartitioned and the predicate is on
-/// a data column, so no skipping applies and every file is kept.
-#[test]
-fn test_skip_stats_disables_data_column_skipping() {
+/// `StatsOptions::none()` hides statistics without changing the selected pruning mode.
+#[rstest]
+#[case::all(DataSkippingOptions::All, 2)]
+#[case::in_memory(DataSkippingOptions::InMemory, 2)]
+#[case::checkpoint_pushdown(DataSkippingOptions::CheckpointPushdown, 6)]
+#[case::none(DataSkippingOptions::None, 6)]
+fn data_skipping_mode_is_independent_of_stats_output(
+    #[case] data_skipping: DataSkippingOptions,
+    #[case] expected_file_count: usize,
+) {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
@@ -1409,6 +1444,7 @@ fn test_skip_stats_disables_data_column_skipping() {
         .scan_builder()
         .with_predicate(predicate)
         .with_stats(StatsOptions::none())
+        .with_data_skipping(data_skipping)
         .build()
         .unwrap();
 
@@ -1419,15 +1455,19 @@ fn test_skip_stats_disables_data_column_skipping() {
         .unwrap();
 
     let mut selected_file_count = 0;
-    for scan_metadata in &scan_metadata_results {
-        let selection_vector = scan_metadata.scan_files.selection_vector();
+    for scan_metadata in scan_metadata_results {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
         selected_file_count += selection_vector
             .iter()
             .filter(|&&selected| selected)
             .count();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        assert!(batch.column_by_name("stats_parsed").is_none());
     }
 
-    assert_eq!(selected_file_count, 6);
+    assert_eq!(selected_file_count, expected_file_count);
 }
 
 /// Calling `with_stats` twice replaces the prior value; the last call wins.
@@ -1507,7 +1547,7 @@ fn test_default_stats_options_no_struct_output() {
 /// the [`StatsOptions::struct_columns`] named constructor (json off).
 #[rstest::rstest]
 #[case::with_json(StatsOptions {
-    synthesize_json: true,
+    emit_json: true,
     struct_stats: StructStats::Columns(vec![column_name!("id")]),
 })]
 #[case::struct_columns_ctor(StatsOptions::struct_columns(vec![column_name!("id")]))]
@@ -1517,7 +1557,12 @@ fn test_scan_metadata_with_specific_stats_columns(#[case] stats: StatsOptions) {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let scan = snapshot.scan_builder().with_stats(stats).build().unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(column_expr!("salary").gt(Expr::literal(0i64))))
+        .with_stats(stats)
+        .build()
+        .unwrap();
 
     let scan_metadata_results: Vec<_> = scan
         .scan_metadata(engine.as_ref())
@@ -1561,7 +1606,7 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
-            synthesize_json: true,
+            emit_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("id"), column_name!("name")]),
         })
         .build()
@@ -1621,10 +1666,10 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that [`StructStats::Columns`] with a nonexistent column name produces empty stats for
-/// that column.
+/// A nonexistent structured-statistics column produces no `stats_parsed` output while preserving
+/// independently requested JSON statistics.
 #[test]
-fn test_scan_metadata_with_nonexistent_stats_columns() {
+fn test_scan_metadata_with_nonexistent_stats_columns_omits_struct_output() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
@@ -1633,7 +1678,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
-            synthesize_json: true,
+            emit_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
         })
         .build()
@@ -1658,14 +1703,9 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         let filtered_batch =
             filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
 
-        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-
-        // Should have numRecords but no minValues/maxValues/nullCount
-        // (or they exist but are empty structs)
-        assert!(
-            stats_parsed.column_by_name(NUM_RECORDS).is_some(),
-            "Should still have numRecords"
-        );
+        assert!(filtered_batch.column_by_name("stats_parsed").is_none());
+        let stats_json = get_column!(filtered_batch, "stats", StringArray);
+        assert!(stats_json.iter().all(|stats| stats.is_some()));
     }
 }
 

@@ -904,10 +904,20 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
     /// ```
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionPredicateOp,
+        mut op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
+        if inverted {
+            op = op.invert();
+        }
+        // The checkpoint predicate may be applied as an exact row filter by an engine. Replacing
+        // an unsupported arm with NULL would then discard the row under SQL WHERE semantics.
+        // TRUE is conservative for both junctions: AND retains supported pruning, while OR
+        // becomes all-keep.
+        Some(Pred::junction(
+            op,
+            preds.map(|pred| pred.unwrap_or_else(|| Pred::literal(true))),
+        ))
     }
 }

@@ -12,7 +12,7 @@ use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
 use crate::scan::ScanMetadata;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 /// Result of sequential scan metadata processing.
 ///
@@ -173,10 +173,15 @@ impl ParallelState {
 
     /// Get the schema to use for reading checkpoint files.
     ///
-    /// Returns the checkpoint read schema which may have stats excluded
-    /// if skip_stats was enabled when the scan was created.
+    /// Returns the checkpoint read schema, which omits statistics when they are needed for neither
+    /// scan metadata output nor an enabled data-skipping mechanism.
     pub fn file_read_schema(&self) -> SchemaRef {
         self.inner.checkpoint_info().checkpoint_read_schema.clone()
+    }
+
+    /// Get the predicate to push into checkpoint parquet reads, if enabled for this scan.
+    pub(crate) fn file_read_predicate(&self) -> Option<PredicateRef> {
+        self.inner.checkpoint_predicate()
     }
 
     /// Serialize the processor state for distributed processing.
@@ -257,8 +262,9 @@ impl ParallelScanMetadata {
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
         let read_schema = state.file_read_schema();
+        let predicate = state.file_read_predicate();
         Ok(Self {
-            processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema)?,
+            processor: ParallelPhase::try_new(engine, state, leaf_files, read_schema, predicate)?,
             // TODO: Associate the same scan ID from sequential phase to correlate phases
             span: info_span!("parallel_scan_metadata"),
         })
@@ -295,7 +301,7 @@ mod tests {
     use crate::log_segment::CheckpointReadInfo;
     use crate::metrics::{MetricEvent, ScanType, TableType};
     use crate::scan::log_replay::{
-        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanReplayOptions,
     };
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
@@ -318,6 +324,7 @@ mod tests {
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
             physical_stats_schema: None,
+            output_stats_schema: None,
             physical_partition_schema: None,
             physical_stats_columns: HashSet::new(),
             is_catalog_managed: true,
@@ -327,7 +334,7 @@ mod tests {
             &engine,
             state_info,
             CheckpointReadInfo::without_stats_parsed(),
-            ScanStatsOptions::default(),
+            ScanReplayOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
         .unwrap();
