@@ -225,8 +225,8 @@ fn get_uc_committer_impl(
 
 /// Free a committer obtained via [`get_uc_committer`] that was not passed to a consuming API.
 ///
-/// APIs that take ownership of the committer -- `transaction_with_committer`,
-/// `create_table_builder_build_with_committer`, and `snapshot_publish_with_committer` --
+/// APIs that take ownership of the committer; `transaction_with_committer`,
+/// `create_table_builder_build_with_committer`, and `snapshot_publish_with_committer`
 /// consume the handle (do not free; it will not need to be freed afterward).
 ///
 /// # Safety

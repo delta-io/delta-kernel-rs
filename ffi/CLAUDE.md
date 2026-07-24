@@ -121,7 +121,7 @@ committed_transaction_post_commit_snapshot()
 commits into `_delta_log/` via the catalog committer's `publish()` implementation. The input
 snapshot is borrowed; the committer is consumed (do not free). The caller owns the returned
 snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
-needed for the next catalog commit -- do not continue from the pre-publish post-commit snapshot.
+needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
 
 Deletion vector update flow:
 

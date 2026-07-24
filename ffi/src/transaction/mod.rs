@@ -823,8 +823,6 @@ mod tests {
     use crate::schema_visitor::{
         visit_field_integer, visit_field_long, visit_field_string, visit_field_struct,
     };
-    #[cfg(feature = "delta-kernel-unity-catalog")]
-    use crate::snapshot_publish_with_committer;
     use crate::{
         free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
         KernelStringSlice, NullableCvoid, OptionalValue,
@@ -1733,7 +1731,7 @@ mod tests {
         use crate::delta_kernel_unity_catalog::{
             free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
         };
-        use crate::{Handle, NullableCvoid, OptionalValue};
+        use crate::{snapshot_publish_with_committer, Handle, NullableCvoid, OptionalValue};
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
