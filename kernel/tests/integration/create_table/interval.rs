@@ -5,37 +5,10 @@ use std::sync::Arc;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::table_features::TableFeature;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use test_utils::test_table_setup;
-
-/// A schema without interval columns must not add the `intervalType-preview` feature. This holds
-/// regardless of the cargo gate, since no interval column is present.
-#[test]
-fn test_create_table_no_interval_no_feature() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("name", DataType::STRING, true),
-    ])?);
-
-    let _ = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    let table_url = delta_kernel::try_parse_uri(&table_path)?;
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    assert!(
-        !snapshot
-            .table_configuration()
-            .is_feature_supported(&TableFeature::IntervalTypePreview),
-        "intervalType feature should NOT be in protocol for a non-interval schema"
-    );
-    Ok(())
-}
 
 #[cfg(not(feature = "interval-type-in-dev"))]
 #[test]
@@ -90,9 +63,8 @@ fn test_create_table_rejects_interval_clustering(
 #[cfg(feature = "interval-type-in-dev")]
 mod feature_enabled {
     use delta_kernel::schema::SchemaRef;
-    use delta_kernel::table_features::{
-        ColumnMappingMode, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
-    };
+    use delta_kernel::snapshot::Snapshot;
+    use delta_kernel::table_features::ColumnMappingMode;
     use rstest::rstest;
     use test_utils::cm_properties;
 
@@ -121,12 +93,9 @@ mod feature_enabled {
         ]))
     }
 
-    /// Creating a table whose schema contains an interval column auto-enables
-    /// `intervalType-preview` across column mapping modes, and the logical schema round-trips. The
-    /// write path requires kernel support, so this test is gated behind the
-    /// `interval-type-in-dev` cargo feature.
+    /// Creating a table with interval columns preserves its schema across column mapping modes.
     #[rstest]
-    fn test_create_table_with_interval_auto_enables_feature(
+    fn test_create_table_with_interval_round_trips_schema(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
         #[values(top_level_interval_schema, nested_interval_schema)] make_schema: fn(
             DataType,
@@ -144,21 +113,6 @@ mod feature_enabled {
 
         let table_url = delta_kernel::try_parse_uri(&table_path)?;
         let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-        let table_config = snapshot.table_configuration();
-
-        assert!(
-            table_config.is_feature_supported(&TableFeature::IntervalTypePreview),
-            "intervalType feature should be auto-enabled"
-        );
-        let protocol = table_config.protocol();
-        assert!(protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION);
-        assert!(protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION);
-        assert!(protocol
-            .reader_features()
-            .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
-        assert!(protocol
-            .writer_features()
-            .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
 
         let expected_cm_mode = match cm_mode {
             "none" => ColumnMappingMode::None,
@@ -175,34 +129,6 @@ mod feature_enabled {
             schema.as_ref(),
             "logical schema should round-trip through create table"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_table_interval_feature_signal_supported() -> DeltaResult<()> {
-        let (_temp_dir, table_path, engine) = test_table_setup()?;
-        let schema = top_level_interval_schema(DataType::INTERVAL_DAY_TIME);
-
-        let _ = create_table(&table_path, schema, "Test/1.0")
-            .with_table_properties([("delta.feature.intervalType-preview", "supported")])
-            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-            .commit(engine.as_ref())?;
-
-        let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-        let table_config = snapshot.table_configuration();
-        assert!(
-            table_config.is_feature_supported(&TableFeature::IntervalTypePreview),
-            "intervalType feature signal should be supported"
-        );
-        let protocol = table_config.protocol();
-        assert!(protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION);
-        assert!(protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION);
-        assert!(protocol
-            .reader_features()
-            .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
-        assert!(protocol
-            .writer_features()
-            .is_some_and(|f| f.contains(&TableFeature::IntervalTypePreview)));
         Ok(())
     }
 }

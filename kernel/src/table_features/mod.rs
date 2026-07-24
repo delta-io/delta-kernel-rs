@@ -14,9 +14,6 @@ pub(crate) use column_mapping::{
 use delta_kernel_derive::internal_api;
 pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
-pub(crate) use interval_type::{
-    schema_contains_interval_type, validate_interval_type_feature_support_on_write,
-};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -34,7 +31,6 @@ use crate::{DeltaResult, Error};
 
 mod column_mapping;
 mod iceberg_compat;
-mod interval_type;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -144,15 +140,6 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
-    /// ANSI interval types, in preview pending RFC ratification (`intervalType-preview`).
-    ///
-    /// TODO(#2840): intervalType support is gated by the `interval-type-in-dev` cargo feature.
-    /// Connectors may enable this protocol feature explicitly. It is not auto-enabled from schema
-    /// contents so tables created for legacy interoperability remain readable by connectors that
-    /// predate the feature.
-    #[strum(serialize = "intervalType-preview")]
-    #[serde(rename = "intervalType-preview")]
-    IntervalTypePreview,
     /// timestamps without timezone support
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
@@ -562,17 +549,6 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-static INTERVAL_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
-    feature_type: FeatureType::ReaderWriter,
-    min_legacy_version: None,
-    feature_requirements: &[],
-    #[cfg(feature = "interval-type-in-dev")]
-    kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "interval-type-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
-    enablement_check: EnablementCheck::AlwaysIfSupported,
-};
-
 /// TODO: When type widening is supported on writes, restrict the allowed
 /// widenings on IcebergCompatV3 tables to the subset permitted by the Iceberg v3
 /// schema-evolution rules. Ref: <https://iceberg.apache.org/spec/#schema-evolution>
@@ -705,7 +681,6 @@ impl TableFeature {
             | TableFeature::CatalogOwnedPreview
             | TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
-            | TableFeature::IntervalTypePreview
             | TableFeature::TimestampWithoutTimezone
             | TableFeature::TypeWidening
             | TableFeature::TypeWideningPreview
@@ -773,7 +748,6 @@ impl TableFeature {
             TableFeature::CatalogOwnedPreview => &CATALOG_OWNED_PREVIEW_INFO,
             TableFeature::ColumnMapping => &COLUMN_MAPPING_INFO,
             TableFeature::DeletionVectors => &DELETION_VECTORS_INFO,
-            TableFeature::IntervalTypePreview => &INTERVAL_TYPE_PREVIEW_INFO,
             TableFeature::TimestampWithoutTimezone => &TIMESTAMP_WITHOUT_TIMEZONE_INFO,
             TableFeature::TypeWidening => &TYPE_WIDENING_INFO,
             TableFeature::TypeWideningPreview => &TYPE_WIDENING_PREVIEW_INFO,
@@ -1063,28 +1037,6 @@ mod tests {
         }
     }
 
-    /// A table that declares `intervalType-preview` in its reader features is readable exactly when
-    /// kernel support is compiled in (the `interval-type-in-dev` gate); otherwise the read is
-    /// refused.
-    #[test]
-    fn test_read_protocol_with_interval_type_feature() {
-        let protocol = Protocol::try_new_modern(
-            [TableFeature::IntervalTypePreview],
-            [TableFeature::IntervalTypePreview],
-        )
-        .unwrap();
-        let result = ensure_table_can_be_read(&protocol);
-        if cfg!(feature = "interval-type-in-dev") {
-            result
-                .expect("intervalType-preview table must be readable when the feature is enabled");
-        } else {
-            assert!(
-                matches!(result, Err(Error::Unsupported(_))),
-                "intervalType-preview read must be Unsupported when the feature is off, got: {result:?}"
-            );
-        }
-    }
-
     #[test]
     fn test_roundtrip_table_features() {
         use strum::IntoEnumIterator as _;
@@ -1109,7 +1061,6 @@ mod tests {
                 TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
                 TableFeature::ColumnMapping => "columnMapping",
                 TableFeature::DeletionVectors => "deletionVectors",
-                TableFeature::IntervalTypePreview => "intervalType-preview",
                 TableFeature::TimestampWithoutTimezone => "timestampNtz",
                 TableFeature::TypeWidening => "typeWidening",
                 TableFeature::TypeWideningPreview => "typeWidening-preview",

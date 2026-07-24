@@ -25,8 +25,12 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::utils::test_utils::assert_result_error_with_message;
+#[cfg(feature = "geo-type-in-dev")]
+use crate::utils::test_utils::{geography_type, geometry_type};
 use crate::EvaluationHandlerExtension as _;
 
 #[test]
@@ -1501,5 +1505,19 @@ fn test_interval_scalar_to_array_unsupported(#[case] interval_type: KernelDataTy
     assert!(
         matches!(result, Err(crate::error::Error::Unsupported(_))),
         "expected Unsupported, got {result:?}"
+    );
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+#[rstest]
+#[case(geometry_type("EPSG:4326"))]
+#[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
+fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
+    let mut builder: Box<dyn crate::arrow::array::ArrayBuilder> =
+        Box::new(crate::arrow::array::BinaryBuilder::new());
+    let err = Scalar::append_null(builder.as_mut(), &dt, 1).unwrap_err();
+    assert!(
+        matches!(err, Error::Unsupported(_)),
+        "expected Unsupported, got: {err:?}"
     );
 }

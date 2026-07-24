@@ -199,8 +199,8 @@ use delta_kernel::schema::{
 use delta_kernel::table_features::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{
-    try_parse_uri, DeltaResult, DeltaResultIterator, Engine, EngineData, Error, FileMeta,
-    FilteredEngineData, LogPath, Snapshot,
+    try_parse_uri, CancellationToken, CancelledFuture, DeltaResult, DeltaResultIterator, Engine,
+    EngineData, Error, FileMeta, FilteredEngineData, LogPath, Snapshot,
 };
 // Re-export `delta_kernel_default_engine` so kernel's integration tests can access it without
 // taking a direct dev-dep on the new crate (which would create a cycle via this crate).
@@ -1396,6 +1396,56 @@ pub async fn write_batch_to_table(
 pub struct AddInfo {
     pub path: String,
     pub stats: Option<serde_json::Value>,
+}
+
+/// A [`CancellationToken`] for tests. Start uncancelled and flip it with
+/// [`cancel`](Self::cancel), or construct one already cancelled with
+/// [`cancelled`](Self::cancelled).
+///
+/// The [`cancelled_future`](CancellationToken::cancelled_future) future is backed by a
+/// [`tokio::sync::Notify`] so it resolves when [`cancel`](Self::cancel) fires even from another
+/// thread -- this drives the default engine's mid-read cancellation race, not just the synchronous
+/// `is_cancelled` poll.
+#[derive(Debug, Default)]
+pub struct TestCancellationToken {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl TestCancellationToken {
+    /// A token that is already cancelled.
+    pub fn cancelled() -> Self {
+        let token = Self::default();
+        token.cancel();
+        token
+    }
+
+    /// Request cancellation, waking any future returned by
+    /// [`cancelled_future`](CancellationToken::cancelled_future).
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
+impl CancellationToken for TestCancellationToken {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn cancelled_future(&self) -> CancelledFuture<'_> {
+        Box::pin(async move {
+            // `notified()` must be registered before the cancellation check to avoid missing a
+            // `notify_waiters` that races between the two; an already-cancelled token still
+            // returns immediately via the check.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        })
+    }
 }
 
 /// Reads all [`AddInfo`]s from a snapshot's log segment.

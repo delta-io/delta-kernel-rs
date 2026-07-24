@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::deletion_vector_writer::{
     KernelDeletionVector, StreamingDeletionVectorWriter,
 };
@@ -420,6 +420,28 @@ pub async fn create_dv_table_with_files(
 
     let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
     Ok((store, engine, table_url, paths))
+}
+
+/// Build a `path -> descriptor` map assigning each file a distinct synthetic DV descriptor.
+pub fn sequential_dv_descriptors(
+    file_paths: &[String],
+) -> HashMap<String, DeletionVectorDescriptor> {
+    file_paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            (
+                path.clone(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: format!("dv_file_{idx}.bin"),
+                    offset: Some(idx as i32 * 10),
+                    size_in_bytes: 40 + idx as i32,
+                    cardinality: idx as i64 + 1,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Extracts scan files from a snapshot for use in deletion vector updates.

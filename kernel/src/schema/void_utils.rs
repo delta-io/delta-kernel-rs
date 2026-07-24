@@ -1,4 +1,4 @@
-//! Write-time validation for void type usage in schemas.
+//! Write-time validation for data types in schemas.
 //!
 //! The Delta protocol allows void columns in table metadata. Void columns are never written to
 //! Parquet files; reads generate null values on the fly for missing void columns. However, certain
@@ -11,6 +11,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use super::validation::validate_interval_type_write_support;
 use super::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
 use crate::expressions::ExpressionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
@@ -60,10 +61,8 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
 }
 
 /// Validates that a schema is suitable for writing data. This is the kernel-internal write-time
-/// rejection point for invalid void placements: [`StructType::try_new`] validates structural
-/// properties only (field-name uniqueness, metadata-column rules) and accepts schemas like
-/// `Array<Void>` or all-void structs. Both JSON-deserialized metadata (which round-trips through
-/// `try_new`) and any `new_unchecked` paths therefore rely on this validator.
+/// rejection point for unsupported data types and invalid void placements. Both JSON-deserialized
+/// metadata and programmatically constructed schemas rely on this validator before writing files.
 ///
 /// Writes are rejected when:
 /// - Void is nested inside Array or Map. Parquet's UNKNOWN logical type can in principle annotate
@@ -72,7 +71,10 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
 ///   values to drop them.
 /// - A struct contains no non-void fields (would produce an empty Parquet struct)
 /// - The table schema contains no non-void columns (would produce an empty Parquet schema)
+/// - The schema contains an ANSI interval type and the `interval-type-in-dev` feature is disabled
 pub(crate) fn validate_schema_for_write(schema: &Schema) -> DeltaResult<()> {
+    validate_interval_type_write_support(schema)?;
+
     ValidateForWrite {
         container_depth: 0,
         depth: 0,
@@ -196,6 +198,17 @@ mod tests {
     };
 
     // ---- validate_schema_for_write tests ----
+
+    #[cfg(not(feature = "interval-type-in-dev"))]
+    #[rstest::rstest]
+    fn test_interval_type_requires_write_support(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+    ) {
+        let schema = StructType::new_unchecked([StructField::nullable("iv", interval)]);
+
+        let error = validate_schema_for_write(&schema).unwrap_err().to_string();
+        assert!(error.contains("interval-type-in-dev"));
+    }
 
     #[test]
     fn test_validator_catches_void_in_map_from_json() {

@@ -26,8 +26,8 @@ use test_utils::{
 use url::Url;
 
 use crate::common::write_utils::{
-    create_dv_table_with_files, get_scan_files, get_simple_int_schema, set_table_properties,
-    write_data_and_check_result_and_stats,
+    create_dv_table_with_files, get_scan_files, get_simple_int_schema, sequential_dv_descriptors,
+    set_table_properties, write_data_and_check_result_and_stats,
 };
 
 #[tokio::test]
@@ -543,17 +543,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
 
     // Update deletion vectors for all 3 files in a single call
-    let mut dv_map = HashMap::new();
-    for (idx, file_path) in file_paths.iter().enumerate() {
-        let descriptor = DeletionVectorDescriptor {
-            storage_type: DeletionVectorStorageType::PersistedRelative,
-            path_or_inline_dv: format!("dv_file_{idx}.bin"),
-            offset: Some(idx as i32 * 10),
-            size_in_bytes: 40 + idx as i32,
-            cardinality: idx as i64 + 1,
-        };
-        dv_map.insert(file_path.to_string(), descriptor);
-    }
+    let dv_map = sequential_dv_descriptors(&file_paths);
 
     txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
 

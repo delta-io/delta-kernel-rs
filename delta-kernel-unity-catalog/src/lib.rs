@@ -357,7 +357,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Time-travel version 5 exceeds max_catalog_version 3"));
+            .contains("Requested version 5 exceeds max catalog version 3"));
     }
 
     #[tokio::test]
@@ -395,7 +395,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("log_tail must be sorted and contiguous"));
+            .contains("Log tail versions 1 and 3 are not contiguous"));
     }
 
     #[rstest]

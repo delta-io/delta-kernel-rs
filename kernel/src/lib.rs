@@ -87,6 +87,7 @@ use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
+pub mod cancellation;
 pub mod checkpoint;
 pub mod commit_range;
 pub mod committer;
@@ -183,6 +184,8 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
+use cancellation::check_cancelled;
+pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
 pub use engine_data::{
@@ -684,13 +687,43 @@ pub trait JsonHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. If
+    ///   applied, a file or row may be omitted only when the predicate cannot evaluate to true for
+    ///   any row in that unit. Unsupported subexpressions and references with no matching physical
+    ///   or generated value must remain unknown and must not fail the read. A missing reference
+    ///   remains unknown for pruning even if schema reconciliation synthesizes a NULL output
+    ///   column. Returned data is not guaranteed to satisfy the predicate.
     fn read_json_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than reading every file to completion.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_json_files`](Self::read_json_files), ignoring the token
+    /// for the rest of the read. So an engine that does not override this stays source-compatible
+    /// while still honoring an up-front cancellation; kernel additionally polls the token at
+    /// action-batch boundaries. An engine that overrides this may assume kernel has already
+    /// performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_json_files(files, physical_schema, predicate)
+    }
 
     /// Atomically (!) write a single JSON file. Each selected row of the input data must be
     /// written as a new JSON object appended to the file; rows not selected by a batch's
@@ -864,12 +897,18 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. A
+    ///   file, row group, or row may be omitted only when the predicate cannot evaluate to true for
+    ///   any row in that unit. Unsupported subexpressions and references with no matching physical
+    ///   or generated value must remain unknown and must not fail the read. A missing reference
+    ///   remains unknown for pruning even if schema reconciliation synthesizes a NULL output
+    ///   column. Returned data is not guaranteed to satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
     /// Each element of the iterator is a [`DeltaResult`] of [`EngineData`]. The [`EngineData`]
-    /// has the contents of `files` and must match the provided `physical_schema`.
+    /// contains rows from `files` after any predicate push-down and must match the provided
+    /// `physical_schema`.
     ///
     /// Note: The [`FileDataReadResultIterator`] must emit data from files in the order that `files`
     /// is given. For example if files ["a", "b"] is provided, then the engine data iterator must
@@ -894,6 +933,31 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than reading every file to completion.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_parquet_files`](Self::read_parquet_files), ignoring the
+    /// token for the rest of the read. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation; kernel additionally polls
+    /// the token at action-batch boundaries. An engine that overrides this may assume kernel has
+    /// already performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_parquet_files(files, physical_schema, predicate)
+    }
 
     /// Write data to a Parquet file at the specified URL.
     ///
@@ -973,6 +1037,28 @@ pub trait ParquetHandler: AsAny {
     /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
+
+    /// Cancellation-aware variant of [`read_parquet_footer`](Self::read_parquet_footer).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
+    /// and return [`Error::Cancelled`] once cancellation is observed.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
+    /// token for the rest of the read. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation. An engine that overrides
+    /// this may assume kernel has already performed the pre-read check, and should focus on
+    /// interrupting its in-flight I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_parquet_footer_with_cancellation(
+        &self,
+        file: &FileMeta,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<ParquetFooter> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_parquet_footer(file)
+    }
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

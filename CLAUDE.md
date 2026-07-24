@@ -78,12 +78,9 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
-- `interval-type-in-dev` -- ANSI interval type support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `intervalType-preview` reader-writer feature. CREATE TABLE
-  auto-enables the table feature when the schema contains an interval column. With the cargo
-  feature off, creating or writing any table with interval columns is blocked, as are reads and
-  writes of tables listing `intervalType-preview`. Reads of legacy featureless interval tables
-  (which never declare the table feature) remain supported.
+- `interval-type-in-dev` -- ANSI interval type support (experimental, in development). With the
+  cargo feature off, creating or writing tables with interval columns is blocked; reads are
+  unaffected.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -267,9 +264,9 @@ is the source of truth. Key concepts:
   `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
   `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
-  `columnMapping`, `deletionVectors`, `intervalType-preview`, `timestampNtz`, `typeWidening`,
-  `v2Checkpoint`, `vacuumProtocolCheck`, `variantShredding`, `variantShredding-preview`,
-  `variantType`, `variantType-preview`
+  `columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
+  `vacuumProtocolCheck`, `variantShredding`, `variantShredding-preview`, `variantType`,
+  `variantType-preview`
 
 Keep this list updated when new protocol features are added to kernel.
 
@@ -286,9 +283,10 @@ Keep this list updated when new protocol features are added to kernel.
   any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
   `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
   and deadlock on the same lock. In `on_new_span`, no extension lock is held during
-  `attrs.record()`, so direct `warn!()` is safe there. In `on_event` and `on_record`, store
-  warnings in a `pending_warnings: Vec<String>` field on the visitor, take them out after
-  the extensions block closes, and emit via `warn!()` only then. See
+  `attrs.record()`, so direct `warn!()` is safe there. In `on_record`, store warnings in a
+  `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
+  block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
+  warning-eligible work, so it may run under the lock directly.) See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
 
 ## Code Style
