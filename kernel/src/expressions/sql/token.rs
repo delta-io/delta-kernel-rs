@@ -6,8 +6,8 @@
 //!
 //! Example: `` `col1` > 5 `` tokenizes to `[Ident("col1"), Gt, Number("5")]`.
 
-// WIP feature behind `check-constraints-in-dev`; some items have no caller until enforcement lands.
-// TODO(#2896): remove this allow once check-constraint enforcement wires up a caller.
+// WIP feature behind `check-constraints-in-dev`; some items have no caller until discovery lands.
+// TODO(#2896): remove this allow once check-constraint discovery wires up a caller.
 #![allow(dead_code)]
 
 use std::iter::Peekable;
@@ -28,9 +28,13 @@ pub(super) enum Token {
     /// caller need not re-derive number-ness from the raw text.
     Number(String),
     /// A non-numeric literal's raw, undecoded source text (quotes and any typed-literal keyword
-    /// retained): quoted strings, `X'..'` binary, `TRUE`/`FALSE`/`NULL`, and typed
+    /// retained): quoted strings, `X'..'` binary, `TRUE`/`FALSE`, and typed
     /// `DATE`/`TIMESTAMP`/ `TIMESTAMP_LTZ`/`TIMESTAMP_NTZ` literals.
     Literal(String),
+    /// The `NULL` keyword (case-insensitive). Recognized here rather than carried as raw
+    /// [`Literal`] text so downstream stages match it structurally instead of re-detecting the
+    /// string and its casing.
+    Null,
     Dot,
     Lt,
     Le,
@@ -227,8 +231,8 @@ fn take_number(chars: &mut CharStream<'_>) -> String {
     out
 }
 
-/// Scan a bare word and classify it: a keyword (`AND`/`OR`/`NOT`/`IS`), a boolean/null/typed/binary
-/// literal, or an identifier. All classification is case-insensitive.
+/// Scan a bare word and classify it: a keyword (`AND`/`OR`/`NOT`/`IS`), `NULL`, a
+/// boolean/typed/binary literal, or an identifier. All classification is case-insensitive.
 ///
 /// Keywords are recognized here rather than downstream so a backtick-quoted `` `AND` `` (parsed as
 /// an `Ident` by the caller of this function) stays distinct from the bareword keyword `AND`.
@@ -242,7 +246,8 @@ fn classify_word(chars: &mut CharStream<'_>, sql: &str) -> DeltaResult<Token> {
         "OR" => Token::Keyword(Keyword::Or),
         "NOT" => Token::Keyword(Keyword::Not),
         "IS" => Token::Keyword(Keyword::Is),
-        "NULL" | "TRUE" | "FALSE" => Token::Literal(word),
+        "NULL" => Token::Null,
+        "TRUE" | "FALSE" => Token::Literal(word),
         // `X'deadbeef'` binary literal: only when a quote immediately follows (no whitespace),
         // otherwise `x` is a column named `x`.
         "X" if chars.peek() == Some(&'\'') => {
@@ -345,7 +350,6 @@ mod tests {
     #[rstest]
     #[case("'foo'", lit("'foo'"))]
     #[case("'O''Brien'", lit("'O''Brien'"))] // doubled '' escape retained
-    #[case("NULL", lit("NULL"))]
     #[case("TRUE", lit("TRUE"))]
     #[case("false", lit("false"))]
     #[case("DATE '1970-01-02'", lit("DATE '1970-01-02'"))]
@@ -353,6 +357,16 @@ mod tests {
     #[case("X'01ff'", lit("X'01ff'"))]
     fn tokenizes_literal_as_single_raw_token(#[case] sql: &str, #[case] expected: Token) {
         assert_eq!(tokenize(sql).unwrap(), [expected]);
+    }
+
+    /// `NULL` tokenizes to the dedicated `Token::Null` (not a raw `Literal`), case-insensitively,
+    /// so downstream stages need not re-detect the string or its casing.
+    #[rstest]
+    #[case("NULL")]
+    #[case("null")]
+    #[case("Null")]
+    fn tokenizes_null_keyword(#[case] sql: &str) {
+        assert_eq!(tokenize(sql).unwrap(), [Token::Null]);
     }
 
     /// Every typed-literal keyword tokenizes to exactly one literal, so dropping one from the

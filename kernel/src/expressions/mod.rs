@@ -30,6 +30,11 @@ pub(crate) use literal_expression_transform::literal_expression_transform;
 mod scalars;
 mod sql;
 pub(crate) use self::sql::parse_sql;
+#[cfg(feature = "check-constraints-in-dev")]
+// TODO(#2896): Wire up `parse_sql_simple_predicate` to check-constraints discovery; remove this
+// allow
+#[allow(unused_imports)]
+pub(crate) use self::sql::parse_sql_simple_predicate;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
