@@ -1013,19 +1013,21 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             is_log_batch,
         } = actions_batch;
 
-        // Step 1: Apply transform FIRST (outputs stats_parsed and partitionValues_parsed).
-        // Use the correct transform based on batch type:
+        let mut should_retry_transform_and_data_skip = false;
+        // Step 1: Apply transform + data skipping. Do this before deduplication to reduce the size
+        // of the dedup map and avoid String allocations.
+        // This step transforms all Adds, including those superseded by Removes (dead Adds).
+        // The transform for a dead Add may fail because it may have a different partition column
+        // type. In that case, we get a ParseError and retry after deduplication.
+        // The transform depends on the batch type:
         // - Log batches: parse JSON for stats, MapToStruct for partition values
         // - Checkpoint batches: read pre-parsed columns directly when available
-
-        // Step 2: Build selection vector from TRANSFORMED batch (reads stats_parsed directly).
         // This avoids double JSON parsing -- the transform already parsed the stats.
         // Data skipping is safe for Remove rows: their add-side columns (stats_parsed,
         // partitionValues_parsed) are null. For stats, the skipping predicate wraps comparisons
         // with ISNULL guards that keep rows with missing stats. For partition values, the
         // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
         // rows always pass the partition filter regardless of null partition values.
-        let mut should_retry_transform_and_data_skip = false;
         let (pre_dedup_transform_result, pre_dedup_selection) =
             match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
                 Ok((transformed_actions, pre_dedup_selection)) => {
@@ -1038,7 +1040,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 Err(err) => return Err(err),
             };
 
-        // Step 3: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
+        // Step 2: Run deduplication visitor on RAW batch (needs add.path, remove.path, etc.)
         let deduplicator = FileActionDeduplicator::new(
             &mut self.seen_file_keys,
             is_log_batch,
@@ -1063,13 +1065,15 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             )
         };
 
-        // Step 4: Return transformed batch with updated selection vector
+        // Step 3: Return transformed batch with updated selection vector
         let RetryTransformAndDataSkipOutput {
             transformed_actions,
             final_selection,
             row_transform_exprs,
             active_add_file_sizes,
         } = if should_retry_transform_and_data_skip {
+            // If step 1 failed with a parse error, filter out the dead Adds and retry after
+            // deduplication.
             self.retry_transform_and_data_skip(
                 actions,
                 is_log_batch,
