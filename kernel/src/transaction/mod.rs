@@ -1937,7 +1937,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
 
-        // Regression coverage for stale SharedWriteState caching: keep the first context alive
+        // Regression coverage for stale WriteState caching: keep the first context alive
         // while the transaction's effective table config changes.
         let initial_write_context = txn.unpartitioned_write_context()?;
         assert!(!initial_write_context

@@ -628,13 +628,15 @@ mod tests {
         random_prefix_length: usize,
     ) -> WriteContext {
         let schema = schema_ref! { nullable "value": INTEGER };
-        let shared = Arc::new(SharedWriteState {
+        let shared = Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
+            full_logical_schema: schema.clone(),
             logical_schema: schema.clone(),
             physical_schema: schema.clone(),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
+            materialize_partition_columns: false,
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
