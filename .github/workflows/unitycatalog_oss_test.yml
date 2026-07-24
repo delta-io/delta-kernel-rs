@@ -1,13 +1,15 @@
 name: unity-catalog-oss-test
 
-# Runs the gated `unity-catalog-delta-rest-client` live integration tests against a real Unity
-# Catalog OSS server (built from a pinned commit). Exercises the read-only `get_config` handshake
-# (needs no table) and `load_table` against a table seeded via the Delta-Commits (legacy) API
-# before the test step, plus the mutating create tests (UC_CREATE) against the ephemeral server.
+# Runs the gated `unity-catalog-delta-rest-client` and `delta-kernel-unity-catalog` live
+# integration tests against a real Unity Catalog OSS server (built from a pinned commit). Exercises
+# the read-only `get_config` handshake (needs no table), `load_table` against a table seeded via the
+# Delta-Commits (legacy) API before the test step, and the CREATE E2E test (bootstraps its own
+# table).
 on:
   push:
     branches: [main, "release/**"]
     paths:
+      - "delta-kernel-unity-catalog/**"
       - "unity-catalog-delta-client-api/**"
       - "unity-catalog-delta-rest-client/**"
       - ".github/workflows/unitycatalog_oss_test.yml"
@@ -16,6 +18,7 @@ on:
       - ".github/scripts/seed_uc_table.sh"
   pull_request:
     paths:
+      - "delta-kernel-unity-catalog/**"
       - "unity-catalog-delta-client-api/**"
       - "unity-catalog-delta-rest-client/**"
       - ".github/workflows/unitycatalog_oss_test.yml"
@@ -89,7 +92,7 @@ jobs:
           UC_TEST_SCHEMA: default
           UC_TEST_TABLE: smoke_test_table
           UC_CREATE: "1"
-        run: cargo nextest run --locked -p unity-catalog-delta-rest-client --features integration-test -E 'test(live_)'
+        run: cargo nextest run --locked -p unity-catalog-delta-rest-client -p delta-kernel-unity-catalog --features integration-test -E 'test(live_)'
 
       - name: Stop Unity Catalog server
         if: always()
