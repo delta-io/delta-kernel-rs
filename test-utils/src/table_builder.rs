@@ -1806,36 +1806,43 @@ fn generate_partition_values(
 /// Generate a deterministic [`Scalar`] partition value for the given data type.
 fn scalar_for_type(data_type: &DataType, seed: usize) -> Scalar {
     match data_type {
-        DataType::Primitive(p) => match p {
-            PrimitiveType::Boolean => Scalar::Boolean(seed.is_multiple_of(2)),
-            PrimitiveType::Byte => Scalar::Byte((seed % 100) as i8),
-            PrimitiveType::Short => Scalar::Short((seed % 100) as i16),
-            PrimitiveType::Integer => Scalar::Integer((seed % 100) as i32),
-            PrimitiveType::Long => Scalar::Long((seed * 1000) as i64),
-            PrimitiveType::Float => Scalar::Float(seed as f32 * 0.5),
-            PrimitiveType::Double => Scalar::Double(seed as f64 * 0.25),
-            PrimitiveType::String => Scalar::String(format!("part_{seed}")),
-            PrimitiveType::Binary => Scalar::Binary(format!("bin_{seed}").into_bytes()),
-            PrimitiveType::Date => {
-                // Days since epoch (1970-01-01)
-                Scalar::Date(18000 + seed as i32)
+        DataType::Primitive(p) => {
+            #[allow(unreachable_patterns)]
+            match p {
+                PrimitiveType::Boolean => Scalar::Boolean(seed.is_multiple_of(2)),
+                PrimitiveType::Byte => Scalar::Byte((seed % 100) as i8),
+                PrimitiveType::Short => Scalar::Short((seed % 100) as i16),
+                PrimitiveType::Integer => Scalar::Integer((seed % 100) as i32),
+                PrimitiveType::Long => Scalar::Long((seed * 1000) as i64),
+                PrimitiveType::Float => Scalar::Float(seed as f32 * 0.5),
+                PrimitiveType::Double => Scalar::Double(seed as f64 * 0.25),
+                PrimitiveType::String => Scalar::String(format!("part_{seed}")),
+                PrimitiveType::Binary => Scalar::Binary(format!("bin_{seed}").into_bytes()),
+                PrimitiveType::Date => {
+                    // Days since epoch (1970-01-01)
+                    Scalar::Date(18000 + seed as i32)
+                }
+                PrimitiveType::Timestamp => {
+                    // Microseconds since epoch (UTC)
+                    Scalar::Timestamp((18000 + seed as i64) * 86_400_000_000)
+                }
+                PrimitiveType::TimestampNtz => {
+                    // Microseconds since epoch (no timezone)
+                    Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
+                }
+                PrimitiveType::Decimal(dt) => {
+                    let scale_factor = 10i128.pow(dt.scale() as u32);
+                    let bits = seed as i128 * scale_factor;
+                    Scalar::decimal(bits, dt.precision(), dt.scale())
+                        .expect("test seed produced invalid decimal")
+                }
+                PrimitiveType::Void => panic!("void type is not a valid partition column"),
+                // Intervals are physical integers: months (year-month) / microseconds (day-time).
+                PrimitiveType::IntervalYearMonth => Scalar::IntervalYearMonth((seed % 100) as i32),
+                PrimitiveType::IntervalDayTime => Scalar::IntervalDayTime((seed * 1000) as i64),
+                other => panic!("{other:?} is not a valid partition column type"),
             }
-            PrimitiveType::Timestamp => {
-                // Microseconds since epoch (UTC)
-                Scalar::Timestamp((18000 + seed as i64) * 86_400_000_000)
-            }
-            PrimitiveType::TimestampNtz => {
-                // Microseconds since epoch (no timezone)
-                Scalar::TimestampNtz((18000 + seed as i64) * 86_400_000_000)
-            }
-            PrimitiveType::Decimal(dt) => {
-                let scale_factor = 10i128.pow(dt.scale() as u32);
-                let bits = seed as i128 * scale_factor;
-                Scalar::decimal(bits, dt.precision(), dt.scale())
-                    .expect("test seed produced invalid decimal")
-            }
-            other => panic!("{other:?} is not a valid partition column type"),
-        },
+        }
         other => panic!("partition columns must be primitive types, got: {other:?}"),
     }
 }
