@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -6,27 +6,77 @@ use rand::Rng;
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
-use crate::expressions::{ColumnName, ExpressionRef};
+use crate::expressions::{
+    lit, ColumnName, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar,
+};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
-use crate::schema::SchemaRef;
+use crate::partition::serialization::serialize_partition_value;
+use crate::partition::validation::validate_partition_values;
+use crate::schema::void_utils::add_void_stripping;
+use crate::schema::{DataType, SchemaRef};
 use crate::table_features::ColumnMappingMode;
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-/// Table-wide write state shared across all [`WriteContext`] instances created by a
-/// [`Transaction`]. Holds the target directory, schemas, column mapping mode, stats columns,
-/// logical partition column names, and randomized-prefix configuration.
+/// Transport format version for [`WriteState::encode`] / [`WriteState::decode`]. Bump on any
+/// change to the on-wire field set so an older writer kernel rejects a payload it cannot read.
+#[cfg(feature = "write-transport")]
+const WRITE_STATE_TRANSPORT_VERSION: u32 = 1;
+
+/// The table-wide, partition-agnostic write contract, frozen on the driver.
+///
+/// A `WriteState` carries everything the whole table needs in order to write a data file, minus
+/// which partition. It is built once via [`Transaction::write_state`], which runs all table-wide
+/// write validation up front, and it is bound to a partition on demand via
+/// [`partitioned_write_context`](Self::partitioned_write_context) /
+/// [`unpartitioned_write_context`](Self::unpartitioned_write_context), each of which returns a
+/// [`WriteContext`]. One `WriteState` produces many `WriteContext`s, and cloning it is cheap
+/// (schemas are `Arc`-shared).
+///
+/// # Distributed writers
+///
+/// A `WriteState` is the only kernel state a distributed writer needs. The driver builds it, ships
+/// it to remote writers, and each writer binds partitions and writes files without holding a
+/// [`Transaction`], re-opening the table, or reimplementing Delta protocol rules. Transport is via
+/// the kernel-owned, versioned [`encode`](Self::encode) / [`decode`](Self::decode) (feature
+/// `write-transport`); the byte format is a kernel choice and callers treat the bytes as opaque.
+/// Single-process writers never encode: they reach `WriteState` through the one-step
+/// [`Transaction::partitioned_write_context`] sugar and skip transport entirely.
+///
+/// The commit, conflict resolution, and row-tracking base-row-id assignment stay on the driver's
+/// [`Transaction`]; a `WriteState` carries no committer and no snapshot.
+///
+/// # Frozen, not re-derived
+///
+/// A `WriteState` stores the already-resolved write contract (physical/logical write schemas,
+/// ordered partition column names, resolved stats columns including clustering columns, column
+/// mapping mode, materialization behavior, and file-layout properties). A writer uses these values
+/// as-is; it does not re-derive them from `Metadata`/`Protocol`. This makes write behavior
+/// identical regardless of which kernel binary the writer runs, and it carries state (clustering
+/// columns) that is not derivable from `Metadata`/`Protocol` alone.
 ///
 /// [`Transaction`]: super::Transaction
-#[derive(Debug)]
-pub(super) struct SharedWriteState {
+/// [`Transaction::write_state`]: super::Transaction::write_state
+/// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
+#[derive(Debug, Clone)]
+pub struct WriteState {
     pub(super) table_root: Url,
-    /// Logical schema of the data to write: the table schema minus partition columns.
+    /// Full logical schema, including partition columns, in metadata order. Used to validate
+    /// partition value types/nullability, resolve each partition column's physical name, and place
+    /// materialized partition columns at their original positions in the logical-to-physical
+    /// transform. Held internally: writers already know the source relation's full schema.
+    pub(super) full_logical_schema: SchemaRef,
+    /// Logical schema of the data to write: the full logical schema minus partition columns. This
+    /// is the input the logical-to-physical transform expects.
     pub(super) logical_schema: SchemaRef,
     pub(super) physical_schema: SchemaRef,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
+    /// Whether the logical-to-physical transform injects partition columns into the written data
+    /// (`materializePartitionColumns` or `icebergCompatV3`).
+    pub(super) materialize_partition_columns: bool,
     /// Resolved value of the `delta.randomizeFilePrefixes` table property. When true,
     /// [`WriteContext::write_dir`] emits a random alphanumeric prefix regardless of column
     /// mapping mode.
@@ -37,8 +87,277 @@ pub(super) struct SharedWriteState {
     pub(super) random_prefix_length: NonZero<usize>,
 }
 
+impl WriteState {
+    /// Binds this write state to a specific partition, returning a [`WriteContext`] for writing
+    /// that partition's files.
+    ///
+    /// Performs the following validations and transformations:
+    ///
+    /// - **Key completeness**: ensures all partition columns are present and no extra keys exist.
+    ///   For example, if the table has partition columns `["year", "region"]` and you pass
+    ///   `{"year": Scalar::Integer(2024)}`, this returns an error for missing "region".
+    ///
+    /// - **Case normalization**: matches keys case-insensitively against the schema and normalizes
+    ///   to schema case. For example, passing `"YEAR"` for a column named `"year"` is accepted and
+    ///   normalized.
+    ///
+    /// - **Type checking**: rejects non-primitive partition column types (struct, array, map) and
+    ///   validates that each non-null `Scalar`'s type matches the partition column's schema type.
+    ///   For example, passing `Scalar::String("2024")` for an `INTEGER` column returns an error.
+    ///   Null-equivalent scalars (null scalars, empty strings, and empty binary, all of which
+    ///   collapse to JSON null in `partitionValues`) skip the value type check, but they are only
+    ///   legal when the partition column is nullable; passing any of these for a `nullable: false`
+    ///   partition column returns an error.
+    ///
+    /// - **Value serialization**: serializes each `Scalar` to a protocol-compliant string per the
+    ///   Delta protocol's "Partition Value Serialization" rules. `Scalar::Null(...)` becomes `None`
+    ///   in `add.partitionValues` (JSON null). `Scalar::String("")` also becomes `None` (empty
+    ///   string equals null for all types). `Scalar::Date(19723)` becomes `Some("2024-01-01")`.
+    ///
+    /// - **Key translation**: translates logical column names to physical names using the table's
+    ///   column mapping mode. For example, under `ColumnMappingMode::Name`, logical `"year"` might
+    ///   become physical `"col-abc-123"` in the `partitionValues` map.
+    ///
+    /// Partition values are supplied by name (`HashMap<String, Scalar>`), not by position, so a
+    /// missing or misnamed key surfaces as a validation error rather than silently pairing a value
+    /// with the wrong column.
+    ///
+    /// Returns an error if the table is not partitioned (use
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
+    pub fn partitioned_write_context(
+        &self,
+        partition_values: HashMap<String, Scalar>,
+    ) -> DeltaResult<WriteContext> {
+        require!(
+            !self.logical_partition_columns.is_empty(),
+            Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
+        );
+        // Validate keys (completeness, case normalization) and value types, then return
+        // the map re-keyed to schema case.
+        let normalized = validate_partition_values(
+            &self.logical_partition_columns,
+            &self.full_logical_schema,
+            partition_values,
+        )?;
+
+        // Serialize values and translate keys from logical to physical names.
+        let mut serialized = HashMap::with_capacity(normalized.len());
+        for logical_name in &self.logical_partition_columns {
+            let scalar = normalized.get(logical_name).ok_or_else(|| {
+                Error::internal_error(format!(
+                    "partition column '{logical_name}' missing after validation"
+                ))
+            })?;
+            let value = serialize_partition_value(scalar)?;
+            let physical_name = self
+                .full_logical_schema
+                .field(logical_name)
+                .ok_or_else(|| {
+                    Error::internal_error(format!(
+                        "partition column '{logical_name}' not found in schema after validation"
+                    ))
+                })?
+                .physical_name(self.column_mapping_mode)
+                .to_string();
+            serialized.insert(physical_name, value);
+        }
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
+
+        Ok(WriteContext {
+            shared: Arc::new(self.clone()),
+            logical_to_physical,
+            physical_partition_values: serialized,
+        })
+    }
+
+    /// Binds this write state for writing to an unpartitioned table, returning a [`WriteContext`].
+    ///
+    /// Returns an error if the table has partition columns (use
+    /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
+    ///
+    /// Note: clustered tables are unpartitioned and use this method.
+    pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
+        require!(
+            self.logical_partition_columns.is_empty(),
+            Error::generic("table is partitioned; use partitioned_write_context() instead")
+        );
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
+        Ok(WriteContext {
+            shared: Arc::new(self.clone()),
+            logical_to_physical,
+            physical_partition_values: HashMap::new(),
+        })
+    }
+
+    /// The schema the writer's logical data must conform to: the table's logical schema with
+    /// partition columns projected out. This is the input to [`WriteContext::logical_to_physical`].
+    pub fn logical_write_schema(&self) -> &SchemaRef {
+        &self.logical_schema
+    }
+
+    /// The physical schema the writer must produce in Parquet. Partition columns are removed unless
+    /// `materializePartitionColumns` keeps them; column mapping is applied.
+    pub fn physical_write_schema(&self) -> &SchemaRef {
+        &self.physical_schema
+    }
+
+    /// The logical partition column names, in metadata-defined order. A writer pairs its discovered
+    /// partition values against these names when calling
+    /// [`partitioned_write_context`](Self::partitioned_write_context).
+    pub fn logical_partition_columns(&self) -> &[String] {
+        &self.logical_partition_columns
+    }
+
+    /// The column names that should have statistics collected during writes, resolved from table
+    /// configuration (including protocol-required clustering columns).
+    pub fn stats_columns(&self) -> &[ColumnName] {
+        &self.stats_columns
+    }
+
+    /// The [`ColumnMappingMode`] for this table.
+    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
+        self.column_mapping_mode
+    }
+
+    /// The table root URL.
+    pub fn table_root(&self) -> &Url {
+        &self.table_root
+    }
+
+    /// Encode this write state to kernel-owned, versioned bytes for transport to a remote writer.
+    ///
+    /// The byte format is a kernel implementation detail: callers treat the result as an opaque
+    /// blob and wrap it in their own envelope. Decode it with [`decode`](Self::decode). Single-
+    /// process writers never call this.
+    #[cfg(feature = "write-transport")]
+    pub fn encode(&self) -> DeltaResult<Vec<u8>> {
+        let transport = WriteStateTransport::from_state(self);
+        Ok(serde_json::to_vec(&transport)?)
+    }
+
+    /// Decode a write state from bytes produced by [`encode`](Self::encode), rejecting any payload
+    /// whose transport version this kernel does not understand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are malformed or carry an unrecognized transport version.
+    #[cfg(feature = "write-transport")]
+    pub fn decode(bytes: &[u8]) -> DeltaResult<Self> {
+        #[derive(serde::Deserialize)]
+        struct VersionProbe {
+            version: u32,
+        }
+        let probe: VersionProbe = serde_json::from_slice(bytes)?;
+        require!(
+            probe.version == WRITE_STATE_TRANSPORT_VERSION,
+            Error::generic(format!(
+                "unsupported WriteState transport version {}; this kernel supports version {}",
+                probe.version, WRITE_STATE_TRANSPORT_VERSION
+            ))
+        );
+        let transport: WriteStateTransport = serde_json::from_slice(bytes)?;
+        transport.into_state()
+    }
+
+    /// Generates the logical-to-physical expression evaluated on every data chunk before writing.
+    /// When partition columns are materialized, `partition_values` supplies the literals to inject;
+    /// it must be present (and complete) for partitioned tables and is `None` otherwise.
+    fn generate_logical_to_physical(
+        &self,
+        partition_values: Option<&HashMap<String, Scalar>>,
+    ) -> DeltaResult<Expression> {
+        let mut patch = ExpressionStructPatchBuilder::new();
+        if self.materialize_partition_columns {
+            let partition_cols: HashSet<&str> = self
+                .logical_partition_columns
+                .iter()
+                .map(String::as_str)
+                .collect();
+            // Insert each partition column after the nearest preceding surviving field
+            // (non-partition and non-void), in the order they appear in the logical schema.
+            // This keeps the post-transform data aligned with the physical schema.
+            let mut predecessor: Option<&str> = None;
+            for field in self.full_logical_schema.fields() {
+                let name = field.name().as_str();
+                if partition_cols.contains(name) {
+                    let value = partition_values.and_then(|m| m.get(name)).ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "partition column '{name}' missing while building logical-to-physical \
+                             expression"
+                        ))
+                    })?;
+                    let literal = lit(value.clone());
+                    patch = match predecessor {
+                        Some(predecessor) => patch.insert_after(predecessor, literal),
+                        None => patch.prepend(literal),
+                    };
+                } else if *field.data_type() != DataType::VOID {
+                    predecessor = Some(name);
+                }
+            }
+        }
+        let patch = add_void_stripping(patch, &self.full_logical_schema);
+        Expression::struct_patch(patch)
+    }
+}
+
+/// Kernel-owned, versioned wire form of [`WriteState`]. Kept separate from `WriteState` so the
+/// public type never derives serde (which would let callers construct one bypassing validation)
+/// and so internal type changes are not silently wire changes. `Url` rides as a string to avoid
+/// depending on `url`'s serde feature.
+#[cfg(feature = "write-transport")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WriteStateTransport {
+    version: u32,
+    table_root: String,
+    full_logical_schema: SchemaRef,
+    logical_schema: SchemaRef,
+    physical_schema: SchemaRef,
+    column_mapping_mode: ColumnMappingMode,
+    stats_columns: Vec<ColumnName>,
+    logical_partition_columns: Vec<String>,
+    materialize_partition_columns: bool,
+    randomize_file_prefixes: bool,
+    random_prefix_length: NonZero<usize>,
+}
+
+#[cfg(feature = "write-transport")]
+impl WriteStateTransport {
+    fn from_state(state: &WriteState) -> Self {
+        Self {
+            version: WRITE_STATE_TRANSPORT_VERSION,
+            table_root: state.table_root.to_string(),
+            full_logical_schema: state.full_logical_schema.clone(),
+            logical_schema: state.logical_schema.clone(),
+            physical_schema: state.physical_schema.clone(),
+            column_mapping_mode: state.column_mapping_mode,
+            stats_columns: state.stats_columns.clone(),
+            logical_partition_columns: state.logical_partition_columns.clone(),
+            materialize_partition_columns: state.materialize_partition_columns,
+            randomize_file_prefixes: state.randomize_file_prefixes,
+            random_prefix_length: state.random_prefix_length,
+        }
+    }
+
+    fn into_state(self) -> DeltaResult<WriteState> {
+        Ok(WriteState {
+            table_root: Url::parse(&self.table_root)?,
+            full_logical_schema: self.full_logical_schema,
+            logical_schema: self.logical_schema,
+            physical_schema: self.physical_schema,
+            column_mapping_mode: self.column_mapping_mode,
+            stats_columns: self.stats_columns,
+            logical_partition_columns: self.logical_partition_columns,
+            materialize_partition_columns: self.materialize_partition_columns,
+            randomize_file_prefixes: self.randomize_file_prefixes,
+            random_prefix_length: self.random_prefix_length,
+        })
+    }
+}
+
 /// A write context for a specific partition or an unpartitioned table. Created by
-/// [`Transaction::partitioned_write_context`] or [`Transaction::unpartitioned_write_context`].
+/// [`Transaction::partitioned_write_context`] or [`Transaction::unpartitioned_write_context`]
+/// (single-process writers) or by binding a [`WriteState`] to a partition (distributed writers).
 ///
 /// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
@@ -60,7 +379,7 @@ pub(super) struct SharedWriteState {
 /// [`physical_partition_values`]: WriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct WriteContext {
-    pub(super) shared: Arc<SharedWriteState>,
+    pub(super) shared: Arc<WriteState>,
     /// Transforms logical data to physical data for writing. The logical data must not contain
     /// any partition columns. The expression injects the partition columns when needed.
     pub(super) logical_to_physical: ExpressionRef,

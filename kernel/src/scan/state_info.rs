@@ -44,7 +44,7 @@ pub(crate) struct StateInfo {
     /// (predicate-independent). `physical_stats_schema` is the per-scan projection shape
     /// (predicate-trimmed).
     ///
-    /// Read-path mirror of `SharedWriteState.stats_columns`.
+    /// Read-path mirror of `WriteState.stats_columns`.
     pub(crate) physical_stats_columns: HashSet<ColumnName>,
     /// Whether the table is catalog-managed, used to label scan metric events. Converted to a
     /// [`TableType`](crate::metrics::TableType) at event construction.
