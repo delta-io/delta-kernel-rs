@@ -41,9 +41,8 @@ impl std::fmt::Debug for MeteredParquetHandler {
 }
 
 impl MeteredParquetHandler {
-    /// The plain and cancellation-aware reads must emit an identical `ParquetReadCompleted` span
-    /// (`num_files` plus summed `bytes_read`, on exhaustion or drop), so both funnel through here
-    /// rather than duplicating the metric wiring and risking the two paths drifting apart.
+    /// Wraps `inner` so it emits a `ParquetReadCompleted` span carrying `num_files` and the summed
+    /// `bytes_read` of `files` when the iterator is exhausted or dropped.
     fn meter(files: &[FileMeta], inner: FileDataReadResultIterator) -> FileDataReadResultIterator {
         let num_files = files.len() as u64;
         let bytes_read = files.iter().map(|f| f.size).sum();

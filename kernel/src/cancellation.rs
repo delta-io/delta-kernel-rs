@@ -38,10 +38,10 @@ pub(crate) fn check_cancelled(token: Option<&CancellationTokenRef>) -> DeltaResu
 ///
 /// Implementors wrap whatever their runtime provides (e.g. `tokio_util::sync::CancellationToken`).
 /// Kernel and cancellation-aware engines only *consume* it: Kernel polls [`is_cancelled`] between
-/// action batches, while an async engine may await [`cancelled`] to wake blocked I/O.
+/// action batches, while an async engine may await [`cancelled_future`] to wake blocked I/O.
 ///
 /// [`is_cancelled`]: CancellationToken::is_cancelled
-/// [`cancelled`]: CancellationToken::cancelled
+/// [`cancelled_future`]: CancellationToken::cancelled_future
 pub trait CancellationToken: Send + Sync {
     /// Returns `true` once cancellation has been requested. Cheap, synchronous, and monotonic:
     /// once it returns `true` it must never return `false` again.
@@ -52,7 +52,7 @@ pub trait CancellationToken: Send + Sync {
     /// There is no default implementation: a correct notification cannot be synthesized from
     /// [`is_cancelled`](Self::is_cancelled) alone without either busy-polling or a runtime, and
     /// Kernel has neither. Implementors back this with their own notification primitive.
-    fn cancelled(&self) -> CancelledFuture<'_>;
+    fn cancelled_future(&self) -> CancelledFuture<'_>;
 }
 
 /// Wraps a fallible iterator so that cancellation terminates it with a single
@@ -129,7 +129,7 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             self.0.load(Ordering::SeqCst)
         }
-        fn cancelled(&self) -> CancelledFuture<'_> {
+        fn cancelled_future(&self) -> CancelledFuture<'_> {
             // Tests only drive `is_cancelled`; a resolved/pending future is enough here.
             Box::pin(ready(()))
         }

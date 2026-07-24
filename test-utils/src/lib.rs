@@ -1402,9 +1402,10 @@ pub struct AddInfo {
 /// [`cancel`](Self::cancel), or construct one already cancelled with
 /// [`cancelled`](Self::cancelled).
 ///
-/// The [`cancelled`](CancellationToken::cancelled) future is backed by a [`tokio::sync::Notify`]
-/// so it resolves when [`cancel`](Self::cancel) fires even from another thread -- this drives the
-/// default engine's mid-read cancellation race, not just the synchronous `is_cancelled` poll.
+/// The [`cancelled_future`](CancellationToken::cancelled_future) future is backed by a
+/// [`tokio::sync::Notify`] so it resolves when [`cancel`](Self::cancel) fires even from another
+/// thread -- this drives the default engine's mid-read cancellation race, not just the synchronous
+/// `is_cancelled` poll.
 #[derive(Debug, Default)]
 pub struct TestCancellationToken {
     cancelled: std::sync::atomic::AtomicBool,
@@ -1420,7 +1421,7 @@ impl TestCancellationToken {
     }
 
     /// Request cancellation, waking any future returned by
-    /// [`cancelled`](CancellationToken::cancelled).
+    /// [`cancelled_future`](CancellationToken::cancelled_future).
     pub fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1433,7 +1434,7 @@ impl CancellationToken for TestCancellationToken {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn cancelled(&self) -> CancelledFuture<'_> {
+    fn cancelled_future(&self) -> CancelledFuture<'_> {
         Box::pin(async move {
             // `notified()` must be registered before the cancellation check to avoid missing a
             // `notify_waiters` that races between the two; an already-cancelled token still
