@@ -585,7 +585,8 @@ impl Snapshot {
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
-    /// requested domain is in a Partial cache, also answer from the cache; else full log
+    /// requested domain is in a Partial cache, also answer from the cache; else if a stale Complete
+    /// CRC is held, scan only the commits after it and reconcile against its map; else full log
     /// replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
@@ -645,6 +646,23 @@ impl Snapshot {
                 }
             }
         }
+        // A stale but authoritative (`Complete`) CRC roots a tail-only scan over the commits after
+        // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
+        // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
+        // scan and falls through to the full replay below.
+        if let Some(base) = self.base_crc() {
+            if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
+                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
+                    base.version,
+                    base_active,
+                    domains,
+                    engine,
+                )?;
+                record_metric(false, rooted.len());
+                return Ok(rooted);
+            }
+        }
+
         // Fallback: scan the log_segment from scratch.
         // TODO: a Partial cache already covers the commits read during snapshot load. A
         //       miss search could skip that range and only scan the older commits, then

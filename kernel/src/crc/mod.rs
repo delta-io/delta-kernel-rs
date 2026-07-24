@@ -26,7 +26,7 @@ mod writer;
 use std::collections::HashMap;
 
 #[allow(unused)]
-pub(crate) use delta::CrcDelta;
+pub(crate) use delta::{merge_domain_metadata, CrcDelta};
 pub use file_size_histogram::FileSizeHistogram;
 pub use file_stats::FileStats;
 #[allow(unused)]

@@ -479,10 +479,15 @@ impl DomainMetadataVisitor {
             .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
     }
 
-    pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
-        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to
-        // filter
-        self.domain_metadatas.retain(|_, dm| !dm.removed);
+    pub(crate) fn into_domain_metadatas(self) -> DomainMetadataMap {
+        let mut domain_metadatas = self.domain_metadatas;
+        domain_metadatas.retain(|_, dm| !dm.removed);
+        domain_metadatas
+    }
+
+    /// The newest-wins domain-metadata map, retaining tombstones (`removed == true`).
+    /// [`Self::into_domain_metadatas`] returns the same map with tombstones stripped.
+    pub(crate) fn into_domain_metadatas_including_tombstones(self) -> DomainMetadataMap {
         self.domain_metadatas
     }
 }
