@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rstest::rstest;
 
 use super::*;
-use crate::expressions::column_name;
+use crate::expressions::{column_expr_ref, column_name};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
 
 const TRUE: Option<bool> = Some(true);
@@ -690,6 +690,25 @@ fn test_partition_timestamp_column_no_adjustment() {
         skipping_pred.to_string(),
         "OR(NOT(Column(is_add)), Column(partitionValues_parsed.ts_part) > 1000000)"
     );
+}
+
+#[rstest]
+fn test_interval_partition_columns_are_not_pruning_columns(
+    #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+) {
+    let partition_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "period", interval,
+    )]));
+    let (_, _, partition_columns) = DataSkippingFilter::build_unified_schema_and_expr(
+        None,
+        column_expr_ref!("stats_parsed"),
+        Some(&partition_schema),
+        column_expr_ref!("partitionValues_parsed"),
+        Arc::new(Expr::literal(true)),
+    )
+    .unwrap();
+
+    assert!(partition_columns.is_empty());
 }
 
 // Tests for partition-aware data skipping

@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -310,7 +310,23 @@ impl DataSkippingFilter {
         is_add_expr: ExpressionRef,
     ) -> Option<(SchemaRef, ExpressionRef, HashSet<ColumnName>)> {
         let partition_columns: HashSet<ColumnName> = physical_partition_schema
-            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
+            .map(|s| {
+                s.fields()
+                    // Intervals are ordered, but interval data skipping is not supported.
+                    .filter(|f| {
+                        matches!(
+                            f.data_type(),
+                            DataType::Primitive(primitive)
+                                if is_skipping_eligible_datatype(primitive)
+                                    || matches!(
+                                        primitive,
+                                        PrimitiveType::Boolean | PrimitiveType::Binary
+                                    )
+                        )
+                    })
+                    .map(|f| ColumnName::new([f.name()]))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let stats_field =

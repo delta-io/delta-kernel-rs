@@ -1496,16 +1496,17 @@ fn test_void_scalar_to_array() {
     assert_eq!(*array.data_type(), DataType::Null);
 }
 
-// Unit test to ensure scalars reject interval types
+// Interval scalars materialize as their physical integer arrays (Int32 months / Int64 micros).
 #[rstest]
-#[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH)]
-#[case::day_time(KernelDataType::INTERVAL_DAY_TIME)]
-fn test_interval_scalar_to_array_unsupported(#[case] interval_type: KernelDataType) {
-    let result = Scalar::Null(interval_type).to_array(1);
-    assert!(
-        matches!(result, Err(crate::error::Error::Unsupported(_))),
-        "expected Unsupported, got {result:?}"
-    );
+#[case::year_month(Scalar::IntervalYearMonth(30), DataType::Int32)]
+#[case::day_time(Scalar::IntervalDayTime(5), DataType::Int64)]
+fn test_interval_scalar_to_array(#[case] scalar: Scalar, #[case] arrow_type: DataType) {
+    let array = scalar.to_array(2).unwrap();
+    assert_eq!(array.len(), 2);
+    assert_eq!(*array.data_type(), arrow_type);
+
+    let nulls = Scalar::Null(scalar.data_type()).to_array(2).unwrap();
+    assert_eq!(*nulls.data_type(), arrow_type);
 }
 
 #[cfg(feature = "geo-type-in-dev")]

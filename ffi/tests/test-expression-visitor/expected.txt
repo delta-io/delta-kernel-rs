@@ -179,7 +179,7 @@ And
 === Simple Round-trip Test ===
 This test validates expressions/predicates with full support.
 Supported types: primitives (int, long, float, double, bool, string),
-  temporal (date, timestamp, timestamp_ntz), binary, decimal, null,
+  temporal (date, timestamp, timestamp_ntz), intervals, binary, decimal, null,
   binary operations (+, -, *, /), struct expressions, predicates (eq, ne, lt, le,
   gt, ge, distinct, is_null, is_not_null, not, and, or)
 
@@ -194,6 +194,8 @@ StructExpression
   Date(19000)
   Timestamp(1234567890)
   TimestampNtz(9876543210)
+  IntervalYearMonth(-13)
+  IntervalDayTime(9876543210)
   Null(Integer)
   Null(Decimal(10,5))
   Add

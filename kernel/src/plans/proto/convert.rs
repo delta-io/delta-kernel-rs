@@ -546,6 +546,8 @@ impl From<&Scalar> for proto_expr::Scalar {
             Scalar::Boolean(v) => Value::Boolean(*v),
             Scalar::Timestamp(v) => Value::Timestamp(*v),
             Scalar::TimestampNtz(v) => Value::TimestampNtz(*v),
+            Scalar::IntervalYearMonth(v) => Value::IntervalYearMonth(*v),
+            Scalar::IntervalDayTime(v) => Value::IntervalDayTime(*v),
             Scalar::Date(v) => Value::Date(*v),
             Scalar::Binary(v) => Value::Binary(v.clone()),
             Scalar::Decimal(decimal) => Value::Decimal(decimal.into()),
@@ -1888,6 +1890,8 @@ mod tests {
             Value::Boolean(_) => "boolean",
             Value::Timestamp(_) => "timestamp",
             Value::TimestampNtz(_) => "timestamp_ntz",
+            Value::IntervalYearMonth(_) => "interval_year_month",
+            Value::IntervalDayTime(_) => "interval_day_time",
             Value::Date(_) => "date",
             Value::Binary(_) => "binary",
             Value::Decimal(_) => "decimal",
@@ -1897,6 +1901,30 @@ mod tests {
             Value::Map(_) => "map",
         };
         assert_eq!(kind, expected);
+    }
+
+    #[rstest]
+    #[case(
+        Scalar::IntervalYearMonth(30),
+        proto_expr::scalar::Value::IntervalYearMonth(30)
+    )]
+    #[case(
+        Scalar::IntervalYearMonth(i32::MIN),
+        proto_expr::scalar::Value::IntervalYearMonth(i32::MIN)
+    )]
+    #[case(
+        Scalar::IntervalDayTime(-5),
+        proto_expr::scalar::Value::IntervalDayTime(-5)
+    )]
+    #[case(
+        Scalar::IntervalDayTime(i64::MAX),
+        proto_expr::scalar::Value::IntervalDayTime(i64::MAX)
+    )]
+    fn from_interval_scalar_preserves_payload(
+        #[case] scalar: Scalar,
+        #[case] expected: proto_expr::scalar::Value,
+    ) {
+        assert_eq!(scalar_value_of(scalar), expected);
     }
 
     #[test]
