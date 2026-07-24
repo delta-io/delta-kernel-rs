@@ -42,9 +42,23 @@ pub(crate) mod validation;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
-/// Prefix of the error message emitted when deserializing a Delta table type the kernel does
-/// not support.
-pub(crate) const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
+/// Prefix of the error message the schema deserializers emit for an unsupported type.
+const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
+
+/// Builds the serde custom error for a Delta type the kernel does not support. Pairs with
+/// [`is_unsupported_delta_type_error`] for detecting whether a serde error is this kind.
+fn unsupported_delta_type_error<E: serde::de::Error>(name: &str) -> E {
+    E::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{name}'"))
+}
+
+/// Returns `true` if `error` is the "unsupported Delta type" failure produced by
+/// `unsupported_delta_type_error`.
+pub(crate) fn is_unsupported_delta_type_error(error: &serde_json::Error) -> bool {
+    error.is_data()
+        && error
+            .to_string()
+            .starts_with(UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX)
+}
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -2155,9 +2169,9 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
             "void" => Ok(PrimitiveType::Void),
             // Accept canonical and narrowed interval spellings
-            s if s.starts_with("interval ") => normalize_interval_type(s).ok_or_else(|| {
-                serde::de::Error::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{s}'"))
-            }),
+            s if s.starts_with("interval ") => {
+                normalize_interval_type(s).ok_or_else(|| unsupported_delta_type_error(s))
+            }
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -2215,9 +2229,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     ))),
                 }
             }
-            unsupported => Err(serde::de::Error::custom(format!(
-                "{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{unsupported}'"
-            ))),
+            unsupported => Err(unsupported_delta_type_error(unsupported)),
         }
     }
 }
@@ -2375,7 +2387,7 @@ impl<'de> serde::Deserialize<'de> for DataType {
                     "map" => MapType::deserialize(value)
                         .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
-                    _ => Err(Error::custom(format!("Unknown complex type: '{type_str}'"))),
+                    _ => Err(unsupported_delta_type_error(type_str)),
                 };
             }
         }
