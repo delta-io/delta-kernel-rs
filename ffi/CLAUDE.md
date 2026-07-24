@@ -49,6 +49,11 @@ Snapshot builder API (`ffi/src/lib.rs`):
 
 The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
 
+Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
+`snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
+`num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
+complete file stats).
+
 ## Commit Range Flow
 
 A `CommitRange` describes a contiguous range of a table's commits. Build one via the commit range

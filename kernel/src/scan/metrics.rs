@@ -11,8 +11,9 @@ use crate::metrics::{MetricId, ScanMetadataCompleted, ScanType, TableType};
 /// Metrics collected during scan log replay. Metrics are updated and read using relaxed ordering
 /// to keep updates fast across parallel executing threads.
 pub(crate) struct ScanMetrics {
-    /// Add files seen during add remove deduplication. This does not include data skipped add
-    /// files.
+    /// Add files that entered deduplication. This normally excludes add files filtered by data
+    /// skipping. During parse-error fallback, deduplication runs first, so add files filtered by
+    /// retry-time data skipping are included.
     num_add_files_seen: AtomicU64,
     /// Add files that survived log replay (files to read). includes files that survived
     /// dataskipping, partition pruning, and add/remove deduplication.
