@@ -784,11 +784,9 @@ fn test_replay_for_scan_metadata() {
     let scan = snapshot.scan_builder().build().unwrap();
     let result = scan.replay_for_scan_metadata(&engine).unwrap();
     let data: Vec<_> = result.actions.try_collect().unwrap();
-    // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
-    // could be skipped when looking for adds/removes.
-    //
-    // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
-    assert_eq!(data.len(), 5);
+    // Metadata and protocol parts have an all-null `add.path` column and are skipped. Transaction
+    // parts omit that column and are retained conservatively.
+    assert_eq!(data.len(), 3);
 }
 
 #[test]
