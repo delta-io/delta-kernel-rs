@@ -33,9 +33,9 @@ pub(crate) trait ParquetRowGroupSkipping {
         row_indexes: Option<&mut RowIndexBuilder>,
     ) -> Self;
 
-    /// Like [`with_row_group_filter`](Self::with_row_group_filter), but for checkpoint and sidecar
-    /// parquet files where statistics are nested under `add.stats_parsed.*` and partition values
-    /// under `add.partitionValues_parsed.*`.
+    /// Filters checkpoint and sidecar row groups based on matching Add actions. Callers that need
+    /// non-Add actions must protect those rows separately. Statistics are nested under
+    /// `add.stats_parsed.*`, with partition values under `add.partitionValues_parsed.*`.
     ///
     /// The `predicate` uses physical column names (e.g. `x > 10`, or `col-abc-123 > 10` under
     /// column mapping), and the filter internally maps them to the checkpoint's nested stats
@@ -315,15 +315,22 @@ struct StatsColumnIndices {
 /// a checkpoint file where statistics are nested under `add.stats_parsed.{minValues,maxValues,
 /// nullCount}.<col>` and partition values under `add.partitionValues_parsed.<col>`.
 ///
-/// Because checkpoint statistics are aggregates _of_ per-file statistics, a null value in a stat
-/// column means the corresponding file was missing that statistic. The parquet footer min/max
-/// ignores nulls, which can produce misleading aggregates. To prevent false pruning, this filter
-/// returns `None` for any stat whose column contains null values in the row group (checked via
-/// the column's own null count in the parquet footer).
+/// A data-stat leaf is null when an Add lacks that statistic or when the row is not an Add. Because
+/// parquet footer min/max ignore those nulls, the filter treats a stat as unavailable whenever its
+/// footer null count is nonzero.
 ///
-/// Partition columns are handled separately: their footer min/max of
-/// `add.partitionValues_parsed.<col>` can be used directly without null guarding, because parquet
-/// footer stats ignore null values (which may appear for non-add action rows).
+/// Partition columns read their footer min/max of `add.partitionValues_parsed.<col>` directly,
+/// without a null guard. Footer min/max ignore nulls, so a non-matching comparison may prune a row
+/// group containing a null partition leaf. This is sound for scan checkpoint reads because non-Add
+/// rows do not participate in replay and an Add with a null partition value cannot match the
+/// comparison.
+///
+/// For example, consider a row group with an Add for partition `p = "A"` whose data statistics are
+/// all null, plus a Remove whose entire `add` struct is null. The partition leaf still contains
+/// `["A", null]`, even though both rows have null data-stat leaves. Its footer min/max is therefore
+/// `"A"`, because parquet ignores the Remove's null. For `p = "B"`, pruning drops the non-matching
+/// Add and the irrelevant Remove. The null data-stat leaves remain guarded and cannot cause
+/// pruning.
 #[allow(dead_code)]
 pub(crate) struct CheckpointRowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
@@ -371,11 +378,6 @@ impl<'a> CheckpointRowGroupFilter<'a> {
             != Some(false)
     }
 
-    /// Returns `true` if the column is a partition column.
-    fn is_partition_column(&self, col: &ColumnName) -> bool {
-        is_partition_column(col, self.partition_columns)
-    }
-
     /// Returns the footer statistics for a parquet column at the given index.
     fn get_stats_at(&self, index: usize) -> Option<&Statistics> {
         self.row_group.column(index).statistics()
@@ -404,7 +406,7 @@ impl<'a> CheckpointRowGroupFilter<'a> {
 
 impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        if self.is_partition_column(col) {
+        if is_top_level_partition_column(col, self.partition_columns) {
             let &idx = self.partition_column_indices.get(col)?;
             return extract_min_scalar(data_type, self.get_stats_at(idx)?);
         }
@@ -412,7 +414,7 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     }
 
     fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
-        if self.is_partition_column(col) {
+        if is_top_level_partition_column(col, self.partition_columns) {
             let &idx = self.partition_column_indices.get(col)?;
             return extract_max_scalar(data_type, self.get_stats_at(idx)?);
         }
@@ -421,7 +423,7 @@ impl ParquetStatsProvider for CheckpointRowGroupFilter<'_> {
     }
 
     fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
-        if self.is_partition_column(col) {
+        if is_top_level_partition_column(col, self.partition_columns) {
             let &idx = self.partition_column_indices.get(col)?;
             return extract_nullcount(self.get_stats_at(idx));
         }
@@ -504,7 +506,7 @@ pub(crate) fn compute_field_indices(
 /// Returns `true` if the column is a top-level partition column.
 /// Delta partition columns are always top-level (no nested partition columns).
 #[allow(dead_code)]
-fn is_partition_column(col: &ColumnName, partition_columns: &HashSet<String>) -> bool {
+fn is_top_level_partition_column(col: &ColumnName, partition_columns: &HashSet<String>) -> bool {
     let path = col.path();
     path.len() == 1 && partition_columns.contains(path[0].as_str())
 }
@@ -534,7 +536,7 @@ fn compute_checkpoint_field_indices(
         if parts.len() == 3 && parts[0] == "add" && parts[1] == "partitionValues_parsed" {
             let col_name = ColumnName::new([&parts[2]]);
             if referenced_columns.contains(&col_name)
-                && is_partition_column(&col_name, partition_columns)
+                && is_top_level_partition_column(&col_name, partition_columns)
             {
                 partition_indices.insert(col_name, i);
             }
@@ -547,7 +549,7 @@ fn compute_checkpoint_field_indices(
             let col_name = ColumnName::new(&parts[3..]);
             // Skip partition columns (they use partitionValues_parsed, not stats_parsed)
             if !referenced_columns.contains(&col_name)
-                || is_partition_column(&col_name, partition_columns)
+                || is_top_level_partition_column(&col_name, partition_columns)
             {
                 continue;
             }

@@ -995,38 +995,49 @@ impl Scan {
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
-    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(stats_parsed.maxValues.x IS NULL, stats_parsed.maxValues.x >
-    /// 100)`), then column references are prefixed with `add` to match the physical column layout
-    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
-    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
-    /// contain matching files.
+    /// The scan predicate is rewritten into a data-skipping form scoped under the `add` action:
+    /// data-column references become `add.stats_parsed.{minValues,maxValues,nullCount}.<col>` and
+    /// partition references become `add.partitionValues_parsed.<col>`, so the parquet reader's row
+    /// group filter can use footer statistics to skip row groups that cannot contain matching
+    /// files. See [`as_checkpoint_skipping_predicate`] for the rewrite and its data-stat IS NULL
+    /// guards.
     ///
-    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
-    /// values. Without them, row groups containing files with missing stats (null stat columns)
-    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
-    ///
-    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
-    /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
-    /// arms replace them with TRUE to conservatively prevent pruning.
+    /// Returns `None` if the scan has no predicate, if neither a data-column stats schema nor a
+    /// partition schema is available, or if the predicate is a bare unsupported expression (e.g.
+    /// column-column comparison). Junctions represent unsupported arms with a NULL literal,
+    /// preserving three-valued logic while allowing independently decisive supported arms to
+    /// prune.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
-        self.state_info.physical_stats_schema.as_ref()?;
+        // Skipping needs either data-column stats or partition values to rewrite against; a
+        // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
+        // unpartitioned table has no partition schema.
+        if self.state_info.physical_stats_schema.is_none()
+            && self.state_info.physical_partition_schema.is_none()
+        {
+            return None;
+        }
 
         // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
         // the predicate also references physical columns, so partition detection reads the physical
         // partition schema rather than the logical names in table metadata.
-        let partition_columns: HashSet<ColumnName> = self
-            .state_info
-            .physical_partition_schema
-            .as_ref()
-            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
-            .unwrap_or_default();
+        let mut partition_columns = HashSet::new();
+        let mut floating_partition_columns = HashSet::new();
+        if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
+            for field in schema.fields() {
+                let column = ColumnName::new([field.name()]);
+                if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
+                    floating_partition_columns.insert(column.clone());
+                }
+                partition_columns.insert(column);
+            }
+        }
         let skipping_pred = as_checkpoint_skipping_predicate(
             predicate,
             &partition_columns,
+            &floating_partition_columns,
             &self.state_info.physical_stats_columns,
         )?;
 
