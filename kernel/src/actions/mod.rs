@@ -366,7 +366,8 @@ impl Metadata {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth, or
+    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth,
+    /// [`Error::Unsupported`] when a column declares a type the kernel doesn't support, or
     /// [`Error::MalformedJson`] for other JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
@@ -374,16 +375,19 @@ impl Metadata {
         serde_json::from_str(&self.schema_string).map_err(|error| {
             // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
             // matching.
-            if error.is_syntax()
-                && error
-                    .to_string()
-                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
-            {
+            let msg = error.to_string();
+            if error.is_syntax() && msg.starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX) {
                 Error::schema(format!(
                     "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
                      serde_json's recursion limit: {error}"
                 ))
                 .with_backtrace()
+            } else if error.is_data()
+                && msg.contains(crate::schema::UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX)
+            {
+                // Serde only allows custom errors with a message string, so use prefix matching
+                // to reclassify the error as [`crate::Error::Unsupported`].
+                Error::Unsupported(msg)
             } else {
                 error.into()
             }
@@ -1285,6 +1289,32 @@ mod tests {
             error => error,
         };
         assert!(matches!(malformed_error, Error::MalformedJson(_)));
+    }
+
+    #[rstest]
+    #[case::time("time(6)")]
+    #[case::interval("interval week")]
+    fn parse_schema_unsupported_type_returns_unsupported(#[case] unsupported_type: &str) {
+        let unsupported_metadata = Metadata {
+            schema_string: format!(
+                r#"{{
+                "type": "struct",
+                "fields": [
+                    {{"name": "t", "type": "{unsupported_type}", "nullable": true, "metadata": {{}}}}
+                ]
+            }}"#
+            ),
+            ..Default::default()
+        };
+        let error = unsupported_metadata.parse_schema().unwrap_err();
+        let error = match error {
+            Error::Backtraced { source, .. } => *source,
+            error => error,
+        };
+        assert!(
+            matches!(error, Error::Unsupported(_)),
+            "expected Error::Unsupported, got: {error:?}"
+        );
     }
 
     fn nested_schema(depth: usize) -> StructType {

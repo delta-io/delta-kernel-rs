@@ -42,6 +42,10 @@ pub(crate) mod validation;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
+/// Prefix of the error message emitted when deserializing a Delta table type the kernel does
+/// not support.
+pub(crate) const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
+
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
@@ -2152,7 +2156,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "void" => Ok(PrimitiveType::Void),
             // Accept canonical and narrowed interval spellings
             s if s.starts_with("interval ") => normalize_interval_type(s).ok_or_else(|| {
-                serde::de::Error::custom(format!("Unsupported Delta table type: '{s}'"))
+                serde::de::Error::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{s}'"))
             }),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
@@ -2212,7 +2216,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                 }
             }
             unsupported => Err(serde::de::Error::custom(format!(
-                "Unsupported Delta table type: '{unsupported}'"
+                "{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{unsupported}'"
             ))),
         }
     }
