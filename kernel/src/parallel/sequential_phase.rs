@@ -19,8 +19,9 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::scan::COMMIT_READ_SCHEMA;
+use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, FileMeta};
+use crate::{DeltaResult, Engine, Error, FileMeta, PredicateRef};
 
 /// Sequential log replay processor for parallel execution.
 ///
@@ -101,6 +102,8 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         processor: P,
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
+        checkpoint_read_schema: SchemaRef,
+        checkpoint_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Self> {
         let commit_phase = Some(CommitReader::try_new(
             engine.as_ref(),
@@ -111,10 +114,12 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase = match log_segment.listed.checkpoint_parts.as_slice() {
-            [single_part] => Some(CheckpointManifestReader::try_new(
+            [single_part] => Some(CheckpointManifestReader::try_new_with_options(
                 engine,
                 single_part,
                 log_segment.log_root.clone(),
+                checkpoint_read_schema,
+                checkpoint_predicate,
             )?),
             _ => None,
         };

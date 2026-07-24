@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::vec;
 
 use delta_kernel::actions::deletion_vector::split_vector;
@@ -21,9 +21,18 @@ use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
-use delta_kernel::scan::{Scan, StatsOptions};
-use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{Engine, FileMeta, Snapshot};
+use delta_kernel::scan::{
+    AfterSequentialScanMetadata, DataSkippingOptions, ParallelScanMetadata, PartitionValuesOptions,
+    Scan, StatsOptions,
+};
+use delta_kernel::schema::{
+    DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType,
+};
+use delta_kernel::{
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
+    FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Snapshot,
+    StorageHandler,
+};
 use itertools::Itertools;
 use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
 use test_utils::{
@@ -882,6 +891,455 @@ fn partition_pruning_with_checkpoint_parsed_values(
     Ok(())
 }
 
+/// Counts the files surviving data skipping (selected rows across `scan_metadata`) for `scan`.
+fn surviving_file_count(
+    engine: &dyn Engine,
+    scan: &Scan,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut count = 0;
+    for res in scan.scan_metadata(engine)? {
+        count = res?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+    }
+    Ok(count)
+}
+
+/// Like [`surviving_file_count`] but drives the two-phase `parallel_scan_metadata` path, rebuilding
+/// the worker `DataSkippingFilter` from the serialized `InternalScanState`. Dispatches one file per
+/// `ParallelScanMetadata` to maximize coverage of the worker rebuild.
+fn surviving_file_count_parallel(
+    engine: Arc<dyn Engine>,
+    scan: &Scan,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut count = 0;
+    let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+    for res in sequential.by_ref() {
+        count = res?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+    }
+    if let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? {
+        let state = Arc::from(state);
+        for file in files {
+            let parallel =
+                ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
+            for res in parallel {
+                count = res?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Connector-visible stats choices do not change in-memory pruning on either scan path.
+#[rstest::rstest]
+#[case::none(StatsOptions::none())]
+#[case::default(StatsOptions::default())]
+#[case::empty_struct_columns(StatsOptions::struct_columns(vec![]))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_output_does_not_change_in_memory_pruning(
+    #[case] stats: StatsOptions,
+    #[values(false, true)] mixed_with_data_col: bool,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine_mt_executor(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let partition_pred = column_expr!("modified").eq(Expr::literal("2021-02-02"));
+    let predicate = if mixed_with_data_col {
+        Pred::and(
+            partition_pred,
+            Pred::gt(column_expr!("value"), Expr::literal(1_000_000i32)),
+        )
+    } else {
+        partition_pred
+    };
+
+    let expected = if mixed_with_data_col { 0 } else { 2 };
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats(stats)
+        .build()?;
+
+    let count = if use_parallel {
+        surviving_file_count_parallel(engine.clone(), &scan)?
+    } else {
+        surviving_file_count(engine.as_ref(), &scan)?
+    };
+    assert_eq!(count, expected);
+    Ok(())
+}
+
+/// The four modes independently select in-memory pruning and checkpoint pushdown. The mixed
+/// predicate is false for every file, but this fixture's checkpoint layout does not provide a
+/// skippable row group for that predicate. Predicate delivery is asserted separately; this matrix
+/// verifies that checkpoint-only mode never falls back to in-memory or partition pruning.
+#[rstest::rstest]
+#[case::all(DataSkippingOptions::All, 2, 0)]
+#[case::in_memory(DataSkippingOptions::InMemory, 2, 0)]
+#[case::checkpoint_pushdown(DataSkippingOptions::CheckpointPushdown, 4, 4)]
+#[case::none(DataSkippingOptions::None, 4, 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_skipping_mode_matrix(
+    #[case] data_skipping: DataSkippingOptions,
+    #[case] partition_only_count: usize,
+    #[case] mixed_count: usize,
+    #[values(false, true)] mixed_with_data_col: bool,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine_mt_executor(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let partition_pred = column_expr!("modified").eq(Expr::literal("2021-02-02"));
+    let predicate = if mixed_with_data_col {
+        Pred::and(
+            partition_pred,
+            Pred::gt(column_expr!("value"), Expr::literal(1_000_000i32)),
+        )
+    } else {
+        partition_pred
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats(StatsOptions::none())
+        .with_data_skipping(data_skipping)
+        .build()?;
+
+    let count = if use_parallel {
+        surviving_file_count_parallel(engine.clone(), &scan)?
+    } else {
+        surviving_file_count(engine.as_ref(), &scan)?
+    };
+    assert_eq!(
+        count,
+        if mixed_with_data_col {
+            mixed_count
+        } else {
+            partition_only_count
+        }
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::all(DataSkippingOptions::All, 0)]
+#[case::in_memory(DataSkippingOptions::InMemory, 0)]
+#[case::checkpoint_pushdown(DataSkippingOptions::CheckpointPushdown, 6)]
+#[case::none(DataSkippingOptions::None, 6)]
+fn static_false_follows_in_memory_capability(
+    #[case] data_skipping: DataSkippingOptions,
+    #[case] expected_count: usize,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::literal(false)))
+        .with_data_skipping(data_skipping)
+        .build()?;
+    assert_eq!(
+        scan.physical_predicate(),
+        Some(Arc::new(Pred::literal(false)))
+    );
+
+    let count = if use_parallel {
+        surviving_file_count_parallel(engine, &scan)?
+    } else {
+        surviving_file_count(engine.as_ref(), &scan)?
+    };
+    assert_eq!(count, expected_count);
+    Ok(())
+}
+
+#[test]
+fn static_false_survives_parallel_sidecar_state_serialization(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from(
+        "./tests/data/v2-json-sidecars-struct-stats-only/",
+    ))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::literal(false)))
+        .with_data_skipping(DataSkippingOptions::All)
+        .build()?;
+
+    let mut count = 0;
+    let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+    for result in sequential.by_ref() {
+        count = result?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+    }
+    let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
+        panic!("sidecar fixture should require a parallel phase");
+    };
+    assert!(!files.is_empty());
+    let state = Arc::from(state);
+    for file in files {
+        let parallel =
+            ParallelScanMetadata::try_new(engine.clone(), Arc::clone(&state), vec![file])?;
+        for result in parallel {
+            count = result?.visit_scan_files(count, |acc, _scan_file| *acc += 1)?;
+        }
+    }
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+/// A data-only predicate under `none()` gains no partition pruning even when `parsed_struct` output
+/// is requested. Requesting the typed struct populates the internal partition schema with all
+/// partition columns, so pruning must key off whether the predicate references a partition column,
+/// not off schema presence. Here `value > 0` references none, so all 4 files survive.
+#[test]
+fn data_only_predicate_under_none_with_parsed_struct_does_not_prune(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::gt(
+            column_expr!("value"),
+            Expr::literal(0i32),
+        )))
+        .with_stats(StatsOptions::none())
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()?;
+
+    assert_eq!(surviving_file_count(engine.as_ref(), &scan)?, 4);
+    Ok(())
+}
+
+/// A NULL partition value under `StatsOptions::none()` must yield the same surviving set as the
+/// default (stats-on) path -- decoupling partition pruning from stats must not shift NULL-partition
+/// semantics. This is a JSON-only table (no checkpoint), so `partitionValues_parsed` comes from
+/// `map_to_struct(partitionValues)`; a null partition value parses to a NULL scalar. Of the three
+/// files (id=1, id=2, id=NULL), `id = 2` keeps exactly the id=2 file on both paths: id=1 mismatches
+/// and the id=NULL file holds only `id IS NULL` rows, none of which can equal 2.
+#[rstest::rstest]
+#[case::stats_none(StatsOptions::none())]
+#[case::stats_default(StatsOptions::default())]
+#[tokio::test]
+async fn null_partition_pruning_matches_across_stats_options(
+    #[case] stats: StatsOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = Arc::new(InMemory::new());
+    let table_root = "memory:///";
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":["id"],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"id=1/{PARQUET_FILE1}","partitionValues":{{"id":"1"}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+        format!(r#"{{"add":{{"path":"id=2/{PARQUET_FILE2}","partitionValues":{{"id":"2"}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+        // A null partition value is serialized as JSON null in the partition map.
+        format!(r#"{{"add":{{"path":"id=__HIVE_DEFAULT_PARTITION__/{PARQUET_FILE3}","partitionValues":{{"id":null}},"size":0,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+    ];
+
+    add_commit(table_root, storage.as_ref(), 0, actions.iter().join("\n")).await?;
+
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
+    let snapshot = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(Pred::eq(column_expr!("id"), Expr::literal(2))))
+        .with_stats(stats)
+        .build()?;
+
+    assert_eq!(surviving_file_count(engine.as_ref(), &scan)?, 1);
+    Ok(())
+}
+
+/// A `ParquetHandler` that records the physical read schema of every `read_parquet_files` call and
+/// otherwise delegates to an inner handler. Used to observe which columns a scan projects out of
+/// checkpoint parquet.
+struct RecordingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    read_schemas: Arc<Mutex<Vec<SchemaRef>>>,
+    predicates: Arc<Mutex<Vec<Option<PredicateRef>>>>,
+}
+
+impl ParquetHandler for RecordingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_schemas
+            .lock()
+            .unwrap()
+            .push(physical_schema.clone());
+        self.predicates.lock().unwrap().push(predicate.clone());
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+}
+
+/// Delegates every handler to an inner engine except `parquet_handler`, which records read schemas.
+struct RecordingEngine {
+    inner: Arc<dyn Engine>,
+    parquet: Arc<RecordingParquetHandler>,
+}
+
+impl Engine for RecordingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.inner.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet.clone()
+    }
+}
+
+/// Returns true if `schema` (or any nested struct field) contains a field named `name`.
+fn schema_contains_field(schema: &StructType, name: &str) -> bool {
+    schema.fields().any(|f| {
+        f.name() == name
+            || match f.data_type() {
+                DataType::Struct(s) => schema_contains_field(s, name),
+                _ => false,
+            }
+    })
+}
+
+/// Checkpoint stats are read when requested for output or needed by an enabled pruning mechanism.
+#[rstest::rstest]
+#[case::no_output_or_skipping(StatsOptions::none(), DataSkippingOptions::None, false)]
+#[case::internal_only(StatsOptions::none(), DataSkippingOptions::All, true)]
+#[case::output_only(StatsOptions::default(), DataSkippingOptions::None, true)]
+fn checkpoint_stats_read_follows_output_or_skipping(
+    #[case] stats: StatsOptions,
+    #[case] data_skipping: DataSkippingOptions,
+    #[case] expect_stats_read: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let inner = test_utils::create_default_engine(&url)?;
+    let read_schemas = Arc::new(Mutex::new(Vec::new()));
+    let predicates = Arc::new(Mutex::new(Vec::new()));
+    let engine = RecordingEngine {
+        parquet: Arc::new(RecordingParquetHandler {
+            inner: inner.parquet_handler(),
+            read_schemas: read_schemas.clone(),
+            predicates,
+        }),
+        inner,
+    };
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+
+    // A predicate on the data column `value` makes `physical_stats_schema` Some, so the read-path
+    // gating is what suppresses the stats projection under `none()`.
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(
+            column_expr!("value").gt(Expr::literal(1_000_000i32)),
+        ))
+        .with_stats(stats)
+        .with_data_skipping(data_skipping)
+        .build()?;
+    surviving_file_count(&engine, &scan)?;
+
+    // The checkpoint read is the one whose schema carries the `add` action.
+    let schemas = read_schemas.lock().unwrap();
+    let checkpoint_reads: Vec<_> = schemas
+        .iter()
+        .filter(|s| schema_contains_field(s, "add"))
+        .collect();
+    assert!(
+        !checkpoint_reads.is_empty(),
+        "expected at least one checkpoint parquet read"
+    );
+    for schema in checkpoint_reads {
+        let reads_stats = schema_contains_field(schema, "stats");
+        let reads_stats_parsed = schema_contains_field(schema, "stats_parsed");
+        assert_eq!(
+            reads_stats || reads_stats_parsed,
+            expect_stats_read,
+            "checkpoint read schema stats presence mismatch (stats={reads_stats}, \
+             stats_parsed={reads_stats_parsed}), expected_stats_read={expect_stats_read}"
+        );
+    }
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::all(DataSkippingOptions::All, true)]
+#[case::in_memory(DataSkippingOptions::InMemory, false)]
+#[case::checkpoint_pushdown(DataSkippingOptions::CheckpointPushdown, true)]
+#[case::none(DataSkippingOptions::None, false)]
+fn checkpoint_pushdown_mode_controls_reader_predicate(
+    #[case] data_skipping: DataSkippingOptions,
+    #[case] expect_stats_predicate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let inner = test_utils::create_default_engine(&url)?;
+    let read_schemas = Arc::new(Mutex::new(Vec::new()));
+    let predicates = Arc::new(Mutex::new(Vec::new()));
+    let engine = RecordingEngine {
+        parquet: Arc::new(RecordingParquetHandler {
+            inner: inner.parquet_handler(),
+            read_schemas,
+            predicates: predicates.clone(),
+        }),
+        inner,
+    };
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    predicates.lock().unwrap().clear();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(
+            column_expr!("value").gt(Expr::literal(1_000_000i32)),
+        ))
+        .with_stats(StatsOptions::none())
+        .with_data_skipping(data_skipping)
+        .build()?;
+    surviving_file_count(&engine, &scan)?;
+
+    let has_stats_predicate = predicates
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .any(|predicate| {
+            predicate.references().iter().any(|column| {
+                let mut path = column.iter();
+                path.next().map(String::as_str) == Some("add")
+                    && path.next().map(String::as_str) == Some("stats_parsed")
+            })
+        });
+    assert_eq!(has_stats_predicate, expect_stats_predicate);
+    Ok(())
+}
+
 /// Test mixed predicates (partition + data stats) on a checkpoint with both
 /// `partitionValues_parsed` and `stats_parsed`. This exercises the unified columnar data skipping
 /// pass that evaluates both partition values and data column statistics together.
@@ -1013,12 +1471,15 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
 /// Test partition pruning on a table with column mapping (name mode). The logical partition
 /// column "category" has physical name "phys_category". With column mapping, `partitionValues`
 /// in the log uses physical column names, and the partition schema + predicate must also use
-/// physical names for `MapToStruct` extraction and data skipping to work correctly.
+/// physical names for `MapToStruct` extraction and data skipping to work correctly. The
+/// `StatsOptions::none()` cases pin that output statistics remain independent of physical-name
+/// partition pruning.
 #[rstest::rstest]
 #[case::partition_only(
     // Partition-only predicate: category = 'A' prunes the category=B file
     Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
     None,
+    StatsOptions::default(),
     1
 )]
 #[case::mixed_partition_and_data(
@@ -1029,6 +1490,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
         Pred::gt(column_expr!("val"), Expr::literal("z")),
     )),
     None,
+    StatsOptions::default(),
     1
 )]
 #[case::predicate_on_unprojected_data_column(
@@ -1037,6 +1499,7 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // schema and prune both files: max(phys_val)='z' is NOT > 'z'.
     Arc::new(Pred::gt(column_expr!("val"), Expr::literal("z"))),
     Some(vec!["category"]),
+    StatsOptions::default(),
     0
 )]
 #[case::predicate_on_unprojected_partition_column(
@@ -1045,12 +1508,30 @@ fn mixed_predicate_with_checkpoint_parsed_columns(
     // using the physical partition name, keeping only the category=A file.
     Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
     Some(vec!["val"]),
+    StatsOptions::default(),
+    1
+)]
+#[case::partition_only_stats_none(
+    // Same partition-only predicate under `none()`: pruning must still resolve `category` to its
+    // physical name `phys_category` even though statistics are omitted from scan metadata.
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    None,
+    StatsOptions::none(),
+    1
+)]
+#[case::unprojected_partition_stats_none(
+    // Partition predicate on an unprojected column under `none()` exercises physical-name
+    // partition pruning independently of statistics output.
+    Arc::new(Pred::eq(column_expr!("category"), Expr::literal("A"))),
+    Some(vec!["val"]),
+    StatsOptions::none(),
     1
 )]
 #[tokio::test]
 async fn test_partition_pruning_with_column_mapping(
     #[case] predicate: Arc<Pred>,
     #[case] select_cols: Option<Vec<&'static str>>,
+    #[case] stats: StatsOptions,
     #[case] expected_files: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_batch(vec![("phys_val", vec!["x", "y", "z"].into_arrow_array())])?;
@@ -1106,6 +1587,7 @@ async fn test_partition_pruning_with_column_mapping(
         .scan_builder()
         .with_schema_opt(projection)
         .with_predicate(predicate)
+        .with_stats(stats)
         .build()?;
 
     let stream = scan.execute(engine)?;
@@ -2164,11 +2646,10 @@ fn checkpoint_stats_skipping(
 // writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
 // Cross-product covers all five checkpoint variants against four stats option
-// shapes: ScanFile.stats should be populated via the COALESCE/ToJson fallback
-// when both `json=true` and `struct_stats=All` are set; otherwise null on these
-// struct-stats-only checkpoints.
+// shapes: ScanFile.stats is populated whenever JSON output is requested, using the
+// COALESCE/ToJson fallback on these struct-stats-only checkpoints.
 #[rstest::rstest]
-#[case::default_json_only(StatsOptions::default(), false)]
+#[case::default_json_only(StatsOptions::default(), true)]
 #[case::all_both(StatsOptions::all(), true)]
 #[case::all_struct_only(StatsOptions::all_struct(), false)]
 #[case::none(StatsOptions::none(), false)]
@@ -2223,13 +2704,12 @@ fn struct_stats_surfaced_in_scan_file(
     Ok(())
 }
 
-// On a JSON-only table (no parsed-stats checkpoint), `has_stats_parsed` is
-// false and the COALESCE branch is never selected, so `StatsOptions::all_struct`
-// vs `StatsOptions::default` is a no-op for the `stats` JSON column: `add.stats`
-// is read directly from the commit JSON either way.
 #[rstest::rstest]
-fn struct_stats_only_no_op_on_json_only_table(
-    #[values(StatsOptions::default(), StatsOptions::all_struct())] stats: StatsOptions,
+#[case::json(StatsOptions::default(), true)]
+#[case::struct_only(StatsOptions::all_struct(), false)]
+fn json_output_option_controls_commit_stats(
+    #[case] stats: StatsOptions,
+    #[case] expect_json_stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
@@ -2246,10 +2726,7 @@ fn struct_stats_only_no_op_on_json_only_table(
 
     assert!(!scan_files.is_empty());
     for scan_file in &scan_files {
-        assert!(
-            scan_file.stats.is_some(),
-            "JSON commits populate stats from add.stats"
-        );
+        assert_eq!(scan_file.stats.is_some(), expect_json_stats);
     }
     Ok(())
 }

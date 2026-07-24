@@ -14,7 +14,7 @@ use itertools::Itertools;
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::scan::CHECKPOINT_READ_SCHEMA;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, EngineData, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -52,10 +52,11 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         processor: P,
         leaf_files: Vec<FileMeta>,
         read_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<Self> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
-            .read_parquet_files(&leaf_files, read_schema, None)?
+            .read_parquet_files(&leaf_files, read_schema, predicate)?
             .map_ok(|batch| ActionsBatch::new(batch, false));
         Ok(Self {
             processor,
@@ -143,7 +144,7 @@ mod tests {
     };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::{
-        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanReplayOptions,
     };
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
@@ -211,7 +212,7 @@ mod tests {
             state_info,
             checkpoint_info,
             seen_file_keys,
-            ScanStatsOptions::default(),
+            ScanReplayOptions::default(),
             ScanPartitionValuesOptions::default(),
         )
     }
@@ -268,6 +269,7 @@ mod tests {
             processor.clone(),
             vec![file_meta],
             CHECKPOINT_READ_SCHEMA.clone(),
+            None,
         )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
@@ -359,6 +361,7 @@ mod tests {
             processor.clone(),
             file_metas,
             CHECKPOINT_READ_SCHEMA.clone(),
+            None,
         )?;
 
         let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
@@ -953,10 +956,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_with_skip_stats() -> DeltaResult<()> {
+    fn test_parallel_without_stats_output() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
 
-        // Get expected paths using single-node scan_metadata with skip_stats=true
+        // Get expected paths using single-node scan_metadata without connector-visible stats.
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -967,14 +970,14 @@ mod tests {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "Single-node: scan_file.stats should be None when skip_stats=true"
+                    "single-node scan_file.stats should be None"
                 );
                 ps.push(scan_file.path);
             })
         })?;
         expected_paths.sort();
 
-        // Run parallel workflow with skip_stats=true
+        // Run the parallel workflow with the same output choice.
         let scan = snapshot
             .scan_builder()
             .with_stats(StatsOptions::none())
@@ -986,7 +989,7 @@ mod tests {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 assert!(
                     scan_file.stats.is_none(),
-                    "sequential: scan_file.stats should be None when skip_stats=true"
+                    "sequential scan_file.stats should be None"
                 );
                 ps.push(scan_file.path);
             })
@@ -1003,7 +1006,7 @@ mod tests {
                     metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                         assert!(
                             scan_file.stats.is_none(),
-                            "parallel: scan_file.stats should be None when skip_stats=true"
+                            "parallel scan_file.stats should be None"
                         );
                         ps.push(scan_file.path);
                     })
@@ -1017,7 +1020,7 @@ mod tests {
         all_paths.sort();
         assert_eq!(
             all_paths, expected_paths,
-            "Parallel workflow with skip_stats=true should return same files as single-node scan_metadata"
+            "parallel workflow should return the same files as single-node scan_metadata"
         );
 
         Ok(())

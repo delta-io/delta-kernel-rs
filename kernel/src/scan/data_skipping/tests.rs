@@ -1164,6 +1164,40 @@ fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
     );
 }
 
+#[rstest]
+#[case::and(
+    Pred::and(
+        Pred::gt(column_expr!("indexed"), Expr::literal(100i64)),
+        Pred::unknown("unsupported"),
+    ),
+    200i64,
+)]
+#[case::or(
+    Pred::or(
+        Pred::gt(column_expr!("indexed"), Expr::literal(100i64)),
+        Pred::unknown("unsupported"),
+    ),
+    50i64,
+)]
+fn checkpoint_unsupported_junction_arms_are_conservatively_true(
+    #[case] predicate: Pred,
+    #[case] max_value: i64,
+) {
+    let stats = all_referenced_columns(&predicate);
+    let skipping = as_checkpoint_skipping_predicate(&predicate, &HashSet::new(), &stats)
+        .expect("supported arm should produce a checkpoint predicate");
+    let evaluator = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("stats_parsed.maxValues.indexed"),
+        Scalar::from(max_value),
+    )]));
+
+    assert_eq!(
+        evaluator.eval_sql_where(&skipping),
+        TRUE,
+        "unsupported checkpoint arms must never make an exact row filter discard an Add"
+    );
+}
+
 // -- Integration tests: end-to-end data skipping with real tables -------------------
 //
 // Two test tables are used:
@@ -1548,11 +1582,10 @@ fn mixed_and_non_stat_arm_still_prunes_via_stat_arm() {
     );
 }
 
-/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint
-/// creator, which adds an `IS NULL` guard on each stat ref for safe parquet
-/// row-group filtering. The non-stat arm still folds to NULL.
+/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint creator, which
+/// guards stat references and replaces unsupported arms with TRUE for exact-filter safety.
 #[test]
-fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
+fn checkpoint_pushdown_non_stat_arm_folds_to_true_literal() {
     let pred = Pred::and(
         Pred::gt(column_expr!("stat"), Scalar::from(100)),
         Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
@@ -1561,6 +1594,6 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
     let result = as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &stats).unwrap();
     assert_eq!(
         result.to_string(),
-        "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, Column(stats_parsed.maxValues.stat) > 100), null)"
+        "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, Column(stats_parsed.maxValues.stat) > 100), true)"
     );
 }

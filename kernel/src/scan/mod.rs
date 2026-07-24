@@ -64,8 +64,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref!
     (&ADD_FIELD),
 };
 
-/// Checkpoint schema WITHOUT stats for column projection pushdown.
-/// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
+/// Checkpoint schema without stats for scans that neither expose nor use file statistics.
 pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
     let fields_no_stats: Vec<_> = add_schema
@@ -95,19 +94,13 @@ pub use crate::parallel::parallel_scan_metadata::{
 ///   `stats_parsed` directly; avoids the per-batch `ToJson` cost.
 /// - [`Self::struct_columns`] -- struct stats projected to a subset of columns, no JSON.
 /// - [`Self::all`] -- both representations.
-/// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
-///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
+/// - [`Self::none`] -- neither representation. Kernel may still read predicate statistics for an
+///   enabled data-skipping mechanism.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
-    /// Whether to surface JSON stats on parsed-stats checkpoints (where the
-    /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
-    /// re-serializes the struct stats into JSON so engines that read JSON stats
-    /// see a populated value; when false, JSON stats are left null on such
-    /// checkpoints and the engine consumes the struct stats directly.
-    ///
-    /// No effect on tables that write JSON stats directly, or on commit JSON --
-    /// the existing JSON is passed through regardless.
-    pub(crate) synthesize_json: bool,
+    /// Whether to emit JSON stats. On parsed-stats checkpoints kernel re-serializes the struct
+    /// value when the JSON value is absent.
+    pub(crate) emit_json: bool,
 
     /// Which struct stats columns to emit in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
@@ -116,9 +109,8 @@ pub struct StatsOptions {
 /// Which struct stats columns appear in `stats_parsed` in scan metadata output.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
-    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
-    /// disables stats reading entirely.
+    /// Don't emit `stats_parsed`. Kernel may still read predicate-referenced statistics for an
+    /// enabled data-skipping mechanism.
     None,
     /// Emit all indexed stats columns.
     All,
@@ -130,7 +122,7 @@ impl Default for StatsOptions {
     /// JSON only, no struct stats.
     fn default() -> Self {
         Self {
-            synthesize_json: true,
+            emit_json: true,
             struct_stats: StructStats::None,
         }
     }
@@ -147,16 +139,22 @@ impl StatsOptions {
     /// parsed-stats checkpoints.
     pub fn all_struct() -> Self {
         Self {
-            synthesize_json: false,
+            emit_json: false,
             struct_stats: StructStats::All,
         }
     }
 
     /// Struct stats projected to the specified columns, no JSON. Like
     /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
+    ///
+    /// An empty `cols` is normalized to [`Self::none`]. This changes only connector-visible
+    /// statistics; data skipping remains controlled by [`DataSkippingOptions`].
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
+        if cols.is_empty() {
+            return Self::none();
+        }
         Self {
-            synthesize_json: false,
+            emit_json: false,
             struct_stats: StructStats::Columns(cols),
         }
     }
@@ -164,22 +162,52 @@ impl StatsOptions {
     /// Both JSON and struct stats. Pays for both representations.
     pub fn all() -> Self {
         Self {
-            synthesize_json: true,
+            emit_json: true,
             struct_stats: StructStats::All,
         }
     }
 
-    /// **Disables all stats work**: no stats output, no internal data skipping (even
-    /// when a predicate is set). Kernel reads no stats columns from parquet at all.
-    /// Use when the engine handles its own pruning.
-    ///
-    /// To get internal predicate-based skipping without `stats_parsed` output, use
-    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `All`/`Columns(_)`.
+    /// Emit neither JSON nor structured statistics in scan metadata. Enabled data-skipping
+    /// mechanisms may still read statistics internally without exposing them to the connector.
     pub fn none() -> Self {
         Self {
-            synthesize_json: false,
+            emit_json: false,
             struct_stats: StructStats::None,
         }
+    }
+}
+
+/// Selects the data-skipping mechanisms kernel may use for a scan.
+///
+/// This is orthogonal to [`StatsOptions`], which controls only the statistics returned in scan
+/// metadata. Modes with in-memory pruning also perform partition pruning. Checkpoint predicate
+/// pushdown applies only to eligible checkpoint and sidecar parquet reads, not JSON commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DataSkippingOptions {
+    /// Use in-memory file pruning and checkpoint predicate pushdown.
+    All,
+    /// Use in-memory file pruning, including partition pruning, without checkpoint pushdown.
+    InMemory,
+    /// Push predicates into checkpoint reads without pruning files in memory.
+    CheckpointPushdown,
+    /// Disable all kernel data-skipping mechanisms.
+    None,
+}
+
+impl DataSkippingOptions {
+    fn uses_in_memory(self) -> bool {
+        matches!(self, Self::All | Self::InMemory)
+    }
+
+    fn uses_checkpoint_pushdown(self) -> bool {
+        matches!(self, Self::All | Self::CheckpointPushdown)
+    }
+}
+
+impl Default for DataSkippingOptions {
+    /// Use every available data-skipping mechanism.
+    fn default() -> Self {
+        Self::All
     }
 }
 
@@ -219,6 +247,7 @@ pub struct ScanBuilder {
     logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
     stats: StatsOptions,
+    data_skipping: DataSkippingOptions,
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
     partition_values: PartitionValuesOptions,
@@ -230,6 +259,7 @@ impl std::fmt::Debug for ScanBuilder {
             .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
             .field("stats", &self.stats)
+            .field("data_skipping", &self.data_skipping)
             .field("correlation_id", &self.correlation_id)
             .field("without_row_transforms", &self.without_row_transforms)
             .field("partition_values", &self.partition_values)
@@ -245,6 +275,7 @@ impl ScanBuilder {
             logical_read_schema: None,
             predicate: None,
             stats: StatsOptions::default(),
+            data_skipping: DataSkippingOptions::default(),
             correlation_id: None,
             without_row_transforms: false,
             partition_values: PartitionValuesOptions::default(),
@@ -282,9 +313,9 @@ impl ScanBuilder {
     /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
     /// and will error at build time.
     ///
-    /// A predicate alone enables internal data skipping; kernel does not surface stats
-    /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
-    /// also wants stats in the scan metadata output.
+    /// By default, a predicate enables all kernel data-skipping mechanisms. Use
+    /// [`with_data_skipping`](Self::with_data_skipping) to select the mechanisms and
+    /// [`with_stats`](Self::with_stats) to control statistics in scan metadata output.
     ///
     /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
@@ -299,6 +330,16 @@ impl ScanBuilder {
     /// per-batch `ToJson` synthesis on parsed-stats checkpoints.
     pub fn with_stats(mut self, stats: StatsOptions) -> Self {
         self.stats = stats;
+        self
+    }
+
+    /// Configure kernel's data-skipping mechanisms. See [`DataSkippingOptions`].
+    ///
+    /// Defaults to [`DataSkippingOptions::All`]. This option is orthogonal to
+    /// [`with_stats`](Self::with_stats), so a scan may use predicate statistics without exposing
+    /// them or may expose statistics without using them for pruning.
+    pub fn with_data_skipping(mut self, data_skipping: DataSkippingOptions) -> Self {
+        self.data_skipping = data_skipping;
         self
     }
 
@@ -378,6 +419,7 @@ impl ScanBuilder {
             self.snapshot.table_configuration(),
             self.predicate,
             &self.stats,
+            self.data_skipping,
             &self.partition_values,
             (), // No classifier, default is for scans
         )?;
@@ -390,6 +432,7 @@ impl ScanBuilder {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
+            data_skipping: self.data_skipping,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
         })
@@ -651,6 +694,7 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
+    data_skipping: DataSkippingOptions,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
 }
@@ -661,22 +705,50 @@ impl std::fmt::Debug for Scan {
             .field("schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
             .field("stats", &self.stats)
+            .field("data_skipping", &self.data_skipping)
             .field("correlation_id", &self.correlation_id)
             .finish()
     }
 }
 
+fn build_actions_meta_predicate(state_info: &StateInfo) -> Option<PredicateRef> {
+    let PhysicalPredicate::Some(ref predicate, _) = state_info.physical_predicate else {
+        return None;
+    };
+    state_info.physical_stats_schema.as_ref()?;
+
+    // `partitionValues_parsed` is keyed by physical partition name, as is the predicate after
+    // column mapping, so use the physical partition schema for exclusion from stats pushdown.
+    let partition_columns: HashSet<ColumnName> = state_info
+        .physical_partition_schema
+        .as_ref()
+        .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
+        .unwrap_or_default();
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        predicate,
+        &partition_columns,
+        &state_info.physical_stats_columns,
+    )?;
+
+    let mut prefixer = PrefixColumns {
+        prefix: ColumnName::new(["add"]),
+    };
+    Some(Arc::new(
+        prefixer.transform_pred(&skipping_pred).into_owned(),
+    ))
+}
+
 impl Scan {
-    /// Whether stats reading is entirely skipped, disabling internal data skipping.
-    fn skip_stats(&self) -> bool {
-        !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
+    /// Whether the checkpoint action stream must carry statistics for output or pruning.
+    fn reads_stats(&self) -> bool {
+        self.stats.emit_json || self.state_info.physical_stats_schema.is_some()
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
-    fn stats_options(&self) -> log_replay::ScanStatsOptions {
-        log_replay::ScanStatsOptions {
-            skip_stats: self.skip_stats(),
-            synthesize_json: self.stats.synthesize_json,
+    fn replay_options(&self) -> log_replay::ScanReplayOptions {
+        log_replay::ScanReplayOptions {
+            emit_json: self.stats.emit_json,
+            data_skipping: self.data_skipping,
         }
     }
 
@@ -722,11 +794,14 @@ impl Scan {
     }
 
     /// Get the predicate [`PredicateRef`] of the scan.
+    ///
+    /// A predicate that is statically false remains available here even when an enabled in-memory
+    /// data-skipping mode avoids reading any files.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
-        if let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate {
-            Some(predicate.clone())
-        } else {
-            None
+        match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
+            PhysicalPredicate::StaticSkipAll => Some(Arc::new(Predicate::literal(false))),
+            PhysicalPredicate::None => None,
         }
     }
 
@@ -882,23 +957,25 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
-        } else {
+        //
+        let (checkpoint_schema, meta_predicate, stats_schema) = if self.reads_stats() {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
                 self.build_actions_meta_predicate(),
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
             )
+        } else {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None, None)
         };
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
-            self.state_info
-                .physical_stats_schema
-                .as_ref()
-                .map(|s| s.as_ref()),
+            stats_schema,
             None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
@@ -927,7 +1004,7 @@ impl Scan {
         let correlation_id = self.correlation_id.clone();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
-            PhysicalPredicate::StaticSkipAll => {
+            PhysicalPredicate::StaticSkipAll if self.data_skipping.uses_in_memory() => {
                 info!("Predicate statically evaluated to false; skipping all files");
                 (None, Arc::new(ScanMetrics::default()))
             }
@@ -937,7 +1014,7 @@ impl Scan {
                     actions_with_checkpoint_info.actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
-                    self.stats_options(),
+                    self.replay_options(),
                     self.partition_values_options(),
                 )?;
                 (Some(it), m)
@@ -965,13 +1042,17 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
-        } else {
+        let (checkpoint_schema, meta_predicate, stats_schema) = if self.reads_stats() {
             (
                 CHECKPOINT_READ_SCHEMA.clone(),
                 self.build_actions_meta_predicate(),
+                self.state_info
+                    .physical_stats_schema
+                    .as_ref()
+                    .map(|s| s.as_ref()),
             )
+        } else {
+            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None, None)
         };
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
@@ -982,10 +1063,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
-                self.state_info
-                    .physical_stats_schema
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                stats_schema,
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
@@ -1010,31 +1088,10 @@ impl Scan {
     /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
     /// arms replace them with TRUE to conservatively prevent pruning.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
-        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
+        if !self.data_skipping.uses_checkpoint_pushdown() {
             return None;
-        };
-        self.state_info.physical_stats_schema.as_ref()?;
-
-        // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
-        // the predicate also references physical columns, so partition detection reads the physical
-        // partition schema rather than the logical names in table metadata.
-        let partition_columns: HashSet<ColumnName> = self
-            .state_info
-            .physical_partition_schema
-            .as_ref()
-            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
-            .unwrap_or_default();
-        let skipping_pred = as_checkpoint_skipping_predicate(
-            predicate,
-            &partition_columns,
-            &self.state_info.physical_stats_columns,
-        )?;
-
-        let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add"]),
-        };
-        let prefixed = prefixer.transform_pred(&skipping_pred);
-        Some(Arc::new(prefixed.into_owned()))
+        }
+        build_actions_meta_predicate(&self.state_info)
     }
 
     /// Start a parallel scan metadata processing for the table.
@@ -1100,25 +1157,31 @@ impl Scan {
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
-        let checkpoint_read_schema = if self.skip_stats() {
-            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
-        } else {
+        let checkpoint_read_schema = if self.reads_stats() {
             CHECKPOINT_READ_SCHEMA.clone()
+        } else {
+            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
         };
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed: false,
             has_partition_values_parsed: false,
-            checkpoint_read_schema,
+            checkpoint_read_schema: checkpoint_read_schema.clone(),
         };
         let processor = ScanLogReplayProcessor::new(
             engine.as_ref(),
             self.state_info.clone(),
             checkpoint_info,
-            self.stats_options(),
+            self.replay_options(),
             self.partition_values_options(),
         )?;
-        let sequential =
-            SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
+        let checkpoint_predicate = processor.checkpoint_predicate();
+        let sequential = SequentialPhase::try_new(
+            processor,
+            self.snapshot.log_segment(),
+            engine.clone(),
+            checkpoint_read_schema,
+            checkpoint_predicate,
+        )?;
 
         Ok(SequentialScanMetadata::new(
             sequential,

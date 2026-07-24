@@ -130,9 +130,9 @@ impl DataSkippingFilter {
     ///   rewrites so non-Add rows are never filtered out.
     /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
     /// - `stats_columns`: Physical leaf paths whose stats are in `stats_schema`. References to
-    ///   other data columns fold to NULL (keeping the file). Must line up with `stats_schema` --
-    ///   otherwise the rewritten predicate references columns the unified schema doesn't have and
-    ///   evaluator construction fails.
+    ///   other data columns fold to NULL (keeping the file). When `stats_schema` is `None` the set
+    ///   is treated as empty regardless of what the caller passes, since no data-column stat is
+    ///   available to compare against; only partition arms can then prune.
     /// - `metrics`: Optional metrics to record data skipping statistics.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -158,6 +158,15 @@ impl DataSkippingFilter {
 
         let predicate = predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
+
+        // With no stats schema there is no data-column stat to compare against, so any
+        // `stats_columns` the caller passed cannot line up with the (absent) schema. Force the set
+        // empty: data-column arms then fold to NULL (keep) and only partition arms prune.
+        let empty_stats_columns = HashSet::new();
+        let stats_columns = match stats_schema {
+            Some(_) => stats_columns,
+            None => &empty_stats_columns,
+        };
 
         // Build the unified evaluation schema and extraction expression. Data stats and partition
         // values are conceptually separate, but the evaluator needs a single schema/expression.
@@ -895,10 +904,20 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
     /// ```
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionPredicateOp,
+        mut op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
+        if inverted {
+            op = op.invert();
+        }
+        // The checkpoint predicate may be applied as an exact row filter by an engine. Replacing
+        // an unsupported arm with NULL would then discard the row under SQL WHERE semantics.
+        // TRUE is conservative for both junctions: AND retains supported pruning, while OR
+        // becomes all-keep.
+        Some(Pred::junction(
+            op,
+            preds.map(|pred| pred.unwrap_or_else(|| Pred::literal(true))),
+        ))
     }
 }
