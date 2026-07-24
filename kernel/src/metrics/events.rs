@@ -25,6 +25,8 @@ use tracing::span::Attributes;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::log_segment::LogSegment;
+
 // ====================================================================
 // MetricId
 // ====================================================================
@@ -117,7 +119,6 @@ impl MetricEvent {
     pub(crate) fn set_duration_if_applicable(&mut self, d: Duration) {
         match self {
             // Lifecycle success: duration must be set by the tracing layer on span close.
-            Self::LogSegmentLoadSuccess(e) => e.set_duration(d),
             Self::SnapshotBuildSuccess(e) => e.set_duration(d),
             Self::TransactionCommitSuccess(e) => e.set_duration(d),
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
@@ -126,7 +127,8 @@ impl MetricEvent {
 
             // Emit-based success events set their duration as a creation attribute, so the
             // span-close hook must not overwrite it.
-            Self::ProtocolMetadataLoadSuccess(_)
+            Self::LogSegmentLoadSuccess(_)
+            | Self::ProtocolMetadataLoadSuccess(_)
             | Self::ScanMetadataCompleted(_)
             | Self::StorageListCompleted(_)
             | Self::StorageReadCompleted(_)
@@ -149,13 +151,12 @@ impl MetricEvent {
     pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
         match self {
             // Variants with u64 fields set during span lifetime.
-            Self::LogSegmentLoadSuccess(e) => e.record_u64(name, value),
             Self::SnapshotBuildSuccess(e) => e.record_u64(name, value),
             Self::TransactionCommitSuccess(e) => e.record_u64(name, value),
             Self::DomainMetadataLoadSuccess(e) => e.record_u64(name, value),
             Self::CrcReadSuccess(e) => e.record_u64(name, value),
 
-            // No u64 fields set during span lifetime — a runtime record() on these is a bug.
+            Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SetTransactionLoadSuccess(_) => Err(SetTransactionLoadSuccess::SPAN_NAME),
             Self::ScanMetadataCompleted(_) => Err(ScanMetadataCompleted::SPAN_NAME),
@@ -179,12 +180,12 @@ impl MetricEvent {
     pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
         match self {
             // Variants with bool fields set during span lifetime.
-            Self::LogSegmentLoadSuccess(e) => e.record_bool(name, value),
             Self::TransactionCommitSuccess(e) => e.record_bool(name, value),
             Self::DomainMetadataLoadSuccess(e) => e.record_bool(name, value),
             Self::SetTransactionLoadSuccess(e) => e.record_bool(name, value),
 
             // No bool fields set during span lifetime — a runtime record() on these is a bug.
+            Self::LogSegmentLoadSuccess(_) => Err(LogSegmentLoadSuccess::SPAN_NAME),
             Self::ProtocolMetadataLoadSuccess(_) => Err(ProtocolMetadataLoadSuccess::SPAN_NAME),
             Self::SnapshotBuildSuccess(_) => Err(SnapshotBuildSuccess::SPAN_NAME),
             Self::CrcReadSuccess(_) => Err(CrcReadSuccess::SPAN_NAME),
@@ -239,18 +240,21 @@ impl MetricEvent {
                 operation_id: e.operation_id,
                 table_type: e.table_type,
                 correlation_id: e.correlation_id,
+                load_type: e.load_type,
             }),
             Self::ProtocolMetadataLoadSuccess(e) => {
                 Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                     operation_id: e.operation_id,
                     table_type: e.table_type,
                     correlation_id: e.correlation_id,
+                    load_type: e.load_type,
                 })
             }
             Self::SnapshotBuildSuccess(e) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: e.operation_id,
                 table_type: e.table_type,
                 correlation_id: e.correlation_id,
+                load_type: e.load_type,
             }),
             Self::TransactionCommitSuccess(e) => {
                 Self::TransactionCommitFailure(TransactionCommitFailure {
@@ -317,70 +321,131 @@ impl fmt::Display for MetricEvent {
 // Canonical example for the per-event block pattern. Other events below follow the same
 // shape; detailed `///` docs on `from_attrs` and `record_*` live here only.
 
-// Module-scope span name. `#[instrument(name = ...)]` only accepts a bare identifier here,
-// not a multi-segment path like `Type::SPAN_NAME`.
 pub(crate) const LOG_SEGMENT_LOADED_SPAN: &str = "segment.for_snapshot";
 
+/// The kind of log-segment load: a full listing from the base up to the target, or an
+/// incremental listing of the commits above an existing segment.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, EnumString, StrumDisplay, AsRefStr, IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum LogSegmentLoadType {
+    /// The segment was listed from its base (a checkpoint, else version 0) up to the target. A
+    /// fresh snapshot build (`LogSegment::for_snapshot`) reads this way.
+    Full,
+    /// The segment was listed as a delta above an existing base. An incremental snapshot update
+    /// (`Snapshot::try_new_from`) reads only the commits above the existing snapshot.
+    Incremental,
+    /// Decode fell back here because the span's `load_type` field was unset or unrecognized.
+    /// Kernel never emits this deliberately.
+    #[default]
+    Unknown,
+}
+
+impl LogSegmentLoadType {
+    fn parse_or_unknown(s: &str) -> Self {
+        if s.is_empty() {
+            return Self::Unknown;
+        }
+        Self::from_str(s).unwrap_or_else(|e| {
+            warn!("Invalid load_type '{s}': {e}. Using Unknown.");
+            Self::Unknown
+        })
+    }
+}
+
 /// A log segment was listed and assembled for a snapshot.
+///
+/// All fields are set at emit time (creation attrs).
 #[derive(Debug, Clone)]
 pub struct LogSegmentLoadSuccess {
-    // === Set on span creation ===
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-
-    // === Set during span lifetime ===
+    pub load_type: LogSegmentLoadType,
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
     pub num_compaction_files: u64,
-    pub has_latest_crc_file: bool,
-
-    // === Set on span close ===
+    /// How many versions behind the segment's end version the latest on-disk CRC file is, or
+    /// `None` if there is no CRC file.
+    pub crc_versions_behind: Option<u64>,
     pub duration: Duration,
 }
 
 impl LogSegmentLoadSuccess {
     pub(crate) const SPAN_NAME: &'static str = LOG_SEGMENT_LOADED_SPAN;
 
-    /// Construction-time channel. Extracts fields bound at span creation via
-    /// `#[instrument(fields(X = expr))]` or `tracing::span!(..., X = expr)`.
-    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+    /// Span field for CRC staleness. `None` (no CRC file) encodes as `-1`.
+    const CRC_VERSIONS_BEHIND_FIELD: &'static str = "crc_versions_behind";
+
+    fn encode_crc_versions_behind(v: Option<u64>) -> i64 {
+        v.map_or(-1, |n| n as i64)
+    }
+
+    fn decode_crc_versions_behind(v: i64) -> Option<u64> {
+        u64::try_from(v).ok()
+    }
+
+    /// The default seed [`Self::from_attrs`] populates from span fields.
+    fn empty() -> Self {
         Self {
-            operation_id: MetricId::from_attrs(attrs),
-            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
-            correlation_id: correlation_id_from_attrs(attrs),
+            operation_id: MetricId::nil(),
+            correlation_id: None,
+            table_type: TableType::from_catalog_managed(false),
+            load_type: LogSegmentLoadType::default(),
             num_commit_files: 0,
             num_checkpoint_files: 0,
             num_compaction_files: 0,
-            has_latest_crc_file: false,
-            duration: Duration::default(),
+            crc_versions_behind: None,
+            duration: Duration::ZERO,
         }
     }
 
-    /// Runtime channel. Dispatches a u64 field update from `Span::current().record(name, value)`
-    /// to the matching field.
-    pub(crate) fn record_u64(&mut self, name: &str, value: u64) -> Result<(), &'static str> {
-        match name {
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+        let mut event = Self::empty();
+        attrs.record(&mut event);
+        event
+    }
+}
+
+impl Visit for LogSegmentLoadSuccess {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == IS_CATALOG_MANAGED_FIELD {
+            self.table_type = TableType::from_catalog_managed(value);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
+            "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "duration_ns" => self.duration = Duration::from_nanos(value),
             "num_commit_files" => self.num_commit_files = value,
             "num_checkpoint_files" => self.num_checkpoint_files = value,
             "num_compaction_files" => self.num_compaction_files = value,
-            _ => return Err(Self::SPAN_NAME),
+            _ => {}
         }
-        Ok(())
     }
 
-    pub(crate) fn record_bool(&mut self, name: &str, value: bool) -> Result<(), &'static str> {
-        match name {
-            "has_latest_crc_file" => self.has_latest_crc_file = value,
-            _ => return Err(Self::SPAN_NAME),
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        if field.name() == Self::CRC_VERSIONS_BEHIND_FIELD {
+            self.crc_versions_behind = Self::decode_crc_versions_behind(value);
         }
-        Ok(())
     }
 
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
+            self.operation_id = id;
+        }
     }
 }
 
@@ -390,19 +455,20 @@ impl fmt::Display for LogSegmentLoadSuccess {
             operation_id,
             table_type,
             correlation_id,
+            load_type,
             duration,
             num_commit_files,
             num_checkpoint_files,
             num_compaction_files,
-            has_latest_crc_file,
+            crc_versions_behind,
         } = self;
         write!(
             f,
             "LogSegmentLoadSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, \
+             correlation_id={correlation_id:?}, load_type={load_type}, \
              duration={duration:?}, commits={num_commit_files}, \
              checkpoints={num_checkpoint_files}, compactions={num_compaction_files}, \
-             has_latest_crc={has_latest_crc_file})"
+             crc_versions_behind={crc_versions_behind:?})"
         )
     }
 }
@@ -415,14 +481,15 @@ pub struct LogSegmentLoadFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 }
 
 impl fmt::Display for LogSegmentLoadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "LogSegmentLoadFailure(id={}, table_type={}, correlation_id={:?})",
-            self.operation_id, self.table_type, self.correlation_id
+            "LogSegmentLoadFailure(id={}, table_type={}, correlation_id={:?}, load_type={})",
+            self.operation_id, self.table_type, self.correlation_id, self.load_type
         )
     }
 }
@@ -475,6 +542,7 @@ pub struct ProtocolMetadataLoadSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
     pub source: ProtocolMetadataSource,
     pub duration: Duration,
 }
@@ -489,6 +557,7 @@ impl ProtocolMetadataLoadSuccess {
             operation_id: MetricId::nil(),
             correlation_id: None,
             table_type: TableType::from_catalog_managed(false),
+            load_type: LogSegmentLoadType::default(),
             source: ProtocolMetadataSource::Unknown,
             duration: Duration::ZERO,
         }
@@ -511,6 +580,7 @@ impl Visit for ProtocolMetadataLoadSuccess {
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
             CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
+            "load_type" => self.load_type = LogSegmentLoadType::parse_or_unknown(value),
             "pm_source" => self.source = ProtocolMetadataSource::parse_or_unknown(value),
             _ => {}
         }
@@ -535,13 +605,15 @@ impl fmt::Display for ProtocolMetadataLoadSuccess {
             operation_id,
             table_type,
             correlation_id,
+            load_type,
             source,
             duration,
         } = self;
         write!(
             f,
             "ProtocolMetadataLoadSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, source={source}, duration={duration:?})"
+             correlation_id={correlation_id:?}, load_type={load_type}, source={source}, \
+             duration={duration:?})"
         )
     }
 }
@@ -554,14 +626,16 @@ pub struct ProtocolMetadataLoadFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 }
 
 impl fmt::Display for ProtocolMetadataLoadFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ProtocolMetadataLoadFailure(id={}, table_type={}, correlation_id={:?})",
-            self.operation_id, self.table_type, self.correlation_id
+            "ProtocolMetadataLoadFailure(id={}, table_type={}, correlation_id={:?}, \
+             load_type={})",
+            self.operation_id, self.table_type, self.correlation_id, self.load_type
         )
     }
 }
@@ -581,6 +655,7 @@ pub struct SnapshotBuildSuccess {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 
     // === Set during span lifetime ===
     pub version: u64,
@@ -597,6 +672,7 @@ impl SnapshotBuildSuccess {
             operation_id: MetricId::from_attrs(attrs),
             table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
             correlation_id: correlation_id_from_attrs(attrs),
+            load_type: load_type_from_attrs(attrs),
             version: 0,
             duration: Duration::default(),
         }
@@ -621,13 +697,15 @@ impl fmt::Display for SnapshotBuildSuccess {
             operation_id,
             table_type,
             correlation_id,
+            load_type,
             version,
             duration,
         } = self;
         write!(
             f,
             "SnapshotBuildSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, version={version}, duration={duration:?})"
+             correlation_id={correlation_id:?}, load_type={load_type}, version={version}, \
+             duration={duration:?})"
         )
     }
 }
@@ -644,14 +722,15 @@ pub struct SnapshotBuildFailure {
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 }
 
 impl fmt::Display for SnapshotBuildFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?})",
-            self.operation_id, self.table_type, self.correlation_id
+            "SnapshotBuildFailure(id={}, table_type={}, correlation_id={:?}, load_type={})",
+            self.operation_id, self.table_type, self.correlation_id, self.load_type
         )
     }
 }
@@ -1194,6 +1273,7 @@ pub struct SnapshotLoadMetricContext {
     pub(crate) operation_id: MetricId,
     pub(crate) correlation_id: Option<Arc<str>>,
     pub(crate) is_catalog_managed: bool,
+    pub(crate) load_type: LogSegmentLoadType,
 }
 
 #[cfg(test)]
@@ -1205,6 +1285,7 @@ impl SnapshotLoadMetricContext {
             operation_id: MetricId::nil(),
             correlation_id: None,
             is_catalog_managed: false,
+            load_type: LogSegmentLoadType::default(),
         }
     }
 }
@@ -1260,6 +1341,22 @@ pub(crate) fn correlation_id_from_attrs(attrs: &Attributes<'_>) -> Option<Arc<st
         fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
     }
     let mut v = CorrelationIdVisitor::default();
+    attrs.record(&mut v);
+    v.0
+}
+
+pub(crate) fn load_type_from_attrs(attrs: &Attributes<'_>) -> LogSegmentLoadType {
+    #[derive(Default)]
+    struct V(LogSegmentLoadType);
+    impl Visit for V {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "load_type" {
+                self.0 = LogSegmentLoadType::parse_or_unknown(value);
+            }
+        }
+        fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+    }
+    let mut v = V::default();
     attrs.record(&mut v);
     v.0
 }
@@ -1631,6 +1728,46 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
     );
 }
 
+/// Emit a [`MetricEvent::LogSegmentLoadSuccess`] for `segment`, reporting its file counts and CRC
+/// staleness. Call once per log-segment load, on success; callers time the load and pass
+/// `duration`.
+pub(crate) fn emit_log_segment_load(
+    ctx: &SnapshotLoadMetricContext,
+    segment: &LogSegment,
+    duration: Duration,
+) {
+    tracing::span!(
+        tracing::Level::INFO,
+        LogSegmentLoadSuccess::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %ctx.operation_id,
+        is_catalog_managed = ctx.is_catalog_managed,
+        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        load_type = ctx.load_type.as_ref(),
+        num_commit_files = segment.listed.ascending_commit_files.len() as u64,
+        num_checkpoint_files = segment.listed.checkpoint_parts.len() as u64,
+        num_compaction_files = segment.listed.ascending_compaction_files.len() as u64,
+        crc_versions_behind =
+            LogSegmentLoadSuccess::encode_crc_versions_behind(segment.crc_versions_behind()),
+        duration_ns = duration.as_nanos() as u64,
+    );
+}
+
+/// Emit a [`MetricEvent::LogSegmentLoadFailure`]. Call once per log-segment load, on failure.
+pub(crate) fn emit_log_segment_load_failure(ctx: &SnapshotLoadMetricContext) {
+    let span = tracing::span!(
+        tracing::Level::INFO,
+        LogSegmentLoadSuccess::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %ctx.operation_id,
+        is_catalog_managed = ctx.is_catalog_managed,
+        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        load_type = ctx.load_type.as_ref(),
+    );
+    let _enter = span.enter();
+    tracing::info!(error = tracing::field::debug("log segment load failed"));
+}
+
 /// Emit a [`MetricEvent::ProtocolMetadataLoadSuccess`]. Call once per snapshot load on the P&M
 /// resolution path, on success.
 pub(crate) fn emit_protocol_metadata_load(
@@ -1645,6 +1782,7 @@ pub(crate) fn emit_protocol_metadata_load(
         operation_id = %ctx.operation_id,
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        load_type = ctx.load_type.as_ref(),
         pm_source = source.as_ref(),
         duration_ns = duration.as_nanos() as u64,
     );
@@ -1660,6 +1798,7 @@ pub(crate) fn emit_protocol_metadata_load_failure(ctx: &SnapshotLoadMetricContex
         operation_id = %ctx.operation_id,
         is_catalog_managed = ctx.is_catalog_managed,
         correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        load_type = ctx.load_type.as_ref(),
     );
     let _enter = span.enter();
     tracing::info!(error = tracing::field::debug("protocol/metadata load failed"));
@@ -1767,6 +1906,42 @@ mod tests {
     }
 
     #[rstest]
+    #[case::full(LogSegmentLoadType::Full, "full")]
+    #[case::incremental(LogSegmentLoadType::Incremental, "incremental")]
+    #[case::unknown(LogSegmentLoadType::Unknown, "unknown")]
+    fn log_segment_load_type_serializes_to_wire_name_and_parses_back(
+        #[case] load_type: LogSegmentLoadType,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = load_type.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(LogSegmentLoadType::from_str(wire).unwrap(), load_type);
+    }
+
+    #[rstest]
+    #[case::known("incremental", LogSegmentLoadType::Incremental)]
+    #[case::empty_maps_to_unknown("", LogSegmentLoadType::Unknown)]
+    #[case::unrecognized_maps_to_unknown("totally_unknown", LogSegmentLoadType::Unknown)]
+    fn log_segment_load_type_parse_or_unknown(
+        #[case] value: &str,
+        #[case] expected: LogSegmentLoadType,
+    ) {
+        assert_eq!(LogSegmentLoadType::parse_or_unknown(value), expected);
+    }
+
+    #[rstest]
+    #[case::none(None)]
+    #[case::zero(Some(0))]
+    #[case::some(Some(7))]
+    fn crc_versions_behind_sentinel_round_trips(#[case] v: Option<u64>) {
+        let encoded = LogSegmentLoadSuccess::encode_crc_versions_behind(v);
+        assert_eq!(
+            LogSegmentLoadSuccess::decode_crc_versions_behind(encoded),
+            v
+        );
+    }
+
+    #[rstest]
     #[case::crc_at_target(ProtocolMetadataSource::CrcAtTarget, "crc_at_target")]
     #[case::crc_advanced(ProtocolMetadataSource::CrcAdvancedByReplay, "crc_advanced_by_replay")]
     #[case::crc_seeded(
@@ -1833,6 +2008,7 @@ mod tests {
             operation_id: MetricId::new(),
             table_type: TableType::PathBased,
             correlation_id: Some("snap-req-3".into()),
+            load_type: LogSegmentLoadType::Incremental,
             version: 0,
             duration: Duration::default(),
         };
@@ -1842,5 +2018,6 @@ mod tests {
             panic!("expected SnapshotBuildFailure");
         };
         assert_eq!(failure.correlation_id.as_deref(), Some("snap-req-3"));
+        assert_eq!(failure.load_type, LogSegmentLoadType::Incremental);
     }
 }

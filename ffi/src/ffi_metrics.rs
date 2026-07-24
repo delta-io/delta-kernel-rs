@@ -100,7 +100,11 @@ pub struct LogSegmentLoadSuccess {
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
     pub num_compaction_files: u64,
-    pub has_latest_crc_file: bool,
+    /// Whether the segment had a CRC file. When false, `crc_versions_behind` is 0 and meaningless.
+    pub has_crc: bool,
+    /// Versions the latest CRC file is behind the loaded version (0 when at the loaded version).
+    /// Only meaningful when `has_crc` is true.
+    pub crc_versions_behind: u64,
 }
 
 /// Listing the log segment failed.
@@ -335,8 +339,9 @@ impl MetricEvent {
                 num_commit_files,
                 num_checkpoint_files,
                 num_compaction_files,
-                has_latest_crc_file,
+                crc_versions_behind,
                 duration,
+                ..
             }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -345,12 +350,15 @@ impl MetricEvent {
                 num_commit_files: *num_commit_files,
                 num_checkpoint_files: *num_checkpoint_files,
                 num_compaction_files: *num_compaction_files,
-                has_latest_crc_file: *has_latest_crc_file,
+                // C has no Option: `has_crc` gates `crc_versions_behind` (0 when absent).
+                has_crc: crc_versions_behind.is_some(),
+                crc_versions_behind: crc_versions_behind.unwrap_or(0),
             }),
             K::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
                 operation_id,
                 correlation_id,
                 table_type,
+                ..
             }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -362,6 +370,7 @@ impl MetricEvent {
                 table_type,
                 source,
                 duration,
+                ..
             }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -373,6 +382,7 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                ..
             }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -384,6 +394,7 @@ impl MetricEvent {
                 table_type,
                 version,
                 duration,
+                ..
             }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -395,6 +406,7 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                ..
             }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
@@ -714,6 +726,7 @@ mod tests {
                 operation_id: id,
                 correlation_id: Some("pm-req".into()),
                 table_type: kernel::TableType::CatalogManaged,
+                load_type: kernel::LogSegmentLoadType::Full,
                 source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
                 duration: Duration::from_nanos(53),
             });
@@ -741,10 +754,11 @@ mod tests {
             operation_id: id,
             correlation_id: Some("req-42".into()),
             table_type: kernel::TableType::CatalogManaged,
+            load_type: kernel::LogSegmentLoadType::Full,
             num_commit_files: 3,
             num_checkpoint_files: 1,
             num_compaction_files: 2,
-            has_latest_crc_file: true,
+            crc_versions_behind: Some(5),
             duration: Duration::from_nanos(61),
         });
         with_ffi_event(&event, |ffi| {
@@ -757,7 +771,8 @@ mod tests {
             assert_eq!(e.num_commit_files, 3);
             assert_eq!(e.num_checkpoint_files, 1);
             assert_eq!(e.num_compaction_files, 2);
-            assert!(e.has_latest_crc_file);
+            assert!(e.has_crc);
+            assert_eq!(e.crc_versions_behind, 5);
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "req-42");
@@ -770,10 +785,11 @@ mod tests {
             operation_id: kernel::MetricId::new(),
             correlation_id: None,
             table_type: kernel::TableType::PathBased,
+            load_type: kernel::LogSegmentLoadType::Full,
             num_commit_files: 0,
             num_checkpoint_files: 0,
             num_compaction_files: 0,
-            has_latest_crc_file: false,
+            crc_versions_behind: None,
             duration: Duration::from_nanos(0),
         });
         with_ffi_event(&event, |ffi| {
@@ -781,6 +797,7 @@ mod tests {
                 panic!("expected LogSegmentLoadSuccess");
             };
             assert!(matches!(e.table_type, TableType::PathBased));
+            assert!(!e.has_crc);
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "");
