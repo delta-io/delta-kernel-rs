@@ -685,11 +685,11 @@ pub trait JsonHandler: AsAny {
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
     /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. If
-    ///   applied, a row may be omitted only when the predicate evaluates to false or null for that
-    ///   row. Unsupported subexpressions and references with no matching physical or generated
-    ///   value must remain unknown and must not fail the read. A missing reference remains unknown
-    ///   for pruning even if schema reconciliation synthesizes a NULL output column. Returned data
-    ///   is not guaranteed to satisfy the predicate.
+    ///   applied, a file or row may be omitted only when the predicate cannot evaluate to true for
+    ///   any row in that unit. Unsupported subexpressions and references with no matching physical
+    ///   or generated value must remain unknown and must not fail the read. A missing reference
+    ///   remains unknown for pruning even if schema reconciliation synthesizes a NULL output
+    ///   column. Returned data is not guaranteed to satisfy the predicate.
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -873,8 +873,8 @@ pub trait ParquetHandler: AsAny {
     ///   file, row group, or row may be omitted only when the predicate cannot evaluate to true for
     ///   any row in that unit. Unsupported subexpressions and references with no matching physical
     ///   or generated value must remain unknown and must not fail the read. A missing reference
-    ///   remains unknown for pruning even if schema reconciliation synthesizes a NULL output column.
-    ///   Returned data is not guaranteed to satisfy the predicate.
+    ///   remains unknown for pruning even if schema reconciliation synthesizes a NULL output
+    ///   column. Returned data is not guaranteed to satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].

@@ -1197,10 +1197,9 @@ fn test_build_actions_meta_predicate_partition_only() {
         .into_iter()
         .map(|c| c.to_string())
         .collect();
-    assert!(
-        refs.iter()
-            .any(|r| r.starts_with("add.partitionValues_parsed.modified")),
-        "expected a reference to add.partitionValues_parsed.modified, got {refs:?}"
+    assert_eq!(
+        refs,
+        vec!["add.partitionValues_parsed.modified".to_string()]
     );
 }
 

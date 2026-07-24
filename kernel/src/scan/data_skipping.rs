@@ -418,10 +418,6 @@ impl DataSkippingFilter {
 /// values. A bare unsupported predicate returns `None`; unsupported junction arms become NULL
 /// literals to preserve three-valued logic.
 ///
-/// This applies to Parquet files that carry checkpoint Adds: V1 single-part and multi-part
-/// checkpoints, inline Adds in V2 Parquet checkpoints, and V2 sidecars. A V2 JSON checkpoint has no
-/// row groups; only its Parquet sidecars use this predicate.
-///
 /// `physical_partition_columns` may be narrowed to the predicate's references; pass an empty set
 /// for unpartitioned tables. `physical_floating_partition_columns` identifies FLOAT and DOUBLE
 /// partitions whose parquet min/max may omit NaNs. `physical_stats_columns` is the table-level
@@ -767,9 +763,9 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
     type Output = Pred;
     type ColumnStat = Expr;
 
-    // Stat selection (partition value vs `stats_parsed.*`, and the max-stat truncation policy) is
-    // shared with the in-memory creator via `DataSkippingColumns`. Only the guards below differ:
-    // this creator guards data-stat comparisons but allows exact partition values to prune nulls.
+    // Stat selection and max-stat truncation are shared through `DataSkippingColumns`. This
+    // creator also limits footer-ineligible columns and predicate shapes while applying
+    // checkpoint-specific null guards.
 
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         // Parquet footer min/max exclude NaNs, so they cannot bound every floating partition value.
@@ -811,8 +807,9 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
     /// Wraps a data-stat comparison with an IS NULL guard, so a missing stat keeps the row group.
     /// `col > 100` becomes
     /// `OR(stats_parsed.maxValues.col IS NULL, stats_parsed.maxValues.col > 100)`.
-    /// Partition comparisons use their exact value directly; null values, including checkpoint
-    /// Remove rows, may be pruned.
+    /// Partition comparisons reference the typed per-Add value without a null guard. The parquet
+    /// filter evaluates that column through row-group footer bounds; null-only groups remain
+    /// unknown while mixed groups may be pruned from their non-null bounds.
     fn eval_partial_cmp(
         &self,
         ord: Ordering,

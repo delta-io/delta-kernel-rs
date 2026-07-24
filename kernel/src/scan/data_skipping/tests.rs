@@ -528,11 +528,7 @@ fn test_checkpoint_skipping_partition_comparison_with_remove(
     expect_eq!(filter.eval(&skipping_pred), expected, "{pred:?}");
 }
 
-// Checkpoint partition skipping across comparison operators. Each case resolves one exact per-file
-// partition value from `partitionValues_parsed.part_col`, which serves as both min and max. The
-// rewritten comparison returns FALSE exactly when that value cannot satisfy the original predicate.
 #[rstest]
-// Value fixed at "b"; the literal sits below, on, or above it.
 #[case::eq_lit_above(Pred::eq(column_expr!("part_col"), Scalar::from("m")), "b", FALSE)]
 #[case::eq_hit(Pred::eq(column_expr!("part_col"), Scalar::from("b")), "b", TRUE)]
 #[case::eq_lit_below(Pred::eq(column_expr!("part_col"), Scalar::from("a")), "b", FALSE)]
@@ -591,8 +587,6 @@ fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] va
     );
 }
 
-// Partition null predicates read `partitionValues_parsed.part_col` directly. FALSE is the pruning
-// verdict; TRUE keeps the row group.
 #[rstest]
 #[case::is_null_null(false, Scalar::Null(DataType::STRING), TRUE)]
 #[case::is_null_value(false, Scalar::from("x"), FALSE)]
@@ -623,9 +617,9 @@ fn test_checkpoint_skipping_partition_null_predicates(
     expect_eq!(resolver.eval(&skipping_pred), expected, "{pred:?}");
 }
 
-// When the checkpoint lacks `partitionValues_parsed` (older writer), the meta-predicate still
-// references it, but every stat resolves to unavailable -> the predicate is NULL/unknown -> the
-// row group is KEPT, never pruned. Simulated with a resolver that has no columns at all.
+// When a checkpoint omits `partitionValues_parsed` (for example, structured checkpoint stats are
+// disabled), every referenced stat is unavailable, so the predicate remains unknown and keeps the
+// row group. Simulated with a resolver that has no columns.
 #[test]
 fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
     let partition_columns = HashSet::from([column_name!("part_col")]);
@@ -648,15 +642,10 @@ fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
     }
 }
 
-// Mixed partition + data predicates. Each arm prunes independently against its own stat: the exact
-// `partitionValues_parsed.part_col` value and the `stats_parsed.maxValues.data_col` range. AND
-// skips when EITHER arm proves no match; OR skips only when BOTH prove no match.
 #[rstest]
-// part_col = 'b' AND data_col > 100
 #[case::and_partition_prunes(true, "z", 500, FALSE)]
 #[case::and_data_prunes(true, "b", 40, FALSE)]
 #[case::and_both_keep(true, "b", 500, TRUE)]
-// part_col = 'b' OR data_col > 100
 #[case::or_both_miss(false, "z", 40, FALSE)]
 #[case::or_partition_keeps(false, "b", 40, TRUE)]
 #[case::or_data_keeps(false, "z", 500, TRUE)]
@@ -691,9 +680,6 @@ fn test_checkpoint_skipping_mixed_partition_and_data(
     expect_eq!(resolver.eval(&skipping_pred), expected, "{pred:?}");
 }
 
-// Partition timestamp columns are exact (never truncated), so unlike data-column timestamps they
-// get NO 999us max-stat adjustment. `part_ts > T` compares against the exact value T (not T-999)
-// without a null guard.
 #[test]
 fn test_checkpoint_skipping_partition_timestamp_no_truncation_adjustment() {
     let partition_columns = HashSet::from([column_name!("part_ts")]);
@@ -709,8 +695,6 @@ fn test_checkpoint_skipping_partition_timestamp_no_truncation_adjustment() {
     );
 }
 
-// Verifies that the IS NULL guard changes behavior compared to a regular data skipping predicate:
-// without the guard, null stats produce NULL (unknown); with the guard, they produce TRUE (keep).
 #[test]
 fn test_checkpoint_skipping_null_guard_vs_regular() {
     let pred = Pred::gt(column_expr!("x"), Scalar::from(100));

@@ -315,11 +315,9 @@ struct StatsColumnIndices {
 /// a checkpoint file where statistics are nested under `add.stats_parsed.{minValues,maxValues,
 /// nullCount}.<col>` and partition values under `add.partitionValues_parsed.<col>`.
 ///
-/// Because checkpoint statistics are aggregates _of_ per-file statistics, a null value in a stat
-/// column means the corresponding file was missing that statistic. The parquet footer min/max
-/// ignores nulls, which can produce misleading aggregates. To prevent false pruning, this filter
-/// returns `None` for any stat whose column contains null values in the row group (checked via
-/// the column's own null count in the parquet footer).
+/// A data-stat leaf is null when an Add lacks that statistic or when the row is not an Add. Because
+/// parquet footer min/max ignore those nulls, the filter treats a stat as unavailable whenever its
+/// footer null count is nonzero.
 ///
 /// Partition columns read their footer min/max of `add.partitionValues_parsed.<col>` directly,
 /// without a null guard. Footer min/max ignore nulls, so a non-matching comparison may prune a row
