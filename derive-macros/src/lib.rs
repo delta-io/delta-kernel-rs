@@ -119,11 +119,12 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 /// delta schema camelCase version).
 ///
 /// Supported field attributes:
-/// - `#[field_id = N]`: Sets the Parquet field ID for this field. `N` must be in `1..=i32::MAX`.
+/// - `#[field_id = N]`: Sets the Parquet field ID for this field. `N` must be in `0..=i32::MAX`
+///   (`0` is a valid reserved Iceberg field ID, e.g. the manifest-entry `status` field).
 /// - `#[nested_field_id = N]`: Sets the Parquet field ID for the element of a list field (`Vec<T>`
 ///   or `Option<Vec<T>>`; rejected on any other type). Stored as `ColumnMappingNestedIds` metadata
 ///   (`{"fieldName.element": N}`) on the parent `StructField` and propagated to the inner Arrow
-///   list element during schema conversion. `N` must be in `1..=i32::MAX`.
+///   list element during schema conversion. `N` must be in `0..=i32::MAX`.
 /// - `#[allow_null_container_values]`: Marks the value field of a container as nullable, i.e. the
 ///   underlying data can contain null in the values of the container (a `key` -> `null` in a
 ///   `HashMap`). Those mappings will be dropped when converting to an actual rust `HashMap`.
@@ -212,10 +213,10 @@ fn get_named_attr_id(
     let value: i64 = lit_int
         .base10_parse()
         .map_err(|e| Error::new(lit_int.span(), format!("{attr_name} error: {e}")))?;
-    if !(1..=i64::from(i32::MAX)).contains(&value) {
+    if !(0..=i64::from(i32::MAX)).contains(&value) {
         return Err(Error::new(
             lit_int.span(),
-            format!("{attr_name} error: field id {value} must be in 1..=2147483647"),
+            format!("{attr_name} error: field id {value} must be in 0..=2147483647"),
         ));
     }
     Ok(Some(value))
@@ -543,6 +544,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case::zero("0", "0i64")]
     #[case::one("1", "1i64")]
     #[case::max("2147483647", "2147483647i64")]
     fn field_id_in_range_renders_literal(#[case] id: &str, #[case] expected: &str) {
@@ -555,7 +557,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zero("#[field_id = 0]")]
     #[case::negative("#[field_id = -1]")]
     #[case::overflow_i32("#[field_id = 2147483648]")]
     #[case::overflow_i64("#[field_id = 9223372036854775808]")]
