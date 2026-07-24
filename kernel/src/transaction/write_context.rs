@@ -941,4 +941,66 @@ mod tests {
             Err(()) => assert!(wc.resolve_file_path(&file).is_err()),
         }
     }
+
+    #[cfg(feature = "write-transport")]
+    fn partitioned_write_state() -> WriteState {
+        WriteState {
+            table_root: Url::parse("s3://bucket/table/").unwrap(),
+            full_logical_schema: schema_ref! {
+                not_null "year": INTEGER,
+                nullable "value": INTEGER
+            },
+            logical_schema: schema_ref! { nullable "value": INTEGER },
+            physical_schema: schema_ref! { nullable "value": INTEGER },
+            column_mapping_mode: ColumnMappingMode::None,
+            stats_columns: vec![ColumnName::new(["value"])],
+            logical_partition_columns: vec!["year".into()],
+            materialize_partition_columns: false,
+            randomize_file_prefixes: false,
+            random_prefix_length: NonZero::new(2).unwrap(),
+        }
+    }
+
+    /// A `WriteState` survives an `encode` -> `decode` round trip: the decoded state binds a
+    /// partition to the same physical values and schemas as the original.
+    #[cfg(feature = "write-transport")]
+    #[test]
+    fn test_write_state_encode_decode_round_trip_preserves_binding() {
+        let original = partitioned_write_state();
+        let decoded = WriteState::decode(&original.encode().unwrap()).unwrap();
+
+        let values = || HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
+        let from_original = original.partitioned_write_context(values()).unwrap();
+        let from_decoded = decoded.partitioned_write_context(values()).unwrap();
+
+        assert_eq!(decoded.table_root(), original.table_root());
+        assert_eq!(decoded.stats_columns(), original.stats_columns());
+        assert_eq!(
+            from_decoded.physical_partition_values(),
+            from_original.physical_partition_values()
+        );
+        assert_eq!(
+            from_decoded.physical_schema(),
+            from_original.physical_schema()
+        );
+    }
+
+    /// `decode` rejects a payload whose transport version this kernel does not understand, rather
+    /// than silently binding partitions against a contract it cannot read.
+    #[cfg(feature = "write-transport")]
+    #[test]
+    fn test_write_state_decode_unknown_version_returns_error() {
+        let mut bytes = partitioned_write_state().encode().unwrap();
+        let bumped = WRITE_STATE_TRANSPORT_VERSION + 1;
+        let json = String::from_utf8(bytes).unwrap().replace(
+            &format!("\"version\":{WRITE_STATE_TRANSPORT_VERSION}"),
+            &format!("\"version\":{bumped}"),
+        );
+        bytes = json.into_bytes();
+        let err = WriteState::decode(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported WriteState transport version"),
+            "{err}"
+        );
+    }
 }

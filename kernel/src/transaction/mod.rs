@@ -3239,4 +3239,29 @@ mod tests {
         assert_eq!(failure.table_type, TableType::PathBased);
         Ok(())
     }
+
+    /// The two-step `write_state()` + `WriteState::partitioned_write_context()` binding produces
+    /// the same write context as the one-step `Transaction::partitioned_write_context()` sugar.
+    #[test]
+    fn test_write_state_binding_matches_one_step_partitioned_write_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+
+        let values = || HashMap::from([("letter".to_string(), Scalar::String("a".into()))]);
+        let one_step = txn.partitioned_write_context(values())?;
+        let two_step = txn.write_state()?.partitioned_write_context(values())?;
+
+        assert_eq!(
+            one_step.physical_partition_values(),
+            two_step.physical_partition_values()
+        );
+        assert_eq!(one_step.logical_schema(), two_step.logical_schema());
+        assert_eq!(one_step.physical_schema(), two_step.physical_schema());
+        assert_eq!(one_step.stats_columns(), two_step.stats_columns());
+        Ok(())
+    }
 }
