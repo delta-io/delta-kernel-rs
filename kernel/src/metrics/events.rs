@@ -14,7 +14,7 @@
 //! default rather than failing the operation being observed.
 
 use std::fmt;
-use std::str::FromStr as _;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,8 +38,15 @@ pub struct MetricId(pub(crate) Uuid);
 
 impl MetricId {
     /// Generate a new unique `MetricId`.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// The nil id (all-zero UUID): the decode seed when a span omits `operation_id`, and the
+    /// sentinel for a malformed one.
+    pub(crate) fn nil() -> Self {
+        Self(Uuid::nil())
     }
 
     /// Return the 16 raw bytes of the underlying UUID. Useful for FFI consumers that want to
@@ -67,12 +74,6 @@ impl MetricId {
         let mut v = V::default();
         attrs.record(&mut v);
         Self(v.0)
-    }
-}
-
-impl Default for MetricId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -117,28 +118,31 @@ impl MetricEvent {
         match self {
             // Lifecycle success: duration must be set by the tracing layer on span close.
             Self::LogSegmentLoadSuccess(e) => e.set_duration(d),
-            Self::ProtocolMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SnapshotBuildSuccess(e) => e.set_duration(d),
             Self::TransactionCommitSuccess(e) => e.set_duration(d),
             Self::DomainMetadataLoadSuccess(e) => e.set_duration(d),
             Self::SetTransactionLoadSuccess(e) => e.set_duration(d),
             Self::CrcReadSuccess(e) => e.set_duration(d),
 
-            // For now, failure events carry no duration; storage/scan events set it at
-            // construction; read events have no duration field.
+            // Emit-based success events set their duration as a creation attribute, so the
+            // span-close hook must not overwrite it.
+            Self::ProtocolMetadataLoadSuccess(_)
+            | Self::ScanMetadataCompleted(_)
+            | Self::StorageListCompleted(_)
+            | Self::StorageReadCompleted(_)
+            | Self::StorageCopyCompleted(_) => {}
+
+            // Failure events carry no duration.
             Self::LogSegmentLoadFailure(_)
             | Self::ProtocolMetadataLoadFailure(_)
             | Self::SnapshotBuildFailure(_)
             | Self::TransactionCommitFailure(_)
             | Self::DomainMetadataLoadFailure
             | Self::SetTransactionLoadFailure
-            | Self::CrcReadFailure
-            | Self::ScanMetadataCompleted(_)
-            | Self::StorageListCompleted(_)
-            | Self::StorageReadCompleted(_)
-            | Self::StorageCopyCompleted(_)
-            | Self::JsonReadCompleted(_)
-            | Self::ParquetReadCompleted(_) => {}
+            | Self::CrcReadFailure => {}
+
+            // Read events have no duration field.
+            Self::JsonReadCompleted(_) | Self::ParquetReadCompleted(_) => {}
         }
     }
 
@@ -429,34 +433,99 @@ impl fmt::Display for LogSegmentLoadFailure {
 
 pub(crate) const PROTOCOL_METADATA_LOADED_SPAN: &str = "segment.read_metadata";
 
-/// Protocol and metadata actions were read from the log.
+/// How a snapshot load resolved Protocol and Metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, StrumDisplay, AsRefStr, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProtocolMetadataSource {
+    /// A CRC already sat at the target version; used as-is with zero replay.
+    CrcAtTarget,
+    /// A stale CRC was advanced to the target version by reverse replay.
+    CrcAdvancedByReplay,
+    /// A stale CRC seeded a pruned P&M replay of the commits above it (falling back to the
+    /// CRC's own P&M when the pruned replay found no newer Protocol or Metadata).
+    CrcSeededPmOnlyReplay,
+    /// No CRC baseline; P&M came from log replay (full history on a fresh load, or the new
+    /// commits on an incremental load).
+    FullReplay,
+    /// Decode fell back here because the span's `pm_source` field was unset or unrecognized.
+    /// Kernel never emits this deliberately.
+    Unknown,
+}
+
+impl ProtocolMetadataSource {
+    fn parse_or_unknown(s: &str) -> Self {
+        if s.is_empty() {
+            return Self::Unknown;
+        }
+        Self::from_str(s).unwrap_or_else(|e| {
+            warn!("Invalid pm_source '{s}': {e}. Using Unknown.");
+            Self::Unknown
+        })
+    }
+}
+
+/// Protocol and metadata actions were resolved for a snapshot.
+///
+/// All fields are set at emit time (creation attrs).
 #[derive(Debug, Clone)]
 pub struct ProtocolMetadataLoadSuccess {
-    // === Set on span creation ===
     pub operation_id: MetricId,
     /// Opaque, caller-supplied id for joining this operation's metric events to the caller's
     /// own request or operation id.
     pub correlation_id: Option<Arc<str>>,
     pub table_type: TableType,
-
-    // === Set on span close ===
+    pub source: ProtocolMetadataSource,
     pub duration: Duration,
 }
 
 impl ProtocolMetadataLoadSuccess {
     pub(crate) const SPAN_NAME: &'static str = PROTOCOL_METADATA_LOADED_SPAN;
 
-    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+    /// The all-unset seed that [`Self::from_attrs`] fills in as span fields arrive. Each field
+    /// here is the value used when its span field is absent.
+    fn empty() -> Self {
         Self {
-            operation_id: MetricId::from_attrs(attrs),
-            table_type: TableType::from_catalog_managed(read_is_catalog_managed(attrs)),
-            correlation_id: correlation_id_from_attrs(attrs),
-            duration: Duration::default(),
+            operation_id: MetricId::nil(),
+            correlation_id: None,
+            table_type: TableType::from_catalog_managed(false),
+            source: ProtocolMetadataSource::Unknown,
+            duration: Duration::ZERO,
         }
     }
 
-    pub(crate) fn set_duration(&mut self, d: Duration) {
-        self.duration = d;
+    pub(crate) fn from_attrs(attrs: &Attributes<'_>) -> Self {
+        let mut event = Self::empty();
+        attrs.record(&mut event);
+        event
+    }
+}
+
+impl Visit for ProtocolMetadataLoadSuccess {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == IS_CATALOG_MANAGED_FIELD {
+            self.table_type = TableType::from_catalog_managed(value);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            CORRELATION_ID_FIELD if !value.is_empty() => self.correlation_id = Some(value.into()),
+            "pm_source" => self.source = ProtocolMetadataSource::parse_or_unknown(value),
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "duration_ns" {
+            self.duration = Duration::from_nanos(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if let Some(id) = record_operation_id(field, value, Self::SPAN_NAME) {
+            self.operation_id = id;
+        }
     }
 }
 
@@ -466,12 +535,13 @@ impl fmt::Display for ProtocolMetadataLoadSuccess {
             operation_id,
             table_type,
             correlation_id,
+            source,
             duration,
         } = self;
         write!(
             f,
             "ProtocolMetadataLoadSuccess(id={operation_id}, table_type={table_type}, \
-             correlation_id={correlation_id:?}, duration={duration:?})"
+             correlation_id={correlation_id:?}, source={source}, duration={duration:?})"
         )
     }
 }
@@ -1119,11 +1189,41 @@ impl fmt::Display for TableType {
 }
 
 /// Operation-scoped values threaded through the snapshot-load chain to label its metric events.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SnapshotLoadMetricContext {
     pub(crate) operation_id: MetricId,
     pub(crate) correlation_id: Option<Arc<str>>,
     pub(crate) is_catalog_managed: bool,
+}
+
+#[cfg(test)]
+impl SnapshotLoadMetricContext {
+    /// A context seeded with a nil `operation_id` for tests that exercise the load chain without
+    /// asserting on the id.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            operation_id: MetricId::nil(),
+            correlation_id: None,
+            is_catalog_managed: false,
+        }
+    }
+}
+
+/// Decode the `operation_id` debug-string span field into a [`MetricId`]. Returns `None` when the
+/// field is not `operation_id`; returns the nil id (with a warning) when the value is malformed.
+/// Shared by the self-visiting event decoders.
+pub(crate) fn record_operation_id(
+    field: &Field,
+    value: &dyn fmt::Debug,
+    span_name: &str,
+) -> Option<MetricId> {
+    (field.name() == "operation_id").then(|| {
+        let s = format!("{value:?}");
+        Uuid::from_str(&s).map(MetricId).unwrap_or_else(|e| {
+            warn!("Invalid uuid '{s}' on {span_name}: {e}. Using nil.");
+            MetricId::nil()
+        })
+    })
 }
 
 pub(crate) fn read_is_catalog_managed(attrs: &Attributes<'_>) -> bool {
@@ -1304,17 +1404,10 @@ impl Visit for ScanMetadataCompletedAttrs {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        let s = format!("{value:?}");
-        match field.name() {
-            "operation_id" => match Uuid::from_str(&s) {
-                Ok(u) => self.operation_id = u,
-                Err(e) => warn!(
-                    "Invalid uuid '{s}' on {}: {e}",
-                    ScanMetadataCompleted::SPAN_NAME
-                ),
-            },
-            "scan_type" => self.scan_type = s,
-            _ => {}
+        if let Some(id) = record_operation_id(field, value, ScanMetadataCompleted::SPAN_NAME) {
+            self.operation_id = id.0;
+        } else if field.name() == "scan_type" {
+            self.scan_type = format!("{value:?}");
         }
     }
 }
@@ -1538,6 +1631,40 @@ pub(crate) fn emit_scan_metadata_completed(e: &ScanMetadataCompleted) {
     );
 }
 
+/// Emit a [`MetricEvent::ProtocolMetadataLoadSuccess`]. Call once per snapshot load on the P&M
+/// resolution path, on success.
+pub(crate) fn emit_protocol_metadata_load(
+    ctx: &SnapshotLoadMetricContext,
+    source: ProtocolMetadataSource,
+    duration: Duration,
+) {
+    let _span = tracing::span!(
+        tracing::Level::INFO,
+        ProtocolMetadataLoadSuccess::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %ctx.operation_id,
+        is_catalog_managed = ctx.is_catalog_managed,
+        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+        pm_source = source.as_ref(),
+        duration_ns = duration.as_nanos() as u64,
+    );
+}
+
+/// Emit a [`MetricEvent::ProtocolMetadataLoadFailure`]. Call once per snapshot load on the P&M
+/// resolution path, on failure.
+pub(crate) fn emit_protocol_metadata_load_failure(ctx: &SnapshotLoadMetricContext) {
+    let span = tracing::span!(
+        tracing::Level::INFO,
+        ProtocolMetadataLoadSuccess::SPAN_NAME,
+        report = tracing::field::Empty,
+        operation_id = %ctx.operation_id,
+        is_catalog_managed = ctx.is_catalog_managed,
+        correlation_id = ctx.correlation_id.as_deref().unwrap_or(""),
+    );
+    let _enter = span.enter();
+    tracing::info!(error = tracing::field::debug("protocol/metadata load failed"));
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -1637,6 +1764,35 @@ mod tests {
         #[case] expected: ScanType,
     ) {
         assert_eq!(ScanType::parse_lenient(value), expected);
+    }
+
+    #[rstest]
+    #[case::crc_at_target(ProtocolMetadataSource::CrcAtTarget, "crc_at_target")]
+    #[case::crc_advanced(ProtocolMetadataSource::CrcAdvancedByReplay, "crc_advanced_by_replay")]
+    #[case::crc_seeded(
+        ProtocolMetadataSource::CrcSeededPmOnlyReplay,
+        "crc_seeded_pm_only_replay"
+    )]
+    #[case::full_replay(ProtocolMetadataSource::FullReplay, "full_replay")]
+    #[case::unknown(ProtocolMetadataSource::Unknown, "unknown")]
+    fn protocol_metadata_source_serializes_to_wire_name_and_parses_back(
+        #[case] source: ProtocolMetadataSource,
+        #[case] wire: &str,
+    ) {
+        let serialized: &'static str = source.into();
+        assert_eq!(serialized, wire);
+        assert_eq!(ProtocolMetadataSource::from_str(wire).unwrap(), source);
+    }
+
+    #[rstest]
+    #[case::known("crc_at_target", ProtocolMetadataSource::CrcAtTarget)]
+    #[case::empty_maps_to_unknown("", ProtocolMetadataSource::Unknown)]
+    #[case::unrecognized_maps_to_unknown("totally_unknown", ProtocolMetadataSource::Unknown)]
+    fn protocol_metadata_source_parse_or_unknown(
+        #[case] value: &str,
+        #[case] expected: ProtocolMetadataSource,
+    ) {
+        assert_eq!(ProtocolMetadataSource::parse_or_unknown(value), expected);
     }
 
     #[test]

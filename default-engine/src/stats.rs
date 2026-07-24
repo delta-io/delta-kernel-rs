@@ -21,6 +21,7 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::column_trie::ColumnTrie;
 use delta_kernel::engine::arrow_utils::fix_nested_null_masks;
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::schema::{DataType as KernelDataType, StructType};
 use delta_kernel::{DeltaResult, Error};
 
 /// Maximum prefix length for string statistics (Delta protocol requirement).
@@ -348,6 +349,7 @@ fn compute_column_stats(
     column: &ArrayRef,
     path: &mut Vec<String>,
     filter: &ColumnTrie<'_>,
+    null_count_only_filter: &ColumnTrie<'_>,
 ) -> DeltaResult<ColumnStats> {
     match column.data_type() {
         // A struct column that the filter marks as a terminal leaf (e.g. Variant, which is a
@@ -377,7 +379,12 @@ fn compute_column_stats(
             for (i, field) in fields.iter().enumerate() {
                 path.push(field.name().to_string());
 
-                let child_stats = compute_column_stats(fixed_struct.column(i), path, filter)?;
+                let child_stats = compute_column_stats(
+                    fixed_struct.column(i),
+                    path,
+                    filter,
+                    null_count_only_filter,
+                )?;
 
                 if let Some(arr) = child_stats.null_count {
                     null_fields.push(Field::new(field.name(), arr.data_type().clone(), true));
@@ -414,22 +421,6 @@ fn compute_column_stats(
                 max_value: build_struct(max_fields, max_arrays)?,
             })
         }
-        // Complex types: collect nullCount only (no min/max)
-        DataType::Map(_, _)
-        | DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::ListView(_)
-        | DataType::LargeListView(_) => {
-            if !filter.contains_prefix_of(path) {
-                return Ok(ColumnStats::default());
-            }
-            Ok(ColumnStats {
-                null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
-                min_value: None,
-                max_value: None,
-            })
-        }
         // Void columns (Arrow `Null` / kernel `VOID`): every value is null by definition,
         // and the column has no parquet representation. We still need to publish nullCount
         // for IS NULL / IS NOT NULL data skipping, so synthesize it from the array length.
@@ -451,6 +442,26 @@ fn compute_column_stats(
                 return Ok(ColumnStats::default());
             }
 
+            let null_count: Option<ArrayRef> =
+                Some(Arc::new(Int64Array::from(vec![column.null_count() as i64])));
+
+            let complex_type = matches!(
+                column.data_type(),
+                DataType::Map(_, _)
+                    | DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+            );
+            if complex_type || null_count_only_filter.contains_prefix_of(path) {
+                return Ok(ColumnStats {
+                    null_count,
+                    min_value: None,
+                    max_value: None,
+                });
+            }
+
             // When min/max is None (all nulls or unsupported type), emit a null-valued
             // single-element array to keep the field present in the stats struct. This
             // allows downstream consumers (like StatsColumnVerifier) to find the column and
@@ -458,7 +469,7 @@ fn compute_column_stats(
             // the on-disk format still matches Spark's ignoreNullFields behavior.
             let null_fallback = || -> ArrayRef { Arc::new(new_null_array(column.data_type(), 1)) };
             Ok(ColumnStats {
-                null_count: Some(Arc::new(Int64Array::from(vec![column.null_count() as i64]))),
+                null_count,
                 min_value: Some(compute_leaf_agg(column, Agg::Min)?.unwrap_or_else(&null_fallback)),
                 max_value: Some(compute_leaf_agg(column, Agg::Max)?.unwrap_or_else(null_fallback)),
             })
@@ -514,13 +525,35 @@ impl StatsAccumulator {
 ///
 /// # Arguments
 /// * `batch` - The RecordBatch to collect statistics from
-/// * `stats_columns` - Column names that should have statistics collected (allowlist). Only these
-///   columns will appear in nullCount/minValues/maxValues.
+/// * `stats_columns` - Column names that should have `nullCount` collected (allowlist). Only these
+///   columns appear in nullCount/minValues/maxValues.
+///
+/// Collect statistics using the kernel physical schema to preserve logical type distinctions that
+/// are erased in Arrow arrays.
 pub(crate) fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
+    physical_schema: &StructType,
+) -> DeltaResult<StructArray> {
+    let null_count_only_columns = interval_column_names(physical_schema, stats_columns);
+    collect_stats_with_null_count_only(batch, stats_columns, &null_count_only_columns)
+}
+
+#[cfg(test)]
+pub(crate) fn collect_stats_for_test(
+    batch: &RecordBatch,
+    stats_columns: &[ColumnName],
+) -> DeltaResult<StructArray> {
+    collect_stats_with_null_count_only(batch, stats_columns, &[])
+}
+
+fn collect_stats_with_null_count_only(
+    batch: &RecordBatch,
+    stats_columns: &[ColumnName],
+    null_count_only_columns: &[ColumnName],
 ) -> DeltaResult<StructArray> {
     let filter = ColumnTrie::from_columns(stats_columns);
+    let null_count_only_filter = ColumnTrie::from_columns(null_count_only_columns);
     let schema = batch.schema();
 
     // Collect all stats in a single traversal
@@ -533,7 +566,7 @@ pub(crate) fn collect_stats(
         let column = batch.column(col_idx);
 
         // Single traversal computes all three stats
-        let stats = compute_column_stats(column, &mut path, &filter)?;
+        let stats = compute_column_stats(column, &mut path, &filter, &null_count_only_filter)?;
 
         if let Some(arr) = stats.null_count {
             null_counts.push(field.name(), arr);
@@ -566,6 +599,27 @@ pub(crate) fn collect_stats(
         .map_err(|e| Error::generic(format!("Failed to create stats struct: {e}")))
 }
 
+fn is_interval_type(data_type: &KernelDataType) -> bool {
+    let KernelDataType::Primitive(primitive_type) = data_type else {
+        return false;
+    };
+    primitive_type.is_interval()
+}
+
+fn interval_column_names(schema: &StructType, stats_columns: &[ColumnName]) -> Vec<ColumnName> {
+    stats_columns
+        .iter()
+        .filter(|col| {
+            schema
+                .fields_of_path(col)
+                .ok()
+                .and_then(|fields| fields.last().map(|field| field.data_type()))
+                .is_some_and(is_interval_type)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use delta_kernel::arrow::array::{
@@ -580,6 +634,13 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     use super::*;
+
+    fn collect_stats(
+        batch: &RecordBatch,
+        stats_columns: &[ColumnName],
+    ) -> DeltaResult<StructArray> {
+        super::collect_stats_for_test(batch, stats_columns)
+    }
 
     #[test]
     fn test_collect_stats_single_batch() {

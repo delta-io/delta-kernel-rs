@@ -67,6 +67,32 @@ impl ResolveColumnAsScalar for IsAddResolver {
 }
 
 #[rstest::rstest]
+#[case::string_to_integer_succeeds(
+    Scalar::String("42".to_string()),
+    DataType::INTEGER,
+    Some(Scalar::Integer(42))
+)]
+#[case::string_to_integer_failure_is_null(
+    Scalar::String("not an integer".to_string()),
+    DataType::INTEGER,
+    Some(Scalar::Null(DataType::INTEGER))
+)]
+#[case::identity_passthrough(Scalar::Long(42), DataType::LONG, Some(Scalar::Long(42)))]
+#[case::null_source_uses_target_type(
+    Scalar::Null(DataType::STRING),
+    DataType::INTEGER,
+    Some(Scalar::Null(DataType::INTEGER))
+)]
+#[case::unsupported_pair(Scalar::Long(42), DataType::INTEGER, None)]
+fn test_cast_scalar(
+    #[case] value: Scalar,
+    #[case] target: DataType,
+    #[case] expected: Option<Scalar>,
+) {
+    assert_eq!(cast_scalar(value, &target), expected);
+}
+
+#[rstest::rstest]
 #[case::bool_true_not_inverted(Scalar::Boolean(true), false, Some(true))]
 #[case::bool_true_inverted(Scalar::Boolean(true), true, Some(false))]
 #[case::bool_false_not_inverted(Scalar::Boolean(false), false, Some(false))]
@@ -591,6 +617,26 @@ fn test_eval_distinct() {
     );
 }
 
+#[test]
+fn test_default_evaluator_resolves_column_then_casts_and_compares() {
+    let col = column_name!("x");
+    let filter = DefaultKernelPredicateEvaluator::from(HashMap::from([(
+        col.clone(),
+        Scalar::String("10".to_string()),
+    )]));
+
+    assert_eq!(
+        filter.eval_pred_cast(
+            BinaryPredicateOp::LessThan,
+            &col,
+            &DataType::INTEGER,
+            &Scalar::Integer(20),
+            false,
+        ),
+        Some(true)
+    );
+}
+
 // NOTE: We're testing routing here -- the actual comparisons are already validated by
 // test_eval_binary_scalars.
 #[test]
@@ -644,6 +690,24 @@ fn eval_binary() {
             "DISTINCT(10, x) (inverted: {inverted})"
         );
     }
+}
+
+#[rstest::rstest]
+#[case::less_than(BinaryPredicateOp::LessThan, false)]
+#[case::greater_than(BinaryPredicateOp::GreaterThan, true)]
+fn test_eval_binary_commutes_literal_and_cast_column(
+    #[case] op: BinaryPredicateOp,
+    #[case] expected: bool,
+    #[values(false, true)] inverted: bool,
+) {
+    let val = Expr::literal(10);
+    let cast_col = Expr::cast(column_expr!("x"), DataType::INTEGER);
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
+
+    assert_eq!(
+        filter.eval_pred_binary(op, &val, &cast_col, inverted),
+        Some(expected != inverted)
+    );
 }
 
 #[derive(Debug, PartialEq)]

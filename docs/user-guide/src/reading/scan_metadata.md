@@ -285,6 +285,51 @@ adds the typed column.
 > When the checkpoint already stores typed partition values, Kernel reads that column directly
 > and skips parsing entirely.
 
+## Cancelling a scan
+
+Log replay for a large table can read many commit and checkpoint files before it yields a single
+`ScanMetadata`. If the request driving the scan goes away — a cancelled query, a dropped
+connection — you can tell Kernel to stop instead of reading to the end. Attach a
+`CancellationToken` to the scan with `with_cancellation_token`:
+
+```rust,ignore
+use std::sync::Arc;
+use delta_kernel::CancellationTokenRef;
+
+// `token` is your connector's cancellation handle, implementing `CancellationToken`.
+// It is commonly a thin wrapper over your runtime's primitive (e.g.
+// `tokio_util::sync::CancellationToken`). See "Cancellation-aware reads" in
+// Implementing the Engine Trait for how to build one.
+let token: CancellationTokenRef = my_request_token();
+
+let scan = snapshot
+    .scan_builder()
+    .with_cancellation_token(token)
+    .build()?;
+
+for metadata in scan.scan_metadata(engine)? {
+    let metadata = metadata?; // yields Err(Error::Cancelled) once the token fires
+    // ... process the batch ...
+}
+```
+
+Cancellation is cooperative and always visible as an error, so a cancelled scan can never be
+mistaken for a complete one:
+
+- Kernel polls the token at each action-batch boundary, so replay stops between reads even if the
+  engine ignores the token.
+- If the engine implements the [cancellation-aware read
+  variants](../connector/implementing_engine.md#cancellation-aware-reads), an I/O already in flight
+  can be interrupted rather than running to completion — this is what lets a scan stuck on one slow
+  file read stop promptly.
+- Either way, the outcome surfaces as `Error::Cancelled`: either returned directly from
+  `scan_metadata()` (when the token is already cancelled before replay begins) or as the terminal
+  item of its iterator. It is never a short or empty result.
+
+Without a token, the scan is not cancellable and runs to completion as usual. Cancellation applies
+to the lazy `scan_metadata()` path; [`parallel_scan_metadata()`](./parallel_scan_metadata.md) does
+not support it and rejects a token rather than silently ignoring it.
+
 ## What's next
 
 - [Column Selection](./column_selection.md): projecting specific columns

@@ -29,6 +29,7 @@ use crate::{
 };
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
@@ -69,6 +70,21 @@ pub(crate) const CHECKPOINT_ACTION_NAME: &str = "checkpoint";
 pub(crate) const CONTENT_ROOT_NAME: &str = "contentRoot";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
+
+/// Returns the required leaf used to identify rows containing `action_name`.
+///
+/// Returns `None` when `action_name` is unknown or has no required identifying leaf.
+pub(crate) fn action_presence_leaf(action_name: &str) -> Option<&'static str> {
+    match action_name {
+        ADD_NAME | REMOVE_NAME | CDC_NAME | SIDECAR_NAME => Some("path"),
+        METADATA_NAME => Some("id"),
+        PROTOCOL_NAME => Some("minReaderVersion"),
+        SET_TRANSACTION_NAME => Some("appId"),
+        DOMAIN_METADATA_NAME => Some("domain"),
+        CHECKPOINT_METADATA_NAME => Some("version"),
+        _ => None,
+    }
+}
 
 // === Sub-fields of an AddFile's `stats` struct ===
 // See the Delta protocol spec, "Per-file Statistics", and `expected_stats_schema` in
@@ -413,9 +429,32 @@ impl Metadata {
         &self.schema_string
     }
 
+    /// Parses the table schema from its JSON representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth, or
+    /// [`Error::MalformedJson`] for other JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
-        Ok(serde_json::from_str(&self.schema_string)?)
+        // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
+        serde_json::from_str(&self.schema_string).map_err(|error| {
+            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
+            // matching.
+            if error.is_syntax()
+                && error
+                    .to_string()
+                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
+            {
+                Error::schema(format!(
+                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
+                     serde_json's recursion limit: {error}"
+                ))
+                .with_backtrace()
+            } else {
+                error.into()
+            }
+        })
     }
 
     #[internal_api]
@@ -1334,6 +1373,22 @@ mod tests {
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
 
+    #[rstest]
+    #[case::add(ADD_NAME, Some("path"))]
+    #[case::remove(REMOVE_NAME, Some("path"))]
+    #[case::metadata(METADATA_NAME, Some("id"))]
+    #[case::protocol(PROTOCOL_NAME, Some("minReaderVersion"))]
+    #[case::transaction(SET_TRANSACTION_NAME, Some("appId"))]
+    #[case::cdc(CDC_NAME, Some("path"))]
+    #[case::domain_metadata(DOMAIN_METADATA_NAME, Some("domain"))]
+    #[case::checkpoint_metadata(CHECKPOINT_METADATA_NAME, Some("version"))]
+    #[case::sidecar(SIDECAR_NAME, Some("path"))]
+    #[case::witnessless_action(COMMIT_INFO_NAME, None)]
+    #[case::unknown_action("futureAction", None)]
+    fn test_action_presence_leaf(#[case] action_name: &str, #[case] expected_leaf: Option<&str>) {
+        assert_eq!(action_presence_leaf(action_name), expected_leaf);
+    }
+
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);
 
@@ -1430,6 +1485,60 @@ mod tests {
             ]),
         )]));
         assert_eq!(schema, expected);
+    }
+
+    #[rstest]
+    #[case::supported(41, false)]
+    #[case::exceeded(42, true)]
+    fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
+        let metadata = Metadata {
+            schema_string: serde_json::to_string(&nested_schema(depth)).unwrap(),
+            ..Default::default()
+        };
+
+        let result = metadata.parse_schema();
+        if exceeds_limit {
+            assert_result_error_with_message(
+                result.as_ref(),
+                concat!(
+                    "Schema error: Table schema is too deeply nested: decoding ",
+                    "metaData.schemaString exceeded serde_json's ",
+                    "recursion limit: recursion limit exceeded"
+                ),
+            );
+            let error = match result.unwrap_err() {
+                Error::Backtraced { source, .. } => *source,
+                error => error,
+            };
+            assert!(matches!(error, Error::Schema(_)));
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn parse_schema_malformed_json_returns_malformed_json() {
+        let malformed_metadata = Metadata {
+            schema_string: "{".to_string(),
+            ..Default::default()
+        };
+        let malformed_error = malformed_metadata.parse_schema().unwrap_err();
+        // Error conversion captures a backtrace only when enabled, so normalize both forms before
+        // checking the underlying error.
+        let malformed_error = match malformed_error {
+            Error::Backtraced { source, .. } => *source,
+            error => error,
+        };
+        assert!(matches!(malformed_error, Error::MalformedJson(_)));
+    }
+
+    fn nested_schema(depth: usize) -> StructType {
+        (0..depth).fold(
+            StructType::new_unchecked([StructField::nullable("leaf", DataType::INTEGER)]),
+            |schema, depth| {
+                StructType::new_unchecked([StructField::nullable(format!("level_{depth}"), schema)])
+            },
+        )
     }
 
     #[test]

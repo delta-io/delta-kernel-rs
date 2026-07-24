@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
@@ -38,10 +38,9 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
-#[cfg(feature = "column-defaults-in-dev")]
-use crate::schema::ColumnDefault;
 use crate::schema::{
-    lazy_schema_ref, ArrayType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
+    StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -49,8 +48,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
-    Version,
+    version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
+    IntoEngineData, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -246,6 +245,8 @@ pub struct Transaction<S = ExistingTable> {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // Count of files whose deletion vector was updated.
+    num_dv_updates: usize,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -336,6 +337,7 @@ impl<S> Transaction<S> {
             commit_version = self.get_commit_version(),
             num_add_files,
             num_remove_files,
+            num_dv_updates,
             add_files_bytes,
             remove_files_bytes,
             is_blind_append,
@@ -349,14 +351,6 @@ impl<S> Transaction<S> {
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
-        // Fields-only event: these feed the `txn.commit` metric via the layer's `on_event`
-        // channel. `num_dv_updates` has no other source (it is not a declared span field and
-        // gets no `span.record` below), so this event must keep its structured fields.
-        info!(
-            num_add_files = self.add_files_metadata.len(),
-            num_remove_files = self.remove_files_metadata.len(),
-            num_dv_updates = self.dv_matched_files.len(),
-        );
 
         // Some table features don't yet support removeFiles. Reject here.
         if !self.remove_files_metadata.is_empty() {
@@ -384,9 +378,8 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
 
-        // Validate that the schema supports data writes when files are being added.
-        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
-        // Reads and metadata-only commits are always allowed.
+        // Validate that the schema supports data writes when files are being added. Reads and
+        // metadata-only commits are always allowed.
         if !self.add_files_metadata.is_empty() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
@@ -557,6 +550,7 @@ impl<S> Transaction<S> {
         let span = tracing::Span::current();
         span.record("num_add_files", file_stats.gross_add_files);
         span.record("num_remove_files", file_stats.gross_remove_files);
+        span.record("num_dv_updates", self.num_dv_updates as u64);
         span.record("add_files_bytes", file_stats.gross_add_bytes);
         span.record("remove_files_bytes", file_stats.gross_remove_bytes);
         span.record("is_blind_append", self.is_blind_append);
@@ -1001,31 +995,30 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
     /// not a protocol one.
     ///
+    /// Malformed defaults (a non-string `CURRENT_DEFAULT`, or a non-`NULL` default on a Variant
+    /// column) are rejected eagerly at snapshot load (when constructing the
+    /// [`TableConfiguration`]), so by the time this runs the metadata is already validated.
+    /// Orphaned metadata (a `CURRENT_DEFAULT` without the `allowColumnDefaults` writer feature)
+    /// is tolerated at table load but is not surfaced through this method.
+    ///
     /// # Errors
     ///
-    /// - A column declares a `CURRENT_DEFAULT` but the table does not enable the
-    ///   `allowColumnDefaults` writer feature. The protocol only honors defaults "when enabled", so
-    ///   such metadata is stray and is rejected rather than returned.
-    /// - Propagates any error from [`StructField::column_default`] -- a malformed `CURRENT_DEFAULT`
-    ///   (non-string metadata, or a non-NULL default on a non-primitive type).
-    #[cfg(feature = "column-defaults-in-dev")]
-    pub fn column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
-        let allow_column_defaults = self
+    /// Propagates any error from [`StructField::column_default`].
+    pub fn top_level_column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
+        if !self
             .effective_table_config
-            .is_feature_enabled(&TableFeature::AllowColumnDefaults);
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            tracing::info!(
+                "allowColumnDefaults is not enabled; the schema may contain orphaned column-default metadata"
+            );
+            return Ok(HashMap::new());
+        }
         let mut defaults = HashMap::new();
         for field in self.effective_table_config.logical_schema_ref().fields() {
-            let Some(column_default) = field.column_default()? else {
-                continue;
-            };
-            if !allow_column_defaults {
-                return Err(Error::generic(format!(
-                    "Field '{}' declares a `CURRENT_DEFAULT` but the table does not enable the \
-                     `allowColumnDefaults` writer feature",
-                    field.name()
-                )));
+            if let Some(column_default) = field.column_default()? {
+                defaults.insert(field.name().clone(), column_default);
             }
-            defaults.insert(field.name().clone(), column_default);
         }
         Ok(defaults)
     }
@@ -1034,8 +1027,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Called at the top of [`partitioned_write_context`](Self::partitioned_write_context) and
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context), before any Parquet is
-    /// written, so connectors fail fast when the schema contains void placements that cannot
-    /// produce valid files (void inside Array/Map, all-void structs, all-void tables).
+    /// written, so connectors fail fast when the schema contains unsupported data types or void
+    /// placements that cannot produce valid files.
     /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
     /// that reach [`add_files`](Self::add_files) without going through a write context.
     fn validate_for_data_write(&self) -> DeltaResult<()> {
@@ -1255,8 +1248,7 @@ impl<S> Transaction<S> {
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
-        let commit_version = i64::try_from(commit_version)
-            .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
+        let commit_version = version_as_i64(commit_version)?;
 
         if row_tracking_supported {
             self.generate_adds_with_row_tracking(engine, commit_version)
@@ -1382,6 +1374,7 @@ impl<S> Transaction<S> {
                     log_segment,
                     self.effective_table_config,
                     Some(Arc::new(crc)),
+                    true, /* built_as_latest */
                 )?;
                 (stats, Arc::new(snapshot))
             }
@@ -2101,14 +2094,14 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "column-defaults-in-dev")]
     mod column_defaults {
         use super::*;
-        use crate::schema::{ColumnMetadataKey, MetadataValue};
+        use crate::schema::column_default::{field_with_default, field_with_invalid_default};
 
         // NB: `test_utils::schema_with_column_defaults` cannot be used here. In `--lib` unit tests
         // the crate under test and the `delta_kernel` that `test_utils` links are two distinct
         // crate instances, so kernel schema types don't unify across the `test_utils` boundary.
+        // The `field_with_*` helpers live in-crate (`schema::column_default`) for the same reason.
 
         /// Builds a transaction whose effective logical schema is `schema`, with the
         /// `allowColumnDefaults` writer feature enabled so any declared defaults are honored.
@@ -2117,9 +2110,8 @@ mod tests {
         }
 
         /// Like [`txn_with_schema`] but with an explicit writer-feature list, so a test can
-        /// exercise a table that does *not* enable `allowColumnDefaults`. The schema and a
-        /// synthetic protocol are swapped onto a real snapshot's table configuration so
-        /// column-default discovery can be exercised without going through `create_table`.
+        /// exercise a table that does *not* enable `allowColumnDefaults`. Panics if the table
+        /// configuration fails to construct; use [`try_table_config`] to assert that error.
         fn txn_with_schema_and_writer_features(
             schema: StructType,
             writer_features: impl IntoIterator<Item = TableFeature>,
@@ -2128,7 +2120,20 @@ mod tests {
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)
                 .unwrap();
-            let metadata = txn
+            txn.effective_table_config = try_table_config(&txn, schema, writer_features).unwrap();
+            txn
+        }
+
+        /// Builds the [`TableConfiguration`] a transaction would carry for `schema` and
+        /// `writer_features`, swapping a synthetic schema/protocol onto a real snapshot's config so
+        /// the validation `try_new` runs at construction can be exercised without `create_table`.
+        /// Returns the construction result so a test can assert eager-validation errors.
+        fn try_table_config(
+            base: &Transaction,
+            schema: StructType,
+            writer_features: impl IntoIterator<Item = TableFeature>,
+        ) -> DeltaResult<TableConfiguration> {
+            let metadata = base
                 .effective_table_config
                 .metadata()
                 .clone()
@@ -2136,23 +2141,22 @@ mod tests {
                 .unwrap();
             let protocol =
                 Protocol::try_new_modern(TableFeature::EMPTY_LIST, writer_features).unwrap();
-            let version = txn.effective_table_config.version();
-            txn.effective_table_config = TableConfiguration::try_new_from(
-                &txn.effective_table_config,
+            let version = base.effective_table_config.version();
+            TableConfiguration::try_new_from(
+                &base.effective_table_config,
                 Some(metadata),
                 Some(protocol),
                 version,
             )
-            .unwrap();
-            txn
         }
 
-        /// A nullable field carrying `raw_sql` as its `CURRENT_DEFAULT`.
-        fn field_with_default(name: &str, data_type: DataType, raw_sql: &str) -> StructField {
-            StructField::nullable(name, data_type).add_metadata([(
-                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-                MetadataValue::String(raw_sql.to_string()),
-            )])
+        /// A transaction over a real (non-DV) table, to use as the base config in
+        /// [`try_table_config`].
+        fn base_txn() -> Transaction {
+            let (engine, snapshot) = setup_non_dv_table();
+            snapshot
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)
+                .unwrap()
         }
 
         #[test]
@@ -2165,7 +2169,7 @@ mod tests {
             .unwrap();
             let txn = txn_with_schema(schema);
 
-            let defaults = txn.column_defaults().unwrap();
+            let defaults = txn.top_level_column_defaults().unwrap();
             assert_eq!(
                 defaults.len(),
                 2,
@@ -2190,37 +2194,28 @@ mod tests {
             ])
             .unwrap();
             let txn = txn_with_schema(schema);
-            assert!(txn.column_defaults().unwrap().is_empty());
+            assert!(txn.top_level_column_defaults().unwrap().is_empty());
         }
 
         #[test]
-        fn propagates_error_for_malformed_default() {
-            let field = StructField::nullable("c", DataType::INTEGER).add_metadata([(
-                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
-                MetadataValue::Number(7),
-            )]);
-            let schema = StructType::try_new(vec![field]).unwrap();
-            let txn = txn_with_schema(schema);
+        fn load_rejects_malformed_default() {
+            let schema = StructType::try_new(vec![field_with_invalid_default("c")]).unwrap();
 
-            let err = txn
-                .column_defaults()
-                .expect_err("non-string CURRENT_DEFAULT must error")
+            let err = try_table_config(&base_txn(), schema, [TableFeature::AllowColumnDefaults])
+                .expect_err("non-string CURRENT_DEFAULT must error at load")
                 .to_string();
             assert!(err.contains("non-string"), "got: {err}");
         }
 
         #[test]
-        fn errors_when_default_present_but_feature_not_enabled() {
+        fn load_tolerates_default_present_but_feature_not_enabled() {
             let schema =
                 StructType::try_new(vec![field_with_default("c", DataType::INTEGER, "42")])
                     .unwrap();
-            let txn = txn_with_schema_and_writer_features(schema, []);
 
-            let err = txn
-                .column_defaults()
-                .expect_err("a column default without the allowColumnDefaults feature must error")
-                .to_string();
-            assert!(err.contains("allowColumnDefaults"), "got: {err}");
+            // Orphaned column-default metadata (no `allowColumnDefaults` feature) is tolerated.
+            let txn = txn_with_schema_and_writer_features(schema, []);
+            assert!(txn.top_level_column_defaults().unwrap().is_empty());
         }
     }
 

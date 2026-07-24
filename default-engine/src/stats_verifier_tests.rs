@@ -27,7 +27,7 @@ mod tests {
     use delta_kernel::{EngineData, Error};
     use rstest::rstest;
 
-    use crate::stats::collect_stats;
+    use crate::stats::collect_stats_for_test as collect_stats;
 
     /// Creates test add file data with stats.numRecords, stats.nullCount.col,
     /// stats.minValues.col, and stats.maxValues.col — all of type LONG.

@@ -1,19 +1,14 @@
 //! [`LogSegmentFiles`] is a struct holding the result of listing the delta log. Currently, it
 //! exposes four APIs for listing:
-//! 1. [`list_commits`]: Lists all commit files between the provided start and end versions.
-//! 2. [`list`]: Lists all commit and checkpoint files between the provided start and end versions.
-//! 3. [`list_with_checkpoint_hint`]: Lists all commit and checkpoint files after the provided
+//! 1. `list_commits`: Lists all commit files between the provided start and end versions.
+//! 2. `list`: Lists all commit and checkpoint files between the provided start and end versions.
+//! 3. `list_with_checkpoint_hint`: Lists all commit and checkpoint files after the provided
 //!    checkpoint hint.
-//! 4. [`list_with_backward_checkpoint_scan`]: Scans backward from an end version in 1000-version
+//! 4. `list_with_backward_checkpoint_scan`: Scans backward from an end version in 1000-version
 //!    windows until a complete checkpoint is found or the log is exhausted.
 //!
 //! After listing, one can leverage the [`LogSegmentFiles`] to construct a [`LogSegment`].
 //!
-//! [`list_with_backward_checkpoint_scan`]: Self::list_with_backward_checkpoint_scan
-//!
-//! [`list_commits`]: Self::list_commits
-//! [`list`]: Self::list
-//! [`list_with_checkpoint_hint`]: Self::list_with_checkpoint_hint
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
 use std::collections::HashMap;
@@ -66,7 +61,8 @@ pub(crate) struct LogSegmentFiles {
 /// This is a thin wrapper around [`StorageHandler::list_from`] that provides the standard
 /// Delta log file discovery pipeline. Callers are responsible for handling the `log_tail`
 /// (catalog-provided commits) and tracking `max_published_version`.
-pub(crate) fn list_from_storage(
+#[internal_api]
+pub(crate) fn list_delta_log_from_storage(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Version,
@@ -109,6 +105,7 @@ pub(crate) fn list_from_storage(
 ///
 /// NOTE: There could be a single-part and/or any number of uuid-based checkpoints. They
 /// are all equivalent, and this routine keeps only one of them (arbitrarily chosen).
+#[internal_api]
 fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
     let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
     for part_file in parts {
@@ -174,6 +171,7 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
 /// Compaction and checkpoint files are skipped when empty -- they have fallbacks
 /// (individual commits, older checkpoints). Commit and CRC files are kept even
 /// if empty; the warning ensures the corrupt file is identifiable in logs.
+#[internal_api]
 pub(crate) fn should_process_log_file(file: &ParsedLogPath) -> bool {
     if file.location.size > 0 {
         return true;
@@ -492,7 +490,7 @@ impl LogSegmentFiles {
         );
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_from_storage(storage, log_root, start, end)?;
+        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
 
         let log_tail_start_version = log_tail.first().map(|f| f.version);
         let mut listed_commits = Vec::new();
@@ -554,7 +552,7 @@ impl LogSegmentFiles {
     ) -> DeltaResult<Self> {
         let start = start_version.unwrap_or(0);
         let end = end_version.unwrap_or(Version::MAX);
-        let fs_iter = list_from_storage(storage, log_root, start, end)?;
+        let fs_iter = list_delta_log_from_storage(storage, log_root, start, end)?;
         Self::build_log_segment_files(fs_iter, log_tail, start, end_version)
     }
 
@@ -629,13 +627,13 @@ impl LogSegmentFiles {
         let mut windows: Vec<Vec<ParsedLogPath>> = Vec::new();
         let mut found_checkpoint_version: Option<Version> = None;
         // upper is the exclusive upper bound of the next window; adding 1 includes end_version
-        // in the first window. The inclusive range passed to list_from_storage is [lower, upper -
-        // 1].
+        // in the first window. The inclusive range passed to list_delta_log_from_storage is
+        // [lower, upper - 1].
         let mut upper = end_version + 1;
         while upper > 0 {
             let lower = upper.saturating_sub(BACKWARD_SCAN_WINDOW_SIZE);
             let window_files: Vec<_> =
-                list_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
+                list_delta_log_from_storage(storage, log_root, lower, upper - 1)?.try_collect()?;
 
             found_checkpoint_version = find_complete_checkpoint_version(&window_files);
             windows.push(window_files);

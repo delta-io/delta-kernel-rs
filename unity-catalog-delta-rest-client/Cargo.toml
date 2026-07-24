@@ -28,6 +28,10 @@ chrono = { version = "0.4", features = ["serde"] }
 [features]
 default = []
 test-utils = ["unity-catalog-delta-client-api/test-utils"]
+# Gates live integration tests that hit a real Unity Catalog OSS server. Off by default so normal
+# `cargo test` never compiles or runs them; the dedicated CI job enables it. See
+# tests/integration_live_server.rs.
+integration-test = []
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

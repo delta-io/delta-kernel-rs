@@ -28,7 +28,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
 delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.25.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.26.0" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
 
@@ -71,3 +71,7 @@ declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "de
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
+
+# Experimental, in-development feature flag gating in-progress geospatial
+# (geometry/geography) type support. TODO(#2949): remove once full geo support ships.
+geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]

@@ -49,6 +49,11 @@ Snapshot builder API (`ffi/src/lib.rs`):
 
 The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
 
+Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
+`snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
+`num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
+complete file stats).
+
 ## Commit Range Flow
 
 A `CommitRange` describes a contiguous range of a table's commits. Build one via the commit range
@@ -70,6 +75,24 @@ The caller owns the builder and must call either `commit_range_builder_build` or
 `free_commit_range_builder`. Release the range with `free_commit_range` and the commits iterator
 with `free_commit_actions_iter`. Each `SharedCommitAction` handed to the visitor must be released
 with `free_commit_action`.
+
+## Incremental Scan Flow
+
+An incremental scan streams the file-action diff between a base version and a target snapshot
+(`ffi/src/incremental_scan.rs`):
+
+```
+snapshot_incremental_scan_builder(snapshot, base_version, engine)
+  -> incremental_scan_builder_with_predicate(builder, engine, predicate)  // optional; prunes live Adds
+  -> incremental_scan_builder_build(builder)      // -> OptionalValue<stream>; None => full-scan fallback
+  -> incremental_scan_stream_next_arrow(stream)*  // optional: pull live-Add batches as Arrow
+  -> incremental_scan_stream_into_summary(stream) // live-Add / Remove key sets; consumes the stream
+```
+
+The module-level docs in `incremental_scan.rs` are the source of truth for the error contract
+(any `next_arrow` error kills the stream), the `OptionalValue::None` full-scan-fallback signal,
+the pass-through-field version caveat (kernel issue #2552), and handle release. The Arrow batch
+reuses `ScanMetadataArrowResult` with null `transforms`.
 
 ## Write Flow
 

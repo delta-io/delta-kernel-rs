@@ -17,6 +17,14 @@ impl SyncStorageHandler {
     pub(crate) fn new(store: Option<Arc<DynObjectStore>>) -> Self {
         Self { store }
     }
+
+    /// The backing store, or `None` for the per-URL [`LocalFileSystem`] fallback.
+    ///
+    /// [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
+    #[cfg(feature = "declarative-plans")]
+    pub(super) fn store(&self) -> Option<&Arc<DynObjectStore>> {
+        self.store.as_ref()
+    }
 }
 
 impl StorageHandler for SyncStorageHandler {

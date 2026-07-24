@@ -5,5 +5,6 @@ mod cdf;
 mod clustering_e2e;
 mod dv;
 mod iceberg_compat;
+mod interval;
 mod maintenance_ops;
 mod row_tracking;

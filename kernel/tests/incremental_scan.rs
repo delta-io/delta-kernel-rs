@@ -4,10 +4,14 @@
 //! cross-commit deduplication: cross-commit cancellation, chained add/remove/add, log
 //! compaction interactions, catalog-managed staged commits, and vacuum races.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred, PredicateRef};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
     IncrementalScanSummary,
@@ -16,16 +20,22 @@ use delta_kernel::log_replay::FileActionKey;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::object_store::ObjectStoreExt;
+use delta_kernel::scan::state::ScanFile;
+use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::{
-    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, StorageHandler,
+    Engine, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot, SnapshotRef, StorageHandler,
 };
 use rstest::rstest;
-use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use test_utils::delta_kernel_default_engine::json::DefaultJsonHandler;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use test_utils::{
-    actions_to_string, actions_to_string_catalog_managed, add_commit, add_staged_commit,
-    compacted_log_path_for_versions, create_log_path, delta_path_for_version, TestAction,
+    actions_to_string, actions_to_string_catalog_managed, actions_to_string_partitioned,
+    add_commit, add_staged_commit, assert_result_error_with_message,
+    compacted_log_path_for_versions, create_log_path, create_table_and_load_snapshot,
+    delta_path_for_version, test_table_setup_mt, write_batch_to_table, TestAction,
 };
 use url::Url;
 
@@ -1162,6 +1172,822 @@ async fn empty_base_keys_produces_no_duplicates() -> Result<(), Box<dyn std::err
     let summary_with = stream.into_summary_against_base_closure(|_| false)?;
     assert!(summary_with.duplicate_adds.is_empty());
     assert_eq!(summary_with.removes, HashSet::from([key("gone.parquet")]));
+
+    Ok(())
+}
+
+// === Predicate pushdown ===
+//
+// `with_predicate` prunes streamed live Adds against file stats using the same
+// `DataSkippingFilter` the read path uses. These tests use raw commit JSON so each Add can
+// carry a distinct `id` min/max range. The metadata (`test_utils::METADATA`) declares an
+// `id: integer` column, so `id`-predicates are eligible for data skipping. Skipping is
+// conservative: an Add is dropped only when its stats prove no row matches; Adds with no
+// stats and all Removes are always kept.
+
+// Build a raw Add action carrying `id` stats over the closed range `[id_min, id_max]`.
+fn add_with_id_stats(path: &str, id_min: i32, id_max: i32) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"id\\\":0}},\
+         \\\"minValues\\\":{{\\\"id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+    )
+}
+
+// Build a raw Add action with no stats (`stats` omitted). Data skipping must always keep it.
+fn add_without_stats(path: &str) -> String {
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true}}}}"
+    )
+}
+
+// Build a raw Remove action.
+fn remove_action(path: &str) -> String {
+    format!(
+        "{{\"remove\":{{\"path\":\"{path}\",\"deletionTimestamp\":1700000000000,\
+         \"dataChange\":true}}}}"
+    )
+}
+
+// Build a raw Add action with a partition value for the `val` partition column and no stats.
+fn add_partitioned(path: &str, val: &str) -> String {
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{\"val\":\"{val}\"}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true}}}}"
+    )
+}
+
+// Build a raw Add carrying both a `val` partition value and `id` stats over `[id_min, id_max]`,
+// for predicates that touch both a partition and a data column.
+fn add_partitioned_with_id_stats(path: &str, val: &str, id_min: i32, id_max: i32) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"id\\\":0}},\
+         \\\"minValues\\\":{{\\\"id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{\"val\":\"{val}\"}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+    )
+}
+
+// Column-mapping (name mode) metadata whose `id` column maps to the physical name `col-id`.
+const COLUMN_MAPPING_METADATA: &str = "{\"metaData\":{\"id\":\"cm-test-id\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"integer\\\",\\\"nullable\\\":true,\\\"metadata\\\":{\\\"delta.columnMapping.id\\\":1,\\\"delta.columnMapping.physicalName\\\":\\\"col-id\\\"}}]}\",\"partitionColumns\":[],\"configuration\":{\"delta.columnMapping.mode\":\"name\",\"delta.columnMapping.maxColumnId\":\"1\"},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"columnMapping\"],\"writerFeatures\":[\"columnMapping\"]}}";
+
+// Build a raw Add whose stats are keyed by the physical column name `col-id` (column mapping).
+fn add_with_physical_id_stats(path: &str, id_min: i32, id_max: i32) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"col-id\\\":0}},\
+         \\\"minValues\\\":{{\\\"col-id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"col-id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\"}}}}"
+    )
+}
+
+// Metadata declaring an `id: integer` column AND the deletionVectors feature, so a DV-bearing
+// Add carrying `id` stats parses and an `id`-predicate is skipping-eligible.
+const DV_AND_ID_METADATA: &str = "{\"metaData\":{\"id\":\"dv-id-test\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"integer\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}}]}\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":1700000000000}}\n{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
+
+// Build a raw DV-bearing Add carrying `id` stats over `[id_min, id_max]`.
+fn add_with_dv_and_id_stats(
+    path: &str,
+    storage_type: &str,
+    path_or_inline: &str,
+    offset: i32,
+    id_min: i32,
+    id_max: i32,
+) -> String {
+    let stats = format!(
+        "{{\\\"numRecords\\\":10,\\\"nullCount\\\":{{\\\"id\\\":0}},\
+         \\\"minValues\\\":{{\\\"id\\\":{id_min}}},\\\"maxValues\\\":{{\\\"id\\\":{id_max}}}}}"
+    );
+    format!(
+        "{{\"add\":{{\"path\":\"{path}\",\"partitionValues\":{{}},\"size\":100,\
+         \"modificationTime\":1700000000000,\"dataChange\":true,\"stats\":\"{stats}\",\
+         \"deletionVector\":{{\"storageType\":\"{storage_type}\",\"pathOrInlineDv\":\"{path_or_inline}\",\
+         \"offset\":{offset},\"sizeInBytes\":10,\"cardinality\":1}}}}}}"
+    )
+}
+
+// Pushdown drops added files whose stats prove they cannot match and keeps the rest; the
+// `None` predicate keeps every live Add unchanged. Three files span disjoint `id` ranges over
+// a single commit. Each case asserts the surviving key set and that the emitted selection
+// vector agrees with `live_adds` (no summary/stream drift).
+#[rstest]
+#[case::pushdown(
+    Some(Arc::new(column_expr!("id").gt(Expr::literal(25i32))) as PredicateRef),
+    vec!["high.parquet"],
+)]
+#[case::no_predicate(None, vec!["low.parquet", "mid.parquet", "high.parquet"])]
+#[tokio::test]
+async fn pushdown_keeps_only_matching_added_files(
+    #[case] predicate: Option<PredicateRef>,
+    #[case] expected_live: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // low: id in [0, 9]; mid: id in [10, 19]; high: id in [20, 30]. `id > 25` can only match
+    // high; low and mid are provably excluded. No predicate keeps all three.
+    let v1 = [
+        add_with_id_stats("low.parquet", 0, 9),
+        add_with_id_stats("mid.parquet", 10, 19),
+        add_with_id_stats("high.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    let expected: HashSet<FileActionKey> = expected_live.iter().map(|p| key(p)).collect();
+    assert_eq!(listing.summary.live_adds, expected);
+    // The streamed selection vector must agree with the summary's live_adds count.
+    assert_eq!(live_add_count(&listing), expected.len());
+    assert!(listing.summary.removes.is_empty());
+
+    Ok(())
+}
+
+// A file with no stats is always kept, even under a predicate whose range would exclude it if
+// stats were present. Conservative skipping never drops a stats-less file.
+#[tokio::test]
+async fn added_file_without_stats_is_always_kept() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // no_stats has no stats; in_range has id in [20, 30]. Both must survive `id > 25`:
+    // no_stats because it can't be disproven, in_range because [20, 30] overlaps.
+    let v1 = [
+        add_without_stats("no_stats.parquet"),
+        add_with_id_stats("in_range.parquet", 20, 30),
+        add_with_id_stats("out_of_range.parquet", 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("no_stats.parquet"), key("in_range.parquet")]),
+        "the stats-less file is kept; only the provably-excluded file is dropped"
+    );
+
+    Ok(())
+}
+
+// Removes are never filtered by the predicate. A removed file whose stat range the predicate
+// excludes must still appear in `removes` in full -- the consumer needs every removal to evict
+// stale cached entries.
+#[tokio::test]
+async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // v1 adds gone.parquet (id in [0, 5], which `id > 25` would exclude).
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_id_stats("gone.parquet", 0, 5),
+    )
+    .await?;
+    // v2 removes gone.parquet and adds kept.parquet (id in [20, 30]).
+    let v2 = [
+        remove_action("gone.parquet"),
+        add_with_id_stats("kept.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 2, v2).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    // The Remove is reported in full even though the predicate excludes its stat range.
+    assert_eq!(
+        listing.summary.removes,
+        HashSet::from([key("gone.parquet")]),
+        "removes must never be filtered by the predicate"
+    );
+    // Only kept.parquet ([20, 30]) survives among the live Adds.
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("kept.parquet")])
+    );
+
+    Ok(())
+}
+
+// A predicate that statically excludes every file (`id > 25 AND FALSE`) yields an empty live-Add
+// stream, but Removes are still reported. A tautology (`id > 25 OR TRUE`) is useless for
+// skipping and behaves like no predicate.
+#[rstest]
+#[case::static_skip_all(Pred::and(column_expr!("id").gt(Expr::literal(25i32)), Pred::literal(false)), 0)]
+#[case::tautology(Pred::or(column_expr!("id").gt(Expr::literal(25i32)), Pred::literal(true)), 2)]
+#[tokio::test]
+async fn static_skip_all_and_tautology(
+    #[case] predicate: Pred,
+    #[case] expected_live: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // v1 adds two files and removes a third, so removes is non-empty regardless of the predicate.
+    let v1 = [
+        add_with_id_stats("a.parquet", 0, 9),
+        add_with_id_stats("b.parquet", 20, 30),
+        remove_action("removed.parquet"),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(Arc::new(predicate))
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(live_add_count(&listing), expected_live);
+    // Removes are reported regardless of the Add-side skipping strategy.
+    assert_eq!(
+        listing.summary.removes,
+        HashSet::from([key("removed.parquet")]),
+        "removes are reported even when all Adds are statically skipped"
+    );
+
+    Ok(())
+}
+
+// Consumer classification (`into_summary_against_base_*`) composes with the predicate: base
+// intersection runs over the predicate-pruned live Adds, so a base key whose file the
+// predicate dropped is not reported as a duplicate.
+#[tokio::test]
+async fn against_base_classification_composes_with_predicate(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // matches.parquet (id in [20, 30]) survives `id > 25`; dropped.parquet (id in [0, 5]) does not.
+    let v1 = [
+        add_with_id_stats("matches.parquet", 20, 30),
+        add_with_id_stats("dropped.parquet", 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // Both files are in the consumer's base. Only the predicate-surviving one should classify
+    // as a duplicate; the dropped file was pruned before base intersection.
+    let base_keys = [key("matches.parquet"), key("dropped.parquet")];
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let stream = target
+        .incremental_scan_builder(0)
+        .with_predicate(predicate)
+        .build(engine.as_ref())?
+        .expect("expected Some(stream)");
+    let summary = stream.into_summary_against_base_iter(&base_keys)?;
+
+    assert_eq!(
+        summary.duplicate_adds,
+        HashSet::from([key("matches.parquet")]),
+        "the pruned file is not classified as a duplicate"
+    );
+    assert!(summary.removes.is_empty());
+
+    Ok(())
+}
+
+// Newest-wins holds when the newest Add of a key is pruned but an older Add of the same key
+// (with a matching range) exists earlier in the range. The pruned newest Add still records the
+// key as `seen`, so the older duplicate must not leak into `live_adds`. The file's live (newest)
+// metadata does not match the predicate, so a cold scan at the target would exclude it too --
+// net zero live Adds. Guards the "record seen regardless of the mask" invariant.
+#[tokio::test]
+async fn pruned_newest_add_suppresses_older_matching_duplicate(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // v1: dupe.parquet with a range that WOULD match `id > 25`.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_id_stats("dupe.parquet", 20, 30),
+    )
+    .await?;
+    // v2: dupe.parquet re-added with a range the predicate provably excludes ([0, 5]).
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        2,
+        add_with_id_stats("dupe.parquet", 0, 5),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert!(
+        listing.summary.live_adds.is_empty(),
+        "the pruned newest Add records `seen`, so the older matching duplicate must not leak"
+    );
+    assert_eq!(live_add_count(&listing), 0);
+
+    Ok(())
+}
+
+// A predicate referencing a column absent from the table schema fails at `build` (fail-fast),
+// not lazily mid-stream, matching the documented `# Errors` contract.
+#[tokio::test]
+async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        1,
+        add_with_id_stats("a.parquet", 0, 9),
+    )
+    .await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("nonexistent").gt(Expr::literal(1i32)));
+    let result = target
+        .incremental_scan_builder(0)
+        .with_predicate(predicate)
+        .build(engine.as_ref());
+
+    // Fail-fast at build, surfacing the unresolved column. The concrete error is
+    // `Error::MissingColumn`, but a captured backtrace wraps it in `Error::Backtraced`, so match
+    // on the message rather than the variant.
+    assert_result_error_with_message(result, "unknown column: nonexistent");
+
+    Ok(())
+}
+
+// A predicate over a partition column prunes added files by their partition value: values are
+// parsed from the raw `add.partitionValues` map via `map_to_struct`, so `val = 'x'` drops the
+// file in partition `y`.
+#[tokio::test]
+async fn partition_column_predicate_prunes_added_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    // METADATA_WITH_PARTITION_COLS partitions by `val`.
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_partitioned(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let v1 = [
+        add_partitioned("a.parquet", "x"),
+        add_partitioned("b.parquet", "y"),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("val").eq(Expr::literal("x")));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("a.parquet")]),
+        "only the file in partition `val = 'x'` survives"
+    );
+
+    Ok(())
+}
+
+// A mixed predicate `id > 25 AND val = 'x'` prunes on both axes: the data conjunct skips on
+// `add.stats`, the partition conjunct skips on `add.partitionValues`. Only the file satisfying
+// both survives; a file failing either is dropped.
+#[tokio::test]
+async fn mixed_data_and_partition_predicate_prunes_on_both(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string_partitioned(vec![TestAction::Metadata]),
+    )
+    .await?;
+    // match: id in [20,30] and val=x. wrong_val: in-range id but val=y. wrong_id: val=x but
+    // id in [0,5]. Only `match` satisfies `id > 25 AND val = 'x'`.
+    let v1 = [
+        add_partitioned_with_id_stats("match.parquet", "x", 20, 30),
+        add_partitioned_with_id_stats("wrong_val.parquet", "y", 20, 30),
+        add_partitioned_with_id_stats("wrong_id.parquet", "x", 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(Pred::and(
+        column_expr!("id").gt(Expr::literal(25i32)),
+        column_expr!("val").eq(Expr::literal("x")),
+    ));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("match.parquet")]),
+        "only the file matching both the data and partition conjuncts survives"
+    );
+
+    Ok(())
+}
+
+// Under column mapping, `with_predicate` lowers the logical predicate column to its physical
+// name before reading stats keyed by that physical name. A logical `id > 25` skips against the
+// physical-name stats, so only the in-range file survives -- proving the physical-vs-logical
+// lowering on this path.
+#[tokio::test]
+async fn pushdown_resolves_column_mapping_physical_names() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        COLUMN_MAPPING_METADATA.to_string(),
+    )
+    .await?;
+    // Stats are keyed by the physical name `col-id`, while the predicate references logical `id`.
+    let v1 = [
+        add_with_physical_id_stats("low.parquet", 0, 5),
+        add_with_physical_id_stats("high.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("high.parquet")]),
+        "predicate on logical `id` resolves to physical `col-id` stats and drops the low file"
+    );
+
+    Ok(())
+}
+
+// A DV-bearing Add is pruned by its stats like any other, and the surviving live Add is keyed by
+// its full `(path, dv_unique_id)`, not path alone. Two DV-bearing Adds with disjoint `id` ranges:
+// `id > 25` drops the out-of-range one and keeps the in-range one under its DV key.
+#[tokio::test]
+async fn pushdown_prunes_dv_bearing_adds_keyed_by_dv() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        DV_AND_ID_METADATA.to_string(),
+    )
+    .await?;
+    let v1 = [
+        add_with_dv_and_id_stats("keep.parquet", "u", "abc", 1, 20, 30),
+        add_with_dv_and_id_stats("prune.parquet", "u", "xyz", 2, 0, 5),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key_with_dv("keep.parquet", "uabc@1")]),
+        "the in-range DV Add survives keyed by its full (path, dv_unique_id)"
+    );
+
+    Ok(())
+}
+
+// A predicate that references no columns and is not statically false (`lit(true)`) resolves to
+// `PhysicalPredicate::None`, which folds to keep-all. Distinct from the tautology case (which
+// references `id` and keeps all via the filter), this exercises the `None -> KeepAll` arm.
+#[tokio::test]
+async fn column_free_predicate_keeps_all_added_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_url) = setup_test();
+    let table_root = table_url.as_str();
+
+    add_commit(
+        table_root,
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![TestAction::Metadata]),
+    )
+    .await?;
+    let v1 = [
+        add_with_id_stats("a.parquet", 0, 9),
+        add_with_id_stats("b.parquet", 20, 30),
+    ]
+    .join("\n");
+    add_commit(table_root, storage.as_ref(), 1, v1).await?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let predicate: PredicateRef = Arc::new(Pred::literal(true));
+    let listing = unwrap_listing(
+        target
+            .incremental_scan_builder(0)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+
+    assert_eq!(
+        listing.summary.live_adds,
+        HashSet::from([key("a.parquet"), key("b.parquet")]),
+        "a column-free predicate is ineligible for skipping and keeps every live Add"
+    );
+
+    Ok(())
+}
+
+// === Round-trip against a full scan ===
+//
+// The correctness promise of `with_predicate` is that the incremental live-Add set, reconciled
+// against the base, reproduces what a full `Scan` at the target with the same predicate keeps.
+// The two paths parse stats differently: a full scan reads pre-parsed `stats_parsed` (from a
+// checkpoint), while the incremental path parses `add.stats` JSON via `for_raw_action_batch`.
+//
+// The incremental scan reads only raw commit JSON and never touches checkpoints, so it cannot
+// serve a range predating a checkpoint (the target snapshot's log segment drops pre-checkpoint
+// commit JSON). The checkpoint therefore sits at the base version: the full scan at the base
+// prunes via the checkpoint's `stats_parsed`, the incremental delta over `(base, target]` prunes
+// via JSON, and `full_scan(base) union live_adds` must equal `full_scan(target)`.
+
+type MtEngine = DefaultEngine<TokioMultiThreadExecutor>;
+
+// Single-column `id: integer` table.
+fn id_schema() -> Arc<StructType> {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        "id",
+        DataType::INTEGER,
+    )]))
+}
+
+// One `RecordBatch` holding a single `id` value, so each written file gets a tight [id, id] range.
+fn id_batch(schema: &Arc<StructType>, id: i32) -> RecordBatch {
+    let arrow_schema: ArrowSchema = schema.as_ref().try_into_arrow().unwrap();
+    RecordBatch::try_new(
+        Arc::new(arrow_schema),
+        vec![Arc::new(Int32Array::from(vec![id]))],
+    )
+    .unwrap()
+}
+
+// Surviving file paths from a full scan at `snapshot` under `predicate`. A snapshot loaded after a
+// checkpoint prunes using the checkpoint's `stats_parsed`.
+fn full_scan_surviving_paths(
+    snapshot: SnapshotRef,
+    engine: &MtEngine,
+    predicate: PredicateRef,
+) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    fn insert_path(paths: &mut HashSet<String>, scan_file: ScanFile) {
+        paths.insert(scan_file.path);
+    }
+
+    let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+    let mut paths: HashSet<String> = HashSet::new();
+    for sm in scan.scan_metadata(engine)? {
+        paths = sm?.visit_scan_files(paths, insert_path)?;
+    }
+    Ok(paths)
+}
+
+// Reconciling a base full scan with the incremental delta reproduces a full scan at the target,
+// even though the base prunes via the checkpoint's `stats_parsed` while the incremental delta
+// prunes via `add.stats` JSON. Guards the stats-parsing divergence the two paths could exhibit.
+#[tokio::test(flavor = "multi_thread")]
+async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkpoint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = Url::from_directory_path(&table_path).map_err(|_| "invalid table path")?;
+    let schema = id_schema();
+    let mut snapshot =
+        create_table_and_load_snapshot(&table_path, schema.clone(), engine.as_ref(), &[])?;
+
+    // Files added before the checkpoint: id 5, 15, 25. The checkpoint captures their stats.
+    for id in [5, 15, 25] {
+        snapshot = write_batch_to_table(
+            &snapshot,
+            engine.as_ref(),
+            id_batch(&schema, id),
+            HashMap::new(),
+        )
+        .await?;
+    }
+    let (_, snapshot) = snapshot.checkpoint(engine.as_ref(), None)?;
+    let base_version = snapshot.version();
+
+    // Files added after the checkpoint: id 35, 45. These live only in raw commit JSON.
+    let mut snapshot = snapshot;
+    for id in [35, 45] {
+        snapshot = write_batch_to_table(
+            &snapshot,
+            engine.as_ref(),
+            id_batch(&schema, id),
+            HashMap::new(),
+        )
+        .await?;
+    }
+    let target_version = snapshot.version();
+
+    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(20i32)));
+
+    // Base full scan (reads the checkpoint's `stats_parsed`) and target full scan, both loaded
+    // fresh off disk so they replay through the checkpoint.
+    let base = Snapshot::builder_for(table_url.clone())
+        .at_version(base_version)
+        .build(engine.as_ref())?;
+    let base_paths = full_scan_surviving_paths(base, engine.as_ref(), predicate.clone())?;
+
+    let target = Snapshot::builder_for(table_url)
+        .at_version(target_version)
+        .build(engine.as_ref())?;
+    let target_paths = full_scan_surviving_paths(target, engine.as_ref(), predicate.clone())?;
+
+    // Incremental delta over `(base, target]` (parses `add.stats` JSON).
+    let listing = unwrap_listing(
+        snapshot
+            .incremental_scan_builder(base_version)
+            .with_predicate(predicate)
+            .build(engine.as_ref())?,
+    );
+    let live_adds: HashSet<String> = listing
+        .summary
+        .live_adds
+        .iter()
+        .map(|k| k.path().to_string())
+        .collect();
+
+    // Sanity: the checkpoint kept a pre-checkpoint match (id 25) that the incremental delta does
+    // not re-report, so the reconciliation is doing real work.
+    assert!(
+        !base_paths.is_empty() && !live_adds.is_empty(),
+        "both the base scan and the incremental delta should contribute matches"
+    );
+    assert!(
+        listing.summary.removes.is_empty(),
+        "no removes in this range"
+    );
+
+    // No in-range removes, so reconciliation is a union of the base and the incremental live Adds.
+    let reconciled: HashSet<String> = base_paths.union(&live_adds).cloned().collect();
+    assert_eq!(
+        reconciled, target_paths,
+        "base full scan plus incremental live_adds must equal the full scan at the target"
+    );
 
     Ok(())
 }

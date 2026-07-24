@@ -33,7 +33,9 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{
+    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
+};
 use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
@@ -76,6 +78,12 @@ impl Transaction {
 
         let effective_table_config = read_snapshot.table_configuration().clone();
 
+        // Surface IcebergCompatV3 interoperability risks without rejecting tables based on
+        // kernel parser limitations.
+        if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            iceberg_compat_v3_column_defaults_validation(&effective_table_config)?;
+        }
+
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
@@ -98,6 +106,7 @@ impl Transaction {
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            num_dv_updates: 0,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
@@ -335,6 +344,7 @@ impl Transaction {
         }
 
         self.dv_matched_files.extend(matched_files);
+        self.num_dv_updates += matched_dv_files;
         Ok(())
     }
 

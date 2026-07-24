@@ -13,6 +13,9 @@ use crate::http::{build_http_client, execute_with_retry, handle_response};
 struct EmptyResponse {}
 
 /// REST implementation of [CommitClient] and [GetCommitsClient].
+///
+/// Backs the legacy Delta-Commits path and will be deleted once the read and commit paths are
+/// swapped onto the new Delta-Tables API.
 #[derive(Debug, Clone)]
 pub struct UCCommitsRestClient {
     http_client: reqwest::Client,

@@ -398,9 +398,9 @@ mod tests {
 
     use delta_kernel::metrics::{
         CrcReadSuccess, DomainMetadataLoadSuccess, LogSegmentLoadSuccess, MetricId,
-        ProtocolMetadataLoadSuccess, SetTransactionLoadSuccess, SnapshotBuildFailure,
-        SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted, StorageReadCompleted,
-        TableType, TransactionCommitFailure, TransactionCommitSuccess,
+        ProtocolMetadataLoadSuccess, ProtocolMetadataSource, SetTransactionLoadSuccess,
+        SnapshotBuildFailure, SnapshotBuildSuccess, StorageCopyCompleted, StorageListCompleted,
+        StorageReadCompleted, TableType, TransactionCommitFailure, TransactionCommitSuccess,
     };
 
     use super::*;
@@ -615,6 +615,7 @@ mod tests {
                 operation_id: MetricId::new(),
                 table_type: TableType::PathBased,
                 correlation_id: None,
+                source: ProtocolMetadataSource::FullReplay,
                 duration: dur(),
             },
         ));

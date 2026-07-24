@@ -663,6 +663,12 @@ fn visit_expression_impl(
             visit_expression_impl(visitor, map_expr, child_list_id);
             call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
         }
+        // TODO(#2975): Add a dedicated visitor callback for cast expressions.
+        Expression::Cast(cast) => visit_unknown(
+            visitor,
+            sibling_list_id,
+            &format!("cast_to_{}", cast.target),
+        ),
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }

@@ -10,11 +10,12 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    schema_contains_file_actions, Sidecar, DOMAIN_METADATA_NAME, LOG_ADD_SCHEMA, MAX_VALUES,
-    METADATA_NAME, MIN_VALUES, PROTOCOL_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, MAX_VALUES,
+    MIN_VALUES, SIDECAR_NAME,
 };
+use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
-use crate::expressions::{column_name, ColumnName};
+use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
@@ -24,9 +25,13 @@ use crate::metrics::events::LOG_SEGMENT_LOADED_SPAN;
 use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::nodes::{FileType, ScanFile};
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
+#[cfg(feature = "declarative-plans")]
+use crate::Scalar;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
     StorageHandler, Version,
@@ -120,36 +125,36 @@ pub(crate) struct LogSegment {
     pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
-/// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
-/// predicates that enable row group skipping in checkpoint parquet files.
-///
-/// For `txn`, this is effective because all app ids end up in a single checkpoint part when
-/// partitioned by `add.path` as the Delta spec requires. Filtering by a specific app id is not
-/// worthwhile since all app ids share one part with a large min/max range (typically UUIDs).
-fn action_identifying_column(action_name: &str) -> Option<ColumnName> {
-    match action_name {
-        METADATA_NAME => Some(column_name!(METADATA_NAME, "id")),
-        PROTOCOL_NAME => Some(column_name!(PROTOCOL_NAME, "minReaderVersion")),
-        SET_TRANSACTION_NAME => Some(column_name!(SET_TRANSACTION_NAME, "appId")),
-        DOMAIN_METADATA_NAME => Some(column_name!(DOMAIN_METADATA_NAME, "domain")),
-        _ => None,
-    }
+/// Returns the column whose non-nullness identifies a row containing `action_name`.
+fn action_presence_witness(action_name: &str) -> Option<ColumnName> {
+    action_presence_leaf(action_name).map(|leaf| ColumnName::new([action_name, leaf]))
 }
 
-/// Builds an IS NOT NULL predicate for row group skipping based on the action types in `schema`.
-/// Returns `None` if any top-level field in the schema is not a recognized action type, since
-/// an unknown type could have non-null rows in the same row group, making skipping unsafe.
-fn schema_to_is_not_null_predicate(schema: &StructType) -> Option<PredicateRef> {
-    // Collect identifying columns for every field; short-circuit to None on any unknown field.
+/// Builds a checkpoint predicate that retains every action requested by `schema`.
+///
+/// Each requested action contributes an `IS NOT NULL` presence witness, and the witnesses are
+/// joined with `OR`. Returns `None` if the schema is empty, or if any field lacks a reliable
+/// witness (an action that could occupy a row group the resulting predicate would otherwise skip).
+fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<PredicateRef> {
     let columns: Vec<ColumnName> = schema
         .fields()
-        .map(|f| action_identifying_column(f.name()))
+        .map(|field| action_presence_witness(field.name()))
         .collect::<Option<_>>()?;
     let mut predicates = columns
         .into_iter()
         .map(|col| Expression::column(col).is_not_null());
     let first = predicates.next()?;
     Some(Arc::new(predicates.fold(first, Predicate::or)))
+}
+
+fn combine_checkpoint_predicates(
+    projection_predicate: Option<PredicateRef>,
+    meta_predicate: Option<PredicateRef>,
+) -> Option<PredicateRef> {
+    match (projection_predicate, meta_predicate) {
+        (None, predicate) | (predicate, None) => predicate,
+        (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
+    }
 }
 
 impl LogSegment {
@@ -693,11 +698,13 @@ impl LogSegment {
     ///
     /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
-    /// `meta_predicate` is an optional expression for row group skipping in checkpoint parquet
-    /// files. It is _NOT_ the query's data predicate, but a hint for skipping irrelevant data.
-    /// IS NOT NULL predicates are automatically derived from `checkpoint_read_schema` and combined
-    /// (AND) with `meta_predicate`, so callers only need to supply query-based skipping predicates.
+    /// `meta_predicate` is an optional conservative predicate for checkpoint reads, not the query's
+    /// final data filter. When every projected action has a reliable presence witness, their
+    /// `IS NOT NULL` predicates are combined (OR), then combined (AND) with `meta_predicate`.
+    /// Otherwise projection-based pruning is disabled. Readers may ignore the resulting predicate,
+    /// and downstream log replay must tolerate rows that do not satisfy it.
     #[internal_api]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
@@ -706,28 +713,28 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        // Combine schema-derived IS NOT NULL predicate with any caller-supplied predicate so
-        // checkpoint parquet row groups without any relevant action type can be skipped.
-        // TODO: The semantics of `meta_predicate` will change in a follow-up PR.
-        let is_not_null_pred = schema_to_is_not_null_predicate(&checkpoint_read_schema);
-        let effective_predicate = match (is_not_null_pred, meta_predicate) {
-            (None, x) | (x, None) => x,
-            (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
-        };
+        // Combine the action-presence predicate with the caller's skipping predicate so readers
+        // can omit checkpoint data that cannot contain a relevant action.
+        let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
+        let checkpoint_predicate =
+            combine_checkpoint_predicates(projection_predicate, meta_predicate);
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
+        let commit_stream =
+            CommitReader::try_new(engine, self, commit_read_schema, cancellation_token)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            effective_predicate,
+            checkpoint_predicate,
             stats_schema,
             partition_schema,
+            cancellation_token,
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -752,6 +759,7 @@ impl LogSegment {
             None,
             None,
             None,
+            None,
         )?;
         Ok(result.actions)
     }
@@ -762,6 +770,13 @@ impl LogSegment {
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
     pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
+        self.find_commit_cover_paths()
+            .into_iter()
+            .map(|path| path.location)
+            .collect()
+    }
+
+    fn find_commit_cover_paths(&self) -> Vec<ParsedLogPath> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
@@ -793,10 +808,56 @@ impl LogSegment {
             }
             debug!("Provisionally selecting {next:?}");
             last_pushed = Some(next);
-            selected_files.push(next.location.clone());
+            selected_files.push(next.clone());
         }
         selected_files.reverse();
         selected_files
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn version_tagged_scan_files<'a>(
+        paths: impl IntoIterator<Item = &'a ParsedLogPath>,
+    ) -> DeltaResult<Vec<ScanFile>> {
+        paths
+            .into_iter()
+            .map(|path| {
+                Ok(ScanFile {
+                    meta: path.location.clone(),
+                    file_constants: vec![Scalar::Long(path.version_as_i64()?)],
+                })
+            })
+            .collect()
+    }
+
+    /// Returns commit-cover files tagged with file-constant `version`.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn commit_cover_version_tagged_scan_files(&self) -> DeltaResult<Vec<ScanFile>> {
+        Self::version_tagged_scan_files(&self.find_commit_cover_paths())
+    }
+
+    /// Returns the checkpoint parts tagged with file-constant `version`, paired with the single
+    /// [`FileType`] they share, or `None` when there is no checkpoint. A V2 checkpoint may be
+    /// UUID-named JSON, so the caller routes the parts to the matching scan operator by `FileType`.
+    ///
+    /// All checkpoint parts of a version share one format (`validate_checkpoint_parts` rejects a
+    /// mixed set), so a single `FileType` describes the whole group -- making a json/parquet mix
+    /// unrepresentable in the return type.
+    ///
+    /// [`FileType`]: crate::plans::ir::nodes::FileType
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_version_tagged_scan_files(
+        &self,
+    ) -> DeltaResult<Option<(FileType, Vec<ScanFile>)>> {
+        let parts = &self.listed.checkpoint_parts;
+        let Some(first) = parts.first() else {
+            return Ok(None);
+        };
+        let file_type = if first.is_json() {
+            FileType::Json
+        } else {
+            FileType::Parquet
+        };
+        Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
@@ -816,6 +877,7 @@ impl LogSegment {
     fn get_file_actions_schema_and_sidecars(
         &self,
         engine: &dyn Engine,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
         // Hint schema from `_last_checkpoint` avoids footer reads when available.
         let hint_schema = self.checkpoint_hint_schema();
@@ -829,22 +891,35 @@ impl LogSegment {
         match &checkpoint.file_type {
             MultiPartCheckpoint { .. } => {
                 // Multi-part checkpoints are always V1 and never have sidecars.
-                let schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                let schema = Self::read_checkpoint_schema(
+                    engine,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                    cancellation_token,
+                )?;
                 Ok((Some(schema), vec![]))
             }
             UuidCheckpoint if checkpoint.extension.as_str() == "json" => {
                 // JSON checkpoint is always V2. No checkpoint schema is available since JSON
                 // checkpoints don't have a parquet footer to read.
-                self.read_sidecar_schema_and_files(engine, checkpoint, None)
+                self.read_sidecar_schema_and_files(engine, checkpoint, None, cancellation_token)
             }
             SinglePartCheckpoint | UuidCheckpoint if checkpoint.extension.as_str() == "parquet" => {
                 // Parquet checkpoint (classic-named or UUID-named): either can be V1 or V2.
                 // Check for sidecar column to distinguish.
-                let checkpoint_schema =
-                    Self::read_checkpoint_schema(engine, checkpoint, hint_schema.as_ref())?;
+                let checkpoint_schema = Self::read_checkpoint_schema(
+                    engine,
+                    checkpoint,
+                    hint_schema.as_ref(),
+                    cancellation_token,
+                )?;
                 if checkpoint_schema.field(SIDECAR_NAME).is_some() {
-                    self.read_sidecar_schema_and_files(engine, checkpoint, Some(&checkpoint_schema))
+                    self.read_sidecar_schema_and_files(
+                        engine,
+                        checkpoint,
+                        Some(&checkpoint_schema),
+                        cancellation_token,
+                    )
                 } else {
                     Ok((Some(checkpoint_schema), vec![]))
                 }
@@ -853,19 +928,30 @@ impl LogSegment {
         }
     }
 
+    /// Reads a parquet footer schema, threading the cancellation token so a cancelled request can
+    /// stop before or during the read (the read itself fails fast on an already-cancelled token).
+    fn read_footer_schema(
+        engine: &dyn Engine,
+        file: &FileMeta,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> DeltaResult<SchemaRef> {
+        Ok(engine
+            .parquet_handler()
+            .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
+            .schema)
+    }
+
     /// Returns the checkpoint's parquet schema, using the hint from `_last_checkpoint` if
     /// available or reading the parquet footer otherwise.
     fn read_checkpoint_schema(
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath<FileMeta>,
         hint_schema: Option<&SchemaRef>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<SchemaRef> {
         match hint_schema {
             Some(schema) => Ok(schema.clone()),
-            None => Ok(engine
-                .parquet_handler()
-                .read_parquet_footer(&checkpoint.location)?
-                .schema),
+            None => Self::read_footer_schema(engine, &checkpoint.location, cancellation_token),
         }
     }
 
@@ -877,10 +963,11 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath<FileMeta>,
         checkpoint_schema: Option<&SchemaRef>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<(Option<SchemaRef>, Vec<FileMeta>)> {
-        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint)?;
+        let sidecar_files = self.extract_sidecar_refs(engine, checkpoint, cancellation_token)?;
         let file_actions_schema = match sidecar_files.first() {
-            Some(first) => Some(engine.parquet_handler().read_parquet_footer(first)?.schema),
+            Some(first) => Some(Self::read_footer_schema(engine, first, cancellation_token)?),
             None => checkpoint_schema.cloned(),
         };
         Ok((file_actions_schema, sidecar_files))
@@ -901,13 +988,14 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         let (file_actions_schema, sidecar_files) = if need_file_actions {
-            self.get_file_actions_schema_and_sidecars(engine)?
+            self.get_file_actions_schema_and_sidecars(engine, cancellation_token)?
         } else {
             (None, vec![])
         };
@@ -985,25 +1073,26 @@ impl LogSegment {
             .map(|f| f.location.clone())
             .collect();
 
-        let parquet_handler = engine.parquet_handler();
-
         // Historically, we had a shared file reader trait for JSON and Parquet handlers,
         // but it was removed to avoid unnecessary coupling. This is a concrete case
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.listed.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.json_handler().read_json_files(
+                engine.json_handler().read_json_files_with_cancellation(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
+                    cancellation_token.cloned(),
                 )?
             }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
-                .read_parquet_files(
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => engine
+                .parquet_handler()
+                .read_parquet_files_with_cancellation(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
+                    cancellation_token.cloned(),
                 )?,
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
@@ -1021,11 +1110,14 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            parquet_handler.read_parquet_files(
-                &sidecar_files,
-                augmented_checkpoint_read_schema.clone(),
-                meta_predicate,
-            )?
+            engine
+                .parquet_handler()
+                .read_parquet_files_with_cancellation(
+                    &sidecar_files,
+                    augmented_checkpoint_read_schema.clone(),
+                    meta_predicate,
+                    cancellation_token.cloned(),
+                )?
         } else {
             Box::new(std::iter::empty())
         };
@@ -1053,21 +1145,31 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         checkpoint: &ParsedLogPath,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
         let batches = match checkpoint.extension.as_str() {
-            "json" => engine.json_handler().read_json_files(
+            "json" => engine.json_handler().read_json_files_with_cancellation(
                 std::slice::from_ref(&checkpoint.location),
                 Self::sidecar_read_schema(),
                 None,
+                cancellation_token.cloned(),
             )?,
-            "parquet" => engine.parquet_handler().read_parquet_files(
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-            )?,
+            "parquet" => engine
+                .parquet_handler()
+                .read_parquet_files_with_cancellation(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                    cancellation_token.cloned(),
+                )?,
             _ => return Ok(vec![]),
         };
+
+        // Unlike the checkpoint/commit reads that feed the wrapped scan-action stream, this loop
+        // consumes batches locally, so wrap it to poll the token between batches even against an
+        // engine whose reader ignores it.
+        let batches = CancellableIterator::new(batches, cancellation_token.cloned());
 
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();

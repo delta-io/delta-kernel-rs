@@ -92,6 +92,41 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
     Ok(())
 }
 
+/// IcebergV3 has no interval type, so icebergCompatV3 omits intervals from
+/// its type allowlist. Enabling V3 alongside an interval column must fail at `.build(...)`. This
+/// holds regardless of the `interval-type-in-dev` gate, since the V3 allowlist is the rejection
+/// point and runs before any kernel-support check.
+#[rstest]
+fn v3_create_table_rejects_interval_column(
+    #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+    #[values(false, true)] nested: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let interval_field = if nested {
+        StructField::nullable(
+            "nested",
+            StructType::new_unchecked([StructField::nullable("iv", interval)]),
+        )
+    } else {
+        StructField::nullable("iv", interval)
+    };
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::LONG),
+        interval_field,
+    ])?);
+
+    let err = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.enableIcebergCompatV3", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not support type at column"),
+        "expected V3 allowlist rejection of the interval column, got: {err}",
+    );
+    Ok(())
+}
+
 /// Listing IcebergCompatV3 in writerFeatures (i.e. "supported") without setting
 /// `delta.enableIcebergCompatV3=true` must not activate V3: column mapping stays off and
 /// no nested-id metadata is set on the Map field.

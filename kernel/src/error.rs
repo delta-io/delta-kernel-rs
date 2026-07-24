@@ -67,6 +67,19 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    /// An error involving the maximum catalog-ratified version when building a snapshot.
+    #[error("Max catalog version error: {0}")]
+    MaxCatalogVersion(String),
+
+    /// The supplied log tail contains adjacent versions that are not contiguous.
+    #[error("Log tail versions {first_version} and {second_version} are not contiguous")]
+    LogTailVersionsNotContiguous {
+        /// Earlier version in the invalid adjacent pair.
+        first_version: Version,
+        /// Later version in the invalid adjacent pair.
+        second_version: Version,
+    },
+
     /// Some kind of [`std::io::Error`]
     #[error(transparent)]
     IOError(std::io::Error),
@@ -184,6 +197,10 @@ pub enum Error {
     #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
+    /// Invalid CRS or other parameter for a Geometry / Geography type
+    #[error("Invalid geo parameters: {0}")]
+    InvalidGeoParams(String),
+
     /// Inconsistent data passed to struct scalar
     #[error("Invalid struct data: {0}")]
     InvalidStructData(String),
@@ -215,6 +232,14 @@ pub enum Error {
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
 
+    /// Row tracking (`delta.enableRowTracking`) must be enabled for the entire version range of a
+    /// row-tracking change feed, but it is not enabled at the given version.
+    #[error(
+        "Row tracking (delta.enableRowTracking) must be enabled for the entire row-tracking change \
+         feed range, but it is not enabled at version {0}"
+    )]
+    RowTrackingChangeFeedUnsupported(Version),
+
     #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
     ChangeDataFeedIncompatibleSchema(String, String),
 
@@ -228,7 +253,7 @@ pub enum Error {
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
 
-    /// Schema mismatch has occurred or invalid schema used somewhere
+    /// Schema mismatch has occurred or invalid/not-kernel-supported schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
 
@@ -246,6 +271,13 @@ pub enum Error {
         expected: &'static str,
         actual: &'static str,
     },
+
+    /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
+    ///
+    /// Surfaced by cancellation-aware reads as a terminal error, distinct from normal iterator
+    /// exhaustion. See [`CancellableIterator`](crate::cancellation) for the enforced contract.
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -295,6 +327,10 @@ impl Error {
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
     }
+    #[cfg(feature = "geo-type-in-dev")]
+    pub fn invalid_geo_params(msg: impl ToString) -> Self {
+        Self::InvalidGeoParams(msg.to_string())
+    }
     pub fn invalid_struct_data(msg: impl ToString) -> Self {
         Self::InvalidStructData(msg.to_string())
     }
@@ -323,11 +359,28 @@ impl Error {
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
     }
+    /// Creates an [`Error::RowTrackingChangeFeedUnsupported`] for the given version, used when row
+    /// tracking is not enabled at some point in a row-tracking change feed's version range.
+    pub(crate) fn row_tracking_change_feed_unsupported(version: impl Into<Version>) -> Self {
+        Self::RowTrackingChangeFeedUnsupported(version.into())
+    }
     pub(crate) fn change_data_feed_incompatible_schema(
         expected: &StructType,
         actual: &StructType,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+        Self::ChangeDataFeedIncompatibleSchema(expected.to_string(), actual.to_string())
+    }
+
+    /// Creates an incompatible-schema error that identifies the version of `actual`.
+    pub(crate) fn change_data_feed_incompatible_schema_at_version(
+        expected: &StructType,
+        actual: &StructType,
+        version: Version,
+    ) -> Self {
+        Self::ChangeDataFeedIncompatibleSchema(
+            expected.to_string(),
+            format!("schema at version {version}: {actual}"),
+        )
     }
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {

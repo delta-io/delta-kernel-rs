@@ -1,3 +1,7 @@
+// Scan-metadata cancellation is a read-path concern, so its coverage lives alongside the other
+// read tests.
+mod scan_cancellation;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::vec;
@@ -1744,7 +1748,7 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
-    let expected = include!("../data/unshredded-variant.expected.in");
+    let expected = include!("../../data/unshredded-variant.expected.in");
     let test_name = "unshredded-variant";
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);

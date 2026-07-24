@@ -1,0 +1,8 @@
+{
+  "10kAdds0CommitsSinceChkpt1V2Chkpt": {
+    "readMetadataLatest": [
+      { "name": "serial",    "parallelScan": "disabled" },
+      { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
+    ]
+  }
+}

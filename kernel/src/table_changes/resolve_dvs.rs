@@ -200,6 +200,8 @@ mod tests {
             commit_version: 42,
             commit_timestamp: 1234,
             size: None,
+            base_row_id: None,
+            default_row_commit_version: None,
         }
     }
 

@@ -80,10 +80,11 @@ pub enum DomainMetadataState {
     /// map does not exist.
     Complete(HashMap<String, DomainMetadata>),
 
-    /// The CRC file did not have the `domainMetadata` field. The map starts empty and gets
-    /// populated by incremental CRC replay over the JSON commits after the latest stale CRC.
-    /// Hits are authoritative (definitely present at this version); misses are NOT
-    /// (the domain may exist in older commits), so callers must do a further log scan.
+    /// The CRC file did not have the `domainMetadata` field, so the full active-domain set is
+    /// unknown. Hits in the map are authoritative (definitely present at this version); misses
+    /// are NOT (the domain may exist in a commit the CRC did not account for), so a miss requires
+    /// a further log scan. The map is empty for a stale CRC that was not incrementally replayed,
+    /// and populated when incremental CRC replay folds in the commits after it.
     Partial(HashMap<String, DomainMetadata>),
 }
 
