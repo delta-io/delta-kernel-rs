@@ -1457,6 +1457,39 @@ mod test {
     }
 
     #[test]
+    fn test_timestamp_ntz_legacy_alias_unblocks_read_and_write() {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "ts",
+            DataType::TIMESTAMP_NTZ,
+        )]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+
+        // Build the protocol from the legacy string alias to exercise the real read path.
+        let protocol =
+            Protocol::try_new_modern(["timestampWithoutTimezone"], ["timestampWithoutTimezone"])
+                .unwrap();
+
+        assert_eq!(
+            protocol.reader_features(),
+            Some([TableFeature::TimestampWithoutTimezone].as_slice())
+        );
+        assert_eq!(
+            protocol.writer_features(),
+            Some([TableFeature::TimestampWithoutTimezone].as_slice())
+        );
+
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        table_config
+            .ensure_operation_supported(Operation::Scan)
+            .unwrap();
+        table_config
+            .ensure_operation_supported(Operation::Write)
+            .unwrap();
+    }
+
+    #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
         let schema = schema_ref! { nullable "v": (DataType::unshredded_variant()) };
