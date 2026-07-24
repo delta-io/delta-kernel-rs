@@ -109,17 +109,19 @@ Catalog-managed publish flow (after a catalog committer stages commits):
 
 ```
 committed_transaction_post_commit_snapshot()
-  -> snapshot_publish_with_committer(snapshot, committer, engine)  // borrows inputs
+  -> snapshot_publish_with_committer(snapshot, committer, engine)
+     // borrows snapshot; consumes committer (do not free)
   -> use returned snapshot for subsequent transaction_with_committer / checkpoint
+     // mint a fresh get_uc_committer for that transaction -- it also consumes
   -> free_snapshot (returned snapshot) when done
-  -> free_uc_committer (committer is NOT consumed here)
+  -> free_snapshot (post-commit input snapshot)
 ```
 
 `snapshot_publish_with_committer` mirrors kernel `Snapshot::publish`: it copies ratified staged
 commits into `_delta_log/` via the catalog committer's `publish()` implementation. The input
-snapshot and committer handles are borrowed, not consumed; the caller owns the returned snapshot
-handle. The returned snapshot carries the published watermark (`max_published_version`) needed
-for the next catalog commit — do not continue from the pre-publish post-commit snapshot.
+snapshot is borrowed; the committer is consumed (do not free). The caller owns the returned
+snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
+needed for the next catalog commit -- do not continue from the pre-publish post-commit snapshot.
 
 Deletion vector update flow:
 

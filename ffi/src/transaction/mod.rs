@@ -1731,8 +1731,7 @@ mod tests {
             cast_test_context, get_test_context, recover_test_context,
         };
         use crate::delta_kernel_unity_catalog::{
-            free_uc_commit_client, free_uc_committer, get_uc_commit_client, get_uc_committer,
-            CommitRequest,
+            free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
         };
         use crate::{Handle, NullableCvoid, OptionalValue};
 
@@ -1882,7 +1881,7 @@ mod tests {
             let published_snapshot = ok_or_panic(unsafe {
                 snapshot_publish_with_committer(
                     post_commit_snapshot.shallow_copy(),
-                    publish_committer.shallow_copy(),
+                    publish_committer,
                     engine.shallow_copy(),
                 )
             });
@@ -1910,10 +1909,18 @@ mod tests {
             );
 
             // Second publish is a no-op when all staged commits are already published.
+            // Publish consumes the committer, so mint a fresh one for the second call.
+            let republish_committer = unsafe {
+                ok_or_panic(get_uc_committer(
+                    uc_client.shallow_copy(),
+                    kernel_string_slice!(table_id),
+                    allocate_err,
+                ))
+            };
             let republished_snapshot = ok_or_panic(unsafe {
                 snapshot_publish_with_committer(
                     published_snapshot.shallow_copy(),
-                    publish_committer.shallow_copy(),
+                    republish_committer,
                     engine.shallow_copy(),
                 )
             });
@@ -1927,7 +1934,6 @@ mod tests {
             unsafe { free_snapshot(republished_snapshot) };
             unsafe { free_snapshot(published_snapshot) };
             unsafe { free_snapshot(post_commit_snapshot) };
-            unsafe { free_uc_committer(publish_committer) };
             unsafe { free_committed_transaction(committed) };
 
             let context = recover_test_context(context).unwrap();

@@ -1246,14 +1246,15 @@ pub unsafe extern "C" fn checkpoint_snapshot(
 /// nothing to publish. Errors when unpublished commits exist but the table is not
 /// catalog-managed or the committer is not a catalog committer.
 ///
-/// Caller owns the returned handle ([`free_snapshot`]). Input snapshot and committer are
-/// borrowed, not consumed. The returned snapshot carries the published watermark used by
-/// subsequent catalog commits — use it for the next `transaction_with_committer` / checkpoint.
+/// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
+/// committer is consumed (do not free). The returned snapshot carries the published watermark
+/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
+/// checkpoint.
 ///
 /// # Safety
 ///
-/// Caller must pass valid snapshot, committer, and engine handles, and must ensure no other
-/// thread accesses the committer handle for the duration of this call.
+/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
+/// consumed and must not be used or freed afterward.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_publish_with_committer(
     snapshot: Handle<SharedSnapshot>,
@@ -1262,9 +1263,9 @@ pub unsafe extern "C" fn snapshot_publish_with_committer(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let engine_ref = unsafe { engine.as_ref() };
     let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
-    let committer_ref = unsafe { committer.as_ref() };
+    let committer = unsafe { committer.into_inner() };
     snapshot_ref
-        .publish(engine_ref.engine().as_ref(), committer_ref)
+        .publish(engine_ref.engine().as_ref(), committer.as_ref())
         .map(|updated| updated.into())
         .into_extern_result(&engine_ref)
 }
