@@ -34,6 +34,7 @@ pub(crate) const MANIFEST_INFO: &str = "manifestInfo";
 pub(crate) const KEY_METADATA: &str = "keyMetadata";
 pub(crate) const SPLIT_OFFSETS: &str = "splitOffsets";
 pub(crate) const EQUALITY_IDS: &str = "equalityIds";
+pub(crate) const FORMAT_VERSION: &str = "formatVersion";
 pub(crate) const TAGS: &str = "tags";
 
 /// Field names for the different fields within content_stats.
@@ -63,7 +64,7 @@ pub(super) struct ContentTreeNode {
     path_in_log: String,
 }
 
-/// Sub-struct of ContentTreeNodeEnty that hold information about
+/// Sub-struct of ContentTreeNodeEntry that hold information about
 /// deletion vector applied to data files.
 #[derive(Debug, Clone, ToSchema, IntoEngineData)]
 pub(crate) struct DeletionVectorInfo {
@@ -94,7 +95,7 @@ pub struct TrackingInfo {
     #[field_id = 0]
     pub(crate) status: TrackingStatus,
 
-    /// Snapshot ID where the file was added, or deleted if status is 2. Inherited when null.
+    /// Snapshot ID where the file was added, or deleted if status is 2. Inherited when `None`.
     /// Must be written in the root file.
     #[field_id = 1]
     pub snapshot_id: Option<i64>,
@@ -103,14 +104,14 @@ pub struct TrackingInfo {
     #[field_id = 5]
     pub(crate) dv_snapshot_id: Option<i64>,
 
-    /// Data sequence number of the file. Inherited in when null and status is 1 (added).
+    /// Data sequence number of the file. Inherited when `None` and status is 1 (added).
     /// Must be equal to file_sequence_number if content_type is {Data,Delete}Manifest.
     /// Must be written in the root file.
     #[field_id = 3]
     pub(crate) sequence_number: Option<i64>,
 
-    /// File sequence number indicating when the file was added. Inherited when null and status is
-    /// added. Must be equal to sequence_number if content_type is {Data,Delete}Manifest.
+    /// File sequence number indicating when the file was added. Inherited when `None` and status
+    /// is added. Must be equal to sequence_number if content_type is {Data,Delete}Manifest.
     #[field_id = 4]
     pub(crate) file_sequence_number: Option<i64>,
 
@@ -121,21 +122,23 @@ pub struct TrackingInfo {
     pub(crate) first_row_id: Option<i64>,
 
     /// Positions deleted from this manifest in the current commit. Cleared between commits.
+    /// Encoded as a serialized `RoaringBitmapArray` (the same portable RoaringBitmap framing used
+    /// for inline deletion vectors, see [`crate::actions::deletion_vector`]).
     #[field_id = 6]
     pub(crate) deleted_positions: Option<Bytes>,
 
     /// Positions replaced (DV changed) in this manifest in the current commit. Cleared between
-    /// commits.
-    // TODO: always null until DvCache tracks replaced positions in a later change.
+    /// commits. Encoded as a serialized `RoaringBitmapArray`, matching `deleted_positions`.
+    // TODO: always `None` until DvCache tracks replaced positions in a later change.
     #[field_id = 7]
     pub(crate) replaced_positions: Option<Bytes>,
 }
 
-/// Represents the an entry/row in a ContentTree node.
+/// Represents an entry/row in a ContentTree node.
 #[derive(Debug, Clone, ToSchema)]
 pub(super) struct ContentTreeNodeEntry {
     /// Type of content stored by the entry.
-    /// DataManifest, DeleteManifest or ManifestDV can only be defined in the root manifest.
+    /// DataManifest and DeleteManifest can only be defined in the root manifest.
     #[field_id = 134]
     pub content_type: DataContentType,
 
@@ -143,7 +146,8 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 100]
     pub location: Option<String>,
 
-    /// avro, orc, parquet or puffin
+    /// File format of the entry: `parquet` for data files or `puffin` for deletion vectors (the
+    /// only formats kernel supports). See [`DataFileFormat`].
     #[field_id = 101]
     pub(crate) file_format: DataFileFormat,
 
@@ -186,13 +190,13 @@ pub(super) struct ContentTreeNodeEntry {
     #[field_id = 146]
     pub(crate) content_stats: Option<StructData>,
 
-    /// Must be set if content_type is {Data,Delete}Manifest, otherwise null.
+    /// Must be set if content_type is {Data,Delete}Manifest, otherwise `None`.
     #[field_id = 150]
     pub(crate) manifest_info: Option<ManifestInfo>,
 
     /// Location of the data file if the content_type is  PositionDeletes
-    /// Location of affiliated data manifest if content_type is or DeleteManifest or null if delete
-    /// manifest is unaffiliated. TODO: place holder for referenced file which is no longer
+    /// Location of affiliated data manifest if content_type is or DeleteManifest or `None` if
+    /// delete manifest is unaffiliated. TODO: place holder for referenced file which is no longer
     /// necessary. #[field_id = 143]
     /// pub referenced_file: `Option<String>`,
 
@@ -207,11 +211,15 @@ pub(super) struct ContentTreeNodeEntry {
     pub(crate) split_offsets: Option<Vec<i64>>,
 
     /// Field ids used to determine row equality in equality delete files.
-    /// Required when content is EqualityDeletes and must be null otherwise.
+    /// Required when content is EqualityDeletes and must be `None` otherwise.
     /// Fields with ids listed in this column must be present in the delete file
     #[field_id = 135]
     #[element_field_id = 136]
     pub(crate) equality_ids: Option<Vec<i32>>,
+
+    /// The AMT/Iceberg format version this entry was written at (Iceberg field id 157).
+    #[field_id = 157]
+    pub(crate) format_version: i32,
 
     /// Metadata tags for this file, propagated from the Add action. Map values can be null.
     ///
@@ -322,8 +330,12 @@ pub(crate) struct ManifestInfo {
     #[field_id = 516]
     pub(crate) min_sequence_number: i64,
 
+    /// Serialized deletion vector covering the manifest's entries, or `None` when the manifest has
+    /// no associated deletion vector. Encoded as a serialized `RoaringBitmapArray`, matching the
+    /// framing used for [`TrackingInfo::deleted_positions`].
     #[field_id = 522]
     pub(crate) dv: Option<Bytes>,
+    /// Number of set bits (deleted rows) in [`Self::dv`], or `None` when `dv` is absent.
     #[field_id = 523]
     pub(crate) dv_cardinality: Option<i64>,
 }
