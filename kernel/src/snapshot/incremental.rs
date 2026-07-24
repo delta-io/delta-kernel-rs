@@ -20,12 +20,14 @@ use crate::{DeltaResult, Engine, Error, Version};
 
 /// The assembled outcome of the listing phase of an incremental update. Listing/assembly
 /// failures surface as `Err` from [`Snapshot::build_new_segment`], not a variant here.
+///
+/// See [`Snapshot::try_new_from`] for the case taxonomy these outcomes map onto.
 enum NewSegment {
-    /// No new segment to build; the caller returns the existing snapshot unchanged (cases C.2, E).
+    /// No new segment to build; the caller returns the existing snapshot unchanged.
     Unchanged,
-    /// A checkpoint ahead of the existing snapshot requires a full rebuild from it (case D.1).
+    /// A checkpoint ahead of the existing snapshot requires a full rebuild from it.
     Rebuild(LogSegment),
-    /// New commits merged into the existing segment; ready for incremental P&M (case F, D.2 -> F).
+    /// New commits merged into the existing segment; ready for incremental P&M.
     Combined(LogSegment),
 }
 
@@ -191,10 +193,10 @@ impl Snapshot {
                 (new_metadata, new_protocol, *source)
             }
             None => {
-                // Incremental CRC replay wasn't applicable or failed (note: we have *not* yet
-                // scanned any log files). Replay the new commits `(existing_snapshot_version, end]`
-                // for P&M, rooted at the base CRC when it is newer than the existing snapshot
-                // (else the existing snapshot is the baseline).
+                // No incremental CRC to reuse: there was no base CRC, or advancing it was out of
+                // budget (note: we have *not* yet scanned any log files). Replay the new commits
+                // `(existing_snapshot_version, end]` for P&M, rooted at the base CRC when it is
+                // newer than the existing snapshot (else the existing snapshot is the baseline).
                 let newer_base = base_crc
                     .as_ref()
                     .filter(|c| c.version > existing_snapshot_version);
