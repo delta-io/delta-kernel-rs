@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ::test_utils::{get_column, load_test_data};
 use bytes::Bytes;
@@ -1245,33 +1245,82 @@ fn test_build_actions_meta_predicate_partition_column_mapping(#[case] mode: &str
     );
 }
 
-/// Helper to build a parquet file with the nested `add.stats_parsed.*` structure that
-/// checkpoint files have. Returns the parquet bytes and the arrow schema.
-///
-/// Each call to `write_row_group` writes one row group. Each row represents one add action's
-/// stats with maxValues.id, minValues.id, nullCount.id, and numRecords.
+struct RgSpec {
+    id: i64,
+    x_min: i64,
+    x_max: i64,
+    part: Option<&'static str>,
+}
+
+struct CheckpointRowGroup {
+    id_max: Vec<Option<i64>>,
+    id_min: Vec<Option<i64>>,
+    id_null_counts: Vec<Option<i64>>,
+    x_max: Vec<Option<i64>>,
+    x_min: Vec<Option<i64>>,
+    x_null_counts: Vec<Option<i64>>,
+    num_records: Vec<i64>,
+    parts: Vec<Option<&'static str>>,
+}
+
+/// Builds checkpoint parquet with one row group per write.
 struct CheckpointParquetBuilder {
     arrow_schema: Arc<ArrowSchema>,
-    id_fields: Fields,
+    stat_value_fields: Fields,
     stats_fields: Fields,
+    partition_fields: Fields,
+    add_fields: Fields,
+    include_partition_values: bool,
     buffer: Vec<u8>,
     writer: Option<ArrowWriter<Vec<u8>>>,
 }
 
 impl CheckpointParquetBuilder {
     fn new() -> Self {
-        let id_fields = Fields::from(vec![Field::new("id", ArrowDataType::Int64, true)]);
+        Self::with_partition_values(true)
+    }
+
+    fn without_partition_values() -> Self {
+        Self::with_partition_values(false)
+    }
+
+    fn with_partition_values(include_partition_values: bool) -> Self {
+        let stat_value_fields = Fields::from(vec![
+            Field::new("id", ArrowDataType::Int64, true),
+            Field::new("x", ArrowDataType::Int64, true),
+        ]);
         let stats_fields = Fields::from(vec![
-            Field::new(MAX_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new(MIN_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new(NULL_COUNT, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(
+                MAX_VALUES,
+                ArrowDataType::Struct(stat_value_fields.clone()),
+                true,
+            ),
+            Field::new(
+                MIN_VALUES,
+                ArrowDataType::Struct(stat_value_fields.clone()),
+                true,
+            ),
+            Field::new(
+                NULL_COUNT,
+                ArrowDataType::Struct(stat_value_fields.clone()),
+                true,
+            ),
             Field::new(NUM_RECORDS, ArrowDataType::Int64, true),
         ]);
-        let add_fields = Fields::from(vec![Field::new(
+        let partition_fields = Fields::from(vec![Field::new("part", ArrowDataType::Utf8, true)]);
+        let mut add_fields = vec![Field::new(
             "stats_parsed",
             ArrowDataType::Struct(stats_fields.clone()),
             true,
-        )]);
+        )];
+        if include_partition_values {
+            add_fields.push(Field::new(
+                "partitionValues_parsed",
+                ArrowDataType::Struct(partition_fields.clone()),
+                true,
+            ));
+        }
+        let add_fields = Fields::from(add_fields);
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "add",
             ArrowDataType::Struct(add_fields.clone()),
@@ -1279,11 +1328,13 @@ impl CheckpointParquetBuilder {
         )]));
         let buffer = Vec::new();
         let writer = ArrowWriter::try_new(buffer, arrow_schema.clone(), None).unwrap();
-        // ArrowWriter takes ownership of buffer, so we use a placeholder here.
         Self {
             arrow_schema,
-            id_fields,
+            stat_value_fields,
             stats_fields,
+            partition_fields,
+            add_fields,
+            include_partition_values,
             buffer: Vec::new(),
             writer: Some(writer),
         }
@@ -1297,50 +1348,83 @@ impl CheckpointParquetBuilder {
         null_counts: &[Option<i64>],
         num_records: &[i64],
     ) {
-        let make_id_struct = |vals: &[Option<i64>]| -> StructArray {
-            StructArray::from(vec![(
-                Arc::new(Field::new("id", ArrowDataType::Int64, true)),
-                Arc::new(Int64Array::from(vals.to_vec())) as Arc<dyn Array>,
-            )])
+        let len = max_ids.len();
+        self.write_values(CheckpointRowGroup {
+            id_max: max_ids.to_vec(),
+            id_min: min_ids.to_vec(),
+            id_null_counts: null_counts.to_vec(),
+            x_max: vec![None; len],
+            x_min: vec![None; len],
+            x_null_counts: vec![None; len],
+            num_records: num_records.to_vec(),
+            parts: vec![None; len],
+        });
+    }
+
+    fn write_rg_group(&mut self, group: &[RgSpec]) {
+        let ids: Vec<Option<i64>> = group.iter().map(|spec| Some(spec.id)).collect();
+        let zeros = vec![Some(0); group.len()];
+        self.write_values(CheckpointRowGroup {
+            id_max: ids.clone(),
+            id_min: ids,
+            id_null_counts: zeros.clone(),
+            x_max: group.iter().map(|spec| Some(spec.x_max)).collect(),
+            x_min: group.iter().map(|spec| Some(spec.x_min)).collect(),
+            x_null_counts: zeros,
+            num_records: vec![1; group.len()],
+            parts: group.iter().map(|spec| spec.part).collect(),
+        });
+    }
+
+    fn write_values(&mut self, values: CheckpointRowGroup) {
+        let make_stat_struct = |ids: Vec<Option<i64>>, xs: Vec<Option<i64>>| {
+            StructArray::from(vec![
+                (
+                    self.stat_value_fields[0].clone(),
+                    Arc::new(Int64Array::from(ids)) as Arc<dyn Array>,
+                ),
+                (
+                    self.stat_value_fields[1].clone(),
+                    Arc::new(Int64Array::from(xs)) as Arc<dyn Array>,
+                ),
+            ])
         };
         let stats_parsed = StructArray::from(vec![
             (
-                Arc::new(Field::new(
-                    MAX_VALUES,
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(max_ids)) as Arc<dyn Array>,
+                self.stats_fields[0].clone(),
+                Arc::new(make_stat_struct(values.id_max, values.x_max)) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new(
-                    MIN_VALUES,
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(min_ids)) as Arc<dyn Array>,
+                self.stats_fields[1].clone(),
+                Arc::new(make_stat_struct(values.id_min, values.x_min)) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new(
-                    NULL_COUNT,
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(null_counts)) as Arc<dyn Array>,
+                self.stats_fields[2].clone(),
+                Arc::new(make_stat_struct(
+                    values.id_null_counts,
+                    values.x_null_counts,
+                )) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
-                Arc::new(Int64Array::from(num_records.to_vec())) as Arc<dyn Array>,
+                self.stats_fields[3].clone(),
+                Arc::new(Int64Array::from(values.num_records)) as Arc<dyn Array>,
             ),
         ]);
-        let add = StructArray::from(vec![(
-            Arc::new(Field::new(
-                "stats_parsed",
-                ArrowDataType::Struct(self.stats_fields.clone()),
-                true,
-            )),
+        let mut add_children = vec![(
+            self.add_fields[0].clone(),
             Arc::new(stats_parsed) as Arc<dyn Array>,
-        )]);
+        )];
+        if self.include_partition_values {
+            let partition_values = StructArray::from(vec![(
+                self.partition_fields[0].clone(),
+                Arc::new(StringArray::from(values.parts)) as Arc<dyn Array>,
+            )]);
+            add_children.push((
+                self.add_fields[1].clone(),
+                Arc::new(partition_values) as Arc<dyn Array>,
+            ));
+        }
+        let add = StructArray::from(add_children);
         let batch = RecordBatch::try_new(self.arrow_schema.clone(), vec![Arc::new(add)]).unwrap();
         let writer = self.writer.as_mut().unwrap();
         writer.write(&batch).unwrap();
@@ -1355,14 +1439,35 @@ impl CheckpointParquetBuilder {
     }
 }
 
+fn rg(id: i64, x_min: i64, x_max: i64, part: Option<&'static str>) -> RgSpec {
+    RgSpec {
+        id,
+        x_min,
+        x_max,
+        part,
+    }
+}
+
+fn write_checkpoint(groups: &[&[RgSpec]], include_partition_values: bool) -> Bytes {
+    let mut builder = if include_partition_values {
+        CheckpointParquetBuilder::new()
+    } else {
+        CheckpointParquetBuilder::without_partition_values()
+    };
+    for group in groups {
+        builder.write_rg_group(group);
+    }
+    builder.finish()
+}
+
 /// Builds a checkpoint meta-predicate scoped under `add`, mirroring `build_actions_meta_predicate`.
-fn build_checkpoint_meta_predicate(pred: &Pred) -> Option<Pred> {
-    let skipping_pred = as_checkpoint_skipping_predicate(
-        pred,
-        &HashSet::new(),
-        &HashSet::new(),
-        &all_referenced_columns(pred),
-    )?;
+fn build_checkpoint_meta_predicate(
+    pred: &Pred,
+    partition_columns: &HashSet<ColumnName>,
+    stats_columns: &HashSet<ColumnName>,
+) -> Option<Pred> {
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(pred, partition_columns, &HashSet::new(), stats_columns)?;
     let mut prefixer = PrefixColumns {
         prefix: ColumnName::new(["add"]),
     };
@@ -1436,7 +1541,8 @@ fn test_checkpoint_row_group_skipping(
     );
     let parquet_bytes = builder.finish();
 
-    let meta_predicate = build_checkpoint_meta_predicate(&pred);
+    let meta_predicate =
+        build_checkpoint_meta_predicate(&pred, &HashSet::new(), &all_referenced_columns(&pred));
 
     match expected_rows {
         Some(expected) => {
@@ -1457,6 +1563,280 @@ fn test_checkpoint_row_group_skipping(
             assert_eq!(total_rows, 6, "all rows should be read without a predicate");
         }
     }
+}
+
+fn surviving_ids(parquet_bytes: Bytes, pred: &Pred) -> Vec<i64> {
+    let meta_predicate = build_checkpoint_meta_predicate(
+        pred,
+        &HashSet::from([column_name!("part")]),
+        &HashSet::from([column_name!("x")]),
+    );
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes).unwrap();
+    if let Some(meta_predicate) = &meta_predicate {
+        builder = builder.with_row_group_filter(meta_predicate, None);
+    }
+    let mut ids: Vec<i64> = builder
+        .build()
+        .unwrap()
+        .map(Result::unwrap)
+        .flat_map(|batch| {
+            let add = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let stats = struct_field(add, "stats_parsed");
+            let min = struct_field(stats, MIN_VALUES);
+            min.column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn struct_field<'a>(parent: &'a StructArray, name: &str) -> &'a StructArray {
+    parent
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+}
+
+fn standard_multi_rg() -> Bytes {
+    write_checkpoint(
+        &[
+            &[rg(1, 0, 10, Some("a"))],
+            &[rg(2, 100, 110, Some("b"))],
+            &[rg(3, 200, 210, Some("a"))],
+            &[rg(4, 900, 910, Some("c"))],
+        ],
+        true,
+    )
+}
+
+#[rstest]
+#[case::stats_gt(Pred::gt(column_expr!("x"), Expr::literal(150i64)), vec![3, 4])]
+#[case::stats_le(Pred::le(column_expr!("x"), Expr::literal(110i64)), vec![1, 2])]
+#[case::stats_all_kept(
+    Pred::ge(column_expr!("x"), Expr::literal(0i64)),
+    vec![1, 2, 3, 4]
+)]
+#[case::partition_eq(Pred::eq(column_expr!("part"), Expr::literal("a")), vec![1, 3])]
+#[case::partition_lt(Pred::lt(column_expr!("part"), Expr::literal("b")), vec![1, 3])]
+#[case::partition_all_pruned(Pred::eq(column_expr!("part"), Expr::literal("z")), vec![])]
+#[case::and_stats_and_partition(
+    Pred::and(
+        Pred::eq(column_expr!("part"), Expr::literal("a")),
+        Pred::gt(column_expr!("x"), Expr::literal(150i64)),
+    ),
+    vec![3]
+)]
+#[case::or_stats_or_partition(
+    Pred::or(
+        Pred::eq(column_expr!("part"), Expr::literal("c")),
+        Pred::gt(column_expr!("x"), Expr::literal(150i64)),
+    ),
+    vec![3, 4]
+)]
+#[case::partition_is_null(Pred::is_null(column_expr!("part")), vec![])]
+#[case::partition_is_not_null(
+    Pred::is_not_null(column_expr!("part")),
+    vec![1, 2, 3, 4]
+)]
+fn test_checkpoint_reader_skips_expected_row_groups(
+    #[case] pred: Pred,
+    #[case] expected: Vec<i64>,
+) {
+    assert_eq!(
+        surviving_ids(standard_multi_rg(), &pred),
+        expected,
+        "{pred:?}"
+    );
+}
+
+#[rstest]
+#[case::is_null_keeps_only_null_group(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None)], &[rg(3, 200, 210, Some("c"))]],
+    Pred::is_null(column_expr!("part")),
+    vec![2],
+)]
+// Footer min/max ignore the null-valued Add, so the non-matching range prunes the group.
+#[case::mixed_group_with_null_partition_pruned(
+    &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, None)] as &[RgSpec]],
+    Pred::eq(column_expr!("part"), Expr::literal("z")),
+    vec![],
+)]
+#[case::partition_range_contains_target(
+    &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, Some("c"))] as &[RgSpec]],
+    Pred::eq(column_expr!("part"), Expr::literal("b")),
+    vec![1, 2],
+)]
+#[case::all_null_group_pruned_under_eq(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Pred::eq(column_expr!("part"), Expr::literal("z")),
+    vec![],
+)]
+#[case::all_null_group_pruned_under_gt(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Pred::gt(column_expr!("part"), Expr::literal("m")),
+    vec![],
+)]
+#[case::all_null_group_pruned_under_is_not_null(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Pred::is_not_null(column_expr!("part")),
+    vec![1],
+)]
+fn test_checkpoint_reader_handles_partition_groups(
+    #[case] groups: &[&[RgSpec]],
+    #[case] pred: Pred,
+    #[case] expected: Vec<i64>,
+) {
+    let parquet_bytes = write_checkpoint(groups, true);
+    assert_eq!(surviving_ids(parquet_bytes, &pred), expected, "{pred:?}");
+}
+
+/// A checkpoint may omit `partitionValues_parsed`; the absent leaf remains non-pruning.
+#[rstest]
+#[case::comparison(Pred::eq(column_expr!("part"), Expr::literal("z")))]
+#[case::is_not_null(Pred::is_not_null(column_expr!("part")))]
+fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
+    let parquet_bytes = write_checkpoint(&[&[rg(1, 0, 10, Some("a"))] as &[RgSpec]], false);
+    assert_eq!(surviving_ids(parquet_bytes, &pred), vec![1]);
+}
+
+#[derive(Debug)]
+struct RecordedParquetRead {
+    files: Vec<String>,
+    predicate: Option<PredicateRef>,
+}
+
+struct RecordingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    reads: Mutex<Vec<RecordedParquetRead>>,
+}
+
+impl ParquetHandler for RecordingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: schema::SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.reads.lock().unwrap().push(RecordedParquetRead {
+            files: files.iter().map(|file| file.location.to_string()).collect(),
+            predicate: predicate.clone(),
+        });
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+}
+
+struct RecordingParquetEngine {
+    inner: Arc<SyncEngine>,
+    parquet: Arc<RecordingParquetHandler>,
+}
+
+impl RecordingParquetEngine {
+    fn new(inner: Arc<SyncEngine>) -> Self {
+        Self {
+            parquet: Arc::new(RecordingParquetHandler {
+                inner: inner.parquet_handler(),
+                reads: Mutex::new(Vec::new()),
+            }),
+            inner,
+        }
+    }
+
+    fn take_reads(&self) -> Vec<RecordedParquetRead> {
+        std::mem::take(&mut *self.parquet.reads.lock().unwrap())
+    }
+}
+
+impl Engine for RecordingParquetEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet.clone()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.inner.storage_handler()
+    }
+}
+
+#[rstest]
+#[case::v1_partition(
+    "v1-multi-part-partitioned-struct-stats-only",
+    Pred::eq(column_expr!("part"), Expr::literal(1i32)),
+    column_name!("add.partitionValues_parsed.part"),
+    ".checkpoint.",
+)]
+#[case::v2_sidecar(
+    "v2-parquet-sidecars-struct-stats-only",
+    Pred::gt(column_expr!("id"), Expr::literal(2i64)),
+    column_name!("add.stats_parsed.maxValues.id"),
+    "_sidecars/",
+)]
+fn test_checkpoint_predicate_reaches_parquet_handler(
+    #[case] table: &str,
+    #[case] pred: Pred,
+    #[case] expected_ref: ColumnName,
+    #[case] expected_file_fragment: &str,
+) {
+    let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    engine.take_reads();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(pred))
+        .build()
+        .unwrap();
+    for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
+        action.unwrap();
+    }
+
+    let reads = engine.take_reads();
+    assert!(
+        reads.iter().any(|read| {
+            read.files
+                .iter()
+                .any(|file| file.contains(expected_file_fragment))
+                && read
+                    .predicate
+                    .as_ref()
+                    .is_some_and(|predicate| predicate.references().contains(&expected_ref))
+        }),
+        "expected {expected_ref} on a {expected_file_fragment} read, got {reads:#?}"
+    );
 }
 
 #[test]
