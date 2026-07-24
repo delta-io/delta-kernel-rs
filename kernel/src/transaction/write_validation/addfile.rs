@@ -32,6 +32,9 @@ impl StagedDataValidator {
 /// Required fields: `path`, `partitionValues`, `size`, `modificationTime`, and `dataChange`.
 /// Optional fields: `stats`, `tags`, `deletionVector`, `baseRowId`,
 /// `defaultRowCommitVersion`, and `clusteringProvider`.
+///
+/// NOTE: Currently, Kernel doesn't require connectors to set dataChange for staged addFile.
+/// TODO(2869): Add intent-based validation for dataChange.
 pub(crate) struct AddFileRequiredFields;
 
 fn validate_required_add_file_field_exist<T>(
