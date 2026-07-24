@@ -502,8 +502,8 @@ fn partition_value_expr(col: &ColumnName) -> Expr {
     Expr::from(ColumnName::new([PARTITION_VALUES_PARSED_NAME]).join(col))
 }
 
-/// Whether an expression references a typed partition value in the unified skipping schema.
-fn is_partition_value_expr(expr: &Expr) -> bool {
+/// Whether a rewritten stat expression references `partitionValues_parsed`.
+fn is_partition_value_reference(expr: &Expr) -> bool {
     matches!(expr, Expr::Column(name)
         if name.path().first().is_some_and(|f| f == PARTITION_VALUES_PARSED_NAME))
 }
@@ -612,10 +612,6 @@ impl<'a> DataSkippingPredicateCreator<'a> {
         }
     }
 
-    fn is_partition_column(&self, col: &ColumnName) -> bool {
-        self.data_skipping_columns.is_partition_column(col)
-    }
-
     /// Wraps a predicate with `OR(NOT is_add, pred)` to protect Remove rows from being
     /// filtered. Used for partition predicates (Remove rows have null add-side partition
     /// values, which would incorrectly evaluate to false) and for opaque-predicate rewrites
@@ -670,7 +666,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         inverted: bool,
     ) -> Option<Pred> {
         // Detect partition columns by the prefix set in get_min_stat/get_max_stat.
-        let is_partition = is_partition_value_expr(&col);
+        let is_partition = is_partition_value_reference(&col);
         let cmp = comparison_predicate(ord, col, val, inverted);
         Some(if is_partition {
             self.guard_for_removes(cmp)
@@ -691,7 +687,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
     /// wrapped with `OR(NOT is_add, ...)` to protect Remove rows from being filtered.
     /// For data columns, uses nullCount stats.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
-        if self.is_partition_column(col) {
+        if self.data_skipping_columns.is_partition_column(col) {
             let pv_expr = partition_value_expr(col);
             let pred = if inverted {
                 Pred::is_not_null(pv_expr)
@@ -750,10 +746,6 @@ struct CheckpointDataSkippingPredicateCreator<'a> {
 }
 
 impl CheckpointDataSkippingPredicateCreator<'_> {
-    fn is_partition_column(&self, col: &ColumnName) -> bool {
-        self.data_skipping_columns.is_partition_column(col)
-    }
-
     fn partition_min_max_may_omit_values(&self, col: &ColumnName) -> bool {
         self.physical_floating_partition_columns.contains(col)
     }
@@ -818,7 +810,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         inverted: bool,
     ) -> Option<Pred> {
         let comparison = comparison_predicate(ord, col.clone(), val, inverted);
-        Some(if is_partition_value_expr(&col) {
+        Some(if is_partition_value_reference(&col) {
             comparison
         } else {
             Pred::or(Pred::is_null(col), comparison)
@@ -840,7 +832,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
     // Skippable when the nullCount and numRecords ranges don't overlap (e.g. nullCount in
     // [0, 0] vs numRecords in [500, 2000] proves all files have non-null values).
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
-        if self.is_partition_column(col) {
+        if self.data_skipping_columns.is_partition_column(col) {
             let partition_value = partition_value_expr(col);
             return Some(if inverted {
                 Pred::is_not_null(partition_value)
