@@ -1887,6 +1887,12 @@ mod tests {
                 )
             });
             assert_eq!(unsafe { version(published_snapshot.shallow_copy()) }, 1);
+            assert!(
+                !std::ptr::eq(unsafe { post_commit_snapshot.as_ref() }, unsafe {
+                    published_snapshot.as_ref()
+                },),
+                "first publish should return a new snapshot carrying published state"
+            );
 
             let published_commit_url = table_url
                 .join("_delta_log/00000000000000000001.json")
@@ -1911,7 +1917,12 @@ mod tests {
                     engine.shallow_copy(),
                 )
             });
-            assert_eq!(unsafe { version(republished_snapshot.shallow_copy()) }, 1);
+            assert!(
+                std::ptr::eq(unsafe { published_snapshot.as_ref() }, unsafe {
+                    republished_snapshot.as_ref()
+                },),
+                "second publish should short-circuit and return the same snapshot"
+            );
 
             unsafe { free_snapshot(republished_snapshot) };
             unsafe { free_snapshot(published_snapshot) };

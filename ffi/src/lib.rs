@@ -1240,15 +1240,20 @@ pub unsafe extern "C" fn checkpoint_snapshot(
         .into_extern_result(&engine_ref)
 }
 
-/// Publish unpublished catalog commits on a catalog-managed snapshot. Mirrors the kernel's
-/// [`delta_kernel::snapshot::Snapshot::publish`] API across the C ABI.
+/// Publish unpublished catalog commits on a catalog-managed snapshot.
 ///
-/// The caller owns the returned snapshot handle and must release it via [`free_snapshot`].
-/// The input snapshot and committer handles are borrowed, not consumed.
+/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
+/// nothing to publish. Errors when unpublished commits exist but the table is not
+/// catalog-managed or the committer is not a catalog committer.
+///
+/// Caller owns the returned handle ([`free_snapshot`]). Input snapshot and committer are
+/// borrowed, not consumed. The returned snapshot carries the published watermark used by
+/// subsequent catalog commits — use it for the next `transaction_with_committer` / checkpoint.
 ///
 /// # Safety
 ///
-/// Caller must pass valid snapshot, committer, and engine handles.
+/// Caller must pass valid snapshot, committer, and engine handles, and must ensure no other
+/// thread accesses the committer handle for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_publish_with_committer(
     snapshot: Handle<SharedSnapshot>,

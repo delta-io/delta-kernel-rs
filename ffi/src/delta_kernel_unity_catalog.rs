@@ -223,9 +223,9 @@ fn get_uc_committer_impl(
     Ok(committer.into())
 }
 
-/// Free a committer obtained via get_uc_committer. Warning! Normally the value returned here will
-/// be consumed when creating a transaction via [`crate::transaction::transaction_with_committer`]
-/// and will NOT need to be freed.
+/// Free a committer obtained via [`get_uc_committer`]. Note that
+/// [`crate::transaction::transaction_with_committer`] consumes the committer (do not free);
+/// [`crate::snapshot_publish_with_committer`] borrows it and the caller must free it here.
 ///
 /// # Safety
 ///
