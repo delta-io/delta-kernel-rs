@@ -367,7 +367,40 @@ pub struct StructField {
     /// The data type of this field
     #[serde(rename = "type")]
     pub data_type: DataType,
-    /// Denotes whether this Field can be null
+    /// Denotes whether this field is logically nullable.
+    ///
+    /// Logical nullability differs from physical nullability: whether the field can
+    /// actually be null in valid data. A field is physically nullable if and only
+    /// if it is logically nullable, or any of its ancestors is null.
+    ///
+    /// A physically non-nullable field must never be null. A physically nullable field
+    /// may be null.
+    ///
+    /// # Examples
+    ///
+    /// Positive example: schema: `s: struct<a: int (nullable=false)> (nullable=true)`
+    /// ```json
+    /// // schema
+    /// { "name": "s", "nullable": true, "type": {
+    ///     "type": "struct",
+    ///     "fields": [{ "name": "a", "nullable": false, "type": "integer" }]
+    /// }}
+    /// // data
+    /// // s is logically nullable and physically nullable.
+    /// // s.a is logically non-nullable but physically nullable, because its parent `s` is null.
+    /// { "s": null, "s.a": null }  // acceptable
+    /// ```
+    ///
+    /// Negative example: schema: `s: struct<a: int (nullable=false)> (nullable=false)`
+    /// ```json
+    /// // schema
+    /// { "name": "s", "nullable": false, "type": {
+    ///     "type": "struct",
+    ///     "fields": [{ "name": "a", "nullable": false, "type": "integer" }]
+    /// }}
+    /// // data
+    /// { "s": { "a": null } }  // invalid: s.a is physically non-nullable but null.
+    /// ```
     pub nullable: bool,
     /// A JSON map containing information about this column
     pub metadata: HashMap<String, MetadataValue>,
