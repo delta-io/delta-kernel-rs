@@ -13,12 +13,11 @@ use crate::actions::{
     action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, MAX_VALUES,
     MIN_VALUES, SIDECAR_NAME,
 };
-use crate::cancellation::{check_cancelled, CancellableIterator, CancellationTokenRef};
+use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
-use crate::log_reader::{read_json_files_cancellable, read_parquet_files_cancellable};
 use crate::log_replay::ActionsBatch;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
@@ -929,15 +928,13 @@ impl LogSegment {
         }
     }
 
-    /// Reads a parquet footer schema, failing fast if cancellation was already requested. The
-    /// pre-read `check_cancelled` is the only cancellation point when the engine uses the default
-    /// (non-cancellation-aware) footer impl, so it must stay paired with the read.
+    /// Reads a parquet footer schema, threading the cancellation token so a cancelled request can
+    /// stop before or during the read (the read itself fails fast on an already-cancelled token).
     fn read_footer_schema(
         engine: &dyn Engine,
         file: &FileMeta,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<SchemaRef> {
-        check_cancelled(cancellation_token)?;
         Ok(engine
             .parquet_handler()
             .read_parquet_footer_with_cancellation(file, cancellation_token.cloned())?
@@ -1082,23 +1079,21 @@ impl LogSegment {
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.listed.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                read_json_files_cancellable(
-                    engine,
+                engine.json_handler().read_json_files_with_cancellation(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                    cancellation_token,
+                    cancellation_token.cloned(),
                 )?
             }
-            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => {
-                read_parquet_files_cancellable(
-                    engine,
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => engine
+                .parquet_handler()
+                .read_parquet_files_with_cancellation(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
                     meta_predicate.clone(),
-                    cancellation_token,
-                )?
-            }
+                    cancellation_token.cloned(),
+                )?,
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
                     "Unsupported checkpoint file type: {}",
@@ -1115,13 +1110,14 @@ impl LogSegment {
         // Both checkpoint and sidecar parquet files share the same `add.stats_parsed.*` column
         // layout, so we reuse the same predicate for row group skipping.
         let sidecar_batches = if !sidecar_files.is_empty() {
-            read_parquet_files_cancellable(
-                engine,
-                &sidecar_files,
-                augmented_checkpoint_read_schema.clone(),
-                meta_predicate,
-                cancellation_token,
-            )?
+            engine
+                .parquet_handler()
+                .read_parquet_files_with_cancellation(
+                    &sidecar_files,
+                    augmented_checkpoint_read_schema.clone(),
+                    meta_predicate,
+                    cancellation_token.cloned(),
+                )?
         } else {
             Box::new(std::iter::empty())
         };
@@ -1153,20 +1149,20 @@ impl LogSegment {
     ) -> DeltaResult<Vec<FileMeta>> {
         // Read checkpoint with just the sidecar column
         let batches = match checkpoint.extension.as_str() {
-            "json" => read_json_files_cancellable(
-                engine,
+            "json" => engine.json_handler().read_json_files_with_cancellation(
                 std::slice::from_ref(&checkpoint.location),
                 Self::sidecar_read_schema(),
                 None,
-                cancellation_token,
+                cancellation_token.cloned(),
             )?,
-            "parquet" => read_parquet_files_cancellable(
-                engine,
-                std::slice::from_ref(&checkpoint.location),
-                Self::sidecar_read_schema(),
-                None,
-                cancellation_token,
-            )?,
+            "parquet" => engine
+                .parquet_handler()
+                .read_parquet_files_with_cancellation(
+                    std::slice::from_ref(&checkpoint.location),
+                    Self::sidecar_read_schema(),
+                    None,
+                    cancellation_token.cloned(),
+                )?,
             _ => return Ok(vec![]),
         };
 

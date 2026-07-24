@@ -102,10 +102,8 @@ where
     if token.is_cancelled() {
         return None;
     }
-    // The owned `token` moves into the async block so the awaited `cancelled()` future borrows an
-    // owned local, keeping the whole future `'static` as `block_on` requires.
     task_executor.block_on(async move {
-        let cancelled = token.cancelled();
+        let cancelled = token.cancelled_future();
         futures::pin_mut!(cancelled);
         match future::select(std::pin::pin!(future), cancelled).await {
             Either::Left((output, _)) => Some(output),

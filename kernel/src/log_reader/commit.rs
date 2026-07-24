@@ -3,7 +3,6 @@
 use itertools::Itertools;
 
 use crate::cancellation::CancellationTokenRef;
-use crate::log_reader::read_json_files_cancellable;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
@@ -29,9 +28,15 @@ impl CommitReader {
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let commit_files = log_segment.find_commit_cover();
-        let actions =
-            read_json_files_cancellable(engine, &commit_files, schema, None, cancellation_token)?
-                .map_ok(|batch| ActionsBatch::new(batch, true));
+        let actions = engine
+            .json_handler()
+            .read_json_files_with_cancellation(
+                &commit_files,
+                schema,
+                None,
+                cancellation_token.cloned(),
+            )?
+            .map_ok(|batch| ActionsBatch::new(batch, true));
 
         Ok(Self {
             actions: Box::new(actions),

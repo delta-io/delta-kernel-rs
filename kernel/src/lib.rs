@@ -184,6 +184,7 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
+use cancellation::check_cancelled;
 pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
@@ -702,14 +703,22 @@ pub trait JsonHandler: AsAny {
     /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
     /// rather than reading every file to completion.
     ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_json_files`](Self::read_json_files), ignoring the token
+    /// for the rest of the read. So an engine that does not override this stays source-compatible
+    /// while still honoring an up-front cancellation; kernel additionally polls the token at
+    /// action-batch boundaries. An engine that overrides this may assume kernel has already
+    /// performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_json_files_with_cancellation(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-        _cancellation_token: Option<CancellationTokenRef>,
+        cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        check_cancelled(cancellation_token.as_ref())?;
         self.read_json_files(files, physical_schema, predicate)
     }
 
@@ -925,14 +934,22 @@ pub trait ParquetHandler: AsAny {
     /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
     /// rather than reading every file to completion.
     ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_parquet_files`](Self::read_parquet_files), ignoring the
+    /// token for the rest of the read. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation; kernel additionally polls
+    /// the token at action-batch boundaries. An engine that overrides this may assume kernel has
+    /// already performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_files_with_cancellation(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-        _cancellation_token: Option<CancellationTokenRef>,
+        cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        check_cancelled(cancellation_token.as_ref())?;
         self.read_parquet_files(files, physical_schema, predicate)
     }
 
@@ -1020,12 +1037,20 @@ pub trait ParquetHandler: AsAny {
     /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
     /// and return [`Error::Cancelled`] once cancellation is observed.
     ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
+    /// token for the rest of the read. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation. An engine that overrides
+    /// this may assume kernel has already performed the pre-read check, and should focus on
+    /// interrupting its in-flight I/O.
+    ///
     /// [`Error::Cancelled`]: crate::Error::Cancelled
     fn read_parquet_footer_with_cancellation(
         &self,
         file: &FileMeta,
-        _cancellation_token: Option<CancellationTokenRef>,
+        cancellation_token: Option<CancellationTokenRef>,
     ) -> DeltaResult<ParquetFooter> {
+        check_cancelled(cancellation_token.as_ref())?;
         self.read_parquet_footer(file)
     }
 }
