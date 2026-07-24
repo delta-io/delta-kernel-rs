@@ -16,6 +16,7 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
@@ -222,6 +223,7 @@ pub struct ScanBuilder {
     correlation_id: Option<Arc<str>>,
     without_row_transforms: bool,
     partition_values: PartitionValuesOptions,
+    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -248,6 +250,7 @@ impl ScanBuilder {
             correlation_id: None,
             without_row_transforms: false,
             partition_values: PartitionValuesOptions::default(),
+            cancellation_token: None,
         }
     }
 
@@ -342,6 +345,27 @@ impl ScanBuilder {
         self
     }
 
+    /// Provide a [`CancellationToken`] so a cancelled request can stop an in-flight
+    /// [`scan_metadata`](Scan::scan_metadata) log replay instead of running to completion.
+    ///
+    /// Cancellation is cooperative: kernel polls the token at each action-batch boundary, and a
+    /// cancellation-aware [`Engine`] additionally races its checkpoint/commit reads against it.
+    /// On cancellation the scan surfaces [`Error::Cancelled`] -- either returned directly from
+    /// [`scan_metadata`](Scan::scan_metadata) when the token is already cancelled before replay
+    /// begins, or as the terminal item of its iterator -- never as a silent early `None`, so a
+    /// cancelled listing cannot be mistaken for a complete one. With no token the scan is not
+    /// cancellable.
+    ///
+    /// [`CancellationToken`]: crate::CancellationToken
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    pub fn with_cancellation_token(
+        mut self,
+        token: impl Into<Option<CancellationTokenRef>>,
+    ) -> Self {
+        self.cancellation_token = token.into();
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -392,6 +416,7 @@ impl ScanBuilder {
             stats: self.stats,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
+            cancellation_token: self.cancellation_token,
         })
     }
 }
@@ -653,6 +678,9 @@ pub struct Scan {
     stats: StatsOptions,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
+    /// Optional cooperative cancellation token supplied via
+    /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
+    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for Scan {
@@ -900,6 +928,10 @@ impl Scan {
                 .as_ref()
                 .map(|s| s.as_ref()),
             None,
+            // The incremental path relies on the batch-boundary poll in `scan_metadata_inner`
+            // for cancellation; it does not thread the token into the engine reads here, so a
+            // read already in flight is not interrupted mid-I/O.
+            None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
             actions: result
@@ -932,9 +964,15 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
+                // Wrap the input iterator (not the shared `process_actions_iter`) so token
+                // polling stays scoped to scans.
+                let actions = CancellableIterator::new(
+                    actions_with_checkpoint_info.actions,
+                    self.cancellation_token.clone(),
+                );
                 let (it, m) = scan_action_iter(
                     engine,
-                    actions_with_checkpoint_info.actions,
+                    actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
                     self.stats_options(),
@@ -990,6 +1028,7 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                self.cancellation_token.as_ref(),
             )
     }
 
@@ -1042,6 +1081,10 @@ impl Scan {
     /// This method returns a [`SequentialScanMetadata`] iterator that processes commits and
     /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
     /// to determine if a distributed phase is needed.
+    ///
+    /// Cancellation is not supported on this path: it errors if a token was set via
+    /// [`ScanBuilder::with_cancellation_token`], rather than silently running to completion.
+    /// Only [`scan_metadata`](Self::scan_metadata) honors the token today.
     ///
     /// # Example
     ///
@@ -1097,6 +1140,14 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<SequentialScanMetadata> {
+        // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
+        // not thread cancellation, so honoring a set token would require dropping it on the floor.
+        if self.cancellation_token.is_some() {
+            return Err(Error::unsupported(
+                "cancellation is not supported by parallel_scan_metadata; \
+                 use scan_metadata for a cancellable scan",
+            ));
+        }
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.

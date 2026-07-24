@@ -258,6 +258,13 @@ pub enum Error {
         expected: &'static str,
         actual: &'static str,
     },
+
+    /// The operation was cancelled via a [`CancellationToken`](crate::CancellationToken).
+    ///
+    /// Surfaced by cancellation-aware reads as a terminal error, distinct from normal iterator
+    /// exhaustion. See [`CancellableIterator`](crate::cancellation) for the enforced contract.
+    #[error("Operation cancelled")]
+    Cancelled,
 }
 
 // Convenience constructors for Error types that take a String argument
