@@ -834,7 +834,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        if !self.is_partition_column(col) {
+        if !self.data_skipping_columns.is_partition_column(col) {
             return None;
         }
         let ord = match op {

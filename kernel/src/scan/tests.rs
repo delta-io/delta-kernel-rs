@@ -1223,7 +1223,10 @@ fn test_build_actions_meta_predicate_partition_only(
 #[rstest]
 #[case::name_mode("name")]
 #[case::id_mode("id")]
-fn test_build_actions_meta_predicate_partition_column_mapping(#[case] mode: &str) {
+fn test_build_actions_meta_predicate_partition_column_mapping(
+    #[case] mode: &str,
+    #[values(false, true)] casted: bool,
+) {
     // `partition_cm/{name,id}` use column mapping, partitioned by `category`
     // (physical name col-6dc68f07-711d-4f00-8bd6-1f5bc698e8ad in both fixtures).
     let path =
@@ -1232,13 +1235,17 @@ fn test_build_actions_meta_predicate_partition_column_mapping(#[case] mode: &str
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    let predicate = Arc::new(Pred::eq(
-        Expr::cast(column_expr!("category"), DataType::DATE),
-        Scalar::Date(20_641),
-    ));
+    let predicate = if casted {
+        Pred::eq(
+            Expr::cast(column_expr!("category"), DataType::DATE),
+            Scalar::Date(20_641),
+        )
+    } else {
+        Pred::eq(column_expr!("category"), Expr::literal("a"))
+    };
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .build()
         .unwrap();
 
@@ -1246,10 +1253,7 @@ fn test_build_actions_meta_predicate_partition_column_mapping(#[case] mode: &str
         .build_actions_meta_predicate()
         .expect("partition predicate under column mapping should produce a meta-predicate");
     let rendered = meta_pred.to_string();
-    assert!(
-        rendered.contains("CAST(Column(add.partitionValues_parsed"),
-        "{rendered}"
-    );
+    assert_eq!(rendered.contains("CAST("), casted, "{rendered}");
     let refs: Vec<String> = meta_pred
         .references()
         .into_iter()

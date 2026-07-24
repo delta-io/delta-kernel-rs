@@ -689,6 +689,85 @@ fn test_checkpoint_skipping_partition_date_cast_comparisons(
     assert_eq!(actual.as_deref(), expected);
 }
 
+fn partition_date_cast() -> Expr {
+    Expr::cast(column_expr!("part_col"), DataType::DATE)
+}
+
+#[rstest]
+#[case::eq_match(
+    Pred::eq(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    TRUE
+)]
+#[case::eq_nomatch(
+    Pred::eq(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-08",
+    FALSE
+)]
+#[case::lt_true(
+    Pred::lt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-06",
+    TRUE
+)]
+#[case::lt_false(
+    Pred::lt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    FALSE
+)]
+#[case::gt_true(
+    Pred::gt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-08",
+    TRUE
+)]
+#[case::gt_false(
+    Pred::gt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    FALSE
+)]
+#[case::ge_boundary(
+    Pred::ge(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    TRUE
+)]
+#[case::le_boundary(
+    Pred::le(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    TRUE
+)]
+#[case::ne_match(
+    Pred::ne(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    FALSE
+)]
+#[case::ne_nomatch(
+    Pred::ne(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-08",
+    TRUE
+)]
+fn test_checkpoint_partition_cast_eval_discriminates_per_operator(
+    #[case] pred: Pred,
+    #[case] partition_value: &str,
+    #[case] expected: Option<bool>,
+) {
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &test_partition_columns(),
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        Scalar::from(partition_value),
+    )]));
+
+    expect_eq!(
+        resolver.eval(&skipping_pred),
+        expected,
+        "{pred:#?} @ {partition_value}"
+    );
+}
+
 #[test]
 fn test_partition_date_cast_is_checkpoint_only() {
     let partition_columns = test_partition_columns();
