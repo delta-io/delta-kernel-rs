@@ -15,6 +15,8 @@ use crate::schema::{
     lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::{schema, ArrayType};
 use crate::table_features::{
     FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -22,7 +24,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
     IntoEngineData, RowVisitor as _,
 };
 
@@ -60,6 +62,12 @@ pub(crate) const SIDECAR_NAME: &str = "sidecar";
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[internal_api]
+pub(crate) const CHECKPOINT_ACTION_NAME: &str = "checkpoint";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[internal_api]
+pub(crate) const CONTENT_ROOT_NAME: &str = "contentRoot";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
@@ -123,6 +131,63 @@ pub(crate) static CHECKPOINT_METADATA_FIELD: LazyLock<StructField> = LazyLock::n
 pub(crate) static SIDECAR_FIELD: LazyLock<StructField> =
     LazyLock::new(|| StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
 
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static CONTENT_ROOT_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(CONTENT_ROOT_NAME, ContentRoot::to_schema()));
+
+/// A `sidecar` element inside a `checkpoint` action array. Unlike the V2-checkpoint [`Sidecar`]
+/// (which references spilled file actions), this references spilled user `txn` / `domainMetadata`
+/// entries, discriminated by its `type` field (`"txn"` or `"domainMetadata"`). Its shape is a
+/// [`Sidecar`] prefixed with that `type` column, so the schema is composed from
+/// [`Sidecar::to_schema`] here rather than duplicated: `type` cannot be produced by [`ToSchema`]
+/// (which stringifies the Rust identifier, and `r#type` stringifies to `"r#type"`).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(
+        SIDECAR_NAME,
+        schema! {
+            not_null "type": STRING,
+            ..(Sidecar::to_schema().into_fields()),
+        },
+    )
+});
+
+/// The `checkpoint` action serializes as an array whose elements are each one of the metadata
+/// actions embedded in an adaptiveMetadata manifest commit. This schema is the union of every
+/// element type that may appear in that array (per the adaptiveMetadata RFC, delta-io/delta#6978):
+/// `checkpointMetadata`, `contentRoot`, `protocol`, `metaData`, `domainMetadata`, `txn`, `sidecar`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&CHECKPOINT_METADATA_FIELD),
+    (&CONTENT_ROOT_FIELD),
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&CONTENT_SIDECAR_FIELD),
+};
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static CHECKPOINT_ACTION_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(
+        CHECKPOINT_ACTION_NAME,
+        ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false),
+    )
+});
+
+/// The `checkpoint` action field, present only under the `adaptive-metadata-in-dev` feature;
+/// otherwise an empty iterator.
+fn checkpoint_action_field() -> impl IntoIterator<Item = &'static StructField> {
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    {
+        Some(&*CHECKPOINT_ACTION_FIELD)
+    }
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    {
+        None::<&'static StructField>
+    }
+}
+
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
     (&REMOVE_FIELD),
@@ -132,6 +197,7 @@ static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&COMMIT_INFO_FIELD),
     (&CDC_FIELD),
     (&DOMAIN_METADATA_FIELD),
+    ..(checkpoint_action_field()),
 };
 
 static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
@@ -143,6 +209,7 @@ static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&COMMIT_INFO_FIELD),
     (&CDC_FIELD),
     (&DOMAIN_METADATA_FIELD),
+    ..(checkpoint_action_field()),
     (&CHECKPOINT_METADATA_FIELD),
     (&SIDECAR_FIELD),
 };
@@ -979,6 +1046,169 @@ impl SetTransaction {
     }
 }
 
+/// Reference to a root of of an adaptive metadata tree.
+///
+/// Contains the path, size, and version of the root manifest file.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
+pub(crate) struct ContentRoot {
+    /// Path to the root manifest file, relative to the table root unless it begins with a
+    /// multi-character URI scheme (in which case it is absolute and used as-is; a single-character
+    /// scheme like `C:` is treated as a Windows drive letter and resolved relative to the table
+    /// root). A relative path is resolved by joining the table location and this path with a `/`
+    /// separator, matching the [Iceberg V4 relative paths specification]. Unlike
+    /// [`Add`]/[`Remove`] paths, this is not RFC 2396 percent-encoded.
+    ///
+    /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
+    pub(crate) path: String,
+    /// Size of the root manifest file in bytes. Not exposed directly -- use
+    /// [`ContentRoot::to_filemeta`] to get a validated [`FileMeta`].
+    size_in_bytes: i64,
+    /// The table version the root manifest reflects. Per the adaptiveMetadata RFC this is
+    /// `<= checkpointMetadata.version`: equal in a manifest commit, and strictly less in a
+    /// standalone checkpoint (where inline file actions cover the gap up to the checkpoint
+    /// version). Distinct from [`CheckpointAction::version`], which is
+    /// `checkpointMetadata.version`.
+    version: i64,
+}
+
+/// The checkpoint action embeds metadata tree state in a Delta log entry.
+///
+/// When a manifest commit occurs, the Delta log entry contains a `checkpoint` action that
+/// references a root manifest file. The `version` field indicates the table version up to
+/// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
+/// the table protocol and metadata, making the commit self-contained with respect to P+M.
+///
+///
+/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
+///
+/// Example manifest-commit JSON:
+/// ```json
+/// { "checkpoint": [
+///     { "checkpointMetadata": { "version": 42 } },
+///     { "contentRoot": { "path": "...", "sizeInBytes": 1024, "version": 42 } },
+///     { "protocol": { ... } },
+///     { "metaData": { ... } },
+///     { "txn": { ... } },
+///     { "domainMetadata": { ... } },
+///     { "sidecar": { "type": "txn", "path": "...", "sizeInBytes": 1024, "modificationTime": 0 } }
+///   ]
+/// }
+/// ```
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct CheckpointAction {
+    /// The table version up to which the checkpoint is complete, sourced from the wire
+    /// `checkpointMetadata.version`. May be less than or equal to the commit version containing
+    /// this checkpoint action, and is `>= content_root.version` (see [`ContentRoot::version`]).
+    pub(crate) version: i64,
+    /// Reference to the root manifest file.
+    pub(crate) content_root: ContentRoot,
+    /// The table protocol at the checkpoint version.
+    pub(crate) protocol: Protocol,
+    /// The table metadata at the checkpoint version.
+    pub(crate) metadata: Metadata,
+    /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint array.
+    pub(crate) transactions: Vec<SetTransaction>,
+    /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint array.
+    pub(crate) domain_metadata: Vec<DomainMetadata>,
+    /// `sidecar` entries of type `txn`, referencing spilled [`SetTransaction`] actions.
+    pub(crate) txn_sidecars: Vec<Sidecar>,
+    /// `sidecar` entries of type `domainMetadata`, referencing spilled [`DomainMetadata`] actions.
+    pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl ContentRoot {
+    /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
+    ///
+    /// A `path` with a multi-character URI scheme is absolute and used as-is; otherwise it is
+    /// resolved relative to `table_root` by literal concatenation (not [`Url::join`], which would
+    /// re-parse `path` as a standalone reference and drop `table_root` for scheme-like paths, per
+    /// RFC 3986 5.2.2). `last_modified` is set to `i64::MAX` since the root manifest has no
+    /// recorded modification time, so staleness-based caches never evict it.
+    ///
+    /// Returns an error if `table_root` carries a query or fragment, if a relative `path` is not a
+    /// clean relative reference (it must not start with `/`, contain a `..` segment, or contain an
+    /// unencoded `?`/`#` -- any of which `Url::parse` would silently normalize or treat as a
+    /// query/fragment delimiter, escaping or corrupting the resolved location), or if the size does
+    /// not fit a [`crate::FileSize`].
+    #[internal_api]
+    pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
+        require!(
+            table_root.query().is_none() && table_root.fragment().is_none(),
+            Error::invalid_table_location(format!(
+                "table_root must not have a query or fragment, got: {table_root}"
+            ))
+        );
+        let path = &self.path;
+        // A single-char "scheme" (e.g. `C:\foo`) is a Windows drive letter, not a URI scheme
+        // (matching `crate::utils::try_parse_uri`), so it is resolved as relative below.
+        let location = match Url::parse(path) {
+            Ok(absolute) if absolute.scheme().len() > 1 => absolute,
+            _ => {
+                // A relative path is concatenated literally onto `table_root`. `Url::parse` still
+                // applies RFC 3986 dot-segment removal and query/fragment splitting to the joined
+                // string, so reject inputs that would escape the table root (`..`, leading `/`) or
+                // be truncated (`?`/`#`); `path` is not percent-encoded, so these are literal.
+                require!(
+                    !path.starts_with('/')
+                        && !path.split('/').any(|segment| segment == "..")
+                        && !path.contains(['?', '#']),
+                    Error::invalid_table_location(format!(
+                        "checkpoint contentRoot path must be a clean relative path (no leading \
+                         '/', no '..' segment, no '?' or '#'), got: {path:?}"
+                    ))
+                );
+                let mut table_root = table_root.as_str().to_string();
+                if !table_root.ends_with('/') {
+                    table_root.push('/');
+                }
+                Url::parse(&format!("{table_root}{path}")).map_err(|e| {
+                    Error::generic(format!(
+                        "Failed to resolve checkpoint contentRoot path {path:?} against table \
+                         root {table_root}: {e}"
+                    ))
+                })?
+            }
+        };
+        Ok(FileMeta {
+            location,
+            last_modified: i64::MAX,
+            size: to_file_size(self.size_in_bytes, "checkpoint contentRoot")?,
+        })
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl CheckpointAction {
+    /// Path to the root manifest file (delegates to the nested [`ContentRoot`]).
+    #[internal_api]
+    pub(crate) fn path(&self) -> &str {
+        &self.content_root.path
+    }
+
+    /// Get the checkpoint version.
+    #[internal_api]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O (delegates to
+    /// [`ContentRoot::to_filemeta`]).
+    #[internal_api]
+    pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
+        self.content_root.to_filemeta(table_root)
+    }
+}
+
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
@@ -1007,6 +1237,16 @@ pub(crate) struct Sidecar {
     pub tags: Option<HashMap<String, String>>,
 }
 
+/// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
+/// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
+fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
+    bytes.try_into().map_err(|_| {
+        Error::generic(format!(
+            "Failed to convert {context} size {bytes} to FileSize"
+        ))
+    })
+}
+
 impl Sidecar {
     /// Convert a Sidecar record to a FileMeta.
     ///
@@ -1016,12 +1256,7 @@ impl Sidecar {
         Ok(FileMeta {
             location: log_root.join("_sidecars/")?.join(&self.path)?,
             last_modified: self.modification_time,
-            size: self.size_in_bytes.try_into().map_err(|_| {
-                Error::generic(format!(
-                    "Failed to convert sidecar size {} to usize",
-                    self.size_in_bytes
-                ))
-            })?,
+            size: to_file_size(self.size_in_bytes, "sidecar")?,
         })
     }
 }
@@ -2271,5 +2506,179 @@ mod tests {
             tags.get("MIN_INSERTION_TIME"),
             Some(&Some("1677811178336000".to_string()))
         );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_schema() {
+        let schema = get_commit_schema()
+            .project(&[CHECKPOINT_ACTION_NAME])
+            .unwrap();
+
+        // The `checkpoint` action serializes as an array whose elements are a union of the
+        // embedded metadata actions.
+        let checkpoint_field = schema.field(CHECKPOINT_ACTION_NAME).unwrap();
+        assert!(checkpoint_field.is_nullable());
+        let array = match checkpoint_field.data_type() {
+            DataType::Array(array) => array,
+            other => panic!("Expected array, got {other:?}"),
+        };
+        assert!(!array.contains_null());
+        let element = match array.element_type() {
+            DataType::Struct(s) => s,
+            other => panic!("Expected struct element, got {other:?}"),
+        };
+        let field_names: Vec<&str> = element.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec![
+                CHECKPOINT_METADATA_NAME,
+                CONTENT_ROOT_NAME,
+                PROTOCOL_NAME,
+                METADATA_NAME,
+                DOMAIN_METADATA_NAME,
+                SET_TRANSACTION_NAME,
+                SIDECAR_NAME,
+            ]
+        );
+        // `commitInfo` must NOT be a checkpoint-array element; the RFC routes it to the top-level
+        // Delta log.
+        assert!(!field_names.contains(&COMMIT_INFO_NAME));
+
+        // Every element type is an optional (union member) struct.
+        for field in element.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name);
+            assert!(matches!(field.data_type(), DataType::Struct(_)));
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_content_sidecar_is_type_prefixed_sidecar() {
+        // The content-sidecar schema is composed from `Sidecar::to_schema()` with a `type`
+        // discriminator prepended, so it must equal exactly `type` followed by `Sidecar`'s fields.
+        let DataType::Struct(content_sidecar) = CONTENT_SIDECAR_FIELD.data_type() else {
+            panic!("content sidecar should be a struct");
+        };
+        let expected: Vec<StructField> =
+            std::iter::once(StructField::not_null("type", DataType::STRING))
+                .chain(Sidecar::to_schema().into_fields())
+                .collect();
+        let actual: Vec<StructField> = content_sidecar.fields().cloned().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::relative_path(
+        "memory:///table/",
+        "metadata/root.parquet",
+        2048,
+        "memory:///table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::absolute_path(
+        "memory:///table/",
+        "s3://bucket/table/metadata/root.parquet",
+        2048,
+        "s3://bucket/table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::negative_size(
+        "memory:///table/",
+        "metadata/root.parquet",
+        -1,
+        "memory:///table/metadata/root.parquet",
+        Err("Failed to convert checkpoint contentRoot size -1")
+    )]
+    #[case::table_root_with_query_is_rejected(
+        "memory:///table/?foo=bar",
+        "metadata/root.parquet",
+        2048,
+        "",
+        Err("table_root must not have a query or fragment")
+    )]
+    #[case::table_root_with_fragment_is_rejected(
+        "memory:///table/#frag",
+        "metadata/root.parquet",
+        2048,
+        "",
+        Err("table_root must not have a query or fragment")
+    )]
+    #[case::table_root_without_trailing_slash_gets_one(
+        "memory:///table",
+        "metadata/root.parquet",
+        2048,
+        "memory:///table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::single_char_scheme_resolved_as_relative(
+        "memory:///table/",
+        "c:/foo/root.parquet",
+        2048,
+        "memory:///table/c:/foo/root.parquet",
+        Ok(2048)
+    )]
+    #[case::parent_segment_is_rejected(
+        "memory:///table/",
+        "../../escape/root.parquet",
+        2048,
+        "",
+        Err("must be a clean relative path")
+    )]
+    #[case::leading_slash_is_rejected(
+        "memory:///table/",
+        "/metadata/root.parquet",
+        2048,
+        "",
+        Err("must be a clean relative path")
+    )]
+    #[case::query_in_path_is_rejected(
+        "memory:///table/",
+        "metadata/root?v2.parquet",
+        2048,
+        "",
+        Err("must be a clean relative path")
+    )]
+    #[case::fragment_in_path_is_rejected(
+        "memory:///table/",
+        "metadata/root#frag.parquet",
+        2048,
+        "",
+        Err("must be a clean relative path")
+    )]
+    fn test_checkpoint_action_root_filemeta(
+        #[case] table_root: &str,
+        #[case] path: &str,
+        #[case] size_in_bytes: i64,
+        #[case] expected_location: &str,
+        #[case] expected: Result<FileSize, &str>,
+    ) {
+        let table_root = Url::parse(table_root).unwrap();
+        let checkpoint_action = CheckpointAction {
+            version: 1,
+            content_root: ContentRoot {
+                path: path.to_string(),
+                size_in_bytes,
+                version: 1,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: Vec::new(),
+            domain_metadata: Vec::new(),
+            txn_sidecars: Vec::new(),
+            domain_metadata_sidecars: Vec::new(),
+        };
+
+        let result = checkpoint_action.root_filemeta(&table_root);
+        match expected {
+            Ok(expected_size) => {
+                let file_meta = result.unwrap();
+                assert_eq!(file_meta.location.as_str(), expected_location);
+                assert_eq!(file_meta.size, expected_size);
+                assert_eq!(file_meta.last_modified, i64::MAX);
+            }
+            Err(expected_message) => assert_result_error_with_message(result, expected_message),
+        }
     }
 }
