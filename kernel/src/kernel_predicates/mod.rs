@@ -880,6 +880,22 @@ pub trait DataSkippingPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// See [`KernelPredicateEvaluator::eval_pred_cast`].
+    ///
+    /// Implementations may evaluate exact values or rewrite casts over exact-value references. A
+    /// bound-based consumer of a rewritten predicate must independently prove that the cast
+    /// preserves those bounds.
+    fn eval_pred_cast(
+        &self,
+        _op: BinaryPredicateOp,
+        _col: &ColumnName,
+        _target: &DataType,
+        _val: &Scalar,
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        None
+    }
+
     /// See [`KernelPredicateEvaluator::eval_pred_opaque`].
     fn eval_pred_opaque(
         &self,
@@ -1046,6 +1062,17 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         _inverted: bool,
     ) -> Option<Self::Output> {
         None
+    }
+
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        DataSkippingPredicateEvaluator::eval_pred_cast(self, op, col, target, val, inverted)
     }
 
     fn eval_pred_opaque(

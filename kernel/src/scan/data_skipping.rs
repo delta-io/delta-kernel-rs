@@ -825,6 +825,28 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
+    /// Rewrites casts over exact per-Add partition values.
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Pred> {
+        if !self.is_partition_column(col) {
+            return None;
+        }
+        let ord = match op {
+            BinaryPredicateOp::LessThan => Ordering::Less,
+            BinaryPredicateOp::Equal => Ordering::Equal,
+            BinaryPredicateOp::GreaterThan => Ordering::Greater,
+            BinaryPredicateOp::Distinct | BinaryPredicateOp::In => return None,
+        };
+        let cast = Expr::cast(partition_value_expr(col), target.clone());
+        Some(comparison_predicate(ord, cast, val, inverted))
+    }
+
     /// Partition NULL checks use the exact parsed value. Data `IS NULL` uses a guarded null count;
     /// data `IS NOT NULL` remains unsupported because row-group filtering cannot compare it with
     /// `numRecords`.
