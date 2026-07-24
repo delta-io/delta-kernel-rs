@@ -27,11 +27,18 @@ impl StagedDataValidator {
     }
 }
 
-/// Validates that every staged add-file row has its protocol-required fields (`path`,
-/// `partitionValues`, `size`, `modificationTime`) present.
+/// Validates that every staged add-file row has its protocol-required fields.
+///
+/// Required fields: `path`, `partitionValues`, `size`, `modificationTime`, and `dataChange`.
+/// Optional fields: `stats`, `tags`, `deletionVector`, `baseRowId`,
+/// `defaultRowCommitVersion`, and `clusteringProvider`.
 pub(crate) struct AddFileRequiredFields;
 
-fn require_add_file_field<T>(value: Option<T>, path: &str, field: &str) -> DeltaResult<T> {
+fn validate_required_add_file_field_exist<T>(
+    value: Option<T>,
+    path: &str,
+    field: &str,
+) -> DeltaResult<T> {
     value.ok_or_else(|| {
         Error::missing_data(format!(
             "AddFile for '{path}' is missing required field '{field}'"
@@ -48,19 +55,22 @@ impl Validation for AddFileRequiredFields {
             return Err(Error::generic("AddFile path must not be empty"));
         }
 
-        require_add_file_field(
+        validate_required_add_file_field_exist(
             getters[PARTITION_VALUES].get_map(row, "partitionValues")?,
             path,
             "partitionValues",
         )?;
-        let size =
-            require_add_file_field::<i64>(getters[SIZE].get_opt(row, "size")?, path, "size")?;
+        let size = validate_required_add_file_field_exist::<i64>(
+            getters[SIZE].get_opt(row, "size")?,
+            path,
+            "size",
+        )?;
         if size < 0 {
             return Err(Error::generic(format!(
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
             )));
         }
-        require_add_file_field::<i64>(
+        validate_required_add_file_field_exist::<i64>(
             getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
             path,
             "modificationTime",
@@ -84,10 +94,16 @@ mod tests {
     use crate::utils::test_utils::{assert_result_error_with_message, create_valid_add_file_batch};
     use crate::EngineData;
 
+    /// Builds one valid add-file row with a fully nullable schema.
+    ///
+    /// The nullable schema lets tests inject nulls to protocol-required fields.
     fn nullable_add_file() -> RecordBatch {
         create_valid_add_file_batch(true /* all_nullable */)
     }
 
+    /// Builds `row_count` valid add-file rows with a fully nullable schema.
+    ///
+    /// The nullable schema lets tests inject nulls to protocol-required fields.
     fn nullable_add_files(row_count: usize) -> RecordBatch {
         let batch = nullable_add_file();
         concat_batches(&batch.schema(), &vec![batch; row_count])

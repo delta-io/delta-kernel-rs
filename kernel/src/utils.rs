@@ -385,9 +385,11 @@ pub(crate) mod test_utils {
         assert_eq!(into_record_batch(actual), into_record_batch(expected));
     }
 
-    /// Build an addFile with all required fields populated.
+    /// Helper for building valid add-file batches.
     ///
-    /// When `all_nullable` is true, every field is marked nullable.
+    /// Tests can generate add-file metadata without writing a Parquet file using this helper. All
+    /// required fields are populated. When `all_nullable` is true, every field in the batch
+    /// schema is nullable.
     pub(crate) fn create_valid_add_file_batch(all_nullable: bool) -> RecordBatch {
         let schema = if all_nullable {
             let fields = BASE_ADD_FILES_SCHEMA

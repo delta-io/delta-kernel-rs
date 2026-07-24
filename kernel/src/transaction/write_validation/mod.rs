@@ -2,6 +2,15 @@
 //!
 //! [`Transaction`]: super::Transaction
 
+// TODO(#2869): Add the remaining write-side validations:
+// - No missing partition columns in `txn.add_files_metadata`
+// - Required fields for `txn.remove_files_metadata`
+// - Required fields for `txn.dv_matched_files`
+// - No missing partition columns in `txn.dv_matched_files`
+// - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
+//   `txn.dv_matched_files`
+// - AppendOnly table can not have `removeFile` with dataChange = true
+
 mod addfile;
 
 use crate::engine_data::{GetData, RowVisitor};
@@ -20,14 +29,6 @@ pub(crate) trait Validation {
 ///
 /// `columns_and_types` is the shared set of column names and types for one staged-data schema;
 /// every [`Validation`] sees the full getter list and reads the columns it needs.
-// TODO(#2869): Add the remaining write-side validations:
-// - No missing partition columns in `txn.add_files_metadata`
-// - Required fields for `txn.remove_files_metadata`
-// - Required fields for `txn.dv_matched_files`
-// - No missing partition columns in `txn.dv_matched_files`
-// - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
-//   `txn.dv_matched_files`
-// - AppendOnly table can not have `removeFile` with dataChange = true
 pub(crate) struct StagedDataValidator {
     columns_and_types: &'static ColumnNamesAndTypes,
     validations: Vec<Box<dyn Validation>>,
