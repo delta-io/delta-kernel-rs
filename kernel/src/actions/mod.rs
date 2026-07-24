@@ -1009,7 +1009,7 @@ impl SetTransaction {
     }
 }
 
-/// Reference to a root of of an adaptive metadata tree.
+/// Reference to a root of an adaptive metadata tree.
 ///
 /// Contains the path, size, and version of the root manifest file.
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -1021,12 +1021,10 @@ impl SetTransaction {
     serde(rename_all = "camelCase")
 )]
 pub(crate) struct ContentRoot {
-    /// Path to the root manifest file, relative to the table root unless it begins with a
-    /// multi-character URI scheme (in which case it is absolute and used as-is; a single-character
-    /// scheme like `C:` is treated as a Windows drive letter and resolved relative to the table
-    /// root). A relative path is resolved by joining the table location and this path with a `/`
-    /// separator, matching the [Iceberg V4 relative paths specification]. Unlike
-    /// [`Add`]/[`Remove`] paths, this is not RFC 2396 percent-encoded.
+    /// Path to the root manifest file. It is absolute if it has a URI scheme (e.g.
+    /// `s3://bucket/...`); otherwise it is relative and resolved against the table root by
+    /// concatenation with a `/` separator, matching the [Iceberg V4 relative paths specification].
+    /// Unlike [`Add`]/[`Remove`] paths, this is not RFC 2396 percent-encoded.
     ///
     /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     pub(crate) path: String,
@@ -1096,52 +1094,31 @@ pub(crate) struct CheckpointAction {
 impl ContentRoot {
     /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
     ///
-    /// A `path` with a multi-character URI scheme is absolute and used as-is; otherwise it is
-    /// resolved relative to `table_root` by literal concatenation (not [`Url::join`], which would
-    /// re-parse `path` as a standalone reference and drop `table_root` for scheme-like paths, per
-    /// RFC 3986 5.2.2). `last_modified` is set to `i64::MAX` since the root manifest has no
+    /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to
+    /// `table_root` by concatenation with a single `/` separator, matching the [Iceberg V4 relative
+    /// paths specification]. `last_modified` is set to `i64::MAX` since the root manifest has no
     /// recorded modification time, so staleness-based caches never evict it.
     ///
-    /// Returns an error if `table_root` carries a query or fragment, if a relative `path` is not a
-    /// clean relative reference (it must not start with `/`, contain a `..` segment, or contain an
-    /// unencoded `?`/`#` -- any of which `Url::parse` would silently normalize or treat as a
-    /// query/fragment delimiter, escaping or corrupting the resolved location), or if the size does
+    /// Returns an error if the resolved location fails to parse as a [`Url`], or if the size does
     /// not fit a [`crate::FileSize`].
+    ///
+    /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
     pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
-        require!(
-            table_root.query().is_none() && table_root.fragment().is_none(),
-            Error::invalid_table_location(format!(
-                "table_root must not have a query or fragment, got: {table_root}"
-            ))
-        );
         let path = &self.path;
-        // A single-char "scheme" (e.g. `C:\foo`) is a Windows drive letter, not a URI scheme
-        // (matching `crate::utils::try_parse_uri`), so it is resolved as relative below.
         let location = match Url::parse(path) {
-            Ok(absolute) if absolute.scheme().len() > 1 => absolute,
-            _ => {
-                // A relative path is concatenated literally onto `table_root`. `Url::parse` still
-                // applies RFC 3986 dot-segment removal and query/fragment splitting to the joined
-                // string, so reject inputs that would escape the table root (`..`, leading `/`) or
-                // be truncated (`?`/`#`); `path` is not percent-encoded, so these are literal.
-                require!(
-                    !path.starts_with('/')
-                        && !path.split('/').any(|segment| segment == "..")
-                        && !path.contains(['?', '#']),
-                    Error::invalid_table_location(format!(
-                        "checkpoint contentRoot path must be a clean relative path (no leading \
-                         '/', no '..' segment, no '?' or '#'), got: {path:?}"
-                    ))
-                );
-                let mut table_root = table_root.as_str().to_string();
-                if !table_root.ends_with('/') {
-                    table_root.push('/');
+            // A parseable scheme means the path is absolute and used as-is.
+            Ok(absolute) => absolute,
+            // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
+            Err(_) => {
+                let mut base = table_root.as_str().to_string();
+                if !base.ends_with('/') {
+                    base.push('/');
                 }
-                Url::parse(&format!("{table_root}{path}")).map_err(|e| {
+                Url::parse(&format!("{base}{path}")).map_err(|e| {
                     Error::generic(format!(
                         "Failed to resolve checkpoint contentRoot path {path:?} against table \
-                         root {table_root}: {e}"
+                         root {base}: {e}"
                     ))
                 })?
             }
@@ -2488,20 +2465,6 @@ mod tests {
         "memory:///table/metadata/root.parquet",
         Err("Failed to convert checkpoint contentRoot size -1")
     )]
-    #[case::table_root_with_query_is_rejected(
-        "memory:///table/?foo=bar",
-        "metadata/root.parquet",
-        2048,
-        "",
-        Err("table_root must not have a query or fragment")
-    )]
-    #[case::table_root_with_fragment_is_rejected(
-        "memory:///table/#frag",
-        "metadata/root.parquet",
-        2048,
-        "",
-        Err("table_root must not have a query or fragment")
-    )]
     #[case::table_root_without_trailing_slash_gets_one(
         "memory:///table",
         "metadata/root.parquet",
@@ -2509,40 +2472,12 @@ mod tests {
         "memory:///table/metadata/root.parquet",
         Ok(2048)
     )]
-    #[case::single_char_scheme_resolved_as_relative(
+    #[case::single_char_scheme_treated_as_absolute(
         "memory:///table/",
         "c:/foo/root.parquet",
         2048,
-        "memory:///table/c:/foo/root.parquet",
+        "c:/foo/root.parquet",
         Ok(2048)
-    )]
-    #[case::parent_segment_is_rejected(
-        "memory:///table/",
-        "../../escape/root.parquet",
-        2048,
-        "",
-        Err("must be a clean relative path")
-    )]
-    #[case::leading_slash_is_rejected(
-        "memory:///table/",
-        "/metadata/root.parquet",
-        2048,
-        "",
-        Err("must be a clean relative path")
-    )]
-    #[case::query_in_path_is_rejected(
-        "memory:///table/",
-        "metadata/root?v2.parquet",
-        2048,
-        "",
-        Err("must be a clean relative path")
-    )]
-    #[case::fragment_in_path_is_rejected(
-        "memory:///table/",
-        "metadata/root#frag.parquet",
-        2048,
-        "",
-        Err("must be a clean relative path")
     )]
     fn test_checkpoint_action_root_filemeta(
         #[case] table_root: &str,
