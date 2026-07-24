@@ -212,6 +212,7 @@ fn collect_projected_adds(
             None,
             None,
             None,
+            None, // cancellation_token
         )?
         .actions;
     collect_materialized_adds(actions)
