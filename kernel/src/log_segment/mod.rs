@@ -146,6 +146,16 @@ fn checkpoint_action_projection_predicate(schema: &StructType) -> Option<Predica
     Some(Arc::new(predicates.fold(first, Predicate::or)))
 }
 
+fn combine_checkpoint_predicates(
+    projection_predicate: Option<PredicateRef>,
+    meta_predicate: Option<PredicateRef>,
+) -> Option<PredicateRef> {
+    match (projection_predicate, meta_predicate) {
+        (None, predicate) | (predicate, None) => predicate,
+        (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
+    }
+}
+
 impl LogSegment {
     /// Creates a LogSegment for a newly created table at version 0 from a single commit file.
     ///
@@ -688,10 +698,10 @@ impl LogSegment {
     /// Also returns `CheckpointReadInfo` with stats_parsed compatibility and the checkpoint schema.
     ///
     /// `meta_predicate` is an optional conservative predicate for checkpoint reads, not the query's
-    /// final data filter. Readers may apply it at any supported granularity or ignore it. IS NOT
-    /// NULL predicates are derived from `checkpoint_read_schema` and combined (AND) with
-    /// `meta_predicate`, so callers only need to supply query-based skipping predicates. Downstream
-    /// log replay must tolerate returned rows that do not satisfy the combined predicate.
+    /// final data filter. When every projected action has a reliable presence witness, their
+    /// `IS NOT NULL` predicates are combined (OR), then combined (AND) with `meta_predicate`.
+    /// Otherwise projection-based pruning is disabled. Readers may ignore the resulting predicate,
+    /// and downstream log replay must tolerate rows that do not satisfy it.
     #[internal_api]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
@@ -707,10 +717,8 @@ impl LogSegment {
         // Combine the action-presence predicate with the caller's skipping predicate so readers
         // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
-        let checkpoint_predicate = match (projection_predicate, meta_predicate) {
-            (None, predicate) | (predicate, None) => predicate,
-            (Some(a), Some(b)) => Some(Arc::new(Predicate::and((*a).clone(), (*b).clone()))),
-        };
+        let checkpoint_predicate =
+            combine_checkpoint_predicates(projection_predicate, meta_predicate);
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct

@@ -183,14 +183,13 @@ async fn write_multi_row_group_parquet_to_store(
     Ok(())
 }
 
-/// Drains a projected checkpoint action stream, returning the total materialized row count and the
-/// sorted `add.path` of every surviving Add.
-fn collect_filtered_adds(
-    filtered: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+/// Returns the materialized row count and sorted paths of all materialized Add actions.
+fn collect_materialized_adds(
+    actions: impl Iterator<Item = DeltaResult<ActionsBatch>>,
 ) -> DeltaResult<(usize, Vec<String>)> {
     let mut rows = 0;
     let mut add_paths: Vec<String> = Vec::new();
-    for batch in filtered {
+    for batch in actions {
         let batch = batch?.actions;
         rows += batch.len();
         let mut visitor = AddVisitor::default();
@@ -215,7 +214,7 @@ fn collect_projected_adds(
             None,
         )?
         .actions;
-    collect_filtered_adds(actions)
+    collect_materialized_adds(actions)
 }
 
 struct IgnorePredicateParquetHandler(Arc<dyn ParquetHandler>);
@@ -1481,8 +1480,8 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 
 #[rstest]
 #[case::all_remove_part_skipped(vec![remove_only_batch(get_commit_schema().clone()) as _], 0, &[])]
-// The single row group holds a live Add, so the whole batch is kept: all 4 rows
-// (`add_batch_with_remove` = 1 remove + 2 adds + 1 metadata) survive.
+// The single row group holds a live Add, so the whole batch is kept: all 4 rows are materialized
+// (`add_batch_with_remove` = 1 remove + 2 adds + 1 metadata).
 #[case::mixed_add_remove_part_kept(
     vec![add_batch_with_remove(get_commit_schema().clone()) as _],
     4,
@@ -1506,7 +1505,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     #[case] row_groups: Vec<Box<dyn EngineData>>,
     #[case] expected_rows_after_pruning: usize,
-    #[case] expected_survivor_adds: &[&str],
+    #[case] expected_add_paths: &[&str],
     #[values(false, true)] ignore_predicate: bool,
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1545,18 +1544,15 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
     // The projected checkpoint read derives `add.path IS NOT NULL`. Engines may use it to skip
     // all-remove row groups or ignore it and return extra rows; both paths must surface the same
     // Adds.
-    let (rows_after_pruning, add_paths) = collect_projected_adds(&log_segment, engine)?;
+    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, engine)?;
     let expected_materialized_rows = if ignore_predicate {
         total_rows
     } else {
         expected_rows_after_pruning
     };
-    assert_eq!(rows_after_pruning, expected_materialized_rows);
+    assert_eq!(materialized_rows, expected_materialized_rows);
 
-    let mut expected: Vec<String> = expected_survivor_adds
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut expected: Vec<String> = expected_add_paths.iter().map(|s| s.to_string()).collect();
     expected.sort();
     assert_eq!(
         add_paths, expected,
@@ -1605,9 +1601,9 @@ async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResu
         None,
     )?;
 
-    let (rows_after_pruning, add_paths) = collect_projected_adds(&log_segment, &engine)?;
+    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, &engine)?;
     assert_eq!(
-        rows_after_pruning, 2,
+        materialized_rows, 2,
         "SyncJsonHandler should return the unfiltered checkpoint rows"
     );
     assert_eq!(
@@ -1673,9 +1669,9 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 
     // Sidecar discovery reads the manifest without a predicate, so pruning its null-`add.path`
     // rows from the projected action stream cannot hide sidecar references.
-    let (rows_after_pruning, add_paths) = collect_projected_adds(&log_segment, engine)?;
+    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, engine)?;
     assert_eq!(
-        rows_after_pruning, expected_materialized_rows,
+        materialized_rows, expected_materialized_rows,
         "materialized rows must reflect whether the engine applies the predicate"
     );
 
@@ -4613,6 +4609,37 @@ fn test_checkpoint_action_projection_predicate(
     #[case] expected: Option<PredicateRef>,
 ) {
     assert_eq!(checkpoint_action_projection_predicate(&schema), expected);
+}
+
+#[rstest]
+#[case::neither(false, false)]
+#[case::projection_only(true, false)]
+#[case::metadata_only(false, true)]
+#[case::both(true, true)]
+fn test_combine_checkpoint_predicates(
+    #[case] include_projection: bool,
+    #[case] include_metadata: bool,
+) {
+    let projection =
+        Arc::new(Expression::column(ColumnName::new([ADD_NAME, "path"])).is_not_null());
+    let metadata = Arc::new(Expression::column(ColumnName::new([ADD_NAME, "size"])).is_not_null());
+    let expected = match (include_projection, include_metadata) {
+        (false, false) => None,
+        (true, false) => Some(projection.clone()),
+        (false, true) => Some(metadata.clone()),
+        (true, true) => Some(Arc::new(Predicate::and(
+            (*projection).clone(),
+            (*metadata).clone(),
+        ))),
+    };
+
+    assert_eq!(
+        combine_checkpoint_predicates(
+            include_projection.then_some(projection),
+            include_metadata.then_some(metadata),
+        ),
+        expected,
+    );
 }
 
 /// Verify that `read_actions` correctly handles null values in map fields across all
