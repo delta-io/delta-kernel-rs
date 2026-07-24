@@ -178,11 +178,36 @@ mod tests {
     }
 
     #[rstest]
-    #[case::valid("dummy", 1, 1, None)]
-    #[case::empty_path("", 1, 1, Some("path must not be empty"))]
-    #[case::negative_size("dummy", -1, 1, Some("size must be non-negative"))]
-    #[case::zero_size("dummy", 0, 1, None)]
-    #[case::negative_modification_time("dummy", 1, -1, None)]
+    #[case::valid(
+        "dummy" /* path */,
+        1 /* size */,
+        1 /* modification_time */,
+        None /* expected_error */,
+    )]
+    #[case::empty_path(
+        "" /* path */,
+        1 /* size */,
+        1 /* modification_time */,
+        Some("path must not be empty") /* expected_error */,
+    )]
+    #[case::negative_size(
+        "dummy" /* path */,
+        -1 /* size */,
+        1 /* modification_time */,
+        Some("size must be non-negative") /* expected_error */,
+    )]
+    #[case::zero_size(
+        "dummy" /* path */,
+        0 /* size */,
+        1 /* modification_time */,
+        None /* expected_error */,
+    )]
+    #[case::negative_modification_time(
+        "dummy" /* path */,
+        1 /* size */,
+        -1 /* modification_time */,
+        None /* expected_error */,
+    )]
     fn add_file_values_accepted_or_rejected(
         #[case] path: &str,
         #[case] size: i64,
