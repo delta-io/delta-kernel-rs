@@ -47,6 +47,8 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod alloc_stats;
+
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
