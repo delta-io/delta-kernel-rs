@@ -2,20 +2,17 @@
 pub(crate) use column_mapping::get_any_level_column_physical_name;
 #[deprecated = "Enable internal-api and use TableConfiguration instead"]
 pub use column_mapping::validate_schema_column_mapping;
-// Crate-visible alias so kernel code avoids the deprecated `pub` re-export above.
-pub(crate) use column_mapping::validate_schema_column_mapping as validate_schema_column_mapping_strict;
 pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
     column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
     try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
-#[cfg(feature = "column-defaults-in-dev")]
-pub(crate) use iceberg_compat::v3::iceberg_compat_v3_column_defaults_validation;
-pub(crate) use iceberg_compat::v3::V3_VALIDATOR;
+pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -128,9 +125,6 @@ pub(crate) enum TableFeature {
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
     /// Column Default Values.
-    ///
-    /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
-    /// the `column-defaults-in-dev` cargo feature.
     AllowColumnDefaults,
 
     ///////////////////////////
@@ -489,15 +483,11 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
-// TODO(#2630): drop the gate once column-defaults is fully supported.
 static ALLOW_COLUMN_DEFAULTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    #[cfg(feature = "column-defaults-in-dev")]
     kernel_support: KernelSupport::Supported,
-    #[cfg(not(feature = "column-defaults-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 

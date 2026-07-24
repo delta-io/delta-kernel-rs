@@ -62,7 +62,11 @@ impl StorageHandler for PlanBasedStorageHandler {
 
     fn delete(&self, _path: &Url) -> DeltaResult<()> {
         // TODO(#2820): implement here once supported as IoOperation.
-        unimplemented!("PlanBasedStorageHandler does not yet implement delete")
+        // Intentionally do not use a fallback because we expect this SHOULD be implemented via
+        // plan-execution.
+        Err(Error::unsupported(
+            "PlanBasedStorageHandler does not yet implement delete",
+        ))
     }
 }
 
@@ -83,7 +87,7 @@ mod tests {
     use crate::{Error, StorageHandler as _};
 
     fn make_handler() -> PlanBasedStorageHandler {
-        PlanBasedStorageHandler::new(Arc::new(SyncPlanExecutor::new()))
+        PlanBasedStorageHandler::new(Arc::new(SyncPlanExecutor::default()))
     }
 
     #[test]

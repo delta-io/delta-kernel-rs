@@ -536,9 +536,9 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
+/// Prefixes all column references in a predicate with a fixed path. The checkpoint path prefixes
+/// stat expressions that already carry their `stats_parsed.*` root (e.g. `stats_parsed.minValues.x
+/// > 100`) with `add`, yielding `add.stats_parsed.minValues.x > 100`.
 struct PrefixColumns {
     prefix: ColumnName,
 }
@@ -994,8 +994,8 @@ impl Scan {
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
     /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
-    /// references are prefixed with `add.stats_parsed` to match the physical column layout
+    /// (e.g., `x > 100` becomes `OR(stats_parsed.maxValues.x IS NULL, stats_parsed.maxValues.x >
+    /// 100)`), then column references are prefixed with `add` to match the physical column layout
     /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
     /// parquet-level statistics on these nested columns to skip entire row groups that cannot
     /// contain matching files.
@@ -1013,19 +1013,23 @@ impl Scan {
         };
         self.state_info.physical_stats_schema.as_ref()?;
 
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
+        // the predicate also references physical columns, so partition detection reads the physical
+        // partition schema rather than the logical names in table metadata.
+        let partition_columns: HashSet<ColumnName> = self
+            .state_info
+            .physical_partition_schema
+            .as_ref()
+            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
+            .unwrap_or_default();
         let skipping_pred = as_checkpoint_skipping_predicate(
             predicate,
-            partition_columns,
+            &partition_columns,
             &self.state_info.physical_stats_columns,
         )?;
 
         let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
+            prefix: ColumnName::new(["add"]),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))

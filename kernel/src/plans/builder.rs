@@ -339,8 +339,9 @@ impl PlanBuilder {
     }
 
     /// Aggregate `self`, grouped by `keys`. `aggs` receives an [`AggregateBuilder`] rooted at
-    /// `self`'s schema and adds the aggregate columns (see [`AggregateBuilder::max`], ...). Mirrors
-    /// [`Self::aggregate`] but spares the caller from naming the input schema, just as
+    /// `self`'s schema and adds the aggregate columns (see e.g. [`AggregateBuilder::max`]).
+    ///
+    /// Mirrors [`Self::aggregate`] but spares the caller from naming the input schema, just as
     /// [`Self::project_patch`] does for [`Self::project`]. See [`Aggregate`].
     ///
     /// Produces an error under the same conditions as [`Self::aggregate`].
@@ -367,6 +368,38 @@ impl PlanBuilder {
         aggs: impl FnOnce(AggregateBuilder) -> AggregateBuilder,
     ) -> DeltaResult<Self> {
         let builder = Aggregate::group_by(Arc::clone(self.schema()), keys);
+        self.aggregate(aggs(builder))
+    }
+
+    /// Aggregate `self` without grouping. `aggs` receives an [`AggregateBuilder`] rooted at
+    /// `self`'s schema and adds aggregate columns (see e.g. [`AggregateBuilder::max`]).
+    ///
+    /// Mirrors [`Self::aggregate`] but infers the input schema and uses
+    /// [`Aggregate::ungrouped`] as the builder root.
+    ///
+    /// Produces an error under the same conditions as [`Self::aggregate`].
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::expressions::column_name;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([
+    ///     StructField::not_null("id", DataType::INTEGER),
+    ///     StructField::nullable("version", DataType::LONG),
+    /// ])?);
+    /// // Latest version across all rows.
+    /// let plan = PlanBuilder::values(schema, vec![vec![1.into(), 7i64.into()]])?
+    ///     .aggregate_ungrouped(|a| a.max(column_name!("version")))?
+    ///     .build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
+    pub fn aggregate_ungrouped(
+        self,
+        aggs: impl FnOnce(AggregateBuilder) -> AggregateBuilder,
+    ) -> DeltaResult<Self> {
+        let builder = Aggregate::ungrouped(Arc::clone(self.schema()));
         self.aggregate(aggs(builder))
     }
 
@@ -903,6 +936,17 @@ mod tests {
             a.max_non_null_by(column_name!("part"), column_name!("id"))
         })?;
         assert_eq!(agg.schema(), &part_schema());
+        assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
+        Ok(())
+    }
+
+    /// `aggregate_ungrouped` roots the `AggregateBuilder` at the input schema without grouping.
+    #[test]
+    fn aggregate_ungrouped_infers_input_schema() -> DeltaResult<()> {
+        let agg = vals(part_schema()).aggregate_ungrouped(|a| a.max(column_name!("part")))?;
+        let schema = agg.schema();
+        assert_eq!(schema.fields().count(), 1);
+        assert!(schema.field("part").is_some());
         assert_plan(agg, &[(&[], "values"), (&[0], "aggregate")]);
         Ok(())
     }

@@ -126,8 +126,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, EvaluationHandlerExtension,
-    FileMeta, Version,
+    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
+    EvaluationHandlerExtension, FileMeta, Version,
 };
 
 #[cfg(feature = "declarative-plans")]
@@ -383,14 +383,6 @@ impl RetentionCalculator for CheckpointWriter {
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
-        let version = i64::try_from(snapshot.version()).map_err(|e| {
-            Error::CheckpointWrite(format!(
-                "Failed to convert checkpoint version from u64 {} to i64: {}",
-                snapshot.version(),
-                e
-            ))
-        })?;
-
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
@@ -409,8 +401,8 @@ impl CheckpointWriter {
         )?;
 
         Ok(Self {
+            version: version_as_i64(snapshot.version())?,
             snapshot,
-            version,
             is_v2: schema_context.is_v2,
             read_schema,
             output_schema,

@@ -70,6 +70,7 @@ pub enum KernelError {
     CheckpointWriteError = 41,
     SchemaError = 42,
     LogHistoryError = 43,
+    RowTrackingChangeFeedUnsupported = 44,
 }
 
 impl From<Error> for KernelError {
@@ -123,6 +124,9 @@ impl From<Error> for KernelError {
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
             Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
+            Error::RowTrackingChangeFeedUnsupported(_) => {
+                KernelError::RowTrackingChangeFeedUnsupported
+            }
             Error::ChangeDataFeedIncompatibleSchema(_, _) => {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
@@ -134,6 +138,20 @@ impl From<Error> for KernelError {
             Error::LogHistory(_) => KernelError::LogHistoryError,
             _ => KernelError::UnknownError,
         }
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn row_tracking_change_feed_error_has_stable_ffi_mapping() {
+        assert_eq!(
+            KernelError::from(Error::RowTrackingChangeFeedUnsupported(7)),
+            KernelError::RowTrackingChangeFeedUnsupported
+        );
+        assert_eq!(KernelError::RowTrackingChangeFeedUnsupported as i32, 44);
     }
 }
 
@@ -337,6 +355,7 @@ impl From<EngineExecError> for Error {
             | KernelError::ParseIntervalError
             | KernelError::ChangeDataFeedUnsupported
             | KernelError::ChangeDataFeedIncompatibleSchema
+            | KernelError::RowTrackingChangeFeedUnsupported
             | KernelError::LiteralExpressionTransformError
             | KernelError::LogHistoryError) => {
                 Error::generic(format!("engine execution error ({code:?}): {message}"))
@@ -377,6 +396,10 @@ mod tests {
     #[case::fallback_io(
         KernelError::IOErrorError,
         "Generic delta kernel error: engine execution error (IOErrorError): boom"
+    )]
+    #[case::fallback_row_tracking(
+        KernelError::RowTrackingChangeFeedUnsupported,
+        "Generic delta kernel error: engine execution error (RowTrackingChangeFeedUnsupported): boom"
     )]
     fn engine_exec_error_maps_kernel_error_code(
         #[case] etype: KernelError,

@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
-use tracing::{info, instrument};
+use tracing::instrument;
 
 use crate::actions::{
     as_log_add_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
@@ -38,10 +38,9 @@ use crate::scan::log_replay::{
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
-#[cfg(feature = "column-defaults-in-dev")]
-use crate::schema::ColumnDefault;
 use crate::schema::{
-    lazy_schema_ref, ArrayType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+    lazy_schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
+    StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -49,8 +48,8 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, FileMeta, IntoEngineData, RowVisitor,
-    Version,
+    version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
+    IntoEngineData, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -246,6 +245,8 @@ pub struct Transaction<S = ExistingTable> {
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
+    // Count of files whose deletion vector was updated.
+    num_dv_updates: usize,
     // Clustering columns from domain metadata. Only populated if the ClusteredTable feature is
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
@@ -336,6 +337,7 @@ impl<S> Transaction<S> {
             commit_version = self.get_commit_version(),
             num_add_files,
             num_remove_files,
+            num_dv_updates,
             add_files_bytes,
             remove_files_bytes,
             is_blind_append,
@@ -349,14 +351,6 @@ impl<S> Transaction<S> {
     )]
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
-        // Fields-only event: these feed the `txn.commit` metric via the layer's `on_event`
-        // channel. `num_dv_updates` has no other source (it is not a declared span field and
-        // gets no `span.record` below), so this event must keep its structured fields.
-        info!(
-            num_add_files = self.add_files_metadata.len(),
-            num_remove_files = self.remove_files_metadata.len(),
-            num_dv_updates = self.dv_matched_files.len(),
-        );
 
         // Some table features don't yet support removeFiles. Reject here.
         if !self.remove_files_metadata.is_empty() {
@@ -384,9 +378,8 @@ impl<S> Transaction<S> {
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
 
-        // Validate that the schema supports data writes when files are being added.
-        // Void-in-array/map, all-void structs, and all-void tables cannot produce valid Parquet.
-        // Reads and metadata-only commits are always allowed.
+        // Validate that the schema supports data writes when files are being added. Reads and
+        // metadata-only commits are always allowed.
         if !self.add_files_metadata.is_empty() {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
@@ -557,6 +550,7 @@ impl<S> Transaction<S> {
         let span = tracing::Span::current();
         span.record("num_add_files", file_stats.gross_add_files);
         span.record("num_remove_files", file_stats.gross_remove_files);
+        span.record("num_dv_updates", self.num_dv_updates as u64);
         span.record("add_files_bytes", file_stats.gross_add_bytes);
         span.record("remove_files_bytes", file_stats.gross_remove_bytes);
         span.record("is_blind_append", self.is_blind_append);
@@ -1010,13 +1004,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// # Errors
     ///
     /// Propagates any error from [`StructField::column_default`].
-    #[cfg(feature = "column-defaults-in-dev")]
     pub fn top_level_column_defaults(&self) -> DeltaResult<HashMap<String, ColumnDefault<'_>>> {
         if !self
             .effective_table_config
             .is_feature_enabled(&TableFeature::AllowColumnDefaults)
         {
-            info!(
+            tracing::info!(
                 "allowColumnDefaults is not enabled; the schema may contain orphaned column-default metadata"
             );
             return Ok(HashMap::new());
@@ -1034,8 +1027,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Called at the top of [`partitioned_write_context`](Self::partitioned_write_context) and
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context), before any Parquet is
-    /// written, so connectors fail fast when the schema contains void placements that cannot
-    /// produce valid files (void inside Array/Map, all-void structs, all-void tables).
+    /// written, so connectors fail fast when the schema contains unsupported data types or void
+    /// placements that cannot produce valid files.
     /// The commit-time check in [`commit`](Self::commit) remains as defense-in-depth for callers
     /// that reach [`add_files`](Self::add_files) without going through a write context.
     fn validate_for_data_write(&self) -> DeltaResult<()> {
@@ -1255,8 +1248,7 @@ impl<S> Transaction<S> {
             return Ok((Box::new(iter::empty()), row_tracking_dm));
         }
 
-        let commit_version = i64::try_from(commit_version)
-            .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
+        let commit_version = version_as_i64(commit_version)?;
 
         if row_tracking_supported {
             self.generate_adds_with_row_tracking(engine, commit_version)
@@ -2102,7 +2094,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "column-defaults-in-dev")]
     mod column_defaults {
         use super::*;
         use crate::schema::column_default::{field_with_default, field_with_invalid_default};

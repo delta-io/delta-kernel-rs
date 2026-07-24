@@ -28,6 +28,7 @@ delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog" }
 object_store = { version = "0.12.3", features = ["aws"] }
 test_utils = { path = "../test-utils" }
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
@@ -36,6 +37,7 @@ url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3"
 
 [[bench]]
 name = "workload_bench"

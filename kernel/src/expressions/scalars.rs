@@ -788,6 +788,11 @@ impl PrimitiveType {
             IntervalYearMonth | IntervalDayTime => Err(Error::unsupported(
                 "Interval types are not supported as scalar or partition values",
             )),
+            // Kernel does not support parsing text into Geometry/Geography types yet.
+            #[cfg(feature = "geo-type-in-dev")]
+            Geometry(_) | Geography(_) => Err(Error::Unsupported(format!(
+                "parse_scalar is not supported for {self:?}"
+            ))),
         }
     }
 
@@ -891,6 +896,26 @@ mod tests {
 
         // Non-empty string should fail
         PrimitiveType::Void.parse_scalar("anything").unwrap_err();
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest::rstest]
+    #[case(PrimitiveType::Geometry(Box::new(
+        crate::schema::GeometryType::try_new("EPSG:4326").unwrap()
+    )))]
+    #[case(PrimitiveType::Geography(Box::new(
+        crate::schema::GeographyType::try_new(
+            "EPSG:4326",
+            crate::schema::EdgeInterpolationAlgorithm::Spherical,
+        )
+        .unwrap()
+    )))]
+    fn test_geo_parse_scalar_unsupported(#[case] ptype: PrimitiveType) {
+        let err = ptype.parse_scalar("anything").unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got: {err:?}"
+        );
     }
 
     #[test]

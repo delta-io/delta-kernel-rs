@@ -229,7 +229,7 @@ mod tests {
     impl CountingExecutor {
         fn new() -> Self {
             Self {
-                inner: SyncPlanExecutor::new(),
+                inner: SyncPlanExecutor::default(),
                 query_scans: AtomicUsize::new(0),
                 footer_reads: AtomicUsize::new(0),
             }
@@ -298,7 +298,7 @@ mod tests {
         #[case] expect_parsed: Option<bool>,
     ) {
         let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
-        let exec = SyncPlanExecutor::new();
+        let exec = SyncPlanExecutor::default();
         let stats_schema = expect_parsed.map(|_| probe_stats_schema());
 
         let shape =

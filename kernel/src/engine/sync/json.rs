@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
-use super::{put_bytes, read_files};
+use super::{put_bytes, read_files_arrow};
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -29,7 +29,7 @@ impl SyncJsonHandler {
     }
 }
 
-fn try_create_from_json(
+pub(super) fn try_create_from_json(
     data: Bytes,
     schema: SchemaRef,
     _predicate: Option<PredicateRef>,
@@ -51,13 +51,14 @@ impl JsonHandler for SyncJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(
+        let iter = read_files_arrow(
             self.store.as_ref(),
             files,
             schema,
             predicate,
             try_create_from_json,
-        )
+        );
+        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
     }
 
     fn parse_json(

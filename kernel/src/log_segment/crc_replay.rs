@@ -28,6 +28,7 @@ use crate::crc::{
     FileSizeHistogram, FileStatsDelta,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
     column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
@@ -75,23 +76,26 @@ impl LogSegment {
         engine: &dyn Engine,
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
-    ) -> DeltaResult<Option<Arc<Crc>>> {
+    ) -> DeltaResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
         if base.version == self.end_version {
-            return Ok(Some(base.clone()));
+            return Ok(Some((base.clone(), ProtocolMetadataSource::CrcAtTarget)));
         }
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
         let advanced = self.build_crc_from_base(engine, base)?;
-        Ok(Some(Arc::new(advanced)))
+        Ok(Some((
+            Arc::new(advanced),
+            ProtocolMetadataSource::CrcAdvancedByReplay,
+        )))
     }
 
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
-    /// `in_memory_base` (e.g. the CRC an updating snapshot holds), whichever is newer. A failed
-    /// on-disk read falls back to `in_memory_base`. Returns None when neither is available.
+    /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
+    /// read. Drops a base below the checkpoint; returns None when no candidate remains.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
@@ -105,6 +109,10 @@ impl LogSegment {
         preferred_disk_crc
             .and_then(|f| read_crc_file_or_none(engine, f))
             .or_else(|| in_memory_base.cloned())
+            .filter(|crc| {
+                self.checkpoint_version
+                    .is_none_or(|ckpt| crc.version >= ckpt)
+            })
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.

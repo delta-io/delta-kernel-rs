@@ -74,14 +74,13 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
-- `column-defaults-in-dev` -- column defaults support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
-  listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
-  carrier type and the SQL literal parser (`parse_sql`).
 - `adaptive-metadata-in-dev` -- adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
+- `interval-type-in-dev` -- ANSI interval type support (experimental, in development). With the
+  cargo feature off, creating or writing tables with interval columns is blocked; reads are
+  unaffected.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -284,9 +283,10 @@ Keep this list updated when new protocol features are added to kernel.
   any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
   `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
   and deadlock on the same lock. In `on_new_span`, no extension lock is held during
-  `attrs.record()`, so direct `warn!()` is safe there. In `on_event` and `on_record`, store
-  warnings in a `pending_warnings: Vec<String>` field on the visitor, take them out after
-  the extensions block closes, and emit via `warn!()` only then. See
+  `attrs.record()`, so direct `warn!()` is safe there. In `on_record`, store warnings in a
+  `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
+  block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
+  warning-eligible work, so it may run under the lock directly.) See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
 
 ## Code Style

@@ -170,6 +170,9 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
+#[cfg(feature = "internal-api")]
+pub mod log_segment_files;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment_files;
 
 pub mod history_manager;
@@ -203,6 +206,13 @@ pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
+
+/// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
+pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
+    version
+        .try_into()
+        .map_err(|_| Error::generic(format!("Delta log version {version} exceeds i64::MAX")))
+}
 
 pub type FileSize = u64;
 pub type FileIndex = u64;

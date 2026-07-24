@@ -148,12 +148,19 @@ where
         }
     }
 
-    // RUNTIME CHANNEL. Both on_event and on_record route Span::current().record(...) updates
-    // (and info!() events within a span) through EventVisitor -> MetricEvent::record_u64 /
-    // record_bool. The visitor's record_debug also handles `#[instrument(err)]`'s `error` field,
-    // flipping a success event into its failure counterpart.
+    // RUNTIME CHANNEL. on_event carries log lines, not metric writes; its only metric effect is the
+    // `#[instrument(err)]` failure signal, which FailureFlipVisitor turns into the event's failure
+    // counterpart.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
-        Self::drain_into_visitor(ctx.event_span(event), |v| event.record(v));
+        let Some(span) = ctx.event_span(event) else {
+            return;
+        };
+        let mut extensions = span.extensions_mut();
+        if let Some(visitor) = extensions.get_mut::<EventVisitor>() {
+            event.record(&mut FailureFlipVisitor {
+                event: &mut visitor.event,
+            });
+        }
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
@@ -256,14 +263,184 @@ impl Visit for EventVisitor {
         }
     }
 
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {
+        // Kernel records every metric field as u64/bool/str (handled above). Anything arriving here
+        // is a debug-formatted log field (or a numeric type tracing forwards to record_debug), not
+        // a metric write.
+    }
+}
+
+// ====================================================================
+// FailureFlipVisitor: the event channel's only metric effect
+// ====================================================================
+
+/// Event-path visitor for the synthetic event `#[instrument(err)]` emits on `Err` return.
+///
+/// Flips the span's in-flight success event to its failure counterpart and ignores every other
+/// field, so arbitrary log-line fields never reach the metric allowlist.
+struct FailureFlipVisitor<'a> {
+    event: &'a mut Option<MetricEvent>,
+}
+
+impl Visit for FailureFlipVisitor<'_> {
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
-        match field.name() {
-            "return" => {} // default to the success case
-            "error" => {
-                // `#[instrument(err)]` records `error` when the wrapped function returns Err.
-                self.event = self.event.take().map(MetricEvent::into_failure);
-            }
-            _ => {}
+        // `#[instrument(err)]` emits a synthetic event with an `error` field (via Display, hence
+        // record_debug) when the wrapped fn returns Err. That field name is a tracing convention,
+        // not kernel's.
+        if field.name() == "error" {
+            *self.event = self.event.take().map(MetricEvent::into_failure);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Error;
+    use std::sync::{Arc, Mutex};
+
+    use test_utils::{ensure_metrics_compatible_global_subscriber, LogWriter};
+    use tracing::field::Empty;
+    use tracing::subscriber::with_default;
+    use tracing::{info, info_span, instrument};
+    use tracing_subscriber::fmt::layer;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::registry;
+    use uuid::Uuid;
+
+    use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
+    use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
+    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+    /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
+    /// buffer, and return the captured log text -- so a test can assert on the warnings the metrics
+    /// layer emits.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        ensure_metrics_compatible_global_subscriber();
+        let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let logs_writer = Arc::clone(&logs);
+        let subscriber = registry()
+            .with(
+                layer()
+                    .with_writer(move || LogWriter(Arc::clone(&logs_writer)))
+                    .with_ansi(false),
+            )
+            .with_metrics_reporter_layer(Arc::new(CapturingReporter::default()));
+        with_default(subscriber, f);
+        let bytes = logs.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn log_event_field_inside_reporting_span_does_not_warn() {
+        // info_span! requires a string-literal name; assert it still matches the span const.
+        assert_eq!(SNAPSHOT_COMPLETED_SPAN, "snap.build");
+        let logs = capture_logs(|| {
+            let span = info_span!(
+                "snap.build",
+                report = Empty,
+                operation_id = %Uuid::new_v4(),
+            );
+            let _enter = span.enter();
+            info!(log_tail_len = 5u64, "building snapshot");
+        });
+        assert!(
+            !logs.contains("Invalid field"),
+            "a log line's fields must not be judged as metric writes; got: {logs}"
+        );
+    }
+
+    #[test]
+    fn recorded_unknown_field_still_warns() {
+        assert_eq!(SNAPSHOT_COMPLETED_SPAN, "snap.build");
+        let logs = capture_logs(|| {
+            let span = info_span!(
+                "snap.build",
+                report = Empty,
+                operation_id = %Uuid::new_v4(),
+                bogus = Empty,
+            );
+            span.record("bogus", 7u64);
+        });
+        assert!(
+            logs.contains("Invalid field 'bogus' recorded on snap.build span"),
+            "an unrecognized .record() field is a declared-field typo and must still warn; got: {logs}"
+        );
+    }
+
+    // A log line whose field name collides with a real metric field must NOT overwrite the value a
+    // genuine `span.record` wrote -- the core guarantee of narrowing on_event to
+    // FailureFlipVisitor. capture_logs discards the reporter, so this test installs a
+    // CapturingReporter to inspect the reported event.
+    #[test]
+    fn log_event_reusing_a_metric_field_name_does_not_overwrite_recorded_metric() {
+        assert_eq!(SNAPSHOT_COMPLETED_SPAN, "snap.build");
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        {
+            let span = info_span!(
+                "snap.build",
+                report = Empty,
+                operation_id = %Uuid::new_v4(),
+                version = Empty,
+            );
+            let _enter = span.enter();
+            span.record("version", 7u64); // real metric write via the on_record channel
+            info!(version = 999u64, "noise"); // log line reusing the metric field name (on_event)
+        } // span close -> report
+        let events = reporter.events();
+        let Some(MetricEvent::SnapshotBuildSuccess(success)) = events
+            .iter()
+            .find(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_)))
+        else {
+            panic!("expected a snapshot build success event; got: {events:?}");
+        };
+        assert_eq!(
+            success.version, 7,
+            "an on_event log field must not overwrite a span.record metric"
+        );
+    }
+
+    #[instrument(name = SNAPSHOT_COMPLETED_SPAN, fields(report, operation_id = %Uuid::new_v4()), err)]
+    fn failing_build() -> Result<(), Error> {
+        Err(Error::other("boom"))
+    }
+
+    #[test]
+    fn instrument_err_event_still_flips_to_failure() {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let _ = failing_build();
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "#[instrument(err)] must flip the success event to its failure form via on_event"
+        );
+    }
+
+    #[instrument(name = SNAPSHOT_COMPLETED_SPAN, fields(report, operation_id = %Uuid::new_v4()), ret)]
+    fn succeeding_build() -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[test]
+    fn instrument_ret_event_does_not_flip_to_failure() {
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        let _ = succeeding_build();
+        let events = reporter.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildSuccess(_))),
+            "#[instrument(ret)]'s `return` field must NOT flip success to failure; got: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MetricEvent::SnapshotBuildFailure(_))),
+            "a successful #[instrument(ret)] must not emit a failure event; got: {events:?}"
+        );
     }
 }

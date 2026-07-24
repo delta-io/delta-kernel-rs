@@ -207,14 +207,14 @@ pub(super) struct ContentTreeNodeEntry {
     /// Split offsets for the data file. For example, all row group offsets in a Parquet file. Must
     /// be sorted ascending
     #[field_id = 132]
-    #[element_field_id = 133]
+    #[nested_field_id = 133]
     pub(crate) split_offsets: Option<Vec<i64>>,
 
     /// Field ids used to determine row equality in equality delete files.
     /// Required when content is EqualityDeletes and must be `None` otherwise.
     /// Fields with ids listed in this column must be present in the delete file
     #[field_id = 135]
-    #[element_field_id = 136]
+    #[nested_field_id = 136]
     pub(crate) equality_ids: Option<Vec<i32>>,
 
     /// The AMT/Iceberg format version this entry was written at (Iceberg field id 157).
