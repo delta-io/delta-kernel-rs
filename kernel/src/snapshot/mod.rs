@@ -658,6 +658,10 @@ impl Snapshot {
                     domains,
                     engine,
                 )?;
+                // TODO: report a distinct metric source here. A rooted tail scan is neither a
+                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+                //       (cache / crc-rooted / full-replay) would let metrics measure it.
                 record_metric(false, rooted.len());
                 return Ok(rooted);
             }

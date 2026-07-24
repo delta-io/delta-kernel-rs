@@ -11,12 +11,16 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
 use delta_kernel::snapshot::{ChecksumWriteResult, IncrementalReplay, Snapshot, SnapshotRef};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Engine, FileStats, Version};
+use delta_kernel::{
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
+    FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
+    PredicateRef, StorageHandler, Version,
+};
 use rstest::rstest;
 use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -2317,54 +2321,52 @@ async fn test_stale_crc_fresh_build_fails_load_when_advance_commit_is_corrupt() 
 // Domain metadata rooted in a stale (but authoritative) CRC
 // ============================================================================
 
-/// Delegates every handler to an inner engine, but panics on `read_parquet_files`. A
-/// domain-metadata query reads only JSON commits, so the only parquet a scan would touch is the
-/// V1 checkpoint.
+/// Delegates every handler to `inner`, but panics on `read_parquet_files`. A domain-metadata query
+/// reads only JSON commits, so the only parquet a scan would touch is the V1 checkpoint; the panic
+/// proves the rooted path skips it. That the pruned tail segment itself excludes the checkpoint and
+/// every commit at/below the base CRC is covered by `test_segment_crc_filtering`.
 struct NoParquetReadsEngine {
     inner: Arc<dyn Engine>,
 }
 
 struct NoParquetReadsHandler {
-    inner: Arc<dyn delta_kernel::ParquetHandler>,
+    inner: Arc<dyn ParquetHandler>,
 }
 
-impl delta_kernel::ParquetHandler for NoParquetReadsHandler {
+impl ParquetHandler for NoParquetReadsHandler {
     fn read_parquet_files(
         &self,
-        _files: &[delta_kernel::FileMeta],
-        _physical_schema: delta_kernel::schema::SchemaRef,
-        _predicate: Option<delta_kernel::PredicateRef>,
-    ) -> DeltaResult<delta_kernel::FileDataReadResultIterator> {
+        _files: &[FileMeta],
+        _physical_schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
         panic!("read_parquet_files called: the checkpoint must not be read on the rooted path");
     }
 
     fn write_parquet_file(
         &self,
         location: Url,
-        data: delta_kernel::DeltaResultIteratorStatic<Box<dyn delta_kernel::EngineData>>,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()> {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(
-        &self,
-        file: &delta_kernel::FileMeta,
-    ) -> DeltaResult<delta_kernel::ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 }
 
 impl Engine for NoParquetReadsEngine {
-    fn evaluation_handler(&self) -> Arc<dyn delta_kernel::EvaluationHandler> {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.inner.evaluation_handler()
     }
-    fn storage_handler(&self) -> Arc<dyn delta_kernel::StorageHandler> {
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
         self.inner.storage_handler()
     }
-    fn json_handler(&self) -> Arc<dyn delta_kernel::JsonHandler> {
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.inner.json_handler()
     }
-    fn parquet_handler(&self) -> Arc<dyn delta_kernel::ParquetHandler> {
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         Arc::new(NoParquetReadsHandler {
             inner: self.inner.parquet_handler(),
         })
