@@ -95,6 +95,11 @@ scan_builder_with_predicate() ->  Handle<ExclusiveScanBuilder>
         |
 scan_builder_with_schema()    ->  Handle<ExclusiveScanBuilder>
         |
+scan_builder_with_stats()     ->  Handle<ExclusiveScanBuilder>
+        |
+scan_builder_with_partition_values()
+                              ->  Handle<ExclusiveScanBuilder>
+        |
 scan_builder_build()          ->  Handle<SharedScan>
 ```
 
@@ -179,7 +184,7 @@ to pass to `scan_builder_with_schema`).
 | Function | Purpose |
 |----------|---------|
 | `scan` | Create a scan with optional predicate and projection (convenience function) |
-| `scan_builder` / `scan_builder_with_predicate` / `scan_builder_with_schema` / `scan_builder_build` | Build a scan incrementally with the builder pattern |
+| `scan_builder` / `scan_builder_with_predicate` / `scan_builder_with_schema` / `scan_builder_with_stats` / `scan_builder_with_partition_values` / `scan_builder_build` | Build a scan incrementally and configure predicate, projection, stats, and partition-value output |
 | `scan_logical_schema` / `scan_physical_schema` / `scan_table_root` | Inspect the scan's logical/physical read schemas and table root |
 | `scan_metadata_iter_init` / `scan_metadata_next` | Iterate over scan metadata (per-file lists, deletion vectors, transforms) |
 | `scan_metadata_next_arrow` / `free_scan_metadata_arrow_result` | Pull the next scan-metadata batch as an Arrow `RecordBatch` and release it (requires `default-engine-base`) |
