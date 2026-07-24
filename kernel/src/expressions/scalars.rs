@@ -924,7 +924,7 @@ fn extract_interval_literal(raw: &str) -> Option<(&str, IntervalFieldRange)> {
 
 fn interval_magnitude(body: &str) -> Option<(bool, &str)> {
     let (negative, magnitude) = body.strip_prefix('-').map_or((false, body), |m| (true, m));
-    (!magnitude.starts_with(['+', '-'])).then_some((negative, magnitude))
+    (!magnitude.starts_with('-') && !magnitude.contains('+')).then_some((negative, magnitude))
 }
 
 fn signed_i32(magnitude: u32, negative: bool) -> Option<i32> {
@@ -1736,7 +1736,10 @@ mod tests {
             "INTERVAL 'x-0' YEAR TO MONTH",     // non-numeric
             "INTERVAL '1' YEAR TO MONTH",       // missing '-'
             "INTERVAL '1-12' YEAR TO MONTH",    // month field out of range
+            "INTERVAL '+5' YEAR",               // leading plus sign
+            "INTERVAL '1-+5' YEAR TO MONTH",    // embedded plus sign
             "INTERVAL '1 12:30' DAY TO SECOND", // missing seconds field
+            "INTERVAL '0.+5' SECOND",           // fractional plus sign
             "INTERVAL '0 00:00:00.123456xyz' DAY TO SECOND",
             "INTERVAL '5.' SECOND",
             "INTERVAL '0.123456.789' SECOND",
