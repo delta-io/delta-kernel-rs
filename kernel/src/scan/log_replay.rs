@@ -175,6 +175,13 @@ pub struct ScanLogReplayProcessor {
     metrics: Arc<ScanMetrics>,
 }
 
+struct RetryTransformAndDataSkipOutput {
+    transformed_actions: Box<dyn EngineData>,
+    final_selection: Vec<bool>,
+    row_transform_exprs: Vec<Option<ExpressionRef>>,
+    active_add_file_sizes: Vec<u64>,
+}
+
 impl ScanLogReplayProcessor {
     // These index positions correspond to the order of columns defined in
     // `selected_column_names_and_types()`
@@ -496,6 +503,36 @@ impl ScanLogReplayProcessor {
             ))
         );
         Ok((transformed, selection_vector))
+    }
+
+    fn retry_transform_and_data_skip(
+        &self,
+        actions: Box<dyn EngineData>,
+        is_log_batch: bool,
+        dedup_selection: Vec<bool>,
+        row_transform_exprs: Vec<Option<ExpressionRef>>,
+        active_add_file_sizes: Vec<u64>,
+    ) -> DeltaResult<RetryTransformAndDataSkipOutput> {
+        let row_transform_exprs = dedup_selection
+            .iter()
+            .enumerate()
+            .filter(|(_, selected)| **selected)
+            .map(|(row, _)| row_transform_exprs.get(row).cloned().flatten())
+            .collect();
+        let active_add_file_sizes = dedup_selection
+            .iter()
+            .zip(active_add_file_sizes)
+            .filter_map(|(selected, size)| (*selected).then_some(size))
+            .collect();
+        let actions = actions.apply_selection_vector(dedup_selection)?;
+        let (transformed_actions, final_selection) =
+            self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
+        Ok(RetryTransformAndDataSkipOutput {
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            active_add_file_sizes,
+        })
     }
 
     fn record_active_add_files(
@@ -889,17 +926,19 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
             Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
         );
 
-        let mut retry_after_dedup = false;
+        let mut should_retry_transform_and_data_skip = false;
         // Step 1: Apply transform + data skipping. Do this before deduplication to reduce the size
         // of the dedup map and avoid String allocations.
         // This step transforms all Adds, including those superseded by Removes (dead Adds).
         // The transform for a dead Add may fail because it may have a different partition column
         // type. In that case, we get a ParseError and retry after deduplication.
-        let (transformed_result, selection_vector) =
+        let (pre_dedup_transform_result, pre_dedup_selection) =
             match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
-                Ok((transformed, selection_vector)) => (Ok(transformed), selection_vector),
+                Ok((transformed_actions, pre_dedup_selection)) => {
+                    (Ok(transformed_actions), pre_dedup_selection)
+                }
                 Err(err @ Error::ParseError(_, _)) => {
-                    retry_after_dedup = true;
+                    should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
                 Err(err) => return Err(err),
@@ -915,7 +954,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
-                selection_vector,
+                pre_dedup_selection,
                 self.state_info.clone(),
                 &self.metrics,
             );
@@ -928,29 +967,32 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         };
 
         // Step 3: Return transformed batch with updated selection vector
-        let scan_metadata = if retry_after_dedup {
+        let RetryTransformAndDataSkipOutput {
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            active_add_file_sizes,
+        } = if should_retry_transform_and_data_skip {
             // If step 1 failed with a parse error, filter out the dead Adds and retry after
             // deduplication.
-            let row_transform_exprs = dedup_selection
-                .iter()
-                .enumerate()
-                .filter(|(_, selected)| **selected)
-                .map(|(row, _)| row_transform_exprs.get(row).cloned().flatten())
-                .collect();
-            let active_add_file_sizes = dedup_selection
-                .iter()
-                .zip(active_add_file_sizes)
-                .filter_map(|(selected, size)| (*selected).then_some(size))
-                .collect::<Vec<_>>();
-            let actions = actions.apply_selection_vector(dedup_selection)?;
-            let (transformed, selection_vector) =
-                self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
-            self.record_active_add_files(&selection_vector, &active_add_file_sizes)?;
-            ScanMetadata::try_new(transformed, selection_vector, row_transform_exprs)?
+            self.retry_transform_and_data_skip(
+                actions,
+                is_log_batch,
+                dedup_selection,
+                row_transform_exprs,
+                active_add_file_sizes,
+            )?
         } else {
-            self.record_active_add_files(&dedup_selection, &active_add_file_sizes)?;
-            ScanMetadata::try_new(transformed_result?, dedup_selection, row_transform_exprs)?
+            RetryTransformAndDataSkipOutput {
+                transformed_actions: pre_dedup_transform_result?,
+                final_selection: dedup_selection,
+                row_transform_exprs,
+                active_add_file_sizes,
+            }
         };
+        self.record_active_add_files(&final_selection, &active_add_file_sizes)?;
+        let scan_metadata =
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -983,12 +1025,14 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         // with ISNULL guards that keep rows with missing stats. For partition values, the
         // predicate is wrapped with OR(NOT is_add, pred) via guard_for_removes, so non-Add
         // rows always pass the partition filter regardless of null partition values.
-        let mut retry_after_dedup = false;
-        let (transformed_result, selection_vector) =
+        let mut should_retry_transform_and_data_skip = false;
+        let (pre_dedup_transform_result, pre_dedup_selection) =
             match self.transform_and_data_skip(actions.as_ref(), is_log_batch) {
-                Ok((transformed, selection_vector)) => (Ok(transformed), selection_vector),
+                Ok((transformed_actions, pre_dedup_selection)) => {
+                    (Ok(transformed_actions), pre_dedup_selection)
+                }
                 Err(err @ Error::ParseError(_, _)) => {
-                    retry_after_dedup = true;
+                    should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
                 Err(err) => return Err(err),
@@ -1007,7 +1051,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let (dedup_selection, row_transform_exprs, active_add_file_sizes) = {
             let mut visitor = AddRemoveDedupVisitor::new(
                 deduplicator,
-                selection_vector,
+                pre_dedup_selection,
                 self.state_info.clone(),
                 &self.metrics,
             );
@@ -1020,27 +1064,30 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         };
 
         // Step 4: Return transformed batch with updated selection vector
-        let scan_metadata = if retry_after_dedup {
-            let row_transform_exprs = dedup_selection
-                .iter()
-                .enumerate()
-                .filter(|(_, selected)| **selected)
-                .map(|(row, _)| row_transform_exprs.get(row).cloned().flatten())
-                .collect();
-            let active_add_file_sizes = dedup_selection
-                .iter()
-                .zip(active_add_file_sizes)
-                .filter_map(|(selected, size)| (*selected).then_some(size))
-                .collect::<Vec<_>>();
-            let actions = actions.apply_selection_vector(dedup_selection)?;
-            let (transformed, selection_vector) =
-                self.transform_and_data_skip(actions.as_ref(), is_log_batch)?;
-            self.record_active_add_files(&selection_vector, &active_add_file_sizes)?;
-            ScanMetadata::try_new(transformed, selection_vector, row_transform_exprs)?
+        let RetryTransformAndDataSkipOutput {
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            active_add_file_sizes,
+        } = if should_retry_transform_and_data_skip {
+            self.retry_transform_and_data_skip(
+                actions,
+                is_log_batch,
+                dedup_selection,
+                row_transform_exprs,
+                active_add_file_sizes,
+            )?
         } else {
-            self.record_active_add_files(&dedup_selection, &active_add_file_sizes)?;
-            ScanMetadata::try_new(transformed_result?, dedup_selection, row_transform_exprs)?
+            RetryTransformAndDataSkipOutput {
+                transformed_actions: pre_dedup_transform_result?,
+                final_selection: dedup_selection,
+                row_transform_exprs,
+                active_add_file_sizes,
+            }
         };
+        self.record_active_add_files(&final_selection, &active_add_file_sizes)?;
+        let scan_metadata =
+            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
