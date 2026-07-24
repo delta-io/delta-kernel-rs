@@ -1019,11 +1019,12 @@ impl SetTransaction {
     serde(rename_all = "camelCase")
 )]
 pub(crate) struct ContentRoot {
-    /// Path to the root manifest file. It is absolute if it has a URI scheme (e.g.
-    /// `s3://bucket/...`); otherwise it is relative and resolved against the table root by
+    /// Path to the root manifest file. It is absolute if it begins with an [RFC 3986] URI scheme
+    /// (e.g. `s3://bucket/...`); otherwise it is relative and resolved against the table root by
     /// concatenation with a `/` separator, matching the [Iceberg V4 relative paths specification].
     /// Unlike [`Add`]/[`Remove`] paths, this is not RFC 2396 percent-encoded.
     ///
+    /// [RFC 3986]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
     /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     pub(crate) path: String,
     /// Size of the root manifest file in bytes. Not exposed directly -- use
@@ -1084,38 +1085,70 @@ pub(crate) struct CheckpointAction {
     pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
 }
 
+/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn has_scheme(location: &str) -> bool {
+    for (position, ch) in location.char_indices() {
+        if ch == ':' {
+            return position > 0;
+        }
+        if !is_scheme_char(ch, position) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
+/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
+/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn is_scheme_char(ch: char, position: usize) -> bool {
+    if ch.is_ascii_alphabetic() {
+        return true;
+    }
+    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
+}
+
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl ContentRoot {
     /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
     ///
     /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to
-    /// `table_root` by concatenation with a single `/` separator, matching the [Iceberg V4 relative
-    /// paths specification]. `last_modified` is set to `i64::MAX` since the root manifest has no
-    /// recorded modification time, so staleness-based caches never evict it.
+    /// `table_root` by concatenation with a single `/` separator, matching Iceberg V4's
+    /// [relative paths specification].
     ///
     /// Returns an error if the resolved location fails to parse as a [`Url`], or if the size does
     /// not fit a [`crate::FileSize`].
     ///
-    /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
+    /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
     #[internal_api]
     pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
         let path = &self.path;
-        let location = match Url::parse(path) {
-            // A parseable scheme means the path is absolute and used as-is.
-            Ok(absolute) => absolute,
+        let location = if has_scheme(path) {
+            // A URI scheme means the path is absolute and used as-is.
+            Url::parse(path).map_err(|e| {
+                Error::generic(format!(
+                    "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
+                ))
+            })?
+        } else {
             // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
-            Err(_) => {
-                let mut base = table_root.as_str().to_string();
-                if !base.ends_with('/') {
-                    base.push('/');
-                }
-                Url::parse(&format!("{base}{path}")).map_err(|e| {
-                    Error::generic(format!(
-                        "Failed to resolve checkpoint contentRoot path {path:?} against table \
-                         root {base}: {e}"
-                    ))
-                })?
+            let mut base = table_root.as_str().to_string();
+            if !base.ends_with('/') {
+                base.push('/');
             }
+            Url::parse(&format!("{base}{path}")).map_err(|e| {
+                Error::generic(format!(
+                    "Failed to resolve checkpoint contentRoot path {path:?} against table \
+                     root {base}: {e}"
+                ))
+            })?
         };
         Ok(FileMeta {
             location,
@@ -2471,6 +2504,39 @@ mod tests {
         "c:/foo/root.parquet",
         2048,
         "c:/foo/root.parquet",
+        Ok(2048)
+    )]
+    // A colon inside a relative path segment is not a scheme delimiter (a `/` precedes it), so
+    // the path stays relative.
+    #[case::colon_in_relative_segment_stays_relative(
+        "memory:///table/",
+        "metadata/snap-123:456.parquet",
+        2048,
+        "memory:///table/metadata/snap-123:456.parquet",
+        Ok(2048)
+    )]
+    // RFC 3986 requires the first scheme char to be ALPHA; a leading digit is not a scheme.
+    #[case::leading_digit_scheme_treated_as_relative(
+        "memory:///table/",
+        "3com/root.parquet",
+        2048,
+        "memory:///table/3com/root.parquet",
+        Ok(2048)
+    )]
+    // A non-ASCII leading letter (Greek alpha, U+03B1) is not a valid scheme char.
+    #[case::non_ascii_scheme_treated_as_relative(
+        "memory:///table/",
+        "\u{03b1}scheme/root.parquet",
+        2048,
+        "memory:///table/%CE%B1scheme/root.parquet",
+        Ok(2048)
+    )]
+    // A multi-char, non-alphanumeric scheme (`git+ssh`) is absolute and used as-is.
+    #[case::compound_scheme_treated_as_absolute(
+        "memory:///table/",
+        "git+ssh://host/repo/root.parquet",
+        2048,
+        "git+ssh://host/repo/root.parquet",
         Ok(2048)
     )]
     fn test_checkpoint_action_root_filemeta(
