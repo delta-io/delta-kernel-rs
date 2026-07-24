@@ -366,9 +366,9 @@ impl Metadata {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth,
-    /// [`Error::Unsupported`] when the schema declares a type the kernel doesn't support,
-    /// or [`Error::MalformedJson`] for other JSON decoding failures.
+    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth or
+    /// declares a type the kernel doesn't support, or [`Error::MalformedJson`] for other
+    /// JSON decoding failures.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
@@ -386,7 +386,7 @@ impl Metadata {
                 ))
                 .with_backtrace()
             } else if is_unsupported_delta_type_error(&error) {
-                Error::Unsupported(error.to_string()).with_backtrace()
+                Error::schema(error.to_string()).with_backtrace()
             } else {
                 error.into()
             }
@@ -1278,37 +1278,37 @@ mod tests {
     // Syntax error -> MalformedJson.
     #[case::malformed_syntax("{", "MalformedJson")]
     // Data error lacking the unsupported-type prefix (invalid decimal) -> MalformedJson, NOT
-    // Unsupported: the reclassification must not fire for every is_data error.
+    // Schema: the reclassification must not fire for every is_data error.
     #[case::malformed_bad_decimal(
         r#"{"type":"struct","fields":[{"name":"t","type":"decimal(nope)","nullable":true,"metadata":{}}]}"#,
         "MalformedJson"
     )]
     // Regression guard: a well-formed schema whose wrong-typed field value echoes the prefix must
     // stay MalformedJson. `nullable` is a bool, so a string value is an is_data error whose message
-    // *contains* the prefix; matching by `starts_with` keeps it out of the Unsupported arm.
+    // *contains* the prefix; matching by `starts_with` keeps it out of the Schema arm.
     #[case::malformed_value_echoes_prefix(
         r#"{"type":"struct","fields":[{"name":"t","type":"string","nullable":"Unsupported Delta table type","metadata":{}}]}"#,
         "MalformedJson"
     )]
-    // Unsupported primitive types -> Unsupported.
+    // Unsupported primitive types -> Schema.
     #[case::unsupported_time(
         r#"{"type":"struct","fields":[{"name":"t","type":"time(6)","nullable":true,"metadata":{}}]}"#,
-        "Unsupported"
+        "Schema"
     )]
     #[case::unsupported_interval(
         r#"{"type":"struct","fields":[{"name":"t","type":"interval week","nullable":true,"metadata":{}}]}"#,
-        "Unsupported"
+        "Schema"
     )]
-    // Unsupported primitive nested inside a struct field -> Unsupported (reclassification is
+    // Unsupported primitive nested inside a struct field -> Schema (reclassification is
     // position-agnostic, not limited to top-level columns).
     #[case::unsupported_nested(
         r#"{"type":"struct","fields":[{"name":"t","type":{"type":"struct","fields":[{"name":"inner","type":"time(6)","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
-        "Unsupported"
+        "Schema"
     )]
-    // Unknown complex type -> Unsupported.
+    // Unknown complex type -> Schema.
     #[case::unsupported_complex(
         r#"{"type":"struct","fields":[{"name":"t","type":{"type":"matrix"},"nullable":true,"metadata":{}}]}"#,
-        "Unsupported"
+        "Schema"
     )]
     fn parse_schema_error_classification(
         #[case] schema_string: &str,
@@ -1328,8 +1328,8 @@ mod tests {
             "MalformedJson" => {
                 assert!(matches!(error, Error::MalformedJson(_)), "got: {error:?}")
             }
-            "Unsupported" => {
-                assert!(matches!(error, Error::Unsupported(_)), "got: {error:?}")
+            "Schema" => {
+                assert!(matches!(error, Error::Schema(_)), "got: {error:?}")
             }
             other => panic!("unknown expected_error discriminant: {other}"),
         }
