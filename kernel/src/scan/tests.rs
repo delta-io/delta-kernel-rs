@@ -1715,6 +1715,7 @@ fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
 #[derive(Debug)]
 struct RecordedParquetRead {
     files: Vec<String>,
+    physical_schema: schema::SchemaRef,
     predicate: Option<PredicateRef>,
 }
 
@@ -1732,6 +1733,7 @@ impl ParquetHandler for RecordingParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
             files: files.iter().map(|file| file.location.to_string()).collect(),
+            physical_schema: physical_schema.clone(),
             predicate: predicate.clone(),
         });
         self.inner
@@ -1788,6 +1790,128 @@ impl Engine for RecordingParquetEngine {
     fn storage_handler(&self) -> Arc<dyn StorageHandler> {
         self.inner.storage_handler()
     }
+}
+
+#[rstest]
+#[case::all_struct(StatsOptions::all_struct(), false, false)]
+#[case::all(StatsOptions::all(), true, false)]
+#[case::none_with_predicate(StatsOptions::none(), false, true)]
+fn test_checkpoint_stats_projection_matches_requested_output(
+    #[values(
+        "v1-single-part-struct-stats-only",
+        "v2-parquet-sidecars-struct-stats-only",
+        "v2-checkpoints-parquet-with-sidecars"
+    )]
+    table: &str,
+    #[case] stats: StatsOptions,
+    #[case] request_raw_stats: bool,
+    #[case] skip_stats: bool,
+) {
+    let extracted = load_test_data("tests/data", table).ok();
+    let path = extracted
+        .as_ref()
+        .map(|dir| dir.path().join(table))
+        .unwrap_or_else(|| {
+            std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
+        });
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    engine.take_reads();
+
+    let predicate: Option<PredicateRef> = skip_stats
+        .then(|| Arc::new(Pred::gt(column_expr!("id"), Expr::literal(0i64))) as PredicateRef);
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats)
+        .build()
+        .unwrap();
+    for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
+        action.unwrap();
+    }
+
+    let reads = engine.take_reads();
+    let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
+    let expect_parsed_stats = !skip_stats && compatible_structured_stats;
+    let expect_raw_stats = !skip_stats && (request_raw_stats || !expect_parsed_stats);
+    let expected_file_fragment = if table.starts_with("v2-") {
+        "_sidecars/"
+    } else {
+        ".checkpoint."
+    };
+    let action_reads: Vec<_> = reads
+        .iter()
+        .filter(|read| {
+            read.files
+                .iter()
+                .any(|file| file.contains(expected_file_fragment))
+                && read.physical_schema.field("add").is_some()
+        })
+        .collect();
+    assert!(!action_reads.is_empty(), "expected checkpoint Add reads");
+    for read in action_reads {
+        let add_field = read
+            .physical_schema
+            .field("add")
+            .expect("checkpoint read schema must contain add");
+        let DataType::Struct(add) = add_field.data_type() else {
+            panic!("checkpoint add field must be a struct");
+        };
+        assert_eq!(
+            add.field("stats").is_some(),
+            expect_raw_stats,
+            "raw checkpoint stats projection must match the requested output"
+        );
+        assert_eq!(
+            add.field("stats_parsed").is_some(),
+            expect_parsed_stats,
+            "structured checkpoint stats projection must match the requested output"
+        );
+    }
+}
+
+#[test]
+fn test_all_struct_parses_json_commit_stats() {
+    let path = std::fs::canonicalize(PathBuf::from(
+        "./tests/data/v1-single-part-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    // The table's checkpoint is at version 5, so version 4 replays only JSON commits.
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(4)
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+
+    let mut file_count = 0;
+    for scan_metadata in scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered = filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+        let stats_parsed = get_column!(filtered, "stats_parsed", StructArray);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
+
+        for row in 0..filtered.num_rows() {
+            assert!(!stats_parsed.is_null(row));
+            assert_eq!(num_records.value(row), 1);
+            file_count += 1;
+        }
+    }
+    assert_eq!(file_count, 4);
 }
 
 #[rstest]

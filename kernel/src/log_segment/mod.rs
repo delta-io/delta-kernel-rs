@@ -10,8 +10,7 @@ use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, MAX_VALUES,
-    MIN_VALUES, SIDECAR_NAME,
+    action_presence_leaf, schema_contains_file_actions, Sidecar, LOG_ADD_SCHEMA, SIDECAR_NAME,
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
@@ -983,22 +982,43 @@ impl LogSegment {
             (None, vec![])
         };
 
-        // Check if checkpoint has compatible stats_parsed and add it to the schema if so
+        let checkpoint_has_raw_stats = file_actions_schema
+            .as_ref()
+            .is_some_and(|schema| Self::schema_contains_raw_stats(schema));
+
+        // Missing structured leaves are usable only when the checkpoint has no raw fallback.
         let has_stats_parsed =
             stats_schema
                 .zip(file_actions_schema.as_ref())
                 .is_some_and(|(stats, file_schema)| {
-                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
+                    if checkpoint_has_raw_stats {
+                        Self::schema_has_compatible_stats_parsed_with_missing_fields(
+                            file_schema,
+                            stats,
+                            false,
+                        )
+                    } else {
+                        Self::schema_has_compatible_stats_parsed(file_schema, stats)
+                    }
                 });
 
         let has_partition_values_parsed = partition_schema
             .zip(file_actions_schema.as_ref())
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
 
-        // Build final schema with any additional fields needed
-        // (stats_parsed, partitionValues_parsed, sidecar)
+        // Raw checkpoint stats are required when structured stats cannot satisfy the scan schema.
+        let needs_raw_stats_fallback = stats_schema.is_some()
+            && !has_stats_parsed
+            && action_schema.field("add").is_some_and(|field| {
+                let DataType::Struct(add) = field.data_type() else {
+                    return false;
+                };
+                add.field("stats").is_none()
+            });
+
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
+        let needs_add_augmentation =
+            needs_raw_stats_fallback || has_stats_parsed || has_partition_values_parsed;
         let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
             let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
                 (needs_add_augmentation, action_schema.field("add"))
@@ -1009,6 +1029,10 @@ impl LogSegment {
                     ));
                 };
                 let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+
+                if needs_raw_stats_fallback {
+                    add_fields.push(StructField::nullable("stats", DataType::STRING));
+                }
 
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
                     add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
@@ -1284,14 +1308,21 @@ impl LogSegment {
         SIDECAR_SCHEMA.clone()
     }
 
+    fn add_field<'a>(checkpoint_schema: &'a StructType, name: &str) -> Option<&'a StructField> {
+        let DataType::Struct(add) = checkpoint_schema.field("add")?.data_type() else {
+            return None;
+        };
+        add.field(name)
+    }
+
     /// Checks if a checkpoint schema contains a usable `add.stats_parsed` field.
     ///
     /// This validates that:
     /// 1. The `add.stats_parsed` field exists in the checkpoint schema
     /// 2. The types in `stats_parsed` are compatible with the stats schema for data skipping
     ///
-    /// The `stats_schema` parameter contains only the columns referenced in the data skipping
-    /// predicate. This is built from the predicate and passed in by the caller.
+    /// `stats_schema` is the physical typed schema required by the scan. It includes requested
+    /// structured output fields and any data-skipping predicate fields.
     ///
     /// Both the checkpoint's `stats_parsed` schema and the `stats_schema` for data skipping
     /// use physical column names (not logical names), so direct name comparison is correct.
@@ -1301,14 +1332,21 @@ impl LogSegment {
         checkpoint_schema: &StructType,
         stats_schema: &StructType,
     ) -> bool {
-        // Get add.stats_parsed from the checkpoint schema
-        let Some(stats_parsed) = checkpoint_schema
-            .field("add")
-            .and_then(|f| match f.data_type() {
-                DataType::Struct(s) => s.field("stats_parsed"),
-                _ => None,
-            })
-        else {
+        Self::schema_has_compatible_stats_parsed_with_missing_fields(
+            checkpoint_schema,
+            stats_schema,
+            true,
+        )
+    }
+
+    /// Returns whether checkpoint parsed stats satisfy `stats_schema`, accepting absent fields
+    /// only when `allow_missing_fields` is true.
+    fn schema_has_compatible_stats_parsed_with_missing_fields(
+        checkpoint_schema: &StructType,
+        stats_schema: &StructType,
+        allow_missing_fields: bool,
+    ) -> bool {
+        let Some(stats_parsed) = Self::add_field(checkpoint_schema, "stats_parsed") else {
             debug!("stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field");
             return false;
         };
@@ -1321,66 +1359,42 @@ impl LogSegment {
             return false;
         };
 
-        // Check type compatibility for both minValues and maxValues structs.
-        // While these typically have the same schema, the protocol doesn't guarantee it,
-        // so we check both to be safe.
-        for field_name in [MIN_VALUES, MAX_VALUES] {
-            let Some(checkpoint_values_field) = stats_struct.field(field_name) else {
-                // stats_parsed exists but no minValues/maxValues - unusual but valid
-                continue;
-            };
-
-            // minValues/maxValues must be a Struct containing per-column statistics.
-            // If it exists but isn't a Struct, the schema is malformed and unusable.
-            let DataType::Struct(checkpoint_values) = checkpoint_values_field.data_type() else {
-                debug!(
-                    "stats_parsed not compatible: stats_parsed.{} is not a Struct, got {:?}",
-                    field_name,
-                    checkpoint_values_field.data_type()
-                );
-                return false;
-            };
-
-            // Get the corresponding field from stats_schema (e.g., stats_schema.minValues)
-            let Some(stats_values_field) = stats_schema.field(field_name) else {
-                // stats_schema doesn't have minValues/maxValues, skip this check
-                continue;
-            };
-            let DataType::Struct(stats_values) = stats_values_field.data_type() else {
-                // stats_schema.minValues/maxValues isn't a struct - shouldn't happen but skip
-                continue;
-            };
-
-            // Check type compatibility recursively for nested structs.
-            // Only fields that exist in both schemas need compatible types.
-            // Extra fields in checkpoint are ignored; missing fields return null.
-            if !Self::structs_have_compatible_types(checkpoint_values, stats_values, field_name) {
-                return false;
-            }
+        if !Self::structs_have_compatible_types(
+            stats_struct,
+            stats_schema,
+            "stats_parsed",
+            allow_missing_fields,
+        ) {
+            return false;
         }
 
         debug!("Checkpoint schema has compatible stats_parsed for data skipping");
         true
     }
 
-    /// Recursively checks if two struct types have compatible field types.
-    ///
-    /// Used by both `stats_parsed` and `partitionValues_parsed` compatibility checks.
-    /// For each field in `needed`, if it exists in `available` (checkpoint):
-    /// - Primitive types: must be compatible via [`PrimitiveType::is_stats_type_compatible_with`]
-    ///   (allows type widening and Parquet physical type reinterpretation)
-    /// - Nested structs: recursively check inner fields
-    /// - Missing fields in checkpoint: OK (will return null when accessed)
-    /// - Extra fields in checkpoint: OK (ignored)
+    /// Returns whether the checkpoint schema contains `add.stats`.
+    fn schema_contains_raw_stats(checkpoint_schema: &StructType) -> bool {
+        Self::add_field(checkpoint_schema, "stats").is_some()
+    }
+
+    /// Returns whether every required field is compatible under the missing-field policy.
     fn structs_have_compatible_types(
         available: &StructType,
         needed: &StructType,
         context: &str,
+        allow_missing_fields: bool,
     ) -> bool {
         for needed_field in needed.fields() {
             let Some(available_field) = available.field(needed_field.name()) else {
-                // Field missing in checkpoint - that's OK, it will be null
-                continue;
+                if allow_missing_fields {
+                    continue;
+                }
+                debug!(
+                    "{} not compatible: checkpoint is missing required field '{}'",
+                    context,
+                    needed_field.name()
+                );
+                return false;
             };
 
             match (available_field.data_type(), needed_field.data_type()) {
@@ -1391,6 +1405,7 @@ impl LogSegment {
                         avail_struct,
                         need_struct,
                         &nested_context,
+                        allow_missing_fields,
                     ) {
                         return false;
                     }
@@ -1406,10 +1421,10 @@ impl LogSegment {
                     };
                     if !compatible {
                         debug!(
-                            "stats_parsed not compatible: incompatible type for '{}' in {}: \
+                            "{} not compatible: incompatible type for '{}': \
                              checkpoint has {:?}, stats schema needs {:?}",
-                            needed_field.name(),
                             context,
+                            needed_field.name(),
                             avail_type,
                             need_type
                         );
@@ -1434,13 +1449,7 @@ impl LogSegment {
         checkpoint_schema: &StructType,
         partition_schema: &StructType,
     ) -> bool {
-        let Some(partition_parsed) =
-            checkpoint_schema
-                .field("add")
-                .and_then(|f| match f.data_type() {
-                    DataType::Struct(s) => s.field("partitionValues_parsed"),
-                    _ => None,
-                })
+        let Some(partition_parsed) = Self::add_field(checkpoint_schema, "partitionValues_parsed")
         else {
             debug!("partitionValues_parsed not compatible: checkpoint schema does not contain add.partitionValues_parsed field");
             return false;
@@ -1459,6 +1468,7 @@ impl LogSegment {
             partition_struct,
             partition_schema,
             "partitionValues_parsed",
+            true,
         ) {
             return false;
         }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::StateInfo;
-use super::{PhysicalPredicate, ScanMetadata};
+use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -40,7 +40,7 @@ pub(crate) struct ScanStatsOptions {
     /// whose `add.stats` is null but whose `add.stats_parsed` is populated
     /// (writeStatsAsJson=false, writeStatsAsStruct=true). When false, `ScanFile.stats`
     /// is left null on such checkpoints; engines that consume `stats_parsed` directly
-    /// avoid the per-batch `ToJson` cost.
+    /// avoid reading raw checkpoint JSON and the per-batch `ToJson` cost.
     pub(crate) synthesize_json: bool,
 }
 
@@ -130,7 +130,7 @@ pub struct SerializableScanState {
 /// During a table scan, the processor reads batches of log actions (in reverse chronological order)
 /// and performs the following steps:
 ///
-/// - Transformation and Data Skipping: Applies a built-in transformation (`log_transform` or
+/// - Transformation and Data Skipping: Applies a built-in transformation (`commit_transform` or
 ///   `checkpoint_transform`) to parse action metadata, then applies a predicate-based filter (via
 ///   [`DataSkippingFilter`]). This includes both data column stats (min/max/nullCount) and
 ///   partition value filtering in a single columnar pass. A secondary row-level partition filter
@@ -156,7 +156,7 @@ pub struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
     /// StructPatch for log batches (commit files) - uses ParseJson for stats and MapToStruct
     /// for partition values
-    log_transform: Arc<dyn ExpressionEvaluator>,
+    commit_transform: Arc<dyn ExpressionEvaluator>,
     /// StructPatch for checkpoint batches - reads pre-parsed stats_parsed and
     /// partitionValues_parsed directly when available, otherwise parses from raw columns
     checkpoint_transform: Arc<dyn ExpressionEvaluator>,
@@ -305,9 +305,9 @@ impl ScanLogReplayProcessor {
 
         Ok(Self {
             data_skipping_filter,
-            // Log transform: parse JSON for stats, MapToStruct for partition values
-            log_transform: engine.evaluation_handler().new_expression_evaluator(
-                checkpoint_read_schema.clone(),
+            // Commit transform: parse JSON for stats, MapToStruct for partition values
+            commit_transform: engine.evaluation_handler().new_expression_evaluator(
+                COMMIT_READ_SCHEMA.clone(),
                 get_add_transform_expr(
                     stats_schema_for_transform.clone(),
                     false,
@@ -417,7 +417,7 @@ impl ScanLogReplayProcessor {
     /// Reconstruct a processor from serialized state.
     ///
     /// Creates a new processor with the provided state. All fields (partition_filter,
-    /// data_skipping_filter, log_transform, checkpoint_transform, and seen_file_keys) are
+    /// data_skipping_filter, commit_transform, checkpoint_transform, and seen_file_keys) are
     /// reconstructed from the serialized state and engine.
     ///
     /// # Parameters
@@ -479,7 +479,7 @@ impl ScanLogReplayProcessor {
         is_log_batch: bool,
     ) -> DeltaResult<(Box<dyn EngineData>, Vec<bool>)> {
         let transform = if is_log_batch {
-            &self.log_transform
+            &self.commit_transform
         } else {
             &self.checkpoint_transform
         };
@@ -807,8 +807,8 @@ fn scan_row_schema_with_parsed_columns(
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
 ///   raw stats JSON string from checkpoint parquet files.
 /// - `synthesize_json`: When false, disables the `ToJson(add.stats_parsed)` fallback regardless of
-///   `has_stats_parsed`. Set false for engines that consume `stats_parsed` directly and don't want
-///   to pay the per-batch `ToJson` cost over potentially large stats structs.
+///   `has_stats_parsed`. Compatible parsed-stats checkpoints produce null JSON stats and can omit
+///   the raw column; raw-only checkpoints and commits retain `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
@@ -838,6 +838,9 @@ fn get_add_transform_expr(
                 Expression::column(["add", "stats_parsed"]),
             ),
         ]))
+    } else if has_stats_parsed {
+        // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
+        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
     } else {
         column_expr_ref!("add.stats")
     };
@@ -1153,7 +1156,7 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate, Scalar,
+        BinaryExpressionOp, ColumnName, Expression, OpaquePredicateOp, Predicate, Scalar,
         ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
@@ -2056,6 +2059,20 @@ mod tests {
             count_to_json(&without_synthesis),
             0,
             "expected no ToJson nodes anywhere in the transform when synthesis is skipped"
+        );
+        assert!(
+            !without_synthesis
+                .references()
+                .contains(&ColumnName::new(["add", "stats"])),
+            "structured-only checkpoint transform must not reference add.stats"
+        );
+        let Expression::Struct(fields, _) = without_synthesis.as_ref() else {
+            panic!("add transform must produce a struct");
+        };
+        assert_eq!(
+            fields[3].as_ref(),
+            &Expression::Literal(Scalar::Null(DataType::STRING)),
+            "structured-only checkpoint stats output must be a typed NULL"
         );
     }
 }
