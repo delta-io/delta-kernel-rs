@@ -217,7 +217,7 @@ pub(super) struct ContentTreeNodeEntry {
     #[nested_field_id = 136]
     pub(crate) equality_ids: Option<Vec<i32>>,
 
-    /// The AMT/Iceberg format version this entry was written at (Iceberg field id 157).
+    /// The AMT/Iceberg format version this entry was written at.
     #[field_id = 157]
     pub(crate) format_version: i32,
 
