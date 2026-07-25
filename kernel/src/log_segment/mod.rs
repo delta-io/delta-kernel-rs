@@ -982,24 +982,11 @@ impl LogSegment {
             (None, vec![])
         };
 
-        let checkpoint_has_raw_stats = file_actions_schema
-            .as_ref()
-            .is_some_and(|schema| Self::schema_contains_raw_stats(schema));
-
-        // Missing structured leaves are usable only when the checkpoint has no raw fallback.
         let has_stats_parsed =
             stats_schema
                 .zip(file_actions_schema.as_ref())
                 .is_some_and(|(stats, file_schema)| {
-                    if checkpoint_has_raw_stats {
-                        Self::schema_has_compatible_stats_parsed_with_missing_fields(
-                            file_schema,
-                            stats,
-                            false,
-                        )
-                    } else {
-                        Self::schema_has_compatible_stats_parsed(file_schema, stats)
-                    }
+                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
 
         let has_partition_values_parsed = partition_schema
@@ -1332,20 +1319,6 @@ impl LogSegment {
         checkpoint_schema: &StructType,
         stats_schema: &StructType,
     ) -> bool {
-        Self::schema_has_compatible_stats_parsed_with_missing_fields(
-            checkpoint_schema,
-            stats_schema,
-            true,
-        )
-    }
-
-    /// Returns whether checkpoint parsed stats satisfy `stats_schema`, accepting absent fields
-    /// only when `allow_missing_fields` is true.
-    fn schema_has_compatible_stats_parsed_with_missing_fields(
-        checkpoint_schema: &StructType,
-        stats_schema: &StructType,
-        allow_missing_fields: bool,
-    ) -> bool {
         let Some(stats_parsed) = Self::add_field(checkpoint_schema, "stats_parsed") else {
             debug!("stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field");
             return false;
@@ -1359,12 +1332,7 @@ impl LogSegment {
             return false;
         };
 
-        if !Self::structs_have_compatible_types(
-            stats_struct,
-            stats_schema,
-            "stats_parsed",
-            allow_missing_fields,
-        ) {
+        if !Self::structs_have_compatible_types(stats_struct, stats_schema, "stats_parsed") {
             return false;
         }
 
@@ -1372,29 +1340,15 @@ impl LogSegment {
         true
     }
 
-    /// Returns whether the checkpoint schema contains `add.stats`.
-    fn schema_contains_raw_stats(checkpoint_schema: &StructType) -> bool {
-        Self::add_field(checkpoint_schema, "stats").is_some()
-    }
-
-    /// Returns whether every required field is compatible under the missing-field policy.
+    /// Returns whether every field present in both schemas has a compatible type.
     fn structs_have_compatible_types(
         available: &StructType,
         needed: &StructType,
         context: &str,
-        allow_missing_fields: bool,
     ) -> bool {
         for needed_field in needed.fields() {
             let Some(available_field) = available.field(needed_field.name()) else {
-                if allow_missing_fields {
-                    continue;
-                }
-                debug!(
-                    "{} not compatible: checkpoint is missing required field '{}'",
-                    context,
-                    needed_field.name()
-                );
-                return false;
+                continue;
             };
 
             match (available_field.data_type(), needed_field.data_type()) {
@@ -1405,7 +1359,6 @@ impl LogSegment {
                         avail_struct,
                         need_struct,
                         &nested_context,
-                        allow_missing_fields,
                     ) {
                         return false;
                     }
@@ -1468,7 +1421,6 @@ impl LogSegment {
             partition_struct,
             partition_schema,
             "partitionValues_parsed",
-            true,
         ) {
             return false;
         }

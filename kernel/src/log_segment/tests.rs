@@ -3445,6 +3445,7 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
 
 fn create_stream_checkpoint_schema_with_stats_parsed(
     min_values_fields: Vec<StructField>,
+    include_raw_stats: bool,
 ) -> DeltaResult<SchemaRef> {
     let stats_parsed = StructField::nullable(
         "stats_parsed",
@@ -3454,9 +3455,12 @@ fn create_stream_checkpoint_schema_with_stats_parsed(
             nullable (MAX_VALUES): { ..(min_values_fields) },
         },
     );
-    let patch = SchemaStructPatchBuilder::new()
-        .append_at(["add"], stats_parsed)
-        .drop_at(["add"], "stats");
+    let patch = SchemaStructPatchBuilder::new().append_at(["add"], stats_parsed);
+    let patch = if include_raw_stats {
+        patch
+    } else {
+        patch.drop_at(["add"], "stats")
+    };
     Ok(Arc::new(patch.build(get_commit_schema().as_ref())?))
 }
 
@@ -3480,23 +3484,25 @@ fn create_checkpoint_schema_without_stats_parsed() -> StructType {
 }
 
 #[rstest]
-#[case::missing_with_raw(true, false, true)]
-#[case::partial_without_raw(false, true, false)]
+#[case::missing_with_raw(false, true, false, true)]
+#[case::partial_with_raw(true, true, true, false)]
+#[case::partial_without_raw(true, false, true, false)]
 #[tokio::test]
 async fn test_checkpoint_stream_resolves_stats_projection(
+    #[case] include_parsed_stats: bool,
     #[case] include_raw_stats: bool,
     #[case] expect_parsed_stats: bool,
     #[case] expect_raw_stats: bool,
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
-    let checkpoint_schema = if include_raw_stats {
-        get_commit_schema().clone()
+    let checkpoint_schema = if include_parsed_stats {
+        create_stream_checkpoint_schema_with_stats_parsed(
+            vec![StructField::nullable("other", DataType::LONG)],
+            include_raw_stats,
+        )?
     } else {
-        create_stream_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
-            "other",
-            DataType::LONG,
-        )])?
+        get_commit_schema().clone()
     };
     add_checkpoint_to_store(
         &store,
