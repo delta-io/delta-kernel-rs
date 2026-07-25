@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use delta_kernel::object_store::list::{PaginatedListOptions, PaginatedListStore};
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
+use delta_kernel::object_store::{self, DynObjectStore, ObjectMeta, ObjectStoreExt as _, PutMode};
 use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -11,17 +12,33 @@ use url::Url;
 use crate::executor::TaskExecutor;
 use crate::UrlExt;
 
-#[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
+    /// `Some` for S3/GCS/Azure (delimiter pushdown), `None` elsewhere (client-side filter).
+    paginated: Option<Arc<dyn PaginatedListStore>>,
     task_executor: Arc<E>,
     readahead: usize,
 }
 
+impl<E: TaskExecutor> std::fmt::Debug for ObjectStoreStorageHandler<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreStorageHandler")
+            .field("inner", &self.inner)
+            .field("paginated", &self.paginated.is_some())
+            .field("readahead", &self.readahead)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(
+        store: Arc<DynObjectStore>,
+        paginated: Option<Arc<dyn PaginatedListStore>>,
+        task_executor: Arc<E>,
+    ) -> Self {
         Self {
             inner: store,
+            paginated,
             task_executor,
             readahead: 10,
         }
@@ -34,21 +51,9 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     }
 }
 
-/// Native async implementation for list_from.
-///
-/// Storage metrics are emitted by the outer [`MeteredStorageHandler`] wrapping this
-/// handler (e.g. inside `DefaultEngine`'s `storage_handler()`), so this function just
-/// returns the raw stream.
-///
-/// [`MeteredStorageHandler`]: delta_kernel::metrics::MeteredStorageHandler
-async fn list_from_impl(
-    store: Arc<DynObjectStore>,
-    path: Url,
-) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
-    // The offset is used for list-after; the prefix is used to restrict the listing to a specific
-    // directory. Unfortunately, `Path` provides no easy way to check whether a name is
-    // directory-like, because it strips trailing /, so we're reduced to manually checking the
-    // original URL.
+/// Returns the `(prefix, offset)` to list: a trailing-`/` `path` lists itself, otherwise its
+/// parent is listed after `path`.
+fn list_scope(path: &Url) -> DeltaResult<(Path, Path)> {
     let offset = Path::from_url_path(path.path())?;
     let prefix = if path.path().ends_with('/') {
         offset.clone()
@@ -61,31 +66,130 @@ async fn list_from_impl(
         }
         Path::from_iter(parts)
     };
+    Ok((prefix, offset))
+}
 
-    let has_ordered_listing = supports_ordered_listing(&path);
+/// Builds a [`FileMeta`], taking the scheme and authority from `base`.
+fn file_meta(base: &Url, meta: ObjectMeta) -> FileMeta {
+    let mut location = base.clone();
+    location.set_path(&format!("/{}", meta.location.as_ref()));
+    FileMeta {
+        location,
+        last_modified: meta.last_modified.timestamp_millis(),
+        size: meta.size,
+    }
+}
 
-    let stream = store
-        .list_with_offset(Some(&prefix), &offset)
-        .map(move |meta| {
-            let meta = meta?;
-            let mut location = path.clone();
-            location.set_path(&format!("/{}", meta.location.as_ref()));
-            Ok(FileMeta {
-                location,
-                last_modified: meta.last_modified.timestamp_millis(),
-                size: meta.size,
+/// Options for a follow-up page: continuation token only, no offset (offset is first-page only).
+fn next_page_opts(token: String) -> PaginatedListOptions {
+    PaginatedListOptions {
+        delimiter: Some("/".into()),
+        page_token: Some(token),
+        ..Default::default()
+    }
+}
+
+/// Sorts and drops entries at or before `offset`, for out-of-order or offset-ignoring backends.
+/// Compares in the store's decoded key space, not the encoded URL path.
+fn sort_and_bound(
+    mut items: Vec<ObjectMeta>,
+    base: &Url,
+    offset: &Path,
+) -> BoxStream<'static, DeltaResult<FileMeta>> {
+    if !offset.as_ref().is_empty() {
+        items.retain(|m| m.location.as_ref() > offset.as_ref());
+    }
+    items.sort_unstable_by(|a, b| a.location.cmp(&b.location));
+    let base = base.clone();
+    Box::pin(stream::iter(
+        items.into_iter().map(move |m| Ok(file_meta(&base, m))),
+    ))
+}
+
+/// Single-directory `list_from`, dispatching by whether the store supports delimiter pushdown.
+async fn list_from_impl(
+    store: Arc<DynObjectStore>,
+    paginated: Option<Arc<dyn PaginatedListStore>>,
+    path: Url,
+) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
+    let (prefix, offset) = list_scope(&path)?;
+    let ordered = supports_ordered_listing(&path);
+    match paginated {
+        Some(p) => list_one_level_paginated(p, path, prefix, offset, ordered).await,
+        None => list_one_level_delimited(store, path, prefix, offset).await,
+    }
+}
+
+/// Fallback for stores without a [`PaginatedListStore`] handle. `list_with_delimiter` is one level
+/// but takes no offset, so bound and sort client-side.
+async fn list_one_level_delimited(
+    store: Arc<DynObjectStore>,
+    base_url: Url,
+    prefix: Path,
+    offset: Path,
+) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
+    let result = store.list_with_delimiter(Some(&prefix)).await?;
+    Ok(sort_and_bound(result.objects, &base_url, &offset))
+}
+
+/// List one directory level via [`PaginatedListStore`]'s `/` delimiter. Ordered backends stream
+/// pages lazily so a caller can stop early. S3 Express is unordered and rejects `start-after`, so
+/// it gets no offset and is bounded client-side.
+async fn list_one_level_paginated(
+    paginated: Arc<dyn PaginatedListStore>,
+    base_url: Url,
+    prefix: Path,
+    offset: Path,
+    ordered: bool,
+) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
+    // `list_paginated` needs the trailing slash. An empty prefix lists the root.
+    let req_prefix = (!prefix.as_ref().is_empty()).then(|| format!("{}/", prefix.as_ref()));
+    // A directory-like path has offset == prefix, which is not a lower bound worth sending.
+    let req_offset = (ordered && offset != prefix).then(|| offset.to_string());
+
+    let first_opts = PaginatedListOptions {
+        offset: req_offset,
+        delimiter: Some("/".into()),
+        ..Default::default()
+    };
+
+    let pages = stream::try_unfold(Some(first_opts), move |opts| {
+        let (paginated, req_prefix) = (paginated.clone(), req_prefix.clone());
+        async move {
+            let Some(opts) = opts else {
+                return Ok::<_, object_store::Error>(None);
+            };
+            let result = paginated
+                .list_paginated(req_prefix.as_deref(), opts)
+                .await?;
+            Ok(Some((
+                result.result.objects,
+                result.page_token.map(next_page_opts),
+            )))
+        }
+    });
+
+    if ordered {
+        Ok(pages
+            .map_ok(move |objects| {
+                let base_url = base_url.clone();
+                stream::iter(
+                    objects
+                        .into_iter()
+                        .map(move |m| Ok::<_, object_store::Error>(file_meta(&base_url, m))),
+                )
             })
-        });
-
-    if !has_ordered_listing {
-        // Local filesystem doesn't return sorted list - need to collect and sort
-        let mut items: Vec<_> = stream.try_collect().await?;
-        items.sort_unstable();
-        Ok(Box::pin(stream::iter(
-            items.into_iter().map(Ok::<FileMeta, delta_kernel::Error>),
-        )))
+            .try_flatten()
+            .err_into()
+            .boxed())
     } else {
-        Ok(Box::pin(stream))
+        let objects: Vec<ObjectMeta> = pages
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(sort_and_bound(objects, &base_url, &offset))
     }
 }
 
@@ -192,7 +296,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let future = list_from_impl(self.inner.clone(), path.clone());
+        let future = list_from_impl(self.inner.clone(), self.paginated.clone(), path.clone());
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
@@ -269,10 +373,15 @@ fn supports_ordered_listing(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use delta_kernel::object_store::list::{
+        PaginatedListOptions, PaginatedListResult, PaginatedListStore,
+    };
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::object_store::{ListResult, ObjectMeta, ObjectStore, PutPayload};
     use delta_kernel::Engine as _;
     use delta_kernel_default_engine_test_utils::current_time_duration;
     use itertools::Itertools;
@@ -290,7 +399,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), None, executor);
         (tmp, store, handler)
     }
 
@@ -337,7 +446,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, None, executor);
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
@@ -371,7 +480,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files: Vec<_> = engine
             .storage_handler()
-            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&table_root.join("_delta_log/").unwrap().join("0").unwrap())
             .unwrap()
             .try_collect()
             .unwrap();
@@ -401,7 +510,7 @@ mod tests {
         let engine = DefaultEngineBuilder::new(store).build();
         let files = engine
             .storage_handler()
-            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .list_from(&url.join("_delta_log/").unwrap().join("0").unwrap())
             .unwrap();
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
@@ -556,5 +665,356 @@ mod tests {
             Err(Error::FileNotFound(_))
         ));
         handler.delete(&missing_url).unwrap();
+    }
+
+    /// [`PaginatedListStore`] over [`InMemory`] mimicking cloud `list_paginated`: `/` grouping,
+    /// `offset` start-after, one `page_size` chunk per call. `reverse` lists descending (exercises
+    /// the sort path). `honors_offset = false` models S3 Express dropping `start-after`.
+    /// `fail_after = Some(n)` errors on page `n`.
+    struct MockPaginatedStore {
+        inner: Arc<InMemory>,
+        page_size: usize,
+        reverse: bool,
+        honors_offset: bool,
+        fail_after: Option<usize>,
+        pages_fetched: Arc<AtomicUsize>,
+    }
+
+    impl MockPaginatedStore {
+        fn new(inner: Arc<InMemory>, page_size: usize, reverse: bool) -> Self {
+            Self {
+                inner,
+                page_size,
+                reverse,
+                honors_offset: true,
+                fail_after: None,
+                pages_fetched: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn ignoring_offset(mut self) -> Self {
+            self.honors_offset = false;
+            self
+        }
+
+        fn failing_after(mut self, pages: usize) -> Self {
+            self.fail_after = Some(pages);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PaginatedListStore for MockPaginatedStore {
+        async fn list_paginated(
+            &self,
+            prefix: Option<&str>,
+            opts: PaginatedListOptions,
+        ) -> delta_kernel::object_store::Result<PaginatedListResult> {
+            assert_eq!(
+                opts.delimiter.as_deref(),
+                Some("/"),
+                "expected `/` delimiter"
+            );
+            let fetched = self.pages_fetched.fetch_add(1, Ordering::Relaxed);
+            if self.fail_after == Some(fetched) {
+                return Err(delta_kernel::object_store::Error::Generic {
+                    store: "MockPaginatedStore",
+                    source: "injected mid-stream failure".into(),
+                });
+            }
+            let prefix = prefix.unwrap_or("");
+
+            // Direct children of the prefix, in key order. Offset-independent so the page cursor
+            // stays valid across pages (the offset only arrives on page one).
+            let mut objects: Vec<ObjectMeta> = self
+                .inner
+                .list(None)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|m| m.unwrap())
+                .filter(|m| {
+                    m.location
+                        .as_ref()
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| !rest.contains('/'))
+                })
+                .collect();
+            objects.sort_by(|a, b| a.location.cmp(&b.location));
+            if self.reverse {
+                objects.reverse();
+            }
+
+            // Page one `page_size` chunk per call, keyed by an integer start cursor. A first-page
+            // offset advances the cursor past every key at or before it (start-after is exclusive).
+            let mut start: usize = opts
+                .page_token
+                .as_deref()
+                .map(|t| t.parse().unwrap())
+                .unwrap_or(0);
+            if self.honors_offset {
+                if let Some(offset) = &opts.offset {
+                    start = objects.partition_point(|m| m.location.as_ref() <= offset.as_str());
+                }
+            }
+            let end = (start + self.page_size).min(objects.len());
+            let page: Vec<ObjectMeta> = objects[start..end].to_vec();
+            let page_token = (end < objects.len()).then(|| end.to_string());
+            Ok(PaginatedListResult {
+                result: ListResult {
+                    common_prefixes: Vec::new(),
+                    objects: page,
+                },
+                page_token,
+            })
+        }
+    }
+
+    async fn put_key(store: &InMemory, key: &str) {
+        store
+            .put(&Path::from(key), PutPayload::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+
+    fn collect_names<E: TaskExecutor>(
+        handler: &ObjectStoreStorageHandler<E>,
+        url: &str,
+    ) -> Vec<String> {
+        handler
+            .list_from(&Url::parse(url).unwrap())
+            .unwrap()
+            .map(|m| m.unwrap().location.path().to_string())
+            .collect()
+    }
+
+    /// Commits 0-2, a checkpoint at 2, and `staged` commits under `_staged_commits/`.
+    async fn seed_log(store: &InMemory, staged: usize) {
+        for v in 0..3 {
+            put_key(store, &format!("_delta_log/{v:020}.json")).await;
+        }
+        put_key(store, "_delta_log/00000000000000000002.checkpoint.parquet").await;
+        for v in 0..staged {
+            put_key(
+                store,
+                &format!("_delta_log/_staged_commits/{v:020}.{v}-uuid.json"),
+            )
+            .await;
+        }
+    }
+
+    /// Both paths return only the direct children of `_delta_log/`, not the staged commits.
+    #[rstest::rstest]
+    #[case::path_a_paginated(true)]
+    #[case::path_b_fallback(false)]
+    #[tokio::test]
+    async fn list_from_single_directory_omits_staged_commits(#[case] paginated: bool) {
+        let store = Arc::new(InMemory::new());
+        seed_log(&store, 20).await;
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let paginated: Option<Arc<dyn PaginatedListStore>> =
+            paginated.then(|| Arc::new(MockPaginatedStore::new(store.clone(), 100, false)) as _);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), paginated, executor);
+
+        // `s3://` is an ordered backend.
+        let names = collect_names(&handler, "s3://bucket/_delta_log/0");
+
+        assert!(
+            names.iter().all(|n| !n.contains("_staged_commits")),
+            "single-directory listing must exclude staged commits: {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            4,
+            "expected 3 commits + 1 checkpoint: {names:?}"
+        );
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "results must be sorted");
+    }
+
+    /// An unordered backend sorts, so descending input still comes back sorted.
+    #[tokio::test]
+    async fn list_from_paginated_unordered_sorts() {
+        let store = Arc::new(InMemory::new());
+        seed_log(&store, 5).await;
+        let mock = Arc::new(MockPaginatedStore::new(store.clone(), 2, true));
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), Some(mock as _), executor);
+
+        // `--x-s3` is an S3 Express (unordered) bucket.
+        let names = collect_names(&handler, "s3://bucket--x-s3/_delta_log/0");
+
+        assert_eq!(names.len(), 4);
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "unordered results must be sorted by the caller"
+        );
+    }
+
+    /// The lazy paginated path fetches only the pages a caller consumes.
+    #[tokio::test]
+    async fn list_from_paginated_ordered_is_lazy() {
+        let store = Arc::new(InMemory::new());
+        for v in 0..50 {
+            put_key(&store, &format!("_delta_log/{v:020}.json")).await;
+        }
+        let mock = Arc::new(MockPaginatedStore::new(store.clone(), 5, false));
+        let pages_fetched = mock.pages_fetched.clone();
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), Some(mock as _), executor);
+
+        let start = Url::parse("s3://bucket/_delta_log/0").unwrap();
+        let first_three: Vec<_> = handler.list_from(&start).unwrap().take(3).collect();
+
+        assert_eq!(first_three.len(), 3);
+        // Taking 3 from 5-per-page fetches only the first page.
+        assert_eq!(pages_fetched.load(Ordering::Relaxed), 1);
+    }
+
+    /// The ordered path threads the page token across many pages, in global order, with no dropped
+    /// or duplicated entries.
+    #[tokio::test]
+    async fn list_from_paginated_ordered_threads_pages_in_order() {
+        let store = Arc::new(InMemory::new());
+        for v in 0..50 {
+            put_key(&store, &format!("_delta_log/{v:020}.json")).await;
+        }
+        let mock = Arc::new(MockPaginatedStore::new(store.clone(), 5, false)); // 10 pages
+        let pages_fetched = mock.pages_fetched.clone();
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), Some(mock as _), executor);
+
+        let names = collect_names(&handler, "s3://bucket/_delta_log/0");
+
+        assert_eq!(
+            names.len(),
+            50,
+            "every direct child returned across all pages"
+        );
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "ordered path stays sorted across page boundaries"
+        );
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            50,
+            "no dropped or duplicated entries at boundaries"
+        );
+        assert!(
+            pages_fetched.load(Ordering::Relaxed) >= 10,
+            "continuation threaded"
+        );
+    }
+
+    /// A first-page offset that excludes entries must stay bounded across page boundaries.
+    #[tokio::test]
+    async fn list_from_paginated_ordered_bounds_offset_across_pages() {
+        let store = Arc::new(InMemory::new());
+        for v in 0..20 {
+            put_key(&store, &format!("_delta_log/{v:020}.json")).await;
+        }
+        let mock = Arc::new(MockPaginatedStore::new(store.clone(), 5, false));
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), Some(mock as _), executor);
+
+        // Listing after version 4 spans multiple pages. Versions 0-4 must never appear.
+        let names = collect_names(&handler, "s3://bucket/_delta_log/00000000000000000004.json");
+
+        assert_eq!(names.len(), 15, "only versions 5-19: {names:?}");
+        assert!(names
+            .iter()
+            .all(|n| n.as_str() > "/_delta_log/00000000000000000004.json"));
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    /// An S3 Express bucket ignores `start-after`, so the offset must be enforced client-side.
+    #[tokio::test]
+    async fn list_from_paginated_s3_express_bounds_offset_client_side() {
+        let store = Arc::new(InMemory::new());
+        for v in 0..6 {
+            put_key(&store, &format!("_delta_log/{v:020}.json")).await;
+        }
+        // Unordered, and ignores the offset the engine sends.
+        let mock = Arc::new(MockPaginatedStore::new(store.clone(), 2, true).ignoring_offset());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), Some(mock as _), executor);
+
+        // Listing after version 2 must still exclude versions 0-2.
+        let names = collect_names(
+            &handler,
+            "s3://bucket--x-s3/_delta_log/00000000000000000002.json",
+        );
+
+        assert_eq!(
+            names.len(),
+            3,
+            "only versions 3-5 are after the offset: {names:?}"
+        );
+        assert!(names
+            .iter()
+            .all(|n| n.as_str() > "/_delta_log/00000000000000000002.json"));
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    /// A failure on any page surfaces as an error, not a silently truncated listing.
+    #[rstest::rstest]
+    #[case::ordered("s3://bucket/_delta_log/0", false)]
+    #[case::unordered("s3://bucket--x-s3/_delta_log/0", true)]
+    #[tokio::test]
+    async fn list_from_paginated_surfaces_mid_stream_error(
+        #[case] url: &str,
+        #[case] reverse: bool,
+    ) {
+        let store = Arc::new(InMemory::new());
+        for v in 0..20 {
+            put_key(&store, &format!("_delta_log/{v:020}.json")).await;
+        }
+        // page_size 5, fail on the 2nd page (index 1).
+        let mock = Arc::new(MockPaginatedStore::new(store.clone(), 5, reverse).failing_after(1));
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), Some(mock as _), executor);
+
+        let outcome = handler.list_from(&Url::parse(url).unwrap());
+        let saw_err = match outcome {
+            Err(_) => true,
+            Ok(iter) => iter.into_iter().any(|r| r.is_err()),
+        };
+        assert!(
+            saw_err,
+            "a mid-stream page failure must surface, not silently truncate"
+        );
+    }
+
+    /// Listing the root directory (empty prefix) via the delimited fallback returns only top-level
+    /// files, not entries nested under a subdirectory.
+    #[tokio::test]
+    async fn list_from_root_delimited_returns_top_level_only() {
+        let store = Arc::new(InMemory::new());
+        put_key(&store, "00000000000000000000.json").await;
+        put_key(&store, "sub/nested.json").await;
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), None, executor);
+
+        let names = collect_names(&handler, "memory:///");
+
+        assert_eq!(
+            names,
+            vec!["/00000000000000000000.json"],
+            "only top-level files: {names:?}"
+        );
     }
 }

@@ -18,8 +18,6 @@ use delta_kernel::history_manager::{
     get_earliest_commit as kernel_get_earliest_commit,
     latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
 };
-#[cfg(feature = "default-engine-base")]
-use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
@@ -935,31 +933,32 @@ fn get_default_engine_impl(
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel_default_engine::storage::store_from_url_opts;
+    use delta_kernel_default_engine::storage::{engine_store_from_url_opts, EngineStore};
 
-    let store = match object_store_backend {
-        ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
-        ObjectStoreBackend::Rest(rest) => {
-            rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
-        }
-    };
+    let store =
+        match object_store_backend {
+            ObjectStoreBackend::UrlScheme => engine_store_from_url_opts(&url, options)?,
+            ObjectStoreBackend::Rest(rest) => EngineStore::Plain(
+                rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?,
+            ),
+        };
     build_engine_from_store(store, executor_config, io_config, allocate_error)
 }
 
-/// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
-/// tuning. Shared by the URL-scheme and REST engine builder paths.
+/// Assemble a default engine from an [`EngineStore`], applying executor and read-path I/O tuning.
+/// Shared by the URL-scheme and REST engine builder paths.
 #[cfg(feature = "default-engine-base")]
 pub(crate) fn build_engine_from_store(
-    store: Arc<dyn ObjectStore>,
+    store: delta_kernel_default_engine::storage::EngineStore,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
 
-    // The builder is generic over the executor type, so apply the shared I/O config via a generic
+    // The builder is generic over the executor type, so apply the shared config via a generic
     // helper to both branches without naming the concrete builder type.
-    fn apply_io_config<E>(
+    fn apply_config<E>(
         builder: DefaultEngineBuilder<E>,
         io_config: &IoConcurrencyConfig,
     ) -> DefaultEngineBuilder<E> {
@@ -978,10 +977,11 @@ pub(crate) fn build_engine_from_store(
             config.worker_threads,
             config.max_blocking_threads,
         )?;
-        let builder = DefaultEngineBuilder::new(store).with_task_executor(Arc::new(executor));
-        Arc::new(apply_io_config(builder, &io_config).build())
+        let builder =
+            DefaultEngineBuilder::from_engine_store(store).with_task_executor(Arc::new(executor));
+        Arc::new(apply_config(builder, &io_config).build())
     } else {
-        let builder = apply_io_config(DefaultEngineBuilder::new(store), &io_config);
+        let builder = apply_config(DefaultEngineBuilder::from_engine_store(store), &io_config);
         Arc::new(builder.build())
     };
 
