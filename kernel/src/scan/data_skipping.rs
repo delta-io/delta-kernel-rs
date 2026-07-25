@@ -16,7 +16,7 @@ use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
-use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
+use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::scan::metrics::ScanMetrics;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
@@ -411,12 +411,10 @@ impl DataSkippingFilter {
     }
 }
 
-/// Rewrites `pred` for scan checkpoint and sidecar Add row-group skipping. Data references become
-/// IS NULL guarded `stats_parsed.{minValues,maxValues,nullCount}.<col>` comparisons; eligible
-/// partition references become exact, unguarded `partitionValues_parsed.<col>` values. Checkpoint
-/// Removes are irrelevant to scan replay, so partition predicates may prune their null add-side
-/// values. A bare unsupported predicate returns `None`; unsupported junction arms become NULL
-/// literals to preserve three-valued logic.
+/// Rewrites `pred` for scan checkpoint and sidecar Add row-group skipping. The normal SQL-WHERE
+/// data-skipping predicate is combined with a verifier that makes missing structured statistics
+/// evaluate to TRUE under an ordinary exact filter. Partition references use exact typed
+/// `partitionValues_parsed` values and do not require verification.
 ///
 /// `physical_partition_columns` may be narrowed to the predicate's references; pass an empty set
 /// for unpartitioned tables. `physical_floating_partition_columns` identifies FLOAT and DOUBLE
@@ -428,14 +426,68 @@ pub(crate) fn as_checkpoint_skipping_predicate(
     physical_floating_partition_columns: &HashSet<ColumnName>,
     physical_stats_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
-    CheckpointDataSkippingPredicateCreator {
+    let creator = CheckpointDataSkippingPredicateCreator {
         data_skipping_columns: DataSkippingColumns {
             physical_partition_columns,
             physical_stats_columns,
         },
         physical_floating_partition_columns,
+    };
+
+    // Preserve the eligibility gate separately from the SQL-WHERE rewrite so a bare unsupported
+    // input does not produce a useless checkpoint predicate.
+    creator.eval(pred)?;
+    with_stats_verification(creator.eval_sql_where(pred)?)
+}
+
+/// Makes a checkpoint data-skipping predicate safe for ordinary exact SQL filtering. Missing
+/// structured statistics make the verifier false and therefore keep the checkpoint row.
+fn with_stats_verification(predicate: Pred) -> Option<Pred> {
+    let mut references: Vec<_> = predicate.references().into_iter().cloned().collect();
+    references.sort();
+
+    let mut verifiers = Vec::new();
+    for reference in references {
+        match reference.path().first().map(String::as_str) {
+            Some(root) if root == PARTITION_VALUES_PARSED_NAME => continue,
+            Some(root) if root == STATS_PARSED_NAME => {
+                verifiers.push(verify_stats_reference(&reference)?)
+            }
+            _ => return None,
+        }
     }
-    .eval(pred)
+    if verifiers.is_empty() {
+        return Some(predicate);
+    }
+
+    Some(Pred::or(predicate, Pred::not(Pred::and_from(verifiers))))
+}
+
+/// Builds a total presence check for one structured-stat reference.
+fn verify_stats_reference(reference: &ColumnName) -> Option<Pred> {
+    let path = reference.path();
+    if path.len() == 2 && path[0] == STATS_PARSED_NAME && path[1] == NUM_RECORDS {
+        return Some(Pred::is_not_null(reference.clone()));
+    }
+    if path.len() < 3 || path[0] != STATS_PARSED_NAME {
+        return None;
+    }
+
+    match path[1].as_str() {
+        NULL_COUNT => Some(Pred::is_not_null(reference.clone())),
+        MIN_VALUES | MAX_VALUES => {
+            let physical_column = ColumnName::new(&path[2..]);
+            let null_count = column_name!(STATS_PARSED_NAME, NULL_COUNT).join(&physical_column);
+            let num_records = column_name!(STATS_PARSED_NAME, NUM_RECORDS);
+            let all_null = Pred::and_from([
+                Pred::is_not_null(null_count.clone()),
+                Pred::is_not_null(num_records.clone()),
+                Pred::eq(null_count, num_records),
+            ]);
+            Some(Pred::or(Pred::is_not_null(reference.clone()), all_null))
+        }
+        _ => None,
+    }
 }
 
 /// Maps an ordering and inversion flag to the corresponding comparison predicate.
@@ -473,6 +525,28 @@ fn collect_junction_preds(
         })
         .collect();
     Pred::junction(op, preds)
+}
+
+/// Collects checkpoint predicates without introducing NULL sentinels. Unsupported AND children
+/// are omitted, while an unsupported OR child makes the complete OR unavailable.
+fn collect_checkpoint_junction_preds(
+    mut op: JunctionPredicateOp,
+    preds: &mut dyn Iterator<Item = Option<Pred>>,
+    inverted: bool,
+) -> Option<Pred> {
+    if inverted {
+        op = op.invert();
+    }
+    match op {
+        JunctionPredicateOp::And => {
+            let preds: Vec<_> = preds.flatten().collect();
+            (!preds.is_empty()).then(|| Pred::junction(op, preds))
+        }
+        JunctionPredicateOp::Or => {
+            let preds: Vec<_> = preds.collect::<Option<_>>()?;
+            (!preds.is_empty()).then(|| Pred::junction(op, preds))
+        }
+    }
 }
 
 /// Adjusts a comparison value before comparing against a max stat, to account for the Delta
@@ -756,8 +830,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
     type ColumnStat = Expr;
 
     // Stat selection and max-stat truncation are shared through `DataSkippingColumns`. This
-    // creator also limits footer-ineligible columns and predicate shapes while applying
-    // checkpoint-specific null guards.
+    // creator also limits footer-ineligible columns and predicate shapes.
 
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         // Parquet footer min/max exclude NaNs, so they cannot bound every floating partition value.
@@ -796,12 +869,6 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         self.eval_partial_cmp(ord, max, &adjusted, inverted)
     }
 
-    /// Wraps a data-stat comparison with an IS NULL guard, so a missing stat keeps the row group.
-    /// `col > 100` becomes
-    /// `OR(stats_parsed.maxValues.col IS NULL, stats_parsed.maxValues.col > 100)`.
-    /// Partition comparisons reference the typed per-Add value without a null guard. The parquet
-    /// filter evaluates that column through row-group footer bounds; null-only groups remain
-    /// unknown while mixed groups may be pruned from their non-null bounds.
     fn eval_partial_cmp(
         &self,
         ord: Ordering,
@@ -809,12 +876,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        let comparison = comparison_predicate(ord, col.clone(), val, inverted);
-        Some(if is_partition_value_reference(&col) {
-            comparison
-        } else {
-            Pred::or(Pred::is_null(col), comparison)
-        })
+        Some(comparison_predicate(ord, col, val, inverted))
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
@@ -825,12 +887,8 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    /// Partition NULL checks use the exact parsed value. Data `IS NULL` uses a guarded null count;
-    /// data `IS NOT NULL` remains unsupported because row-group filtering cannot compare it with
-    /// `numRecords`.
-    // TODO(#1873): IS NOT NULL pruning requires cross-column range comparison in RowGroupFilter.
-    // Skippable when the nullCount and numRecords ranges don't overlap (e.g. nullCount in
-    // [0, 0] vs numRecords in [500, 2000] proves all files have non-null values).
+    /// Partition NULL checks use the exact parsed value. Data NULL checks use the same null-count
+    /// predicates as normal data skipping.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         if self.data_skipping_columns.is_partition_column(col) {
             let partition_value = partition_value_expr(col);
@@ -840,12 +898,11 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
                 Pred::is_null(partition_value)
             });
         }
-        if inverted {
-            return None; // IS NOT NULL: column vs column, can't prune (#1873)
-        }
-        let nullcount = self.get_nullcount_stat(col)?;
-        let comparison = Pred::ne(nullcount.clone(), Expr::literal(0i64));
-        Some(Pred::or(Pred::is_null(nullcount), comparison))
+        let safe_to_skip = match inverted {
+            true => self.get_rowcount_stat()?,
+            false => Expr::literal(0i64),
+        };
+        Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
     }
 
     fn eval_pred_binary_scalars(
@@ -859,9 +916,9 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
             .map(Pred::literal)
     }
 
-    /// Unsupported. Opaque predicates can construct data-stat references directly, bypassing IS
-    /// NULL guards and risking false pruning when a live Add has missing stats. Returns `None` to
-    /// conservatively drop these from the skipping predicate.
+    /// Unsupported. Opaque predicates can construct data-stat references whose availability
+    /// contract Kernel cannot verify. Returns `None` to conservatively drop them from the skipping
+    /// predicate.
     fn eval_pred_opaque(
         &self,
         _op: &OpaquePredicateOpRef,
@@ -871,19 +928,12 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         None
     }
 
-    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` becomes
-    /// ```text
-    /// AND(
-    ///   OR(stats_parsed.maxValues.col_a IS NULL, stats_parsed.maxValues.col_a > 100),
-    ///   OR(stats_parsed.minValues.col_b IS NULL, stats_parsed.minValues.col_b < 50)
-    /// )
-    /// ```
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
+        collect_checkpoint_junction_preds(op, preds, inverted)
     }
 }

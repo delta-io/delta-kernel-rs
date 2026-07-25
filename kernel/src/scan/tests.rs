@@ -1116,6 +1116,10 @@ fn test_build_actions_meta_predicate_with_predicate() {
 
     // Verify all column references are prefixed with add.stats_parsed
     let pred = meta_pred.unwrap();
+    assert!(
+        !pred.to_string().contains("DISTINCT"),
+        "checkpoint predicates use P OR NOT V, not a DISTINCT boundary"
+    );
     for col_ref in pred.references() {
         let path: Vec<_> = col_ref.iter().collect();
         assert_eq!(
@@ -1495,14 +1499,14 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 ///
 /// | Predicate      | RG 0 (2 rows)         | RG 1 (1 row)       | RG 2 (1 row)       | RG 3 (2 rows)        | Total |
 /// |----------------|-----------------------|--------------------|--------------------|-----------------------|-------|
-/// | id > 200       | keep (null max stats) | keep (max=300>200) | skip (max=50<200)  | skip (max=150<200)    | 3     |
+/// | id > 200       | keep (missing stats)  | keep (max=300>200) | skip (max=50<200)  | keep (missing stats)  | 5     |
 /// | id IS NULL     | keep (nullCount>0)    | skip (nullCount=0) | keep (nullCount=10)| keep (null nullCount) | 5     |
-/// | id IS NOT NULL | no predicate (col vs col, #1873)                                                       | 6     |
+/// | id IS NOT NULL | keep                    | keep               | keep               | keep                  | 6     |
 #[rstest]
 #[case::comparison(
     Pred::gt(column_expr!("id"), Expr::literal(200i64)),
-    Some(3),
-    "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
+    Some(5),
+    "keep RG 0 + RG 3 (missing stats) and RG 1 (max>200), skip only RG 2"
 )]
 #[case::is_null(
     Pred::is_null(column_expr!("id")),
@@ -1511,8 +1515,8 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 )]
 #[case::is_not_null(
     Pred::not(Pred::is_null(column_expr!("id"))),
-    None,
-    "IS NOT NULL produces no skipping predicate (column vs column, #1873)"
+    Some(6),
+    "IS NOT NULL produces the normal predicate; this footer cannot prove its column-column comparison"
 )]
 fn test_checkpoint_row_group_skipping(
     #[case] pred: Pred,
@@ -1825,18 +1829,26 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
     }
 
     let reads = engine.take_reads();
-    assert!(
-        reads.iter().any(|read| {
+    let matching_predicates: Vec<_> = reads
+        .iter()
+        .filter(|read| {
             read.files
                 .iter()
                 .any(|file| file.contains(expected_file_fragment))
-                && read
-                    .predicate
-                    .as_ref()
-                    .is_some_and(|predicate| predicate.references().contains(&expected_ref))
-        }),
+        })
+        .filter_map(|read| read.predicate.as_ref())
+        .filter(|predicate| predicate.references().contains(&expected_ref))
+        .collect();
+    assert!(
+        !matching_predicates.is_empty(),
         "expected {expected_ref} on a {expected_file_fragment} read, got {reads:#?}"
     );
+    for predicate in matching_predicates {
+        assert!(
+            !predicate.to_string().contains("DISTINCT"),
+            "V1 checkpoints and V2 sidecars must receive P OR NOT V without DISTINCT: {predicate}"
+        );
+    }
 }
 
 #[test]
