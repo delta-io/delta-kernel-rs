@@ -33,12 +33,33 @@ on:
   merge_group:
 ```
 
-## Never `paths`/`paths-ignore` a workflow whose jobs are required checks
+## Skipping docs-only PRs without wedging required checks
 
-Do NOT add `paths` or `paths-ignore` filters to a workflow whose jobs are required
-status checks (most of `build.yml`). When a path filter skips the whole workflow,
-the required checks never report, and the PR stays blocked on "Expected, waiting
-for status" indefinitely. A skipped workflow is not the same as a passing one.
+GitHub treats two kinds of "skip" differently for required status checks:
+
+- A **workflow** skipped by `paths`/`paths-ignore` never reports its checks, so any
+  required check stays "Expected, waiting for status" and blocks the merge forever.
+  NEVER add `paths`/`paths-ignore` to a workflow whose jobs are required.
+- A **job** skipped by its own `if:` reports "skipped", which satisfies a required
+  check of the same name. This is the mechanism we use.
+
+The shared `detect-changes.yml` reusable workflow emits `docs_only`. Callers gate on
+`needs: detect_changes` + a `docs_only` `if:`. How to gate depends on the job shape:
+
+- **Matrix jobs** (`build`, `test`, `ffi_test`, `miri`): a job-level `if:` skip never expands
+  the matrix, so its per-leg checks (`build (ubuntu-latest)`, ...) never report and the PR
+  blocks. These CANNOT be individually required. `build.yml` funnels every job into one
+  `all-required-checks-pass` aggregator (`if: always()`, `needs:` every job) whose step fails
+  only when a needed job is `failure`/`cancelled` (`success`/`skipped` pass). Branch protection
+  requires ONLY that aggregator, so each job (matrix included) carries a single job-level
+  `if: docs_only == 'false'` and skips as a unit. The aggregator's `name:` is load-bearing:
+  renaming it silently disables branch protection. Add every new job to its `needs:` unless
+  intentionally non-required (e.g. `invalid-handle-code`).
+- **Single directly-required jobs** (`run-examples`): with no aggregator to catch a `failure`,
+  gate on `if: always() && docs_only != 'true'`, NOT `== 'false'`. A failed `detect_changes`
+  yields an empty output; `== 'false'` plus the implicit `success()` would skip the job, and a
+  skipped required check counts as passing, so the work would silently never run. `!= 'true'`
+  under `always()` runs the job unless docs-only is positively confirmed (fail-safe).
 
 ## Supply chain security: `--locked`
 
