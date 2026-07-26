@@ -931,24 +931,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decimal_parse_errors_normalized() {
-        // Failures caused by the raw decimal string must surface as ParseError, not the
-        // lower-level ParseIntError / InvalidDecimal variants they originate from.
-        let dtype = DecimalType::try_new(5, 2).unwrap();
-        let cases = [
-            "1.2e",    // non-numeric exponent -> ParseIntError from exp parse
-            "1x.23",   // non-numeric integer part -> ParseIntError from int parse
-            "1.2x",    // non-numeric fractional part -> ParseIntError from combined parse
-            "1234.56", // exceeds target precision -> InvalidDecimal from DecimalData::try_new
-        ];
-        for raw in cases {
-            match PrimitiveType::parse_decimal(raw, dtype) {
-                Err(Error::ParseError(..)) => {}
-                other => panic!("expected ParseError for {raw:?}, got {other:?}"),
-            }
-        }
-    }
-    #[test]
     fn test_decimal_display() {
         let s = Scalar::decimal(123456789, 9, 2).unwrap();
         assert_eq!(s.to_string(), "1234567.89");
@@ -1061,8 +1043,10 @@ mod tests {
 
     fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
         let s = PrimitiveType::decimal(prec, scale).unwrap();
-        let res = s.parse_scalar(raw);
-        assert!(res.is_err(), "Fail on {raw}");
+        match s.parse_scalar(raw) {
+            Err(Error::ParseError(..)) => {}
+            other => panic!("expected ParseError for {raw:?}, got {other:?}"),
+        }
     }
 
     #[test]
