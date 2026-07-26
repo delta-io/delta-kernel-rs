@@ -1,0 +1,4 @@
+{"commitInfo":{"timestamp":1776720408182,"engineInfo":"Kernel-4.2.0-SNAPSHOT/test-engine","operation":"CREATE TABLE","operationParameters":{"partitionBy":"[]"},"isBlindAppend":false,"txnId":"3cc4e528-235b-40ee-9286-4c63bc61016f","operationMetrics":{}}}
+{"metaData":{"id":"25b8ac9c-ca99-44bd-92f6-5180f948ffc1","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"geog\",\"type\":\"geography(OGC:CRS84, spherical)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"createdTime":1776720408145,"configuration":{}}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["geospatial"],"writerFeatures":["geospatial","appendOnly","invariants"]}}
+{"add":{"path":"03b46437-25a6-4f1e-8ae7-60eb60dd80f2-000.parquet","partitionValues":{},"size":610,"modificationTime":1776720408165,"dataChange":true,"stats":"{\"numRecords\":5,\"minValues\":{},\"maxValues\":{},\"nullCount\":{\"geog\":1}}"}}

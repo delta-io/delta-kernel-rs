@@ -1,0 +1,4 @@
+{"commitInfo":{"timestamp":1776720408857,"engineInfo":"Kernel-4.2.0-SNAPSHOT/test-engine","operation":"CREATE TABLE","operationParameters":{"partitionBy":"[]"},"isBlindAppend":false,"txnId":"c24a6b34-978f-47a5-87a6-7b612adad7ce","operationMetrics":{}}}
+{"metaData":{"id":"10d37963-ead8-47c6-9a5c-ee8acb0a2eb2","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"geog\",\"type\":\"geography(OGC:CRS84, vincenty)\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"createdTime":1776720408826,"configuration":{}}}
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["geospatial"],"writerFeatures":["geospatial","appendOnly","invariants"]}}
+{"add":{"path":"533cee2b-c2e6-4652-b8b2-68abf11f4b3e-000.parquet","partitionValues":{},"size":610,"modificationTime":1776720408845,"dataChange":true,"stats":"{\"numRecords\":4,\"minValues\":{},\"maxValues\":{},\"nullCount\":{\"geog\":0}}"}}
