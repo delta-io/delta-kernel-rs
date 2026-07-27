@@ -296,6 +296,39 @@ impl FileMeta {
     }
 }
 
+/// Metadata produced by a successful JSON file write.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JsonWriteResult {
+    /// The number of bytes written to the JSON file, when known without a separate storage
+    /// metadata request.
+    pub size: Option<FileSize>,
+}
+
+impl JsonWriteResult {
+    /// Create a JSON write result with a known serialized file size.
+    ///
+    /// # Parameters
+    ///
+    /// - `size` - Exact number of bytes written to the JSON file.
+    ///
+    /// # Returns
+    ///
+    /// A write result containing `size`.
+    pub fn new(size: FileSize) -> Self {
+        Self { size: Some(size) }
+    }
+
+    /// Create a JSON write result without a known serialized file size.
+    ///
+    /// # Returns
+    ///
+    /// A write result with no file size.
+    pub fn without_size() -> Self {
+        Self { size: None }
+    }
+}
+
 /// Extension trait that makes it easier to work with traits objects that implement [`Any`],
 /// implemented automatically for any type that satisfies `Any`, `Send`, and `Sync`. In particular,
 /// given some `trait T: Any + Send + Sync`, it allows upcasting `T` to `dyn Any + Send + Sync`,
@@ -751,12 +784,22 @@ pub trait JsonHandler: AsAny {
     /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
+    ///
+    /// # Returns
+    ///
+    /// Metadata about the completed write. Implementations should return the exact serialized file
+    /// size when it is available without a separate storage metadata request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FileAlreadyExists`] when `overwrite` is false and the destination exists,
+    /// or another error when serialization or storage fails.
     fn write_json_file(
         &self,
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()>;
+    ) -> DeltaResult<JsonWriteResult>;
 }
 
 /// Reserved field IDs for metadata columns in Delta tables.

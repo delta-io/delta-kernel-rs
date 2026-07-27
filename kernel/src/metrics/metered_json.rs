@@ -10,7 +10,7 @@ use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator,
-    FileMeta, FilteredEngineData, JsonHandler, PredicateRef,
+    FileMeta, FilteredEngineData, JsonHandler, JsonWriteResult, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn JsonHandler>` that emits a
@@ -96,7 +96,7 @@ impl JsonHandler for MeteredJsonHandler {
         path: &url::Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<JsonWriteResult> {
         self.inner.write_json_file(path, data, overwrite)
     }
 }
@@ -163,8 +163,8 @@ mod tests {
             _path: &Url,
             _data: DeltaResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
-        ) -> DeltaResult<()> {
-            Ok(())
+        ) -> DeltaResult<JsonWriteResult> {
+            Ok(JsonWriteResult::new(0))
         }
     }
 

@@ -1,6 +1,6 @@
 //! File system committer for non-catalog-managed tables.
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
@@ -42,17 +42,22 @@ impl Committer for FileSystemCommitter {
             Box::new(actions),
             false,
         ) {
-            Ok(()) => {
+            Ok(write_result) => {
                 info!(
                     committed_version = version,
                     "Committed delta file via filesystem committer"
                 );
-                // For now, we don't need the real size of the written file, so we can use 0.
-                // If we need this in the future, we can get it from StorageHandler::head.
+                let size = write_result.size.unwrap_or_else(|| {
+                    warn!(
+                        committed_version = version,
+                        "JSON handler did not report the committed file size; using zero"
+                    );
+                    0
+                });
                 let file_meta = FileMeta::new(
                     published_commit_path,
                     commit_metadata.in_commit_timestamp(),
-                    0,
+                    size,
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
@@ -91,13 +96,52 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
     use crate::committer::{CommitProtocolMetadata, CommitType};
     use crate::engine::sync::SyncEngine;
+    use crate::engine::test_delegating::DelegatingEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
+    use crate::{
+        EngineData, FileDataReadResultIterator, IntoEngineData, JsonHandler, JsonWriteResult,
+        PredicateRef, SchemaRef,
+    };
+
+    struct SizeOmittingJsonHandler {
+        inner: Arc<dyn JsonHandler>,
+    }
+
+    impl JsonHandler for SizeOmittingJsonHandler {
+        fn parse_json(
+            &self,
+            json_strings: Box<dyn EngineData>,
+            output_schema: SchemaRef,
+        ) -> DeltaResult<Box<dyn EngineData>> {
+            self.inner.parse_json(json_strings, output_schema)
+        }
+
+        fn read_json_files(
+            &self,
+            files: &[FileMeta],
+            physical_schema: SchemaRef,
+            predicate: Option<PredicateRef>,
+        ) -> DeltaResult<FileDataReadResultIterator> {
+            self.inner
+                .read_json_files(files, physical_schema, predicate)
+        }
+
+        fn write_json_file(
+            &self,
+            path: &Url,
+            data: DeltaResultIterator<'_, FilteredEngineData>,
+            overwrite: bool,
+        ) -> DeltaResult<JsonWriteResult> {
+            self.inner.write_json_file(path, data, overwrite)?;
+            Ok(JsonWriteResult::without_size())
+        }
+    }
 
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
@@ -135,13 +179,17 @@ mod tests {
     async fn test_filesystem_committer_returns_valid_commit_response() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = SyncEngine::new_with_store(storage);
+        let engine = SyncEngine::new_with_store(storage.clone());
 
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
         let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
         let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let action = metadata
+            .clone()
+            .into_engine_data(LOG_METADATA_SCHEMA.clone(), &engine)
+            .unwrap();
         let commit_metadata = CommitMetadata::new(
             log_root,
             1,
@@ -151,19 +199,60 @@ mod tests {
             CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
             vec![],
         );
-        let actions = Box::new(std::iter::empty());
+        let actions = Box::new(std::iter::once(Ok(
+            FilteredEngineData::with_all_rows_selected(action),
+        )));
 
         let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+        let stored_size = storage
+            .head(&Path::from("_delta_log/00000000000000000001.json"))
+            .await
+            .unwrap()
+            .size;
 
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert_eq!(file_meta.last_modified, 12345);
-                assert_eq!(file_meta.size, 0);
+                assert!(file_meta.size > 0);
+                assert_eq!(file_meta.size, stored_size);
                 assert!(file_meta
                     .location
                     .as_str()
                     .ends_with("00000000000000000001.json"));
             }
+            CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_committer_succeeds_without_reported_file_size() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let base_engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(storage));
+        let json_handler = Arc::new(SizeOmittingJsonHandler {
+            inner: base_engine.json_handler(),
+        });
+        let engine = DelegatingEngine::new(base_engine).with_json_handler(json_handler);
+
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let commit_metadata = CommitMetadata::new(
+            LogRoot::new(table_root).unwrap(),
+            1,
+            CommitType::PathBasedWrite,
+            12345,
+            Some(0),
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
+            vec![],
+        );
+
+        let result = FileSystemCommitter::new()
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap();
+
+        match result {
+            CommitResponse::Committed { file_meta } => assert_eq!(file_meta.size, 0),
             CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
         }
     }
