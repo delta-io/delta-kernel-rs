@@ -897,12 +897,11 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
-    /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. A
-    ///   file, row group, or row may be omitted only when the predicate cannot evaluate to true for
-    ///   any row in that unit. Unsupported subexpressions and references with no matching physical
-    ///   or generated value must remain unknown and must not fail the read. A missing reference
-    ///   remains unknown for pruning even if schema reconciliation synthesizes a NULL output
-    ///   column. Returned data is not guaranteed to satisfy the predicate.
+    /// - `predicate` - Optional SQL push-down predicate. Implementations may ignore it, evaluate
+    ///   the complete expression as an exact SQL filter, or use a conservative footer compiler that
+    ///   omits a unit only when the predicate is proven false for every row. Unsupported
+    ///   subexpressions and references with no matching physical or generated value must not fail
+    ///   the read. Returned data is not guaranteed to satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].

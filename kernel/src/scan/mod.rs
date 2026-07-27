@@ -1034,18 +1034,15 @@ impl Scan {
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
-    /// The scan predicate is rewritten into a data-skipping form scoped under the `add` action:
-    /// data-column references become `add.stats_parsed.{minValues,maxValues,nullCount}.<col>` and
-    /// partition references become `add.partitionValues_parsed.<col>`, so the parquet reader's row
-    /// group filter can use footer statistics to skip row groups that cannot contain matching
-    /// files. See [`as_checkpoint_skipping_predicate`] for the rewrite and its data-stat IS NULL
-    /// guards.
+    /// The scan predicate is rewritten into a normal SQL-WHERE data-skipping predicate `P` scoped
+    /// under the `add` action. Structured-stat references are protected by a total verifier `V`,
+    /// producing `P OR NOT V`, so an ordinary exact SQL filter keeps rows with missing statistics.
+    /// Typed partition values are exact and are not included in `V`.
     ///
     /// Returns `None` if the scan has no predicate, if neither a data-column stats schema nor a
     /// partition schema is available, or if the predicate is a bare unsupported expression (e.g.
-    /// column-column comparison). Junctions represent unsupported arms with a NULL literal,
-    /// preserving three-valued logic while allowing independently decisive supported arms to
-    /// prune.
+    /// column-column comparison). Unsupported AND children are omitted; an unsupported OR child
+    /// disables that complete OR rewrite.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;

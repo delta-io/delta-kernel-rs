@@ -158,6 +158,12 @@ must return a column of all nulls.
 **Ordering**: Like `JsonHandler`, data must be returned in file order, and rows within a
 file must be in source order.
 
+**Predicate pushdown**: The predicate is an optional SQL expression. Your handler can ignore it and
+return every requested row, evaluate the complete expression as an exact SQL filter, or use a
+conservative footer compiler that skips a file or row group only when it proves the predicate false
+for every row. Unsupported expressions must not fail the read. Kernel encodes missing-stat safety
+inside checkpoint predicates, so handlers don't need checkpoint-specific NULL semantics.
+
 **Metadata columns**: The handler must support two virtual metadata columns that are not
 stored in the Parquet file but generated at read time:
 
@@ -315,4 +321,3 @@ pub trait PredicateEvaluator {
 ### Default implementation
 
 The `DefaultEngine` uses Arrow compute kernels for expression evaluation.
-
