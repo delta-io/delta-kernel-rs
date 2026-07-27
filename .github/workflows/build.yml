@@ -455,11 +455,20 @@ jobs:
           workspaces: datafusion-executor
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: build and lint with clippy
         working-directory: datafusion-executor
-        run: |
-          cargo build --locked
-          cargo clippy --locked --tests -- -D warnings
+        run: cargo clippy --locked --benches --tests --all-features -- -D warnings
+      - name: build docs
+        working-directory: datafusion-executor
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
+      # --no-tests=pass: this crate is a scaffold with no tests yet, and nextest fails on an
+      # empty test set by default. Drop the flag once the crate has tests.
       - name: test
         working-directory: datafusion-executor
-        run: cargo test --locked
+        run: cargo nextest run --locked --all-features --no-tests=pass
+      - name: doc tests
+        working-directory: datafusion-executor
+        run: cargo test --locked --all-features --doc

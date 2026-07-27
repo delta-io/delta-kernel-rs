@@ -5,7 +5,6 @@ edition = "2021"
 homepage = "https://delta.io"
 license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
-readme = "README.md"
 version = "0.26.0"
 rust-version = "1.88"
 
