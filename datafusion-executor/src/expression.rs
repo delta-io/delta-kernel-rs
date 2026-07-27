@@ -1,14 +1,12 @@
 //! Conversion from a kernel [`Expression`] to a DataFusion [`Expr`].
 
-use datafusion::arrow::datatypes::DataType as ArrowDataType;
 use datafusion::common::Column;
 use datafusion::functions::core::expr_fn::{coalesce, get_field_path};
 use datafusion::functions_nested::expr_fn::make_array;
-use datafusion::logical_expr::{binary_expr, lit, try_cast, Expr, Operator};
-use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use datafusion::logical_expr::{binary_expr, lit, Expr, Operator};
 use delta_kernel::expressions::{
-    BinaryExpression, BinaryExpressionOp, CastExpression, ColumnName, Expression,
-    UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
+    BinaryExpression, BinaryExpressionOp, ColumnName, Expression, UnaryExpressionOp,
+    VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
@@ -26,7 +24,15 @@ pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaR
         Expression::Column(name) => kernel_column_to_df_expr(name, input_schema),
         Expression::Binary(binary) => kernel_binary_expr_to_df_expr(binary, input_schema),
         Expression::Variadic(variadic) => kernel_variadic_to_df_expr(variadic, input_schema),
-        Expression::Cast(cast) => kernel_cast_to_df_expr(cast, input_schema),
+
+        // TODO(delta-io/delta-kernel-rs#3007): implement once kernel's Cast semantics are
+        // clarified. Likely lowers to `Expr::TryCast` (matching kernel's per-value
+        // NULL-on-failure), but kernel degrades a whole-pair-incompatible cast (`can_cast_types`
+        // false, e.g. struct -> int) to an all-NULL column whereas DataFusion raises a planning
+        // error, and the intended contract for that case is still open.
+        Expression::Cast(_) => Err(Error::unsupported(
+            "converting a Cast expression is not yet supported",
+        )),
 
         // TODO: wire up in the predicate-conversion PR (needs the `Predicate -> Expr` converter).
         Expression::Predicate(_) => Err(Error::unsupported(
@@ -116,23 +122,10 @@ fn kernel_variadic_to_df_expr(
     })
 }
 
-/// Lowers a cast to `Expr::TryCast`, matching kernel's per-value SQL semantics: a value that does
-/// not fit the target becomes NULL rather than erroring (DataFusion `Cast` errors on overflow;
-/// `TryCast` does not).
-///
-/// One divergence from kernel's evaluator: for a type pair Arrow cannot cast at all, kernel
-/// degrades to an all-NULL column, whereas DataFusion `TryCast` planning raises `not_impl_err!`.
-/// That fallback needs the runtime input array type, so it cannot be expressed at lowering time.
-fn kernel_cast_to_df_expr(cast: &CastExpression, input_schema: &StructType) -> DeltaResult<Expr> {
-    let expr = kernel_to_df_expr(&cast.expr, input_schema)?;
-    let target: ArrowDataType = (&cast.target).try_into_arrow()?;
-    Ok(try_cast(expr, target))
-}
-
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::{column_expr, Expression as Expr_};
-    use delta_kernel::schema::{ArrayType, DataType, StructField, StructType};
+    use delta_kernel::schema::{DataType, StructField, StructType};
     use rstest::rstest;
 
     use super::*;
@@ -208,24 +201,6 @@ mod tests {
     fn array_lowers_to_make_array_call() {
         let kernel = Expr_::array([Expr_::literal(1i64), Expr_::literal(2i64)]);
         assert_eq!(lower(kernel), "make_array(Int64(1), Int64(2))");
-    }
-
-    // Kernel casts follow SQL NULL-on-failure semantics, so they lower to TryCast, not Cast. The
-    // `string -> int` case is the one where that choice is observable: it can fail per value (and
-    // yields NULL under TryCast), unlike `-> string`, which effectively never does.
-    #[rstest]
-    #[case::widen(Expr_::cast(column_expr!("b"), DataType::STRING), "TRY_CAST(b AS Utf8)")]
-    #[case::narrowing(Expr_::cast(column_expr!("b"), DataType::INTEGER), "TRY_CAST(b AS Int32)")]
-    #[case::fallible_parse(
-        Expr_::cast(Expr_::literal("abc"), DataType::INTEGER),
-        "TRY_CAST(Utf8(\"abc\") AS Int32)"
-    )]
-    #[case::nested_target(
-        Expr_::cast(column_expr!("b"), ArrayType::new(DataType::LONG, true).into()),
-        "TRY_CAST(b AS List(Int64, field: 'element'))"
-    )]
-    fn cast_lowers_to_try_cast(#[case] kernel: Expr_, #[case] expected: &str) {
-        assert_eq!(lower(kernel), expected);
     }
 
     /// A column reference that does not resolve against the input schema fails at conversion time,
