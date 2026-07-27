@@ -5,35 +5,38 @@
 //! crate executes them by lowering each plan to a DataFusion `LogicalPlan`, optimizing it, and
 //! running the resulting `ExecutionPlan`.
 
-// TODO: remove once `task_ctx` and `engine` are consumed by the query-execution path.
+// TODO: remove once `session_ctx` and `storage_handler` are consumed by the query-execution path.
 #![allow(dead_code)]
 
 use std::sync::Arc;
 
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::TaskContext;
-use delta_kernel::Engine;
+use delta_kernel::StorageHandler;
 
 /// Executes kernel declarative plans on DataFusion.
 ///
-/// Holds three handles, each owning a distinct part of the work:
-/// - `session_ctx` -- *plan it*: compiles and optimizes a kernel plan into a DataFusion
-///   `LogicalPlan`, then lowers it to a physical `ExecutionPlan`.
-/// - `task_ctx` -- *run it*: the per-execution runtime handle `ExecutionPlan::execute` requires.
-/// - `engine` -- *fetch the bytes the query engine can't*: a kernel [`Engine`] for storage the
-///   DataFusion query cannot perform itself (deletion-vector resolution, footer reads, listing).
+/// Holds two handles, each owning a distinct part of the work:
+/// - `session_ctx` -- *plan it, then run it*: DataFusion's `SessionContext` is the front door to
+///   the query engine. It holds the session-scoped state needed to turn a query into something
+///   runnable: configuration, registered tables/catalogs and functions, the logical/physical
+///   optimizer rules, and a handle to the shared runtime environment (memory pool, object-store
+///   registry). We use it to compile and optimize a kernel plan into a DataFusion `LogicalPlan`,
+///   then lower it to a physical `ExecutionPlan`. It is heavyweight and meant to be long-lived and
+///   shared.
+/// - `storage_handler` -- *fetch the bytes the query engine can't*: a kernel [`StorageHandler`] for
+///   the storage I/O DataFusion cannot do itself (deletion-vector resolution, footer reads,
+///   listing). This is the file-system subset of a kernel [`Engine`](delta_kernel::Engine) -- the
+///   executor needs nothing else from the engine, so it holds only this.
 pub struct DataFusionExecutor {
     session_ctx: SessionContext,
-    task_ctx: Arc<TaskContext>,
-    engine: Arc<dyn Engine>,
+    storage_handler: Arc<dyn StorageHandler>,
 }
 
 impl DataFusionExecutor {
-    pub fn new(engine: Arc<dyn Engine>) -> Self {
+    pub fn new(storage_handler: Arc<dyn StorageHandler>) -> Self {
         Self {
             session_ctx: SessionContext::new(),
-            task_ctx: Arc::new(TaskContext::default()),
-            engine,
+            storage_handler,
         }
     }
 }
