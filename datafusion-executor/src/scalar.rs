@@ -16,8 +16,9 @@ use delta_kernel::{DeltaResult, Error};
 /// Converts a kernel [`Scalar`] into the equivalent DataFusion [`ScalarValue`].
 ///
 /// # Errors
-/// Returns an error if the scalar's type has no Arrow representation (the interval types), or
-/// if building the backing Arrow array for a nested container otherwise fails.
+/// Returns an error for interval scalars, which are not yet supported; for a type with no Arrow
+/// representation (e.g. a shredded variant); or if building the backing Arrow array for a nested
+/// container otherwise fails.
 pub fn kernel_to_df_scalar(scalar: &Scalar) -> DeltaResult<ScalarValue> {
     Ok(match scalar {
         Scalar::Integer(i) => ScalarValue::Int32(Some(*i)),
@@ -39,6 +40,11 @@ pub fn kernel_to_df_scalar(scalar: &Scalar) -> DeltaResult<ScalarValue> {
         Scalar::Struct(data) => kernel_struct_to_df_scalar(data)?,
         Scalar::Array(data) => kernel_array_to_df_scalar(data)?,
         Scalar::Map(data) => kernel_map_to_df_scalar(data)?,
+        Scalar::IntervalYearMonth(_) | Scalar::IntervalDayTime(_) => {
+            return Err(Error::unsupported(
+                "interval scalars are not supported in the DataFusion executor",
+            ))
+        }
         Scalar::Null(data_type) => kernel_datatype_to_df_null_scalar(data_type)?,
     })
 }
