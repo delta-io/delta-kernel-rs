@@ -284,20 +284,13 @@ fn validate_partition_columns(
             Error::generic(format!("Partition column '{col}' not found in schema"))
         })?;
 
-        let DataType::Primitive(primitive_type) = field.data_type() else {
+        let DataType::Primitive(_) = field.data_type() else {
             return Err(Error::generic(format!(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
                 field.data_type()
             )));
         };
-        if primitive_type.is_interval() {
-            return Err(Error::generic(format!(
-                "Partition column '{col}' has unsupported interval type '{}'. \
-                 Interval types are not supported for partition columns.",
-                field.data_type()
-            )));
-        }
     }
     Ok(())
 }
@@ -1676,27 +1669,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_validate_partition_columns_interval_types_rejected(
-        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
-    ) {
-        let schema = StructType::new_unchecked([
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::not_null("col", data_type),
-        ]);
-
-        let error = validate_partition_columns(&schema, &[ColumnName::new(["col"])])
-            .expect_err("interval partition columns must be rejected")
-            .to_string();
-        assert!(error.contains("Interval types are not supported for partition columns"));
-    }
-
-    #[rstest::rstest]
     #[case::integer(DataType::INTEGER)]
     #[case::string(DataType::STRING)]
     #[case::date(DataType::DATE)]
     #[case::timestamp(DataType::TIMESTAMP)]
     #[case::boolean(DataType::BOOLEAN)]
     #[case::long(DataType::LONG)]
+    #[case::interval_year_month(DataType::INTERVAL_YEAR_MONTH)]
+    #[case::interval_day_time(DataType::INTERVAL_DAY_TIME)]
     fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
