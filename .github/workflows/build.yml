@@ -464,11 +464,9 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --all-features --no-deps
-      # --no-tests=pass: this crate is a scaffold with no tests yet, and nextest fails on an
-      # empty test set by default. Drop the flag once the crate has tests.
       - name: test
         working-directory: datafusion-executor
-        run: cargo nextest run --locked --all-features --no-tests=pass
+        run: cargo nextest run --locked --all-features
       - name: doc tests
         working-directory: datafusion-executor
         run: cargo test --locked --all-features --doc
