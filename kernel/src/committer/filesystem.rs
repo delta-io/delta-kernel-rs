@@ -1,6 +1,6 @@
 //! File system committer for non-catalog-managed tables.
 
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use super::commit_types::{CommitMetadata, CommitResponse};
 use super::publish_types::PublishMetadata;
@@ -47,12 +47,23 @@ impl Committer for FileSystemCommitter {
                     committed_version = version,
                     "Committed delta file via filesystem committer"
                 );
-                // For now, we don't need the real size of the written file, so we can use 0.
-                // If we need this in the future, we can get it from StorageHandler::head.
+                // The atomic write has already committed. Treat the size lookup as best-effort so
+                // a metadata error cannot turn a durable commit into a reported failure.
+                let size = match engine.storage_handler().head(&published_commit_path) {
+                    Ok(file_meta) => file_meta.size,
+                    Err(error) => {
+                        warn!(
+                            path = %published_commit_path,
+                            error = %error,
+                            "Failed to retrieve metadata for committed delta file; falling back to size 0"
+                        );
+                        0
+                    }
+                };
                 let file_meta = FileMeta::new(
                     published_commit_path,
                     commit_metadata.in_commit_timestamp(),
-                    0,
+                    size,
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
@@ -86,18 +97,154 @@ impl Committer for FileSystemCommitter {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use url::Url;
 
     use super::*;
-    use crate::actions::{Metadata, Protocol};
+    use crate::actions::{Metadata, Protocol, LOG_METADATA_SCHEMA};
     use crate::committer::{CommitProtocolMetadata, CommitType};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
     use crate::path::LogRoot;
+    use crate::{
+        EvaluationHandler, FileSlice, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
+    };
+
+    struct HeadTrackingStorageHandler {
+        inner: Arc<dyn StorageHandler>,
+        fail_head: bool,
+        head_calls: AtomicUsize,
+    }
+
+    impl HeadTrackingStorageHandler {
+        fn new(inner: Arc<dyn StorageHandler>, fail_head: bool) -> Self {
+            Self {
+                inner,
+                fail_head,
+                head_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn head_calls(&self) -> usize {
+            self.head_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StorageHandler for HeadTrackingStorageHandler {
+        fn list_from(
+            &self,
+            path: &Url,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+            self.inner.list_from(path)
+        }
+
+        fn read_files(
+            &self,
+            files: Vec<FileSlice>,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+            self.inner.read_files(files)
+        }
+
+        fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+            self.inner.copy_atomic(src, dest)
+        }
+
+        fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+            self.inner.put(path, data, overwrite)
+        }
+
+        fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+            self.head_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_head {
+                Err(Error::generic("injected HEAD failure"))
+            } else {
+                self.inner.head(path)
+            }
+        }
+
+        fn delete(&self, path: &Url) -> DeltaResult<()> {
+            self.inner.delete(path)
+        }
+    }
+
+    struct HeadTrackingEngine {
+        inner: SyncEngine,
+        storage_handler: Arc<HeadTrackingStorageHandler>,
+    }
+
+    impl HeadTrackingEngine {
+        fn new(store: Arc<InMemory>, fail_head: bool) -> Self {
+            let inner = SyncEngine::new_with_store(store);
+            let storage_handler = Arc::new(HeadTrackingStorageHandler::new(
+                inner.storage_handler(),
+                fail_head,
+            ));
+            Self {
+                inner,
+                storage_handler,
+            }
+        }
+
+        fn head_calls(&self) -> usize {
+            self.storage_handler.head_calls()
+        }
+    }
+
+    impl Engine for HeadTrackingEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.inner.evaluation_handler()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            self.storage_handler.clone()
+        }
+
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            self.inner.json_handler()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            self.inner.parquet_handler()
+        }
+
+        #[cfg(feature = "declarative-plans")]
+        fn plan_executor(&self) -> Arc<dyn crate::plans::PlanExecutor> {
+            self.inner.plan_executor()
+        }
+    }
+
+    fn commit_input(
+        engine: &dyn Engine,
+        table_root: Url,
+        version: u64,
+        in_commit_timestamp: i64,
+    ) -> (FilteredEngineData, CommitMetadata) {
+        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let action = metadata
+            .clone()
+            .into_engine_data(LOG_METADATA_SCHEMA.clone(), engine)
+            .unwrap();
+        let commit_metadata = CommitMetadata::new(
+            LogRoot::new(table_root).unwrap(),
+            version,
+            CommitType::PathBasedWrite,
+            in_commit_timestamp,
+            version.checked_sub(1),
+            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
+            vec![],
+        );
+        (
+            FilteredEngineData::with_all_rows_selected(action),
+            commit_metadata,
+        )
+    }
 
     #[tokio::test]
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
@@ -135,26 +282,57 @@ mod tests {
     async fn test_filesystem_committer_returns_valid_commit_response() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = SyncEngine::new_with_store(storage);
+        let engine = HeadTrackingEngine::new(storage.clone(), false);
 
         let committer = FileSystemCommitter::new();
-        let log_root = LogRoot::new(table_root).unwrap();
-        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let commit_metadata = CommitMetadata::new(
-            log_root,
-            1,
-            CommitType::PathBasedWrite,
-            12345,
-            Some(0),
-            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata), None, None).unwrap(),
-            vec![],
-        );
-        let actions = Box::new(std::iter::empty());
+        let (action, commit_metadata) = commit_input(&engine, table_root, 1, 12345);
+        let actions = Box::new(std::iter::once(Ok(action)));
 
         let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+        let stored_size = storage
+            .head(&Path::from("_delta_log/00000000000000000001.json"))
+            .await
+            .unwrap()
+            .size;
 
+        match result {
+            CommitResponse::Committed { file_meta } => {
+                assert_eq!(file_meta.last_modified, 12345);
+                assert!(file_meta.size > 0);
+                assert_eq!(file_meta.size, stored_size);
+                assert!(file_meta
+                    .location
+                    .as_str()
+                    .ends_with("00000000000000000001.json"));
+            }
+            CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
+        }
+        assert_eq!(engine.head_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_committer_head_failure_preserves_successful_commit() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let engine = HeadTrackingEngine::new(storage.clone(), true);
+        let committer = FileSystemCommitter::new();
+        let (action, commit_metadata) = commit_input(&engine, table_root, 1, 12345);
+
+        let result = committer
+            .commit(
+                &engine,
+                Box::new(std::iter::once(Ok(action))),
+                commit_metadata,
+            )
+            .unwrap();
+
+        let stored_size = storage
+            .head(&Path::from("_delta_log/00000000000000000001.json"))
+            .await
+            .unwrap()
+            .size;
+        assert!(stored_size > 0, "the commit file must be durable");
+        assert_eq!(engine.head_calls(), 1);
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert_eq!(file_meta.last_modified, 12345);
@@ -169,45 +347,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_filesystem_committer_write_failure_skips_head() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let engine = HeadTrackingEngine::new(storage.clone(), false);
+        let committer = FileSystemCommitter::new();
+        let (_action, commit_metadata) = commit_input(&engine, table_root, 1, 12345);
+        let actions = Box::new(std::iter::once(Err(Error::generic(
+            "injected write failure",
+        ))));
+
+        let error = committer
+            .commit(&engine, actions, commit_metadata)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected write failure"));
+        assert_eq!(engine.head_calls(), 0);
+        assert!(storage
+            .head(&Path::from("_delta_log/00000000000000000001.json"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn test_filesystem_committer_returns_conflict_for_existing_version() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = SyncEngine::new_with_store(storage);
+        let engine = HeadTrackingEngine::new(storage, false);
 
         let committer = FileSystemCommitter::new();
-        let protocol = Protocol::try_new_modern(Vec::<&str>::new(), Vec::<&str>::new()).unwrap();
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
-        let metadata1 =
-            Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
-        let metadata2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let first_metadata = CommitMetadata::new(
-            LogRoot::new(table_root.clone()).unwrap(),
-            1,
-            CommitType::PathBasedWrite,
-            12345,
-            Some(0),
-            CommitProtocolMetadata::try_new(Some(protocol.clone()), Some(metadata1), None, None)
-                .unwrap(),
-            vec![],
-        );
-        let second_metadata = CommitMetadata::new(
-            LogRoot::new(table_root).unwrap(),
-            1,
-            CommitType::PathBasedWrite,
-            12346,
-            Some(0),
-            CommitProtocolMetadata::try_new(Some(protocol), Some(metadata2), None, None).unwrap(),
-            vec![],
-        );
+        let (first_action, first_metadata) = commit_input(&engine, table_root.clone(), 1, 12345);
+        let (second_action, second_metadata) = commit_input(&engine, table_root, 1, 12346);
 
         let first = committer
-            .commit(&engine, Box::new(std::iter::empty()), first_metadata)
+            .commit(
+                &engine,
+                Box::new(std::iter::once(Ok(first_action))),
+                first_metadata,
+            )
             .unwrap();
         assert!(matches!(first, CommitResponse::Committed { .. }));
+        assert_eq!(engine.head_calls(), 1);
 
         let second = committer
-            .commit(&engine, Box::new(std::iter::empty()), second_metadata)
+            .commit(
+                &engine,
+                Box::new(std::iter::once(Ok(second_action))),
+                second_metadata,
+            )
             .unwrap();
         assert!(matches!(second, CommitResponse::Conflict { version: 1 }));
+        assert_eq!(engine.head_calls(), 1);
     }
 }
