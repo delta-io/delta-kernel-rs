@@ -25,15 +25,6 @@ pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaR
         Expression::Binary(binary) => kernel_binary_expr_to_df_expr(binary, input_schema),
         Expression::Variadic(variadic) => kernel_variadic_to_df_expr(variadic, input_schema),
 
-        // TODO(delta-io/delta-kernel-rs#3007): implement once kernel's Cast semantics are
-        // clarified. Likely lowers to `Expr::TryCast` (matching kernel's per-value
-        // NULL-on-failure), but kernel degrades a whole-pair-incompatible cast (`can_cast_types`
-        // false, e.g. struct -> int) to an all-NULL column whereas DataFusion raises a planning
-        // error, and the intended contract for that case is still open.
-        Expression::Cast(_) => Err(Error::unsupported(
-            "converting a Cast expression is not yet supported",
-        )),
-
         // TODO: wire up in the predicate-conversion PR (needs the `Predicate -> Expr` converter).
         Expression::Predicate(_) => Err(Error::unsupported(
             "converting an embedded Predicate expression is not yet supported",
@@ -58,6 +49,11 @@ pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaR
                 "converting the ToJson expression is not yet supported",
             )),
         },
+
+        // TODO(#3007): implement once kernel's Cast semantics are clarified.
+        Expression::Cast(_) => Err(Error::unsupported(
+            "converting a Cast expression is not yet supported",
+        )),
 
         Expression::Opaque(_) => Err(Error::unsupported(
             "cannot convert an engine-defined Opaque expression",
