@@ -40,7 +40,7 @@ pub(crate) struct ScanStatsOptions {
     /// whose `add.stats` is null but whose `add.stats_parsed` is populated
     /// (writeStatsAsJson=false, writeStatsAsStruct=true). When false, `ScanFile.stats`
     /// is left null on such checkpoints; engines that consume `stats_parsed` directly
-    /// avoid reading raw checkpoint JSON and the per-batch `ToJson` cost.
+    /// avoid reading JSON stats in checkpoints and the per-batch `ToJson` cost.
     pub(crate) synthesize_json: bool,
 }
 
@@ -805,10 +805,10 @@ fn scan_row_schema_with_parsed_columns(
 ///   so that `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
 ///   (writeStatsAsJson=false).
 /// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
-///   raw stats JSON string from checkpoint parquet files.
+///   JSON stats column in checkpoint parquet files.
 /// - `synthesize_json`: When false, disables the `ToJson(add.stats_parsed)` fallback regardless of
 ///   `has_stats_parsed`. Compatible parsed-stats checkpoints produce null JSON stats and can omit
-///   the raw column; raw-only checkpoints and commits retain `add.stats` as fallback input.
+///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`

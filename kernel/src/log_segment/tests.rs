@@ -33,7 +33,7 @@ use crate::scan::test_utils::{
     sidecar_batch_with_given_paths, sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::scan::{
-    CHECKPOINT_READ_SCHEMA, CHECKPOINT_READ_SCHEMA_NO_RAW_STATS, COMMIT_READ_SCHEMA,
+    CHECKPOINT_READ_SCHEMA, CHECKPOINT_READ_SCHEMA_NO_JSON_STATS, COMMIT_READ_SCHEMA,
 };
 use crate::schema::{
     schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
@@ -3443,9 +3443,9 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
     }
 }
 
-fn create_stream_checkpoint_schema_with_stats_parsed(
+fn create_checkpoint_file_schema_with_stats_parsed(
     min_values_fields: Vec<StructField>,
-    include_raw_stats: bool,
+    include_json_stats: bool,
 ) -> DeltaResult<SchemaRef> {
     let stats_parsed = StructField::nullable(
         "stats_parsed",
@@ -3456,7 +3456,7 @@ fn create_stream_checkpoint_schema_with_stats_parsed(
         },
     );
     let patch = SchemaStructPatchBuilder::new().append_at(["add"], stats_parsed);
-    let patch = if include_raw_stats {
+    let patch = if include_json_stats {
         patch
     } else {
         patch.drop_at(["add"], "stats")
@@ -3484,22 +3484,22 @@ fn create_checkpoint_schema_without_stats_parsed() -> StructType {
 }
 
 #[rstest]
-#[case::missing_with_raw(false, true, false, true)]
-#[case::partial_with_raw(true, true, true, false)]
-#[case::partial_without_raw(true, false, true, false)]
+#[case::missing_with_json(false, true, false, true)]
+#[case::partial_with_json(true, true, true, false)]
+#[case::partial_without_json(true, false, true, false)]
 #[tokio::test]
 async fn test_checkpoint_stream_resolves_stats_projection(
     #[case] include_parsed_stats: bool,
-    #[case] include_raw_stats: bool,
+    #[case] include_json_stats: bool,
     #[case] expect_parsed_stats: bool,
-    #[case] expect_raw_stats: bool,
+    #[case] expect_json_stats: bool,
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = SyncEngine::new_with_store(store.clone());
     let checkpoint_schema = if include_parsed_stats {
-        create_stream_checkpoint_schema_with_stats_parsed(
+        create_checkpoint_file_schema_with_stats_parsed(
             vec![StructField::nullable("other", DataType::LONG)],
-            include_raw_stats,
+            include_json_stats,
         )?
     } else {
         get_commit_schema().clone()
@@ -3530,11 +3530,11 @@ async fn test_checkpoint_stream_resolves_stats_projection(
 
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
-        CHECKPOINT_READ_SCHEMA_NO_RAW_STATS.clone(),
-        None,
+        CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
+        None, // meta_predicate
         Some(&stats_schema),
-        None,
-        None,
+        None, // partition_schema
+        None, // cancellation_token
     )?;
 
     assert_eq!(
@@ -3549,7 +3549,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
     let DataType::Struct(add) = add_field.data_type() else {
         panic!("checkpoint add field must be a struct");
     };
-    assert_eq!(add.field("stats").is_some(), expect_raw_stats);
+    assert_eq!(add.field("stats").is_some(), expect_json_stats);
     assert_eq!(add.field("stats_parsed").is_some(), expect_parsed_stats);
 
     let read_schema = checkpoint_result
@@ -3557,9 +3557,16 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         .checkpoint_read_schema
         .clone();
     let mut actions = checkpoint_result.actions;
-    let batch = actions.next().expect("checkpoint batch")?;
+    let batch = actions
+        .next()
+        .expect("checkpoint stream must yield one batch")?;
     assert!(!batch.is_log_batch);
-    if include_raw_stats {
+    assert_eq!(
+        batch.actions.has_field(&ColumnName::new(["add", "stats"])),
+        expect_json_stats,
+        "checkpoint batch JSON stats projection must match the resolved schema"
+    );
+    if include_json_stats {
         assert_batch_matches(batch.actions, add_batch_simple(read_schema));
     } else {
         assert!(!batch.actions.is_empty());

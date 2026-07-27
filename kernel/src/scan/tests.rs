@@ -1,9 +1,11 @@
+use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ::test_utils::{get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
+use url::Url;
 
 use super::*;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
@@ -1804,7 +1806,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     )]
     table: &str,
     #[case] stats: StatsOptions,
-    #[case] request_raw_stats: bool,
+    #[case] request_json_stats: bool,
     #[case] skip_stats: bool,
 ) {
     let extracted = load_test_data("tests/data", table).ok();
@@ -1812,9 +1814,9 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         .as_ref()
         .map(|dir| dir.path().join(table))
         .unwrap_or_else(|| {
-            std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
+            fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
         });
-    let url = url::Url::from_directory_path(path).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
     let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
     engine.take_reads();
@@ -1834,7 +1836,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     let reads = engine.take_reads();
     let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
     let expect_parsed_stats = !skip_stats && compatible_structured_stats;
-    let expect_raw_stats = !skip_stats && (request_raw_stats || !expect_parsed_stats);
+    let expect_json_stats = !skip_stats && (request_json_stats || !expect_parsed_stats);
     let expected_file_fragment = if table.starts_with("v2-") {
         "_sidecars/"
     } else {
@@ -1860,8 +1862,8 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         };
         assert_eq!(
             add.field("stats").is_some(),
-            expect_raw_stats,
-            "raw checkpoint stats projection must match the requested output"
+            expect_json_stats,
+            "JSON checkpoint stats projection must match the requested output"
         );
         assert_eq!(
             add.field("stats_parsed").is_some(),
@@ -1873,11 +1875,11 @@ fn test_checkpoint_stats_projection_matches_requested_output(
 
 #[test]
 fn test_all_struct_parses_json_commit_stats() {
-    let path = std::fs::canonicalize(PathBuf::from(
+    let path = fs::canonicalize(PathBuf::from(
         "./tests/data/v1-single-part-struct-stats-only/",
     ))
     .unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     // The table's checkpoint is at version 5, so version 4 replays only JSON commits.
     let snapshot = Snapshot::builder_for(url)
