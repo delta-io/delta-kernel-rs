@@ -213,6 +213,13 @@ def render_table(rows):
     out.append("</details>")
     return "\n".join(out)
 
+def write_flag(env_var, value):
+    """Write 'true'/'false' to the file named by env_var, if that var is set."""
+    path = os.environ.get(env_var)
+    if path:
+        with open(path, 'w') as f:
+            f.write('true' if value else 'false')
+
 def main():
     lines = sys.stdin.read().splitlines()
     rows = parse_rows(lines)
@@ -233,16 +240,10 @@ def main():
     print(render_legend())
 
     # Record whether any benchmark crossed FAIL_THRESHOLD so the workflow can
-    # fail the job (unless overridden by the ignore-benchmark-failure label).
-    flag_path = os.environ.get('BENCH_REGRESSION_FILE')
-    if flag_path:
-        with open(flag_path, 'w') as f:
-            f.write('true' if regressed else 'false')
-
-    retry_path = os.environ.get('BENCH_RETRY_FILE')
-    if retry_path:
-        with open(retry_path, 'w') as f:
-            f.write('true' if retryable else 'false')
+    # fail the job (unless overridden by the ignore-benchmark-failure label), and
+    # whether the regression is noisy enough to warrant one automatic retry.
+    write_flag('BENCH_REGRESSION_FILE', regressed)
+    write_flag('BENCH_RETRY_FILE', retryable)
 
 if __name__ == "__main__":
     main()

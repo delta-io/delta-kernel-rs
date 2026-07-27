@@ -87,51 +87,47 @@ echo "mem: $(free -m | awk '/^Mem:/ {print $2 " MB total, " $7 " MB available"}'
 echo "==========================="
 
 # ---------------------------------------------------------------------------
-# 3. Benchmark the integration commit (PR head merged into base)
-# ---------------------------------------------------------------------------
-# HEAD is the merge commit checked out by the workflow; capture it so step 5 can
-# restore this tree after the base checkout below.
-MERGE_SHA=$(git rev-parse HEAD)
-(cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER")
-
-# ---------------------------------------------------------------------------
-# 4. Switch to the base branch and benchmark it
-#    The benchmarks/target/ directory is not tracked by git, so the
-#    "changes" baseline files are preserved across the branch switch.
-# ---------------------------------------------------------------------------
-git fetch origin -- "$BASE_REF"
-git checkout FETCH_HEAD
-BASE_SHA=$(git rev-parse HEAD)
-(cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
-
-# ---------------------------------------------------------------------------
-# 5. Compare baselines with critcmp and format as a markdown comment
-#    (per-tier summary line + collapsed per-benchmark table; see
-#    benchmarks/ci/parse_critcmp.py for the format and tier thresholds).
-#      - Parses actual duration values (not rank factors) to compute a ratio
-# ---------------------------------------------------------------------------
-# Step 4 left the working tree on the base branch, so parse_critcmp.py on disk
-# is the base version. Restore the merge tree so the comment is formatted by the
-# PR's own formatter (a formatter change is then exercised on the PR that
-# introduces it). The raw PR-head SHA is not reachable in the shallow merge-ref
-# checkout, so restore the merge commit captured in step 3. Only tracked sources
-# move; the `base`/`changes` criterion baselines live in gitignored
-# benchmarks/target/ and survive the checkout.
-git checkout "$MERGE_SHA"
-# Use `critcmp` to compare the criterion output for `base` and `changes`. We use `critcmp` instead of manually
-# parsing criterion outputs because criterion may update its output format. By using `critcmp`, we inherit all
-# updated criterion output parsing.
+# 3. Benchmark both sides, compare with critcmp, retry once on a noisy regression
+#    Each attempt benchmarks the merge tree ("changes") and the base tree
+#    ("base"), then compares them. HEAD is the merge commit (PR head merged into
+#    base) checked out by the workflow; capture it so each attempt can restore
+#    this tree. The base SHA is resolved from the fetch without a checkout -- the
+#    loop checks it out itself.
 #
-# parse_critcmp.py records whether any benchmark regressed past its fail
-# threshold in this file; benchmark.yml's gate step reads it to fail the job.
-# It also records whether a non-overridden regression is below the automatic
-# retry threshold, allowing one fresh measurement pair to replace a noisy run.
+#    After measuring, restore the merge tree so the comment is formatted by the
+#    PR's own parse_critcmp.py (a formatter change is then exercised on the PR
+#    that introduces it). The raw PR-head SHA is not reachable in the shallow
+#    merge-ref checkout, so restore the captured merge commit. Only tracked
+#    sources move; the `base`/`changes` criterion baselines live in gitignored
+#    benchmarks/target/ and survive the checkout.
+#
+#    We use `critcmp` to compare the criterion output for `base` and `changes`
+#    instead of parsing criterion output ourselves: criterion may change its
+#    output format, and critcmp tracks it, so we inherit any format updates.
+#
+#    parse_critcmp.py records whether any benchmark regressed past its fail
+#    threshold in BENCH_REGRESSION_FILE (benchmark.yml's gate step reads it to
+#    fail the job). It also records whether a non-overridden regression is below
+#    the automatic retry threshold in BENCH_RETRY_FILE, allowing one fresh
+#    measurement pair to replace a noisy run.
+# ---------------------------------------------------------------------------
+run_bench() { (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline "$1" "$FILTER"); }
+
+MERGE_SHA=$(git rev-parse HEAD)
+git fetch origin -- "$BASE_REF"
+BASE_SHA=$(git rev-parse FETCH_HEAD)
+
 export BENCH_REGRESSION_FILE=/tmp/bench-regression.txt
 export BENCH_RETRY_FILE=/tmp/bench-retry.txt
 ATTEMPT=1
 MAX_ATTEMPTS=2
 
 while true; do
+  run_bench changes
+  git checkout "$BASE_SHA"
+  run_bench base
+  git checkout "$MERGE_SHA"
+
   COMPARISON=$((cd benchmarks && critcmp base changes) | python3 benchmarks/ci/parse_critcmp.py)
   RETRY=$(tr -d '[:space:]' < "$BENCH_RETRY_FILE" 2>/dev/null || echo false)
 
@@ -140,18 +136,11 @@ while true; do
   fi
 
   ATTEMPT=$((ATTEMPT + 1))
-  echo "::notice::Benchmark regression is below 1.50x; starting attempt $ATTEMPT/$MAX_ATTEMPTS."
-  (
-    cd benchmarks
-    cargo bench --locked --bench workload_bench -- --save-baseline changes "$FILTER"
-  )
-  git checkout "$BASE_SHA"
-  (cd benchmarks && cargo bench --locked --bench workload_bench -- --save-baseline base "$FILTER")
-  git checkout "$MERGE_SHA"
+  echo "::notice::Benchmark regression within retry band; starting attempt $ATTEMPT/$MAX_ATTEMPTS."
 done
 
 # ---------------------------------------------------------------------------
-# 6. Write results to /tmp/bench-comment.md
+# 4. Write results to /tmp/bench-comment.md
 #    benchmark.yml uploads this as an artifact; benchmark-post-comment.yml
 #    downloads it and posts the PR comment in base-branch context.
 # ---------------------------------------------------------------------------

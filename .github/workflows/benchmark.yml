@@ -20,7 +20,7 @@
 # pull_request from a fork).
 #
 # The run-benchmark job reruns one fresh comparison when a non-overridden
-# regression is below RERUN_THRESHOLD, then fails if the final comparison still
+# regression is below RETRY_THRESHOLD, then fails if the final comparison still
 # crosses the fail threshold in benchmarks/ci/parse_critcmp.py. The comment artifact
 # is uploaded before the gate runs, so the result table still gets posted on a gate
 # failure. The ignore-benchmark-failure label bypasses both retry and failure.
