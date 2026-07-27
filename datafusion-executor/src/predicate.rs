@@ -21,7 +21,10 @@ use crate::scalar::kernel_to_df_scalar;
 /// predicates Also propagates any error from converting a child expression (an unresolved column
 /// reference, or an interval literal, which has no Arrow representation) and rejects an `IN`
 /// predicate whose right side is not a literal array.
-pub fn kernel_predicate_to_df_expr(pred: &Predicate, input_schema: &StructType) -> DeltaResult<Expr> {
+pub fn kernel_predicate_to_df_expr(
+    pred: &Predicate,
+    input_schema: &StructType,
+) -> DeltaResult<Expr> {
     match pred {
         Predicate::BooleanExpression(expr) => kernel_to_df_expr(expr, input_schema),
         Predicate::Not(inner) => Ok(Expr::Not(Box::new(kernel_predicate_to_df_expr(
@@ -51,7 +54,9 @@ fn kernel_unary_to_expr(unary: &UnaryPredicate, input_schema: &StructType) -> De
 /// Lowers a binary predicate.
 fn kernel_binary_to_expr(binary: &BinaryPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
     let op = match binary.op {
-        BinaryPredicateOp::In => return kernel_in_to_expr(&binary.left, &binary.right, input_schema),
+        BinaryPredicateOp::In => {
+            return kernel_in_to_expr(&binary.left, &binary.right, input_schema)
+        }
         BinaryPredicateOp::Equal => Operator::Eq,
         BinaryPredicateOp::LessThan => Operator::Lt,
         BinaryPredicateOp::GreaterThan => Operator::Gt,
@@ -89,16 +94,18 @@ fn kernel_in_to_expr(
 }
 
 /// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
-/// left-associative [`conjunction`]/[`disjunction`] helpers. An empty junction lowers to the
-/// operator's identity literal (`AND` of nothing is `true`, `OR` of nothing is `false`), matching
-/// how kernel normalizes empty junctions at construction.
-fn kernel_junction_to_expr(junction: &JunctionPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
+/// left-associative [`conjunction`]/[`disjunction`] helpers.
+fn kernel_junction_to_expr(
+    junction: &JunctionPredicate,
+    input_schema: &StructType,
+) -> DeltaResult<Expr> {
     let preds = junction
         .preds
         .iter()
         .map(|pred| kernel_predicate_to_df_expr(pred, input_schema))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(match junction.op {
+        // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics
         JunctionPredicateOp::And => conjunction(preds).unwrap_or_else(|| lit(true)),
         JunctionPredicateOp::Or => disjunction(preds).unwrap_or_else(|| lit(false)),
     })
