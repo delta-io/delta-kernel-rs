@@ -314,7 +314,7 @@ mod tests {
         } else {
             Box::new(FileSystemCommitter::new())
         };
-        let txn = snapshot.clone().transaction(committer, &engine)?;
+        let txn = snapshot.clone().transaction().build(&engine, committer)?;
         let _write_context = txn.unpartitioned_write_context()?;
 
         match txn.commit(&engine)? {

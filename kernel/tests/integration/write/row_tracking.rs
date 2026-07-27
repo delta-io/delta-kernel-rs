@@ -84,8 +84,9 @@ async fn test_row_tracking_remove_gate(
         .unwrap()?
         .scan_files;
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_data_change(true);
+        .transaction()
+        .with_data_change(true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     txn.remove_files(scan_files);
 
     if expect_err {

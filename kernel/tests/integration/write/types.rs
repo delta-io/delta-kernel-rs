@@ -567,7 +567,8 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
         .build(engine.as_ref())
         .expect("snapshot should build");
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
     // Add dummy file metadata to trigger write validation
@@ -764,7 +765,8 @@ async fn write_context_creation_fails_fast_on_invalid_void_schema(
         .build(engine.as_ref())
         .expect("snapshot should build");
     let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
+        .transaction()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
         .expect("transaction should create");
 
     let err = if partition_columns.is_empty() {
@@ -800,7 +802,9 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
         assert!(logical.field("v").is_some());
     }
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     let wc = txn.unpartitioned_write_context()?;
     let physical = wc.physical_schema();
@@ -827,7 +831,9 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
 
     // Commit with NO add_files — this is a metadata-only operation and should succeed
     let result = txn.commit(engine.as_ref());
@@ -874,7 +880,9 @@ async fn write_context_excludes_nested_void_from_physical_schema(
         }
     }
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.unpartitioned_write_context()?;
     let physical = wc.physical_schema();
 
@@ -915,7 +923,9 @@ async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::e
     let engine = Arc::new(engine);
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
 
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    let txn = snapshot
+        .transaction()
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let wc = txn.unpartitioned_write_context()?;
 
     // The transform expression should mention dropping "b" inside the struct

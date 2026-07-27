@@ -803,10 +803,11 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 
     let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-        let result = txn
+        let txn = snapshot
+            .transaction()
             .with_domain_metadata(domain.to_string(), value.to_string())
-            .commit(&engine)?;
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        let result = txn.commit(&engine)?;
         assert!(result.is_committed());
         Ok(())
     };
@@ -879,10 +880,11 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
 
     // ===== Commit domain metadata for "foo" =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let result = txn
+    let txn = snapshot
+        .transaction()
         .with_domain_metadata("foo".to_string(), "bar".to_string())
-        .commit(&engine)?;
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    let result = txn.commit(&engine)?;
     assert!(result.is_committed());
 
     // Verify domain exists before removal
@@ -894,10 +896,11 @@ async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()
 
     // ===== Remove domain metadata for "foo" (tombstone) =====
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    let result = txn
+    let txn = snapshot
+        .transaction()
         .with_domain_metadata_removed("foo".to_string())
-        .commit(&engine)?;
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    let result = txn.commit(&engine)?;
     assert!(result.is_committed());
 
     // Verify domain is gone before checkpoint

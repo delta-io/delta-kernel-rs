@@ -69,10 +69,11 @@ async fn main() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+        .transaction()
         .with_operation("INSERT".to_string())
         .with_engine_info("quick-start/1.0")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
     // Build an Arrow RecordBatch
     let arrow_schema: delta_kernel::arrow::datatypes::Schema =
@@ -154,9 +155,10 @@ The write flow has four parts:
 **Start a transaction:**
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction()
     .with_operation("INSERT".to_string())
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 **Build your data as an Arrow RecordBatch and wrap it:**

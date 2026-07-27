@@ -623,15 +623,16 @@ async fn test_write_checksum_resolves_correct_crc_from_each_root(
             vec![Arc::new(Int32Array::from(vec![v as i32]))],
         )
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-        let mut txn = snap
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        let mut builder = snap
+            .transaction()
             .with_operation("WRITE".to_string())
             .with_data_change(true)
             .with_domain_metadata(format!("d{v}"), format!("cfg{v}"))
             .with_transaction_id(format!("app{v}"), v);
         if v == 3 {
-            txn = txn.with_domain_metadata_removed(removed_domain.to_string());
+            builder = builder.with_domain_metadata_removed(removed_domain.to_string());
         }
+        let mut txn = builder.build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let write_context = txn.unpartitioned_write_context()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
@@ -815,9 +816,10 @@ async fn setup_incremental_below_checkpoint_base<E: TaskExecutor>(
         )
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
         let mut txn = snap
-            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .transaction()
             .with_operation("WRITE".to_string())
-            .with_data_change(true);
+            .with_data_change(true)
+            .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let write_context = txn.unpartitioned_write_context()?;
         let adds = engine
             .write_parquet(&ArrowEngineData::new(batch), &write_context)
@@ -2072,9 +2074,10 @@ async fn commit_data<E: TaskExecutor>(
     )
     .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
     let txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+        .transaction()
         .with_operation("WRITE".to_string())
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     let mut txn = customize(txn);
     let write_context = txn.unpartitioned_write_context()?;
     let adds = engine

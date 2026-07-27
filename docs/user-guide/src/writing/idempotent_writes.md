@@ -52,9 +52,10 @@ if let Some(committed_version) = snapshot.get_app_id_version(app_id, &engine)? {
 
 // Not yet committed. Proceed with the write.
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction()
     .with_transaction_id(app_id.to_string(), batch_version)
-    .with_operation("STREAMING UPDATE".to_string());
+    .with_operation("STREAMING UPDATE".to_string())
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // ... write data, add files, commit ...
 # Ok(())

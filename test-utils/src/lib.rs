@@ -946,13 +946,14 @@ pub async fn insert_data_with<E: TaskExecutor>(
     let arrow_schema = TryFromKernel::try_from_kernel(snapshot.schema().as_ref())?;
     let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
-    let mut txn = snapshot
-        .transaction(committer, engine.as_ref())?
+    let mut builder = snapshot
+        .transaction()
         .with_operation(operation.to_string())
         .with_data_change(data_change);
     if is_blind_append {
-        txn = txn.with_blind_append();
+        builder = builder.with_blind_append();
     }
+    let mut txn = builder.build(engine.as_ref(), committer)?;
 
     let write_context = txn.unpartitioned_write_context()?;
     let add_files_metadata = engine
@@ -965,7 +966,9 @@ pub async fn insert_data_with<E: TaskExecutor>(
 
 /// Starts a transaction using the passed snapshot using a [`FileSystemCommitter`].
 pub fn begin_transaction(snapshot: Arc<Snapshot>, engine: &dyn Engine) -> DeltaResult<Transaction> {
-    snapshot.transaction(Box::new(FileSystemCommitter::new()), engine)
+    snapshot
+        .transaction()
+        .build(engine, Box::new(FileSystemCommitter::new()))
 }
 
 /// A catalog [`Committer`] for tests: writes every commit directly to the published Delta log
@@ -1367,9 +1370,10 @@ pub async fn write_batch_to_table(
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction()
         .with_engine_info("DefaultEngine")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
@@ -1682,9 +1686,10 @@ pub fn remove_all_and_get_remove_actions(
 
     let mut txn = snapshot
         .clone()
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction()
         .with_engine_info("DefaultEngine")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
     for sm in all_scan_metadata {
         txn.remove_files(sm.scan_files);
     }

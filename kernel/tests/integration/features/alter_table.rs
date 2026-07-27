@@ -468,8 +468,9 @@ async fn empty_create_then_add_column(
     );
     let write_err = v0
         .clone()
-        .transaction(committer(), engine.as_ref())?
+        .transaction()
         .with_engine_info("EmptySchemaApp/0.1.0")
+        .build(engine.as_ref(), committer())?
         .unpartitioned_write_context()
         .expect_err("unpartitioned_write_context() must reject empty-schema snapshots");
     assert!(
@@ -959,7 +960,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
         .expect("CURRENT_DEFAULT metadata must survive ALTER");
     assert_eq!(default.raw_sql(), "42");
 
-    let txn = reloaded.transaction(committer(), engine.as_ref())?;
+    let txn = reloaded.transaction().build(engine.as_ref(), committer())?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
         "default metadata must remain inert without allowColumnDefaults",

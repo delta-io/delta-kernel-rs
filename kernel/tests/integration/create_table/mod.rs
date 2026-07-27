@@ -109,17 +109,16 @@ async fn test_create_table_with_user_domain_metadata() -> DeltaResult<()> {
 
     let schema = simple_schema()?;
 
-    // Create table with domainMetadata feature enabled
-    let txn = create_table(&table_path, schema, "Test/1.0")
-        .with_table_properties([("delta.feature.domainMetadata", "supported")])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
-
-    // Add user domain metadata during table creation
+    // Add user domain metadata during table creation. Staged on the builder (not the built
+    // transaction) so this exercises CreateTableTransactionBuilder's domain-metadata threading.
     let domain = "app.settings";
     let config = r#"{"version": 1, "enabled": true}"#;
 
-    let _ = txn
+    // Create table with domainMetadata feature enabled
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.domainMetadata", "supported")])
         .with_domain_metadata(domain.to_string(), config.to_string())
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?;
 
     // Load snapshot and verify domain metadata was persisted

@@ -68,8 +68,9 @@ including those that haven't been published to `_delta_log/` yet.
 use delta_kernel_unity_catalog::UCCommitter;
 
 let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone().transaction()
+    .with_operation("INSERT".to_string())
+    .build(&engine, committer)?;
 ```
 
 `UCCommitter` requires a multi-threaded tokio runtime. The default Kernel
@@ -215,8 +216,9 @@ let snapshot = catalog.load_snapshot(table_id, table_uri, &engine).await?;
 
 // 5. Create transaction with UCCommitter
 let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
-let mut txn = snapshot.clone().transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+let mut txn = snapshot.clone().transaction()
+    .with_operation("INSERT".to_string())
+    .build(&engine, committer)?;
 
 // 6. Write data
 let write_context = txn.unpartitioned_write_context()?;
