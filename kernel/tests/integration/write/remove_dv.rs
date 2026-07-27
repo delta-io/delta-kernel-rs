@@ -248,12 +248,11 @@ async fn test_remove_scanned_file_sets_extended_metadata(
     assert_eq!(remove_actions.len(), 1);
     let remove = &remove_actions[0];
     assert_eq!(remove["extendedFileMetadata"], missing_field.is_none());
-    if let Some(field) = missing_field {
-        assert!(remove.get(field.name()).is_none());
-    } else {
-        for field in ExtendedMetadataField::ALL {
-            assert!(remove.get(field.name()).is_some());
-        }
+    for field in ExtendedMetadataField::ALL {
+        let present = remove
+            .get(field.name())
+            .is_some_and(|value| !value.is_null());
+        assert_eq!(present, Some(field) != missing_field);
     }
 
     let scan = snapshot.scan_builder().build()?;
