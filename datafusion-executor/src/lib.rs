@@ -22,7 +22,8 @@ use delta_kernel::StorageHandler;
 ///   optimizer rules, and a handle to the shared runtime environment (memory pool, object-store
 ///   registry). We use it to compile and optimize a kernel plan into a DataFusion `LogicalPlan`,
 ///   then lower it to a physical `ExecutionPlan`. It is heavyweight and meant to be long-lived and
-///   shared.
+///   shared. At execution time we derive a fresh per-run `TaskContext` from it via
+///   `session_ctx.task_ctx()` and pass that to `ExecutionPlan::execute`.
 /// - `storage_handler` -- *fetch the bytes the query engine can't*: a kernel [`StorageHandler`] for
 ///   the storage I/O DataFusion cannot do itself (deletion-vector resolution, footer reads,
 ///   listing). This is the file-system subset of a kernel [`Engine`](delta_kernel::Engine) -- the
