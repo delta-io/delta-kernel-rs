@@ -6,22 +6,25 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::expressions::{column_expr, Scalar};
+use delta_kernel::expressions::{column_expr, lit, ExpressionStructPatchBuilder, MapData, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::scan::{scan_row_schema, StatsOptions};
+use delta_kernel::schema::{schema_ref, DataType, MapType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
+use delta_kernel::{Engine, Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    begin_transaction, copy_directory, create_default_engine, create_default_engine_mt_executor,
-    load_and_begin_transaction, read_actions_from_commit, setup_test_tables,
+    assert_result_error_with_message, begin_transaction, copy_directory, create_default_engine,
+    create_default_engine_mt_executor, insert_data, load_and_begin_transaction,
+    read_actions_from_commit, setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -191,6 +194,79 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
         }
         _ => panic!("Transaction should be committed"),
     }
+
+    Ok(())
+}
+
+/// Verifies `extendedFileMetadata` is true exactly when `size`, `partitionValues`, and `tags`
+/// are all present.
+#[rstest::rstest]
+#[case::all_present(None)]
+#[case::missing_size(Some(ExtendedMetadataField::Size))]
+#[case::missing_partition_values(Some(ExtendedMetadataField::PartitionValues))]
+#[case::missing_tags(Some(ExtendedMetadataField::Tags))]
+#[tokio::test]
+async fn test_remove_scanned_file_sets_extended_metadata(
+    #[case] missing_field: Option<ExtendedMetadataField>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let schema = schema_ref! { nullable "number": INTEGER };
+
+    let snapshot = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snapshot = insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+
+    let scan = snapshot.clone().scan_builder().build()?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        txn.remove_files(with_missing_extended_metadata_field(
+            engine.as_ref(),
+            scan_metadata?.scan_files,
+            missing_field,
+        )?);
+    }
+    let commit_result = txn.commit(engine.as_ref());
+    if missing_field == Some(ExtendedMetadataField::Size) {
+        // TODO(#2717): The commit is materialized before post-commit validation returns this error,
+        // so the committed Remove action remains available for validation below.
+        assert_result_error_with_message(commit_result, "Data missing for field size");
+    } else {
+        commit_result?.unwrap_committed();
+    }
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
+    assert_eq!(remove_actions.len(), 1);
+    let remove = &remove_actions[0];
+    assert_eq!(remove["extendedFileMetadata"], missing_field.is_none());
+    if let Some(field) = missing_field {
+        assert!(remove.get(field.name()).is_none());
+    } else {
+        for field in ExtendedMetadataField::ALL {
+            assert!(remove.get(field.name()).is_some());
+        }
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let mut surviving_files = 0;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        surviving_files += scan_metadata?
+            .scan_files
+            .selection_vector()
+            .iter()
+            .filter(|selected| **selected)
+            .count();
+    }
+    assert_eq!(surviving_files, 0);
 
     Ok(())
 }
@@ -813,6 +889,60 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtendedMetadataField {
+    Size,
+    PartitionValues,
+    Tags,
+}
+
+impl ExtendedMetadataField {
+    const ALL: [Self; 3] = [Self::Size, Self::PartitionValues, Self::Tags];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::PartitionValues => "partitionValues",
+            Self::Tags => "tags",
+        }
+    }
+}
+
+fn with_missing_extended_metadata_field(
+    engine: &dyn Engine,
+    scan_files: FilteredEngineData,
+    missing_field: Option<ExtendedMetadataField>,
+) -> Result<FilteredEngineData, Box<dyn std::error::Error>> {
+    let (data, selection_vector) = scan_files.into_parts();
+    let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let tags = if missing_field == Some(ExtendedMetadataField::Tags) {
+        Scalar::Null(DataType::from(map_type.clone()))
+    } else {
+        Scalar::Map(MapData::try_new(map_type.clone(), [("key", "value")])?)
+    };
+    let mut patch =
+        ExpressionStructPatchBuilder::new().replace_at(["fileConstantValues"], "tags", lit(tags));
+    if let Some(field) = missing_field {
+        patch = match field {
+            ExtendedMetadataField::Size => patch.replace("size", lit(Scalar::Null(DataType::LONG))),
+            ExtendedMetadataField::PartitionValues => patch.replace_at(
+                ["fileConstantValues"],
+                field.name(),
+                lit(Scalar::Null(DataType::from(map_type))),
+            ),
+            ExtendedMetadataField::Tags => patch,
+        };
+    }
+    let schema = scan_row_schema();
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        schema.clone(),
+        Arc::new(Expr::struct_patch(patch)?),
+        schema.into(),
+    )?;
+    let data = evaluator.evaluate(data.as_ref())?;
+    Ok(FilteredEngineData::try_new(data, selection_vector)?)
 }
 
 #[tokio::test]

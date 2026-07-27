@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
-    IntoEngineData, RowVisitor, Version,
+    IntoEngineData, Predicate, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -1551,13 +1551,18 @@ fn build_remove_struct_patch(
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
 ) -> DeltaResult<ExpressionStructPatch> {
+    let extended_file_metadata = Predicate::and_from([
+        col!("size").is_not_null(),
+        col!(FILE_CONSTANT_VALUES_NAME, "partitionValues").is_not_null(),
+        col!(FILE_CONSTANT_VALUES_NAME, TAGS_NAME).is_not_null(),
+    ]);
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
         .insert_after("path", lit(commit_timestamp))
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .insert_after("path", lit(true))
+        .insert_after("path", Expression::from(extended_file_metadata))
         .insert_after("path", col!(FILE_CONSTANT_VALUES_NAME, "partitionValues"));
 
     if coalesce_stats_with_parsed {
