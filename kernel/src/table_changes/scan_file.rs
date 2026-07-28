@@ -501,7 +501,7 @@ mod tests {
     use crate::table_changes::CdfMode;
     use crate::table_configuration::TableConfiguration;
     use crate::table_properties::{COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED};
-    use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+    use crate::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
     use crate::Engine as _;
 
     fn row_tracking_add(

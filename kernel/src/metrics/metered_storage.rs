@@ -94,7 +94,7 @@ mod tests {
 
     use super::*;
     use crate::metrics::MetricEvent;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     /// Storage handler that returns N preconfigured FileMeta / byte slices.
     #[derive(Debug)]

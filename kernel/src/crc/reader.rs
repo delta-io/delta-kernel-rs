@@ -55,7 +55,7 @@ mod tests {
     use crate::metrics::MetricEvent;
     use crate::path::ParsedLogPath;
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     fn test_table_root(dir: &str) -> url::Url {
         let path = std::fs::canonicalize(PathBuf::from(dir)).unwrap();

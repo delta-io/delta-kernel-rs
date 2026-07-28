@@ -392,7 +392,7 @@ mod apply_schema_validation_tests {
     };
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
-    use crate::utils::test_utils::{
+    use crate::test_utils::{
         array_in_map_arrow_data_without_field_ids, array_in_map_kernel_schema,
         array_in_map_with_field_ids, assert_result_error_with_message,
         collect_arrow_field_metadata, complex_nested_with_field_ids,

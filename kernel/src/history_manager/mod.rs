@@ -912,7 +912,7 @@ mod tests {
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{Action, LocalMockTable};
+    use crate::test_utils::{Action, LocalMockTable};
     use crate::utils::FoldWithOption as _;
     use crate::Version;
 

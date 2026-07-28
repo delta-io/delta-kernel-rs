@@ -2379,7 +2379,7 @@ mod scan_metadata_completed_tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
 

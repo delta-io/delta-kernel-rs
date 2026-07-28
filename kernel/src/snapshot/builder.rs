@@ -473,7 +473,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
 
     fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {

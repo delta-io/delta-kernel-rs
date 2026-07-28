@@ -216,7 +216,7 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::load_test_table;
+    use crate::test_utils::load_test_table;
 
     /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
     /// performs.
@@ -408,7 +408,7 @@ mod tests {
     fn segment_with_empty_sidecars_hint(extension: &str) -> LogSegment {
         use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
         use crate::log_segment_files::LogSegmentFiles;
-        use crate::utils::test_utils::{create_log_path, create_log_path_with_size};
+        use crate::test_utils::{create_log_path, create_log_path_with_size};
 
         let (_store, log_root) = crate::checkpoint::tests::new_in_memory_store();
         let selected = format!(

@@ -2732,7 +2732,7 @@ mod tests {
 
     use super::*;
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::{
+    use crate::test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };

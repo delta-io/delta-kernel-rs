@@ -15,7 +15,7 @@ use crate::scan::state_info::StateInfo;
 use crate::scan::transform_spec::TransformSpec;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::utils::test_utils::string_array_to_engine_data;
+use crate::test_utils::string_array_to_engine_data;
 use crate::JsonHandler;
 
 // Preserve schema-projected null columns because batch equality checks include them.

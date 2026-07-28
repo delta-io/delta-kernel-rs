@@ -207,7 +207,7 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 mod tests {
     use super::*;
     use crate::scan::AfterSequentialScanMetadata;
-    use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
+    use crate::test_utils::{assert_result_error_with_message, load_test_table};
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
     fn verify_sequential_processing(

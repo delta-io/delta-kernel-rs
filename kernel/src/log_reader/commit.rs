@@ -62,7 +62,7 @@ mod tests {
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::scan::COMMIT_READ_SCHEMA;
-    use crate::utils::test_utils::load_test_table;
+    use crate::test_utils::load_test_table;
 
     #[test]
     fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {

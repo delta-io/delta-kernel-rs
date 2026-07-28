@@ -98,7 +98,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
-    use crate::utils::test_utils::parse_json_batch;
+    use crate::test_utils::parse_json_batch;
     use crate::Snapshot;
 
     fn get_latest_transactions(

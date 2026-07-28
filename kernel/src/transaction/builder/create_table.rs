@@ -987,10 +987,8 @@ mod tests {
         COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
         PARQUET_FORMAT_VERSION,
     };
+    use crate::test_utils::{assert_result_error_with_message, build_complex_nested_kernel_schema};
     use crate::transforms::SchemaTransform;
-    use crate::utils::test_utils::{
-        assert_result_error_with_message, build_complex_nested_kernel_schema,
-    };
 
     fn test_schema() -> SchemaRef {
         schema_ref! { not_null "id": INTEGER }

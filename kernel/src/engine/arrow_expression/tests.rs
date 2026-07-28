@@ -28,9 +28,9 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
-use crate::utils::test_utils::assert_result_error_with_message;
+use crate::test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
-use crate::utils::test_utils::{geography_type, geometry_type};
+use crate::test_utils::{geography_type, geometry_type};
 use crate::EvaluationHandlerExtension as _;
 
 #[test]

@@ -94,7 +94,7 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::ColumnName;
-    use crate::utils::test_utils::{assert_result_error_with_message, create_valid_add_file_batch};
+    use crate::test_utils::{assert_result_error_with_message, create_valid_add_file_batch};
     use crate::EngineData;
 
     /// Builds one valid add-file row with a fully nullable schema.

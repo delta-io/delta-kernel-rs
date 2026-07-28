@@ -670,13 +670,13 @@ mod tests {
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
         StructType,
     };
-    use crate::transforms::{transform_output_type, SchemaTransform};
-    use crate::utils::test_utils::{
+    use crate::test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
         complex_nested_with_field_ids,
     };
     #[cfg(feature = "geo-type-in-dev")]
-    use crate::utils::test_utils::{geography_type, geometry_type};
+    use crate::test_utils::{geography_type, geometry_type};
+    use crate::transforms::{transform_output_type, SchemaTransform};
     use crate::DeltaResult;
 
     #[cfg(feature = "geo-type-in-dev")]

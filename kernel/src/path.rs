@@ -525,7 +525,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::test_utils::assert_result_error_with_message;
 
     impl ParsedLogPath<FileMeta> {
         pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {

@@ -503,7 +503,7 @@ mod tests {
     use crate::scan::state_info::tests::get_state_info_with_options;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
-    use crate::utils::test_utils::create_log_path;
+    use crate::test_utils::create_log_path;
     use crate::Engine as _;
 
     fn state(

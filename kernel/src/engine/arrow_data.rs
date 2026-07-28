@@ -553,7 +553,7 @@ mod tests {
     use crate::expressions::ArrayData;
     use crate::schema::{schema_ref, ArrayType, ColumnName, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
 
     #[test]

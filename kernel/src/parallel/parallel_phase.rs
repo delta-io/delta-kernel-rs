@@ -149,7 +149,7 @@ mod tests {
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::{ScanBuilder, StatsOptions};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{
+    use crate::test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
     use crate::utils::FoldWithOption as _;

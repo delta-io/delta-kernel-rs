@@ -690,7 +690,7 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::StringArray;
-    use crate::utils::test_utils::{action_batch, parse_json_batch};
+    use crate::test_utils::{action_batch, parse_json_batch};
     use crate::Error;
 
     /// Helper function to create test batches from JSON strings

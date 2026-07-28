@@ -94,7 +94,7 @@ mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
     use crate::metrics::MetricEvent;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::{DeltaResult, FileMeta, FileSlice};
 
     /// Minimal storage handler used in tests: returns N preconfigured FileMeta items.
