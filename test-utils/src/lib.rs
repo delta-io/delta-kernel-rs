@@ -172,7 +172,7 @@ use delta_kernel::actions::{
 };
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
-    RecordBatch, StringArray, StructArray,
+    MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{
@@ -509,6 +509,71 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
     ArrowEngineData::try_from_engine_data(engine_data)
         .unwrap()
         .into()
+}
+
+/// A modification to an add-file batch's `partitionValues` keys.
+#[derive(Clone, Copy)]
+pub enum AddFilePartitionKeyModify<'a> {
+    Drop {
+        key: &'a str,
+    },
+    Insert {
+        key: &'a str,
+        value: Option<&'a str>,
+    },
+}
+
+pub fn modify_add_file_partition_keys(
+    batch: RecordBatch,
+    modifications: &[AddFilePartitionKeyModify<'_>],
+) -> RecordBatch {
+    assert_eq!(batch.num_rows(), 1, "add-file batch must contain one row");
+    let index = batch
+        .schema()
+        .index_of("partitionValues")
+        .expect("partitionValues field in add-file batch");
+    let map = batch.column(index).as_map();
+    let entries = map.entries();
+    let keys = entries.column(0).as_string::<i32>();
+    let values = entries.column(1).as_string::<i32>();
+    let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
+        .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
+        .collect();
+    for modification in modifications {
+        match *modification {
+            AddFilePartitionKeyModify::Drop { key } => {
+                partition_values.retain(|(existing_key, _)| *existing_key != key);
+            }
+            AddFilePartitionKeyModify::Insert { key, value } => {
+                partition_values.push((key, value));
+            }
+        }
+    }
+
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for (key, value) in partition_values {
+        builder.keys().append_value(key);
+        match value {
+            Some(v) => builder.values().append_value(v),
+            None => builder.values().append_null(),
+        }
+    }
+    builder
+        .append(true)
+        .expect("failed to append partition-values map row");
+    let new_map: ArrayRef = Arc::new(builder.finish());
+
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields[index] = Field::new("partitionValues", new_map.data_type().clone(), true);
+    let mut columns = batch.columns().to_vec();
+    columns[index] = new_map;
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+        .expect("failed to rebuild add-file batch after modifying a partition key")
 }
 
 /// Helper to create a DefaultEngine with the default executor for tests.

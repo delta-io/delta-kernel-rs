@@ -4,10 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray as _, Int32Array, MapBuilder, StringArray,
-    StringBuilder,
-};
+use delta_kernel::arrow::array::{new_null_array, Int32Array, StringArray};
 use delta_kernel::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -28,7 +25,8 @@ use rstest::rstest;
 use serde_json::{json, Deserializer};
 use test_utils::{
     assert_result_error_with_message, into_record_batch, load_and_begin_transaction,
-    set_json_value, setup_test_tables, test_read,
+    modify_add_file_partition_keys, set_json_value, setup_test_tables, test_read,
+    AddFilePartitionKeyModify,
 };
 
 use crate::common::write_utils::{
@@ -448,27 +446,27 @@ async fn commit_rejects_add_missing_required_field() -> Result<(), Box<dyn std::
 #[case::missing(None, &[AddFilePartitionKeyModify::Drop { key: "p2" }])]
 #[case::extra(None, &[AddFilePartitionKeyModify::Insert {
     key: "p3",
-    value: "extra",
+    value: Some("extra"),
 }])]
 #[case::incorrect_name(None, &[
     AddFilePartitionKeyModify::Drop { key: "p2" },
     AddFilePartitionKeyModify::Insert {
         key: "partition_2",
-        value: "6",
+        value: Some("6"),
     },
 ])]
 #[case::logical_partition_name_when_cm_name_mode(
     Some("name"),
     &[
         AddFilePartitionKeyModify::Drop { key: "p2" },
-        AddFilePartitionKeyModify::Insert { key: "p2", value: "6" },
+        AddFilePartitionKeyModify::Insert { key: "p2", value: Some("6") },
     ],
 )]
 #[case::logical_partition_name_when_cm_id_mode(
     Some("id"),
     &[
         AddFilePartitionKeyModify::Drop { key: "p2" },
-        AddFilePartitionKeyModify::Insert { key: "p2", value: "6" },
+        AddFilePartitionKeyModify::Insert { key: "p2", value: Some("6") },
     ],
 )]
 #[tokio::test(flavor = "multi_thread")]
@@ -538,63 +536,4 @@ async fn commit_rejects_add_with_invalid_partition_keys(
     txn.add_files(Box::new(ArrowEngineData::new(corrupted)));
     assert_result_error_with_message(txn.commit(engine.as_ref()), "partitionValues keys");
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum AddFilePartitionKeyModify<'a> {
-    Drop { key: &'a str },
-    Insert { key: &'a str, value: &'a str },
-}
-
-/// Rebuilds `batch` after applying the partition-key modifications.
-fn modify_add_file_partition_keys(
-    batch: RecordBatch,
-    modifications: &[AddFilePartitionKeyModify<'_>],
-) -> RecordBatch {
-    let index = batch
-        .schema()
-        .index_of("partitionValues")
-        .expect("partitionValues field in add-file batch");
-    let map = batch.column(index).as_map();
-    let entries = map.entries();
-    let keys = entries.column(0).as_string::<i32>();
-    let values = entries.column(1).as_string::<i32>();
-    let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
-        .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
-        .collect();
-    for modification in modifications {
-        match *modification {
-            AddFilePartitionKeyModify::Drop { key } => {
-                partition_values.retain(|(existing_key, _)| *existing_key != key);
-            }
-            AddFilePartitionKeyModify::Insert { key, value } => {
-                partition_values.push((key, Some(value)));
-            }
-        }
-    }
-
-    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-    for (key, value) in partition_values {
-        builder.keys().append_value(key);
-        match value {
-            Some(v) => builder.values().append_value(v),
-            None => builder.values().append_null(),
-        }
-    }
-    builder
-        .append(true)
-        .expect("failed to append partition-values map row");
-    let new_map: ArrayRef = Arc::new(builder.finish());
-
-    let mut fields: Vec<ArrowField> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect();
-    fields[index] = ArrowField::new("partitionValues", new_map.data_type().clone(), true);
-    let mut columns = batch.columns().to_vec();
-    columns[index] = new_map;
-    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
-        .expect("failed to rebuild add-file batch after modifying a partition key")
 }
