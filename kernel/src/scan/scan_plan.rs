@@ -122,6 +122,12 @@ impl Scan {
 
     /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
     ///
+    /// `CheckpointShape` selects exactly one stats source: compatible checkpoints use native
+    /// `stats_parsed`; all other checkpoints parse `stats`.
+    ///
+    /// `CheckpointShape` selects exactly one stats source: compatible checkpoints use native
+    /// `stats_parsed`; all other checkpoints parse `stats`.
+    ///
     /// ## SQL equivalent:
     //
     /// SELECT STRUCT(

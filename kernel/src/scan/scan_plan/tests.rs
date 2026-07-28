@@ -282,6 +282,35 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
 }
 
 #[rstest]
+#[case::compatible("v2-parquet-sidecars-struct-stats-only", true)]
+#[case::incompatible("v2-checkpoints-parquet-with-sidecars", false)]
+fn declarative_checkpoint_reads_native_stats_only_when_shape_confirms(
+    #[case] table: &str,
+    #[case] expected: bool,
+) -> DeltaResult<()> {
+    let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table(table)?;
+    let plan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .build()?
+        .declarative_metadata_scan_plan(engine.as_ref())?
+        .expect("metadata plan");
+
+    let checkpoint_scans = Vec::from_iter(plan.nodes.iter().filter_map(|node| match &node.op {
+        Operator::ScanParquet(scan) if scan.schema.field(ADD_NAME).is_some() => Some(scan),
+        _ => None,
+    }));
+    assert!(!checkpoint_scans.is_empty());
+    assert!(checkpoint_scans.iter().all(|scan| {
+        scan.schema
+            .field_at(&column_name!("add.stats_parsed"))
+            .is_ok()
+            == expected
+    }));
+    Ok(())
+}
+
+#[rstest]
 #[case::json_only(StatsOptions::json_only(), &[JSON_STATS_FIELDS])]
 #[case::all_struct(StatsOptions::all_struct(), &[PARSED_STATS_TABLE_ALL_STATS_FIELDS])]
 #[case::struct_columns(
