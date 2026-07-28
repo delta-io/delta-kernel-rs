@@ -2025,6 +2025,31 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_action_projection_sets_extended_metadata() -> DeltaResult<()> {
+        let patch = build_remove_struct_patch(
+            0,     /* commit_timestamp */
+            true,  /* data_change */
+            &[],   /* columns_to_drop */
+            false, /* coalesce_stats_with_parsed */
+        )?;
+        let path_patch = patch
+            .field_patches
+            .get("path")
+            .expect("path should have inserted fields");
+        let extended_file_metadata = path_patch
+            .insertions
+            .get(2)
+            .expect("extendedFileMetadata should follow deletionTimestamp and dataChange");
+        let expected = Expression::from_pred(Predicate::and_from([
+            col!("size").is_not_null(),
+            col!(FILE_CONSTANT_VALUES_NAME, "partitionValues").is_not_null(),
+            col!(FILE_CONSTANT_VALUES_NAME, TAGS_NAME).is_not_null(),
+        ]));
+        assert_eq!(extended_file_metadata.as_ref(), &expected);
+        Ok(())
+    }
+
+    #[test]
     fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
