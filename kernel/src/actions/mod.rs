@@ -602,34 +602,35 @@ impl Protocol {
                 // Check all reader features are ReaderWriter and present in writer features.
                 // Unknown features are treated as potentially ReaderWriter for forward
                 // compatibility.
-                let check_r = reader_features.iter().all(|feature| {
-                    matches!(
+                if let Some(offending) = reader_features.iter().find(|feature| {
+                    !matches!(
                         feature.feature_type(),
                         FeatureType::ReaderWriter | FeatureType::Unknown
-                    ) && writer_features.contains(feature)
-                });
-                require!(
-                    check_r,
-                    Error::invalid_protocol(
-                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
-                    )
-                );
+                    ) || !writer_features.contains(*feature)
+                }) {
+                    return Err(Error::invalid_protocol(format!(
+                        "Reader features must contain only ReaderWriter features that are also \
+                         listed in writer features, but {offending:?} is not \
+                         (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
+                         minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
+                    )));
+                }
 
                 // Check all writer features that are ReaderWriter must also be in reader features
                 // Unknown features are treated as potentially Writer-only for forward
                 // compatibility.
-                let check_w = writer_features
-                    .iter()
-                    .all(|feature| match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
-                        FeatureType::ReaderWriter => reader_features.contains(feature),
-                    });
-                require!(
-                    check_w,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
+                if let Some(offending) = writer_features.iter().find(|feature| {
+                    matches!(feature.feature_type(), FeatureType::ReaderWriter)
+                        && !reader_features.contains(*feature)
+                }) {
+                    return Err(Error::invalid_protocol(format!(
+                        "Writer features must be Writer-only or also listed in reader features, \
+                         but ReaderWriter feature {offending:?} is listed in writerFeatures and \
+                         missing from readerFeatures \
+                         (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
+                         minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
+                    )));
+                }
                 Ok(())
             }
             (None, None) => Ok(()),
@@ -638,22 +639,23 @@ impl Protocol {
                 // All other ReaderWriter features require explicit reader_features list (reader
                 // version 3). Unknown features are treated as potentially
                 // Writer-only for forward compatibility.
-                let is_valid = writer_features.iter().all(|feature| {
+                if let Some(offending) = writer_features.iter().find(|feature| {
                     match feature.feature_type() {
-                        FeatureType::WriterOnly | FeatureType::Unknown => true,
+                        FeatureType::WriterOnly | FeatureType::Unknown => false,
                         FeatureType::ReaderWriter => {
                             // ColumnMapping is allowed when reader version is 2 (implied support)
-                            min_reader_version == 2 && feature == &TableFeature::ColumnMapping
+                            !(min_reader_version == 2 && *feature == &TableFeature::ColumnMapping)
                         }
                     }
-                });
-
-                require!(
-                    is_valid,
-                    Error::invalid_protocol(
-                        "Writer features must be Writer-only or also listed in reader features"
-                    )
-                );
+                }) {
+                    return Err(Error::invalid_protocol(format!(
+                        "Writer features must be Writer-only or also listed in reader features, \
+                         but ReaderWriter feature {offending:?} is listed in writerFeatures with \
+                         no reader features present \
+                         (writerFeatures={writer_features:?}, minReaderVersion={min_reader_version}, \
+                         minWriterVersion={min_writer_version})"
+                    )));
+                }
                 Ok(())
             }
             (Some(_), None) => Err(Error::invalid_protocol(
@@ -1588,12 +1590,14 @@ mod tests {
 
         for (reader_features, writer_features, error_msg) in invalid_features {
             let res = Protocol::try_new_modern(reader_features, writer_features);
+            // The error message is enriched with the offending feature and the parsed
+            // feature lists, so match on a prefix rather than the whole string.
             assert!(
                 matches!(
                     &res,
-                    Err(Error::InvalidProtocol(error)) if error.to_string().eq(error_msg)
+                    Err(Error::InvalidProtocol(error)) if error.to_string().contains(error_msg)
                 ),
-                "Expected:\t{error_msg}\nBut got:{res:?}\n"
+                "Expected message containing:\t{error_msg}\nBut got:{res:?}\n"
             );
         }
     }
