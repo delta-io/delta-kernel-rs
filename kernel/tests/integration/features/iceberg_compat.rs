@@ -160,10 +160,11 @@ async fn v3_commit_validates_num_records(
         .unwrap();
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())
-        .unwrap()
+        .transaction()
         .with_engine_info("Test/1.0")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap();
     let add_files = create_add_files_metadata(
         txn.add_files_schema(),
         vec![("part-fake.parquet", 1024, 1_000_000, num_records)],

@@ -140,7 +140,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
 }
 
 /// Sets the correlation id on the `Transaction` returned by `build()` and checks it reaches the
-/// commit metric event. The two tests below instead set it on the builder.
+/// commit metric event. The tests below instead set it on the update, create, and alter builders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
@@ -222,6 +222,50 @@ async fn alter_table_builder_carries_correlation_id(
     }
     builder
         .add_column(StructField::nullable("extra", DataType::STRING))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let success = reporter.take_success();
+    assert_eq!(success.commit_version, 1);
+    assert_eq!(success.correlation_id.as_deref(), expected);
+    Ok(())
+}
+
+/// A correlation id set on the update-table *builder* (`Snapshot::transaction()`) reaches the
+/// commit metric event, and an empty id is treated as unset. This pins the `Option<Arc<str>>`
+/// staging on the builder threading through `build()`, since the empty-id normalization lives on
+/// the underlying `Transaction` setter that `build()` delegates to.
+#[rstest]
+#[case::with_id(Some("update-req-1"), Some("update-req-1"))]
+#[case::without_id(None, None)]
+#[case::empty_id_is_unset(Some(""), None)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_table_builder_carries_correlation_id(
+    #[case] correlation_id: Option<&str>,
+    #[case] expected: Option<&str>,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    create_table(&table_path, simple_schema(), "Test/1.0")
+        .with_table_properties([("delta.feature.domainMetadata", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    // Install the reporter after the create commit so the captured event is the update commit.
+    let reporter = Arc::new(LastCommitSuccess::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let mut builder = snapshot
+        .transaction()
+        .with_operation("WRITE".to_string())
+        .with_domain_metadata("app.settings".to_string(), r#"{"v":1}"#.to_string());
+    if let Some(id) = correlation_id {
+        builder = builder.with_correlation_id(id);
+    }
+    builder
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
         .commit(engine.as_ref())?
         .unwrap_committed();

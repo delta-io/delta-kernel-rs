@@ -1448,9 +1448,10 @@ async fn write_data_commit<E: TaskExecutor>(
         .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
     let mut txn = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), engine)?
+        .transaction()
         .with_operation("WRITE".to_string())
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(engine, Box::new(FileSystemCommitter::new()))?;
 
     let partition_set: HashSet<&str> = partition_columns.iter().map(String::as_str).collect();
 

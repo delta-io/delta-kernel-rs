@@ -61,8 +61,9 @@ let committer = Box::new(MyCatalogCommitter::new(
     table_id.clone(),
 ));
 let mut txn = snapshot
-    .transaction(committer, &engine)?
-    .with_operation("INSERT".to_string());
+    .transaction()
+    .with_operation("INSERT".to_string())
+    .build(&engine, committer)?;
 
 // Drive your Parquet writer from the write context, then hand the resulting
 // add-file metadata batch to the transaction. See the

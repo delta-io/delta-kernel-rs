@@ -91,7 +91,7 @@ From a snapshot, you can:
 |-----------|-----------|-------------------------------|
 | Get schema and metadata | `snapshot.schema()`, `snapshot.table_properties()` | Table schema discovery |
 | Read data | `snapshot.scan_builder()` | Scan / PartitionReader |
-| Write data | `snapshot.transaction(committer, &engine)` | Writer / Committer |
+| Write data | `snapshot.transaction().build(&engine, committer)` | Writer / Committer |
 | Checkpoint | `snapshot.create_checkpoint_writer(&engine)` | Maintenance task |
 
 ## What your connector does vs. what Kernel does

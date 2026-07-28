@@ -120,14 +120,27 @@ impl Transaction {
     ///
     /// Blind append transactions should only add new files and avoid write operations that
     /// depend on existing table state.
-    pub fn with_blind_append(mut self) -> Self {
+    ///
+    /// Staged via [`UpdateTableTransactionBuilder::with_blind_append`] and applied here during
+    /// [`build`]; not part of the public transaction API.
+    ///
+    /// [`UpdateTableTransactionBuilder::with_blind_append`]: super::builder::update_table::UpdateTableTransactionBuilder::with_blind_append
+    /// [`build`]: super::builder::update_table::UpdateTableTransactionBuilder::build
+    #[internal_api]
+    pub(crate) fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
         self
     }
 
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
+    ///
+    /// Staged via [`UpdateTableTransactionBuilder::with_operation`] and applied during [`build`].
+    ///
+    /// [`UpdateTableTransactionBuilder::with_operation`]: super::builder::update_table::UpdateTableTransactionBuilder::with_operation
+    /// [`build`]: super::builder::update_table::UpdateTableTransactionBuilder::build
+    #[internal_api]
+    pub(crate) fn with_operation(mut self, operation: String) -> Self {
         self.operation = Some(operation);
         self
     }
@@ -141,7 +154,14 @@ impl Transaction {
     /// the same domain in a single transaction. If a duplicate domain is included, the `commit`
     /// will fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
-    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+    ///
+    /// Staged via [`UpdateTableTransactionBuilder::with_domain_metadata_removed`] and applied
+    /// during [`build`].
+    ///
+    /// [`UpdateTableTransactionBuilder::with_domain_metadata_removed`]: super::builder::update_table::UpdateTableTransactionBuilder::with_domain_metadata_removed
+    /// [`build`]: super::builder::update_table::UpdateTableTransactionBuilder::build
+    #[internal_api]
+    pub(crate) fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
     }
@@ -165,7 +185,7 @@ impl Transaction {
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    /// let mut txn = snapshot.clone().transaction().build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -246,8 +266,9 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?
-    ///     .with_operation("UPDATE".to_string());
+    /// let mut txn = snapshot.clone().transaction()
+    ///     .with_operation("UPDATE".to_string())
+    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?
