@@ -530,7 +530,7 @@ impl StatsAccumulator {
 ///
 /// Collect statistics using the kernel physical schema to preserve logical type distinctions that
 /// are erased in Arrow arrays.
-pub(crate) fn collect_stats(
+pub fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
     physical_schema: &StructType,

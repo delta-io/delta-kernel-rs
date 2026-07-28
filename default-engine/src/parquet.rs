@@ -56,7 +56,7 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 /// Metadata of a data file (typically a parquet file).
 #[derive(Debug)]
 pub struct DataFileMetadata {
-    file_meta: FileMeta,
+    pub file_meta: FileMeta,
     /// Collected statistics for this file (includes numRecords, tightBounds, etc.).
     stats: StructArray,
 }
