@@ -7,9 +7,9 @@
 //!
 //! ```ignore
 //! // Step 1: Get staging info from UC
-//! let staging_info: CreateStagingTableResponse = my_uc_client.post_staging_table(..).await?;
+//! let staging_info = my_uc_client.post_staging_table(..).await?;
 //!
-//! // Step 2: Build and commit the create-table transaction.
+//! // Step 2: Build and commit the create-table transaction
 //! let disk_props = get_required_properties_for_disk(&staging_info.table_id);
 //! let create_table_txn = kernel::create_table(path, schema, "MyApp/1.0")
 //!     .with_table_properties(disk_props)
@@ -38,7 +38,8 @@ use crate::constants::{
     VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
 };
 
-/// Convert a kernel `Protocol` into the api crate's wire `Protocol`.
+/// Convert a kernel `Protocol` into the api crate's wire `Protocol`. The api crate is kernel-free,
+/// so it defines its own serializable transport type rather than reusing `delta_kernel::Protocol`.
 fn to_wire_protocol(protocol: &Protocol) -> WireProtocol {
     WireProtocol {
         min_reader_version: protocol.min_reader_version(),
@@ -65,9 +66,10 @@ fn to_wire_protocol(protocol: &Protocol) -> WireProtocol {
 /// catalog-managed. Note: ICT enablement is handled automatically by kernel's CREATE TABLE
 /// when the `catalogManaged` feature is present.
 ///
-/// TODO: this hardcodes the required table features and properties. The create table flow should
-/// instead derive them from the `createStagingTable` response's advertised `required_protocol` and
-/// `required_properties`, so it stays correct if UC changes what it requires.
+/// TODO(delta-io/delta#7179): this hardcodes the required table features and properties. The create
+/// table flow should instead derive them from the `createStagingTable` response's advertised
+/// `required_protocol` and `required_properties`, so it stays correct if UC changes what it
+/// requires.
 pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, String> {
     [
         (CATALOG_MANAGED_FEATURE_KEY, FEATURE_SUPPORTED),
@@ -88,8 +90,11 @@ pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, St
 /// `get_table_credentials`) into `object_store` option keys, for building an engine over the
 /// table's storage.
 ///
-/// TODO: only AWS S3 is handled today. Generalize to GCS (`gcs.*`) and Azure (`azure.*`), which
-/// need their own `object_store` key mappings.
+/// This is a convenience over the public `store_from_url_opts`: connectors can build a store
+/// themselves by passing option keys directly. It only translates S3's key names today.
+///
+/// TODO(#3016): also translate GCS (`gcs.*`) and Azure (`azure.*`) credential keys so connectors
+/// don't each re-derive the mapping.
 pub fn aws_object_store_options(
     creds: &[StorageCredential],
     region: &str,
