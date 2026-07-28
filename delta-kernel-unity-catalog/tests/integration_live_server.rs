@@ -4,7 +4,7 @@
 //! normal `cargo nextest`. Even with the feature enabled, each test skips (passes as a no-op) when
 //! `UC_SERVER_URL` is unset, so a developer can build the suite without a server on hand.
 //!
-//! Run against a local UC OSS server:
+//! Run against a local UC server:
 //! ```bash
 //! UC_SERVER_URL=http://localhost:8080 UC_TOKEN=not-used \
 //!   cargo nextest run -p delta-kernel-unity-catalog --features integration-test
@@ -13,14 +13,12 @@
 //! Optional overrides for the read-path test: `UC_TEST_CATALOG`, `UC_TEST_SCHEMA`,
 //! `UC_TEST_TABLE` (the read test skips unless `UC_TEST_TABLE` is set).
 //!
-//! The mutating CREATE test (`live_create_table`) is double-gated: it requires `UC_CREATE=1` (and
-//! also skips with an eprintln otherwise). Point it only at throwaway tables/schemas.
+//! The CREATE test (`live_create_table`) mutates the catalog, so point `UC_SERVER_URL` only at a
+//! throwaway server or schema.
 //!
-//! UC does no validation of the createTable payload against the committed log. These tests prove
-//! the RPCs round-trip, not that the values we send are correct.
+//! These tests prove the RPCs round-trip, not that the payloads are semantically correct.
 #![cfg(feature = "integration-test")]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
@@ -33,14 +31,14 @@ use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::storage::store_from_url_opts;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel_unity_catalog::{
-    build_uc_create_table_request, log_tail_from_commits, UCCommitter,
+    aws_object_store_options, build_uc_create_table_request, get_required_properties_for_disk,
+    log_tail_from_commits, snapshot_builder_from_load_table, UCCommitter,
 };
 use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
-    CreateStagingTableRequest, CreateStagingTableResponse, LoadTableResponse, StorageCredential,
-    TableName,
+    CreateStagingTableRequest, CreateStagingTableResponse, LoadTableResponse, TableIdentifier,
 };
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 use url::Url;
 
 /// Returns `(server_url, token)` from the environment, or `None` to signal the caller to skip.
@@ -107,30 +105,6 @@ fn raw_delta_rest_client(url: &str, token: &str) -> (Url, reqwest::Client) {
     (base, http)
 }
 
-/// Maps vended storage credentials into `object_store` option keys so the table's cloud store can
-/// be constructed. Currently handles the AWS S3 credential keys; pass-through for anything else
-/// (e.g. region), plus a `UC_AWS_REGION` fallback since vended creds may omit the region. Used by
-/// the CREATE path (`CreateStagingTableResponse.storage_credentials`).
-fn object_store_options(creds: &[StorageCredential]) -> HashMap<String, String> {
-    let mut opts = HashMap::new();
-    for cred in creds {
-        for (key, value) in &cred.config {
-            let mapped = match key.as_str() {
-                "s3.access-key-id" => "access_key_id",
-                "s3.secret-access-key" => "secret_access_key",
-                "s3.session-token" => "session_token",
-                // Pass keys we don't remap (e.g. region) through unchanged; intentional, test-only.
-                other => other,
-            };
-            opts.insert(mapped.to_string(), value.clone());
-        }
-    }
-    if let Ok(region) = std::env::var("UC_AWS_REGION") {
-        opts.insert("region".to_string(), region);
-    }
-    opts
-}
-
 /// Normalize a UC table location to a root URL ending in `/`. UC returns the location without a
 /// trailing slash, but staged-commit path resolution and snapshot building require one.
 fn normalize_table_root(table_url: &Url) -> Url {
@@ -141,25 +115,11 @@ fn normalize_table_root(table_url: &Url) -> Url {
     root
 }
 
-/// Builds a `Snapshot` from a `load_table` response: normalize the location, build the log tail
-/// from the inline commits, and pin the snapshot to the catalog's max version. Returns the
-/// normalized table root alongside the snapshot.
-fn snapshot_from_load_table(resp: &LoadTableResponse, engine: &dyn Engine) -> (Url, Arc<Snapshot>) {
-    let root = normalize_table_root(
-        &Url::parse(&resp.metadata.location).expect("location is not a valid URL"),
-    );
-    let max_version: u64 = resp
-        .latest_table_version
-        .unwrap_or(0)
-        .try_into()
-        .expect("latest_table_version does not fit u64");
-    let log_tail = log_tail_from_commits(&resp.commits, root.clone()).expect("log tail");
-    let snapshot = Snapshot::builder_for(root.clone())
-        .with_log_tail(log_tail)
-        .with_max_catalog_version(max_version)
+fn snapshot_from_load_table(resp: &LoadTableResponse, engine: &dyn Engine) -> Arc<Snapshot> {
+    snapshot_builder_from_load_table(resp)
+        .expect("build snapshot builder from load_table response")
         .build(engine)
-        .expect("failed to build snapshot from load_table response");
-    (root, snapshot)
+        .expect("build snapshot from load_table response")
 }
 
 /// `load_table` returns parseable metadata + commits, and the commits convert to a kernel log tail.
@@ -199,32 +159,6 @@ async fn live_load_table_builds_log_tail() {
     );
 }
 
-/// Translate the staging response's required protocol + properties into the table properties the v0
-/// create commit must carry. Each required protocol feature becomes
-/// `delta.feature.<name>=supported` so kernel enables it; required raw properties with concrete
-/// values pass through (a null value means "any value is acceptable").
-fn disk_properties_from_staging(resp: &CreateStagingTableResponse) -> HashMap<String, String> {
-    let mut props: HashMap<String, String> = resp
-        .required_protocol
-        .reader_features
-        .iter()
-        .chain(resp.required_protocol.writer_features.iter())
-        .map(|f| (format!("delta.feature.{f}"), "supported".to_string()))
-        .collect();
-    for (k, v) in &resp.required_properties {
-        // Skip properties kernel derives from the enabled features and forbids setting at CREATE
-        // (e.g. `delta.checkpointPolicy` is implied by `delta.feature.v2Checkpoint`).
-        if k == "delta.checkpointPolicy" {
-            continue;
-        }
-        if let Some(v) = v {
-            props.insert(k.clone(), v.clone());
-        }
-    }
-    props.insert("io.unitycatalog.tableId".to_string(), resp.table_id.clone());
-    props
-}
-
 /// Live CREATE through the full connector flow. The two CREATE endpoints (`staging-tables`,
 /// `tables`) are deliberately not in the REST client, so this test hand-rolls those POSTs with raw
 /// `reqwest` while using kernel for the v0 commit and the typed `tables` body. The inline
@@ -235,7 +169,7 @@ fn disk_properties_from_staging(resp: &CreateStagingTableResponse) -> HashMap<St
 /// is forwarded at create and advances to 2 after the append (the CTAS concern), and the clustering
 /// columns are forwarded under `delta.clustering`.
 ///
-/// This mutates the catalog, so it is double-gated: requires `UC_CREATE=1`. Uses a unique table
+/// This mutates the catalog, so point it only at a throwaway server or schema. Uses a unique table
 /// name and best-effort DELETEs before and after to keep reruns idempotent.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_create_table() {
@@ -243,10 +177,6 @@ async fn live_create_table() {
         eprintln!("UC_SERVER_URL unset; skipping live_create_table");
         return;
     };
-    if std::env::var("UC_CREATE").is_err() {
-        eprintln!("UC_CREATE unset; skipping mutating live_create_table");
-        return;
-    }
     let catalog = std::env::var("UC_TEST_CATALOG").unwrap_or_else(|_| "unity".to_string());
     let schema_name = std::env::var("UC_TEST_SCHEMA").unwrap_or_else(|_| "default".to_string());
     // Unique per run: a leftover table/staging-table from a prior run (best-effort cleanup can
@@ -295,11 +225,14 @@ async fn live_create_table() {
     // (c)/(d) Build the engine over the staging storage location.
     let table_root =
         normalize_table_root(&Url::parse(&resp.location).expect("location is not a valid URL"));
-    let store = store_from_url_opts(&table_root, object_store_options(&resp.storage_credentials))
-        .expect("failed to build object store from staging credentials");
+    let store = store_from_url_opts(
+        &table_root,
+        aws_object_store_options(&resp.storage_credentials, "us-east-1"),
+    )
+    .expect("failed to build object store from staging credentials");
     let engine = Arc::new(DefaultEngineBuilder::new(store).build());
 
-    // A server backed by local-FS storage (e.g. the OSS server in CI) allocates the table location
+    // A server backed by local-FS storage (e.g. the server in CI) allocates the table location
     // logically without creating the directory; kernel lists the table root during create-table and
     // `LocalFileSystem` errors on a missing path (a cloud object store returns empty). Create it
     // for file:// locations so the create-table build can proceed.
@@ -330,12 +263,12 @@ async fn live_create_table() {
     // (f)/(g) Commit v0 directly to storage via the UC committer (v0 path does not call the
     // catalog). Enable row tracking so the create body carries `delta.rowTracking`, and cluster on
     // `name` and the nested `address.city` so it carries `delta.clustering`.
-    let mut disk_props = disk_properties_from_staging(&resp);
+    let mut disk_props = get_required_properties_for_disk(&resp.table_id);
     disk_props.insert("delta.enableRowTracking".to_string(), "true".to_string());
     let committer = Box::new(UCCommitter::new(
         Arc::new(UCUpdateTableRestClient::new(client_config(&url, &token)).expect("update client")),
         resp.table_id.clone(),
-        TableName::new(catalog.clone(), schema_name.clone(), name.to_string()),
+        TableIdentifier::new(catalog.clone(), schema_name.clone(), name.to_string()),
     ));
     create_table(table_root.as_str(), schema, "delta-kernel-rs-live-test")
         .with_table_properties(disk_props)
@@ -364,7 +297,7 @@ async fn live_create_table() {
     );
 
     // (i)/(j) Build the typed create body and register the table.
-    let mut req = build_uc_create_table_request(&snapshot, engine.as_ref(), name)
+    let req = build_uc_create_table_request(&snapshot, engine.as_ref(), name)
         .expect("failed to build CreateTableRequest");
     // Empty create forwards the initial row-tracking watermark and the clustering columns.
     assert_eq!(
@@ -377,12 +310,18 @@ async fn live_create_table() {
     )
     .expect("clusteringColumns should deserialize");
     assert_eq!(clustering, vec![vec!["name"], vec!["address", "city"]]);
-    // The server requires `delta.checkpointPolicy=v2` in the create body for v2Checkpoint tables.
-    // The kernel does not write the companion `delta.checkpointPolicy` property when enabling the
-    // `v2Checkpoint` feature, so it is absent from the committed metadata. The connector supplies
-    // it here to satisfy the server contract.
-    req.properties
-        .insert("delta.checkpointPolicy".to_string(), "v2".to_string());
+    for (key, value) in [
+        ("delta.checkpoint.writeStatsAsStruct", "true"),
+        ("delta.checkpoint.writeStatsAsJson", "true"),
+        ("delta.enableDeletionVectors", "true"),
+        ("delta.checkpointPolicy", "v2"),
+    ] {
+        assert_eq!(
+            req.properties.get(key).map(String::as_str),
+            Some(value),
+            "{key} should be present in the create body"
+        );
+    }
     let req_json = serde_json::to_string_pretty(&req).expect("serialize CreateTableRequest");
     let create_resp = http
         .post(tables_base.join("tables").expect("tables URL"))
@@ -414,7 +353,7 @@ async fn live_create_table() {
         .load_table(&catalog, &schema_name, name)
         .await
         .expect("load_table before append failed");
-    let (_, snapshot) = snapshot_from_load_table(&pre, engine.as_ref());
+    let snapshot = snapshot_from_load_table(&pre, engine.as_ref());
 
     let id_col: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
     let name_col: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "z"]));
@@ -431,7 +370,7 @@ async fn live_create_table() {
     let append_committer = Box::new(UCCommitter::new(
         Arc::new(UCUpdateTableRestClient::new(client_config(&url, &token)).expect("update client")),
         resp.table_id.clone(),
-        TableName::new(catalog.clone(), schema_name.clone(), name.to_string()),
+        TableIdentifier::new(catalog.clone(), schema_name.clone(), name.to_string()),
     ));
     insert_data_with(
         snapshot,
@@ -450,7 +389,7 @@ async fn live_create_table() {
         .load_table(&catalog, &schema_name, name)
         .await
         .expect("load_table after append failed");
-    let (_, snapshot) = snapshot_from_load_table(&post, engine.as_ref());
+    let snapshot = snapshot_from_load_table(&post, engine.as_ref());
 
     // Appending 3 rows to a row-tracking table assigns IDs 0..=2, advancing the mark from -1 to 2.
     let row_tracking = snapshot

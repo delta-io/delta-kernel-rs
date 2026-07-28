@@ -177,10 +177,6 @@ async fn live_create_staging_table() {
         eprintln!("UC_SERVER_URL unset; skipping live_create_staging_table");
         return;
     };
-    if std::env::var("UC_CREATE").is_err() {
-        eprintln!("UC_CREATE unset; skipping mutating live_create_staging_table");
-        return;
-    }
     let catalog = std::env::var("UC_TEST_CATALOG").unwrap_or_else(|_| "unity".to_string());
     let schema = std::env::var("UC_TEST_SCHEMA").unwrap_or_else(|_| "default".to_string());
     let table = "delta_rest_client_staging_test";

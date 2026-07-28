@@ -26,11 +26,16 @@ use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
 use delta_kernel::{Engine, Snapshot};
-use unity_catalog_delta_client_api::{CreateTableRequest, Protocol as WireProtocol};
+use unity_catalog_delta_client_api::{
+    CreateTableRequest, Protocol as WireProtocol, StorageCredential,
+};
 
 use crate::constants::{
-    CATALOG_MANAGED_FEATURE_KEY, CLUSTERING_DOMAIN_NAME, FEATURE_SUPPORTED,
-    ROW_TRACKING_DOMAIN_NAME, UC_TABLE_ID_KEY, VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
+    CATALOG_MANAGED_FEATURE_KEY, CHECKPOINT_POLICY_KEY, CHECKPOINT_POLICY_V2,
+    CHECKPOINT_WRITE_STATS_AS_JSON_KEY, CHECKPOINT_WRITE_STATS_AS_STRUCT_KEY,
+    CLUSTERING_DOMAIN_NAME, CONFIG_TRUE, DELETION_VECTORS_FEATURE_KEY, ENABLE_DELETION_VECTORS_KEY,
+    FEATURE_SUPPORTED, ROW_TRACKING_DOMAIN_NAME, UC_TABLE_ID_KEY, V2_CHECKPOINT_FEATURE_KEY,
+    VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
 };
 
 /// Convert a kernel `Protocol` into the api crate's wire `Protocol`.
@@ -59,10 +64,19 @@ fn to_wire_protocol(protocol: &Protocol) -> WireProtocol {
 /// These properties must be persisted in the Delta log so that the table is recognized as
 /// catalog-managed. Note: ICT enablement is handled automatically by kernel's CREATE TABLE
 /// when the `catalogManaged` feature is present.
+///
+/// TODO: this hardcodes the required table features and properties. The create table flow should
+/// instead derive them from the `createStagingTable` response's advertised `required_protocol` and
+/// `required_properties`, so it stays correct if UC changes what it requires.
 pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, String> {
     [
         (CATALOG_MANAGED_FEATURE_KEY, FEATURE_SUPPORTED),
         (VACUUM_PROTOCOL_CHECK_FEATURE_KEY, FEATURE_SUPPORTED),
+        (V2_CHECKPOINT_FEATURE_KEY, FEATURE_SUPPORTED),
+        (DELETION_VECTORS_FEATURE_KEY, FEATURE_SUPPORTED),
+        (ENABLE_DELETION_VECTORS_KEY, CONFIG_TRUE),
+        (CHECKPOINT_WRITE_STATS_AS_STRUCT_KEY, CONFIG_TRUE),
+        (CHECKPOINT_WRITE_STATS_AS_JSON_KEY, CONFIG_TRUE),
         (UC_TABLE_ID_KEY, uc_table_id),
     ]
     .into_iter()
@@ -70,12 +84,42 @@ pub fn get_required_properties_for_disk(uc_table_id: &str) -> HashMap<String, St
     .collect()
 }
 
+/// Map AWS S3 credentials vended by UC (`CreateStagingTableResponse.storage_credentials` or
+/// `get_table_credentials`) into `object_store` option keys, for building an engine over the
+/// table's storage.
+///
+/// TODO: only AWS S3 is handled today. Generalize to GCS (`gcs.*`) and Azure (`azure.*`), which
+/// need their own `object_store` key mappings.
+pub fn aws_object_store_options(
+    creds: &[StorageCredential],
+    region: &str,
+) -> HashMap<String, String> {
+    let mut opts = HashMap::new();
+    for cred in creds {
+        for (key, value) in &cred.config {
+            let mapped = match key.as_str() {
+                "s3.access-key-id" => "access_key_id",
+                "s3.secret-access-key" => "secret_access_key",
+                "s3.session-token" => "session_token",
+                other => other,
+            };
+            opts.insert(mapped.to_string(), value.clone());
+        }
+    }
+    opts.insert("region".to_string(), region.to_string());
+    opts
+}
+
 /// Build the typed `CreateTableRequest` body the connector sends to the UC `tables` endpoint after
-/// the v0 commit succeeds, driving off the post-commit v0 snapshot.
+/// the v0 commit succeeds, built from the post-commit v0 snapshot.
 ///
 /// User properties set via `create_table`'s `with_table_properties` flow through automatically
 /// (they land in `metaData.configuration`). To add or override properties afterward, mutate
 /// `req.properties` on the returned request before sending.
+///
+/// UC requires `delta.checkpointPolicy=v2` in the request body, but kernel's CREATE TABLE rejects
+/// it as a table property, so it never lands in the committed metadata. This function adds it to
+/// the request body so callers get a complete, contract-valid request.
 ///
 /// # Errors
 ///
@@ -103,8 +147,12 @@ pub fn build_uc_create_table_request(
     let protocol = table_config.protocol();
 
     let partition_columns = metadata.partition_columns().to_vec();
-    let properties = metadata.configuration().clone();
-    let typed_protocol = to_wire_protocol(protocol);
+    let mut properties = metadata.configuration().clone();
+    properties.insert(
+        CHECKPOINT_POLICY_KEY.to_string(),
+        CHECKPOINT_POLICY_V2.to_string(),
+    );
+    let wire_protocol = to_wire_protocol(protocol);
 
     // UC only recognizes the `delta.clustering` and `delta.rowTracking` domain metadatas.
     let uc_recognized_domains = HashSet::from([CLUSTERING_DOMAIN_NAME, ROW_TRACKING_DOMAIN_NAME]);
@@ -127,7 +175,7 @@ pub fn build_uc_create_table_request(
         comment: None,
         columns,
         partition_columns,
-        protocol: typed_protocol,
+        protocol: wire_protocol,
         properties,
         domain_metadata,
         last_commit_timestamp_ms: in_commit_timestamp_ms,
@@ -178,9 +226,14 @@ mod tests {
     #[test]
     fn test_get_required_properties_for_disk() {
         let props = get_required_properties_for_disk("my-uc-table-123");
-        assert_eq!(props.len(), 3);
+        assert_eq!(props.len(), 8);
         assert_eq!(props["delta.feature.catalogManaged"], "supported");
         assert_eq!(props["delta.feature.vacuumProtocolCheck"], "supported");
+        assert_eq!(props["delta.feature.v2Checkpoint"], "supported");
+        assert_eq!(props["delta.feature.deletionVectors"], "supported");
+        assert_eq!(props["delta.enableDeletionVectors"], "true");
+        assert_eq!(props["delta.checkpoint.writeStatsAsStruct"], "true");
+        assert_eq!(props["delta.checkpoint.writeStatsAsJson"], "true");
         assert_eq!(props["io.unitycatalog.tableId"], "my-uc-table-123");
     }
 
@@ -223,6 +276,7 @@ mod tests {
             req.properties["io.unitycatalog.tableId"],
             "test-table-id-456"
         );
+        assert_eq!(req.properties["delta.checkpointPolicy"], "v2");
         assert!(!req.properties.contains_key("delta.feature.catalogManaged"));
         assert!(!req.properties.contains_key("delta.minReaderVersion"));
         assert!(!req.properties.contains_key("delta.lastUpdateVersion"));

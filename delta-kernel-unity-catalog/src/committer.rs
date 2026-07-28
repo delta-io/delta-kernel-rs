@@ -255,9 +255,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
 impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     /// Commit the given `actions` to the delta table in UC.
     ///
-    /// For version 0, the caller finalizes the table in UC separately. For version >= 1, connectors
-    /// should publish staged commits to the delta log immediately after writing; UC expects to be
-    /// informed of the last known published version during commit.
+    /// For version 0 (table creation), the committer writes `000.json` directly to the published
+    /// commit path; the caller finalizes the table in UC via the create-table API. For version >=
+    /// 1, connectors should publish staged commits to the delta log immediately after writing;
+    /// UC expects to be informed of the last known published version during commit.
     fn commit(
         &self,
         engine: &dyn Engine,

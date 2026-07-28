@@ -88,10 +88,11 @@ This crate connects the UC client layer to Kernel's APIs. It depends on both
   it. The `publish()` method copies ratified staged commits to `_delta_log/` as
   published commits.
 - **`get_required_properties_for_disk()`**: returns the table properties you
-  must include when creating a UC-managed table (the `catalogManaged` and
-  `vacuumProtocolCheck` feature signals, plus the `io.unitycatalog.tableId`).
-  Kernel's `create_table()` consumes these as table properties on the version 0
-  commit.
+  must include when creating a UC-managed table (the `catalogManaged`,
+  `vacuumProtocolCheck`, `v2Checkpoint`, and `deletionVectors` feature signals,
+  the companion config properties kernel does not write itself, plus the
+  `io.unitycatalog.tableId`). Kernel's `create_table()` consumes these as table
+  properties on the version 0 commit.
 - **`build_uc_create_table_request()`**: reads the post-creation version 0
   Snapshot and produces a typed `CreateTableRequest` whose schema, partition
   columns, protocol, domain metadata, and metadata-config properties are separate

@@ -857,7 +857,7 @@
 2. Add create many API to engine ([#2070])
    - Adds `create_many` method to `ParquetHandler` trait. Implementors must add this method. See the trait rustdocs for details.
 3. Rename uc-catalog and uc-client crates ([#2136])
-   - `delta-kernel-uc-catalog` renamed to `delta-kernel-unity-catalog`. `delta-kernel-uc-client` renamed to `unity-catalog-delta-client-default`. Update `Cargo.toml` dependencies accordingly.
+   - `delta-kernel-uc-catalog` renamed to `delta-kernel-unity-catalog`. `delta-kernel-uc-client` renamed to `unity-catalog-delta-rest-client`. Update `Cargo.toml` dependencies accordingly.
 4. Checksum and checkpoint APIs return updated Snapshot ([#2182])
    - `Snapshot::checkpoint()` and checksum APIs now return the updated `Snapshot`. Callers must handle the returned value.
 5. Add P&M to CommitMetadata and enforce committer/table type matching ([#2250])

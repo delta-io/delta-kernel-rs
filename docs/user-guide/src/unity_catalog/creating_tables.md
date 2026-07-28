@@ -48,12 +48,19 @@ use delta_kernel_unity_catalog::get_required_properties_for_disk;
 let disk_props = get_required_properties_for_disk(&table_id);
 ```
 
-The returned map has exactly three entries:
+The returned map has exactly eight entries: four `delta.feature.*` signals that enable the required
+table features, three companion config properties that kernel does not write itself, and the UC
+table ID.
 
 | Key | Value |
 |-----|-------|
 | `delta.feature.catalogManaged` | `supported` |
 | `delta.feature.vacuumProtocolCheck` | `supported` |
+| `delta.feature.v2Checkpoint` | `supported` |
+| `delta.feature.deletionVectors` | `supported` |
+| `delta.enableDeletionVectors` | `true` |
+| `delta.checkpoint.writeStatsAsStruct` | `true` |
+| `delta.checkpoint.writeStatsAsJson` | `true` |
 | `io.unitycatalog.tableId` | the UC-assigned table ID |
 
 > [!NOTE]
@@ -135,9 +142,11 @@ let create_req = build_uc_create_table_request(&post_commit_snapshot, &engine, "
 > `build_uc_create_table_request` requires a version 0 snapshot with an in-commit timestamp. The
 > `post_commit_snapshot` from Step 3 satisfies both.
 >
-> If your UC server requires `delta.checkpointPolicy=v2` for `v2Checkpoint` tables, insert it into
-> `create_req.properties` before sending: kernel enables the `v2Checkpoint` feature without writing
-> the companion property.
+> The companion config properties from `get_required_properties_for_disk`
+> (`delta.enableDeletionVectors`, `delta.checkpoint.writeStatsAsStruct`,
+> `delta.checkpoint.writeStatsAsJson`) round-trip from the committed metadata into `properties`
+> automatically. `build_uc_create_table_request` also sets `delta.checkpointPolicy=v2` in the request
+> body, which kernel's CREATE TABLE rejects as a table property and so cannot round-trip from disk.
 
 ## Step 5: Finalize the table in Unity Catalog
 
