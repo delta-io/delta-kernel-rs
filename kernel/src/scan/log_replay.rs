@@ -740,6 +740,8 @@ pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
 pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
 pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
 pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
+pub(crate) static PARTITION_VALUES_NAME: &str = "partitionValues";
+pub(crate) static SIZE_NAME: &str = "size";
 pub(crate) static TAGS_NAME: &str = "tags";
 pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 #[internal_api]
@@ -752,12 +754,12 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     // Note that fields projected out of a nullable struct must be nullable
     schema_ref! {
         nullable "path": STRING,
-        nullable "size": LONG,
+        nullable SIZE_NAME: LONG,
         nullable "modificationTime": LONG,
         nullable "stats": STRING,
         nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
         nullable FILE_CONSTANT_VALUES_NAME: {
-            nullable "partitionValues": { STRING => nullable STRING },
+            nullable PARTITION_VALUES_NAME: { STRING => nullable STRING },
             nullable BASE_ROW_ID_NAME: LONG,
             nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
             nullable "tags": { STRING => nullable STRING },
