@@ -523,6 +523,12 @@ pub enum AddFilePartitionKeyModify<'a> {
     },
 }
 
+/// Applies `modifications` in order to a single-row add-file batch.
+///
+/// # Panics
+///
+/// Panics when `batch` does not have exactly one row with a string-keyed and string-valued
+/// `partitionValues` map, or when the modified batch cannot be constructed.
 pub fn modify_add_file_partition_keys(
     batch: RecordBatch,
     modifications: &[AddFilePartitionKeyModify<'_>],
@@ -533,7 +539,7 @@ pub fn modify_add_file_partition_keys(
         .index_of("partitionValues")
         .expect("partitionValues field in add-file batch");
     let map = batch.column(index).as_map();
-    let entries = map.entries();
+    let entries = map.value(0);
     let keys = entries.column(0).as_string::<i32>();
     let values = entries.column(1).as_string::<i32>();
     let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
