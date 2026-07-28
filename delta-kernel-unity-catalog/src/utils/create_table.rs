@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 
 use delta_kernel::actions::Protocol;
-use delta_kernel::{Engine, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use unity_catalog_delta_client_api::{
     CreateTableRequest, Protocol as WireProtocol, StorageCredential,
 };
@@ -134,18 +134,17 @@ pub fn build_uc_create_table_request(
     snapshot: &Snapshot,
     engine: &dyn Engine,
     table_name: impl Into<String>,
-) -> delta_kernel::DeltaResult<CreateTableRequest> {
+) -> DeltaResult<CreateTableRequest> {
     if snapshot.version() != 0 {
-        return Err(delta_kernel::Error::generic(format!(
+        return Err(Error::generic(format!(
             "build_uc_create_table_request is only valid for version 0 (table creation) \
              snapshots, but snapshot is at version {}",
             snapshot.version()
         )));
     }
 
-    let columns = serde_json::to_value(snapshot.schema().as_ref()).map_err(|e| {
-        delta_kernel::Error::generic(format!("Failed to serialize table schema: {e}"))
-    })?;
+    let columns = serde_json::to_value(snapshot.schema().as_ref())
+        .map_err(|e| Error::generic(format!("Failed to serialize table schema: {e}")))?;
 
     let table_config = snapshot.table_configuration();
     let metadata = table_config.metadata();
@@ -165,9 +164,8 @@ pub fn build_uc_create_table_request(
     for (domain, dm) in
         snapshot.get_domain_metadatas_internal(engine, Some(&uc_recognized_domains))?
     {
-        let value = serde_json::from_str(dm.configuration()).map_err(|e| {
-            delta_kernel::Error::generic(format!("malformed {domain} domain metadata: {e}"))
-        })?;
+        let value = serde_json::from_str(dm.configuration())
+            .map_err(|e| Error::generic(format!("malformed {domain} domain metadata: {e}")))?;
         domain_metadata.insert(domain, value);
     }
 
