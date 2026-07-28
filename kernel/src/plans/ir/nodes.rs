@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
 use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transforms::SchemaTransform as _;
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error, FileMeta};
@@ -22,7 +22,7 @@ use crate::{DeltaResult, Error, FileMeta};
 /// Plan node operators.
 ///
 /// Output schemas are stored on the payload struct for operators whose caller
-/// declares them (`ScanParquet`, `ScanJson`, `Values`, `Load`, `Project`,
+/// declares them (`ScanParquet`, `ScanJson`, `Values`, `DynamicScan`, `Project`,
 /// `Aggregate`); the remaining operators pass an input's schema through
 /// unchanged:
 /// - `Filter` from its input.
@@ -38,7 +38,7 @@ pub enum Operator {
     // === Unary operators (1 input) ===========================================
     Project(Project),
     Filter(Filter),
-    Load(Load),
+    DynamicScan(DynamicScan),
     Aggregate(Aggregate),
 
     // === Binary operators (2 inputs) =========================================
@@ -66,7 +66,7 @@ impl_from_payload_for_operator!(
     Values,
     Project,
     Filter,
-    Load,
+    DynamicScan,
     Aggregate,
     SemiJoin,
     UnionAll,
@@ -172,7 +172,8 @@ impl From<FileMeta> for ScanFile {
 /// literals in the same order as `file_constant_columns`.
 ///
 /// File-constant columns are distinct from [metadata columns], which are engine-generated
-/// (such as row index). [`Load::file_constant_columns`] is the same concept for the [`Load`] node.
+/// (such as row index). [`DynamicScan::file_constant_columns`] is the same concept for the
+/// [`DynamicScan`] node.
 ///
 /// # Invariants
 ///
@@ -330,37 +331,72 @@ pub struct Filter {
     pub predicate: PredicateRef,
 }
 
-/// File formats supported by [`Load`].
+/// File formats supported by [`DynamicScan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Parquet,
     Json,
 }
 
-/// Names the columns a [`Load`] reads from each upstream row to locate and size each file.
+/// Names the columns carrying each file's path, size, modification time, and optional row count.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadColumnFileMeta {
+pub struct DynamicScanFileMetadataColumns {
     /// Non-nullable column holding the per-row file path / URL fragment.
     pub path_column: ColumnName,
-    /// Nullable column with the file's total size in bytes. Engines use non-NULL size and
-    /// row-count values as split-sizing / pruning hints.
+    /// Non-nullable column with the file's total size in bytes.
     pub file_size_column: ColumnName,
+    /// Non-nullable column with the file's last-modified timestamp in milliseconds since epoch.
+    pub last_modified_column: ColumnName,
     /// Nullable column with the file's row-count.
     pub num_records_column: ColumnName,
 }
 
-impl LoadColumnFileMeta {
-    /// The columns naming each file's path, size, and row-count.
+impl DynamicScanFileMetadataColumns {
+    /// The columns naming each file's path, size, last-modified timestamp, and row-count.
     pub fn new(
         path_column: ColumnName,
         file_size_column: ColumnName,
+        last_modified_column: ColumnName,
         num_records_column: ColumnName,
     ) -> Self {
         Self {
             path_column,
             file_size_column,
+            last_modified_column,
             num_records_column,
         }
+    }
+
+    /// Validate the file-metadata columns against an upstream schema.
+    pub(crate) fn validate_input_schema(&self, schema: &SchemaRef) -> DeltaResult<()> {
+        Self::validate_column(schema, &self.path_column, &DataType::STRING, true)?;
+        Self::validate_column(schema, &self.file_size_column, &DataType::LONG, true)?;
+        Self::validate_column(schema, &self.last_modified_column, &DataType::LONG, true)?;
+        Self::validate_column(schema, &self.num_records_column, &DataType::LONG, false)
+    }
+
+    fn validate_column(
+        schema: &SchemaRef,
+        column: &ColumnName,
+        expected_type: &DataType,
+        required: bool,
+    ) -> DeltaResult<()> {
+        let fields = schema.fields_of_path(column)?;
+        let field = fields
+            .last()
+            .ok_or_else(|| Error::generic("dynamic scan: column path must not be empty"))?;
+        if field.data_type() != expected_type {
+            return Err(Error::generic(format!(
+                "dynamic scan: column `{column}` must have type {expected_type:?}, found {:?}",
+                field.data_type()
+            )));
+        }
+        if required && fields.iter().any(|field| field.is_nullable()) {
+            return Err(Error::generic(format!(
+                "dynamic scan: required column `{column}` is nullable"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -379,13 +415,9 @@ impl LoadColumnFileMeta {
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
-/// Each upstream path is resolved against `base_url`:
-///
-/// - **`Some(base)`**: each path column value is treated as a path relative to `base` and resolved
-///   via [`Url::join`]. Paths that are themselves absolute URLs (any scheme prefix) bypass the join
-///   and are used as-is.
-/// - **`None`**: every path column value must already be an absolute URL; the engine errors on
-///   relative paths.
+/// Each path column value is treated as a path relative to `base_url` and resolved via
+/// [`Url::join`]. Paths that are themselves absolute URLs (any scheme prefix) bypass the join and
+/// are used as-is.
 ///
 /// Output row order is unspecified: the engine is free to read files in any order, in
 /// parallel, and to interleave rows from different files. The relative order of upstream
@@ -393,17 +425,17 @@ impl LoadColumnFileMeta {
 ///
 /// # Example
 ///
-/// Given an upstream metadata stream and a `Load` configuration:
+/// Given an upstream metadata stream and a `DynamicScan` configuration:
 ///
 /// ```text
 /// upstream (metadata)
-///     path             | size | num_records | version | dv
-///     -----------------+------+-------------+---------+------
-///     part-0.parquet   | 1024 |        NULL |       7 | NULL
-///     part-1.parquet   | 2048 |        NULL |       8 | NULL
+///     path             | size | filemod | num_records | version | dv
+///     -----------------+------+---------+-------------+---------+------
+///     part-0.parquet   | 1024 |  100000 |        NULL |       7 | NULL
+///     part-1.parquet   | 2048 |  200000 |        NULL |       8 | NULL
 /// ```
 /// ```text
-/// Load {
+/// DynamicScan {
 ///     schema: { id: int, name: string, version: long },
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
@@ -411,6 +443,7 @@ impl LoadColumnFileMeta {
 ///     file_meta: {
 ///         path_column: "path",
 ///         file_size_column: "size",
+///         last_modified_column: "filemod",
 ///         num_records_column: "num_records",
 ///     },
 ///     dv_column: "dv",
@@ -429,38 +462,33 @@ impl LoadColumnFileMeta {
 ///     |  1 |  a   |       7
 /// ```
 #[derive(Debug, Clone)]
-pub struct Load {
+pub struct DynamicScan {
     pub schema: SchemaRef,
     pub file_type: FileType,
-    pub base_url: Option<Url>,
+    pub base_url: Url,
     pub file_constant_columns: Vec<String>,
-    pub file_meta: LoadColumnFileMeta,
+    pub file_meta: DynamicScanFileMetadataColumns,
     pub dv_column: ColumnName,
 }
 
-impl Load {
-    /// A [`Load`] over `schema` reading `file_type` files, with no base URL and no file-constant
-    /// columns. Add those with [`Self::with_base_url`] / [`Self::with_file_constant_columns`].
+impl DynamicScan {
+    /// A [`DynamicScan`] over `schema` reading `file_type` files relative to `base_url`, with no
+    /// file-constant columns. Add those with [`Self::with_file_constant_columns`].
     pub fn new(
         schema: impl Into<SchemaRef>,
         file_type: FileType,
-        file_meta: LoadColumnFileMeta,
+        base_url: Url,
+        file_meta: DynamicScanFileMetadataColumns,
         dv_column: ColumnName,
     ) -> Self {
         Self {
             schema: schema.into(),
             file_type,
-            base_url: None,
+            base_url,
             file_constant_columns: Vec::new(),
             file_meta,
             dv_column,
         }
-    }
-
-    /// Set the base URL that per-row file paths resolve against.
-    pub fn with_base_url(mut self, base_url: Url) -> Self {
-        self.base_url = Some(base_url);
-        self
     }
 
     /// Set the output columns broadcast from the upstream row (see

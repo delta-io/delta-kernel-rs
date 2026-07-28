@@ -18,8 +18,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, DynamicScanFileMetadataColumns, FileType, Filter, Operator,
+    Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -147,7 +147,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Values(n) => Op::Values(n.into()),
             Operator::Project(n) => Op::Project(n.into()),
             Operator::Filter(n) => Op::Filter(n.into()),
-            Operator::Load(n) => Op::Load(n.into()),
+            Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
@@ -218,12 +218,12 @@ impl From<&Filter> for proto_plan::FilterNode {
     }
 }
 
-impl From<&Load> for proto_plan::LoadNode {
-    fn from(node: &Load) -> Self {
-        proto_plan::LoadNode {
+impl From<&DynamicScan> for proto_plan::DynamicScanNode {
+    fn from(node: &DynamicScan) -> Self {
+        proto_plan::DynamicScanNode {
             schema: Some(node.schema.as_ref().into()),
             file_type: proto_plan::FileType::from(node.file_type) as i32,
-            base_url: node.base_url.as_ref().map(ToString::to_string),
+            base_url: node.base_url.to_string(),
             file_constant_columns: node.file_constant_columns.clone(),
             file_meta: Some((&node.file_meta).into()),
             dv_column: Some((&node.dv_column).into()),
@@ -231,12 +231,13 @@ impl From<&Load> for proto_plan::LoadNode {
     }
 }
 
-impl From<&LoadColumnFileMeta> for proto_plan::LoadColumnFileMeta {
-    fn from(meta: &LoadColumnFileMeta) -> Self {
-        proto_plan::LoadColumnFileMeta {
+impl From<&DynamicScanFileMetadataColumns> for proto_plan::DynamicScanFileMetadataColumns {
+    fn from(meta: &DynamicScanFileMetadataColumns) -> Self {
+        proto_plan::DynamicScanFileMetadataColumns {
             path_column: Some((&meta.path_column).into()),
             file_size_column: Some((&meta.file_size_column).into()),
             num_records_column: Some((&meta.num_records_column).into()),
+            last_modified_column: Some((&meta.last_modified_column).into()),
         }
     }
 }
@@ -984,8 +985,8 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, FileType, Filter, Load, LoadColumnFileMeta, Operator, Project, ScanFile,
-        ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DynamicScan, DynamicScanFileMetadataColumns, FileType, Filter, Operator,
+        Project, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1305,15 +1306,15 @@ mod tests {
     )]
     #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::literal(true)) }), "filter")]
     #[case(
-        Operator::Load(Load {
+        Operator::DynamicScan(DynamicScan {
             schema: sample_schema(),
             file_type: FileType::Parquet,
-            base_url: None,
+            base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            file_meta: sample_load_column_file_meta(),
+            file_meta: sample_dynamic_scan_file_metadata_columns(),
             dv_column: ColumnName::new(["dv"]),
         }),
-        "load"
+        "dynamic_scan"
     )]
     #[case(
         Operator::Aggregate(Aggregate {
@@ -1336,7 +1337,7 @@ mod tests {
             Op::Values(_) => "values",
             Op::Project(_) => "project",
             Op::Filter(_) => "filter",
-            Op::Load(_) => "load",
+            Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
             Op::UnionAll(_) => "union_all",
@@ -1413,10 +1414,11 @@ mod tests {
         assert!(proto.predicate.is_some());
     }
 
-    fn sample_load_column_file_meta() -> LoadColumnFileMeta {
-        LoadColumnFileMeta {
+    fn sample_dynamic_scan_file_metadata_columns() -> DynamicScanFileMetadataColumns {
+        DynamicScanFileMetadataColumns {
             path_column: ColumnName::new(["path"]),
             file_size_column: ColumnName::new(["size"]),
+            last_modified_column: ColumnName::new(["filemod"]),
             num_records_column: ColumnName::new(["num_records"]),
         }
     }
@@ -1424,36 +1426,41 @@ mod tests {
     #[rstest]
     #[case(
         FileType::Json,
-        Some(Url::parse("memory:///base/").unwrap()),
-        Some("memory:///base/")
+        Url::parse("memory:///base/").unwrap(),
+        "memory:///base/"
     )]
-    #[case(FileType::Parquet, None, None)]
-    fn from_load(
+    #[case(
+        FileType::Parquet,
+        Url::parse("file:///table/").unwrap(),
+        "file:///table/"
+    )]
+    fn from_dynamic_scan(
         #[case] file_type: FileType,
-        #[case] base_url: Option<Url>,
-        #[case] expected_base_url: Option<&str>,
+        #[case] base_url: Url,
+        #[case] expected_base_url: &str,
     ) {
-        let node = Load {
-            schema: sample_schema(),
+        let node = DynamicScan::new(
+            sample_schema(),
             file_type,
             base_url,
-            file_constant_columns: vec!["c".to_string()],
-            file_meta: sample_load_column_file_meta(),
-            dv_column: ColumnName::new(["dv"]),
-        };
-        let proto = proto_plan::LoadNode::from(&node);
+            sample_dynamic_scan_file_metadata_columns(),
+            ColumnName::new(["dv"]),
+        )
+        .with_file_constant_columns(["c"]);
+        let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
         assert_eq!(
             proto.file_type,
             proto_plan::FileType::from(file_type) as i32
         );
-        assert_eq!(proto.base_url.as_deref(), expected_base_url);
+        assert_eq!(proto.base_url, expected_base_url);
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.dv_column.is_some());
 
         let file_meta = proto.file_meta.expect("file_meta present");
         assert!(file_meta.path_column.is_some());
         assert!(file_meta.file_size_column.is_some());
+        assert!(file_meta.last_modified_column.is_some());
         assert!(file_meta.num_records_column.is_some());
     }
 
