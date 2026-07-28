@@ -533,6 +533,10 @@ pub fn modify_add_file_partition_keys(
     batch: RecordBatch,
     modifications: &[AddFilePartitionKeyModify<'_>],
 ) -> RecordBatch {
+    if modifications.is_empty() {
+        return batch;
+    }
+
     assert_eq!(batch.num_rows(), 1, "add-file batch must contain one row");
     let index = batch
         .schema()
@@ -556,7 +560,14 @@ pub fn modify_add_file_partition_keys(
         }
     }
 
-    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    let (entry_field, ordered) = match map.data_type() {
+        ArrowDataType::Map(entry_field, ordered) => (entry_field.clone(), *ordered),
+        _ => unreachable!("partitionValues column must be a map"),
+    };
+    let (key_field, value_field) = map.entries_fields();
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field.clone())
+        .with_values_field(value_field.clone());
     for (key, value) in partition_values {
         builder.keys().append_value(key);
         match value {
@@ -567,18 +578,15 @@ pub fn modify_add_file_partition_keys(
     builder
         .append(true)
         .expect("failed to append partition-values map row");
-    let new_map: ArrayRef = Arc::new(builder.finish());
+    let (_, offsets, entries, nulls, _) = builder.finish().into_parts();
+    let new_map: ArrayRef = Arc::new(
+        MapArray::try_new(entry_field, offsets, entries, nulls, ordered)
+            .expect("failed to rebuild partition-values map"),
+    );
 
-    let mut fields: Vec<Field> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect();
-    fields[index] = Field::new("partitionValues", new_map.data_type().clone(), true);
     let mut columns = batch.columns().to_vec();
     columns[index] = new_map;
-    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+    RecordBatch::try_new(batch.schema(), columns)
         .expect("failed to rebuild add-file batch after modifying a partition key")
 }
 
