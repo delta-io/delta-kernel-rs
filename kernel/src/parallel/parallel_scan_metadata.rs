@@ -301,7 +301,7 @@ mod tests {
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
-    use crate::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     #[test]
     fn test_parallel_state_log_metrics_carries_round_tripped_table_type() {

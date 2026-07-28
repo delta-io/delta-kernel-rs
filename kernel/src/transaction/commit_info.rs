@@ -136,8 +136,8 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::schema::{Schema, SchemaRef, StructField, StructType, ToSchema};
-    use crate::test_utils::load_test_table;
     use crate::transaction::Transaction;
+    use crate::unit_test_utils::load_test_table;
     use crate::utils::FoldWithOption as _;
     use crate::{DeltaResult, Engine, EngineData};
 

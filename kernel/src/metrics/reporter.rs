@@ -309,7 +309,7 @@ mod tests {
 
     use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
     use crate::metrics::{MetricEvent, WithMetricsReporterLayer as _};
-    use crate::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     /// Run `f` under a subscriber that layers the metrics layer over an fmt layer capturing to a
     /// buffer, and return the captured log text -- so a test can assert on the warnings the metrics

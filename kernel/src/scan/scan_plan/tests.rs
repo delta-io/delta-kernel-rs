@@ -159,7 +159,7 @@ fn declarative_metadata_matches_imperative_scan(
     )]
     predicate: Option<Pred>,
 ) -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) = crate::test_utils::load_test_table(table)?;
+    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = predicate.map(Arc::new);
 
     let imperative_builder = snapshot
@@ -193,7 +193,7 @@ fn declarative_metadata_matches_imperative_scan(
 fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
     #[case] table: &str,
 ) -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) = crate::test_utils::load_test_table(table)?;
+    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let plan = snapshot
         .scan_builder()
         .build()?
@@ -229,7 +229,7 @@ fn declarative_metadata_data_skipping(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
 ) -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) = crate::test_utils::load_test_table(table)?;
+    let (engine, snapshot, _tempdir) = crate::unit_test_utils::load_test_table(table)?;
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
         snapshot
@@ -263,7 +263,7 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
     #[case] expected_count: usize,
 ) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) =
-        crate::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let predicate = Arc::new(predicate);
     let expected = imperative_metadata(
         snapshot
@@ -291,7 +291,7 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
 #[test]
 fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) =
-        crate::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+        crate::unit_test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::all())

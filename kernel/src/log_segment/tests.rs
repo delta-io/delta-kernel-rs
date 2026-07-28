@@ -38,7 +38,7 @@ use crate::scan::{
 use crate::schema::{
     schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
-use crate::test_utils::{
+use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, string_array_to_engine_data, Action,
 };

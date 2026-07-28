@@ -27,8 +27,8 @@ use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::schema::{schema_ref, DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
-use crate::test_utils::Action;
 use crate::transaction::create_table::create_table;
+use crate::unit_test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 #[rstest::rstest]

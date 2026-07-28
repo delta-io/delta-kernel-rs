@@ -45,7 +45,9 @@ mod tests {
     use crate::actions::Protocol;
     use crate::schema::{schema, DataType, StructField};
     use crate::table_features::TableFeature;
-    use crate::test_utils::{assert_result_error_with_message, assert_schema_feature_validation};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, assert_schema_feature_validation,
+    };
 
     #[test]
     fn test_is_unshredded_variant() {

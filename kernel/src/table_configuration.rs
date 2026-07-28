@@ -920,7 +920,7 @@ mod test {
         ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
         ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED,
     };
-    use crate::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, test_schema_flat, test_schema_flat_with_column_mapping,
         test_schema_nested, test_schema_nested_with_column_mapping, test_schema_with_array,
         test_schema_with_array_and_column_mapping, test_schema_with_map,

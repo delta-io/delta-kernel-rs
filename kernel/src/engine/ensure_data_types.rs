@@ -355,7 +355,7 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
-    use crate::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     #[test]
     fn accepts_safe_decimal_casts() {

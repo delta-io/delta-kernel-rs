@@ -1763,13 +1763,13 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::schema::{schema_ref, MapType};
     use crate::table_features::ColumnMappingMode;
-    use crate::test_utils::{
+    use crate::transaction::create_table::create_table;
+    use crate::transaction::data_layout::DataLayout;
+    use crate::unit_test_utils::{
         copy_test_table, create_valid_add_file_batch, install_thread_local_metrics_reporter,
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map, CapturingReporter,
     };
-    use crate::transaction::create_table::create_table;
-    use crate::transaction::data_layout::DataLayout;
     use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
 
     impl Transaction {
@@ -2871,9 +2871,9 @@ mod tests {
         #[case] schema: SchemaRef,
         #[case] mode: ColumnMappingMode,
     ) -> DeltaResult<()> {
-        let (_engine, txn) = crate::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.unpartitioned_write_context().unwrap();
-        crate::test_utils::validate_physical_schema_column_mapping(
+        crate::unit_test_utils::validate_physical_schema_column_mapping(
             write_context.logical_schema(),
             write_context.physical_schema(),
             mode,
@@ -2919,7 +2919,7 @@ mod tests {
     /// children.
     fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
         let schema = test_schema_nested();
-        let (_engine, txn) = crate::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.unpartitioned_write_context().unwrap();
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();

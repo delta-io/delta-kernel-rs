@@ -140,7 +140,7 @@ pub mod column_trie;
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
 #[cfg(test)]
-pub(crate) mod test_utils;
+pub(crate) mod unit_test_utils;
 #[cfg(feature = "internal-api")]
 pub mod utils;
 #[cfg(not(feature = "internal-api"))]
