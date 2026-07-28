@@ -90,6 +90,17 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
     }
 
+    fn eval_pred_cast(
+        &self,
+        _op: BinaryPredicateOp,
+        _col: &ColumnName,
+        _target: &DataType,
+        _val: &Scalar,
+        _inverted: bool,
+    ) -> Option<bool> {
+        None
+    }
+
     fn eval_pred_opaque(
         &self,
         op: &OpaquePredicateOpRef,

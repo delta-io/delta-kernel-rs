@@ -972,6 +972,16 @@ mod tests {
             ) -> Option<Predicate> {
                 None
             }
+            fn eval_pred_cast(
+                &self,
+                _: BinaryPredicateOp,
+                _: &ColumnName,
+                _: &DataType,
+                _: &Scalar,
+                _: bool,
+            ) -> Option<Predicate> {
+                None
+            }
             fn eval_pred_opaque(
                 &self,
                 _: &OpaquePredicateOpRef,

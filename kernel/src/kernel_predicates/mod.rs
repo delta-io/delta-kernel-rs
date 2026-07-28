@@ -887,14 +887,12 @@ pub trait DataSkippingPredicateEvaluator {
     /// preserves those bounds.
     fn eval_pred_cast(
         &self,
-        _op: BinaryPredicateOp,
-        _col: &ColumnName,
-        _target: &DataType,
-        _val: &Scalar,
-        _inverted: bool,
-    ) -> Option<Self::Output> {
-        None
-    }
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output>;
 
     /// See [`KernelPredicateEvaluator::eval_pred_opaque`].
     fn eval_pred_opaque(

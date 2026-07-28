@@ -715,6 +715,17 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             .map(Pred::literal)
     }
 
+    fn eval_pred_cast(
+        &self,
+        _op: BinaryPredicateOp,
+        _col: &ColumnName,
+        _target: &DataType,
+        _val: &Scalar,
+        _inverted: bool,
+    ) -> Option<Pred> {
+        None
+    }
+
     /// Rewrites an opaque predicate via its `as_data_skipping_predicate`, wrapped with
     /// `OR(NOT is_add, ...)`. Opaque rewrites may embed op-computed verdicts (e.g. an engine
     /// callback behind FFI) that bypass kernel's null-stats folding, so kernel itself must
