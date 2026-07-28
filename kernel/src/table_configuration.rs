@@ -571,6 +571,8 @@ impl TableConfiguration {
         self.version
     }
 
+    // TODO(#3020): Unify scan-state schema construction and write-context serialization to call
+    // this.
     fn physical_partition_fields(&self) -> impl Iterator<Item = (&StructField, &str)> + '_ {
         let column_mapping_mode = self.column_mapping_mode();
         self.logical_partition_columns()
