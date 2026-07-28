@@ -355,6 +355,12 @@ mod tests {
         &["p1", "p2"],
         "partitionValues keys"
     )]
+    #[case::wrong_partition_column_name(
+        &[("p1", Some("a")), ("p2", Some("b"))],
+        &[("p1", Some("a")), ("wrong", Some("b"))],
+        &["p1", "p2"],
+        "partitionValues keys"
+    )]
     #[case::duplicate_partition_column(
         &[("p1", Some("a")), ("p2", Some("b"))],
         &[("p1", Some("a")), ("p1", Some("b")), ("p2", Some("c"))],
