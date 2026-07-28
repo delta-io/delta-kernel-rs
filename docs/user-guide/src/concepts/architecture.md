@@ -181,9 +181,8 @@ build that batch from Parquet write results.
 > create-table transactions the operation is fixed to `"CREATE TABLE"` and
 > cannot be overridden.
 
-For schema evolution, start from the snapshot's `alter_table()` builder
-instead of `transaction()`. See
-[Altering a Table](../writing/alter_table.md).
+For schema evolution, stage `add_column()` on the same `transaction()` builder.
+See [Altering a Table](../writing/alter_table.md).
 
 See [Quick Start: Writing a Table](../getting_started/quick_start_write.md) for a complete example.
 

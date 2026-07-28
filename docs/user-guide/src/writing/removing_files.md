@@ -121,9 +121,8 @@ You can call `remove_files()` multiple times to remove files from different
 pending removals.
 
 > [!NOTE]
-> `remove_files()` is available on transaction states that produce data files (gated by
-> the `SupportsDataFiles` trait bound). Metadata-only transaction states cannot register
-> file removals.
+> `remove_files()` is available on update transactions but not on create-table
+> transactions, which have no existing files to remove.
 
 ## Full example
 

@@ -67,8 +67,6 @@ pub mod data_layout;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod data_layout;
 
-pub(crate) mod alter_table;
-pub use alter_table::AlterTableTransaction;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
@@ -160,22 +158,6 @@ pub struct ExistingTable;
 /// invalid for table creation (e.g. file removal, domain metadata removal) are not available.
 #[derive(Debug)]
 pub struct CreateTable;
-
-/// Marker type for alter-table (schema evolution) transactions.
-///
-/// Transactions in this state perform metadata-only commits. Data file operations are not
-/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
-#[derive(Debug)]
-pub struct AlterTable;
-
-/// Marker trait for transaction states that support data file operations.
-///
-/// Only transaction types that implement this trait can access methods for adding, removing, or
-/// updating data files. This prevents compile-time misuse by states like `AlterTable` that
-/// only perform metadata-only commits.
-pub trait SupportsDataFiles {}
-impl SupportsDataFiles for ExistingTable {}
-impl SupportsDataFiles for CreateTable {}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -805,7 +787,7 @@ impl<S> Transaction<S> {
         if self.effective_table_config.logical_schema().num_fields() == 0 {
             return Err(Error::generic(
                 "Cannot write data files to a Delta table with empty schema; \
-                 use `snapshot.alter_table().add_column(...)` to add at least one \
+                 use `snapshot.transaction().add_column(...)` to add at least one \
                  column before writing data",
             ));
         }
@@ -901,9 +883,9 @@ impl<S> Transaction<S> {
 }
 
 // =============================================================================
-// Data file methods -- only available on transaction types that support data files
+// Data file methods
 // =============================================================================
-impl<S: SupportsDataFiles> Transaction<S> {
+impl<S> Transaction<S> {
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -2692,7 +2674,7 @@ mod tests {
     // ============================================================================
     // validate_blind_append tests
     // ============================================================================
-    fn add_dummy_file<S: SupportsDataFiles>(txn: &mut Transaction<S>) {
+    fn add_dummy_file<S>(txn: &mut Transaction<S>) {
         let batch = create_valid_add_file_batch(false /* all_nullable */);
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }

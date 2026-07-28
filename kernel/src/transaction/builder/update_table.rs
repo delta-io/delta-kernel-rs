@@ -2,7 +2,8 @@
 //!
 //! This module contains [`UpdateTableTransactionBuilder`], which stages write configuration
 //! (operation, engine info, blind-append, domain metadata, set-transaction, commit info) and
-//! then builds a [`Transaction`] against an existing table.
+//! schema-evolution operations (add column, set nullable), then builds a [`Transaction`] against
+//! an existing table.
 //!
 //! Use [`Snapshot::transaction()`](crate::snapshot::Snapshot::transaction) as the entry point
 //! rather than constructing the builder directly.
@@ -10,8 +11,10 @@
 use std::sync::Arc;
 
 use crate::committer::Committer;
-use crate::schema::SchemaRef;
+use crate::expressions::ColumnName;
+use crate::schema::{SchemaRef, StructField};
 use crate::snapshot::SnapshotRef;
+use crate::transaction::schema_evolution::SchemaOperation;
 use crate::transaction::Transaction;
 use crate::{DeltaResult, Engine, EngineData};
 
@@ -51,6 +54,7 @@ pub struct UpdateTableTransactionBuilder {
     domain_removals: Vec<String>,
     set_transactions: Vec<(String, i64)>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
+    schema_operations: Vec<SchemaOperation>,
 }
 
 impl UpdateTableTransactionBuilder {
@@ -70,6 +74,7 @@ impl UpdateTableTransactionBuilder {
             domain_removals: Vec::new(),
             set_transactions: Vec::new(),
             engine_commit_info: None,
+            schema_operations: Vec::new(),
         }
     }
 
@@ -153,19 +158,50 @@ impl UpdateTableTransactionBuilder {
         self
     }
 
+    /// Add a new top-level column to the table schema (schema evolution).
+    ///
+    /// The field must not already exist in the schema (case-insensitive) and must be nullable,
+    /// because existing data files do not contain this column and will read NULL for it. `field`
+    /// and any nested fields must not carry `delta.columnMapping.id` or
+    /// `delta.columnMapping.physicalName` annotations.
+    ///
+    /// These constraints are validated during [`build`](Self::build).
+    pub fn add_column(mut self, field: StructField) -> Self {
+        self.schema_operations
+            .push(SchemaOperation::AddColumn { field });
+        self
+    }
+
+    /// Change a column's nullability from NOT NULL to nullable (schema evolution). If the column
+    /// is already nullable, the op is a no-op but still generates a commit (matching Spark).
+    pub fn set_nullable(mut self, column: ColumnName) -> Self {
+        self.schema_operations
+            .push(SchemaOperation::SetNullable { column });
+        self
+    }
+
     /// Validate the table supports writes and build the [`Transaction`], applying all staged
-    /// write configuration.
+    /// write configuration and schema-evolution operations.
     ///
     /// # Errors
     ///
     /// - The table does not support writes (unsupported reader/writer features).
     /// - Reading clustering columns from the snapshot fails.
+    /// - Schema-evolution operations were staged and the table enables `icebergCompatV3` or
+    ///   `allowColumnDefaults` (not yet supported), an operation fails validation, or the evolved
+    ///   schema requires a protocol feature the table does not enable.
     pub fn build(
         self,
         engine: &dyn Engine,
         committer: Box<dyn Committer>,
     ) -> DeltaResult<Transaction> {
         let mut txn = Transaction::try_new_existing_table(self.snapshot, committer, engine)?;
+
+        // Apply schema evolution first: it rebuilds the transaction's effective table
+        // configuration and marks Metadata for emission.
+        if !self.schema_operations.is_empty() {
+            txn = txn.apply_schema_evolution(self.schema_operations)?;
+        }
 
         if let Some(operation) = self.operation {
             txn = txn.with_operation(operation);

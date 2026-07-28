@@ -182,12 +182,6 @@ txn.add_files(add_file_metadata);
 
 You can call `add_files` multiple times to write multiple files in one transaction.
 
-> [!NOTE]
-> Methods that produce or register data files (`unpartitioned_write_context`,
-> `partitioned_write_context`, `add_files`, `stats_schema`) are gated by the
-> `SupportsDataFiles` trait bound and are available on standard write transactions but not
-> on metadata-only transaction states (such as a future `AlterTable`).
-
 ## Committing
 
 `commit()` consumes the transaction and returns a `CommitResult`:

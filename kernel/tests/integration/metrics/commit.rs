@@ -140,7 +140,7 @@ async fn commit_reports_added_file_count_not_batch_count() -> DeltaResult<()> {
 }
 
 /// Sets the correlation id on the `Transaction` returned by `build()` and checks it reaches the
-/// commit metric event. The tests below instead set it on the update, create, and alter builders.
+/// commit metric event. The tests below instead set it on the update and create builders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_success_carries_correlation_id() -> DeltaResult<()> {
     let (_temp_dir, table_path, setup_engine) = test_table_setup_mt()?;
@@ -190,16 +190,15 @@ async fn create_table_builder_carries_correlation_id(
     Ok(())
 }
 
-/// A correlation id set on the alter-table *builder* reaches the commit metric event. The id is
-/// set before any schema operation (in the `Ready` state), so this also verifies it survives the
-/// builder's `Ready -> Modifying` transition. An empty id is treated as unset. Builder-level
-/// setter added in issue #2833.
+/// A correlation id set on the update-table *builder* reaches the commit metric event when the
+/// transaction performs schema evolution. The id is set before the `add_column` op, so this
+/// verifies it survives alongside a staged schema operation. An empty id is treated as unset.
 #[rstest]
-#[case::with_id(Some("alter-req-1"), Some("alter-req-1"))]
+#[case::with_id(Some("evolve-req-1"), Some("evolve-req-1"))]
 #[case::without_id(None, None)]
 #[case::empty_id_is_unset(Some(""), None)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn alter_table_builder_carries_correlation_id(
+async fn schema_evolution_builder_carries_correlation_id(
     #[case] correlation_id: Option<&str>,
     #[case] expected: Option<&str>,
 ) -> DeltaResult<()> {
@@ -209,14 +208,14 @@ async fn alter_table_builder_carries_correlation_id(
         .commit(engine.as_ref())?
         .unwrap_committed();
 
-    // Install the reporter after the create commit so the captured event is the alter commit.
+    // Install the reporter after the create commit so the captured event is the evolution commit.
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    // Set the id in the `Ready` state (before `add_column`) to exercise the carry-through.
-    let mut builder = snapshot.alter_table();
+    // Set the id before `add_column` to exercise the carry-through alongside a schema op.
+    let mut builder = snapshot.transaction();
     if let Some(id) = correlation_id {
         builder = builder.with_correlation_id(id);
     }
