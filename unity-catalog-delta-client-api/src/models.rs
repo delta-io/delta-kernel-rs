@@ -102,9 +102,9 @@ impl UpdateTableRequest {
     ///
     /// # Errors
     ///
-    /// Returns an error if a singleton entry appears more than once: at most one `AssertTableUuid`
-    /// and one `AssertEtag` requirement, and at most one `SetLatestBackfilledVersion` update.
-    /// `AddCommit` may appear multiple times (a batch of staged commits).
+    /// Returns an error if a singleton entry appears more than once. The UC `updateTable` endpoint
+    /// accepts at most one each of `AssertTableUuid`, `AssertEtag`, `AddCommit`, and
+    /// `SetLatestBackfilledVersion`.
     pub fn new(
         requirements: Vec<DeltaTableRequirement>,
         updates: Vec<DeltaTableUpdate>,
@@ -124,11 +124,15 @@ impl UpdateTableRequest {
                     .to_string(),
             ));
         }
-        let backfilled_version_count = updates
-            .iter()
-            .filter(|u| matches!(u, DeltaTableUpdate::SetLatestBackfilledVersion { .. }))
-            .count();
-        if backfilled_version_count > 1 {
+        let update_count = |is_variant: fn(&DeltaTableUpdate) -> bool| {
+            updates.iter().filter(|u| is_variant(u)).count()
+        };
+        if update_count(|u| matches!(u, DeltaTableUpdate::AddCommit { .. })) > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one AddCommit update".to_string(),
+            ));
+        }
+        if update_count(|u| matches!(u, DeltaTableUpdate::SetLatestBackfilledVersion { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one SetLatestBackfilledVersion \
                  update"
@@ -503,13 +507,26 @@ mod tests {
             "more than one SetLatestBackfilledVersion must be rejected"
         );
 
-        // Multiple AddCommit updates are allowed (a batch of staged commits).
+        assert!(
+            UpdateTableRequest::new(
+                vec![],
+                vec![
+                    DeltaTableUpdate::AddCommit {
+                        commit: sample_commit(),
+                    },
+                    DeltaTableUpdate::AddCommit {
+                        commit: sample_commit(),
+                    },
+                ],
+            )
+            .is_err(),
+            "more than one AddCommit must be rejected"
+        );
+
+        // A single AddCommit alongside the other singletons is accepted.
         assert!(UpdateTableRequest::new(
             vec![],
             vec![
-                DeltaTableUpdate::AddCommit {
-                    commit: sample_commit(),
-                },
                 DeltaTableUpdate::AddCommit {
                     commit: sample_commit(),
                 },

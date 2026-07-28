@@ -1,3 +1,4 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use delta_kernel::committer::{
@@ -230,7 +231,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")
         })?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = catch_unwind(AssertUnwindSafe(|| {
             tokio::task::block_in_place(|| {
                 handle.block_on(async move {
                     self.update_table_client
@@ -239,7 +240,16 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 })
             })
         }))
-        .map_err(|_| DeltaError::generic("UCCommitter requires a multi-threaded tokio runtime"))?;
+        .map_err(|panic| {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            DeltaError::generic(format!(
+                "UCCommitter commit panicked (requires a multi-threaded tokio runtime): {msg}"
+            ))
+        })?;
         match result {
             Ok(_) => Ok(CommitResponse::Committed {
                 file_meta: committed,

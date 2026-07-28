@@ -1742,9 +1742,8 @@ mod tests {
             context.commit_called = true;
 
             let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
-            let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
 
-            context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
+            context.last_commit_table_id = Some(table_id.clone());
 
             // Capture the staged commit file name if present
             if let OptionalValue::Some(commit_info) = request.commit_info {
@@ -1955,7 +1954,7 @@ mod tests {
 
             {
                 // scope so we don't hold mutex across the await lower down
-                let (last_table_id, _) = context.last_commit_request.unwrap();
+                let last_table_id = context.last_commit_table_id.unwrap();
                 assert_eq!(
                     last_table_id, "test_id",
                     "Table ID should match the one passed to UCCommitter"

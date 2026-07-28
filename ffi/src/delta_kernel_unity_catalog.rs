@@ -37,7 +37,6 @@ pub struct Commit {
 #[repr(C)]
 pub struct CommitRequest {
     pub table_id: KernelStringSlice,
-    pub table_uri: KernelStringSlice,
     pub commit_info: OptionalValue<Commit>,
     pub latest_backfilled_version: OptionalValue<i64>,
     /// json serialized version of the metadata
@@ -67,6 +66,9 @@ unsafe impl Sync for FfiUCCommitClient {}
 
 impl UpdateTableClient for FfiUCCommitClient {
     /// Commit a new version to the table.
+    ///
+    /// `target` is unused: the FFI CommitRequest is addressed by table UUID (from the request's
+    /// AssertTableUuid requirement), not the three-part identifier.
     async fn update_table(
         &self,
         _target: &TableIdentifier,
@@ -80,7 +82,6 @@ impl UpdateTableClient for FfiUCCommitClient {
                 )
             })?
             .to_string();
-        let table_uri = String::new();
 
         let latest_backfilled_version = request.latest_backfilled_version();
         let add_commit = request.staged_commit().cloned();
@@ -94,7 +95,6 @@ impl UpdateTableClient for FfiUCCommitClient {
         let send_request = |commit_info| -> ApiResult<()> {
             let c_commit_request = CommitRequest {
                 table_id: kernel_string_slice!(table_id),
-                table_uri: kernel_string_slice!(table_uri),
                 commit_info,
                 latest_backfilled_version: latest_backfilled_version.into(),
                 metadata: None.into(),
@@ -283,7 +283,7 @@ pub(crate) mod tests {
 
     pub(crate) struct TestContext {
         pub(crate) commit_called: bool,
-        pub(crate) last_commit_request: Option<(String, String)>,
+        pub(crate) last_commit_table_id: Option<String>,
         pub(crate) last_staged_filename: Option<String>,
         pub(crate) should_fail_commit: bool,
     }
@@ -291,7 +291,7 @@ pub(crate) mod tests {
     pub(crate) fn get_test_context(should_fail_commit: bool) -> NullableCvoid {
         let context = Box::new(TestContext {
             commit_called: false,
-            last_commit_request: None,
+            last_commit_table_id: None,
             last_staged_filename: None,
             should_fail_commit,
         });
@@ -319,7 +319,6 @@ pub(crate) mod tests {
         context.commit_called = true;
 
         let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
-        let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
 
         if let OptionalValue::Some(commit_info) = request.commit_info {
             let file_name = unsafe {
@@ -327,7 +326,7 @@ pub(crate) mod tests {
             };
             context.last_staged_filename = Some(file_name);
         }
-        context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
+        context.last_commit_table_id = Some(table_id.clone());
         if context.should_fail_commit {
             let error_msg = "Test commit failure";
             let error_str = unsafe {
@@ -382,9 +381,8 @@ pub(crate) mod tests {
         let context = recover_test_context(context).unwrap();
 
         assert!(context.commit_called);
-        let (table_id, table_uri) = context.last_commit_request.unwrap();
+        let table_id = context.last_commit_table_id.unwrap();
         assert_eq!(table_id, "test_table_id");
-        assert_eq!(table_uri, "");
         assert_eq!(
             context.last_staged_filename.unwrap(),
             "_staged_commits/00000000000000000010.uuid.json"

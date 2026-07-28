@@ -83,12 +83,9 @@ OptionalValueHandleExclusiveRustString commit_callback(
 
     // Extract request information
     char table_id[256];
-    char table_uri[1024];
     snprintf(table_id, sizeof(table_id), "%.*s", (int)request.table_id.len, request.table_id.ptr);
-    snprintf(table_uri, sizeof(table_uri), "%.*s", (int)request.table_uri.len, request.table_uri.ptr);
 
     printf("Committing to table ID: %s\n", table_id);
-    printf("Table URI: %s\n", table_uri);
 
     if (request.commit_info.tag == SomeCommit) {
         Commit commit_info = request.commit_info.some;
