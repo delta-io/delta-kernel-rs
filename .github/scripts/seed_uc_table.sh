@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Seed a catalog-managed Delta table in the running UC OSS server via its `bin/uc` CLI,
+# Seed a catalog-managed Delta table in the running UC server via its `bin/uc` CLI,
 # so the gated `load_table` live test has a table to read.
 #
 # Usage: seed_uc_table.sh <catalog> <schema> <table>

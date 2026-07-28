@@ -1,7 +1,7 @@
 # Writing to Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-rest-client -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-client-default -->
 
 To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`,
 pass it to a Kernel transaction, and then publish the staged commit to make it
@@ -13,7 +13,7 @@ Before reading this page, make sure you understand the generic
 
 > [!NOTE]
 > This page uses the `delta-kernel-unity-catalog` and
-> `unity-catalog-delta-rest-client` crates. All code examples use
+> `unity-catalog-delta-client-default` crates. All code examples use
 > `rust,ignore` because they require these external crates.
 
 ## Set up clients and resolve the table
@@ -25,7 +25,7 @@ Use `UCClient` to load the table and fetch read-write credentials, and build a
 ```rust,ignore
 use std::sync::Arc;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
 let uc_client = UCClient::new(config.clone())?;
@@ -70,13 +70,13 @@ three-part name plus its table ID.
 
 ```rust,ignore
 use delta_kernel_unity_catalog::UCCommitter;
-use unity_catalog_delta_client_api::TableName;
+use unity_catalog_delta_client_api::TableIdentifier;
 
 let table_id = resp.metadata.table_uuid.clone();
 let committer = Box::new(UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
-    TableName::new("my_catalog", "my_schema", "my_table"),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
 let mut txn = snapshot.clone().transaction(committer, &engine)?
     .with_operation("INSERT".to_string());
@@ -170,13 +170,13 @@ readers can see the commit.
 
 ```rust,ignore
 use delta_kernel_unity_catalog::UCCommitter;
-use unity_catalog_delta_client_api::TableName;
+use unity_catalog_delta_client_api::TableIdentifier;
 
 // Build a committer to drive publishing
 let committer: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
-    TableName::new("my_catalog", "my_schema", "my_table"),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
 
 let published_snapshot = post_commit_snapshot
@@ -204,8 +204,8 @@ checkpointing fails because it can only operate on published versions.
 use std::sync::Arc;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
-use unity_catalog_delta_client_api::{Operation, TableName};
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_client_api::{Operation, TableIdentifier};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 // 1. Set up clients
 let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
@@ -234,7 +234,7 @@ let snapshot = snapshot_builder_from_load_table(&resp)?.build(&engine)?;
 let committer = Box::new(UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
-    TableName::new("my_catalog", "my_schema", "my_table"),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
 let mut txn = snapshot.clone().transaction(committer, &engine)?
     .with_operation("INSERT".to_string());
@@ -248,7 +248,7 @@ txn.add_files(file_metadata);
 let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
-    TableName::new("my_catalog", "my_schema", "my_table"),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
 ));
 
 match txn.commit(&engine)? {

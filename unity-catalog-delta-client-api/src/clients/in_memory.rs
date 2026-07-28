@@ -6,7 +6,9 @@ use std::sync::RwLock;
 
 use super::UpdateTableClient;
 use crate::error::{Error, Result};
-use crate::models::{Commit, LoadTableResponse, TableMetadata, TableName, UpdateTableRequest};
+use crate::models::{
+    Commit, LoadTableResponse, TableIdentifier, TableMetadata, UpdateTableRequest,
+};
 
 // ============================================================================
 // TableData
@@ -149,7 +151,11 @@ impl Default for InMemoryUpdateTableClient {
 }
 
 impl UpdateTableClient for InMemoryUpdateTableClient {
-    async fn update_table(&self, _target: &TableName, request: UpdateTableRequest) -> Result<()> {
+    async fn update_table(
+        &self,
+        _target: &TableIdentifier,
+        request: UpdateTableRequest,
+    ) -> Result<()> {
         // Identify the target table from the assert-table-uuid requirement.
         let table_id = request
             .table_uuid()
@@ -190,8 +196,8 @@ mod tests {
         )
     }
 
-    fn target() -> TableName {
-        TableName::new("test_catalog", "test_schema", "test_table")
+    fn target() -> TableIdentifier {
+        TableIdentifier::new("test_catalog", "test_schema", "test_table")
     }
 
     fn commit_request(version: i64, latest_backfilled_version: Option<i64>) -> UpdateTableRequest {

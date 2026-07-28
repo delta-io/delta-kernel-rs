@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::models::{TableName, UpdateTableRequest};
+use crate::models::{TableIdentifier, UpdateTableRequest};
 
 #[cfg(any(test, feature = "test-utils"))]
 mod in_memory;
@@ -14,5 +14,9 @@ pub use in_memory::{InMemoryUpdateTableClient, TableData};
 #[allow(async_fn_in_trait)]
 pub trait UpdateTableClient: Send + Sync {
     /// Apply the typed `requirements + updates` payload atomically against `target`.
-    async fn update_table(&self, target: &TableName, request: UpdateTableRequest) -> Result<()>;
+    async fn update_table(
+        &self,
+        target: &TableIdentifier,
+        request: UpdateTableRequest,
+    ) -> Result<()>;
 }

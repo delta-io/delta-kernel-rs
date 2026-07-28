@@ -7,7 +7,9 @@ use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
 use test_utils::read_scan;
-use unity_catalog_delta_client_api::{Commit, InMemoryUpdateTableClient, TableData, TableName};
+use unity_catalog_delta_client_api::{
+    Commit, InMemoryUpdateTableClient, TableData, TableIdentifier,
+};
 
 // ============================================================================
 // Test Setup
@@ -103,7 +105,7 @@ fn uc_committer(
     UCCommitter::new(
         update_table_client.clone(),
         TABLE_ID,
-        TableName::new(TEST_CATALOG, TEST_SCHEMA, TEST_TABLE),
+        TableIdentifier::new(TEST_CATALOG, TEST_SCHEMA, TEST_TABLE),
     )
 }
 

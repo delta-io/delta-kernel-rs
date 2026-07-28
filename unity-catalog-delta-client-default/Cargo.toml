@@ -1,5 +1,5 @@
 [package]
-name = "unity-catalog-delta-rest-client"
+name = "unity-catalog-delta-client-default"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -27,7 +27,7 @@ url = "2.5"
 [features]
 default = []
 test-utils = ["unity-catalog-delta-client-api/test-utils"]
-# Gates live integration tests that hit a real Unity Catalog OSS server. Off by default so normal
+# Gates live integration tests that hit a real Unity Catalog server. Off by default so normal
 # `cargo test` never compiles or runs them; the dedicated CI job enables it. See
 # tests/integration_live_server.rs.
 integration-test = []

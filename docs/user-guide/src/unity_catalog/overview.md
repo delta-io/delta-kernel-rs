@@ -55,7 +55,7 @@ contains no HTTP code or network dependencies. The key types are:
 Because this crate is transport-agnostic, you can swap in any backend (REST,
 gRPC, or in-memory) without changing the code that depends on these traits.
 
-### `unity-catalog-delta-rest-client`: HTTP implementation
+### `unity-catalog-delta-client-default`: HTTP implementation
 
 This crate provides the concrete REST-over-HTTP implementations:
 
@@ -173,7 +173,7 @@ To use the UC integration, add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 delta-kernel-unity-catalog = { version = "..." }
-unity-catalog-delta-rest-client = { version = "..." }
+unity-catalog-delta-client-default = { version = "..." }
 ```
 
 Depend on `unity-catalog-delta-client-api` whenever you import types from it
@@ -196,7 +196,7 @@ The `unity-catalog-delta-client-api` crate has one feature flag:
 | `test-utils` | No | Enables `InMemoryUpdateTableClient` for unit testing |
 
 > [!TIP]
-> The `unity-catalog-delta-rest-client` crate also exposes a `test-utils`
+> The `unity-catalog-delta-client-default` crate also exposes a `test-utils`
 > feature that enables the `test-utils` feature on the client API crate
 > transitively. Add it to your `[dev-dependencies]` to get the in-memory
 > client for tests.
@@ -216,7 +216,7 @@ often benefit from raising timeouts or the retry budget.
 
 ```rust,ignore
 use std::time::Duration;
-use unity_catalog_delta_rest_client::ClientConfig;
+use unity_catalog_delta_client_default::ClientConfig;
 
 let config = ClientConfig::build(&endpoint, &token)
     .with_timeout(Duration::from_secs(60))

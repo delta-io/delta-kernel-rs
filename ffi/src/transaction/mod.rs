@@ -1879,6 +1879,9 @@ mod tests {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };
@@ -1918,6 +1921,9 @@ mod tests {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };

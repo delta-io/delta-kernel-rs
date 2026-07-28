@@ -14,7 +14,7 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel_unity_catalog::UCCommitter;
 use tracing::debug;
 use unity_catalog_delta_client_api::{
-    Result as ApiResult, TableName, UpdateTableClient,
+    Result as ApiResult, TableIdentifier, UpdateTableClient,
     UpdateTableRequest as ClientUpdateTableRequest,
 };
 
@@ -69,7 +69,7 @@ impl UpdateTableClient for FfiUCCommitClient {
     /// Commit a new version to the table.
     async fn update_table(
         &self,
-        _target: &TableName,
+        _target: &TableIdentifier,
         request: ClientUpdateTableRequest,
     ) -> ApiResult<()> {
         let table_id = request
@@ -245,7 +245,7 @@ fn get_uc_committer_impl(
         inner: UCCommitter::new(
             client,
             table_id_str,
-            TableName::new(catalog_str, schema_str, table_name_str),
+            TableIdentifier::new(catalog_str, schema_str, table_name_str),
         ),
     });
     Ok(committer.into())
@@ -374,7 +374,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let target = TableName::new("test_catalog", "test_schema", "test_table");
+        let target = TableIdentifier::new("test_catalog", "test_schema", "test_table");
         let result: ApiResult<()> = client_arc.update_table(&target, request).await;
 
         assert!(result.is_ok());
@@ -417,7 +417,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let target = TableName::new("test_catalog", "test_schema", "test_table");
+        let target = TableIdentifier::new("test_catalog", "test_schema", "test_table");
         let result: ApiResult<()> = client_arc.update_table(&target, request).await;
 
         assert!(result.is_err());

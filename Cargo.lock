@@ -1317,7 +1317,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unity-catalog-delta-client-api",
- "unity-catalog-delta-rest-client",
+ "unity-catalog-delta-client-default",
  "url",
 ]
 
@@ -1389,7 +1389,7 @@ dependencies = [
  "test_utils",
  "tokio",
  "unity-catalog-delta-client-api",
- "unity-catalog-delta-rest-client",
+ "unity-catalog-delta-client-default",
  "ureq",
  "url",
 ]
@@ -4842,7 +4842,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "unity-catalog-delta-rest-client"
+name = "unity-catalog-delta-client-default"
 version = "0.26.0"
 dependencies = [
  "reqwest 0.13.2",

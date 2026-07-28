@@ -1,7 +1,7 @@
 # Creating Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-rest-client, unity-catalog-delta-client-api -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-default, unity-catalog-delta-client-api -->
 
 To create a new Unity Catalog-managed Delta table, you register the table with
 your UC server to obtain a table ID and storage location, write a version 0
@@ -16,7 +16,7 @@ Before reading this page, make sure you understand
 > The create flow is not yet wired end-to-end. `UCCommitter::commit` currently
 > rejects version 0 (see #2826), so Step 3 does not work yet. This page
 > documents the intended flow. In addition, Steps 1 and 5 call UC endpoints that
-> the Rust `unity-catalog-delta-rest-client` crate does not yet expose. Route
+> the Rust `unity-catalog-delta-client-default` crate does not yet expose. Route
 > those through your connector's own UC client.
 
 ## Prerequisites
@@ -28,7 +28,7 @@ Before reading this page, make sure you understand
 ## Step 1: Reserve the table in Unity Catalog
 
 ```rust,ignore
-// TODO: not yet exposed by `unity-catalog-delta-rest-client`. Call through
+// TODO: not yet exposed by `unity-catalog-delta-client-default`. Call through
 // your connector's own UC client.
 let staging_info = my_uc_client.get_staging_table(
     "main.default.my_table",
@@ -66,8 +66,8 @@ use std::sync::Arc;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::UCCommitter;
-use unity_catalog_delta_client_api::{Operation, TableName};
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_client_api::{Operation, TableIdentifier};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 let config = ClientConfig::build(&endpoint, &token).build()?;
 let uc_client = UCClient::new(config.clone())?;
@@ -83,7 +83,7 @@ let engine = build_engine_with_credentials(&table_uri, &creds)?;
 let committer = Box::new(UCCommitter::new(
     update_client.clone(),
     table_id.clone(),
-    TableName::new("main", "default", "my_table"),
+    TableIdentifier::new("main", "default", "my_table"),
 ));
 let create_txn = create_table(table_uri.as_str(), Arc::new(schema), "MyApp/1.0")
     .with_table_properties(disk_props)
@@ -141,7 +141,7 @@ The returned map contains:
 ## Step 5: Finalize the table in Unity Catalog
 
 ```rust,ignore
-// TODO: not yet exposed by `unity-catalog-delta-rest-client`. Call through
+// TODO: not yet exposed by `unity-catalog-delta-client-default`. Call through
 // your connector's own UC client.
 my_uc_client.create_table(&table_id, uc_props).await?;
 ```

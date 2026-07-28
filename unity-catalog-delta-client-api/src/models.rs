@@ -64,15 +64,15 @@ pub enum DeltaTableUpdate {
     },
 }
 
-/// The three-part name identifying a UC table, used to route requests.
+/// The three-part identifier for a UC table (catalog, schema, table), used to route requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableName {
+pub struct TableIdentifier {
     pub catalog: String,
     pub schema: String,
     pub table: String,
 }
 
-impl TableName {
+impl TableIdentifier {
     pub fn new(
         catalog: impl Into<String>,
         schema: impl Into<String>,
@@ -102,24 +102,36 @@ impl UpdateTableRequest {
     ///
     /// # Errors
     ///
-    /// Returns an error if `requirements` contains more than one `AssertTableUuid` or more than
-    /// one `AssertEtag` requirement.
+    /// Returns an error if a singleton entry appears more than once: at most one `AssertTableUuid`
+    /// and one `AssertEtag` requirement, and at most one `SetLatestBackfilledVersion` update.
+    /// `AddCommit` may appear multiple times (a batch of staged commits).
     pub fn new(
         requirements: Vec<DeltaTableRequirement>,
         updates: Vec<DeltaTableUpdate>,
     ) -> crate::error::Result<Self> {
-        let count = |is_variant: fn(&DeltaTableRequirement) -> bool| {
+        let requirement_count = |is_variant: fn(&DeltaTableRequirement) -> bool| {
             requirements.iter().filter(|r| is_variant(r)).count()
         };
-        if count(|r| matches!(r, DeltaTableRequirement::AssertTableUuid { .. })) > 1 {
+        if requirement_count(|r| matches!(r, DeltaTableRequirement::AssertTableUuid { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one AssertTableUuid requirement"
                     .to_string(),
             ));
         }
-        if count(|r| matches!(r, DeltaTableRequirement::AssertEtag { .. })) > 1 {
+        if requirement_count(|r| matches!(r, DeltaTableRequirement::AssertEtag { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one AssertEtag requirement"
+                    .to_string(),
+            ));
+        }
+        let backfilled_version_count = updates
+            .iter()
+            .filter(|u| matches!(u, DeltaTableUpdate::SetLatestBackfilledVersion { .. }))
+            .count();
+        if backfilled_version_count > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one SetLatestBackfilledVersion \
+                 update"
                     .to_string(),
             ));
         }
@@ -469,6 +481,42 @@ mod tests {
                 DeltaTableRequirement::AssertEtag { etag: "e1".into() },
             ],
             vec![],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn new_rejects_duplicate_set_latest_backfilled_version() {
+        assert!(
+            UpdateTableRequest::new(
+                vec![],
+                vec![
+                    DeltaTableUpdate::SetLatestBackfilledVersion {
+                        latest_published_version: 1,
+                    },
+                    DeltaTableUpdate::SetLatestBackfilledVersion {
+                        latest_published_version: 2,
+                    },
+                ],
+            )
+            .is_err(),
+            "more than one SetLatestBackfilledVersion must be rejected"
+        );
+
+        // Multiple AddCommit updates are allowed (a batch of staged commits).
+        assert!(UpdateTableRequest::new(
+            vec![],
+            vec![
+                DeltaTableUpdate::AddCommit {
+                    commit: sample_commit(),
+                },
+                DeltaTableUpdate::AddCommit {
+                    commit: sample_commit(),
+                },
+                DeltaTableUpdate::SetLatestBackfilledVersion {
+                    latest_published_version: 3,
+                },
+            ],
         )
         .is_ok());
     }

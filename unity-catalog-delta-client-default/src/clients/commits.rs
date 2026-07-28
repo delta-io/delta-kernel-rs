@@ -1,5 +1,5 @@
 use tracing::instrument;
-use unity_catalog_delta_client_api::{TableName, UpdateTableClient, UpdateTableRequest};
+use unity_catalog_delta_client_api::{TableIdentifier, UpdateTableClient, UpdateTableRequest};
 use url::Url;
 
 use crate::config::ClientConfig;
@@ -34,7 +34,7 @@ impl UpdateTableClient for UCUpdateTableRestClient {
     #[instrument(skip(self))]
     async fn update_table(
         &self,
-        target: &TableName,
+        target: &TableIdentifier,
         request: UpdateTableRequest,
     ) -> unity_catalog_delta_client_api::Result<()> {
         let result: crate::error::Result<()> = async {

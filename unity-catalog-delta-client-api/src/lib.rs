@@ -5,7 +5,7 @@
 //! kernel-uc's `UCCommitter` dispatches through, plus serde-friendly wire
 //! models for the connector-driven endpoints (`load_table`, credentials,
 //! `/config`). Concrete HTTP implementations live in
-//! `unity-catalog-delta-rest-client`.
+//! `unity-catalog-delta-client-default`.
 //!
 //! Only `update_table` (the commit RPC) is behind a trait. Read and
 //! credential-vending flows are connector-driven: connectors call concrete
@@ -35,5 +35,5 @@ pub use error::{Error, Result};
 pub use models::{
     CatalogConfig, Commit, CreateStagingTableRequest, CreateStagingTableResponse,
     CreateTableRequest, DeltaTableRequirement, DeltaTableUpdate, LoadTableResponse, Protocol,
-    TableMetadata, TableName, UpdateTableRequest,
+    TableIdentifier, TableMetadata, UpdateTableRequest,
 };

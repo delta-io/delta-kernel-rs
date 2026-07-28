@@ -8,7 +8,7 @@ use delta_kernel::{
 };
 use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
-    Commit, DeltaTableRequirement, DeltaTableUpdate, TableName, UpdateTableClient,
+    Commit, DeltaTableRequirement, DeltaTableUpdate, TableIdentifier, UpdateTableClient,
     UpdateTableRequest,
 };
 
@@ -27,6 +27,21 @@ macro_rules! require {
     };
 }
 
+/// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
+fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
+    value
+        .try_into()
+        .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
+}
+
+fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
+    path.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| DeltaError::generic("staged commit path has no file name"))
+}
+
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
@@ -43,13 +58,17 @@ macro_rules! require {
 pub struct UCCommitter<C: UpdateTableClient> {
     update_table_client: Arc<C>,
     table_id: String,
-    table: TableName,
+    table: TableIdentifier,
 }
 
 impl<C: UpdateTableClient> UCCommitter<C> {
     /// Build a committer that issues commits for the UC-managed table `table` via
     /// `update_table_client`.
-    pub fn new(update_table_client: Arc<C>, table_id: impl Into<String>, table: TableName) -> Self {
+    pub fn new(
+        update_table_client: Arc<C>,
+        table_id: impl Into<String>,
+        table: TableIdentifier,
+    ) -> Self {
         UCCommitter {
             update_table_client,
             table_id: table_id.into(),
@@ -185,37 +204,18 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         let committed = engine.storage_handler().head(&staged_commit_path)?;
         debug!("wrote staged commit file: {:?}", committed);
 
-        let file_name = staged_commit_path
-            .path_segments()
-            .ok_or_else(|| DeltaError::generic("staged commit contained no path segments"))?
-            .next_back()
-            .ok_or_else(|| DeltaError::generic("staged commit segments next_back was empty"))?
-            .to_string();
-        let version_i64: i64 = commit_metadata.version().try_into().map_err(|_| {
-            DeltaError::generic("commit version does not fit into i64 for UC commit")
-        })?;
-        let file_size_i64: i64 = committed
-            .size
-            .try_into()
-            .map_err(|_| DeltaError::generic("committed size does not fit into i64"))?;
-
         let mut updates = vec![DeltaTableUpdate::AddCommit {
             commit: Commit {
-                version: version_i64,
+                version: u64_to_wire_i64(commit_metadata.version(), "commit version")?,
                 timestamp: commit_metadata.in_commit_timestamp(),
-                file_name,
-                file_size: file_size_i64,
+                file_name: staged_commit_file_name(&staged_commit_path)?,
+                file_size: u64_to_wire_i64(committed.size, "committed size")?,
                 file_modification_timestamp: committed.last_modified,
             },
         }];
         if let Some(max_pub) = commit_metadata.max_published_version() {
-            let v: i64 = max_pub.try_into().map_err(|_| {
-                DeltaError::Generic(format!(
-                    "Max published version {max_pub} does not fit into i64 for UC commit"
-                ))
-            })?;
             updates.push(DeltaTableUpdate::SetLatestBackfilledVersion {
-                latest_published_version: v,
+                latest_published_version: u64_to_wire_i64(max_pub, "max published version")?,
             });
         }
         let update_req = UpdateTableRequest::new(
@@ -313,7 +313,7 @@ mod tests {
     struct MockUpdateTableClient;
 
     impl UpdateTableClient for MockUpdateTableClient {
-        async fn update_table(&self, _: &TableName, _: UpdateTableRequest) -> Result<()> {
+        async fn update_table(&self, _: &TableIdentifier, _: UpdateTableRequest) -> Result<()> {
             unimplemented!()
         }
     }
@@ -322,7 +322,7 @@ mod tests {
         UCCommitter::new(
             Arc::new(MockUpdateTableClient),
             "test-table-id",
-            TableName::new("test_catalog", "test_schema", "test_table"),
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         )
     }
 
@@ -597,7 +597,7 @@ mod tests {
         let committer = UCCommitter::new(
             Arc::new(MockUpdateTableClient),
             "different-table-id",
-            TableName::new("test_catalog", "test_schema", "test_table"),
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
 
@@ -663,7 +663,7 @@ mod tests {
         let committer = UCCommitter::new(
             Arc::new(MockUpdateTableClient),
             "testUcTableId",
-            TableName::new("test_catalog", "test_schema", "test_table"),
+            TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         );
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         committer.publish(&engine, publish_metadata).unwrap();
