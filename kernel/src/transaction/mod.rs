@@ -417,7 +417,7 @@ impl<S> Transaction<S> {
         // each stats column.
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
-        // Validate required fields and partition-column completeness for addFile.
+        // Validate required fields for addFile.
         write_validation::StagedDataValidator::staged_add_file(
             self.effective_table_config.physical_partition_columns(),
         )

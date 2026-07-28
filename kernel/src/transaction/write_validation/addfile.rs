@@ -20,7 +20,7 @@ static MANDATORY_ADD_FILE_COLUMNS: LazyLock<ColumnNamesAndTypes> =
     LazyLock::new(|| mandatory_add_file_schema().leaves(None));
 
 impl StagedDataValidator {
-    /// Creates a validator for required add-file values.
+    /// Creates a validator that validates every staged add-file row.
     pub(crate) fn staged_add_file(
         physical_partition_columns: impl IntoIterator<Item = String>,
     ) -> Self {
@@ -366,13 +366,24 @@ mod tests {
         #[case] invalid_partition_values: &[(&str, Option<&str>)],
         #[case] physical_partition_columns: &[&str],
         #[case] expected_error: &str,
-        #[values(0, 1, 2)] invalid_row_index: usize,
+        #[values(0, 1, 2)] invalid_batch: usize,
+        #[values(0, 1, 2)] invalid_row: usize,
     ) {
-        let mut partition_values = [valid_partition_values; 3];
-        partition_values[invalid_row_index] = invalid_partition_values;
-        let batch = add_files_with_partition_values(&partition_values);
+        const BATCH_COUNT: usize = 3;
+        const ROW_COUNT: usize = 3;
+
+        let adds: Vec<Box<dyn EngineData>> = (0..BATCH_COUNT)
+            .map(|batch_index| {
+                let mut partition_values = [valid_partition_values; ROW_COUNT];
+                if batch_index == invalid_batch {
+                    partition_values[invalid_row] = invalid_partition_values;
+                }
+                let batch = add_files_with_partition_values(&partition_values);
+                Box::new(ArrowEngineData::new(batch)) as Box<dyn EngineData>
+            })
+            .collect();
         let error = add_file_validator(physical_partition_columns)
-            .validate(&as_engine_data(batch))
+            .validate(&adds)
             .expect_err("invalid partition values should be rejected");
         let Error::InvalidPartitionValues(message) = error else {
             panic!("expected InvalidPartitionValues, got {error:?}");
