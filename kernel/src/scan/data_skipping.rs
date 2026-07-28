@@ -715,6 +715,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             .map(Pred::literal)
     }
 
+    // TODO(#3011): Rewrite partition CASTs over exact values through the engine evaluator.
     fn eval_pred_cast(
         &self,
         _op: BinaryPredicateOp,
