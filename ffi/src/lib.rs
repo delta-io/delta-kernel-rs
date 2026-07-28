@@ -368,6 +368,60 @@ mod private {
         len: usize,
     }
 
+    /// An owned byte buffer allocated by the kernel. Any time the engine receives a
+    /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
+    /// must free it by calling [super::free_kernel_bytes] exactly once.
+    #[cfg(feature = "declarative-plans")]
+    #[repr(C)]
+    pub struct KernelOwnedBytes {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl KernelOwnedBytes {
+        /// Converts this buffer back into a `Vec<u8>`.
+        ///
+        /// # Safety
+        ///
+        /// The buffer must have been originally created `From<Vec<u8>>`, and must not have already
+        /// been consumed by a previous call to this method.
+        pub unsafe fn into_vec(self) -> Vec<u8> {
+            if self.len == 0 {
+                Default::default()
+            } else {
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
+            }
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl From<Vec<u8>> for KernelOwnedBytes {
+        fn from(val: Vec<u8>) -> Self {
+            let len = val.len();
+            let boxed = val.into_boxed_slice();
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            #[allow(clippy::expect_used)]
+            let ptr = NonNull::new(leaked_ptr)
+                .expect("This should never be null please report this bug.");
+            KernelOwnedBytes { ptr, len }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The engine assumes ownership of the buffer memory when kernel passes it a
+    /// [KernelOwnedBytes], but must only free it by calling [super::free_kernel_bytes]. Since the
+    /// global allocator is threadsafe, it doesn't matter which engine thread invokes that method.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Send for KernelOwnedBytes {}
+    /// # Safety
+    ///
+    /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Sync for KernelOwnedBytes {}
+
     impl KernelBoolSlice {
         /// Creates an empty slice.
         pub fn empty() -> KernelBoolSlice {
@@ -475,6 +529,8 @@ mod private {
         }
     }
 }
+#[cfg(feature = "declarative-plans")]
+pub use private::KernelOwnedBytes;
 pub use private::{KernelBoolSlice, KernelRowIndexArray};
 
 /// # Safety
@@ -492,6 +548,17 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 #[no_mangle]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
+}
+
+/// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
+    let _ = unsafe { bytes.into_vec() };
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void
