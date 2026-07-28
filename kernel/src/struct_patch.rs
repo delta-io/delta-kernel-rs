@@ -12,6 +12,35 @@
 //!   produces an output [`StructType`] directly from an input schema.
 //! * [`ProjectionStructPatchBuilder`] pairs each output field with the expression that produces it
 //!   and lowers both at once to a matched ([`SchemaRef`], `[ExpressionRef`]) pair.
+//!
+//! # Worked example
+//!
+//! Every builder call names one edit relative to an input field:
+//!
+//! ```ignore
+//! builder
+//!     .prepend(first)
+//!     .insert_after("a", x)
+//!     .replace("b", bb)
+//!     .drop("c")
+//!     .append(last)
+//! ```
+//!
+//! Applied to `{ a, b, c }`, walking the input fields in order:
+//!
+//! ```text
+//! input field:   (none)     a              b          c        (none)
+//! edit:          prepend    keep +after    replace    drop     append
+//! emits:         first      a, x           bb         nothing  last
+//!
+//! output:        { first, a, x, bb, last }
+//! ```
+//!
+//! Field `a` is untouched and passes through in place, which is what makes the patch cost
+//! `O(edits)` rather than `O(struct width)`. Only the expression side of a
+//! [`ProjectionStructPatchBuilder`] is sparse, since a schema has to enumerate every output field.
+//! The `_at` variants (e.g. [`insert_after_at`](StructPatchBuilder::insert_after_at)) apply the
+//! same edits to a nested struct named by path.
 
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;

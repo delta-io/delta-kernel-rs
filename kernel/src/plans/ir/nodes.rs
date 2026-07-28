@@ -19,15 +19,12 @@ use crate::{DeltaResult, Error, FileMeta};
 // Operator: enumerates every operator kind
 // ============================================================================
 
-/// Plan node operators.
+/// Plan node operators, grouped below by input arity. Each variant wraps a payload struct
+/// documenting that operator's semantics, invariants, and output shape.
 ///
-/// Output schemas are stored on the payload struct for operators whose caller
-/// declares them (`ScanParquet`, `ScanJson`, `Values`, `Load`, `Project`,
-/// `Aggregate`); the remaining operators pass an input's schema through
-/// unchanged:
-/// - `Filter` from its input.
-/// - `UnionAll` from its inputs' common schema.
-/// - `SemiJoin` from the probe input.
+/// An operator that reshapes its rows (a source, projection, aggregation, or file load) carries a
+/// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
+/// they inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display)]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
@@ -640,7 +637,10 @@ impl Agg {
     /// ```
     ///
     /// Equivalent to SQL `max_by(value, key) FILTER (WHERE value IS NOT NULL)`: `max_by` already
-    /// ignores NULL keys, and the filter additionally drops NULL values.
+    /// ignores NULL keys, and the filter additionally drops NULL values. The filter is required,
+    /// not decorative: an engine's native `max_by` typically retains NULL values, so lowering
+    /// to it unfiltered returns NULL whenever the greatest-key row has a NULL value, instead of
+    /// the next-greatest row that has one.
     ///
     /// In systems without `max_by`, it can also be expressed using window functions:
     ///

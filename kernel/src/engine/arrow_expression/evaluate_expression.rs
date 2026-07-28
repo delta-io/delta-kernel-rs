@@ -1091,17 +1091,18 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, LargeStringArray, MapBuilder,
-        StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, MapBuilder, StringArray, StringBuilder, StructArray,
+        TimestampMicrosecondArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        col, column_expr, column_expr_ref, lit, BinaryExpressionOp, Expression as Expr,
-        ExpressionStructPatchBuilder,
+        col, column_expr, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
+        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, Predicate as Pred,
     };
-    use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
+    use crate::schema::{schema, schema_ref, ArrayType, DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn create_test_batch() -> RecordBatch {
@@ -1866,6 +1867,200 @@ mod tests {
         assert_result_error_with_message(result, "Incorrect datatype");
     }
 
+    fn divide(left: Expr, right: Expr) -> Expr {
+        Expr::binary(BinaryExpressionOp::Divide, left, right)
+    }
+
+    #[rstest]
+    #[case::equal_non_null(Some(1), Some(1), false)]
+    #[case::unequal_non_null(Some(1), Some(2), true)]
+    #[case::both_null(None, None, false)]
+    #[case::left_null(None, Some(1), true)]
+    #[case::right_null(Some(1), None, true)]
+    fn test_distinct_is_null_safe(
+        #[case] left: Option<i32>,
+        #[case] right: Option<i32>,
+        #[case] expected: bool,
+    ) {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("l", ArrowDataType::Int32, true),
+            ArrowField::new("r", ArrowDataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![left])),
+                Arc::new(Int32Array::from(vec![right])),
+            ],
+        )
+        .unwrap();
+
+        let pred = Pred::distinct(column_expr!("l"), column_expr!("r"));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(result.value(0), expected);
+    }
+
+    #[rstest]
+    #[case::present(2, true)]
+    #[case::absent(9, false)]
+    fn test_in_matches_literal_array_membership(#[case] needle: i32, #[case] expected: bool) {
+        let schema = ArrowSchema::new(vec![ArrowField::new("n", ArrowDataType::Int32, true)]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+
+        let elements = ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, false),
+            vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
+        )
+        .unwrap();
+        let pred = Pred::binary(
+            BinaryPredicateOp::In,
+            lit(needle),
+            Expr::Literal(Scalar::Array(elements)),
+        );
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result.value(0), expected);
+    }
+
+    #[rstest]
+    #[case::column_in_literal_array(true)]
+    #[case::non_array_right_operand(false)]
+    fn test_in_rejects_unsupported_operand_shapes(#[case] array_rhs: bool) {
+        let schema = ArrowSchema::new(vec![ArrowField::new("n", ArrowDataType::Int32, true)]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+
+        let rhs = if array_rhs {
+            let elements =
+                ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), vec![1, 2, 3])
+                    .unwrap();
+            Expr::Literal(Scalar::Array(elements))
+        } else {
+            lit(1)
+        };
+        let pred = Pred::binary(BinaryPredicateOp::In, column_expr!("n"), rhs);
+        assert_result_error_with_message(
+            evaluate_predicate(&pred, &batch, false),
+            "Invalid right value for (NOT) IN comparison",
+        );
+    }
+
+    #[rstest]
+    #[case::is_null(false, &[false, true])]
+    #[case::is_not_null(true, &[true, false])]
+    fn test_is_null_never_yields_null(#[case] inverted: bool, #[case] expected: &[bool]) {
+        let schema = ArrowSchema::new(vec![ArrowField::new("n", ArrowDataType::Int32, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+
+        let pred = Pred::is_null(column_expr!("n"));
+        let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[rstest]
+    #[case::and_false_beats_null(JunctionPredicateOp::And, Some(false), None, Some(false))]
+    #[case::and_null_left_false_right(JunctionPredicateOp::And, None, Some(false), Some(false))]
+    #[case::and_true_with_null_is_null(JunctionPredicateOp::And, Some(true), None, None)]
+    #[case::and_both_null_is_null(JunctionPredicateOp::And, None, None, None)]
+    #[case::or_true_beats_null(JunctionPredicateOp::Or, Some(true), None, Some(true))]
+    #[case::or_null_left_true_right(JunctionPredicateOp::Or, None, Some(true), Some(true))]
+    #[case::or_false_with_null_is_null(JunctionPredicateOp::Or, Some(false), None, None)]
+    #[case::or_both_null_is_null(JunctionPredicateOp::Or, None, None, None)]
+    fn test_junction_uses_kleene_logic(
+        #[case] op: JunctionPredicateOp,
+        #[case] left: Option<bool>,
+        #[case] right: Option<bool>,
+        #[case] expected: Option<bool>,
+    ) {
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", ArrowDataType::Int32, false)]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+
+        let operand = |v: Option<bool>| match v {
+            Some(b) => Pred::literal(b),
+            None => Pred::null_literal(),
+        };
+        let pred = Pred::junction(op, [operand(left), operand(right)]);
+
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        let actual = result.is_valid(0).then(|| result.value(0));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_divide_integer_truncates_and_rejects_zero_divisor() {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("n", ArrowDataType::Int32, false),
+            ArrowField::new("d", ArrowDataType::Int32, false),
+            ArrowField::new("zero", ArrowDataType::Int32, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        let quotient = evaluate_expression(
+            &divide(column_expr!("n"), column_expr!("d")),
+            &batch,
+            Some(&DataType::INTEGER),
+        )
+        .unwrap();
+        assert_eq!(
+            quotient.as_any().downcast_ref::<Int32Array>().unwrap(),
+            &Int32Array::from(vec![3])
+        );
+
+        let result = evaluate_expression(
+            &divide(column_expr!("n"), column_expr!("zero")),
+            &batch,
+            Some(&DataType::INTEGER),
+        );
+        assert_result_error_with_message(result, "Divide by zero");
+    }
+
+    #[test]
+    fn test_divide_float_by_zero_yields_infinity_and_nan() {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("n", ArrowDataType::Float64, false),
+            ArrowField::new("zero", ArrowDataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(vec![7.0])),
+                Arc::new(Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+
+        let eval = |expr| {
+            let array = evaluate_expression(&expr, &batch, Some(&DataType::DOUBLE)).unwrap();
+            assert_eq!(array.null_count(), 0);
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0)
+        };
+
+        assert!(eval(divide(column_expr!("n"), column_expr!("zero"))).is_infinite());
+        assert!(eval(divide(column_expr!("zero"), column_expr!("zero"))).is_nan());
+    }
+
     fn create_json_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
         let json_strings = StringArray::from(vec![
@@ -1874,6 +2069,35 @@ mod tests {
             Some(r#"{"a": 3, "b": "test"}"#),
         ]);
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap()
+    }
+
+    /// An empty string is not valid JSON, so it does not parse to an empty struct. A single
+    /// unparseable input nulls the whole batch rather than only its own row, while a NULL input
+    /// decodes as `{}` and leaves the batch intact.
+    #[rstest]
+    #[case::empty_string(vec![Some("")], 1)]
+    #[case::malformed(vec![Some("{not json")], 1)]
+    #[case::one_bad_input_nulls_whole_batch(vec![Some(""), Some(r#"{"a":1}"#)], 2)]
+    #[case::null_input_is_empty_object(vec![None], 0)]
+    fn test_parse_json_permissively_nulls_unparseable_batches(
+        #[case] input: Vec<Option<&str>>,
+        #[case] expected_null_count: usize,
+    ) {
+        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "a",
+            DataType::LONG,
+        )]));
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(input.clone()))],
+        )
+        .unwrap();
+
+        let expr = Expr::parse_json(column_expr!("s"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
+        assert_eq!(result.len(), input.len());
+        assert_eq!(result.null_count(), expected_null_count);
     }
 
     #[test]
