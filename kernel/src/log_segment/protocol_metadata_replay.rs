@@ -206,12 +206,49 @@ impl LogSegment {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use itertools::Itertools;
     use test_log::test;
 
     use crate::engine::sync::SyncEngine;
-    use crate::Snapshot;
+    use crate::plans::{Operation, PlanExecutor, PlanResult};
+    use crate::{
+        DeltaResult, Engine, Error, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot,
+        StorageHandler,
+    };
+
+    // A [`PlanExecutor`] whose every operation fails, used to prove that a plan-path failure
+    // surfaces from P&M replay rather than falling back to legacy replay.
+    struct FailingPlanExecutor;
+
+    impl PlanExecutor for FailingPlanExecutor {
+        fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
+            Err(Error::generic("plan executor deliberately failed"))
+        }
+    }
+
+    // Forwards every handler to an inner [`SyncEngine`] but returns a [`FailingPlanExecutor`], so
+    // P&M replay takes the plan path and hits the failure.
+    struct FailingPlanEngine(Arc<SyncEngine>);
+
+    impl Engine for FailingPlanEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.0.evaluation_handler()
+        }
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            self.0.storage_handler()
+        }
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            self.0.json_handler()
+        }
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            self.0.parquet_handler()
+        }
+        fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+            Some(Arc::new(FailingPlanExecutor))
+        }
+    }
 
     // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
     // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
@@ -263,7 +300,8 @@ mod tests {
     // `WriterProperties::coerce_types`, which is off by default, and Arrow's own
     // `MapFieldNames::default()` is `entries`. So a writer that builds its maps from Arrow defaults
     // produces a file kernel must translate on read. Spark and kernel both write `key_value`,
-    // covered by `scan_plan::tests::declarative_metadata_reconciles_checkpoint_with_later_commits`.
+    // covered by
+    // `scan_plan::execution_tests::declarative_metadata_reconciles_checkpoint_with_later_commits`.
     #[test]
     fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_entries_named_maps() {
         let path =
@@ -291,5 +329,20 @@ mod tests {
 
         assert_eq!(snapshot.version(), 5);
         assert_eq!(snapshot.schema().fields().count(), 5);
+    }
+
+    #[test]
+    fn test_snapshot_build_via_failing_plan_executor_surfaces_error_without_fallback() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = FailingPlanEngine(Arc::new(SyncEngine::new()));
+
+        let result = Snapshot::builder_for(url).build(&engine);
+
+        assert!(
+            result.is_err(),
+            "plan failure must surface, not fall back to legacy replay"
+        );
     }
 }

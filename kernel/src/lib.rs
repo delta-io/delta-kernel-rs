@@ -1091,6 +1091,17 @@ pub trait Engine: AsAny {
     fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
         None
     }
+
+    /// Get the connector provided [`PlanExecutor`], erroring if this engine provides none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
+    #[cfg(feature = "declarative-plans")]
+    fn require_plan_executor(&self) -> DeltaResult<Arc<dyn PlanExecutor>> {
+        self.plan_executor()
+            .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))
+    }
 }
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are

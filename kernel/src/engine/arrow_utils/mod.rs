@@ -1377,6 +1377,14 @@ fn cast_array_to_type(
         ArrowDataType::Struct(target_fields) => {
             let s = array.as_struct();
             let nulls = s.nulls().cloned();
+            require!(
+                s.columns().len() == target_fields.len(),
+                Error::generic(format!(
+                    "cannot cast struct with {} children to target with {} fields",
+                    s.columns().len(),
+                    target_fields.len()
+                ))
+            );
             let new_children = s
                 .columns()
                 .iter()
