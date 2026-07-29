@@ -10,23 +10,26 @@ use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
-use super::PhysicalPredicate;
+use super::{PhysicalPredicate, Scan, StructStats};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
-    ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
+    ADD_FIELD, ADD_NAME, ADD_SCHEMA, NULL_COUNT, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME,
+    STATS_PARSED,
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
     col, column_name, joined_column_expr, ColumnName, Expression as Expr, Predicate,
+    UnaryExpressionOp,
 };
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, ToSchema as _,
+    StructField, StructType, ToSchema as _,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::table_features::get_any_level_column_physical_name;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, PlanBuilder};
@@ -42,195 +45,206 @@ const PARTITION_VALUES: &str = "partitionValues";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
 // Generated partition pruning predicates reference this to retain removes.
 const IS_ADD: &str = "is_add";
+const RAW_PARTITION_VALUES: &str = "__raw_partition_values";
+const RAW_STATS: &str = "__raw_stats";
 const VERSION: &str = "version";
 
-/// Build the live-add metadata plan from checkpoint and commit actions.
-///
-/// Returns `None` for an empty result or a statically false predicate.
-pub(crate) fn build_metadata_scan_plan(
-    state: &StateInfo,
-    log_segment: &LogSegment,
-    shape: &CheckpointShape,
-) -> DeltaResult<Option<Plan>> {
-    // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
-    if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
-        return Ok(None);
+impl Scan {
+    /// Build the live-add metadata plan from checkpoint and commit actions.
+    ///
+    /// Returns `None` for an empty result or a statically false predicate.
+    pub(super) fn build_metadata_scan_plan(
+        &self,
+        log_segment: &LogSegment,
+        shape: &CheckpointShape,
+    ) -> DeltaResult<Option<Plan>> {
+        let state = &self.state_info;
+        // A statically-unsatisfiable predicate (e.g. `x > 10 AND FALSE`) skips the whole table.
+        if state.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
+
+        let stats_schema = self.metadata_stats_read_schema();
+        let partition_schema = state.physical_partition_schema.as_ref();
+        let stats_output_schema = self.metadata_stats_output_schema()?;
+        let partition_output_schema = self.metadata_partition_output_schema();
+        let prune = (!self.skip_stats())
+            .then(|| stats_skipping_predicate(state))
+            .flatten();
+        let prune = prune.as_ref();
+
+        // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's
+        // dedup carrier and both terminal `{ add }` projections, so every arm agrees on the
+        // union schema.
+        let add_field = add_field_with_parsed_stats_and_partitions(stats_schema, partition_schema)?;
+        let output_schema = schema_ref! {
+            (output_add_field(stats_output_schema.as_ref(), partition_output_schema)?)
+        };
+        let output_expr = Expr::struct_from([output_add_expr(
+            stats_output_schema.as_ref(),
+            partition_output_schema,
+            self.stats.synthesize_json || stats_output_schema.is_some(),
+        )]);
+
+        let commit_actions = self
+            .commit_arm(log_segment)?
+            .try_fold_with(prune, |p, prune| {
+                // We filter so that:
+                // * All remove actions are kept
+                // * Add actions that do not match the partition pruning or stats predicate are
+                //   removed.
+                //
+                // NOTE: It is important that add actions are filtered by the partition predicate
+                // because partition filtering may not be applied on data rows. On the other
+                // hand, failing to skip based on data columns is safe because the data
+                // predicate will also be evaluated on data rows. Thus it is crucial that we
+                // partition prune adds here.
+                //
+                // NOTE: It is not safe to prune remove actions using the partition filter. This is
+                // because a NULL result for `remove.partitionValues.partCol` may be due to
+                // `remove.partitionValues` being NULL, or it may be from `partCol` being
+                // NULL. Thus, we simply do not prune removes.
+                p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
+            })?;
+
+        let deduped_commit = commit_actions
+            // Wrap `add` so removes, whose inner `add` is null, survive `MaxNonNullBy`. Unwrap it
+            // after aggregation.
+            .project_patch(|patch| {
+                patch.replace(
+                    ADD_NAME,
+                    StructField::not_null(ADD_NAME, schema! { (add_field.clone()) }),
+                    Expr::struct_from([col!("add")]),
+                )
+            })?
+            .aggregate_by([ColumnName::new([FILE_ACTION_KEY])], |a| {
+                a.max_non_null_by(ColumnName::new([ADD_NAME]), ColumnName::new([VERSION]))
+            })?
+            // We unwrap `add.add` to the top level now that MaxNonNullBy is complete.
+            .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
+
+        let checkpoint_adds = self
+            .checkpoint_arm(log_segment, shape)?
+            .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+
+        let checkpoint_live_adds = checkpoint_adds
+            .anti_join(
+                deduped_commit.clone(),
+                [ColumnName::new([FILE_ACTION_KEY])],
+                [ColumnName::new([FILE_ACTION_KEY])],
+            )?
+            .project(output_expr.clone(), output_schema.clone())?;
+
+        let commit_live_adds = deduped_commit
+            .filter(col!("add").is_not_null())?
+            .project(output_expr, output_schema)?;
+
+        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
     }
 
-    let stats_schema = state.physical_stats_schema.as_ref();
-    let partition_schema = state.physical_partition_schema.as_ref();
-    let prune = stats_skipping_predicate(state);
-    let prune = prune.as_ref();
+    /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
+    ///
+    /// ## SQL equivalent:
+    //
+    /// SELECT STRUCT(
+    ///          add.* EXCEPT (
+    ///            stats, stats_parsed, partitionValues, partitionValues_parsed
+    ///          ),
+    ///          COALESCE(
+    ///            add.stats_parsed, FROM_JSON(add.stats, stats_schema)
+    ///          ) AS stats,
+    ///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
+    ///        ) AS add,
+    ///        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
+    /// FROM checkpoint_actions
+    /// WHERE add.path IS NOT NULL
+    fn checkpoint_arm(
+        &self,
+        log_segment: &LogSegment,
+        shape: &CheckpointShape,
+    ) -> DeltaResult<PlanBuilder> {
+        let source_stats_schema = shape.parsed_stats_schema.as_ref();
+        let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
-    // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's dedup
-    // carrier and both terminal `{ add }` projections, so every arm agrees on the union schema.
-    let add_field = add_field_with_parsed_stats_and_partitions(stats_schema, partition_schema)?;
-    let output_schema = schema_ref! { (&add_field) };
-
-    let commit_actions = commit_arm(log_segment, stats_schema, partition_schema)?.try_fold_with(
-        prune,
-        |p, prune| {
-            // We filter so that:
-            // * All remove actions are kept
-            // * Add actions that do not match the partition pruning or stats predicate are removed.
-            //
-            // NOTE: It is important that add actions are filtered by the partition predicate
-            // because partition filtering may not be applied on data rows. On the other
-            // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-            // prune adds here.
-            //
-            // NOTE: It is not safe to prune remove actions using the partition filter. This is
-            // because a NULL result for `remove.partitionValues.partCol` may be due to
-            // `remove.partitionValues` being NULL, or it may be from `partCol` being
-            // NULL. Thus, we simply do not prune removes.
-            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-        },
-    )?;
-
-    let deduped_commit = commit_actions
-        // Wrap `add` so removes, whose inner `add` is null, survive `MaxNonNullBy`. Unwrap it
-        // after aggregation.
-        .project_patch(|patch| {
-            patch.replace(
-                ADD_NAME,
-                StructField::not_null(ADD_NAME, schema! { (add_field.clone()) }),
-                Expr::struct_from([col!("add")]),
-            )
-        })?
-        .aggregate_by([ColumnName::new([FILE_ACTION_KEY])], |a| {
-            a.max_non_null_by(ColumnName::new([ADD_NAME]), ColumnName::new([VERSION]))
-        })?
-        // We unwrap `add.add` to the top level now that MaxNonNullBy is complete.
-        .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
-
-    let checkpoint_adds = checkpoint_arm(log_segment, shape, stats_schema, partition_schema)?
-        .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
-
-    let checkpoint_live_adds = checkpoint_adds
-        .anti_join(
-            deduped_commit.clone(),
-            [ColumnName::new([FILE_ACTION_KEY])],
-            [ColumnName::new([FILE_ACTION_KEY])],
-        )?
-        .project(Expr::struct_from([col!("add")]), output_schema.clone())?;
-
-    let commit_live_adds = deduped_commit
-        .filter(col!("add").is_not_null())?
-        .project(Expr::struct_from([col!("add")]), output_schema)?;
-
-    PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
-}
-
-/// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
-///
-/// ## SQL equivalent:
-//
-/// SELECT STRUCT(
-///          add.* EXCEPT (
-///            stats, stats_parsed, partitionValues, partitionValues_parsed
-///          ),
-///          COALESCE(
-///            add.stats_parsed, FROM_JSON(add.stats, stats_schema)
-///          ) AS stats,
-///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
-///        ) AS add,
-///        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
-/// FROM checkpoint_actions
-/// WHERE add.path IS NOT NULL
-fn checkpoint_arm(
-    log_segment: &LogSegment,
-    shape: &CheckpointShape,
-    stats_schema: Option<&SchemaRef>,
-    partition_schema: Option<&SchemaRef>,
-) -> DeltaResult<PlanBuilder> {
-    let source_stats_schema = shape.parsed_stats_schema.as_ref();
-    let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
-
-    let actions = match (&shape.checkpoint_type, checkpoint) {
-        (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-            let schema = parquet_read_schema(source_stats_schema, None)?;
-            PlanBuilder::scan_parquet(parts, &[VERSION], schema)
-        }
-        (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
-            PlanBuilder::scan_json(
-                parts,
-                &[VERSION],
-                json_read_schema(/* include_remove */ false),
-            )
-        }
-        (CheckpointType::Manifest, Some((file_type, parts))) => {
-            let schema = parquet_read_schema(source_stats_schema, None)?;
-            match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
-                // Without a complete hint, load the sidecars referenced by the manifest.
-                None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+        let actions = match (&shape.checkpoint_type, checkpoint) {
+            (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
+                let schema = parquet_read_schema(source_stats_schema, None)?;
+                PlanBuilder::scan_parquet(parts, &[VERSION], schema)
             }
-        }
-        (CheckpointType::None, _) | (_, None) => {
-            PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
-        }
-    }?;
+            (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
+                PlanBuilder::scan_json(
+                    parts,
+                    &[VERSION],
+                    json_read_schema(/* include_remove */ false),
+                )
+            }
+            (CheckpointType::Manifest, Some((file_type, parts))) => {
+                let schema = parquet_read_schema(source_stats_schema, None)?;
+                match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
+                    Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
+                    // Without a complete hint, load the sidecars referenced by the manifest.
+                    None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+                }
+            }
+            (CheckpointType::None, _) | (_, None) => {
+                PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
+            }
+        }?;
 
-    actions
-        .filter(col!("add.path").is_not_null())?
-        .project_patch(|patch| {
-            patch
-                .with_parsed_add_stats_and_partitions(stats_schema, partition_schema)
-                .append(
-                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                    Expr::from(col!("add.path").is_not_null()),
-                )
-                .append(
-                    FILE_ACTION_KEY_FIELD.clone(),
-                    file_action_key_expr(|col| joined_column_expr!("add", col)),
-                )
-        })
-}
+        actions
+            .filter(col!("add.path").is_not_null())?
+            .project_patch(|patch| {
+                self.with_parsed_add_stats_and_partitions(patch)
+                    .append(
+                        StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                        Expr::from(col!("add.path").is_not_null()),
+                    )
+                    .append(
+                        FILE_ACTION_KEY_FIELD.clone(),
+                        file_action_key_expr(|col| joined_column_expr!("add", col)),
+                    )
+            })
+    }
 
-/// Build the normalized commit JSON arm.
-///
-/// ## SQL equivalent:
-///
-/// SELECT STRUCT(
-///          add.* EXCEPT (stats, partitionValues),
-///          FROM_JSON(add.stats, stats_schema) AS stats,
-///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
-///        ) AS add,
-///        remove, version, add.path IS NOT NULL AS is_add,
-///        file_key(COALESCE(add, remove)) AS key
-/// FROM json_commits
-/// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
-fn commit_arm(
-    log_segment: &LogSegment,
-    stats_schema: Option<&SchemaRef>,
-    partition_schema: Option<&SchemaRef>,
-) -> DeltaResult<PlanBuilder> {
-    let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-    PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
-        .filter(Predicate::or(
-            col!("add.path").is_not_null(),
-            col!("remove.path").is_not_null(),
-        ))?
-        .project_patch(|patch| {
-            // Commits never carry source-native parsed columns, so normalize from the raw
-            // encodings.
-            patch
-                .with_parsed_add_stats_and_partitions(stats_schema, partition_schema)
-                .append(
-                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                    Expr::from(col!("add.path").is_not_null()),
-                )
-                .append(
-                    FILE_ACTION_KEY_FIELD.clone(),
-                    file_action_key_expr(|col| {
-                        Expr::coalesce([
-                            joined_column_expr!("add", col),
-                            joined_column_expr!("remove", col),
-                        ])
-                    }),
-                )
-        })
+    /// Build the normalized commit JSON arm.
+    ///
+    /// ## SQL equivalent:
+    ///
+    /// SELECT STRUCT(
+    ///          add.* EXCEPT (stats, partitionValues),
+    ///          FROM_JSON(add.stats, stats_schema) AS stats,
+    ///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
+    ///        ) AS add,
+    ///        remove, version, add.path IS NOT NULL AS is_add,
+    ///        file_key(COALESCE(add, remove)) AS key
+    /// FROM json_commits
+    /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
+    fn commit_arm(&self, log_segment: &LogSegment) -> DeltaResult<PlanBuilder> {
+        let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
+        PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
+            .filter(Predicate::or(
+                col!("add.path").is_not_null(),
+                col!("remove.path").is_not_null(),
+            ))?
+            .project_patch(|patch| {
+                // Commits never carry source-native parsed columns, so normalize from the raw
+                // encodings.
+                self.with_parsed_add_stats_and_partitions(patch)
+                    .append(
+                        StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                        Expr::from(col!("add.path").is_not_null()),
+                    )
+                    .append(
+                        FILE_ACTION_KEY_FIELD.clone(),
+                        file_action_key_expr(|col| {
+                            Expr::coalesce([
+                                joined_column_expr!("add", col),
+                                joined_column_expr!("remove", col),
+                            ])
+                        }),
+                    )
+            })
+    }
 }
 
 /// Load actions from V2 checkpoint sidecars.
@@ -354,43 +368,96 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
     ])
 }
 
-trait ProjectionStructPatchBuilderExt<'a> {
-    /// Parse add stats and partition values, preferring compatible parsed input columns.
-    fn with_parsed_add_stats_and_partitions(
-        self,
-        stats_schema: Option<&SchemaRef>,
-        partition_schema: Option<&SchemaRef>,
-    ) -> Self;
-}
+impl Scan {
+    /// Stats schema needed to evaluate metadata pruning and produce requested output.
+    pub(super) fn metadata_stats_read_schema(&self) -> Option<&SchemaRef> {
+        (!self.skip_stats())
+            .then_some(self.state_info.physical_stats_schema.as_ref())
+            .flatten()
+    }
 
-impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
-    fn with_parsed_add_stats_and_partitions(
-        mut self,
-        stats_schema: Option<&SchemaRef>,
-        partition_schema: Option<&SchemaRef>,
-    ) -> Self {
-        let has_stats_parsed = self
+    fn metadata_stats_output_schema(&self) -> DeltaResult<Option<SchemaRef>> {
+        let table_configuration = self.snapshot.table_configuration();
+        let requested_physical = match &self.stats.struct_stats {
+            StructStats::None => return Ok(None),
+            StructStats::All => None,
+            StructStats::Columns(columns) if columns.is_empty() => return Ok(None),
+            StructStats::Columns(columns) => {
+                let logical_schema = table_configuration.logical_schema();
+                let column_mapping_mode = table_configuration.column_mapping_mode();
+                Some(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            get_any_level_column_physical_name(
+                                &logical_schema,
+                                column,
+                                column_mapping_mode,
+                            )
+                        })
+                        .collect::<DeltaResult<Vec<_>>>()?,
+                )
+            }
+        };
+        let schema = table_configuration
+            .build_expected_stats_schemas(None, requested_physical.as_deref())?
+            .physical;
+        Ok(schema.field(NULL_COUNT).is_some().then_some(schema))
+    }
+
+    fn metadata_partition_output_schema(&self) -> Option<&SchemaRef> {
+        self.partition_values
+            .parsed_struct
+            .then_some(self.state_info.physical_partition_schema.as_ref())
+            .flatten()
+    }
+
+    /// Parse add stats and partition values, preferring compatible parsed input columns.
+    fn with_parsed_add_stats_and_partitions<'a>(
+        &self,
+        mut patch: ProjectionStructPatchBuilder<'a>,
+    ) -> ProjectionStructPatchBuilder<'a> {
+        let stats_schema = self.metadata_stats_read_schema();
+        let partition_schema = self.state_info.physical_partition_schema.as_ref();
+        let has_stats_parsed = patch
             .input_schema()
             .field_at(&column_name!("add.stats_parsed"))
             .is_ok();
-        let has_partition_values_parsed = self
+        let has_partition_values_parsed = patch
             .input_schema()
             .field_at(&column_name!("add.partitionValues_parsed"))
             .is_ok();
         let add = [ADD_NAME];
-        self = match stats_schema {
+        let raw_stats = if self.stats.synthesize_json && has_stats_parsed {
+            Expr::unary(UnaryExpressionOp::ToJson, col!(ADD_NAME, STATS_PARSED))
+        } else {
+            col!(ADD_NAME, STATS)
+        };
+        patch = patch
+            .append_at(
+                add,
+                StructField::nullable(RAW_STATS, DataType::STRING),
+                raw_stats,
+            )
+            .append_at(
+                add,
+                StructField::nullable(RAW_PARTITION_VALUES, partition_values_map_type()),
+                col!(ADD_NAME, PARTITION_VALUES),
+            );
+        patch = match stats_schema {
             Some(ss) => {
                 let field = StructField::nullable(STATS, ss.as_ref().clone());
                 let expr = Expr::parse_json(col!("add.stats"), Arc::clone(ss));
                 if has_stats_parsed {
                     let expr = Expr::coalesce([col!(ADD_NAME, STATS_PARSED), expr]);
-                    self.replace_at(add, STATS, field, expr)
+                    patch
+                        .replace_at(add, STATS, field, expr)
                         .drop_at(add, STATS_PARSED)
                 } else {
-                    self.replace_at(add, STATS, field, expr)
+                    patch.replace_at(add, STATS, field, expr)
                 }
             }
-            None => self.replace_expr_at(add, STATS, Expr::null_literal(DataType::STRING)),
+            None => patch.replace_expr_at(add, STATS, Expr::null_literal(DataType::STRING)),
         };
         match partition_schema {
             Some(ps) => {
@@ -398,10 +465,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                 let expr = Expr::map_to_struct(col!("add.partitionValues"));
                 if has_partition_values_parsed {
                     let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
-                    self.replace_at(add, PARTITION_VALUES, field, expr)
+                    patch
+                        .replace_at(add, PARTITION_VALUES, field, expr)
                         .drop_at(add, PARTITION_VALUES_PARSED)
                 } else {
-                    self.replace_at(add, PARTITION_VALUES, field, expr)
+                    patch.replace_at(add, PARTITION_VALUES, field, expr)
                 }
             }
             None => {
@@ -409,7 +477,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                 // null it out, so the field must become nullable to match.
                 let field = StructField::nullable(PARTITION_VALUES, partition_values_map_type());
                 let expr = Expr::null_literal(partition_values_map_type());
-                self.replace_at(add, PARTITION_VALUES, field, expr)
+                patch.replace_at(add, PARTITION_VALUES, field, expr)
             }
         }
     }
@@ -434,8 +502,70 @@ fn add_field_with_parsed_stats_and_partitions(
         .fold_with(stats_schema, |patch, ss| {
             patch.replace(STATS, StructField::nullable(STATS, ss.as_ref().clone()))
         })
-        .replace(PARTITION_VALUES, partition_field);
+        .replace(PARTITION_VALUES, partition_field)
+        .append(StructField::nullable(RAW_STATS, DataType::STRING))
+        .append(StructField::nullable(
+            RAW_PARTITION_VALUES,
+            partition_values_map_type(),
+        ));
     Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
+}
+
+fn output_add_field(
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+) -> DeltaResult<StructField> {
+    let patch = SchemaStructPatchBuilder::new()
+        .fold_with(stats_schema, |patch, schema| {
+            patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
+        })
+        .fold_with(partition_schema, |patch, schema| {
+            patch.append(StructField::nullable(
+                PARTITION_VALUES_PARSED,
+                schema.as_ref().clone(),
+            ))
+        });
+    Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
+}
+
+fn output_add_expr(
+    stats_schema: Option<&SchemaRef>,
+    partition_schema: Option<&SchemaRef>,
+    include_json_stats: bool,
+) -> Expr {
+    let mut fields: Vec<_> = ADD_SCHEMA
+        .fields()
+        .map(|field| match field.name().as_str() {
+            STATS if !include_json_stats => Expr::null_literal(DataType::STRING),
+            STATS => col!(ADD_NAME, RAW_STATS),
+            PARTITION_VALUES => col!(ADD_NAME, RAW_PARTITION_VALUES),
+            name => Expr::from(ColumnName::new([ADD_NAME, name])),
+        })
+        .collect();
+    if let Some(stats_schema) = stats_schema {
+        fields.push(project_struct(column_name!("add.stats"), stats_schema));
+    }
+    if let Some(partition_schema) = partition_schema {
+        fields.push(project_struct(
+            column_name!("add.partitionValues"),
+            partition_schema,
+        ));
+    }
+    Expr::struct_from(fields)
+}
+
+fn project_struct(root: ColumnName, schema: &StructType) -> Expr {
+    let fields = schema.fields().map(|field| {
+        let column = root.join(&ColumnName::new([field.name()]));
+        match field.data_type() {
+            DataType::Struct(schema) => project_struct(column, schema),
+            _ => Expr::from(column),
+        }
+    });
+    Expr::struct_with_nullability_from(
+        fields,
+        Expr::from_pred(Expr::from(root.clone()).is_not_null()),
+    )
 }
 
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
@@ -490,6 +620,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
@@ -503,6 +634,8 @@ mod tests {
     use crate::scan::state_info::tests::get_state_info_with_options;
     use crate::scan::{PartitionValuesOptions, StatsOptions};
     use crate::schema::StructType;
+    use crate::snapshot::Snapshot;
+    use crate::table_configuration::TableConfiguration;
     use crate::utils::test_utils::create_log_path;
     use crate::Engine as _;
 
@@ -524,6 +657,44 @@ mod tests {
             partition_values,
         )
         .expect("state info")
+    }
+
+    fn scan(
+        state: StateInfo,
+        stats: StatsOptions,
+        partition_values: PartitionValuesOptions,
+    ) -> DeltaResult<Scan> {
+        let partition_columns = state
+            .physical_partition_schema
+            .iter()
+            .flat_map(|schema| schema.fields().map(|field| field.name().clone()))
+            .collect();
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            state.logical_schema.clone(),
+            partition_columns,
+            0,
+            HashMap::new(),
+        )?;
+        let table_configuration = TableConfiguration::try_new(
+            metadata,
+            Protocol::try_new_legacy(2, 5)?,
+            Url::parse("memory:///")?,
+            0,
+        )?;
+        let snapshot = Arc::new(Snapshot::new(
+            log_segment(Url::parse("memory:///_delta_log/")?, &[], None),
+            table_configuration,
+        )?);
+        Ok(Scan {
+            snapshot,
+            state_info: Arc::new(state),
+            stats,
+            correlation_id: None,
+            partition_values,
+            cancellation_token: None,
+        })
     }
 
     fn data_schema() -> SchemaRef {
@@ -724,19 +895,24 @@ mod tests {
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
     ) -> DeltaResult<()> {
+        let stats = StatsOptions::default();
+        let partition_values = PartitionValuesOptions::default();
         let state = state(
             data_schema(),
             vec![],
             None,
-            StatsOptions::default(),
-            PartitionValuesOptions::default(),
+            stats.clone(),
+            partition_values.clone(),
         );
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
             Some(checkpoint_path(file_type)),
         );
-        let plan = build_metadata_scan_plan(&state, &segment, &shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&segment, &shape)?
+            .expect("non-empty");
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
@@ -752,20 +928,20 @@ mod tests {
         #[case] parsed_stats: Option<SchemaRef>,
         #[case] expect_parsed_columns: bool,
     ) -> DeltaResult<()> {
+        let stats = StatsOptions::all();
+        let partition_values = PartitionValuesOptions::with_struct();
         let state = state(
             partitioned_schema(),
             vec!["p".to_string()],
             None,
-            StatsOptions::all(),
-            PartitionValuesOptions::with_struct(),
+            stats.clone(),
+            partition_values.clone(),
         );
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
-        let plan = build_metadata_scan_plan(
-            &state,
-            &segment,
-            &shape(CheckpointType::Manifest, parsed_stats),
-        )?
-        .expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&segment, &shape(CheckpointType::Manifest, parsed_stats))?
+            .expect("non-empty");
 
         let load = plan
             .nodes
@@ -790,20 +966,24 @@ mod tests {
 
     #[test]
     fn metadata_plan_commits_only() -> DeltaResult<()> {
+        let stats = StatsOptions::default();
+        let partition_values = PartitionValuesOptions::default();
         let state = state(
             data_schema(),
             vec![],
             None,
-            StatsOptions::default(),
-            PartitionValuesOptions::default(),
+            stats.clone(),
+            partition_values.clone(),
         );
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(
             log_root(),
             &["file:///_delta_log/00000000000000000001.json"],
             None,
         );
-        let plan =
-            build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&segment, &no_checkpoint())?
+            .expect("non-empty");
         assert_eq!(tags(&plan), COMMIT_ARM_TAGS.to_vec());
         Ok(())
     }
@@ -818,48 +998,60 @@ mod tests {
         #[case] file_type: FileType,
         #[case] checkpoint_arm_tags: Vec<&'static str>,
     ) -> DeltaResult<()> {
+        let stats = StatsOptions::default();
+        let partition_values = PartitionValuesOptions::default();
         let state = state(
             data_schema(),
             vec![],
             None,
-            StatsOptions::default(),
-            PartitionValuesOptions::default(),
+            stats.clone(),
+            partition_values.clone(),
         );
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
-        let plan = build_metadata_scan_plan(&state, &segment, &shape)?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&segment, &shape)?
+            .expect("non-empty");
         assert_eq!(tags(&plan), checkpoint_arm_tags);
         Ok(())
     }
 
     #[test]
     fn metadata_plan_empty_is_none() -> DeltaResult<()> {
+        let stats = StatsOptions::default();
+        let partition_values = PartitionValuesOptions::default();
         let state = state(
             data_schema(),
             vec![],
             None,
-            StatsOptions::default(),
-            PartitionValuesOptions::default(),
+            stats.clone(),
+            partition_values.clone(),
         );
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(log_root(), &[], None);
-        assert!(build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.is_none());
+        assert!(scan
+            .build_metadata_scan_plan(&segment, &no_checkpoint())?
+            .is_none());
         Ok(())
     }
 
     #[test]
     fn metadata_plan_static_skip_all_is_none() -> DeltaResult<()> {
+        let stats = StatsOptions::default();
+        let partition_values = PartitionValuesOptions::default();
         let state = state(
             data_schema(),
             vec![],
             Some(Predicate::literal(false)),
-            StatsOptions::default(),
-            PartitionValuesOptions::default(),
+            stats.clone(),
+            partition_values.clone(),
         );
         assert_eq!(state.physical_predicate, PhysicalPredicate::StaticSkipAll);
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(log_root(), &[], None);
-        assert!(
-            build_metadata_scan_plan(&state, &segment, &shape(CheckpointType::Leaf, None),)?
-                .is_none()
-        );
+        assert!(scan
+            .build_metadata_scan_plan(&segment, &shape(CheckpointType::Leaf, None))?
+            .is_none());
         Ok(())
     }
 
@@ -887,13 +1079,16 @@ mod tests {
             DeltaResult::<()>::Ok(())
         })?;
 
+        let stats = StatsOptions::default();
+        let partition_values = PartitionValuesOptions::default();
         let state = state(
             data_schema(),
             vec![],
             None,
-            StatsOptions::default(),
-            PartitionValuesOptions::default(),
+            stats.clone(),
+            partition_values.clone(),
         );
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(
             Url::parse("memory:///_delta_log/").unwrap(),
             &[
@@ -902,8 +1097,9 @@ mod tests {
             ],
             None,
         );
-        let plan =
-            build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(&segment, &no_checkpoint())?
+            .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
         let mut batches = engine
@@ -945,25 +1141,28 @@ mod tests {
         // `stats_parsed` column.
         write_parquet_checkpoint(&store, "_delta_log/00000000000000000000.checkpoint.parquet")?;
 
+        let stats = StatsOptions::all();
+        let partition_values = PartitionValuesOptions::default();
         let state = state(
             data_schema(),
             vec![],
             Some(col!("x").gt(lit(lower_bound))),
-            StatsOptions::all(),
-            PartitionValuesOptions::default(),
+            stats.clone(),
+            partition_values.clone(),
         );
+        let scan = scan(state, stats, partition_values)?;
         let segment = log_segment(
             Url::parse("memory:///_delta_log/").unwrap(),
             &[],
             Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
         );
-        let plan = build_metadata_scan_plan(
-            &state,
-            &segment,
-            // Leaf with no compatible parsed stats -> parse add.stats instead.
-            &shape(CheckpointType::Leaf, None),
-        )?
-        .expect("non-empty");
+        let plan = scan
+            .build_metadata_scan_plan(
+                &segment,
+                // Leaf with no compatible parsed stats -> parse add.stats instead.
+                &shape(CheckpointType::Leaf, None),
+            )?
+            .expect("non-empty");
 
         let engine = SyncEngine::new_with_store(store);
         let mut batches = engine

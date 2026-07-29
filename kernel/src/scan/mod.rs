@@ -1039,9 +1039,9 @@ impl Scan {
         let shape = CheckpointShape::try_new(
             plan_executor.as_ref(),
             &self.snapshot,
-            self.state_info.physical_stats_schema.as_ref(),
+            self.metadata_stats_read_schema(),
         )?;
-        scan_plan::build_metadata_scan_plan(&self.state_info, log_segment, &shape)
+        self.build_metadata_scan_plan(log_segment, &shape)
     }
 
     // Factored out to facilitate testing

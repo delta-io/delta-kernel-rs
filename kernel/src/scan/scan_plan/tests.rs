@@ -11,30 +11,34 @@ use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
-use crate::scan::{PartitionValuesOptions, Scan, StatsOptions};
+use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::{DeltaResult, Engine, Snapshot};
 
 fn comparable_metadata_batch(
     field: impl Fn(&str) -> ArrayRef,
-    stats: ArrayRef,
-    partitions: Option<ArrayRef>,
+    stats_parsed: Option<ArrayRef>,
+    partitions_parsed: Option<ArrayRef>,
 ) -> DeltaResult<RecordBatch> {
     let mut columns = vec![
         ("path", field("path")),
         ("size", field("size")),
         ("modificationTime", field("modificationTime")),
-        ("stats", stats),
+        ("stats", field("stats")),
+        ("partitionValues", field("partitionValues")),
         ("deletionVector", field("deletionVector")),
         ("baseRowId", field("baseRowId")),
         ("defaultRowCommitVersion", field("defaultRowCommitVersion")),
         ("tags", field("tags")),
         ("clusteringProvider", field("clusteringProvider")),
     ];
-    if let Some(partitions) = partitions {
-        columns.push(("partitionValues", partitions));
+    if let Some(stats) = stats_parsed {
+        columns.push(("stats_parsed", stats));
+    }
+    if let Some(partitions) = partitions_parsed {
+        columns.push(("partitionValues_parsed", partitions));
     }
     Ok(RecordBatch::try_from_iter(columns)?)
 }
@@ -64,10 +68,7 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<Recor
                     .unwrap_or_else(|| panic!("metadata field {name}"))
                     .clone()
             },
-            batch
-                .column_by_name("stats_parsed")
-                .expect("parsed stats")
-                .clone(),
+            batch.column_by_name("stats_parsed").cloned(),
             batch.column_by_name("partitionValues_parsed").cloned(),
         )?);
     }
@@ -95,18 +96,14 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("add struct");
-        let partitions = add
-            .column_by_name(PARTITION_VALUES)
-            .filter(|column| matches!(column.data_type(), ArrowDataType::Struct(_)))
-            .cloned();
         projected.push(comparable_metadata_batch(
             |name| {
                 add.column_by_name(name)
                     .unwrap_or_else(|| panic!("add.{name}"))
                     .clone()
             },
-            add.column_by_name(STATS).expect("add.stats").clone(),
-            partitions,
+            add.column_by_name(STATS_PARSED).cloned(),
+            add.column_by_name(PARTITION_VALUES_PARSED).cloned(),
         )?);
     }
     Ok(projected)
@@ -138,6 +135,59 @@ fn assert_metadata_eq(
     let expected = sorted_pretty_lines(expected)?;
     assert_eq!(actual, expected, "{context}");
     Ok(())
+}
+
+fn without_stats_parsed(batches: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| {
+            RecordBatch::try_from_iter(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(batch.columns())
+                    .filter(|(field, _)| field.name() != STATS_PARSED)
+                    .map(|(field, column)| (field.name(), column.clone())),
+            )
+            .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn assert_stats_output_schema(batches: &[RecordBatch], stats: &StructStats) {
+    for batch in batches {
+        let schema = batch.schema();
+        let stats_field = schema.field_with_name(STATS_PARSED).ok();
+        match stats {
+            StructStats::None => assert!(stats_field.is_none()),
+            StructStats::All => assert!(stats_field.is_some()),
+            StructStats::Columns(columns) if columns.is_empty() => assert!(stats_field.is_none()),
+            StructStats::Columns(columns) => {
+                let ArrowDataType::Struct(stats_fields) =
+                    stats_field.expect("stats_parsed output").data_type()
+                else {
+                    panic!("stats_parsed must be a struct");
+                };
+                let null_counts = stats_fields
+                    .iter()
+                    .find(|field| field.name() == "nullCount")
+                    .expect("nullCount output");
+                let ArrowDataType::Struct(data_fields) = null_counts.data_type() else {
+                    panic!("nullCount must be a struct");
+                };
+                let actual: Vec<_> = data_fields
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect();
+                let expected: Vec<_> = columns
+                    .iter()
+                    .map(|column| column.path()[0].as_str())
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }
 
 #[rstest]
@@ -213,6 +263,63 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
             .any(|file| file.meta.location.path().contains("/_sidecars/"))
     }));
     Ok(())
+}
+
+#[rstest]
+fn declarative_metadata_respects_output_options(
+    #[values(
+        StatsOptions::json_only(),
+        StatsOptions::all_struct(),
+        StatsOptions::struct_columns(vec![column_name!("id")]),
+        StatsOptions::all(),
+        StatsOptions::none()
+    )]
+    stats: StatsOptions,
+    #[values(
+        PartitionValuesOptions::string_map_only(),
+        PartitionValuesOptions::with_struct()
+    )]
+    partitions: PartitionValuesOptions,
+    #[values(None, Some(column_expr!("value").gt(Expr::literal("value_2"))))] predicate: Option<
+        Pred,
+    >,
+) -> DeltaResult<()> {
+    let (engine, snapshot, _tempdir) =
+        crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+    let struct_stats = stats.struct_stats.clone();
+    let compare_without_stats = predicate.is_some()
+        && (matches!(stats.struct_stats, StructStats::Columns(_))
+            || matches!(stats.struct_stats, StructStats::None) && stats.synthesize_json);
+    let expected_builder = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(stats.clone())
+        .with_partition_values(partitions.clone());
+    let expected_builder = match &predicate {
+        Some(predicate) => expected_builder.with_predicate(Arc::new(predicate.clone())),
+        None => expected_builder,
+    };
+    let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
+    let builder = snapshot
+        .scan_builder()
+        .with_stats(stats)
+        .with_partition_values(partitions);
+    let builder = match predicate {
+        Some(predicate) => builder.with_predicate(Arc::new(predicate)),
+        None => builder,
+    };
+    let scan = builder.build()?;
+    let actual = declarative_metadata(&scan, engine.as_ref())?;
+    assert_stats_output_schema(&actual, &struct_stats);
+    if compare_without_stats {
+        assert_metadata_eq(
+            &without_stats_parsed(&actual)?,
+            &without_stats_parsed(&expected)?,
+            "metadata output options",
+        )
+    } else {
+        assert_metadata_eq(&actual, &expected, "metadata output options")
+    }
 }
 
 #[rstest]
@@ -317,12 +424,14 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Delta
         projected.push(RecordBatch::try_from_iter([
             (
                 "stats",
-                add.column_by_name("stats").expect("add.stats").clone(),
+                add.column_by_name(STATS_PARSED)
+                    .expect("add.stats_parsed")
+                    .clone(),
             ),
             (
                 "partitionValues",
-                add.column_by_name("partitionValues")
-                    .expect("add.partitionValues")
+                add.column_by_name(PARTITION_VALUES_PARSED)
+                    .expect("add.partitionValues_parsed")
                     .clone(),
             ),
         ])?);
