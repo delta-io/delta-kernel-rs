@@ -248,6 +248,12 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
     }
 }
 
+fn ignore_predicate_engine(sync_engine: &Arc<SyncEngine>) -> DelegatingEngine {
+    DelegatingEngine::new(sync_engine.clone()).with_parquet_handler(Arc::new(
+        IgnorePredicateParquetHandler(sync_engine.parquet_handler()),
+    ))
+}
+
 /// Writes all actions to a _delta_log/_sidecars file in the store and return the [`FileMeta`].
 /// This function formats the provided filename into the _sidecars subdirectory.
 async fn add_sidecar_to_store(
@@ -1486,9 +1492,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    let ignore_predicate_engine = DelegatingEngine::new(sync_engine.clone()).with_parquet_handler(
-        Arc::new(IgnorePredicateParquetHandler(sync_engine.parquet_handler())),
-    );
+    let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
     } else {
@@ -1602,9 +1606,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    let ignore_predicate_engine = DelegatingEngine::new(sync_engine.clone()).with_parquet_handler(
-        Arc::new(IgnorePredicateParquetHandler(sync_engine.parquet_handler())),
-    );
+    let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
     } else {
