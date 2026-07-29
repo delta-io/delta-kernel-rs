@@ -28,21 +28,6 @@ macro_rules! require {
     };
 }
 
-/// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
-fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
-    value
-        .try_into()
-        .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
-}
-
-fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
-    path.path_segments()
-        .and_then(|mut segments| segments.next_back())
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| DeltaError::generic("staged commit path has no file name"))
-}
-
 /// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
@@ -305,6 +290,21 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
 
         Ok(())
     }
+}
+
+/// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
+fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
+    value
+        .try_into()
+        .map_err(|_| DeltaError::generic(format!("{field} does not fit into i64 for UC commit")))
+}
+
+fn staged_commit_file_name(path: &url::Url) -> DeltaResult<String> {
+    path.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| DeltaError::generic("staged commit path has no file name"))
 }
 
 #[cfg(test)]

@@ -332,6 +332,10 @@ Keep this list updated when new protocol features are added to kernel.
   data-dependent schema manipulation.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
+- Order a file so the most important APIs and impls come first; put private helper functions
+  toward the bottom. A reader scanning top to bottom should hit the public surface before the
+  private plumbing. (Order-sensitive items like `macro_rules!` used within the file are exempt --
+  they must precede their use.)
 
 ## Comment & Doc Style
 

@@ -86,6 +86,12 @@ impl TableIdentifier {
     }
 }
 
+impl std::fmt::Display for TableIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.catalog, self.schema, self.table)
+    }
+}
+
 /// Body of a `POST /delta/v1/catalogs/{c}/schemas/{s}/tables/{t}`
 /// (`update_table`) request. The target table is routed separately (see
 /// [`crate::UpdateTableClient::update_table`]); this struct is purely the serialized body.
@@ -109,30 +115,30 @@ impl UpdateTableRequest {
         requirements: Vec<DeltaTableRequirement>,
         updates: Vec<DeltaTableUpdate>,
     ) -> crate::error::Result<Self> {
-        let requirement_count = |is_variant: fn(&DeltaTableRequirement) -> bool| {
+        let num_requirements = |is_variant: fn(&DeltaTableRequirement) -> bool| {
             requirements.iter().filter(|r| is_variant(r)).count()
         };
-        if requirement_count(|r| matches!(r, DeltaTableRequirement::AssertTableUuid { .. })) > 1 {
+        if num_requirements(|r| matches!(r, DeltaTableRequirement::AssertTableUuid { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one AssertTableUuid requirement"
                     .to_string(),
             ));
         }
-        if requirement_count(|r| matches!(r, DeltaTableRequirement::AssertEtag { .. })) > 1 {
+        if num_requirements(|r| matches!(r, DeltaTableRequirement::AssertEtag { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one AssertEtag requirement"
                     .to_string(),
             ));
         }
-        let update_count = |is_variant: fn(&DeltaTableUpdate) -> bool| {
+        let num_updates = |is_variant: fn(&DeltaTableUpdate) -> bool| {
             updates.iter().filter(|u| is_variant(u)).count()
         };
-        if update_count(|u| matches!(u, DeltaTableUpdate::AddCommit { .. })) > 1 {
+        if num_updates(|u| matches!(u, DeltaTableUpdate::AddCommit { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one AddCommit update".to_string(),
             ));
         }
-        if update_count(|u| matches!(u, DeltaTableUpdate::SetLatestBackfilledVersion { .. })) > 1 {
+        if num_updates(|u| matches!(u, DeltaTableUpdate::SetLatestBackfilledVersion { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one SetLatestBackfilledVersion \
                  update"
@@ -341,6 +347,12 @@ pub struct CreateTableRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_identifier_displays_as_dotted_three_part_name() {
+        let id = TableIdentifier::new("main", "default", "my_table");
+        assert_eq!(id.to_string(), "main.default.my_table");
+    }
 
     #[test]
     fn load_table_response_decodes_full_body() {

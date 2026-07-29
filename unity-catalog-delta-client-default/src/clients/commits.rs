@@ -44,8 +44,8 @@ impl UpdateTableClient for UCUpdateTableRestClient {
             );
             let url = self.base_url.join(&path)?;
 
-            // Single attempt, no retry: AddCommit is non-idempotent, so a retried POST could
-            // double-register a commit.
+            // Single attempt. UC rejects a resubmit of an already-ratified version with a version
+            // conflict. Retries belong in the transaction layer.
             let response = self.http_client.post(url).json(&request).send().await?;
             handle_empty_response(response).await
         }
