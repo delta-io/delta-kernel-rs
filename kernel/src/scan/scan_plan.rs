@@ -130,9 +130,7 @@ pub(crate) fn build_metadata_scan_plan(
 ///          add.* EXCEPT (
 ///            stats, stats_parsed, partitionValues, partitionValues_parsed
 ///          ),
-///          COALESCE(
-///            add.stats_parsed, FROM_JSON(add.stats, stats_schema)
-///          ) AS stats,
+///          add.stats_parsed AS stats,
 ///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues
 ///        ) AS add,
 ///        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
@@ -381,12 +379,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         self = match stats_schema {
             Some(ss) => {
                 let field = StructField::nullable(STATS, ss.as_ref().clone());
-                let expr = Expr::parse_json(col!("add.stats"), Arc::clone(ss));
                 if has_stats_parsed {
-                    let expr = Expr::coalesce([col!(ADD_NAME, STATS_PARSED), expr]);
-                    self.replace_at(add, STATS, field, expr)
+                    self.replace_at(add, STATS, field, col!(ADD_NAME, STATS_PARSED))
                         .drop_at(add, STATS_PARSED)
                 } else {
+                    let expr = Expr::parse_json(col!("add.stats"), Arc::clone(ss));
                     self.replace_at(add, STATS, field, expr)
                 }
             }
@@ -395,12 +392,16 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
         match partition_schema {
             Some(ps) => {
                 let field = StructField::nullable(PARTITION_VALUES, ps.as_ref().clone());
-                let expr = Expr::map_to_struct(col!("add.partitionValues"));
                 if has_partition_values_parsed {
-                    let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
-                    self.replace_at(add, PARTITION_VALUES, field, expr)
-                        .drop_at(add, PARTITION_VALUES_PARSED)
+                    self.replace_at(
+                        add,
+                        PARTITION_VALUES,
+                        field,
+                        col!(ADD_NAME, PARTITION_VALUES_PARSED),
+                    )
+                    .drop_at(add, PARTITION_VALUES_PARSED)
                 } else {
+                    let expr = Expr::map_to_struct(col!("add.partitionValues"));
                     self.replace_at(add, PARTITION_VALUES, field, expr)
                 }
             }
