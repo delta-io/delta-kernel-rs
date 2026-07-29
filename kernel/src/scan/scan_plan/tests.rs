@@ -137,7 +137,7 @@ fn assert_metadata_eq(
     Ok(())
 }
 
-fn without_stats_parsed(batches: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
+fn without_stats(batches: &[RecordBatch], keep_json: bool) -> DeltaResult<Vec<RecordBatch>> {
     batches
         .iter()
         .map(|batch| {
@@ -147,7 +147,9 @@ fn without_stats_parsed(batches: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>
                     .fields()
                     .iter()
                     .zip(batch.columns())
-                    .filter(|(field, _)| field.name() != STATS_PARSED)
+                    .filter(|(field, _)| {
+                        field.name() != STATS_PARSED && (keep_json || field.name() != STATS)
+                    })
                     .map(|(field, column)| (field.name(), column.clone())),
             )
             .map_err(Into::into)
@@ -187,6 +189,19 @@ fn assert_stats_output_schema(batches: &[RecordBatch], stats: &StructStats) {
                 assert_eq!(actual, expected);
             }
         }
+    }
+}
+
+fn assert_json_only_output_schema(batches: &[RecordBatch]) {
+    for batch in batches {
+        assert_eq!(
+            batch
+                .schema()
+                .field_with_name(STATS)
+                .expect("JSON stats output")
+                .data_type(),
+            &ArrowDataType::Utf8,
+        );
     }
 }
 
@@ -287,13 +302,23 @@ fn declarative_metadata_respects_output_options(
     let (engine, snapshot, _tempdir) =
         crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let struct_stats = stats.struct_stats.clone();
+    let json_only = stats.synthesize_json && matches!(&struct_stats, StructStats::None);
+    let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
+    // Imperative metadata includes structured stats needed internally by its predicate. Those
+    // fields are not caller-requested output, so compare common fields and validate the
+    // declarative stats schema separately.
     let compare_without_stats = predicate.is_some()
         && (matches!(stats.struct_stats, StructStats::Columns(_))
-            || matches!(stats.struct_stats, StructStats::None) && stats.synthesize_json);
+            || matches!(stats.struct_stats, StructStats::None));
+    let expected_stats = if no_stats && predicate.is_some() {
+        StatsOptions::json_only()
+    } else {
+        stats.clone()
+    };
     let expected_builder = snapshot
         .clone()
         .scan_builder()
-        .with_stats(stats.clone())
+        .with_stats(expected_stats)
         .with_partition_values(partitions.clone());
     let expected_builder = match &predicate {
         Some(predicate) => expected_builder.with_predicate(Arc::new(predicate.clone())),
@@ -311,10 +336,13 @@ fn declarative_metadata_respects_output_options(
     let scan = builder.build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     assert_stats_output_schema(&actual, &struct_stats);
+    if json_only {
+        assert_json_only_output_schema(&actual);
+    }
     if compare_without_stats {
         assert_metadata_eq(
-            &without_stats_parsed(&actual)?,
-            &without_stats_parsed(&expected)?,
+            &without_stats(&actual, !no_stats)?,
+            &without_stats(&expected, !no_stats)?,
             "metadata output options",
         )
     } else {

@@ -64,13 +64,11 @@ impl Scan {
             return Ok(None);
         }
 
-        let stats_schema = self.metadata_stats_read_schema();
+        let stats_schema = state.physical_stats_schema.as_ref();
         let partition_schema = state.physical_partition_schema.as_ref();
         let stats_output_schema = self.metadata_stats_output_schema()?;
         let partition_output_schema = self.metadata_partition_output_schema();
-        let prune = (!self.skip_stats())
-            .then(|| stats_skipping_predicate(state))
-            .flatten();
+        let prune = stats_skipping_predicate(state);
         let prune = prune.as_ref();
 
         // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's
@@ -369,13 +367,6 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 }
 
 impl Scan {
-    /// Stats schema needed to evaluate metadata pruning and produce requested output.
-    pub(super) fn metadata_stats_read_schema(&self) -> Option<&SchemaRef> {
-        (!self.skip_stats())
-            .then_some(self.state_info.physical_stats_schema.as_ref())
-            .flatten()
-    }
-
     fn metadata_stats_output_schema(&self) -> DeltaResult<Option<SchemaRef>> {
         let table_configuration = self.snapshot.table_configuration();
         let requested_physical = match &self.stats.struct_stats {
@@ -417,7 +408,7 @@ impl Scan {
         &self,
         mut patch: ProjectionStructPatchBuilder<'a>,
     ) -> ProjectionStructPatchBuilder<'a> {
-        let stats_schema = self.metadata_stats_read_schema();
+        let stats_schema = self.state_info.physical_stats_schema.as_ref();
         let partition_schema = self.state_info.physical_partition_schema.as_ref();
         let has_stats_parsed = patch
             .input_schema()
