@@ -31,6 +31,7 @@ use crate::arrow::row::{OwnedRow, RowConverter, SortField};
 use crate::engine::arrow_conversion::{TryFromArrow as _, TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::arrow_expression::{extract_column, ArrowEvaluationHandler};
+use crate::engine::arrow_utils::coerce_columns_to_schema;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
@@ -228,6 +229,11 @@ impl SyncPlanExecutor {
                     &file_constant_columns,
                     &file.file_constants,
                 )?;
+                // A file may name its map entry field `entries` and its array element field
+                // `item`, where `output_schema` expects `key_value` and `element`. The
+                // reader keeps the file's names, and Arrow counts them as part of the
+                // type, so translate before asserting the schema.
+                let columns = coerce_columns_to_schema(columns, &output_schema)?;
                 batches.push(RecordBatch::try_new(output_schema.clone(), columns)?);
             }
         }

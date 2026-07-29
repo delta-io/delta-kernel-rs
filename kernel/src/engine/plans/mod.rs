@@ -79,7 +79,7 @@ impl Engine for PlanBasedEngine {
         self.parquet.clone()
     }
 
-    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
-        self.executor.clone()
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        Some(self.executor.clone())
     }
 }

@@ -80,6 +80,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
     };
     let batches = engine
         .plan_executor()
+        .unwrap()
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?;
 
@@ -302,6 +303,7 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Delta
         .expect("metadata plan");
     let batches = engine
         .plan_executor()
+        .unwrap()
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?;
 

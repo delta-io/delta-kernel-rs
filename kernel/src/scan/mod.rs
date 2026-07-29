@@ -1035,7 +1035,9 @@ impl Scan {
         let log_segment = self.snapshot.log_segment();
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
-        let plan_executor = engine.plan_executor();
+        let plan_executor = engine
+            .plan_executor()
+            .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))?;
         let shape = CheckpointShape::try_new(
             plan_executor.as_ref(),
             &self.snapshot,
