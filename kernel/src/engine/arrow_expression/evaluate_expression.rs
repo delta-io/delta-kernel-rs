@@ -2096,6 +2096,40 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap()
     }
 
+    #[rstest]
+    #[case::keeps_on_true(Some(true), false)]
+    #[case::nulls_on_false(Some(false), true)]
+    #[case::nulls_on_null(None, true)]
+    fn test_struct_nullability_predicate_keeps_only_true_rows(
+        #[case] predicate: Option<bool>,
+        #[case] expect_null_struct: bool,
+    ) {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("v", ArrowDataType::Int32, true),
+            ArrowField::new("p", ArrowDataType::Boolean, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(BooleanArray::from(vec![predicate])),
+            ],
+        )
+        .unwrap();
+
+        let output_type = DataType::Struct(Box::new(StructType::new_unchecked(vec![
+            StructField::nullable("v", DataType::INTEGER),
+        ])));
+        let expr = Expr::struct_with_nullability_from(
+            [Arc::new(column_expr!("v"))],
+            Arc::new(Expr::from_pred(Pred::from_expr(column_expr!("p")))),
+        );
+
+        let result = evaluate_expression(&expr, &batch, Some(&output_type)).unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(result.is_null(0), expect_null_struct);
+    }
+
     /// Base64 would render `0xDEAD` as `3q0=`.
     #[test]
     fn test_to_json_encodes_binary_as_hex_and_nests_structs_and_arrays() {

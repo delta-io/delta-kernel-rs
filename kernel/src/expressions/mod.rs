@@ -110,8 +110,8 @@ pub enum UnaryExpressionOp {
     /// ```
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
-    /// hex, two digits per byte, rather than base64, so `{ b: 0xDEAD, l: [1, 2], n: { z: 7 } }`
-    /// becomes:
+    /// hex rather than base64, two digits per byte in the order the bytes appear, so
+    /// `{ b: 0xDEAD, l: [1, 2], n: { z: 7 } }` becomes:
     ///
     /// ```text
     /// {"b":"dead","l":[1,2],"n":{"z":7}}
@@ -473,8 +473,12 @@ pub enum Expression {
     /// validated against the schema, so building a struct takes both. The expression count must
     /// equal the output field count.
     ///
-    /// The optional nullability predicate nulls the whole struct for rows where it is false or
-    /// null.
+    /// The optional nullability predicate says when to *keep* the struct: a row survives only
+    /// where it is true, and nulls entirely where it is false or null.
+    ///
+    /// ```sql
+    /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END
+    /// ```
     ///
     /// [`Project`]: crate::plans::ir::nodes::Project
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
