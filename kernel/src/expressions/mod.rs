@@ -109,8 +109,9 @@ pub enum UnaryExpressionOp {
     /// to_json(expr)
     /// ```
     ///
-    /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as a hex
-    /// string, not base64, so a struct `{ b: 0xDEAD, l: [1, 2], n: { z: 7 } }` becomes:
+    /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
+    /// hex, two digits per byte, rather than base64, so `{ b: 0xDEAD, l: [1, 2], n: { z: 7 } }`
+    /// becomes:
     ///
     /// ```text
     /// {"b":"dead","l":[1,2],"n":{"z":7}}

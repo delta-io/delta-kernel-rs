@@ -2096,9 +2096,59 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap()
     }
 
-    /// An empty string is not valid JSON, so it does not parse to an empty struct. A single
-    /// unparseable input nulls the whole batch rather than only its own row, while a NULL input
+    /// Base64 would render `0xDEAD` as `3q0=`.
+    #[test]
+    fn test_to_json_encodes_binary_as_hex_and_nests_structs_and_arrays() {
+        let item = Arc::new(ArrowField::new("item", ArrowDataType::Int32, true));
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        );
+        let inner = Fields::from(vec![Arc::new(ArrowField::new(
+            "z",
+            ArrowDataType::Int32,
+            true,
+        ))]);
+        let nested = StructArray::new(
+            inner.clone(),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+            None,
+        );
+        let fields = Fields::from(vec![
+            Arc::new(ArrowField::new("b", ArrowDataType::Binary, true)),
+            Arc::new(ArrowField::new("l", ArrowDataType::List(item), true)),
+            Arc::new(ArrowField::new("n", ArrowDataType::Struct(inner), true)),
+        ]);
+        let value = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![&[0xDEu8, 0xADu8][..]])),
+                Arc::new(list),
+                Arc::new(nested),
+            ],
+            None,
+        );
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            ArrowDataType::Struct(fields),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
+
+        let expr = Expr::unary(UnaryExpressionOp::ToJson, column_expr!("s"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result.value(0), r#"{"b":"dead","l":[1,2],"n":{"z":7}}"#);
+    }
+
+    /// An empty string is not valid JSON, so it does not parse to an empty struct. A NULL input
     /// decodes as `{}` and leaves the batch intact.
+    ///
+    /// Nulling the whole batch for one unparseable row is a limitation rather than a guarantee: the
+    /// `arrow-json` error names no row, so the fallback can only blanket the array it was given,
+    /// discarding stats from rows that parsed fine.
     #[rstest]
     #[case::empty_string(vec![Some("")], 1)]
     #[case::malformed(vec![Some("{not json")], 1)]
