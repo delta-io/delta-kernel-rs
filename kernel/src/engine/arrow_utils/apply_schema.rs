@@ -133,7 +133,7 @@ pub(crate) fn apply_schema_to_struct(
             "Arrow claimed to be a struct but isn't a StructArray",
         ));
     };
-    transform_struct(sa, kernel_fields.fields())
+    transform_struct(sa, kernel_fields.fields().cloned())
 }
 
 // Rebuild a [`ListArray`] under the contract of [`apply_schema_to_inner`] (see that fn's doc

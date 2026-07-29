@@ -1,5 +1,8 @@
 //! Shared transform infrastructure.
 use std::borrow::{Cow, ToOwned};
+use std::sync::Arc;
+
+use crate::schema::{StructField, StructFieldRef, StructType};
 
 mod carrier;
 mod expression;
@@ -96,6 +99,44 @@ where
     if num_borrowed < num_children {
         let owned = new_children.into_iter().map(Cow::into_owned).collect();
         Carrier::from_inner(Cow::Owned(map_owned(owned)))
+    } else {
+        Carrier::from_inner(Cow::Borrowed(parent))
+    }
+}
+
+/// Rebuilds a struct from transformed fields while retaining shared references for unchanged
+/// fields.
+pub(crate) fn map_struct_field_children<'a, ChildCarrier, ParentCarrier, R>(
+    parent: &'a StructType,
+    children: impl ExactSizeIterator<Item = (&'a StructFieldRef, ChildCarrier)>,
+) -> ParentCarrier
+where
+    ChildCarrier: Carrier<'a, StructField, Residual = R>,
+    ParentCarrier: Carrier<'a, StructType, Residual = R>,
+{
+    let num_children = children.len();
+    let mut num_borrowed = 0;
+    let mut new_children = Vec::with_capacity(num_children);
+
+    for (original, child) in children {
+        if let Some(transformed) = carrier_into_inner_opt!(child) {
+            let field = match transformed {
+                Cow::Borrowed(_) => {
+                    num_borrowed += 1;
+                    original.clone()
+                }
+                Cow::Owned(field) => Arc::new(field),
+            };
+            new_children.push(field);
+        }
+    }
+
+    if new_children.is_empty() {
+        carrier_try_none!();
+    }
+
+    if num_borrowed < num_children {
+        Carrier::from_inner(Cow::Owned(StructType::new_unchecked_refs(new_children)))
     } else {
         Carrier::from_inner(Cow::Borrowed(parent))
     }

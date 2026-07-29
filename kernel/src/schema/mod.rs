@@ -44,6 +44,11 @@ pub(crate) mod void_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
+/// A shared reference to a [`StructField`].
+///
+/// Cloning a field reference allows the same immutable field definition to be reused across
+/// multiple [`StructType`]s without cloning the field's nested data type and metadata.
+pub type StructFieldRef = Arc<StructField>;
 
 /// Sugar for `LazyLock::new(|| `[`schema_ref!`](schema_ref)` { ... })`, yielding a lazy
 /// [`SchemaRef`].
@@ -141,18 +146,24 @@ pub(crate) use delta_kernel_derive::try_schema;
 /// Converts field interpolation inputs in [`schema!`] and [`try_schema!`] to [`StructField`].
 #[internal_api]
 pub(crate) trait ToSchemaField {
-    fn to_schema_field(self) -> StructField;
+    fn to_schema_field(self) -> StructFieldRef;
 }
 
 impl ToSchemaField for StructField {
-    fn to_schema_field(self) -> StructField {
-        self
+    fn to_schema_field(self) -> StructFieldRef {
+        self.into()
     }
 }
 
 impl ToSchemaField for &StructField {
-    fn to_schema_field(self) -> StructField {
-        self.clone()
+    fn to_schema_field(self) -> StructFieldRef {
+        self.clone().into()
+    }
+}
+
+impl ToSchemaField for StructFieldRef {
+    fn to_schema_field(self) -> StructFieldRef {
+        self
     }
 }
 
@@ -160,15 +171,15 @@ impl<T> ToSchemaField for &T
 where
     T: Deref<Target = StructField>,
 {
-    fn to_schema_field(self) -> StructField {
-        self.deref().clone()
+    fn to_schema_field(self) -> StructFieldRef {
+        self.deref().clone().into()
     }
 }
 
 /// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
 /// fields, lowered into an output [`StructType`] directly from an input schema via
-/// [`build`](crate::struct_patch::StructPatchBuilder::<StructField>::build).
-pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<StructField>;
+/// [`build`](crate::struct_patch::StructPatchBuilder::<StructFieldRef>::build).
+pub type SchemaStructPatchBuilder = crate::struct_patch::StructPatchBuilder<StructFieldRef>;
 
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
@@ -837,7 +848,7 @@ pub struct StructType {
     // We use indexmap to preserve the order of fields as they are defined in the schema
     // while also allowing for fast lookup by name. The alternative is to do a linear search
     // for each field by name would be potentially quite expensive for large schemas.
-    fields: IndexMap<String, StructField>,
+    fields: IndexMap<String, StructFieldRef>,
     /// The metadata columns in this struct
     // We use a dedicated map for metadata columns to allow for fast lookup without having to
     // iterate over all fields.
@@ -845,7 +856,7 @@ pub struct StructType {
 }
 
 pub struct StructTypeBuilder {
-    fields: IndexMap<String, StructField>,
+    fields: IndexMap<String, StructFieldRef>,
 }
 
 impl Default for StructTypeBuilder {
@@ -867,17 +878,18 @@ impl StructTypeBuilder {
         }
     }
 
-    pub fn add_field(mut self, field: StructField) -> Self {
+    pub fn add_field(mut self, field: impl Into<StructFieldRef>) -> Self {
+        let field = field.into();
         self.fields.insert(field.name.clone(), field);
         self
     }
 
     pub fn build(self) -> DeltaResult<StructType> {
-        StructType::try_new(self.fields.into_values())
+        StructType::try_new_refs(self.fields.into_values())
     }
 
     pub fn build_arc_unchecked(self) -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(self.fields.into_values()))
+        Arc::new(StructType::new_unchecked_refs(self.fields.into_values()))
     }
 }
 
@@ -890,6 +902,14 @@ impl StructType {
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Self::try_new_refs(fields.into_iter().map(Into::into))
+    }
+
+    /// Creates a new [`StructType`] from shared field references.
+    ///
+    /// The field allocations are retained in the resulting struct. Validation is identical to
+    /// [`StructType::try_new`].
+    pub fn try_new_refs(fields: impl IntoIterator<Item = StructFieldRef>) -> DeltaResult<Self> {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
         let mut seen_lowercase_names = HashSet::new();
@@ -953,6 +973,12 @@ impl StructType {
     /// Refer to [`StructType::try_new`] for more details on the validation checks.
     #[internal_api]
     pub(crate) fn new_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
+        Self::new_unchecked_refs(fields.into_iter().map(Into::into))
+    }
+
+    /// Creates a new [`StructType`] from shared field references without validating them.
+    #[internal_api]
+    pub(crate) fn new_unchecked_refs(fields: impl IntoIterator<Item = StructFieldRef>) -> Self {
         let mut field_map = IndexMap::new();
         let mut metadata_columns = HashMap::new();
 
@@ -980,7 +1006,7 @@ impl StructType {
                 .cloned()
                 .ok_or_else(|| Error::missing_column(name.as_ref()))
         });
-        Self::try_from_results(fields)
+        fields.process_results(|fields| Self::try_new_refs(fields))?
     }
 
     /// Gets a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
@@ -993,7 +1019,12 @@ impl StructType {
 
     /// Adds fields to this [`StructType`], returning a new [`StructType`].
     pub fn add(&self, fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
-        Self::try_new(self.fields.values().cloned().chain(fields))
+        self.add_refs(fields.into_iter().map(Into::into))
+    }
+
+    /// Adds shared fields to this [`StructType`], returning a new [`StructType`].
+    pub fn add_refs(&self, fields: impl IntoIterator<Item = StructFieldRef>) -> DeltaResult<Self> {
+        Self::try_new_refs(self.fields.values().cloned().chain(fields))
     }
 
     /// Adds a predefined metadata column to this [`StructType`], returning a new [`StructType`].
@@ -1026,7 +1057,7 @@ impl StructType {
     }
 
     /// Gets the field with the given name.
-    pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
+    pub fn field(&self, name: impl AsRef<str>) -> Option<&StructFieldRef> {
         self.fields.get(name.as_ref())
     }
 
@@ -1034,7 +1065,7 @@ impl StructType {
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
     /// a struct type.
-    pub fn field_at<'a>(&'a self, col: &ColumnName) -> DeltaResult<&'a StructField> {
+    pub fn field_at<'a>(&'a self, col: &ColumnName) -> DeltaResult<&'a StructFieldRef> {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
         field.ok_or_else(|| Error::generic("Empty path"))
@@ -1048,7 +1079,7 @@ impl StructType {
     pub(crate) fn visit_fields_of_path<'a>(
         &'a self,
         col: &ColumnName,
-        visit_field: impl FnMut(&'a StructField),
+        visit_field: impl FnMut(&'a StructFieldRef),
     ) -> DeltaResult<()> {
         self.visit_fields_of_path_by(col, |s, name| s.field(name), visit_field)
     }
@@ -1065,7 +1096,7 @@ impl StructType {
     pub(crate) fn fields_of_path<'a>(
         &'a self,
         col: &ColumnName,
-    ) -> DeltaResult<Vec<&'a StructField>> {
+    ) -> DeltaResult<Vec<&'a StructFieldRef>> {
         let mut result = Vec::with_capacity(col.path().len());
         self.visit_fields_of_path(col, |f| result.push(f))?;
         Ok(result)
@@ -1079,10 +1110,10 @@ impl StructType {
         &'a self,
         col: &ColumnName,
         find_field: F,
-        mut visit_field: impl FnMut(&'a StructField),
+        mut visit_field: impl FnMut(&'a StructFieldRef),
     ) -> DeltaResult<()>
     where
-        F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructField>,
+        F: for<'b> Fn(&'b StructType, &str) -> Option<&'b StructFieldRef>,
     {
         let path = col.path();
         if path.is_empty() {
@@ -1110,33 +1141,33 @@ impl StructType {
     }
 
     /// Gets the field with the given name and its index.
-    pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
+    pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructFieldRef)> {
         self.fields
             .get_full(name.as_ref())
             .map(|(index, _, field)| (index, field))
     }
 
     /// Gets the field at the given index.
-    pub fn field_at_index(&self, index: usize) -> Option<&StructField> {
+    pub fn field_at_index(&self, index: usize) -> Option<&StructFieldRef> {
         self.fields.get_index(index).map(|(_, field)| field)
     }
 
     /// Gets a reference to all the fields in this struct type.
     pub fn fields(
         &self,
-    ) -> impl ExactSizeIterator<Item = &StructField> + DoubleEndedIterator + FusedIterator {
+    ) -> impl ExactSizeIterator<Item = &StructFieldRef> + DoubleEndedIterator + FusedIterator {
         self.fields.values()
     }
 
     /// Gets an iterator over all the fields in this struct type.
     pub fn into_fields(
         self,
-    ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
+    ) -> impl ExactSizeIterator<Item = StructFieldRef> + DoubleEndedIterator + FusedIterator {
         self.fields.into_values()
     }
 
     /// Gets a mutable reference to the underlying field map.
-    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructField> {
+    pub(crate) fn field_map_mut(&mut self) -> &mut IndexMap<String, StructFieldRef> {
         &mut self.fields
     }
 
@@ -1164,11 +1195,11 @@ impl StructType {
     /// ```
     #[cfg(any(test, feature = "test-utils"))]
     #[allow(clippy::panic, clippy::expect_used)]
-    pub fn field_at_path<'a>(&'a self, path: &[String]) -> &'a StructField {
+    pub fn field_at_path<'a>(&'a self, path: &[String]) -> &'a StructFieldRef {
         fn find_ci<'a>(
-            mut fields: impl Iterator<Item = &'a StructField>,
+            mut fields: impl Iterator<Item = &'a StructFieldRef>,
             name: &str,
-        ) -> &'a StructField {
+        ) -> &'a StructFieldRef {
             let lowered = name.to_lowercase();
             fields
                 .find(|f| f.name().to_lowercase() == lowered)
@@ -1221,14 +1252,14 @@ impl StructType {
     }
 
     /// Gets a reference to the metadata column with the given spec.
-    pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructField> {
+    pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructFieldRef> {
         self.metadata_columns
             .get(spec)
             .and_then(|index| self.fields.get_index(*index).map(|(_, field)| field))
     }
 
     /// Gets an iterator over all the metadata columns in this struct type.
-    pub fn metadata_columns(&self) -> impl Iterator<Item = &StructField> {
+    pub fn metadata_columns(&self) -> impl Iterator<Item = &StructFieldRef> {
         self.metadata_columns
             .values()
             .filter_map(|index| self.fields.get_index(*index).map(|(_, field)| field))
@@ -1265,7 +1296,7 @@ impl StructType {
 
     /// Validates that there are no metadata columns in the given fields.
     pub(crate) fn ensure_no_metadata_columns(
-        fields: &mut dyn Iterator<Item = &StructField>,
+        fields: &mut dyn Iterator<Item = &StructFieldRef>,
     ) -> DeltaResult<()> {
         for field in fields {
             Self::ensure_no_metadata_columns_in_field(field)?;
@@ -1315,7 +1346,7 @@ impl StructType {
         &self,
         predicate: impl Fn(&StructField) -> bool,
     ) -> DeltaResult<Self> {
-        Self::try_new(self.fields().filter(|f| predicate(f)).cloned())
+        Self::try_new_refs(self.fields().filter(|f| predicate(f)).cloned())
     }
 
     /// Returns an optional [`StructType`] containing only the top-level fields for which
@@ -1383,7 +1414,7 @@ impl Display for StructType {
 }
 
 impl IntoIterator for StructType {
-    type Item = StructField;
+    type Item = StructFieldRef;
     type IntoIter = StructFieldIntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -1394,7 +1425,7 @@ impl IntoIterator for StructType {
 }
 
 impl<'a> IntoIterator for &'a StructType {
-    type Item = &'a StructField;
+    type Item = &'a StructFieldRef;
     type IntoIter = StructFieldRefIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -1404,11 +1435,11 @@ impl<'a> IntoIterator for &'a StructType {
     }
 }
 
-/// An iterator that yields owned [`StructField`]s from a [`StructType`].
+/// An iterator that yields shared [`StructFieldRef`]s from a [`StructType`].
 ///
 /// This iterator is returned by the [`IntoIterator`] implementation for [`StructType`] and
-/// consumes the original struct. It yields each field in the order they were defined in the
-/// schema, preserving the insertion order maintained by the underlying [`IndexMap`].
+/// consumes the original struct. It yields each shared field reference in schema order, preserving
+/// the insertion order maintained by the underlying [`IndexMap`].
 ///
 /// # Examples
 ///
@@ -1432,11 +1463,11 @@ impl<'a> IntoIterator for &'a StructType {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug)]
 pub struct StructFieldIntoIter {
-    inner: indexmap::map::IntoValues<String, StructField>,
+    inner: indexmap::map::IntoValues<String, StructFieldRef>,
 }
 
 impl Iterator for StructFieldIntoIter {
-    type Item = StructField;
+    type Item = StructFieldRef;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
@@ -1473,11 +1504,11 @@ impl DoubleEndedIterator for StructFieldIntoIter {
     }
 }
 
-/// An iterator that yields references to [`StructField`]s from a [`StructType`].
+/// An iterator that yields references to [`StructFieldRef`]s from a [`StructType`].
 ///
 /// This iterator is returned by the [`IntoIterator`] implementation for `&StructType` and by
 /// the [`StructType::fields()`] method. Unlike [`StructFieldIntoIter`], this iterator does not
-/// consume the original struct and yields references to the fields. It preserves the insertion
+/// consume the original struct and yields borrowed shared references. It preserves the insertion
 /// order maintained by the underlying [`IndexMap`].
 ///
 /// This iterator implements [`Clone`], allowing you to create multiple independent iterators
@@ -1514,11 +1545,11 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// [`IndexMap`]: indexmap::IndexMap
 #[derive(Debug, Clone)]
 pub struct StructFieldRefIter<'a> {
-    inner: indexmap::map::Values<'a, String, StructField>,
+    inner: indexmap::map::Values<'a, String, StructFieldRef>,
 }
 
 impl<'a> Iterator for StructFieldRefIter<'a> {
-    type Item = &'a StructField;
+    type Item = &'a StructFieldRef;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
@@ -1685,7 +1716,7 @@ impl From<(Vec<ColumnName>, Vec<DataType>)> for ColumnNamesAndTypes {
 struct StructTypeSerDeHelper {
     #[serde(rename = "type")]
     type_name: String,
-    fields: Vec<StructField>,
+    fields: Vec<StructFieldRef>,
 }
 
 impl Serialize for StructType {
@@ -1708,7 +1739,7 @@ impl<'de> Deserialize<'de> for StructType {
         Self: Sized,
     {
         let helper = StructTypeSerDeHelper::deserialize(deserializer)?;
-        StructType::try_new(helper.fields).map_err(serde::de::Error::custom)
+        StructType::try_new_refs(helper.fields).map_err(serde::de::Error::custom)
     }
 }
 
@@ -2412,6 +2443,13 @@ impl DataType {
         Ok(StructType::try_new(fields)?.into())
     }
 
+    /// Create a new struct type with the given shared fields.
+    pub fn try_struct_type_refs(
+        fields: impl IntoIterator<Item = StructFieldRef>,
+    ) -> DeltaResult<Self> {
+        Ok(StructType::try_new_refs(fields)?.into())
+    }
+
     /// Create a new struct type from a fallible iterator of fields.
     pub fn try_struct_type_from_results<E: Into<Error>>(
         fields: impl IntoIterator<Item = Result<StructField, E>>,
@@ -2436,10 +2474,18 @@ impl DataType {
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
     /// should prefer using [`DataType::unshredded_variant`].
     pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Self::variant_type_refs(fields.into_iter().map(Into::into))
+    }
+
+    /// Create a new [`DataType::Variant`] from shared fields.
+    pub fn variant_type_refs(
+        fields: impl IntoIterator<Item = StructFieldRef>,
+    ) -> DeltaResult<Self> {
         // Different from regular StructTypes, Variants are not allowed to contain metadata columns
         // at all, so we also need to check their top-level primitive types.
-        Ok(DataType::Variant(Box::new(StructType::try_from_results(
-            fields.into_iter().map(|field| {
+        let fields = fields
+            .into_iter()
+            .map(|field| {
                 if field.is_metadata_column() {
                     Err(Error::schema(
                         "Metadata columns are not allowed in Variant types".to_string(),
@@ -2447,7 +2493,10 @@ impl DataType {
                 } else {
                     Ok(field)
                 }
-            }),
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+        Ok(DataType::Variant(Box::new(StructType::try_new_refs(
+            fields,
         )?)))
     }
 
@@ -3780,7 +3829,7 @@ mod tests {
         // Test owned iteration (consumes the struct)
         let mut field_names = Vec::new();
         for field in struct_type {
-            field_names.push(field.name);
+            field_names.push(field.name().to_string());
         }
         assert_eq!(field_names, vec!["a", "b"]);
     }
@@ -3884,7 +3933,10 @@ mod tests {
         assert_eq!(ref_names, vec!["zebra", "apple", "banana"]);
 
         // Test consuming iterator maintains order too
-        let owned_names: Vec<_> = struct_type.into_iter().map(|f| f.name).collect();
+        let owned_names: Vec<_> = struct_type
+            .into_iter()
+            .map(|field| field.name().to_string())
+            .collect();
         assert_eq!(owned_names, vec!["zebra", "apple", "banana"]);
     }
 
@@ -3897,16 +3949,16 @@ mod tests {
         let struct_type = StructType::new_unchecked(original_fields.clone());
 
         // Test collecting from reference iterator
-        let collected_refs: Vec<&StructField> = struct_type.fields().collect();
+        let collected_refs: Vec<&StructFieldRef> = struct_type.fields().collect();
         assert_eq!(collected_refs.len(), 2);
         assert_eq!(collected_refs[0].name, "field1");
         assert_eq!(collected_refs[1].name, "field2");
 
         // Test collecting from consuming iterator
-        let collected_owned: Vec<StructField> = struct_type.into_iter().collect();
-        assert_eq!(collected_owned.len(), 2);
-        assert_eq!(collected_owned[0].name, "field1");
-        assert_eq!(collected_owned[1].name, "field2");
+        let collected_refs: Vec<StructFieldRef> = struct_type.into_iter().collect();
+        assert_eq!(collected_refs.len(), 2);
+        assert_eq!(collected_refs[0].name, "field1");
+        assert_eq!(collected_refs[1].name, "field2");
     }
 
     #[test]
@@ -4299,7 +4351,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                nested_field_with_metadata.into(),
             )]
             .into_iter()
             .collect(),
@@ -4324,7 +4376,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                nested_field_with_metadata.into(),
             )]
             .into_iter()
             .collect(),
@@ -4350,7 +4402,7 @@ mod tests {
             type_name: "struct".into(),
             fields: [(
                 nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
+                nested_field_with_metadata.into(),
             )]
             .into_iter()
             .collect(),
@@ -4631,6 +4683,23 @@ mod tests {
         assert_eq!(extended_schema.num_fields(), 2);
         assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
         assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn struct_field_refs_are_reused_across_schemas_and_projections() {
+        let shared: StructFieldRef = StructField::nullable("id", DataType::INTEGER).into();
+        let first = StructType::try_new_refs([shared.clone()]).unwrap();
+        let second = StructType::try_new_refs([shared.clone()]).unwrap();
+        let projected = first.project_as_struct(&["id"]).unwrap();
+        let extended = StructTypeBuilder::from_schema(&first)
+            .add_field(StructField::nullable("name", DataType::STRING))
+            .build()
+            .unwrap();
+
+        assert!(Arc::ptr_eq(first.field("id").unwrap(), &shared));
+        assert!(Arc::ptr_eq(second.field("id").unwrap(), &shared));
+        assert!(Arc::ptr_eq(projected.field("id").unwrap(), &shared));
+        assert!(Arc::ptr_eq(extended.field("id").unwrap(), &shared));
     }
 
     #[test]

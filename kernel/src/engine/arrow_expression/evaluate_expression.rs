@@ -976,7 +976,7 @@ fn evaluate_map_to_struct(
         .ok_or_else(|| Error::generic("MapToStruct requires maps with string values"))?;
 
     let num_rows = map_array.len();
-    let fields: Vec<&StructField> = output_schema.fields().collect();
+    let fields: Vec<&StructField> = output_schema.fields().map(AsRef::as_ref).collect();
 
     // Pre-build a builder and resolve the PrimitiveType for each output field.
     let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::with_capacity(fields.len());

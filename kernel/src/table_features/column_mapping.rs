@@ -652,7 +652,7 @@ fn assign_nested_cm_ids(schema: &StructType, max_id: &mut i64) -> DeltaResult<St
             let physical = expect_physical_name(field)?;
             let mut nested_ids = NestedFieldIds::new();
             let new_dt = walk(&field.data_type, max_id, &physical, &mut nested_ids)?;
-            let mut new_field = field.clone();
+            let mut new_field = field.as_ref().clone();
             new_field.data_type = new_dt;
             if !nested_ids.is_empty() {
                 insert_nested_field_ids_metadata(&mut new_field, nested_ids);

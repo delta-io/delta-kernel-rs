@@ -800,11 +800,11 @@ pub fn schema_with_column_defaults(
     let augmented_fields: Vec<_> = schema
         .fields()
         .map(|field| match column_defaults.remove(field.name.as_str()) {
-            Some(sql) => field.clone().add_metadata([(
+            Some(sql) => field.as_ref().clone().add_metadata([(
                 ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
                 MetadataValue::String(sql.to_string()),
             )]),
-            None => field.clone(),
+            None => field.as_ref().clone(),
         })
         .collect();
     if !column_defaults.is_empty() {
@@ -1195,6 +1195,7 @@ pub fn resolve_field<'a>(
     }
     current
         .field(last.as_ref())
+        .map(AsRef::as_ref)
         .ok_or_else(|| format!("schema missing field '{display}'"))
 }
 

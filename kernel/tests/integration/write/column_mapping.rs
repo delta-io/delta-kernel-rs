@@ -503,15 +503,21 @@ async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled(
         nullable "id": INTEGER,
         nullable "value": INTEGER
     };
-    let stale_schema = StructType::try_new([
+    let stale_schema = StructType::try_new_refs([
         stale_schema.field("id").unwrap().clone(),
-        stale_schema.field("value").unwrap().clone().add_metadata([
-            ("delta.columnMapping.id", MetadataValue::Number(2)),
-            (
-                "delta.columnMapping.physicalName",
-                MetadataValue::String("col-2f8a".to_string()),
-            ),
-        ]),
+        stale_schema
+            .field("value")
+            .unwrap()
+            .as_ref()
+            .clone()
+            .add_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(2)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col-2f8a".to_string()),
+                ),
+            ])
+            .into(),
     ])?;
     let escaped = serde_json::to_string(&serde_json::to_string(&stale_schema)?)?;
     // Create a v0 commit directly to bypass create_table validation (which would reject the

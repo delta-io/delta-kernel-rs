@@ -31,7 +31,7 @@ use crate::error::Error;
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    StructFieldRef, StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
@@ -167,7 +167,9 @@ where
 
 /// Converts a kernel [`StructType`] to a `Vec<ArrowField>`.
 fn try_kernel_struct_to_arrow_fields(s: &StructType) -> Result<Vec<ArrowField>, ArrowError> {
-    s.fields().map(|f| f.try_into_arrow()).try_collect()
+    s.fields()
+        .map(|field| field.as_ref().try_into_arrow())
+        .try_collect()
 }
 
 impl TryFromKernel<&StructType> for ArrowSchema {
@@ -184,6 +186,12 @@ impl TryFromKernel<&StructField> for ArrowField {
         metadata.remove(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
         let arrow_type = kernel_field_into_arrow(f, f.name(), f.data_type())?;
         Ok(ArrowField::new(f.name(), arrow_type, f.is_nullable()).with_metadata(metadata))
+    }
+}
+
+impl TryFromKernel<&StructFieldRef> for ArrowField {
+    fn try_from_kernel(field: &StructFieldRef) -> Result<Self, ArrowError> {
+        Self::try_from_kernel(field.as_ref())
     }
 }
 

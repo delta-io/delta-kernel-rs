@@ -424,7 +424,7 @@ fn build_data_batch(random_seed: i32) -> RecordBatch {
     let rows = ROWS_PER_PARTITION as usize;
 
     // Data schema excludes the `region` partition column.
-    let data_schema = StructType::try_new(
+    let data_schema = StructType::try_new_refs(
         nested_schema_with_all_delta_types()
             .fields()
             .filter(|f| f.name() != "region")

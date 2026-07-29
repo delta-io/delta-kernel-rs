@@ -149,6 +149,7 @@ fn validate_checkpoint_schema(schema: &SchemaRef) {
             .fields()
             .find(|f| f.name() == name)
             .unwrap_or_else(|| panic!("Field '{name}' not found"))
+            .as_ref()
             .clone()
     }
 

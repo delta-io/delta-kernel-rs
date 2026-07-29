@@ -19,7 +19,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructFieldRef, StructType};
 use crate::utils::{CollectInto, FoldWithOption as _};
 use crate::{DeltaResult, Error};
 
@@ -553,7 +553,7 @@ impl<Item: ExpressionItem> FieldPatchNode<Item> {
 
 // === Schema lowering ===
 
-impl StructPatchBuilder<StructField> {
+impl StructPatchBuilder<StructFieldRef> {
     /// Builds the output struct schema for this patch over `input_schema`.
     ///
     /// If this builder targets a nested path (via [`new_nested`](Self::new_nested)), the returned
@@ -567,16 +567,16 @@ impl StructPatchBuilder<StructField> {
     /// field patch targets a non-struct field, or the resulting output schema is invalid.
     pub fn build(self, input_schema: &StructType) -> DeltaResult<StructType> {
         let (root, _input_path, source_schema) = self.begin_build(input_schema)?;
-        StructType::try_new(schema_walk(root, source_schema)?)
+        StructType::try_new_refs(schema_walk(root, source_schema)?)
     }
 }
 
-type ProjectionItem = (StructField, ExpressionRef);
+type ProjectionItem = (StructFieldRef, ExpressionRef);
 
 trait SchemaPatchItem {
-    fn into_field(self) -> StructField;
+    fn into_field(self) -> StructFieldRef;
 
-    fn into_fields(items: Vec<Self>) -> impl Iterator<Item = StructField>
+    fn into_fields(items: Vec<Self>) -> impl Iterator<Item = StructFieldRef>
     where
         Self: Sized,
     {
@@ -584,14 +584,14 @@ trait SchemaPatchItem {
     }
 }
 
-impl SchemaPatchItem for StructField {
-    fn into_field(self) -> StructField {
+impl SchemaPatchItem for StructFieldRef {
+    fn into_field(self) -> StructFieldRef {
         self
     }
 }
 
 impl SchemaPatchItem for ProjectionItem {
-    fn into_field(self) -> StructField {
+    fn into_field(self) -> StructFieldRef {
         self.0
     }
 }
@@ -599,7 +599,7 @@ impl SchemaPatchItem for ProjectionItem {
 fn schema_walk<Item: SchemaPatchItem>(
     node: StructPatchNode<Item>,
     input_schema: &StructType,
-) -> DeltaResult<Vec<StructField>> {
+) -> DeltaResult<Vec<StructFieldRef>> {
     let mut fields = node.fields;
     let mut output: Vec<_> = Item::into_fields(node.prepended_fields).collect();
     output.reserve(input_schema.num_fields() + fields.len());
@@ -621,10 +621,10 @@ fn schema_walk<Item: SchemaPatchItem>(
                 let children = schema_walk(*node, nested_schema)?;
                 let field = StructField::new(
                     input_field.name(),
-                    StructType::try_new(children)?,
+                    StructType::try_new_refs(children)?,
                     input_field.nullable,
                 );
-                output.push(field.with_metadata(input_field.metadata.clone()));
+                output.push(field.with_metadata(input_field.metadata.clone()).into());
             }
         }
         output.extend(Item::into_fields(field_patch.insert_after));
@@ -664,7 +664,7 @@ pub struct ProjectionStructPatchBuilder<'a> {
 /// precedes the emitted item in the inner call, matching the inner builder's signatures.
 macro_rules! delegate {
     ($self:ident, $method:ident, $field:expr, $expr:expr $(, $arg:expr)*) => {{
-        $self.inner = $self.inner.$method($($arg,)* ($field, $expr.into()));
+        $self.inner = $self.inner.$method($($arg,)* (($field).into(), $expr.into()));
         $self
     }};
 }
@@ -674,7 +674,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         &self,
         struct_path: &ColumnName,
         field_name: &str,
-    ) -> DeltaResult<StructField> {
+    ) -> DeltaResult<StructFieldRef> {
         let field_path: ColumnName = [
             self.inner.input_path.clone().unwrap_or_default(),
             struct_path.clone(),
@@ -744,7 +744,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     pub fn replace(
         mut self,
         field_name: impl Into<String>,
-        field: StructField,
+        field: impl Into<StructFieldRef>,
         expr: impl Into<ExpressionRef>,
     ) -> Self {
         delegate!(self, replace, field, expr, field_name)
@@ -755,7 +755,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         mut self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
-        field: StructField,
+        field: impl Into<StructFieldRef>,
         expr: impl Into<ExpressionRef>,
     ) -> Self {
         delegate!(self, replace_at, field, expr, struct_path, field_name)
@@ -796,7 +796,11 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     }
 
     /// Emits `field`, produced by `expr`, before all input fields.
-    pub fn prepend(mut self, field: StructField, expr: impl Into<ExpressionRef>) -> Self {
+    pub fn prepend(
+        mut self,
+        field: impl Into<StructFieldRef>,
+        expr: impl Into<ExpressionRef>,
+    ) -> Self {
         delegate!(self, prepend, field, expr)
     }
 
@@ -804,7 +808,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     pub fn prepend_at(
         mut self,
         struct_path: impl CollectInto<ColumnName>,
-        field: StructField,
+        field: impl Into<StructFieldRef>,
         expr: impl Into<ExpressionRef>,
     ) -> Self {
         delegate!(self, prepend_at, field, expr, struct_path)
@@ -814,7 +818,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     pub fn insert_after(
         mut self,
         field_name: impl Into<String>,
-        field: StructField,
+        field: impl Into<StructFieldRef>,
         expr: impl Into<ExpressionRef>,
     ) -> Self {
         delegate!(self, insert_after, field, expr, field_name)
@@ -825,14 +829,18 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         mut self,
         struct_path: impl CollectInto<ColumnName>,
         field_name: impl Into<String>,
-        field: StructField,
+        field: impl Into<StructFieldRef>,
         expr: impl Into<ExpressionRef>,
     ) -> Self {
         delegate!(self, insert_after_at, field, expr, struct_path, field_name)
     }
 
     /// Emits `field`, produced by `expr`, after all input fields and field-specific insertions.
-    pub fn append(mut self, field: StructField, expr: impl Into<ExpressionRef>) -> Self {
+    pub fn append(
+        mut self,
+        field: impl Into<StructFieldRef>,
+        expr: impl Into<ExpressionRef>,
+    ) -> Self {
         delegate!(self, append, field, expr)
     }
 
@@ -840,7 +848,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     pub fn append_at(
         mut self,
         struct_path: impl CollectInto<ColumnName>,
-        field: StructField,
+        field: impl Into<StructFieldRef>,
         expr: impl Into<ExpressionRef>,
     ) -> Self {
         delegate!(self, append_at, field, expr, struct_path)
@@ -865,7 +873,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
     pub fn build(self) -> DeltaResult<(SchemaRef, ExpressionRef)> {
         let (root, input_path, source_schema) = self.inner.begin_build(self.input_schema)?;
         let patch = root.to_expr_patch(input_path);
-        let schema = StructType::try_new(schema_walk(root, source_schema)?)?;
+        let schema = StructType::try_new_refs(schema_walk(root, source_schema)?)?;
         Ok((Arc::new(schema), Arc::new(Expression::StructPatch(patch))))
     }
 }
@@ -1004,7 +1012,12 @@ mod tests {
     #[case::optional_missing_drop(SchemaStructPatchBuilder::new().drop_if_exists("missing"))]
     fn schema_build_preserves_input_schema(#[case] builder: SchemaStructPatchBuilder) {
         let input_schema = schema(&["a", "b"]);
-        assert_eq!(builder.build(&input_schema).unwrap(), input_schema);
+        let output_schema = builder.build(&input_schema).unwrap();
+        assert_eq!(output_schema, input_schema);
+        assert!(input_schema
+            .fields()
+            .zip(output_schema.fields())
+            .all(|(input, output)| Arc::ptr_eq(input, output)));
     }
 
     // Patches that reorder/insert/replace/drop fields, asserted by the resulting field order.
@@ -1074,6 +1087,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(field_names(&output_schema), ["nested", "top"]);
+        assert!(!Arc::ptr_eq(
+            input_schema.field("nested").unwrap(),
+            output_schema.field("nested").unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            input_schema.field("top").unwrap(),
+            output_schema.field("top").unwrap()
+        ));
         let DataType::Struct(nested) = output_schema.field("nested").unwrap().data_type() else {
             panic!("Expected nested struct field");
         };
@@ -1081,6 +1102,18 @@ mod tests {
             field_names(nested),
             ["nested_a", "nested_inserted", "nested_b"]
         );
+        let DataType::Struct(input_nested) = input_schema.field("nested").unwrap().data_type()
+        else {
+            panic!("Expected nested struct field");
+        };
+        assert!(Arc::ptr_eq(
+            input_nested.field("nested_a").unwrap(),
+            nested.field("nested_a").unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            input_nested.field("nested_b").unwrap(),
+            nested.field("nested_b").unwrap()
+        ));
     }
 
     #[rstest]

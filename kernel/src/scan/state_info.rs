@@ -389,7 +389,7 @@ impl StateInfo {
         );
         let table_partition_schema =
             if (has_predicate || partition_values.parsed_struct) && !partition_columns.is_empty() {
-                let partition_fields: Vec<StructField> = table_configuration
+                let partition_fields: Vec<_> = table_configuration
                     .logical_schema()
                     .fields()
                     .zip(table_configuration.physical_schema().fields())
@@ -399,7 +399,7 @@ impl StateInfo {
                 if partition_fields.is_empty() {
                     None
                 } else {
-                    Some(Arc::new(StructType::new_unchecked(partition_fields)))
+                    Some(Arc::new(StructType::new_unchecked_refs(partition_fields)))
                 }
             } else {
                 None

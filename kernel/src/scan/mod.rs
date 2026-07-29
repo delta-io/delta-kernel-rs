@@ -74,7 +74,7 @@ pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLoc
         .filter(|f| f.name() != "stats")
         .cloned()
         .collect();
-    let add_no_stats = StructType::new_unchecked(fields_no_stats);
+    let add_no_stats = StructType::new_unchecked_refs(fields_no_stats);
     Arc::new(StructType::new_unchecked([StructField::nullable(
         ADD_NAME,
         add_no_stats,

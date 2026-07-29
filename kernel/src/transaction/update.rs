@@ -381,13 +381,14 @@ static NEW_STATS_NAME: &str = "newStats";
 /// This is an intermediate schema used during deletion vector updates before transforming to final
 /// add actions.
 static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(
+    Arc::new(StructType::new_unchecked_refs(
         scan_row_schema().fields().cloned().chain([
             StructField::nullable(
                 NEW_DELETION_VECTOR_NAME.to_string(),
                 DeletionVectorDescriptor::to_schema(),
-            ),
-            StructField::nullable(NEW_STATS_NAME.to_string(), DataType::STRING),
+            )
+            .into(),
+            StructField::nullable(NEW_STATS_NAME.to_string(), DataType::STRING).into(),
         ]),
     ))
 });
@@ -628,6 +629,7 @@ impl FilteredRowVisitor for DvMatchVisitor<'_> {
         static DV_SCHEMA_FIELDS: LazyLock<Vec<StructField>> = LazyLock::new(|| {
             DeletionVectorDescriptor::to_schema()
                 .into_fields()
+                .map(|field| field.as_ref().clone())
                 .collect()
         });
         let num_rows = rows.num_rows();

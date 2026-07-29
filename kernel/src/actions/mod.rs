@@ -239,7 +239,10 @@ impl TryFrom<Format> for Scalar {
         )
         .map(Scalar::Map)?;
         Ok(Scalar::Struct(StructData::try_new(
-            Format::to_schema().into_fields().collect(),
+            Format::to_schema()
+                .into_fields()
+                .map(|field| field.as_ref().clone())
+                .collect(),
             vec![provider, options],
         )?))
     }

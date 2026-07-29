@@ -190,7 +190,7 @@ impl TableConfiguration {
                 })
                 .map(|(_, physical_field)| physical_field.clone());
             // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
+            Arc::new(StructType::new_unchecked_refs(fields))
         };
         let logical_schema_without_partition_columns = {
             let fields = logical_schema
@@ -198,7 +198,7 @@ impl TableConfiguration {
                 .filter(|field| !partition_columns.contains(field.name().as_str()))
                 .cloned();
             // Safety: subset of an already-valid schema.
-            Arc::new(StructType::new_unchecked(fields))
+            Arc::new(StructType::new_unchecked_refs(fields))
         };
 
         let table_config = Self {
@@ -386,7 +386,7 @@ impl TableConfiguration {
                 }
                 field
             })
-            .map(|field: &StructField| {
+            .map(|field| {
                 StructField::new(
                     field.physical_name(column_mapping_mode).to_owned(),
                     field.data_type().clone(),

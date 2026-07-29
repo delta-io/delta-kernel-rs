@@ -1841,7 +1841,10 @@ mod tests {
         let complex = StripFieldMetadataTransform
             .transform_struct(&with_metadata)
             .into_owned();
-        let mut fields: Vec<StructField> = complex.fields().cloned().collect();
+        let mut fields: Vec<StructField> = complex
+            .fields()
+            .map(|field| field.as_ref().clone())
+            .collect();
         fields.push(StructField::nullable("region", DataType::STRING));
         Arc::new(StructType::try_new(fields).unwrap())
     }

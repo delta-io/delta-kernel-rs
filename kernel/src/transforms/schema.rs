@@ -2,7 +2,7 @@ use std::borrow::{Cow, ToOwned};
 
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
+    map_owned_or_else, map_owned_pair_or_else, map_struct_field_children, transform_output_type,
     Carrier,
 };
 
@@ -165,8 +165,10 @@ pub trait SchemaTransform<'a> {
 
     /// Recursively transforms a struct's fields (variadic).
     fn recurse_into_struct(&mut self, stype: &'a StructType) -> Self::Output<StructType> {
-        let children = stype.fields().map(|f| self.transform_struct_field(f));
-        map_owned_children_or_else(stype, children, StructType::new_unchecked)
+        let children = stype
+            .fields()
+            .map(|field| (field, self.transform_struct_field(field)));
+        map_struct_field_children(stype, children)
     }
 
     /// Recursively transforms an array's element type (unary).
@@ -260,6 +262,9 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
     use super::*;
     use crate::schema::{DataType, StructField};
 
@@ -349,5 +354,40 @@ mod tests {
         // Depth limit not hit (full traversal required)
         assert_eq!(check_with_call_count(7), (7, 32));
         assert_eq!(check_with_call_count(8), (7, 32));
+    }
+
+    #[test]
+    fn schema_transform_reuses_unchanged_field_refs() {
+        struct MakeIdNullable;
+
+        impl<'a> SchemaTransform<'a> for MakeIdNullable {
+            transform_output_type!(|'a, T| Cow<'a, T>);
+
+            fn transform_struct_field(&mut self, field: &'a StructField) -> Cow<'a, StructField> {
+                if field.name() == "id" {
+                    let mut field = field.clone();
+                    field.nullable = true;
+                    Cow::Owned(field)
+                } else {
+                    self.recurse_into_struct_field(field)
+                }
+            }
+        }
+
+        let input = StructType::try_new([
+            StructField::not_null("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+        ])
+        .unwrap();
+        let output = MakeIdNullable.transform_struct(&input).into_owned();
+
+        assert!(!Arc::ptr_eq(
+            input.field("id").unwrap(),
+            output.field("id").unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            input.field("name").unwrap(),
+            output.field("name").unwrap()
+        ));
     }
 }

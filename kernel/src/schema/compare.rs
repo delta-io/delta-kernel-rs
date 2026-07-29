@@ -120,7 +120,7 @@ impl SchemaComparison for StructType {
         let lowercase_field_map: HashMap<String, &StructField> = self
             .fields
             .iter()
-            .map(|(name, field)| (name.to_lowercase(), field))
+            .map(|(name, field)| (name.to_lowercase(), field.as_ref()))
             .collect();
         require!(
             lowercase_field_map.len() == self.fields.len(),

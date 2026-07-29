@@ -679,14 +679,14 @@ fn get_indices(
                         debug!("Inserting a row index column: {}", field.name());
                         reorder_indices.push(ReorderIndex::row_index(
                             requested_position,
-                            Arc::new(field.try_into_arrow()?),
+                            Arc::new(field.as_ref().try_into_arrow()?),
                         ));
                     }
                     Some(MetadataColumnSpec::FilePath) => {
                         debug!("Inserting a file path column: {}", field.name());
                         reorder_indices.push(ReorderIndex::file_path(
                             requested_position,
-                            Arc::new(field.try_into_arrow()?),
+                            Arc::new(field.as_ref().try_into_arrow()?),
                         ));
                     }
                     Some(metadata_spec) => {
@@ -698,7 +698,7 @@ fn get_indices(
                         debug!("Inserting missing and nullable field: {}", field.name());
                         reorder_indices.push(ReorderIndex::missing(
                             requested_position,
-                            Arc::new(field.try_into_arrow()?),
+                            Arc::new(field.as_ref().try_into_arrow()?),
                         ));
                     }
                     None => {
@@ -1467,7 +1467,7 @@ pub(crate) fn build_json_reorder_indices(schema: &StructType) -> DeltaResult<Vec
     }
 
     for (output_pos, field, spec) in metadata_entries {
-        let field = Arc::new(field.try_into_arrow()?);
+        let field = Arc::new(field.as_ref().try_into_arrow()?);
         let rindex = match spec {
             MetadataColumnSpec::FilePath => ReorderIndex::file_path(output_pos, field),
             _ => ReorderIndex::missing(output_pos, field),

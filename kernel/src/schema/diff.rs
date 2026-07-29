@@ -497,7 +497,7 @@ fn collect_all_fields_with_paths(
         let field_id = get_field_id_for_path(field, &field_path)?;
 
         out.push(FieldWithPath {
-            field: field.clone(),
+            field: field.as_ref().clone(),
             path: field_path.clone(),
             field_id,
         });

@@ -1017,7 +1017,7 @@ impl LogSegment {
         let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
         let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
         let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
-            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
+            let mut new_fields: Vec<_> = if let (true, Some(add_field)) =
                 (needs_add_augmentation, action_schema.field("add"))
             {
                 let DataType::Struct(add_struct) = add_field.data_type() else {
@@ -1025,14 +1025,15 @@ impl LogSegment {
                         "add field in action schema must be a struct",
                     ));
                 };
-                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+                let mut add_fields: Vec<_> = add_struct.fields().cloned().collect();
 
                 if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
+                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()).into());
                 }
 
                 if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
+                    add_fields
+                        .push(StructField::nullable("partitionValues_parsed", ps.clone()).into());
                 }
 
                 // Rebuild schema with modified add field
@@ -1042,10 +1043,11 @@ impl LogSegment {
                         if f.name() == "add" {
                             StructField::new(
                                 add_field.name(),
-                                StructType::new_unchecked(add_fields.clone()),
+                                StructType::new_unchecked_refs(add_fields.clone()),
                                 add_field.is_nullable(),
                             )
                             .with_metadata(add_field.metadata.clone())
+                            .into()
                         } else {
                             f.clone()
                         }
@@ -1057,10 +1059,10 @@ impl LogSegment {
 
             // Add sidecar column at top-level for V2 checkpoints
             if needs_sidecar {
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()).into());
             }
 
-            Arc::new(StructType::new_unchecked(new_fields))
+            Arc::new(StructType::new_unchecked_refs(new_fields))
         } else {
             // No modifications needed, use schema as-is
             action_schema.clone()

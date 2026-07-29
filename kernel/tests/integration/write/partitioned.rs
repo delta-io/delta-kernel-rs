@@ -678,7 +678,7 @@ async fn setup_and_write(
         .zip(arrow_columns)
         .filter(|(f, _)| !partition_cols.contains(&f.name().as_str()))
         .unzip();
-    let kernel_data_schema = StructType::try_new(data_fields)?;
+    let kernel_data_schema = StructType::try_new_refs(data_fields)?;
     let arrow_data_schema: Arc<ArrowSchema> = Arc::new((&kernel_data_schema).try_into_arrow()?);
     let snapshot = create_partitioned_table(
         &table_path,

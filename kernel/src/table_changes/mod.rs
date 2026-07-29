@@ -382,12 +382,12 @@ impl TableChanges {
             return Err(mode.boundary_schema_error(start_schema.as_ref(), end_schema.as_ref()));
         }
 
-        let schema = StructType::try_new(
+        let schema = StructType::try_new_refs(
             end_snapshot
                 .schema()
                 .fields()
                 .cloned()
-                .chain(CDF_FIELDS.clone()),
+                .chain(CDF_FIELDS.iter().cloned().map(Into::into)),
         )?;
 
         Ok(TableChanges {
@@ -637,7 +637,13 @@ mod tests {
 
         let table_changes =
             TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).unwrap();
-        assert_equal(expected_schema, table_changes.schema().fields().cloned());
+        assert_equal(
+            expected_schema,
+            table_changes
+                .schema()
+                .fields()
+                .map(|field| field.as_ref().clone()),
+        );
     }
 
     #[test]

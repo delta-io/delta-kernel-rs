@@ -4,13 +4,14 @@
 //! that validates and applies schema changes to produce an evolved schema.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructFieldRef, StructType};
 use crate::table_features::{
     find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
     ColumnMappingMode,
@@ -48,7 +49,7 @@ pub(crate) enum SchemaOperation {
 // yields:
 //   [ id: int not null, address: struct { city: string, zip: string } ]
 fn modify_field_at_path(
-    fields: &mut IndexMap<String, StructField>,
+    fields: &mut IndexMap<String, StructFieldRef>,
     path: &[String],
     modifier: &dyn Fn(&mut StructField) -> DeltaResult<()>,
 ) -> DeltaResult<()> {
@@ -67,6 +68,7 @@ fn modify_field_at_path(
         let (_, field) = fields
             .get_index_mut(idx)
             .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
+        let field = Arc::make_mut(field);
         let DataType::Struct(inner) = &mut field.data_type else {
             return Err(Error::generic(format!(
                 "intermediate field '{first}' is not a struct"
@@ -79,7 +81,7 @@ fn modify_field_at_path(
     let (_, field) = fields
         .get_index_mut(idx)
         .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
-    modifier(field)
+    modifier(Arc::make_mut(field))
 }
 
 /// The result of applying schema operations.
@@ -185,7 +187,9 @@ pub(crate) fn apply_schema_operations(
                     // evolved schema.
                     field
                 };
-                schema.field_map_mut().insert(field.name().clone(), field);
+                schema
+                    .field_map_mut()
+                    .insert(field.name().clone(), field.into());
             }
             SchemaOperation::SetNullable { column } => {
                 modify_field_at_path(schema.field_map_mut(), column.path(), &|f| {
@@ -276,9 +280,9 @@ mod tests {
 
     // === modify_field_at_path tests ===
 
-    // Convert a StructType into the IndexMap<String, StructField> shape that
+    // Convert a StructType into the IndexMap<String, StructFieldRef> shape that
     // `modify_field_at_path` operates on.
-    fn into_field_map(schema: StructType) -> IndexMap<String, StructField> {
+    fn into_field_map(schema: StructType) -> IndexMap<String, StructFieldRef> {
         schema
             .into_fields()
             .map(|f| (f.name().clone(), f))
@@ -293,7 +297,7 @@ mod tests {
     fn modify_field_at_path_test_helper(
         schema: StructType,
         path: &[String],
-    ) -> DeltaResult<IndexMap<String, StructField>> {
+    ) -> DeltaResult<IndexMap<String, StructFieldRef>> {
         let mut fields = into_field_map(schema);
         modify_field_at_path(&mut fields, path, &set_nullable_modifier)?;
         Ok(fields)
@@ -429,6 +433,32 @@ mod tests {
         }];
         let result = apply_schema_operations(schema, ops, ColumnMappingMode::None, None).unwrap();
         assert!(result.schema.field_at_path(column.path()).is_nullable());
+    }
+
+    #[test]
+    fn set_nullable_clones_only_the_modified_field() {
+        let schema = simple_schema();
+        let original = schema.clone();
+        let result = apply_schema_operations(
+            schema,
+            vec![SchemaOperation::SetNullable {
+                column: column_name!("id"),
+            }],
+            ColumnMappingMode::None,
+            None,
+        )
+        .unwrap();
+
+        assert!(!Arc::ptr_eq(
+            original.field("id").unwrap(),
+            result.schema.field("id").unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            original.field("name").unwrap(),
+            result.schema.field("name").unwrap()
+        ));
+        assert!(!original.field("id").unwrap().is_nullable());
+        assert!(result.schema.field("id").unwrap().is_nullable());
     }
 
     #[rstest]

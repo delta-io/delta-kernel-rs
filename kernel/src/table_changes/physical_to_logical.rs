@@ -62,10 +62,13 @@ pub(crate) fn scan_file_physical_schema(
 ) -> SchemaRef {
     if scan_file.scan_type == CdfScanFileType::Cdc {
         let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
-        let fields = physical_schema.fields().cloned().chain(Some(change_type));
+        let fields = physical_schema
+            .fields()
+            .cloned()
+            .chain(Some(change_type.into()));
         // NOTE: We don't validate the fields again because CHANGE_TYPE_COL_NAME should never be
         // used anywhere else
-        StructType::new_unchecked(fields).into()
+        StructType::new_unchecked_refs(fields).into()
     } else {
         physical_schema.clone().into()
     }

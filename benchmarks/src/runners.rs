@@ -38,6 +38,10 @@ const CATALOG_MANAGED_PROPERTY: &str = "delta.feature.catalogManaged";
 pub trait WorkloadRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>>;
     fn name(&self) -> &str;
+
+    fn execute_concurrent(&self, _num_queries: usize) -> Result<(), Box<dyn std::error::Error>> {
+        Err("concurrent execution is not supported for this workload".into())
+    }
 }
 
 /// Builds `{table}/{case}` from `table_info.name` and `case_name`.
@@ -341,6 +345,24 @@ impl ReadMetadataRunner {
         }
         Ok(())
     }
+
+    pub fn execute_concurrent(&self, num_queries: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if num_queries == 0 {
+            return Err("num_queries must be greater than 0".into());
+        }
+        std::thread::scope(|scope| {
+            let handles = (0..num_queries)
+                .map(|_| scope.spawn(|| self.execute_serial().map_err(|e| e.to_string())))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| "concurrent query panicked".to_string())??;
+            }
+            Ok::<_, String>(())
+        })
+        .map_err(Into::into)
+    }
 }
 
 impl WorkloadRunner for ReadMetadataRunner {
@@ -353,6 +375,10 @@ impl WorkloadRunner for ReadMetadataRunner {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn execute_concurrent(&self, num_queries: usize) -> Result<(), Box<dyn std::error::Error>> {
+        Self::execute_concurrent(self, num_queries)
     }
 }
 

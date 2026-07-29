@@ -41,7 +41,7 @@ pub(super) fn create_sidecar_action_batch(
     }
 
     // Derive the sidecar struct schema and sidecar column index from the checkpoint data schema.
-    let checkpoint_data_fields: Vec<&StructField> = checkpoint_data_schema.fields().collect();
+    let checkpoint_data_fields: Vec<_> = checkpoint_data_schema.fields().collect();
     let (sidecar_col_idx, sidecar_field) = checkpoint_data_fields
         .iter()
         .enumerate()
@@ -53,7 +53,10 @@ pub(super) fn create_sidecar_action_batch(
             sidecar_field.data_type()
         )));
     };
-    let sidecar_fields: Vec<StructField> = sidecar_struct.fields().cloned().collect();
+    let sidecar_fields: Vec<StructField> = sidecar_struct
+        .fields()
+        .map(|field| field.as_ref().clone())
+        .collect();
     // Per-row data template (follows checkpoint data schema, all fields null). Each sidecar row is
     // built by cloning this and populating only the `sidecar` field.
     let null_template: Vec<Scalar> = checkpoint_data_fields
@@ -179,7 +182,7 @@ impl SidecarSplitter {
             )));
         }
         let sidecar_output_schema: SchemaRef =
-            StructType::try_new([add_field.clone(), remove_field.clone()])?.into();
+            StructType::try_new_refs([add_field.clone(), remove_field.clone()])?.into();
 
         // Sidecar projector: select only add/remove columns.
         let file_action_projector = eval_handler.new_expression_evaluator(

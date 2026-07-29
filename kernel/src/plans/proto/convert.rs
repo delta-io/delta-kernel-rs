@@ -717,7 +717,10 @@ impl From<&MapType> for proto_schema::MapType {
 impl From<&StructType> for proto_schema::StructType {
     fn from(struct_type: &StructType) -> Self {
         proto_schema::StructType {
-            fields: struct_type.fields().map(Into::into).collect(),
+            fields: struct_type
+                .fields()
+                .map(|field| field.as_ref().into())
+                .collect(),
         }
     }
 }

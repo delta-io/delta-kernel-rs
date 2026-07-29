@@ -467,7 +467,7 @@ fn read_table_data(
         let selected_fields = select_cols
             .iter()
             .map(|col| table_schema.field(col).cloned().unwrap());
-        Arc::new(Schema::new_unchecked(selected_fields))
+        Arc::new(Schema::new_unchecked_refs(selected_fields))
     });
     println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
     let scan = snapshot

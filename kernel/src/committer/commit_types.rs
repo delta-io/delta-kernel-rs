@@ -269,7 +269,9 @@ impl CommitMetadata {
     ) -> DeltaResult<Self> {
         let log_root = crate::path::LogRoot::new(table_root)?;
         let protocol = Protocol::try_new_modern(reader_features, writer_features)?;
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let schema = Arc::new(crate::schema::StructType::new_unchecked(Vec::<
+            crate::schema::StructField,
+        >::new()));
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, configuration)?;
         Ok(Self::new(
             log_root,

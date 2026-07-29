@@ -757,14 +757,14 @@ impl AggregateBuilder {
         }
         let mut aggs = Vec::with_capacity(self.aggs.len());
         for (agg, alias) in self.aggs {
-            fields.push(agg.output_field(&self.input_schema, alias)?);
+            fields.push(agg.output_field(&self.input_schema, alias)?.into());
             aggs.push(agg);
         }
         // NOTE: `StructType::try_new` rejects duplicate (case-insensitive) output column names.
         Ok(Aggregate {
             group_by: self.group_by,
             aggs,
-            schema: Arc::new(StructType::try_new(fields)?),
+            schema: Arc::new(StructType::try_new_refs(fields)?),
         })
     }
 }

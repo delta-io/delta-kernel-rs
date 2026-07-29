@@ -186,7 +186,7 @@ impl SyncPlanExecutor {
             .fields()
             .filter(|f| !file_constant_columns.contains(f.name()))
             .cloned();
-        let read_schema = Arc::new(StructType::try_new(read_fields)?);
+        let read_schema = Arc::new(StructType::try_new_refs(read_fields)?);
         let output_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
 
         let store = self.storage.store();

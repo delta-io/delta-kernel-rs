@@ -1310,8 +1310,9 @@ impl<S> Transaction<S> {
                 let commit_versions_array =
                     ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
-                let row_tracking_schema =
-                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![])))?;
+                let row_tracking_schema = with_row_tracking_cols(&Arc::new(
+                    StructType::new_unchecked(Vec::<StructField>::new()),
+                ))?;
                 add_files_batch.append_columns(
                     row_tracking_schema,
                     vec![base_row_ids_array, commit_versions_array],
@@ -2002,7 +2003,10 @@ mod tests {
             ]
         };
         assert_eq!(field_names, expected_field_names);
-        assert_eq!(schema.field("dataChange"), Some(&*DATA_CHANGE_COLUMN));
+        assert_eq!(
+            schema.field("dataChange").map(AsRef::as_ref),
+            Some(&*DATA_CHANGE_COLUMN)
+        );
         assert_eq!(
             schema.field("stats").unwrap().data_type(),
             &DataType::STRING
@@ -2065,7 +2069,7 @@ mod tests {
             .effective_table_config
             .logical_schema()
             .fields()
-            .cloned()
+            .map(|field| field.as_ref().clone())
             .collect();
         evolved_fields.push(StructField::nullable("fresh_column", DataType::INTEGER));
         let evolved_schema = Arc::new(StructType::new_unchecked(evolved_fields));

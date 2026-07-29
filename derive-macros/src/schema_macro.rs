@@ -108,12 +108,13 @@ fn emit_struct(
         input.parse::<Token![,]>()?;
     }
     let ctor = if fallible {
-        quote!(try_new)
+        quote!(try_new_refs)
     } else {
-        quote!(new_unchecked)
+        quote!(new_unchecked_refs)
     };
     Ok(quote! {{
-        let mut __fields = ::std::vec::Vec::new();
+        let mut __fields: ::std::vec::Vec<delta_kernel::schema::StructFieldRef> =
+            ::std::vec::Vec::new();
         #( #stmts )*
         delta_kernel::schema::StructType::#ctor(__fields)
     }})
@@ -154,7 +155,9 @@ fn emit_field_entry(
     input.parse::<Token![:]>()?;
     let dtype = emit_type(input, fallible, errors)?;
     Ok(quote! {
-        __fields.push(delta_kernel::schema::StructField::new(#name, #dtype, #nullable));
+        __fields.push(delta_kernel::schema::StructFieldRef::from(
+            delta_kernel::schema::StructField::new(#name, #dtype, #nullable)
+        ));
     })
 }
 
