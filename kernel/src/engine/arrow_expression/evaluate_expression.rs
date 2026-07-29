@@ -2130,7 +2130,7 @@ mod tests {
         assert_eq!(result.is_null(0), expect_null_struct);
     }
 
-    /// Base64 would render `0xDEAD` as `3q0=`.
+    /// Base64 would render `0xABCD` as `q80=`.
     #[test]
     fn test_to_json_encodes_binary_as_hex_and_nests_structs_and_arrays() {
         let item = Arc::new(ArrowField::new("item", ArrowDataType::Int32, true));
@@ -2158,7 +2158,7 @@ mod tests {
         let value = StructArray::new(
             fields.clone(),
             vec![
-                Arc::new(BinaryArray::from(vec![&[0xDEu8, 0xADu8][..]])),
+                Arc::new(BinaryArray::from(vec![&[0xABu8, 0xCDu8][..]])),
                 Arc::new(list),
                 Arc::new(nested),
             ],
@@ -2174,7 +2174,7 @@ mod tests {
         let expr = Expr::unary(UnaryExpressionOp::ToJson, column_expr!("s"));
         let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
         let result = result.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(result.value(0), r#"{"b":"dead","l":[1,2],"n":{"z":7}}"#);
+        assert_eq!(result.value(0), r#"{"b":"abcd","l":[1,2],"n":{"z":7}}"#);
     }
 
     /// An empty string is not valid JSON, so it does not parse to an empty struct. A NULL input

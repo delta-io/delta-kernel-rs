@@ -111,10 +111,10 @@ pub enum UnaryExpressionOp {
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
     /// hex rather than base64, two digits per byte in the order the bytes appear, so
-    /// `{ b: 0xDEAD, l: [1, 2], n: { z: 7 } }` becomes:
+    /// `{ b: 0xABCD, l: [1, 2], n: { z: 7 } }` becomes:
     ///
     /// ```text
-    /// {"b":"dead","l":[1,2],"n":{"z":7}}
+    /// {"b":"abcd","l":[1,2],"n":{"z":7}}
     /// ```
     ToJson,
 }
