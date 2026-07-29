@@ -125,6 +125,11 @@ impl From<&Plan> for proto_plan::Plan {
     fn from(plan: &Plan) -> Self {
         proto_plan::Plan {
             nodes: convert_vec(&plan.nodes),
+            header: Some(proto_plan::PlanHeader {
+                protocol_major: plan.header.protocol_major,
+                protocol_minor: plan.header.protocol_minor,
+                required_capabilities: plan.header.required_capabilities.clone(),
+            }),
         }
     }
 }
@@ -181,6 +186,7 @@ impl From<&ScanJson> for proto_plan::ScanJsonNode {
             files: convert_vec(&node.files),
             file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
+            commit_action_position_column: node.commit_action_position_column.clone(),
         }
     }
 }
@@ -1104,7 +1110,10 @@ mod tests {
         Operation::IoOperation(IoOperation::head_file(Url::parse("memory:///h").unwrap())),
         "io"
     )]
-    #[case(Operation::QueryPlan(Plan { nodes: vec![] }), "query_plan")]
+    #[case(Operation::QueryPlan(Plan {
+        header: Default::default(),
+        nodes: vec![],
+    }), "query_plan")]
     fn from_operation(#[case] op: Operation, #[case] expected: &str) {
         use proto_op::operation::Op;
         let kind = match decode(&op).op.unwrap() {
@@ -1224,6 +1233,7 @@ mod tests {
             .unwrap(),
         );
         let plan = Plan {
+            header: Default::default(),
             nodes: vec![
                 PlanNode {
                     op: Operator::ScanParquet(ScanParquet {
@@ -1294,6 +1304,7 @@ mod tests {
             files: vec![],
             file_constant_columns: vec![],
             schema: sample_schema(),
+            commit_action_position_column: None,
         }),
         "scan_json"
     )]
@@ -1376,6 +1387,7 @@ mod tests {
             files: vec![ScanFile::new(sample_file_meta())],
             file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
+            commit_action_position_column: None,
         };
         let proto = proto_plan::ScanJsonNode::from(&node);
         assert_eq!(proto.files.len(), 1);

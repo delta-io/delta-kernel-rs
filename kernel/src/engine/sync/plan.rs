@@ -158,12 +158,25 @@ impl SyncPlanExecutor {
                 files,
                 file_constant_columns,
                 schema,
-            }) => self.eval_scan(FileType::Json, files, file_constant_columns, schema),
+                commit_action_position_column,
+            }) => self.eval_scan(
+                FileType::Json,
+                files,
+                file_constant_columns,
+                schema,
+                commit_action_position_column,
+            ),
             Operator::ScanParquet(ScanParquet {
                 files,
                 file_constant_columns,
                 schema,
-            }) => self.eval_scan(FileType::Parquet, files, file_constant_columns, schema),
+            }) => self.eval_scan(
+                FileType::Parquet,
+                files,
+                file_constant_columns,
+                schema,
+                None,
+            ),
             Operator::Values(values) => Ok(vec![values_to_record_batch(values)?]),
             Operator::UnionAll(_) => Ok(Vec::from_iter(
                 inputs.iter().flat_map(|&i| results[i].iter().cloned()),
@@ -190,11 +203,15 @@ impl SyncPlanExecutor {
         files: Vec<ScanFile>,
         file_constant_columns: Vec<String>,
         schema: SchemaRef,
+        commit_action_position_column: Option<String>,
     ) -> DeltaResult<Vec<RecordBatch>> {
         // The engine reads only the non-constant columns; constants are spliced in afterwards.
         let read_fields = schema
             .fields()
-            .filter(|f| !file_constant_columns.contains(f.name()))
+            .filter(|f| {
+                !file_constant_columns.contains(f.name())
+                    && commit_action_position_column.as_deref() != Some(f.name())
+            })
             .cloned();
         let read_schema = Arc::new(StructType::try_new(read_fields)?);
         let output_schema: Arc<ArrowSchema> = Arc::new(schema.as_ref().try_into_arrow()?);
@@ -202,6 +219,9 @@ impl SyncPlanExecutor {
         let store = self.storage.store();
         let mut batches = Vec::new();
         for file in files {
+            // Test-only executor: the zero-based row position is monotonic with the JSON line
+            // byte offset and therefore preserves the same per-commit ordering semantics.
+            let mut action_position = 0i64;
             let metas = [file.meta.clone()];
             let read_schema = read_schema.clone();
             // The two constructors have distinct `impl Iterator` types, so box to unify the arms.
@@ -228,6 +248,8 @@ impl SyncPlanExecutor {
                     &schema,
                     &file_constant_columns,
                     &file.file_constants,
+                    commit_action_position_column.as_deref(),
+                    &mut action_position,
                 )?;
                 // Reconcile writer-chosen map/list field names to `output_schema`'s before
                 // `try_new` asserts the schema. See `coerce_columns_to_schema`.
@@ -291,6 +313,7 @@ impl SyncPlanExecutor {
             files,
             load.file_constant_columns,
             load.schema,
+            None,
         )
     }
 }
@@ -368,14 +391,23 @@ fn splice_file_constants(
     schema: &SchemaRef,
     file_constant_columns: &[String],
     constants: &[Scalar],
+    commit_action_position_column: Option<&str>,
+    next_action_position: &mut i64,
 ) -> DeltaResult<Vec<ArrayRef>> {
     let (_, read_columns, rows) = batch.into_parts();
     let mut read_columns = read_columns.into_iter();
+    let first_action_position = *next_action_position;
+    *next_action_position += rows as i64;
     schema
         .fields()
         .map(
             |field| match file_constant_columns.iter().position(|c| c == field.name()) {
                 Some(slot) => constants[slot].to_array(rows),
+                None if commit_action_position_column == Some(field.name()) => {
+                    Ok(Arc::new(Int64Array::from_iter_values(
+                        first_action_position..first_action_position + rows as i64,
+                    )) as ArrayRef)
+                }
                 None => read_columns
                     .next()
                     .ok_or_else(|| Error::generic("scan output has fewer columns than schema")),
@@ -385,7 +417,7 @@ fn splice_file_constants(
 }
 
 /// Evaluates an [`Aggregate`].
-/// Currently supports MaxNonNullBy aggregates comparing LONG-typed keys.
+/// Currently supports MaxNonNullBy aggregates with orderable keys.
 fn eval_aggregate(aggregate: &Aggregate, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
     if !aggregate.group_by.is_empty() {
         return eval_grouped_max_non_null_by(aggregate, input);
@@ -425,24 +457,24 @@ fn eval_grouped_max_non_null_by(
     }
     let value_name = simple_column_name(value)?;
     let key_name = simple_column_name(key)?;
-    // Track the winning cell and its key per group as batches stream by.
-    let mut best = HashMap::<OwnedRow, (Winner, i64)>::new();
+
+    // Track the winning cell and its orderable key per group as batches stream by.
+    let mut best = HashMap::<OwnedRow, (Winner, OwnedRow)>::new();
     for (batch_idx, batch) in input.iter().enumerate() {
         let values = extract_column(batch, &[value_name])?;
         let keys = extract_column(batch, &[key_name])?;
-        let keys = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-            Error::unsupported("SyncPlanExecutor max_non_null_by with non-LONG key")
-        })?;
+        let ordering_keys = batch_to_rows(batch, std::slice::from_ref(key))?;
         let group_key_rows = batch_to_rows(batch, &aggregate.group_by)?;
-        for (row_idx, group_keys) in group_key_rows.iter().enumerate().take(batch.num_rows()) {
+        for row_idx in 0..batch.num_rows() {
             if values.is_null(row_idx) || keys.is_null(row_idx) {
                 continue;
             }
-            let candidate = keys.value(row_idx);
-            if matches!(best.get(group_keys), Some((_, best_key)) if candidate <= *best_key) {
+            let candidate = &ordering_keys[row_idx];
+            let group = &group_key_rows[row_idx];
+            if matches!(best.get(group), Some((_, best_key)) if candidate <= best_key) {
                 continue;
             }
-            best.insert(group_keys.clone(), ((batch_idx, row_idx), candidate));
+            best.insert(group.clone(), ((batch_idx, row_idx), candidate.clone()));
         }
     }
 
@@ -480,8 +512,8 @@ fn gather_winners(input: &[RecordBatch], winners: &[Winner], name: &str) -> Delt
 ///
 /// Extraction is deferred: the winning `(column, row)` is tracked as batches stream by, then sliced
 /// once at the end -- avoiding a per-candidate copy of the (possibly struct-typed) value. The
-/// grouped case ([`eval_grouped_max_non_null_by`]) generalizes this, gathering one winning cell per
-/// group with [`interleave`].
+/// grouped case ([`eval_grouped_max_non_null_by`]) generalizes this, gathering one winning cell
+/// per group with [`interleave`].
 ///
 /// [`Agg::max_non_null_by`]: crate::plans::ir::nodes::Agg::max_non_null_by
 fn max_non_null_by(

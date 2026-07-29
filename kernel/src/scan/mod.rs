@@ -1041,6 +1041,7 @@ impl Scan {
             plan_executor.as_ref(),
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
+            self.state_info.physical_partition_schema.as_ref(),
         )?;
         scan_plan::build_metadata_scan_plan(&self.state_info, log_segment, &shape)
     }

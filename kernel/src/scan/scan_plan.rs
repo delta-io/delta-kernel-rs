@@ -21,7 +21,7 @@ use crate::expressions::{
 };
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
-use crate::plans::ir::plan::Plan;
+use crate::plans::ir::plan::{Plan, COMMIT_ACTION_POSITION_V1};
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, ToSchema as _,
@@ -40,8 +40,9 @@ const FILE_ACTION_KEY: &str = "file_action_key";
 const STATS: &str = "stats";
 const PARTITION_VALUES: &str = "partitionValues";
 const PARTITION_VALUES_PARSED: &str = "partitionValues_parsed";
-// Generated partition pruning predicates reference this to retain removes.
 const IS_ADD: &str = "is_add";
+const ORDERING_KEY: &str = "ordering_key";
+const ACTION_POSITION: &str = "actionPosition";
 const VERSION: &str = "version";
 
 /// Build the live-add metadata plan from checkpoint and commit actions.
@@ -69,43 +70,41 @@ pub(crate) fn build_metadata_scan_plan(
 
     let commit_actions = commit_arm(log_segment, stats_schema, partition_schema)?.try_fold_with(
         prune,
-        |p, prune| {
-            // We filter so that:
-            // * All remove actions are kept
-            // * Add actions that do not match the partition pruning or stats predicate are removed.
-            //
-            // NOTE: It is important that add actions are filtered by the partition predicate
-            // because partition filtering may not be applied on data rows. On the other
-            // hand, failing to skip based on data columns is safe because the data
-            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-            // prune adds here.
-            //
-            // NOTE: It is not safe to prune remove actions using the partition filter. This is
-            // because a NULL result for `remove.partitionValues.partCol` may be due to
-            // `remove.partitionValues` being NULL, or it may be from `partCol` being
-            // NULL. Thus, we simply do not prune removes.
-            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
+        |plan, predicate| {
+            // Removes must survive pruning so they can suppress older checkpoint Adds. Adds may be
+            // pruned before commit dedup because the complete predicate is applied again to data.
+            plan.filter(Predicate::or(col!("add").is_null(), predicate.clone()))
         },
     )?;
 
     let deduped_commit = commit_actions
-        // Wrap `add` so removes, whose inner `add` is null, survive `MaxNonNullBy`. Unwrap it
-        // after aggregation.
+        // Wrap `add` so removes, whose inner `add` is null, survive MaxNonNullBy. Order actions in
+        // the same commit by their absolute JSON line byte position.
         .project_patch(|patch| {
-            patch.replace(
-                ADD_NAME,
-                StructField::not_null(ADD_NAME, schema! { (add_field.clone()) }),
-                Expr::struct_from([col!("add")]),
-            )
+            patch
+                .replace(
+                    ADD_NAME,
+                    StructField::not_null(ADD_NAME, schema! { (add_field.clone()) }),
+                    Expr::struct_from([col!("add")]),
+                )
+                .append(
+                    StructField::not_null(
+                        ORDERING_KEY,
+                        schema! {
+                            not_null (VERSION): LONG,
+                            not_null (ACTION_POSITION): LONG,
+                        },
+                    ),
+                    Expr::struct_from([col!(VERSION), col!(ACTION_POSITION)]),
+                )
         })?
-        .aggregate_by([ColumnName::new([FILE_ACTION_KEY])], |a| {
-            a.max_non_null_by(ColumnName::new([ADD_NAME]), ColumnName::new([VERSION]))
+        .aggregate_by([ColumnName::new([FILE_ACTION_KEY])], |aggregate| {
+            aggregate.max_non_null_by(ColumnName::new([ADD_NAME]), ColumnName::new([ORDERING_KEY]))
         })?
-        // We unwrap `add.add` to the top level now that MaxNonNullBy is complete.
         .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
 
     let checkpoint_adds = checkpoint_arm(log_segment, shape, stats_schema, partition_schema)?
-        .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+        .try_fold_with(prune, |plan, predicate| plan.filter(predicate.clone()))?;
 
     let checkpoint_live_adds = checkpoint_adds
         .anti_join(
@@ -119,7 +118,11 @@ pub(crate) fn build_metadata_scan_plan(
         .filter(col!("add").is_not_null())?
         .project(Expr::struct_from([col!("add")]), output_schema)?;
 
-    PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
+    Ok(
+        PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?
+            .build_opt()?
+            .map(|plan| plan.require_capability(COMMIT_ACTION_POSITION_V1)),
+    )
 }
 
 /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
@@ -143,22 +146,25 @@ fn checkpoint_arm(
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
     let source_stats_schema = shape.parsed_stats_schema.as_ref();
+    let source_partition_schema = shape.parsed_partition_schema.as_ref();
     let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
     let actions = match (&shape.checkpoint_type, checkpoint) {
         (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-            let schema = parquet_read_schema(source_stats_schema, None)?;
+            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
             PlanBuilder::scan_parquet(parts, &[VERSION], schema)
         }
         (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
             PlanBuilder::scan_json(
                 parts,
                 &[VERSION],
-                json_read_schema(/* include_remove */ false),
+                json_read_schema(
+                    /* include_remove */ false, /* action_position */ false,
+                ),
             )
         }
         (CheckpointType::Manifest, Some((file_type, parts))) => {
-            let schema = parquet_read_schema(source_stats_schema, None)?;
+            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
             match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
                 Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                 // Without a complete hint, load the sidecars referenced by the manifest.
@@ -166,7 +172,12 @@ fn checkpoint_arm(
             }
         }
         (CheckpointType::None, _) | (_, None) => {
-            PlanBuilder::values(json_read_schema(/* include_remove */ false), vec![])
+            PlanBuilder::values(
+                json_read_schema(
+                    /* include_remove */ false, /* action_position */ false,
+                ),
+                vec![],
+            )
         }
     }?;
 
@@ -181,7 +192,7 @@ fn checkpoint_arm(
                 )
                 .append(
                     FILE_ACTION_KEY_FIELD.clone(),
-                    file_action_key_expr(|col| joined_column_expr!("add", col)),
+                    file_action_key_expr(|column| joined_column_expr!("add", column)),
                 )
         })
 }
@@ -205,30 +216,37 @@ fn commit_arm(
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
     let commit_files = log_segment.commit_cover_version_tagged_scan_files()?;
-    PlanBuilder::scan_json(commit_files, &[VERSION], json_read_schema(true))?
-        .filter(Predicate::or(
-            col!("add.path").is_not_null(),
-            col!("remove.path").is_not_null(),
-        ))?
-        .project_patch(|patch| {
-            // Commits never carry source-native parsed columns, so normalize from the raw
-            // encodings.
-            patch
-                .with_parsed_add_stats_and_partitions(stats_schema, partition_schema)
-                .append(
-                    StructField::not_null(IS_ADD, DataType::BOOLEAN),
-                    Expr::from(col!("add.path").is_not_null()),
-                )
-                .append(
-                    FILE_ACTION_KEY_FIELD.clone(),
-                    file_action_key_expr(|col| {
-                        Expr::coalesce([
-                            joined_column_expr!("add", col),
-                            joined_column_expr!("remove", col),
-                        ])
-                    }),
-                )
-        })
+    PlanBuilder::scan_json_with_action_position(
+        commit_files,
+        &[VERSION],
+        json_read_schema(
+            /* include_remove */ true, /* action_position */ true,
+        ),
+        ACTION_POSITION,
+    )?
+    .filter(Predicate::or(
+        col!("add.path").is_not_null(),
+        col!("remove.path").is_not_null(),
+    ))?
+    .project_patch(|patch| {
+        // Commits never carry source-native parsed columns, so normalize from the raw
+        // encodings.
+        patch
+            .with_parsed_add_stats_and_partitions(stats_schema, partition_schema)
+            .append(
+                StructField::not_null(IS_ADD, DataType::BOOLEAN),
+                Expr::from(col!("add.path").is_not_null()),
+            )
+            .append(
+                FILE_ACTION_KEY_FIELD.clone(),
+                file_action_key_expr(|col| {
+                    Expr::coalesce([
+                        joined_column_expr!("add", col),
+                        joined_column_expr!("remove", col),
+                    ])
+                }),
+            )
+    })
 }
 
 /// Load actions from V2 checkpoint sidecars.
@@ -294,11 +312,12 @@ fn sidecar_actions(
 
 /// Read schema for JSON actions tagged with their log version.
 /// Commits include removes; JSON checkpoint leaves do not.
-fn json_read_schema(include_remove: bool) -> SchemaRef {
+fn json_read_schema(include_remove: bool, include_action_position: bool) -> SchemaRef {
     schema_ref! {
         (&ADD_FIELD),
         ..(include_remove.then_some(&REMOVE_FIELD)),
-        nullable (VERSION): LONG,
+        not_null (VERSION): LONG,
+        ..(include_action_position.then(|| StructField::not_null(ACTION_POSITION, DataType::LONG))),
     }
 }
 
@@ -319,7 +338,7 @@ fn parquet_read_schema(
         });
     Ok(schema_ref! {
         (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
-        nullable (VERSION): LONG,
+        not_null (VERSION): LONG,
     })
 }
 
@@ -333,7 +352,7 @@ static FILE_ACTION_KEY_FIELD: LazyLock<StructField> = LazyLock::new(|| {
             nullable "offset": INTEGER,
         },
     };
-    StructField::nullable(FILE_ACTION_KEY, schema)
+    StructField::not_null(FILE_ACTION_KEY, schema)
 });
 
 /// Build a file identity from path and deletion vector.
@@ -585,6 +604,7 @@ mod tests {
         CheckpointShape {
             checkpoint_type,
             parsed_stats_schema: parsed_stats,
+            parsed_partition_schema: None,
         }
     }
 
@@ -706,8 +726,8 @@ mod tests {
         "scan_json", // commits
         "filter",    // keep file actions
         "project",   // normalize
-        "project",   // wrap add for dedup
-        "aggregate", // newest-action-per-key
+        "project",   // wrap add and build ordering key
+        "aggregate", // newest action per file identity
         "project",   // unwrap newest add
         "filter",    // live commit adds
         "project",   // extract add
@@ -739,9 +759,9 @@ mod tests {
         );
         let plan = build_metadata_scan_plan(&state, &segment, &shape)?.expect("non-empty");
 
-        let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
+        let mut expected = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
-        expected.push("union_all"); // terminal
+        expected.push("union_all");
         assert_eq!(tags(&plan), expected);
         Ok(())
     }
@@ -790,6 +810,48 @@ mod tests {
     }
 
     #[test]
+    fn metadata_plan_manifest_sidecar_load_partition_columns() -> DeltaResult<()> {
+        let state = state(
+            partitioned_schema(),
+            vec!["p".to_string()],
+            None,
+            StatsOptions::default(),
+            PartitionValuesOptions::with_struct(),
+        );
+        let parsed_partition_schema = state
+            .physical_partition_schema
+            .clone()
+            .expect("partition schema");
+        let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
+        let plan = build_metadata_scan_plan(
+            &state,
+            &segment,
+            &CheckpointShape {
+                checkpoint_type: CheckpointType::Manifest,
+                parsed_stats_schema: None,
+                parsed_partition_schema: Some(parsed_partition_schema),
+            },
+        )?
+        .expect("non-empty");
+
+        let load = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::Load(load) => Some(load),
+                _ => None,
+            })
+            .expect("sidecar load");
+        assert!(
+            add_struct(&load.schema)
+                .field(PARTITION_VALUES_PARSED)
+                .is_some(),
+            "compatible structured partition values must be requested from the Load"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn metadata_plan_commits_only() -> DeltaResult<()> {
         let state = state(
             data_schema(),
@@ -805,7 +867,23 @@ mod tests {
         );
         let plan =
             build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.expect("non-empty");
-        assert_eq!(tags(&plan), COMMIT_ARM_TAGS.to_vec());
+        assert_eq!(tags(&plan), COMMIT_ARM_TAGS);
+        assert_eq!(
+            plan.header.required_capabilities,
+            [COMMIT_ACTION_POSITION_V1.to_string()]
+        );
+        let commit_scan = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::ScanJson(scan) => Some(scan),
+                _ => None,
+            })
+            .expect("commit scan");
+        assert_eq!(
+            commit_scan.commit_action_position_column.as_deref(),
+            Some(ACTION_POSITION)
+        );
         Ok(())
     }
 
@@ -931,6 +1009,57 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("path string");
+        assert_eq!(paths.value(0), "b.parquet");
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_plan_orders_actions_within_one_commit() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        futures::executor::block_on(store.put(
+            &Path::from("_delta_log/00000000000000000000.json"),
+            r#"{"add":{"path":"a.parquet","size":1,"modificationTime":1,"dataChange":true,"partitionValues":{}}}
+{"remove":{"path":"a.parquet","deletionTimestamp":2,"dataChange":true}}
+{"add":{"path":"b.parquet","size":1,"modificationTime":1,"dataChange":true,"partitionValues":{}}}
+"#
+            .into(),
+        ))?;
+        let state = state(
+            data_schema(),
+            vec![],
+            None,
+            StatsOptions::default(),
+            PartitionValuesOptions::default(),
+        );
+        let segment = log_segment(
+            Url::parse("memory:///_delta_log/").unwrap(),
+            &["memory:///_delta_log/00000000000000000000.json"],
+            None,
+        );
+        let plan =
+            build_metadata_scan_plan(&state, &segment, &no_checkpoint())?.expect("non-empty");
+        let engine = SyncEngine::new_with_store(store);
+        let mut batches = engine
+            .plan_executor()
+            .execute_op(PlanOperation::QueryPlan(plan))?
+            .into_data()?;
+        let batch = batches
+            .next()
+            .expect("one batch")?
+            .try_into_record_batch()?;
+        let add = batch
+            .column_by_name(ADD_NAME)
+            .expect("add column")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("add struct");
+        let paths = add
+            .column_by_name("path")
+            .expect("add.path")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path string");
+        assert_eq!(batch.num_rows(), 1);
         assert_eq!(paths.value(0), "b.parquet");
         Ok(())
     }

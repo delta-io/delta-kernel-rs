@@ -2,6 +2,28 @@
 
 pub use super::nodes::Operator;
 
+pub const PLAN_PROTOCOL_MAJOR: i32 = 1;
+pub const PLAN_PROTOCOL_MINOR: i32 = 0;
+pub const COMMIT_ACTION_POSITION_V1: &str = "COMMIT_ACTION_POSITION_V1";
+
+/// Version and semantic capabilities required to execute a plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanHeader {
+    pub protocol_major: i32,
+    pub protocol_minor: i32,
+    pub required_capabilities: Vec<String>,
+}
+
+impl Default for PlanHeader {
+    fn default() -> Self {
+        Self {
+            protocol_major: PLAN_PROTOCOL_MAJOR,
+            protocol_minor: PLAN_PROTOCOL_MINOR,
+            required_capabilities: Vec::new(),
+        }
+    }
+}
+
 // ============================================================================
 // Plan nodes
 // ============================================================================
@@ -92,5 +114,17 @@ impl PlanNode {
 /// node to the caller.
 #[derive(Debug, Clone)]
 pub struct Plan {
+    pub header: PlanHeader,
     pub nodes: Vec<PlanNode>,
+}
+
+impl Plan {
+    /// Adds a required executor capability while preserving insertion order and uniqueness.
+    pub fn require_capability(mut self, capability: impl Into<String>) -> Self {
+        let capability = capability.into();
+        if !self.header.required_capabilities.contains(&capability) {
+            self.header.required_capabilities.push(capability);
+        }
+        self
+    }
 }
