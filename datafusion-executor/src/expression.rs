@@ -1,64 +1,67 @@
-//! Conversion from a kernel [`Expression`] to a DataFusion [`Expr`].
+//! Conversion from a kernel [`Expression`](KernelExpression) to a DataFusion [`Expr`](DFExpr).
 
-use datafusion::common::Column;
+// Each foreign type is aliased with its source crate (`Kernel*`/`DF*`) so every use site reads
+// unambiguously across the two crates this converter bridges.
+use datafusion::common::Column as DFColumn;
 use datafusion::functions::core::expr_fn::{coalesce, get_field_path};
 use datafusion::functions_nested::expr_fn::make_array;
-use datafusion::logical_expr::{binary_expr, lit, Expr, Operator};
+use datafusion::logical_expr::{binary_expr, lit, Expr as DFExpr, Operator};
 use delta_kernel::expressions::{
-    BinaryExpression, BinaryExpressionOp, ColumnName, Expression, UnaryExpressionOp,
-    VariadicExpression, VariadicExpressionOp,
+    BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
+    Expression as KernelExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
-use crate::scalar::kernel_to_df_scalar;
+use crate::scalar::to_df_scalar;
 
-/// Converts a kernel [`Expression`] into the equivalent DataFusion [`Expr`].
+/// Converts a kernel [`Expression`](KernelExpression) into the equivalent DataFusion
+/// [`Expr`](DFExpr).
 ///
 /// # Errors
 /// Returns an error for a column that does not resolve against `input_schema`, and
 /// [`Error::unsupported`] for arms with no untyped DataFusion equivalent (see the `TODO`s below).
-pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaResult<Expr> {
+pub fn to_df_expr(expr: &KernelExpression, input_schema: &StructType) -> DeltaResult<DFExpr> {
     match expr {
-        Expression::Literal(scalar) => Ok(lit(kernel_to_df_scalar(scalar)?)),
-        Expression::Column(name) => kernel_column_to_df_expr(name, input_schema),
-        Expression::Binary(binary) => kernel_binary_expr_to_df_expr(binary, input_schema),
-        Expression::Variadic(variadic) => kernel_variadic_to_df_expr(variadic, input_schema),
+        KernelExpression::Literal(scalar) => Ok(lit(to_df_scalar(scalar)?)),
+        KernelExpression::Column(name) => column_to_df_expr(name, input_schema),
+        KernelExpression::Binary(binary) => binary_expr_to_df_expr(binary, input_schema),
+        KernelExpression::Variadic(variadic) => variadic_to_df_expr(variadic, input_schema),
 
         // TODO: wire up in the predicate-conversion PR (needs the `Predicate -> Expr` converter).
-        Expression::Predicate(_) => Err(Error::unsupported(
+        KernelExpression::Predicate(_) => Err(Error::unsupported(
             "converting an embedded Predicate expression is not yet supported",
         )),
 
         // TODO: wire up once this function takes an output schema (`Struct` needs it for field
         // names; `MapToStruct`/`StructPatch` for field types). Each arm's lowering follows later.
-        Expression::Struct(_, _)
-        | Expression::MapToStruct(_)
-        | Expression::StructPatch(_) => Err(Error::unsupported(
-            "converting schema-dependent expressions (Struct, MapToStruct, StructPatch) requires \
-             a typed projection context",
+        KernelExpression::Struct(_, _)
+        | KernelExpression::MapToStruct(_)
+        | KernelExpression::StructPatch(_) => Err(Error::unsupported(
+            "converting schema-dependent expressions (Struct, MapToStruct, StructPatch) \
+                 requires a typed projection context",
         )),
 
         // TODO: wire up via a custom JSON-parsing UDF (DataFusion core has no stock JSON parser).
-        Expression::ParseJson(_) => Err(Error::unsupported(
+        KernelExpression::ParseJson(_) => Err(Error::unsupported(
             "converting a ParseJson expression requires a custom JSON-parsing UDF",
         )),
 
-        Expression::Unary(u) => match u.op {
+        KernelExpression::Unary(u) => match u.op {
             UnaryExpressionOp::ToJson => Err(Error::unsupported(
                 "converting the ToJson expression is not yet supported",
             )),
         },
 
         // TODO(#3007): implement once kernel's Cast semantics are clarified.
-        Expression::Cast(_) => Err(Error::unsupported(
+        KernelExpression::Cast(_) => Err(Error::unsupported(
             "converting a Cast expression is not yet supported",
         )),
 
-        Expression::Opaque(_) => Err(Error::unsupported(
+        KernelExpression::Opaque(_) => Err(Error::unsupported(
             "cannot convert an engine-defined Opaque expression",
         )),
-        Expression::Unknown(name) => Err(Error::unsupported(format!(
+        KernelExpression::Unknown(name) => Err(Error::unsupported(format!(
             "cannot convert Unknown expression {name:?}"
         ))),
     }
@@ -67,54 +70,54 @@ pub fn kernel_to_df_expr(expr: &Expression, input_schema: &StructType) -> DeltaR
 /// Lowers a column reference to a nested field access, e.g. `a.b.c` becomes a single
 /// `get_field(col("a"), "b", "c")` call. The path is resolved against `input_schema` (via
 /// [`StructType::field_at`]) to fail fast, but the resolved field is otherwise unused.
-fn kernel_column_to_df_expr(name: &ColumnName, input_schema: &StructType) -> DeltaResult<Expr> {
-    input_schema.field_at(name)?;
+fn column_to_df_expr(name: &KernelColumnName, input_schema: &StructType) -> DeltaResult<DFExpr> {
+    let _ = input_schema.field_at(name)?;
     let mut path = name.iter();
-    let root = path
-        .next()
-        .ok_or_else(|| Error::generic("cannot convert an empty column reference"))?;
-    let root = Expr::Column(Column::new_unqualified(root));
-    let field_names = path.map(lit).collect::<Vec<_>>();
+    let Some(root) = path.next() else {
+        return Err(Error::generic("cannot convert an empty column reference"));
+    };
+    let root = DFExpr::Column(DFColumn::new_unqualified(root));
+    let field_names = Vec::from_iter(path.map(lit));
     // A bare column stays a bare column; only nested access wraps it in a `get_field` call.
-    Ok(if field_names.is_empty() {
-        root
+    if field_names.is_empty() {
+        Ok(root)
     } else {
-        get_field_path(root, field_names)
-    })
+        Ok(get_field_path(root, field_names))
+    }
 }
 
 /// Lowers an arithmetic binary expression (`Plus`/`Minus`/`Multiply`/`Divide`) to an
 /// `Expr::BinaryExpr`. Comparison and `IN` operators are modeled as predicates, not expressions,
 /// so they never reach this arm.
-fn kernel_binary_expr_to_df_expr(
+fn binary_expr_to_df_expr(
     binary: &BinaryExpression,
     input_schema: &StructType,
-) -> DeltaResult<Expr> {
+) -> DeltaResult<DFExpr> {
     let op = match binary.op {
         BinaryExpressionOp::Plus => Operator::Plus,
         BinaryExpressionOp::Minus => Operator::Minus,
         BinaryExpressionOp::Multiply => Operator::Multiply,
         BinaryExpressionOp::Divide => Operator::Divide,
     };
-    let left = kernel_to_df_expr(&binary.left, input_schema)?;
-    let right = kernel_to_df_expr(&binary.right, input_schema)?;
+    let left = to_df_expr(&binary.left, input_schema)?;
+    let right = to_df_expr(&binary.right, input_schema)?;
     Ok(binary_expr(left, op, right))
 }
 
 /// Lowers a variadic expression: `Coalesce` to `coalesce(..)` and `Array` to `make_array(..)`,
 /// each over the converted arguments.
-fn kernel_variadic_to_df_expr(
+fn variadic_to_df_expr(
     variadic: &VariadicExpression,
     input_schema: &StructType,
-) -> DeltaResult<Expr> {
-    let args = variadic
+) -> DeltaResult<DFExpr> {
+    let args: DeltaResult<Vec<DFExpr>> = variadic
         .exprs
         .iter()
-        .map(|e| kernel_to_df_expr(e, input_schema))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .map(|e| to_df_expr(e, input_schema))
+        .collect();
     Ok(match variadic.op {
-        VariadicExpressionOp::Coalesce => coalesce(args),
-        VariadicExpressionOp::Array => make_array(args),
+        VariadicExpressionOp::Coalesce => coalesce(args?),
+        VariadicExpressionOp::Array => make_array(args?),
     })
 }
 
@@ -146,9 +149,7 @@ mod tests {
     /// Lowers an expression against [`test_schema`] and renders it as a DataFusion `Display`
     /// string.
     fn lower(expr: Expr_) -> String {
-        kernel_to_df_expr(&expr, &test_schema())
-            .unwrap()
-            .to_string()
+        to_df_expr(&expr, &test_schema()).unwrap().to_string()
     }
 
     #[rstest]
@@ -181,32 +182,58 @@ mod tests {
         assert_eq!(lower(kernel), expected);
     }
 
-    #[test]
-    fn nested_arithmetic_preserves_grouping() {
-        let kernel = (column_expr!("x") + Expr_::literal(4i64)) * Expr_::literal(10i64);
-        assert_eq!(lower(kernel), "(x + Int64(4)) * Int64(10)");
+    /// Nested arithmetic lowers to the matching operator tree. DataFusion's `Display`
+    /// parenthesizes a child only when its precedence is strictly lower than the parent's, so the
+    /// `precedence_pins_grouping` case is deliberate: lower-precedence `Plus`/`Minus` operands
+    /// under a higher-precedence `Multiply` MUST print parentheses, which makes the assertion
+    /// sensitive to re-association -- a wrongly-flattened tree renders differently.
+    #[rstest]
+    #[case::precedence_pins_grouping(
+        (column_expr!("x") + Expr_::literal(1i64)) * (column_expr!("b") - Expr_::literal(2i64)),
+        "(x + Int64(1)) * (b - Int64(2))"
+    )]
+    #[case::nested_field_and_all_ops(
+        (Expr_::column(["a", "b", "c"]) * Expr_::literal(5i64)
+            - (column_expr!("b") + column_expr!("x")))
+            / Expr_::literal(20i64),
+        "(get_field(a, Utf8(\"b\"), Utf8(\"c\")) * Int64(5) - b + x) / Int64(20)"
+    )]
+    fn nested_arithmetic_lowers_to_operator_tree(#[case] kernel: Expr_, #[case] expected: &str) {
+        assert_eq!(lower(kernel), expected);
     }
 
-    #[test]
-    fn coalesce_lowers_to_coalesce_call() {
-        let kernel = Expr_::coalesce([column_expr!("a"), column_expr!("b"), Expr_::literal(0i64)]);
-        assert_eq!(lower(kernel), "coalesce(a, b, Int64(0))");
-    }
-
-    #[test]
-    fn array_lowers_to_make_array_call() {
-        let kernel = Expr_::array([Expr_::literal(1i64), Expr_::literal(2i64)]);
-        assert_eq!(lower(kernel), "make_array(Int64(1), Int64(2))");
+    #[rstest]
+    #[case::coalesce(
+        Expr_::coalesce([column_expr!("a"), column_expr!("b"), Expr_::literal(0i64)]),
+        "coalesce(a, b, Int64(0))"
+    )]
+    #[case::array(
+        Expr_::array([Expr_::literal(1i64), Expr_::literal(2i64)]),
+        "make_array(Int64(1), Int64(2))"
+    )]
+    #[case::nested_coalesce(
+        Expr_::coalesce([Expr_::coalesce([column_expr!("a"), column_expr!("b")]), column_expr!("x")]),
+        "coalesce(coalesce(a, b), x)"
+    )]
+    #[case::nested_array(
+        Expr_::array([
+            Expr_::array([Expr_::literal(1i64), Expr_::literal(2i64)]),
+            Expr_::array([Expr_::literal(3i64), Expr_::literal(4i64)]),
+        ]),
+        "make_array(make_array(Int64(1), Int64(2)), make_array(Int64(3), Int64(4)))"
+    )]
+    fn variadic_lowers_to_call(#[case] kernel: Expr_, #[case] expected: &str) {
+        assert_eq!(lower(kernel), expected);
     }
 
     /// A column reference that does not resolve against the input schema fails at conversion time,
     /// not later during DataFusion analysis. Covers each `field_at` failure mode.
     #[rstest]
-    #[case::empty(Expr_::Column(ColumnName::new(Vec::<String>::new())))]
+    #[case::empty(Expr_::Column(KernelColumnName::default()))]
     #[case::unknown_root(Expr_::column(["nope"]))]
     #[case::unknown_nested(Expr_::column(["a", "b", "missing"]))]
     #[case::descend_into_non_struct(Expr_::column(["x", "y"]))]
     fn unresolved_column_is_an_error(#[case] kernel: Expr_) {
-        kernel_to_df_expr(&kernel, &test_schema()).unwrap_err();
+        to_df_expr(&kernel, &test_schema()).unwrap_err();
     }
 }
