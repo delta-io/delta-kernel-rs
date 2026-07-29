@@ -5,27 +5,12 @@ use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine, RowVisitor as _, Version};
 
-/// Returns `true` if a set transaction is expired according to the given expiration and
-/// last-updated timestamps. A transaction is expired when both values are present and
-/// `last_updated <= expiration_timestamp`. Transactions without `last_updated` never
-/// expire. A `None` expiration timestamp (no retention duration configured) means
-/// nothing expires.
-pub(crate) fn is_set_txn_expired(
-    expiration_timestamp: Option<i64>,
-    last_updated: Option<i64>,
-) -> bool {
-    matches!(
-        (expiration_timestamp, last_updated),
-        (Some(exp_ts), Some(lu)) if lu <= exp_ts
-    )
-}
-
 /// Resolves the latest `txn` action per application id via log replay, where the newest action in
 /// log order wins.
 ///
 /// Every method returns the resolved `txn` as-is. Applying retention is the caller's
-/// responsibility: filter the resolved result with [`is_set_txn_expired`]. Filtering during replay
-/// instead would drop an expired newest `txn` and resolve to an older one.
+/// responsibility: use [`SetTransaction::non_expired_version`] on the resolved result. Filtering
+/// during replay instead would drop an expired newest `txn` and resolve to an older one.
 pub(crate) struct SetTransactionScanner {}
 
 impl SetTransactionScanner {

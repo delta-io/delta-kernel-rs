@@ -9,7 +9,7 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
+use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
@@ -470,16 +470,14 @@ impl Snapshot {
                     // Complete is authoritative: a miss means the app_id has no transaction.
                     let version = map
                         .get(application_id)
-                        .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                        .map(|txn| txn.version);
+                        .and_then(|txn| txn.non_expired_version(expiration_timestamp));
                     record_metric(true, version.is_some());
                     return Ok(version);
                 }
                 SetTransactionState::Partial(map) => {
                     // Hit is authoritative; miss falls through to log replay below.
                     if let Some(txn) = map.get(application_id) {
-                        let version = (!is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                            .then_some(txn.version);
+                        let version = txn.non_expired_version(expiration_timestamp);
                         record_metric(true, version.is_some());
                         return Ok(version);
                     }
@@ -500,9 +498,7 @@ impl Snapshot {
                     base.version,
                     engine,
                 )?;
-                let version = txn
-                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                    .map(|txn| txn.version);
+                let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
                 // TODO: report a distinct metric source here. A rooted tail scan is neither a
                 //       cache hit nor a full replay, yet `from_cache = false` buckets it with
                 //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
@@ -515,9 +511,7 @@ impl Snapshot {
         // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
         // CRC paths above.
         let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
-        let version = txn
-            .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-            .map(|txn| txn.version);
+        let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
         record_metric(false, version.is_some());
         Ok(version)
     }
