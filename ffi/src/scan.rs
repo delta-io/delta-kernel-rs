@@ -439,8 +439,8 @@ pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handl
 /// - [`OptionalValue::Some`] wraps a [`KernelOwnedBytes`](crate::KernelOwnedBytes) buffer holding
 ///   the proto-serialized `delta.kernel.operation.Operation` message (a `QueryPlan`). The engine
 ///   owns the buffer and must free it with [`free_kernel_bytes`](crate::free_kernel_bytes).
-/// - [`OptionalValue::None`] means there is no plan to execute: either the scan's predicate
-///   statically skips all files, or no Delta metadata matches this scan (empty result).
+/// - [`OptionalValue::None`] means there is no plan to execute because the scan's predicate
+///   statically skips all files.
 ///
 /// # Safety
 ///

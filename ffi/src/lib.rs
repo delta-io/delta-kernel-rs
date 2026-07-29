@@ -402,9 +402,7 @@ mod private {
             let boxed = val.into_boxed_slice();
             let leaked_ptr = Box::leak(boxed).as_mut_ptr();
             // safety: Box::leak always returns a valid, non-null pointer
-            #[allow(clippy::expect_used)]
-            let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be null please report this bug.");
+            let ptr = unsafe { NonNull::new_unchecked(leaked_ptr) };
             KernelOwnedBytes { ptr, len }
         }
     }
