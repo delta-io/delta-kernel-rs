@@ -436,7 +436,9 @@ impl Snapshot {
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
     /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
-    /// Uses the CRC fast path when available, otherwise falls back to log replay.
+    /// Serves from an at-version CRC when it has the app_id (or authoritatively lacks it); else
+    /// roots a tail-only scan in a stale but `Complete` CRC, skipping the checkpoint; else full log
+    /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
@@ -485,15 +487,39 @@ impl Snapshot {
             }
         }
 
-        // Fallback: full log replay.
-        let txn = SetTransactionScanner::get_one(
-            self.log_segment(),
-            application_id,
-            engine,
-            expiration_timestamp,
-        )?;
-        record_metric(false, txn.is_some());
-        Ok(txn.map(|t| t.version))
+        // A stale but authoritative (`Complete`) CRC roots a tail-only scan over the commits after
+        // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
+        // `setTransactions` field) has no authoritative transaction set, so it cannot root the
+        // scan and falls through to the full replay below.
+        if let Some(base) = self.base_crc() {
+            if let SetTransactionState::Complete(base_active) = &base.set_transaction_state {
+                let txn = SetTransactionScanner::get_one_rooted_in_crc(
+                    self.log_segment(),
+                    application_id,
+                    base_active,
+                    base.version,
+                    engine,
+                )?;
+                let version = txn
+                    .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+                    .map(|txn| txn.version);
+                // TODO: report a distinct metric source here. A rooted tail scan is neither a
+                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+                //       (cache / crc-rooted / full-replay) would let metrics measure it.
+                record_metric(false, version.is_some());
+                return Ok(version);
+            }
+        }
+
+        // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
+        // CRC paths above.
+        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let version = txn
+            .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
+            .map(|txn| txn.version);
+        record_metric(false, version.is_some());
+        Ok(version)
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest

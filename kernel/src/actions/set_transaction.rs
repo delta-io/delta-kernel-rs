@@ -3,7 +3,7 @@ use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, LOG_TXN_SCHEMA};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, RowVisitor as _};
+use crate::{DeltaResult, Engine, RowVisitor as _, Version};
 
 /// Returns `true` if a set transaction is expired according to the given expiration and
 /// last-updated timestamps. A transaction is expired when both values are present and
@@ -20,6 +20,12 @@ pub(crate) fn is_set_txn_expired(
     )
 }
 
+/// Resolves the latest `txn` action per application id via log replay, where the newest action in
+/// log order wins.
+///
+/// Every method returns the resolved `txn` as-is. Applying retention is the caller's
+/// responsibility: filter the resolved result with [`is_set_txn_expired`]. Filtering during replay
+/// instead would drop an expired newest `txn` and resolve to an older one.
 pub(crate) struct SetTransactionScanner {}
 
 impl SetTransactionScanner {
@@ -31,28 +37,42 @@ impl SetTransactionScanner {
         log_segment: &LogSegment,
         application_id: &str,
         engine: &dyn Engine,
-        expiration_timestamp: Option<i64>,
     ) -> DeltaResult<Option<SetTransaction>> {
-        let mut transactions = scan_application_transactions(
-            log_segment,
-            Some(application_id),
-            engine,
-            expiration_timestamp,
-        )?;
+        let mut transactions =
+            scan_application_transactions(log_segment, Some(application_id), engine)?;
         Ok(transactions.remove(application_id))
     }
 
-    /// Scan the Delta Log to obtain the all of the latest `txn` actions.
-    ///
-    /// This performs log replay and populates the `SetTransactionMap` with the latest `txn` action
-    /// found for each app_id.
+    /// Scan the Delta Log for the latest `txn` action of every application id.
     #[allow(unused)]
     pub(crate) fn get_all(
         log_segment: &LogSegment,
         engine: &dyn Engine,
-        expiration_timestamp: Option<i64>,
     ) -> DeltaResult<SetTransactionMap> {
-        scan_application_transactions(log_segment, None, engine, expiration_timestamp)
+        scan_application_transactions(log_segment, None, engine)
+    }
+
+    /// Fetch the latest `txn` action for `application_id`, rooted in an authoritative (`Complete`)
+    /// but stale CRC's `base_active` map at `base_version`, scanning ONLY the commits in
+    /// `(base_version, log_segment.end_version]`.
+    ///
+    /// The checkpoint and every commit at/below `base_version` are skipped via
+    /// [`LogSegment::segment_after_version`]. When the tail holds a `txn` for `application_id`, its
+    /// newest wins; otherwise the result is that id's entry in `base_active`, the value the CRC
+    /// recorded at `base_version`.
+    pub(crate) fn get_one_rooted_in_crc(
+        log_segment: &LogSegment,
+        application_id: &str,
+        base_active: &SetTransactionMap,
+        base_version: Version,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<SetTransaction>> {
+        let tail = Self::get_one(
+            &log_segment.segment_after_version(base_version),
+            application_id,
+            engine,
+        )?;
+        Ok(tail.or_else(|| base_active.get(application_id).cloned()))
     }
 }
 
@@ -63,10 +83,8 @@ fn scan_application_transactions(
     log_segment: &LogSegment,
     application_id: Option<&str>,
     engine: &dyn Engine,
-    expiration_timestamp: Option<i64>,
 ) -> DeltaResult<SetTransactionMap> {
-    let mut visitor =
-        SetTransactionVisitor::new(application_id.map(|s| s.to_owned()), expiration_timestamp);
+    let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()));
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
     for maybe_data in replay_for_app_ids(log_segment, engine)? {
@@ -113,8 +131,8 @@ mod tests {
         let log_segment = snapshot.log_segment();
 
         (
-            SetTransactionScanner::get_all(log_segment, &engine, None).unwrap(),
-            SetTransactionScanner::get_one(log_segment, app_id, &engine, None).unwrap(),
+            SetTransactionScanner::get_all(log_segment, &engine).unwrap(),
+            SetTransactionScanner::get_one(log_segment, app_id, &engine).unwrap(),
         )
     }
 
@@ -171,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_retention_filtering() {
+    fn test_get_all_returns_every_txn_unfiltered() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-with-last-updated/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
@@ -179,34 +197,25 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
         let log_segment = snapshot.log_segment();
 
-        // Test with no retention (should get all transactions)
-        let all_txns = SetTransactionScanner::get_all(log_segment, &engine, None).unwrap();
+        // The scanner returns every app_id regardless of `lastUpdated`; callers apply retention.
+        let all_txns = SetTransactionScanner::get_all(log_segment, &engine).unwrap();
         assert_eq!(all_txns.len(), 4);
-
-        // Test with retention that filters out old transactions
-        let expiration_timestamp = Some(100); // Very old timestamp
-        let filtered_txns =
-            SetTransactionScanner::get_all(log_segment, &engine, expiration_timestamp).unwrap();
-
-        // Exact count depends on test data
-        assert!(filtered_txns.len() <= all_txns.len());
     }
 
     #[test]
-    fn test_visitor_retention_with_null_last_updated() {
+    fn test_visitor_keeps_newest_by_log_order_regardless_of_last_updated() {
+        // Batches are visited in reverse log order, so the first row wins per app_id.
         let json_strings: StringArray = vec![
-            r#"{"txn":{"appId":"app_with_time","version":1,"lastUpdated":100}}"#,
-            r#"{"txn":{"appId":"app_without_time","version":2}}"#,
+            r#"{"txn":{"appId":"app","version":2,"lastUpdated":100}}"#,
+            r#"{"txn":{"appId":"app","version":1,"lastUpdated":999}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
 
-        let mut visitor = SetTransactionVisitor::new(None, Some(1000));
+        let mut visitor = SetTransactionVisitor::new(None);
         visitor.visit_rows_of(batch.as_ref()).unwrap();
 
-        // app_with_last_updated should be filtered out (100 < 1000)
-        // app_without_last_updated should be kept
         assert_eq!(visitor.set_transactions.len(), 1);
-        assert!(visitor.set_transactions.contains_key("app_without_time"));
+        assert_eq!(visitor.set_transactions.get("app").unwrap().version, 2);
     }
 }
