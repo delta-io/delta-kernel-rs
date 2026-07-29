@@ -193,12 +193,6 @@ fn leaf_paths(batches: &[RecordBatch]) -> Vec<String> {
     paths
 }
 
-fn assert_leaf_paths(batches: &[RecordBatch], expected: &[&str]) {
-    let mut expected: Vec<_> = expected.iter().map(|path| path.to_string()).collect();
-    expected.sort_unstable();
-    assert_eq!(leaf_paths(batches), expected);
-}
-
 fn assert_stats_output(
     batches: &[RecordBatch],
     expect_json_stats: bool,
@@ -433,14 +427,119 @@ fn declarative_metadata_preserves_requested_json_stats() -> DeltaResult<()> {
     )
 }
 
-#[test]
-fn declarative_metadata_has_complete_output_leaf_schema() -> DeltaResult<()> {
+const ADD_FIELDS: &[&str] = &[
+    "add.path",
+    "add.size",
+    "add.modificationTime",
+    "add.dataChange",
+    "add.partitionValues",
+    "add.deletionVector.storageType",
+    "add.deletionVector.pathOrInlineDv",
+    "add.deletionVector.offset",
+    "add.deletionVector.sizeInBytes",
+    "add.deletionVector.cardinality",
+    "add.baseRowId",
+    "add.defaultRowCommitVersion",
+    "add.tags",
+    "add.clusteringProvider",
+];
+const ALL_STATS_PARSED_FIELDS: &[&str] = &[
+    "add.stats_parsed.numRecords",
+    "add.stats_parsed.nullCount.id",
+    "add.stats_parsed.nullCount.value",
+    "add.stats_parsed.minValues.id",
+    "add.stats_parsed.minValues.value",
+    "add.stats_parsed.maxValues.id",
+    "add.stats_parsed.maxValues.value",
+    "add.stats_parsed.tightBounds",
+];
+const ID_STATS_PARSED_FIELDS: &[&str] = &[
+    "add.stats_parsed.numRecords",
+    "add.stats_parsed.nullCount.id",
+    "add.stats_parsed.minValues.id",
+    "add.stats_parsed.maxValues.id",
+    "add.stats_parsed.tightBounds",
+];
+const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
+const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
+
+#[rstest]
+#[case::json_only_string_map(
+    StatsOptions::json_only(),
+    PartitionValuesOptions::string_map_only(),
+    &[ADD_FIELDS, JSON_STATS_FIELDS]
+)]
+#[case::json_only_with_struct(
+    StatsOptions::json_only(),
+    PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, JSON_STATS_FIELDS, PARTITION_PARSED_FIELDS]
+)]
+#[case::all_struct_string_map(
+    StatsOptions::all_struct(),
+    PartitionValuesOptions::string_map_only(),
+    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS]
+)]
+#[case::all_struct_with_struct(
+    StatsOptions::all_struct(),
+    PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+)]
+#[case::struct_columns_string_map(
+    StatsOptions::struct_columns(vec![column_name!("id")]),
+    PartitionValuesOptions::string_map_only(),
+    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS]
+)]
+#[case::struct_columns_with_struct(
+    StatsOptions::struct_columns(vec![column_name!("id")]),
+    PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
+)]
+#[case::empty_struct_columns_string_map(
+    StatsOptions::struct_columns(vec![]),
+    PartitionValuesOptions::string_map_only(),
+    &[ADD_FIELDS]
+)]
+#[case::empty_struct_columns_with_struct(
+    StatsOptions::struct_columns(vec![]),
+    PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
+)]
+#[case::all_string_map(
+    StatsOptions::all(),
+    PartitionValuesOptions::string_map_only(),
+    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
+)]
+#[case::all_with_struct(
+    StatsOptions::all(),
+    PartitionValuesOptions::with_struct(),
+    &[
+        ADD_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        JSON_STATS_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
+)]
+#[case::none_string_map(
+    StatsOptions::none(),
+    PartitionValuesOptions::string_map_only(),
+    &[ADD_FIELDS]
+)]
+#[case::none_with_struct(
+    StatsOptions::none(),
+    PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
+)]
+fn declarative_metadata_has_complete_output_leaf_schema(
+    #[case] stats: StatsOptions,
+    #[case] partition_values: PartitionValuesOptions,
+    #[case] expected_field_groups: &[&[&str]],
+) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) =
         crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all())
-        .with_partition_values(PartitionValuesOptions::with_struct())
+        .with_stats(stats)
+        .with_partition_values(partition_values)
         .build()?;
     let plan = scan
         .declarative_metadata_scan_plan(engine.as_ref())?
@@ -452,35 +551,13 @@ fn declarative_metadata_has_complete_output_leaf_schema() -> DeltaResult<()> {
         .map(|batch| batch?.try_into_record_batch())
         .collect::<DeltaResult<Vec<_>>>()?;
 
-    assert_leaf_paths(
-        &actual,
-        &[
-            "add.path",
-            "add.size",
-            "add.modificationTime",
-            "add.dataChange",
-            "add.stats",
-            "add.partitionValues",
-            "add.deletionVector.storageType",
-            "add.deletionVector.pathOrInlineDv",
-            "add.deletionVector.offset",
-            "add.deletionVector.sizeInBytes",
-            "add.deletionVector.cardinality",
-            "add.baseRowId",
-            "add.defaultRowCommitVersion",
-            "add.tags",
-            "add.clusteringProvider",
-            "add.stats_parsed.numRecords",
-            "add.stats_parsed.nullCount.id",
-            "add.stats_parsed.nullCount.value",
-            "add.stats_parsed.minValues.id",
-            "add.stats_parsed.minValues.value",
-            "add.stats_parsed.maxValues.id",
-            "add.stats_parsed.maxValues.value",
-            "add.stats_parsed.tightBounds",
-            "add.partitionValues_parsed.part",
-        ],
-    );
+    let mut expected: Vec<_> = expected_field_groups
+        .iter()
+        .flat_map(|fields| fields.iter())
+        .map(|field| field.to_string())
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(leaf_paths(&actual), expected);
     Ok(())
 }
 
@@ -576,6 +653,15 @@ fn declarative_metadata_output_options_across_log_shapes(
         .expect("build output-options table");
     let engine = SyncEngine::new_with_store(table.store().clone());
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let expected = imperative_metadata(
+        snapshot
+            .clone()
+            .scan_builder()
+            .with_stats(stats.clone())
+            .with_partition_values(PartitionValuesOptions::with_struct())
+            .build()?,
+        &engine,
+    )?;
     let scan = snapshot
         .scan_builder()
         .with_stats(stats)
@@ -587,6 +673,11 @@ fn declarative_metadata_output_options_across_log_shapes(
     assert!(leaf_paths(&actual)
         .iter()
         .any(|path| path.starts_with("partitionValues_parsed.")));
+    assert_metadata_eq(
+        &without_columns(&actual, &[STATS])?,
+        &without_columns(&expected, &[STATS])?,
+        "metadata output options across log shapes",
+    )?;
     Ok(())
 }
 
