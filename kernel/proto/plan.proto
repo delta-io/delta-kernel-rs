@@ -82,7 +82,7 @@ enum FileType {
 message DynamicScanNode {
   delta.kernel.schema.StructType schema = 1;
   FileType file_type = 2;
-  string base_url = 3;  // Absolute base URL; the empty proto3 default is invalid.
+  string base_url = 3;
   repeated string file_constant_columns = 4;
   DynamicScanFileMetadataColumns file_meta = 5;
   delta.kernel.expressions.ColumnName dv_column = 6;

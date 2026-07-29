@@ -1423,6 +1423,16 @@ mod tests {
         }
     }
 
+    fn sample_dynamic_scan_input_schema() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("filemod", DataType::LONG),
+            StructField::nullable("num_records", DataType::LONG),
+            StructField::nullable("dv", DataType::STRING),
+        ]))
+    }
+
     #[rstest]
     #[case(
         FileType::Json,
@@ -1438,14 +1448,15 @@ mod tests {
         #[case] file_type: FileType,
         #[case] base_url: Url,
         #[case] expected_base_url: &str,
-    ) {
+    ) -> DeltaResult<()> {
         let node = DynamicScan::new(
+            &sample_dynamic_scan_input_schema(),
             sample_schema(),
             file_type,
             base_url,
             sample_dynamic_scan_file_metadata_columns(),
             ColumnName::new(["dv"]),
-        )
+        )?
         .with_file_constant_columns(["c"]);
         let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
@@ -1462,6 +1473,7 @@ mod tests {
         assert!(file_meta.file_size_column.is_some());
         assert!(file_meta.last_modified_column.is_some());
         assert!(file_meta.num_records_column.is_some());
+        Ok(())
     }
 
     #[test]

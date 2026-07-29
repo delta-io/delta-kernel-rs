@@ -474,21 +474,37 @@ pub struct DynamicScan {
 impl DynamicScan {
     /// A [`DynamicScan`] over `schema` reading `file_type` files relative to `base_url`, with no
     /// file-constant columns. Add those with [`Self::with_file_constant_columns`].
+    ///
+    /// Validates `file_meta` and `dv_column` against `input_schema`. The same requirements apply
+    /// when the node is attached to an upstream plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file-metadata or deletion-vector column is absent from
+    /// `input_schema`, a file-metadata column has an incompatible type, or a required path, size,
+    /// or last-modified column is nullable.
     pub fn new(
+        input_schema: &SchemaRef,
         schema: impl Into<SchemaRef>,
         file_type: FileType,
         base_url: Url,
         file_meta: DynamicScanFileMetadataColumns,
         dv_column: ColumnName,
-    ) -> Self {
-        Self {
+    ) -> DeltaResult<Self> {
+        file_meta.validate_input_schema(input_schema)?;
+        input_schema.field_at(&dv_column).map_err(|err| {
+            Error::generic(format!(
+                "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
+            ))
+        })?;
+        Ok(Self {
             schema: schema.into(),
             file_type,
             base_url,
             file_constant_columns: Vec::new(),
             file_meta,
             dv_column,
-        }
+        })
     }
 
     /// Set the output columns broadcast from the upstream row (see
