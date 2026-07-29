@@ -36,8 +36,8 @@
 //!   so a node's inputs are already evaluated, or compile the DAG into the engine's own plan.
 //!
 //! Every operator, expression, and predicate a plan contains must be handled; returning an error
-//! for an unsupported one is fine, and kernel surfaces it to the caller. The `()` executor below
-//! does this, and the sync engine's `SyncPlanExecutor` is a complete reference implementation.
+//! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
+//! `SyncPlanExecutor` is a complete reference implementation.
 //!
 //! # Where to look
 //!
