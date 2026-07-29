@@ -338,7 +338,7 @@ pub enum FileType {
     Json,
 }
 
-/// Names the columns carrying each file's path, size, modification time, and optional row count.
+/// Names the columns carrying each file's path, size, and modification time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicScanFileMetadataColumns {
     /// Non-nullable column holding the per-row file path / URL fragment.
@@ -347,23 +347,19 @@ pub struct DynamicScanFileMetadataColumns {
     pub file_size_column: ColumnName,
     /// Non-nullable column with the file's last-modified timestamp in milliseconds since epoch.
     pub last_modified_column: ColumnName,
-    /// Nullable column with the file's row-count.
-    pub num_records_column: ColumnName,
 }
 
 impl DynamicScanFileMetadataColumns {
-    /// The columns naming each file's path, size, last-modified timestamp, and row-count.
+    /// The columns naming each file's path, size, and last-modified timestamp.
     pub fn new(
         path_column: ColumnName,
         file_size_column: ColumnName,
         last_modified_column: ColumnName,
-        num_records_column: ColumnName,
     ) -> Self {
         Self {
             path_column,
             file_size_column,
             last_modified_column,
-            num_records_column,
         }
     }
 
@@ -371,8 +367,7 @@ impl DynamicScanFileMetadataColumns {
     pub(crate) fn validate_input_schema(&self, schema: &SchemaRef) -> DeltaResult<()> {
         Self::validate_column(schema, &self.path_column, &DataType::STRING, true)?;
         Self::validate_column(schema, &self.file_size_column, &DataType::LONG, true)?;
-        Self::validate_column(schema, &self.last_modified_column, &DataType::LONG, true)?;
-        Self::validate_column(schema, &self.num_records_column, &DataType::LONG, false)
+        Self::validate_column(schema, &self.last_modified_column, &DataType::LONG, true)
     }
 
     fn validate_column(
@@ -429,10 +424,10 @@ impl DynamicScanFileMetadataColumns {
 ///
 /// ```text
 /// upstream (metadata)
-///     path             | size | filemod | num_records | version | dv
-///     -----------------+------+---------+-------------+---------+------
-///     part-0.parquet   | 1024 |  100000 |        NULL |       7 | NULL
-///     part-1.parquet   | 2048 |  200000 |        NULL |       8 | NULL
+///     path             | size | filemod | version | dv
+///     -----------------+------+---------+---------+------
+///     part-0.parquet   | 1024 |  100000 |       7 | NULL
+///     part-1.parquet   | 2048 |  200000 |       8 | NULL
 /// ```
 /// ```text
 /// DynamicScan {
@@ -444,7 +439,6 @@ impl DynamicScanFileMetadataColumns {
 ///         path_column: "path",
 ///         file_size_column: "size",
 ///         last_modified_column: "filemod",
-///         num_records_column: "num_records",
 ///     },
 ///     dv_column: "dv",
 /// }

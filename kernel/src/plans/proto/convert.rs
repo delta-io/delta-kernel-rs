@@ -236,7 +236,6 @@ impl From<&DynamicScanFileMetadataColumns> for proto_plan::DynamicScanFileMetada
         proto_plan::DynamicScanFileMetadataColumns {
             path_column: Some((&meta.path_column).into()),
             file_size_column: Some((&meta.file_size_column).into()),
-            num_records_column: Some((&meta.num_records_column).into()),
             last_modified_column: Some((&meta.last_modified_column).into()),
         }
     }
@@ -1419,7 +1418,6 @@ mod tests {
             path_column: ColumnName::new(["path"]),
             file_size_column: ColumnName::new(["size"]),
             last_modified_column: ColumnName::new(["filemod"]),
-            num_records_column: ColumnName::new(["num_records"]),
         }
     }
 
@@ -1428,7 +1426,6 @@ mod tests {
             StructField::not_null("path", DataType::STRING),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("num_records", DataType::LONG),
             StructField::nullable("dv", DataType::STRING),
         ]))
     }
@@ -1472,7 +1469,6 @@ mod tests {
         assert!(file_meta.path_column.is_some());
         assert!(file_meta.file_size_column.is_some());
         assert!(file_meta.last_modified_column.is_some());
-        assert!(file_meta.num_records_column.is_some());
         Ok(())
     }
 

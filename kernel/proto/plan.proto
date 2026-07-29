@@ -69,8 +69,7 @@ message DynamicScanFileMetadataColumns {
   // The path, size, and last-modified columns are required and non-nullable in the input schema.
   delta.kernel.expressions.ColumnName path_column = 1;
   delta.kernel.expressions.ColumnName file_size_column = 2;
-  delta.kernel.expressions.ColumnName num_records_column = 3;
-  delta.kernel.expressions.ColumnName last_modified_column = 4;
+  delta.kernel.expressions.ColumnName last_modified_column = 3;
 }
 
 enum FileType {

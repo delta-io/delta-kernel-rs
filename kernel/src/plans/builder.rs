@@ -1085,7 +1085,6 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            column_name!("num_records"),
         );
         DynamicScan::new(
             input_schema,
@@ -1105,7 +1104,6 @@ mod tests {
             StructField::not_null("path", DataType::STRING),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("num_records", DataType::LONG),
             StructField::nullable("dv", DataType::STRING),
             StructField::nullable("version", DataType::LONG),
         ]))
@@ -1152,7 +1150,6 @@ mod tests {
             StructField::new("path", DataType::STRING, nullable == "path"),
             StructField::new("size", DataType::LONG, nullable == "size"),
             StructField::new("filemod", DataType::LONG, nullable == "filemod"),
-            StructField::nullable("num_records", DataType::LONG),
             StructField::nullable("dv", DataType::STRING),
             StructField::nullable("version", DataType::LONG),
         ]))
@@ -1194,7 +1191,6 @@ mod tests {
             column_name!("path"),
             column_name!("size"),
             column_name!("filemod"),
-            column_name!("num_records"),
         );
         match column {
             "path" => file_meta.path_column = nested_column,
@@ -1275,8 +1271,6 @@ mod tests {
     #[case::dynamic_scan_wrong_path_type("must have type Primitive(String)", || build_dynamic_scan(dynamic_scan_input_with_type("path", DataType::BOOLEAN)))]
     #[case::dynamic_scan_wrong_size_type("must have type Primitive(Long)", || build_dynamic_scan(dynamic_scan_input_with_type("size", DataType::STRING)))]
     #[case::dynamic_scan_wrong_filemod_type("must have type Primitive(Long)", || build_dynamic_scan(dynamic_scan_input_with_type("filemod", DataType::STRING)))]
-    #[case::dynamic_scan_wrong_num_records_type("must have type Primitive(Long)", || build_dynamic_scan(dynamic_scan_input_with_type("num_records", DataType::STRING)))]
-    #[case::dynamic_scan_missing_num_records("num_records", || build_dynamic_scan(dynamic_scan_input_missing("num_records")))]
     #[case::dynamic_scan_missing_dv("`dv`", || build_dynamic_scan(dynamic_scan_input_missing("dv")))]
     #[case::dynamic_scan_missing_file_constant_source("`version`", || build_dynamic_scan(dynamic_scan_input_missing("version")))]
     #[case::dynamic_scan_file_constant_absent_from_output("`version`", || {
