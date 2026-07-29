@@ -1358,9 +1358,11 @@ pub(crate) fn coerce_columns_to_schema(
 
 /// Casts one Arrow [`Array`] of any type to `target`.
 ///
-/// `Struct` is handled here rather than by [`cast_with_options`] so the parent null buffer survives
-/// the rebuild. Everything else, `Map` and `List` included, goes to [`cast_with_options`], which
-/// rebuilds the container using the field names in `target`.
+/// A struct tracks which of its rows are null separately from its children, so casting a child
+/// means rebuilding the struct around it. This recurses into `Struct` by hand, carrying that
+/// row-level null information onto the rebuilt struct: given a struct column whose row 0 is null,
+/// row 0 is still null after the cast. Everything else, `Map` and `List` included, goes to
+/// [`cast_with_options`], which rebuilds the container using the field names in `target`.
 ///
 /// `opts` decides what a failed leaf cast does: `safe: true` nulls the cell, strict errors.
 fn cast_array_to_type(
@@ -4362,12 +4364,15 @@ mod tests {
 
     // === coerce_columns_to_schema ===
 
-    // Converting a kernel schema is what puts kernel's `key_value` / `element` names on the target,
-    // so these tests build the target that way rather than hand-writing Arrow fields.
+    // Wraps [`TryIntoArrow`] in an `Arc` for brevity at the call sites below. Going through the
+    // kernel conversion is the point: that is what names the map entry `key_value` and the array
+    // element `element`, which hand-written Arrow fields would not.
     fn kernel_target_schema(schema: StructType) -> ArrowSchemaRef {
         Arc::new((&schema).try_into_arrow().unwrap())
     }
 
+    // A one-entry `{"k": "v"}` map whose entry struct is named `entry`. That struct holds the
+    // key/value pair of every entry, and is the field whose name writers disagree on.
     fn map_string_string_with_entry_name(entry: &str) -> MapArray {
         let names = MapFieldNames {
             entry: entry.to_string(),
@@ -4452,12 +4457,30 @@ mod tests {
     // Beyond renaming, this is a real cast: a primitive column converts to the target's type.
     #[test]
     fn test_coerce_columns_casts_primitive_to_target_type() {
-        let col: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-        let target = kernel_target_schema(schema! { nullable "n": LONG });
+        let col: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3])); // <-- source: Int32
+        let target = kernel_target_schema(schema! { nullable "n": LONG }); // <-- target: Int64
 
         let coerced = coerce_columns_to_schema(vec![col], &target).unwrap();
 
         assert_eq!(coerced[0].data_type(), &ArrowDataType::Int64);
+    }
+
+    // Casting a child rebuilds the struct around it, which must keep the struct's own null rows.
+    #[test]
+    fn test_coerce_columns_preserves_struct_null_rows() {
+        let child: ArrowArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2)]));
+        let fields: ArrowFields = vec![ArrowField::new("n", ArrowDataType::Int32, true)].into();
+        let nulls = NullBuffer::from(vec![false, true]); // <-- row 0 is a null struct
+        let outer = StructArray::try_new(fields, vec![child], Some(nulls)).unwrap();
+
+        // Widening the child to Int64 forces the struct to be rebuilt.
+        let target = kernel_target_schema(schema! { nullable "s": { nullable "n": LONG } });
+        let coerced = coerce_columns_to_schema(vec![Arc::new(outer)], &target).unwrap();
+
+        let out = coerced[0].as_struct();
+        assert!(out.is_null(0), "null struct row must survive the rebuild");
+        assert!(!out.is_null(1));
+        assert_eq!(out.column(0).data_type(), &ArrowDataType::Int64);
     }
 
     #[test]
