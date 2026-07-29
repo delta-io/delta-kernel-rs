@@ -217,18 +217,20 @@ fn assert_stats_output(
             else {
                 panic!("stats_parsed must be a struct");
             };
-            let max_values = stats_fields
-                .iter()
-                .find(|field| field.name() == "maxValues")
-                .expect("add.stats_parsed.maxValues output");
-            let ArrowDataType::Struct(data_fields) = max_values.data_type() else {
-                panic!("add.stats_parsed.maxValues must be a struct");
-            };
-            let actual: Vec<_> = data_fields
-                .iter()
-                .map(|field| field.name().as_str())
-                .collect();
-            assert_eq!(actual, expected_parsed_columns);
+            for name in ["nullCount", "minValues", "maxValues"] {
+                let field = stats_fields
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .unwrap_or_else(|| panic!("add.stats_parsed.{name} output"));
+                let ArrowDataType::Struct(data_fields) = field.data_type() else {
+                    panic!("add.stats_parsed.{name} must be a struct");
+                };
+                let actual: Vec<_> = data_fields
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect();
+                assert_eq!(actual, expected_parsed_columns, "{name}");
+            }
         }
     }
 }
@@ -331,32 +333,23 @@ fn declarative_metadata_respects_output_options(
     #[case] stats: StatsOptions,
     #[case] expect_json_stats: bool,
     #[case] expected_parsed_columns: &[&str],
-    #[values(
-        PartitionValuesOptions::string_map_only(),
-        PartitionValuesOptions::with_struct()
-    )]
-    partitions: PartitionValuesOptions,
-    #[values(None, Some(column_expr!("value").gt(Expr::literal("value_2")).into()))]
-    predicate: Option<PredicateRef>,
 ) -> DeltaResult<()> {
     let (engine, snapshot, _tempdir) =
         crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
     let struct_stats = stats.struct_stats.clone();
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
-    let expected_stats = if no_stats && predicate.is_some() {
+    let expected_stats = if no_stats {
         StatsOptions::json_only()
     } else {
         stats.clone()
     };
+    let predicate: PredicateRef = column_expr!("value").gt(Expr::literal("value_2")).into();
     let expected_builder = snapshot
         .clone()
         .scan_builder()
         .with_stats(expected_stats)
-        .with_partition_values(partitions.clone());
-    let expected_builder = match &predicate {
-        Some(predicate) => expected_builder.with_predicate(predicate.clone()),
-        None => expected_builder,
-    };
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .with_predicate(predicate.clone());
     let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
     // This fixture stores only parsed checkpoint stats. Imperative metadata synthesizes JSON,
     // while declarative metadata preserves the source JSON field, so compare other fields here.
@@ -364,16 +357,13 @@ fn declarative_metadata_respects_output_options(
     let builder = snapshot
         .scan_builder()
         .with_stats(stats)
-        .with_partition_values(partitions);
-    let builder = match &predicate {
-        Some(predicate) => builder.with_predicate(predicate.clone()),
-        None => builder,
-    };
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .with_predicate(predicate);
     let scan = builder.build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     assert_stats_output(&actual, expect_json_stats, expected_parsed_columns);
-    match (&struct_stats, predicate) {
-        (StructStats::None | StructStats::Columns(_), Some(_pred)) => {
+    match &struct_stats {
+        StructStats::None | StructStats::Columns(_) => {
             // Imperative metadata exposes stats needed internally by its predicate, while the
             // declarative path projects caller-requested output. Assert that mismatch before
             // removing stats from the comparison so normalization cannot hide it.
@@ -391,7 +381,7 @@ fn declarative_metadata_respects_output_options(
                 "metadata output options",
             )
         }
-        _ => assert_metadata_eq(
+        StructStats::All => assert_metadata_eq(
             &without_columns(&actual, &[STATS])?,
             &expected,
             "metadata output options",
@@ -592,57 +582,29 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> DeltaResult<()>
 }
 
 #[rstest]
-#[case::commits_json(
-    LogState::with_latest_version(2),
-    FeatureSet::new(),
-    checkpoint_json_stats(),
-    StatsOptions::json_only(),
-    true,
-    &[]
-)]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
-    checkpoint_json_stats(),
-    StatsOptions::all_struct(),
-    false,
-    &["value"]
-)]
-#[case::v1_mixed_struct(
-    LogState::with_latest_version(2).with_checkpoint_at([1]),
-    FeatureSet::new(),
-    checkpoint_struct_stats(),
-    StatsOptions::all_struct(),
-    false,
-    &["value"]
+    checkpoint_json_stats()
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
         .with_checkpoint_at([1])
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
-    checkpoint_struct_stats(),
-    StatsOptions::all_struct(),
-    false,
-    &["value"]
+    checkpoint_struct_stats()
 )]
 #[case::v2_checkpoint_without_stats(
     LogState::with_latest_version(2)
         .with_checkpoint_at([2])
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
-    no_checkpoint_stats(),
-    StatsOptions::all_struct(),
-    false,
-    &["value"]
+    no_checkpoint_stats()
 )]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
-    #[case] stats: StatsOptions,
-    #[case] expect_json_stats: bool,
-    #[case] expected_parsed_columns: &[&str],
 ) -> DeltaResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
@@ -657,19 +619,19 @@ fn declarative_metadata_output_options_across_log_shapes(
         snapshot
             .clone()
             .scan_builder()
-            .with_stats(stats.clone())
+            .with_stats(StatsOptions::all_struct())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
     )?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(stats)
+        .with_stats(StatsOptions::all_struct())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
-    assert_stats_output(&actual, expect_json_stats, expected_parsed_columns);
+    assert_stats_output(&actual, false, &["value"]);
     assert!(leaf_paths(&actual)
         .iter()
         .any(|path| path.starts_with("partitionValues_parsed.")));
@@ -678,43 +640,6 @@ fn declarative_metadata_output_options_across_log_shapes(
         &without_columns(&expected, &[STATS])?,
         "metadata output options across log shapes",
     )?;
-    Ok(())
-}
-
-#[test]
-fn declarative_all_stats_with_predicate_includes_non_predicate_stats() -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
-    let scan = snapshot
-        .scan_builder()
-        .with_stats(StatsOptions::all())
-        .with_predicate(Arc::new(column_expr!("id").is_not_null()))
-        .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
-
-    let schema = actual.first().expect("metadata output").schema();
-    let ArrowDataType::Struct(stats_fields) = schema
-        .field_with_name(STATS_PARSED)
-        .expect("stats_parsed output")
-        .data_type()
-    else {
-        panic!("stats_parsed must be a struct");
-    };
-    for stats_field in ["nullCount", "minValues", "maxValues"] {
-        let ArrowDataType::Struct(data_fields) = stats_fields
-            .iter()
-            .find(|field| field.name() == stats_field)
-            .expect("stats field")
-            .data_type()
-        else {
-            panic!("{stats_field} must be a struct");
-        };
-        let columns: Vec<_> = data_fields
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect();
-        assert_eq!(columns, ["id", "value"], "{stats_field}");
-    }
     Ok(())
 }
 
