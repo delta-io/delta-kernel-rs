@@ -15,7 +15,7 @@ use delta_kernel::StorageHandler;
 
 mod scalar;
 
-pub use scalar::kernel_to_df_scalar;
+pub use scalar::to_df_scalar;
 
 /// Executes kernel declarative plans on DataFusion.
 ///
