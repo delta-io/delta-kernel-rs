@@ -1,68 +1,84 @@
-//! Conversion from a kernel [`Scalar`](KernelScalar) to a DataFusion [`ScalarValue`].
+//! Conversion from a kernel [`Scalar`](KernelScalar) to a DataFusion
+//! [`ScalarValue`](DFScalarValue).
 
 use std::sync::Arc;
 
+// Each foreign type is aliased with its source crate (`Kernel*`/`DF*`/`Arrow*`) so every use
+// site reads unambiguously across the three crates this converter bridges.
 use datafusion::arrow::array::{new_empty_array, ArrayRef, MapArray, StructArray};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use datafusion::common::scalar::ScalarStructBuilder;
 use datafusion::common::utils::SingleRowListArrayBuilder;
-use datafusion::common::ScalarValue;
+use datafusion::common::ScalarValue as DFScalarValue;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     ArrayData as KernelArrayData, MapData as KernelMapData, Scalar as KernelScalar,
     StructData as KernelStructData,
 };
-use delta_kernel::schema::DataType;
+use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::{DeltaResult, Error};
 
-/// Converts a kernel [`Scalar`](KernelScalar) into the equivalent DataFusion [`ScalarValue`].
+/// Converts a kernel [`Scalar`](KernelScalar) into the equivalent DataFusion
+/// [`ScalarValue`](DFScalarValue).
 ///
 /// # Errors
 /// Returns an error for interval scalars, which are not yet supported; for a type with no Arrow
 /// representation (e.g. a shredded variant); or if building the backing Arrow array for a nested
 /// container otherwise fails.
-pub fn to_df_scalar(scalar: &KernelScalar) -> DeltaResult<ScalarValue> {
+pub fn to_df_scalar(scalar: &KernelScalar) -> DeltaResult<DFScalarValue> {
     Ok(match scalar {
-        KernelScalar::Integer(i) => ScalarValue::Int32(Some(*i)),
-        KernelScalar::Long(i) => ScalarValue::Int64(Some(*i)),
-        KernelScalar::Short(i) => ScalarValue::Int16(Some(*i)),
-        KernelScalar::Byte(i) => ScalarValue::Int8(Some(*i)),
-        KernelScalar::Float(f) => ScalarValue::Float32(Some(*f)),
-        KernelScalar::Double(f) => ScalarValue::Float64(Some(*f)),
-        KernelScalar::String(s) => ScalarValue::Utf8(Some(s.clone())),
-        KernelScalar::Boolean(b) => ScalarValue::Boolean(Some(*b)),
+        KernelScalar::Integer(i) => DFScalarValue::Int32(Some(*i)),
+        KernelScalar::Long(i) => DFScalarValue::Int64(Some(*i)),
+        KernelScalar::Short(i) => DFScalarValue::Int16(Some(*i)),
+        KernelScalar::Byte(i) => DFScalarValue::Int8(Some(*i)),
+        KernelScalar::Float(f) => DFScalarValue::Float32(Some(*f)),
+        KernelScalar::Double(f) => DFScalarValue::Float64(Some(*f)),
+        KernelScalar::String(s) => DFScalarValue::Utf8(Some(s.clone())),
+        KernelScalar::Boolean(b) => DFScalarValue::Boolean(Some(*b)),
         KernelScalar::Timestamp(v) => {
-            ScalarValue::TimestampMicrosecond(Some(*v), Some("UTC".into()))
+            DFScalarValue::TimestampMicrosecond(Some(*v), Some("UTC".into()))
         }
-        KernelScalar::TimestampNtz(v) => ScalarValue::TimestampMicrosecond(Some(*v), None),
-        KernelScalar::Date(d) => ScalarValue::Date32(Some(*d)),
-        KernelScalar::Binary(b) => ScalarValue::Binary(Some(b.clone())),
+        KernelScalar::TimestampNtz(v) => DFScalarValue::TimestampMicrosecond(Some(*v), None),
+        KernelScalar::Date(d) => DFScalarValue::Date32(Some(*d)),
+        KernelScalar::Binary(b) => DFScalarValue::Binary(Some(b.clone())),
         // scale() is 0..=38, so the i8 cast never truncates.
         KernelScalar::Decimal(d) => {
-            ScalarValue::Decimal128(Some(d.bits()), d.precision(), d.scale() as i8)
+            DFScalarValue::Decimal128(Some(d.bits()), d.precision(), d.scale() as i8)
         }
         KernelScalar::Struct(data) => struct_to_df_scalar(data)?,
         KernelScalar::Array(data) => array_to_df_scalar(data)?,
         KernelScalar::Map(data) => map_to_df_scalar(data)?,
         KernelScalar::IntervalYearMonth(_) | KernelScalar::IntervalDayTime(_) => {
-            return Err(Error::unsupported(
-                "interval scalars are not supported in the DataFusion executor",
-            ))
+            return Err(unsupported_interval_error())
         }
         KernelScalar::Null(data_type) => datatype_to_df_null_scalar(data_type)?,
     })
 }
 
-/// Builds a typed-null `ScalarValue` from a kernel type.
-fn datatype_to_df_null_scalar(data_type: &DataType) -> DeltaResult<ScalarValue> {
+/// Builds a typed-null `DFScalarValue` from a kernel type.
+///
+/// Interval types are rejected here as well as in [`to_df_scalar`]: kernel maps them to
+/// `Int32`/`Int64` in Arrow, so an interval-typed null would otherwise silently convert to a
+/// plain integer null while a non-null interval errors.
+fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> DeltaResult<DFScalarValue> {
+    if data_type == &KernelDataType::INTERVAL_YEAR_MONTH
+        || data_type == &KernelDataType::INTERVAL_DAY_TIME
+    {
+        return Err(unsupported_interval_error());
+    }
     let arrow_type: ArrowDataType = data_type.try_into_arrow()?;
     arrow_type.try_into().map_err(Error::generic_err)
 }
 
-/// Builds a `ScalarValue::List` holding a single list row of the converted elements.
-fn array_to_df_scalar(data: &KernelArrayData) -> DeltaResult<ScalarValue> {
-    let elements: DeltaResult<Vec<ScalarValue>> =
+/// The shared error for interval scalars, which have no supported DataFusion representation.
+fn unsupported_interval_error() -> Error {
+    Error::unsupported("interval scalars are not supported in the DataFusion executor")
+}
+
+/// Builds a `DFScalarValue::List` holding a single list row of the converted elements.
+fn array_to_df_scalar(data: &KernelArrayData) -> DeltaResult<DFScalarValue> {
+    let elements: DeltaResult<Vec<DFScalarValue>> =
         data.array_elements().iter().map(to_df_scalar).collect();
     // Name the list's element field from kernel's own ArrayType->Arrow conversion
     let element_field: ArrowField = data.array_type().try_into_arrow()?;
@@ -70,11 +86,11 @@ fn array_to_df_scalar(data: &KernelArrayData) -> DeltaResult<ScalarValue> {
     let list = SingleRowListArrayBuilder::new(element_array)
         .with_field(&element_field)
         .build_list_array();
-    Ok(ScalarValue::List(Arc::new(list)))
+    Ok(DFScalarValue::List(Arc::new(list)))
 }
 
-/// Builds a `ScalarValue::Struct` from the struct's fields and converted values.
-fn struct_to_df_scalar(data: &KernelStructData) -> DeltaResult<ScalarValue> {
+/// Builds a `DFScalarValue::Struct` from the struct's fields and converted values.
+fn struct_to_df_scalar(data: &KernelStructData) -> DeltaResult<DFScalarValue> {
     let mut builder = ScalarStructBuilder::new();
     for (field, value) in data.fields().iter().zip(data.values()) {
         let arrow_field: ArrowField = field.try_into_arrow()?;
@@ -83,8 +99,8 @@ fn struct_to_df_scalar(data: &KernelStructData) -> DeltaResult<ScalarValue> {
     builder.build().map_err(Error::generic_err)
 }
 
-/// Builds a `ScalarValue::Map` holding a single map row of the converted key/value pairs.
-fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<ScalarValue> {
+/// Builds a `DFScalarValue::Map` holding a single map row of the converted key/value pairs.
+fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
     let map_type = data.map_type();
     let entries_field: ArrowField = map_type.try_into_arrow()?;
     let ArrowDataType::Struct(kv_fields) = entries_field.data_type() else {
@@ -99,7 +115,7 @@ fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<ScalarValue> {
     let pairs = data.pairs();
     // Convert each pair once; collect fans the results out into parallel key/value columns,
     // short-circuiting on the first conversion error.
-    let converted: DeltaResult<(Vec<ScalarValue>, Vec<ScalarValue>)> = pairs
+    let converted: DeltaResult<(Vec<DFScalarValue>, Vec<DFScalarValue>)> = pairs
         .iter()
         .map(|(key, value)| Ok((to_df_scalar(key)?, to_df_scalar(value)?)))
         .collect();
@@ -112,19 +128,19 @@ fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<ScalarValue> {
     let offsets = OffsetBuffer::from_lengths([pairs.len()]);
     let map_array = MapArray::try_new(Arc::new(entries_field), offsets, entries, None, false)
         .map_err(Error::generic_err)?;
-    Ok(ScalarValue::Map(Arc::new(map_array)))
+    Ok(DFScalarValue::Map(Arc::new(map_array)))
 }
 
-/// Collects converted scalars into a single Arrow column. [`ScalarValue::iter_to_array`] infers
+/// Collects converted scalars into a single Arrow column. [`DFScalarValue::iter_to_array`] infers
 /// the type from the first element, so an empty column falls back to `arrow_type`.
 fn df_scalars_to_arrow_array(
-    scalars: Vec<ScalarValue>,
+    scalars: Vec<DFScalarValue>,
     arrow_type: &ArrowDataType,
 ) -> DeltaResult<ArrayRef> {
     if scalars.is_empty() {
         Ok(new_empty_array(arrow_type))
     } else {
-        ScalarValue::iter_to_array(scalars).map_err(Error::generic_err)
+        DFScalarValue::iter_to_array(scalars).map_err(Error::generic_err)
     }
 }
 
@@ -133,14 +149,16 @@ mod tests {
     use datafusion::arrow::array::{Array, AsArray, Int32Array, ListArray};
     use datafusion::arrow::datatypes::Int32Type;
     use datafusion::arrow::util::pretty::pretty_format_columns;
-    use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use delta_kernel::schema::{
+        ArrayType, DataType as KernelDataType, MapType, StructField, StructType,
+    };
     use rstest::rstest;
 
     use super::*;
 
     // === Shared helpers ===
 
-    fn assert_rendered(value: &ScalarValue, expected: &[&str]) {
+    fn assert_rendered(value: &DFScalarValue, expected: &[&str]) {
         let table = pretty_format_columns("c", &[value.to_array().unwrap()])
             .unwrap()
             .to_string();
@@ -153,8 +171,8 @@ mod tests {
 
     fn sample_struct_type() -> StructType {
         StructType::try_new([
-            StructField::not_null("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
+            StructField::not_null("a", KernelDataType::INTEGER),
+            StructField::nullable("b", KernelDataType::STRING),
         ])
         .unwrap()
     }
@@ -170,7 +188,7 @@ mod tests {
     }
 
     fn sample_map_type() -> MapType {
-        MapType::new(DataType::STRING, DataType::INTEGER, false)
+        MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, false)
     }
 
     fn sample_map_scalar() -> KernelScalar {
@@ -186,7 +204,7 @@ mod tests {
     fn sample_int_array_scalar() -> KernelScalar {
         KernelScalar::Array(
             KernelArrayData::try_new(
-                ArrayType::new(DataType::INTEGER, false),
+                ArrayType::new(KernelDataType::INTEGER, false),
                 [KernelScalar::Integer(1), KernelScalar::Integer(2)],
             )
             .unwrap(),
@@ -199,34 +217,34 @@ mod tests {
         use super::*;
 
         #[rstest]
-        #[case::integer(KernelScalar::Integer(42), ScalarValue::Int32(Some(42)))]
+        #[case::integer(KernelScalar::Integer(42), DFScalarValue::Int32(Some(42)))]
         #[case::long(
             KernelScalar::Long(9_876_543_210),
-            ScalarValue::Int64(Some(9_876_543_210))
+            DFScalarValue::Int64(Some(9_876_543_210))
         )]
-        #[case::short(KernelScalar::Short(7), ScalarValue::Int16(Some(7)))]
-        #[case::byte(KernelScalar::Byte(3), ScalarValue::Int8(Some(3)))]
-        #[case::float(KernelScalar::Float(1.25), ScalarValue::Float32(Some(1.25)))]
-        #[case::double(KernelScalar::Double(99.99), ScalarValue::Float64(Some(99.99)))]
-        #[case::boolean(KernelScalar::Boolean(true), ScalarValue::Boolean(Some(true)))]
-        #[case::string(KernelScalar::String("hi".into()), ScalarValue::Utf8(Some("hi".into())))]
-        #[case::binary(KernelScalar::Binary(b"abc".to_vec()), ScalarValue::Binary(Some(b"abc".to_vec())))]
-        #[case::date(KernelScalar::Date(20178), ScalarValue::Date32(Some(20178)))]
+        #[case::short(KernelScalar::Short(7), DFScalarValue::Int16(Some(7)))]
+        #[case::byte(KernelScalar::Byte(3), DFScalarValue::Int8(Some(3)))]
+        #[case::float(KernelScalar::Float(1.25), DFScalarValue::Float32(Some(1.25)))]
+        #[case::double(KernelScalar::Double(99.99), DFScalarValue::Float64(Some(99.99)))]
+        #[case::boolean(KernelScalar::Boolean(true), DFScalarValue::Boolean(Some(true)))]
+        #[case::string(KernelScalar::String("hi".into()), DFScalarValue::Utf8(Some("hi".into())))]
+        #[case::binary(KernelScalar::Binary(b"abc".to_vec()), DFScalarValue::Binary(Some(b"abc".to_vec())))]
+        #[case::date(KernelScalar::Date(20178), DFScalarValue::Date32(Some(20178)))]
         #[case::timestamp(
             KernelScalar::Timestamp(1_000_000),
-            ScalarValue::TimestampMicrosecond(Some(1_000_000), Some("UTC".into()))
+            DFScalarValue::TimestampMicrosecond(Some(1_000_000), Some("UTC".into()))
         )]
         #[case::timestamp_ntz(
             KernelScalar::TimestampNtz(1_000_000),
-            ScalarValue::TimestampMicrosecond(Some(1_000_000), None)
+            DFScalarValue::TimestampMicrosecond(Some(1_000_000), None)
         )]
         #[case::decimal(
             KernelScalar::decimal(12345, 10, 2).unwrap(),
-            ScalarValue::Decimal128(Some(12345), 10, 2)
+            DFScalarValue::Decimal128(Some(12345), 10, 2)
         )]
         fn primitive_scalar_converts_to_matching_value(
             #[case] scalar: KernelScalar,
-            #[case] expected: ScalarValue,
+            #[case] expected: DFScalarValue,
         ) {
             assert_eq!(to_df_scalar(&scalar).unwrap(), expected);
         }
@@ -234,12 +252,12 @@ mod tests {
         #[test]
         fn nan_and_infinity_are_preserved() {
             match to_df_scalar(&KernelScalar::Double(f64::NAN)).unwrap() {
-                ScalarValue::Float64(Some(v)) => assert!(v.is_nan()),
+                DFScalarValue::Float64(Some(v)) => assert!(v.is_nan()),
                 other => panic!("expected Float64 NaN, got {other:?}"),
             }
             assert_eq!(
                 to_df_scalar(&KernelScalar::Float(f32::INFINITY)).unwrap(),
-                ScalarValue::Float32(Some(f32::INFINITY))
+                DFScalarValue::Float32(Some(f32::INFINITY))
             );
         }
     }
@@ -250,22 +268,22 @@ mod tests {
         use super::*;
 
         #[rstest]
-        #[case::integer(DataType::INTEGER, ScalarValue::Int32(None))]
-        #[case::long(DataType::LONG, ScalarValue::Int64(None))]
-        #[case::string(DataType::STRING, ScalarValue::Utf8(None))]
-        #[case::boolean(DataType::BOOLEAN, ScalarValue::Boolean(None))]
-        #[case::date(DataType::DATE, ScalarValue::Date32(None))]
+        #[case::integer(KernelDataType::INTEGER, DFScalarValue::Int32(None))]
+        #[case::long(KernelDataType::LONG, DFScalarValue::Int64(None))]
+        #[case::string(KernelDataType::STRING, DFScalarValue::Utf8(None))]
+        #[case::boolean(KernelDataType::BOOLEAN, DFScalarValue::Boolean(None))]
+        #[case::date(KernelDataType::DATE, DFScalarValue::Date32(None))]
         #[case::timestamp(
-            DataType::TIMESTAMP,
-            ScalarValue::TimestampMicrosecond(None, Some("UTC".into()))
+            KernelDataType::TIMESTAMP,
+            DFScalarValue::TimestampMicrosecond(None, Some("UTC".into()))
         )]
         #[case::timestamp_ntz(
-            DataType::TIMESTAMP_NTZ,
-            ScalarValue::TimestampMicrosecond(None, None)
+            KernelDataType::TIMESTAMP_NTZ,
+            DFScalarValue::TimestampMicrosecond(None, None)
         )]
         fn typed_null_scalar_converts_to_typed_null_value(
-            #[case] data_type: DataType,
-            #[case] expected: ScalarValue,
+            #[case] data_type: KernelDataType,
+            #[case] expected: DFScalarValue,
         ) {
             assert_eq!(
                 to_df_scalar(&KernelScalar::Null(data_type)).unwrap(),
@@ -276,13 +294,33 @@ mod tests {
         #[test]
         fn null_struct_with_non_null_subfields_converts_to_null_struct() {
             let struct_type = StructType::try_new([
-                StructField::not_null("a", DataType::INTEGER),
-                StructField::not_null("b", DataType::STRING),
+                StructField::not_null("a", KernelDataType::INTEGER),
+                StructField::not_null("b", KernelDataType::STRING),
             ])
             .unwrap();
             let value = to_df_scalar(&KernelScalar::Null(struct_type.into())).unwrap();
-            assert!(matches!(value, ScalarValue::Struct(_)), "got {value:?}");
+            assert!(matches!(value, DFScalarValue::Struct(_)), "got {value:?}");
             assert!(value.is_null(), "expected a null struct, got {value:?}");
+        }
+
+        // Container nulls take DataFusion's nested `try_new_null` paths (distinct from the
+        // primitive arms), so assert both the variant and that the value reads back as null.
+        #[rstest]
+        #[case::array(KernelDataType::from(ArrayType::new(KernelDataType::INTEGER, true)))]
+        #[case::map(KernelDataType::from(MapType::new(
+            KernelDataType::STRING,
+            KernelDataType::INTEGER,
+            false
+        )))]
+        fn null_container_converts_to_typed_null(#[case] data_type: KernelDataType) {
+            let value = to_df_scalar(&KernelScalar::Null(data_type)).unwrap();
+            assert!(value.is_null(), "expected a null value, got {value:?}");
+        }
+
+        #[test]
+        fn null_decimal_converts_to_typed_null_decimal() {
+            let value = to_df_scalar(&KernelScalar::Null(KernelDataType::decimal(10, 2).unwrap()));
+            assert_eq!(value.unwrap(), DFScalarValue::Decimal128(None, 10, 2));
         }
 
         // A shredded (non-unshredded) variant has no Arrow representation in kernel's type
@@ -290,8 +328,18 @@ mod tests {
         #[test]
         fn unrepresentable_type_returns_error() {
             let shredded_variant =
-                DataType::variant_type([StructField::not_null("x", DataType::INTEGER)]).unwrap();
+                KernelDataType::variant_type([StructField::not_null("x", KernelDataType::INTEGER)])
+                    .unwrap();
             to_df_scalar(&KernelScalar::Null(shredded_variant)).unwrap_err();
+        }
+
+        // An interval type maps to Int32/Int64 in Arrow, but the executor rejects intervals; the
+        // null path must reject them too rather than silently produce an integer null.
+        #[rstest]
+        #[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH)]
+        #[case::day_time(KernelDataType::INTERVAL_DAY_TIME)]
+        fn null_interval_returns_error(#[case] data_type: KernelDataType) {
+            to_df_scalar(&KernelScalar::Null(data_type)).unwrap_err();
         }
     }
 
@@ -306,7 +354,7 @@ mod tests {
         #[test]
         fn array_scalar_converts_to_list_with_matching_elements() {
             let array = KernelArrayData::try_new(
-                ArrayType::new(DataType::INTEGER, false),
+                ArrayType::new(KernelDataType::INTEGER, false),
                 [KernelScalar::Integer(1), KernelScalar::Integer(2)],
             )
             .unwrap();
@@ -318,7 +366,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![1, 2])),
                 None,
             );
-            let expected = ScalarValue::List(Arc::new(list));
+            let expected = DFScalarValue::List(Arc::new(list));
             assert_eq!(value, expected);
         }
 
@@ -346,7 +394,7 @@ mod tests {
             ]
         )]
         #[case::array_of_arrays(
-            ArrayType::new(ArrayType::new(DataType::INTEGER, false), false),
+            ArrayType::new(ArrayType::new(KernelDataType::INTEGER, false), false),
             vec![sample_int_array_scalar()],
             &[
                 "+----------+",
@@ -363,8 +411,60 @@ mod tests {
         ) {
             let data = KernelArrayData::try_new(array_type, elements).unwrap();
             let value = to_df_scalar(&KernelScalar::Array(data)).unwrap();
-            assert!(matches!(value, ScalarValue::List(_)), "got {value:?}");
+            assert!(matches!(value, DFScalarValue::List(_)), "got {value:?}");
             assert_rendered(&value, expected);
+        }
+
+        // A nullable-element array carrying a null: the element field must stay nullable (so the
+        // null round-trips) rather than inheriting the values' non-null inference.
+        #[test]
+        fn array_with_null_element_keeps_nullable_element_field() {
+            let data = KernelArrayData::try_new(
+                ArrayType::new(KernelDataType::INTEGER, true),
+                [
+                    KernelScalar::Integer(1),
+                    KernelScalar::Null(KernelDataType::INTEGER),
+                ],
+            )
+            .unwrap();
+            let value = to_df_scalar(&KernelScalar::Array(data)).unwrap();
+            let DFScalarValue::List(list) = &value else {
+                panic!("expected List, got {value:?}");
+            };
+            let values = list.values();
+            assert!(
+                values.is_null(1),
+                "second element should be null, got {values:?}"
+            );
+            assert_rendered(
+                &value,
+                &[
+                    "+-------+",
+                    "| c     |",
+                    "+-------+",
+                    "| [1, ] |",
+                    "+-------+",
+                ],
+            );
+        }
+
+        // The empty-column path in `df_scalars_to_arrow_array` (element type from the declared
+        // `ArrayType`, not from a first element) must still produce a typed empty list.
+        #[test]
+        fn empty_array_converts_to_empty_list() {
+            let empty: Vec<KernelScalar> = vec![];
+            let data =
+                KernelArrayData::try_new(ArrayType::new(KernelDataType::INTEGER, false), empty)
+                    .unwrap();
+            let value = to_df_scalar(&KernelScalar::Array(data)).unwrap();
+            let DFScalarValue::List(list) = &value else {
+                panic!("expected List, got {value:?}");
+            };
+            assert_eq!(
+                list.values().len(),
+                0,
+                "expected an empty list, got {list:?}"
+            );
         }
     }
 
@@ -379,8 +479,8 @@ mod tests {
         fn struct_scalar_converts_to_struct_with_matching_fields() {
             let data = KernelStructData::try_new(
                 vec![
-                    StructField::not_null("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::STRING),
+                    StructField::not_null("a", KernelDataType::INTEGER),
+                    StructField::nullable("b", KernelDataType::STRING),
                 ],
                 vec![KernelScalar::Integer(1), KernelScalar::String("x".into())],
             )
@@ -389,36 +489,50 @@ mod tests {
             let expected = ScalarStructBuilder::new()
                 .with_scalar(
                     ArrowField::new("a", ArrowDataType::Int32, false),
-                    ScalarValue::Int32(Some(1)),
+                    DFScalarValue::Int32(Some(1)),
                 )
                 .with_scalar(
                     ArrowField::new("b", ArrowDataType::Utf8, true),
-                    ScalarValue::Utf8(Some("x".into())),
+                    DFScalarValue::Utf8(Some("x".into())),
                 )
                 .build()
                 .unwrap();
             assert_eq!(value, expected);
         }
 
-        #[test]
-        fn nested_struct_field_converts_to_struct() {
-            let data = KernelStructData::try_new(
-                vec![StructField::not_null("inner", sample_struct_type())],
-                vec![sample_struct_scalar()],
-            )
-            .unwrap();
+        // A struct field whose value is itself a nested container (struct or array).
+        #[rstest]
+        #[case::nested_struct(
+            StructField::not_null("inner", sample_struct_type()),
+            sample_struct_scalar(),
+            &[
+                "+-----------------------+",
+                "| c                     |",
+                "+-----------------------+",
+                "| {inner: {a: 1, b: x}} |",
+                "+-----------------------+",
+            ]
+        )]
+        #[case::array_field(
+            StructField::not_null("arr", ArrayType::new(KernelDataType::INTEGER, false)),
+            sample_int_array_scalar(),
+            &[
+                "+---------------+",
+                "| c             |",
+                "+---------------+",
+                "| {arr: [1, 2]} |",
+                "+---------------+",
+            ]
+        )]
+        fn struct_with_container_field_converts_to_struct(
+            #[case] field: StructField,
+            #[case] value: KernelScalar,
+            #[case] expected: &[&str],
+        ) {
+            let data = KernelStructData::try_new(vec![field], vec![value]).unwrap();
             let value = to_df_scalar(&KernelScalar::Struct(data)).unwrap();
-            assert!(matches!(value, ScalarValue::Struct(_)), "got {value:?}");
-            assert_rendered(
-                &value,
-                &[
-                    "+-----------------------+",
-                    "| c                     |",
-                    "+-----------------------+",
-                    "| {inner: {a: 1, b: x}} |",
-                    "+-----------------------+",
-                ],
-            );
+            assert!(matches!(value, DFScalarValue::Struct(_)), "got {value:?}");
+            assert_rendered(&value, expected);
         }
 
         // A present (non-null) struct that carries a null in a NULLABLE field.
@@ -426,46 +540,23 @@ mod tests {
         fn present_struct_with_null_nullable_subfield_converts() {
             let data = KernelStructData::try_new(
                 vec![
-                    StructField::not_null("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::STRING),
+                    StructField::not_null("a", KernelDataType::INTEGER),
+                    StructField::nullable("b", KernelDataType::STRING),
                 ],
                 vec![
                     KernelScalar::Integer(1),
-                    KernelScalar::Null(DataType::STRING),
+                    KernelScalar::Null(KernelDataType::STRING),
                 ],
             )
             .unwrap();
             let value = to_df_scalar(&KernelScalar::Struct(data)).unwrap();
-            let ScalarValue::Struct(array) = &value else {
+            let DFScalarValue::Struct(array) = &value else {
                 panic!("expected Struct, got {value:?}");
             };
             assert!(!value.is_null(), "struct itself is present, got {value:?}");
             // Subfield `b` must be an actual null
             let b = array.column_by_name("b").unwrap();
             assert!(b.is_null(0), "subfield b should be null, got {b:?}");
-        }
-
-        #[test]
-        fn struct_with_array_field_converts_to_struct() {
-            let data = KernelStructData::try_new(
-                vec![StructField::not_null(
-                    "arr",
-                    ArrayType::new(DataType::INTEGER, false),
-                )],
-                vec![sample_int_array_scalar()],
-            )
-            .unwrap();
-            let value = to_df_scalar(&KernelScalar::Struct(data)).unwrap();
-            assert_rendered(
-                &value,
-                &[
-                    "+---------------+",
-                    "| c             |",
-                    "+---------------+",
-                    "| {arr: [1, 2]} |",
-                    "+---------------+",
-                ],
-            );
         }
     }
 
@@ -474,7 +565,7 @@ mod tests {
     mod maps {
         use super::*;
 
-        // No symmetric ScalarValue map constructor exists, so read the entries back directly
+        // No symmetric DFScalarValue map constructor exists, so read the entries back directly
         // rather than asserting against a hand-built expected value.
         #[rstest]
         #[case::single(vec![(KernelScalar::String("k".into()), KernelScalar::Integer(1))], vec![("k", 1)])]
@@ -484,12 +575,12 @@ mod tests {
             #[case] expected: Vec<(&str, i32)>,
         ) {
             let data = KernelMapData::try_new(
-                MapType::new(DataType::STRING, DataType::INTEGER, false),
+                MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, false),
                 pairs,
             )
             .unwrap();
             let value = to_df_scalar(&KernelScalar::Map(data)).unwrap();
-            let ScalarValue::Map(map) = &value else {
+            let DFScalarValue::Map(map) = &value else {
                 panic!("expected Map, got {value:?}");
             };
             let keys = map.keys().as_string::<i32>();
@@ -523,6 +614,21 @@ mod tests {
                 "+------------------+",
             ]
         )]
+        #[case::map_of_arrays(
+            MapType::new(
+                ArrayType::new(KernelDataType::INTEGER, false),
+                ArrayType::new(KernelDataType::INTEGER, false),
+                false,
+            ),
+            vec![(sample_int_array_scalar(), sample_int_array_scalar())],
+            &[
+                "+------------------+",
+                "| c                |",
+                "+------------------+",
+                "| {[1, 2]: [1, 2]} |",
+                "+------------------+",
+            ]
+        )]
         fn nested_map_converts_to_map(
             #[case] map_type: MapType,
             #[case] pairs: Vec<(KernelScalar, KernelScalar)>,
@@ -530,32 +636,8 @@ mod tests {
         ) {
             let data = KernelMapData::try_new(map_type, pairs).unwrap();
             let value = to_df_scalar(&KernelScalar::Map(data)).unwrap();
-            assert!(matches!(value, ScalarValue::Map(_)), "got {value:?}");
+            assert!(matches!(value, DFScalarValue::Map(_)), "got {value:?}");
             assert_rendered(&value, expected);
-        }
-
-        #[test]
-        fn map_of_arrays_converts_to_map() {
-            let data = KernelMapData::try_new(
-                MapType::new(
-                    ArrayType::new(DataType::INTEGER, false),
-                    ArrayType::new(DataType::INTEGER, false),
-                    false,
-                ),
-                vec![(sample_int_array_scalar(), sample_int_array_scalar())],
-            )
-            .unwrap();
-            let value = to_df_scalar(&KernelScalar::Map(data)).unwrap();
-            assert_rendered(
-                &value,
-                &[
-                    "+------------------+",
-                    "| c                |",
-                    "+------------------+",
-                    "| {[1, 2]: [1, 2]} |",
-                    "+------------------+",
-                ],
-            );
         }
     }
 }
