@@ -276,4 +276,20 @@ mod tests {
         assert_eq!(snapshot.version(), 1);
         assert_eq!(snapshot.schema().fields().count(), 3);
     }
+
+    // The array counterpart of the test above. This fixture's checkpoint names its array element
+    // fields `item` where kernel expects `element`, so it covers the other half of the naming
+    // disagreement. `metaData.partitionColumns` is the array in question, and it is present in
+    // every `metaData` action, so its element name is checked on every P&M replay.
+    #[test]
+    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_item_named_arrays() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        assert_eq!(snapshot.version(), 5);
+        assert_eq!(snapshot.schema().fields().count(), 5);
+    }
 }
