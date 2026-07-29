@@ -101,13 +101,9 @@ pub enum BinaryPredicateOp {
 /// A unary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
-    /// Encode a struct as a JSON object string, one string per row. The input must be a struct and
-    /// the output is STRING. A NULL input row produces a NULL string rather than `"null"`. This is
-    /// the inverse of [`ParseJsonExpression`].
-    ///
-    /// ```sql
-    /// to_json(expr)
-    /// ```
+    /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
+    /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
+    /// than `"null"`. This is the inverse of [`ParseJsonExpression`].
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
     /// hex rather than base64, two digits per byte in the order the bytes appear, so
@@ -331,22 +327,18 @@ pub struct VariadicExpression {
 /// struct of null fields is unspecified, since data skipping treats the two alike.
 ///
 /// An empty string is not valid JSON here, so it is unparseable. This operator does not share
-/// [`MapToStructExpression`]'s empty-string-to-NULL behavior.
-///
-/// ```sql
-/// -- SQL equivalent, in a dialect whose from_json is permissive rather than strict
-/// from_json(json_expr, output_schema)
-/// ```
+/// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
+/// output_schema)` in a dialect whose `from_json` is permissive rather than strict.
 ///
 /// # Default engine behavior
 ///
-/// The default engine builds on `arrow-json`, whose typed decoders reject a whole batch when one
-/// cell fails to parse. It works around that for the leaf types that fail most often (timestamp,
-/// date, decimal) by decoding them as strings and safe-casting back, so a bad value in one of those
-/// degrades to a NULL for that field alone. Anything the workaround does not cover, namely
-/// structurally invalid JSON and a type mismatch on any other leaf, falls back to nulling the
-/// entire batch rather than the offending row. A NULL input decodes as `{}`, leaving every field
-/// NULL without disturbing the rest of the batch.
+/// `arrow-json`'s typed decoders reject a whole batch when one cell fails to parse. The default
+/// engine works around that for the leaf types that fail most often (timestamp, date, decimal) by
+/// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
+/// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
+/// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
+/// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
+/// rest of the batch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.
