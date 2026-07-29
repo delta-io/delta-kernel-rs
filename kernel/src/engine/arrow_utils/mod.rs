@@ -1356,7 +1356,7 @@ pub(crate) fn coerce_columns_to_schema(
         .collect()
 }
 
-/// Casts one Arrow [`Array`] of any type to `target`.
+/// Casts one Arrow [`ArrowArray`] of any type to `target`.
 ///
 /// A struct tracks which of its rows are null separately from its children, so casting a child
 /// means rebuilding the struct around it. This recurses into `Struct` by hand, carrying that
@@ -1375,7 +1375,12 @@ fn cast_array_to_type(
     }
     match target {
         ArrowDataType::Struct(target_fields) => {
-            let s = array.as_struct();
+            let s = array.as_struct_opt().ok_or_else(|| {
+                Error::generic(format!(
+                    "cannot cast {} to a struct target",
+                    array.data_type()
+                ))
+            })?;
             let nulls = s.nulls().cloned();
             require!(
                 s.columns().len() == target_fields.len(),
@@ -4497,5 +4502,56 @@ mod tests {
         let target = kernel_target_schema(schema! { nullable "d": DATE });
 
         assert!(coerce_columns_to_schema(vec![col], &target).is_err());
+    }
+
+    // A primitive source against a struct target: the struct arm must reject it, not panic on the
+    // `as_struct` downcast.
+    #[test]
+    fn test_coerce_columns_non_struct_source_to_struct_target_errors() {
+        let col: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let target = kernel_target_schema(schema! { nullable "s": { nullable "n": INTEGER } });
+
+        let result = coerce_columns_to_schema(vec![col], &target);
+        assert_result_error_with_message(result, "to a struct target");
+    }
+
+    // A struct source with fewer children than the struct target has fields.
+    #[test]
+    fn test_coerce_columns_struct_child_count_mismatch_errors() {
+        let child: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let fields: ArrowFields = vec![ArrowField::new("a", ArrowDataType::Int32, true)].into();
+        let source = StructArray::try_new(fields, vec![child], None).unwrap();
+
+        let target = kernel_target_schema(schema! {
+            nullable "s": { nullable "a": INTEGER, nullable "b": INTEGER },
+        });
+
+        let result = coerce_columns_to_schema(vec![Arc::new(source)], &target);
+        assert_result_error_with_message(result, "cannot cast struct with 1 children");
+    }
+
+    // Recursion must reach through every container: struct -> list -> map, with `entries`/`item`
+    // names at each level, all renamed in one pass.
+    #[test]
+    fn test_coerce_columns_recurses_through_struct_list_map() {
+        let map = map_string_string_with_entry_name("entries"); // <-- writer's name
+        let list_field = Arc::new(ArrowField::new("item", map.data_type().clone(), true));
+        let list = ListArray::new(
+            list_field,
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(map),
+            None,
+        );
+        let outer = StructArray::from(vec![(
+            Arc::new(ArrowField::new("maps", list.data_type().clone(), true)),
+            Arc::new(list) as ArrowArrayRef,
+        )]);
+
+        let target = kernel_target_schema(schema! {
+            nullable "s": { nullable "maps": [ nullable { STRING => nullable STRING } ] },
+        });
+        let coerced = coerce_columns_to_schema(vec![Arc::new(outer)], &target).unwrap();
+
+        assert_eq!(coerced[0].data_type(), target.field(0).data_type());
     }
 }

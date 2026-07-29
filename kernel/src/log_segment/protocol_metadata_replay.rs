@@ -125,7 +125,7 @@ impl LogSegment {
         // Providing a plan executor opts the engine into declarative P&M replay.
         #[cfg(feature = "declarative-plans")]
         let actions_batches = match engine.plan_executor() {
-            Some(exec) => self.read_pm_batches_via_plan(exec.as_ref())?,
+            Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
             None => Box::new(self.read_pm_batches(engine)?) as _,
         };
 
@@ -152,7 +152,7 @@ impl LogSegment {
     #[cfg(feature = "declarative-plans")]
     fn read_pm_batches_via_plan(
         &self,
-        exec: &dyn PlanExecutor,
+        executor: &dyn PlanExecutor,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -183,7 +183,7 @@ impl LogSegment {
             .build()?;
 
         // NOTE: The plan dedupes all actions, so mark all results as coming from checkpoint
-        let batches = exec
+        let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
             .map(|batch| Ok(ActionsBatch::new(batch?, true)));
