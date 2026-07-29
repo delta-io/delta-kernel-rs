@@ -1092,9 +1092,10 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, MapBuilder, StringArray, StringBuilder, StructArray,
+        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StructArray,
         TimestampMicrosecondArray,
     };
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
@@ -1901,49 +1902,73 @@ mod tests {
         assert_eq!(result.value(0), expected);
     }
 
-    #[rstest]
-    #[case::present(2, true)]
-    #[case::absent(9, false)]
-    fn test_in_matches_literal_array_membership(#[case] needle: i32, #[case] expected: bool) {
-        let schema = ArrowSchema::new(vec![ArrowField::new("n", ArrowDataType::Int32, true)]);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(vec![1]))])
-                .unwrap();
-
-        let elements = ArrayData::try_new(
-            ArrayType::new(DataType::INTEGER, false),
-            vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
-        )
-        .unwrap();
-        let pred = Pred::binary(
-            BinaryPredicateOp::In,
-            lit(needle),
-            Expr::Literal(Scalar::Array(elements)),
+    /// `{ n: 1 }` plus a `list` column holding `[1, 2]`, covering both element sources `IN`
+    /// accepts.
+    fn in_batch() -> RecordBatch {
+        let item = Arc::new(ArrowField::new("item", ArrowDataType::Int32, true));
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
         );
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("n", ArrowDataType::Int32, true),
+            ArrowField::new("list", ArrowDataType::List(item), true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![1])), Arc::new(list)],
+        )
+        .unwrap()
+    }
+
+    fn int_array_literal() -> Expr {
+        let elements =
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), vec![1, 2]).unwrap();
+        Expr::Literal(Scalar::Array(elements))
+    }
+
+    /// A NULL needle is not null-propagating: it answers `false` rather than NULL.
+    #[rstest]
+    #[case::present_in_literal_array(Some(2), true, true)]
+    #[case::absent_from_literal_array(Some(9), false, true)]
+    #[case::null_needle_in_literal_array(None, false, true)]
+    #[case::present_in_list_column(Some(2), true, false)]
+    #[case::absent_from_list_column(Some(9), false, false)]
+    #[case::null_needle_in_list_column(None, false, false)]
+    fn test_in_matches_membership_and_never_nulls(
+        #[case] needle: Option<i32>,
+        #[case] expected: bool,
+        #[case] literal_elements: bool,
+    ) {
+        let batch = in_batch();
+        let needle = match needle {
+            Some(n) => lit(n),
+            None => Expr::null_literal(DataType::INTEGER),
+        };
+        let elements = if literal_elements {
+            int_array_literal()
+        } else {
+            column_expr!("list")
+        };
+
+        let pred = Pred::binary(BinaryPredicateOp::In, needle, elements);
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result.null_count(), 0);
         assert_eq!(result.value(0), expected);
     }
 
+    /// Only a literal left operand is supported, so a column needle is rejected regardless of where
+    /// the elements come from, as is a right operand that holds no elements at all.
     #[rstest]
-    #[case::column_in_literal_array(true)]
-    #[case::non_array_right_operand(false)]
-    fn test_in_rejects_unsupported_operand_shapes(#[case] array_rhs: bool) {
-        let schema = ArrowSchema::new(vec![ArrowField::new("n", ArrowDataType::Int32, true)]);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(vec![1]))])
-                .unwrap();
-
-        let rhs = if array_rhs {
-            let elements =
-                ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), vec![1, 2, 3])
-                    .unwrap();
-            Expr::Literal(Scalar::Array(elements))
-        } else {
-            lit(1)
-        };
-        let pred = Pred::binary(BinaryPredicateOp::In, column_expr!("n"), rhs);
+    #[case::column_in_literal_array(int_array_literal())]
+    #[case::column_in_column(column_expr!("list"))]
+    #[case::non_array_right_operand(lit(1))]
+    fn test_in_rejects_unsupported_operand_shapes(#[case] elements: Expr) {
+        let pred = Pred::binary(BinaryPredicateOp::In, column_expr!("n"), elements);
         assert_result_error_with_message(
-            evaluate_predicate(&pred, &batch, false),
+            evaluate_predicate(&pred, &in_batch(), false),
             "Invalid right value for (NOT) IN comparison",
         );
     }

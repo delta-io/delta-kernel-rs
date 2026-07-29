@@ -636,11 +636,17 @@ impl Agg {
     /// (no rows)        ->  NULL
     /// ```
     ///
-    /// Equivalent to SQL `max_by(value, key) FILTER (WHERE value IS NOT NULL)`: `max_by` already
-    /// ignores NULL keys, and the filter additionally drops NULL values. The filter is required,
-    /// not decorative: an engine's native `max_by` typically retains NULL values, so lowering
-    /// to it unfiltered returns NULL whenever the greatest-key row has a NULL value, instead of
-    /// the next-greatest row that has one.
+    /// A native `max_by` ignores NULL keys but keeps NULL values, so it needs help to drop the
+    /// latter. Either of these is equivalent; the third form is the one to avoid:
+    ///
+    /// ```sql
+    /// max_by(value, key) FILTER (WHERE value IS NOT NULL)
+    /// max_by(value, CASE WHEN value IS NOT NULL THEN key END)  -- nulls the key instead
+    /// max_by(value, key)                                       -- WRONG: keeps NULL values
+    /// ```
+    ///
+    /// The wrong form returns NULL whenever the greatest-key row has a NULL value, rather than the
+    /// next-greatest row that has one.
     ///
     /// In systems without `max_by`, it can also be expressed using window functions:
     ///

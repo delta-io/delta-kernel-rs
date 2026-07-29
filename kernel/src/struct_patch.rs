@@ -37,10 +37,27 @@
 //! ```
 //!
 //! Field `a` is untouched and passes through in place, which is what makes the patch cost
-//! `O(edits)` rather than `O(struct width)`. Only the expression side of a
-//! [`ProjectionStructPatchBuilder`] is sparse, since a schema has to enumerate every output field.
-//! The `_at` variants (e.g. [`insert_after_at`](StructPatchBuilder::insert_after_at)) apply the
-//! same edits to a nested struct named by path.
+//! `O(edits)` rather than `O(struct width)`. The `_at` variants (e.g.
+//! [`insert_after_at`](StructPatchBuilder::insert_after_at)) apply the same edits to a nested
+//! struct named by path.
+//!
+//! # Flattening to a dense projection
+//!
+//! An engine whose projection operator takes one expression per output column has to expand the
+//! patch, which is the walk the example above traces. Emit
+//! [`prepended_fields`](ExpressionStructPatch::prepended_fields), then visit the input struct's
+//! fields in order: look each one up in
+//! [`field_patches`](ExpressionStructPatch::field_patches), emit the field itself when the entry is
+//! absent or sets [`keep_input`](ExpressionFieldPatch::keep_input), and emit that entry's
+//! [`insertions`](ExpressionFieldPatch::insertions) after it. An entry that keeps nothing and
+//! inserts nothing drops the field. Finish with
+//! [`appended_fields`](ExpressionStructPatch::appended_fields). A nested patch arrives as an
+//! [`Expression::StructPatch`] insertion, so the same walk recurses with that patch's
+//! [`input_path`](ExpressionStructPatch::input_path) as the struct to expand against.
+//!
+//! [`ProjectionStructPatchBuilder`] hands back the flattened schema already, so a caller building
+//! both halves can pair its dense field list with the expressions this walk produces rather than
+//! deriving the field names again.
 
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;

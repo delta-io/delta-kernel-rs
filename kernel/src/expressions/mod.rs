@@ -81,19 +81,40 @@ pub enum BinaryPredicateOp {
     /// value. `DISTINCT(1, 1)` and `DISTINCT(NULL, NULL)` are `false`; `DISTINCT(NULL, 1)` is
     /// `true`.
     Distinct,
-    /// SQL `left IN (elements)`: `true` when `left` equals one of the elements. `left` must be a
-    /// literal, and the elements are either a list-typed column or an [`Expression::Literal`]
-    /// holding a [`Scalar::Array`], never a list of expressions or a subquery. The reverse shape,
-    /// a column tested against a literal array, is unsupported.
+    /// SQL `left IN (elements)`: `true` when `left` equals one of the elements, and `false`
+    /// otherwise, including when `left` is NULL. `left` must be a literal, and the elements are
+    /// either a list-typed column or an [`Expression::Literal`] holding a [`Scalar::Array`], never
+    /// a list of expressions or a subquery:
+    ///
+    /// ```sql
+    /// 2 IN (1, 2, 3)         -- literal elements
+    /// 2 IN (SELECT ...)      -- unsupported: no subquery form
+    /// col IN (1, 2, 3)       -- unsupported: the left operand must be a literal
+    /// ```
+    ///
+    /// Testing a literal against a list column is the shape data skipping uses, and it is the
+    /// reason the operands sit this way around rather than the more familiar
+    /// column-on-the-left form.
     In,
 }
 
 /// A unary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
-    /// Encode a struct as a JSON object string, one string per row: `{ a: 1, b: "x" }` becomes
-    /// `{"a":1,"b":"x"}`. The input must be a struct and the output is STRING. This is the inverse
-    /// of [`ParseJsonExpression`].
+    /// Encode a struct as a JSON object string, one string per row. The input must be a struct and
+    /// the output is STRING. A NULL input row produces a NULL string rather than `"null"`. This is
+    /// the inverse of [`ParseJsonExpression`].
+    ///
+    /// ```sql
+    /// to_json(expr)
+    /// ```
+    ///
+    /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as a hex
+    /// string, not base64, so a struct `{ b: 0xDEAD, l: [1, 2], n: { z: 7 } }` becomes:
+    ///
+    /// ```text
+    /// {"b":"dead","l":[1,2],"n":{"z":7}}
+    /// ```
     ToJson,
 }
 
@@ -112,26 +133,27 @@ pub enum BinaryExpressionOp {
     Multiply,
     /// `left / right`. A zero divisor never yields NULL.
     ///
-    /// Integer operands divide truncating toward zero, so `7 / 2` is `3`, and a zero divisor
-    /// fails. Float operands follow IEEE 754: `+/-inf` for a non-zero numerator, `NaN` for
-    /// `0.0 / 0.0`.
+    /// Integer operands divide truncating toward zero, and a zero divisor fails. Float operands
+    /// follow IEEE 754: `+/-inf` for a non-zero numerator, `NaN` for `0.0 / 0.0`. In a dialect
+    /// whose `/` is always fractional, the integer case is the other division operator:
     ///
-    /// An engine whose `/` is always fractional must lower integer operands to its own truncating
-    /// operator instead.
+    /// ```sql
+    /// 7 DIV 2      -- 3, this operator over integers
+    /// 7 / 2        -- 3.5, NOT this operator
+    /// ```
     Divide,
 }
 
 /// A variadic expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
-    /// Collapse multiple values into one by taking the first non-null value, or null when every
-    /// input is null. All inputs share one type, which is also the result type. Requires at least
-    /// one input.
+    /// SQL `COALESCE(exprs...)`: the first non-null value, or null when every input is null. All
+    /// inputs share one type, which is also the result type. Requires at least one input.
     Coalesce,
-    /// Construct an Array by evaluating each input expression. For example, the expression
-    /// `Array(1, (1 + 2), col("my_int_col"))` evaluates to the array
-    /// `[1, 3, <my_int_col value>]` per row. All inputs must share the same element type.
-    /// Requires at least one element; the element type is inferred from the inputs.
+    /// SQL `ARRAY(exprs...)`: an array built by evaluating each input per row, so
+    /// `ARRAY(1, 1 + 2, my_int_col)` yields `[1, 3, <my_int_col value>]`. All inputs must share
+    /// the same element type. Requires at least one element; the element type is inferred from
+    /// the inputs.
     ///
     /// For static array literals whose elements are all compile-time constants, use
     /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
@@ -147,9 +169,9 @@ pub enum VariadicExpressionOp {
 /// junction to its operator's identity, `true` for `AND` and `false` for `OR`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JunctionPredicateOp {
-    /// `AND(preds...)`: true when every child is true.
+    /// SQL `a AND b AND ...`: true when every child is true.
     And,
-    /// `OR(preds...)`: true when any child is true.
+    /// SQL `a OR b OR ...`: true when any child is true.
     Or,
 }
 
@@ -302,16 +324,28 @@ pub struct VariadicExpression {
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
 /// inverse of [`UnaryExpressionOp::ToJson`].
 ///
-/// Unparseable input must degrade to NULL rather than fail the query, since kernel parses stats
-/// with this operator and data skipping treats null stats as "include the file". Which NULL an
-/// engine produces is up to it. An empty string is not valid JSON here, and this operator does not
-/// share [`MapToStructExpression`]'s empty-string-to-NULL behavior.
+/// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
+/// `add.stats` with this operator and data skipping reads null stats as "include the file". The
+/// required part is that it does not error; whether a given row comes back as a null struct or as a
+/// struct of null fields is unspecified, since data skipping treats the two alike.
 ///
-/// The default engine parses permissively: a NULL input decodes as an empty object, so every field
-/// is NULL, and a single input that is not valid JSON nulls the whole batch, not just its own row.
-/// A leaf value that does not fit its declared type yields a NULL for that field when the type is
-/// one of the failure-tolerant leaves (timestamp, date, decimal); any other type mismatch nulls the
-/// whole struct.
+/// An empty string is not valid JSON here, so it is unparseable. This operator does not share
+/// [`MapToStructExpression`]'s empty-string-to-NULL behavior.
+///
+/// ```sql
+/// -- SQL equivalent, in a dialect whose from_json is permissive rather than strict
+/// from_json(json_expr, output_schema)
+/// ```
+///
+/// # Default engine behavior
+///
+/// The default engine builds on `arrow-json`, whose typed decoders reject a whole batch when one
+/// cell fails to parse. It works around that for the leaf types that fail most often (timestamp,
+/// date, decimal) by decoding them as strings and safe-casting back, so a bad value in one of those
+/// degrades to a NULL for that field alone. Anything the workaround does not cover, namely
+/// structurally invalid JSON and a type mismatch on any other leaf, falls back to nulling the
+/// entire batch rather than the offending row. A NULL input decodes as `{}`, leaving every field
+/// NULL without disturbing the rest of the batch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.
@@ -467,8 +501,9 @@ pub enum Expression {
     /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
     /// for expressions kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
-    /// Parse a JSON string expression into a struct with the given schema. Malformed and empty
-    /// input is engine-defined; see [`ParseJsonExpression`].
+    /// Parse a JSON string expression into a struct with the given schema. Unparseable input,
+    /// which includes an empty string, must yield NULL rather than error; see
+    /// [`ParseJsonExpression`].
     ParseJson(ParseJsonExpression),
     /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
     /// [`MapToStructExpression`] for how values are parsed.
