@@ -206,22 +206,27 @@ impl LogSegment {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    #[cfg(feature = "declarative-plans")]
     use std::sync::Arc;
 
     use itertools::Itertools;
     use test_log::test;
 
     use crate::engine::sync::SyncEngine;
+    #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
+    use crate::Snapshot;
+    #[cfg(feature = "declarative-plans")]
     use crate::{
-        DeltaResult, Engine, Error, EvaluationHandler, JsonHandler, ParquetHandler, Snapshot,
-        StorageHandler,
+        DeltaResult, Engine, Error, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
 
     // A [`PlanExecutor`] whose every operation fails, used to prove that a plan-path failure
     // surfaces from P&M replay rather than falling back to legacy replay.
+    #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
 
+    #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
             Err(Error::generic("plan executor deliberately failed"))
@@ -230,8 +235,10 @@ mod tests {
 
     // Forwards every handler to an inner [`SyncEngine`] but returns a [`FailingPlanExecutor`], so
     // P&M replay takes the plan path and hits the failure.
+    #[cfg(feature = "declarative-plans")]
     struct FailingPlanEngine(Arc<SyncEngine>);
 
+    #[cfg(feature = "declarative-plans")]
     impl Engine for FailingPlanEngine {
         fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
             self.0.evaluation_handler()
@@ -331,6 +338,7 @@ mod tests {
         assert_eq!(snapshot.schema().fields().count(), 5);
     }
 
+    #[cfg(feature = "declarative-plans")]
     #[test]
     fn test_snapshot_build_via_failing_plan_executor_surfaces_error_without_fallback() {
         let path =
