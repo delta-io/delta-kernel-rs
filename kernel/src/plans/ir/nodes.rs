@@ -637,16 +637,20 @@ impl Agg {
     /// ```
     ///
     /// A native `max_by` ignores NULL keys but keeps NULL values, so it needs help to drop the
-    /// latter. Either of these is equivalent; the third form is the one to avoid:
+    /// latter. Both of the first two forms below do that, and are equivalent:
     ///
     /// ```sql
+    /// -- CORRECT: the filter drops NULL-value rows before aggregating
     /// max_by(value, key) FILTER (WHERE value IS NOT NULL)
-    /// max_by(value, CASE WHEN value IS NOT NULL THEN key END)  -- nulls the key instead
-    /// max_by(value, key)                                       -- WRONG: keeps NULL values
-    /// ```
     ///
-    /// The wrong form returns NULL whenever the greatest-key row has a NULL value, rather than the
-    /// next-greatest row that has one.
+    /// -- CORRECT: nulls the key on NULL-value rows, which max_by then ignores anyway. Use this
+    /// -- where FILTER is unavailable, such as a DataFrame API with no filtered-aggregate form.
+    /// max_by(value, CASE WHEN value IS NOT NULL THEN key END)
+    ///
+    /// -- WRONG: keeps NULL values, so it returns NULL whenever the greatest-key row has one
+    /// -- instead of the next-greatest row that does not
+    /// max_by(value, key)
+    /// ```
     ///
     /// In systems without `max_by`, it can also be expressed using window functions:
     ///
