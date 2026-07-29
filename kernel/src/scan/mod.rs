@@ -1032,7 +1032,6 @@ impl Scan {
     ///
     /// Returns an error if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        let log_segment = self.snapshot.log_segment();
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
         let plan_executor = engine.plan_executor();
@@ -1041,7 +1040,7 @@ impl Scan {
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
         )?;
-        self.build_metadata_scan_plan(log_segment, &shape)
+        self.build_metadata_scan_plan(&shape)
     }
 
     // Factored out to facilitate testing

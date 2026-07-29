@@ -205,6 +205,22 @@ fn assert_json_only_output_schema(batches: &[RecordBatch]) {
     }
 }
 
+fn assert_imperative_exposes_internal_stats(
+    declarative: &[RecordBatch],
+    imperative: &[RecordBatch],
+) {
+    let declarative = declarative.first().expect("declarative metadata").schema();
+    let imperative = imperative.first().expect("imperative metadata").schema();
+    let imperative_stats = imperative
+        .field_with_name(STATS_PARSED)
+        .expect("imperative predicate stats");
+    assert_ne!(
+        declarative.field_with_name(STATS_PARSED).ok(),
+        Some(imperative_stats),
+        "imperative output must expose stats used only for predicate evaluation",
+    );
+}
+
 #[rstest]
 #[case::v2_parquet_manifest("v2-checkpoints-parquet-with-sidecars")]
 #[case::v2_json_manifest("v2-checkpoints-json-with-sidecars")]
@@ -340,6 +356,7 @@ fn declarative_metadata_respects_output_options(
         assert_json_only_output_schema(&actual);
     }
     if compare_without_stats {
+        assert_imperative_exposes_internal_stats(&actual, &expected);
         assert_metadata_eq(
             &without_stats(&actual, !no_stats)?,
             &without_stats(&expected, !no_stats)?,
