@@ -973,6 +973,7 @@ mod tests {
 
     #[cfg(feature = "geo-type-in-dev")]
     use super::EdgeAlgo;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{
         lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, ColumnName, DecimalData, Expression,
         ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, OpaqueExpressionOp,
@@ -995,7 +996,7 @@ mod tests {
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
         ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType,
+        StructField, StructType, ToSchema as _,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1426,7 +1427,7 @@ mod tests {
             StructField::not_null("path", DataType::STRING),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("dv", DataType::STRING),
+            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
         ]))
     }
 
@@ -1466,9 +1467,24 @@ mod tests {
         assert!(proto.dv_column.is_some());
 
         let file_meta = proto.file_meta.expect("file_meta present");
-        assert!(file_meta.path_column.is_some());
-        assert!(file_meta.file_size_column.is_some());
-        assert!(file_meta.last_modified_column.is_some());
+        assert_eq!(
+            file_meta.path_column.expect("path column present").path,
+            ["path"]
+        );
+        assert_eq!(
+            file_meta
+                .file_size_column
+                .expect("file size column present")
+                .path,
+            ["size"]
+        );
+        assert_eq!(
+            file_meta
+                .last_modified_column
+                .expect("last modified column present")
+                .path,
+            ["filemod"]
+        );
         Ok(())
     }
 

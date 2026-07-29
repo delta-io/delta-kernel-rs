@@ -286,19 +286,12 @@ impl PlanBuilder {
     /// Produces an error when a `file_meta`/deletion-vector column is absent from the input schema;
     /// when a file-metadata column has an incompatible type; when the path, size, or last-modified
     /// column is nullable; or when a `file_constant_columns` entry is absent from the input or
-    /// output schema or names a metadata column in either schema.
+    /// output schema, names a metadata column in either schema, or has different input/output type
+    /// or nullability.
     pub fn dynamic_scan(self, dynamic_scan: DynamicScan) -> DeltaResult<Self> {
-        dynamic_scan
-            .file_meta
-            .validate_input_schema(self.schema())?;
-        check_columns_resolve(self.schema(), [&dynamic_scan.dv_column], "dynamic scan")?;
-        // File-constant columns are sourced upstream and emitted in the output, so check both.
-        check_file_constant_columns(
+        dynamic_scan.validate_input_schema(self.schema())?;
+        check_matching_file_constant_columns(
             self.schema(),
-            &dynamic_scan.file_constant_columns,
-            "dynamic scan file_constant source",
-        )?;
-        check_file_constant_columns(
             &dynamic_scan.schema,
             &dynamic_scan.file_constant_columns,
             "dynamic scan file_constant",
@@ -614,12 +607,39 @@ fn check_file_constant_columns<'a>(
     Ok(())
 }
 
+fn check_matching_file_constant_columns(
+    input_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+    names: &[String],
+    ctx: &str,
+) -> DeltaResult<()> {
+    check_file_constant_columns(input_schema, names, &format!("{ctx} source"))?;
+    check_file_constant_columns(output_schema, names, ctx)?;
+    for name in names {
+        let input_field = input_schema
+            .field(name)
+            .ok_or_else(|| Error::internal_error(format!("validated input column `{name}`")))?;
+        let output_field = output_schema
+            .field(name)
+            .ok_or_else(|| Error::internal_error(format!("validated output column `{name}`")))?;
+        if input_field.data_type() != output_field.data_type()
+            || input_field.is_nullable() != output_field.is_nullable()
+        {
+            return Err(Error::generic(format!(
+                "{ctx}: column `{name}` must have the same type and nullability in input and output"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{col, column_name, lit, Expression};
     use crate::plans::ir::nodes::{DynamicScanFileMetadataColumns, FileType};
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{DataType, MetadataColumnSpec, StructField, StructType, ToSchema as _};
     use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
@@ -1104,7 +1124,7 @@ mod tests {
             StructField::not_null("path", DataType::STRING),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("dv", DataType::STRING),
+            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
             StructField::nullable("version", DataType::LONG),
         ]))
     }
@@ -1150,7 +1170,7 @@ mod tests {
             StructField::new("path", DataType::STRING, nullable == "path"),
             StructField::new("size", DataType::LONG, nullable == "size"),
             StructField::new("filemod", DataType::LONG, nullable == "filemod"),
-            StructField::nullable("dv", DataType::STRING),
+            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
             StructField::nullable("version", DataType::LONG),
         ]))
     }
@@ -1167,19 +1187,31 @@ mod tests {
         Arc::new(StructType::new_unchecked(fields))
     }
 
-    fn dynamic_scan_input_with_nullable_metadata() -> SchemaRef {
+    fn dynamic_scan_input_with_metadata(metadata_nullable: bool) -> SchemaRef {
         let schema = dynamic_scan_input_schema();
-        let metadata = StructField::nullable(
+        let metadata = StructField::new(
             "metadata",
             StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null("size", DataType::LONG),
                 StructField::not_null("filemod", DataType::LONG),
             ]),
+            metadata_nullable,
         );
         Arc::new(StructType::new_unchecked(
             schema.fields().cloned().chain([metadata]),
         ))
+    }
+
+    fn schema_with_field(schema: SchemaRef, replacement: StructField) -> SchemaRef {
+        let fields = schema.fields().map(|field| {
+            if field.name() == replacement.name() {
+                replacement.clone()
+            } else {
+                field.clone()
+            }
+        });
+        Arc::new(StructType::new_unchecked(fields))
     }
 
     fn dynamic_scan_node_with_nested_metadata(
@@ -1210,14 +1242,38 @@ mod tests {
     }
 
     fn build_dynamic_scan(input: SchemaRef) -> DeltaResult<PlanBuilder> {
-        let dynamic_scan = dynamic_scan_node(&input, dynamic_scan_output_schema())?;
+        build_dynamic_scan_with_schemas(input, dynamic_scan_output_schema())
+    }
+
+    fn build_dynamic_scan_with_schemas(
+        input: SchemaRef,
+        output: SchemaRef,
+    ) -> DeltaResult<PlanBuilder> {
+        let dynamic_scan = dynamic_scan_node(&input, output)?;
         vals(input).dynamic_scan(dynamic_scan)
     }
 
     fn build_dynamic_scan_with_nested_metadata(column: &str) -> DeltaResult<PlanBuilder> {
-        let input = dynamic_scan_input_with_nullable_metadata();
+        let input = dynamic_scan_input_with_metadata(true);
         let dynamic_scan = dynamic_scan_node_with_nested_metadata(&input, column)?;
         vals(input).dynamic_scan(dynamic_scan)
+    }
+
+    fn attach_dynamic_scan_to(input: SchemaRef) -> DeltaResult<PlanBuilder> {
+        let valid_input = dynamic_scan_input_schema();
+        let dynamic_scan = dynamic_scan_node(&valid_input, dynamic_scan_output_schema())?;
+        vals(input).dynamic_scan(dynamic_scan)
+    }
+
+    #[rstest::rstest]
+    #[case::path("path")]
+    #[case::size("size")]
+    #[case::last_modified("filemod")]
+    fn dynamic_scan_accepts_non_nullable_nested_metadata(#[case] column: &str) -> DeltaResult<()> {
+        let input = dynamic_scan_input_with_metadata(false);
+        let dynamic_scan = dynamic_scan_node_with_nested_metadata(&input, column)?;
+        let _ = vals(input).dynamic_scan(dynamic_scan)?;
+        Ok(())
     }
 
     fn absent_dynamic_scan() -> DeltaResult<PlanBuilder> {
@@ -1271,12 +1327,49 @@ mod tests {
     #[case::dynamic_scan_wrong_path_type("must have type Primitive(String)", || build_dynamic_scan(dynamic_scan_input_with_type("path", DataType::BOOLEAN)))]
     #[case::dynamic_scan_wrong_size_type("must have type Primitive(Long)", || build_dynamic_scan(dynamic_scan_input_with_type("size", DataType::STRING)))]
     #[case::dynamic_scan_wrong_filemod_type("must have type Primitive(Long)", || build_dynamic_scan(dynamic_scan_input_with_type("filemod", DataType::STRING)))]
+    #[case::dynamic_scan_wrong_dv_type("deletion-vector column `dv` must have type", || build_dynamic_scan(dynamic_scan_input_with_type("dv", DataType::STRING)))]
     #[case::dynamic_scan_missing_dv("`dv`", || build_dynamic_scan(dynamic_scan_input_missing("dv")))]
+    #[case::dynamic_scan_attachment_revalidates("required column `size` is nullable", || attach_dynamic_scan_to(dynamic_scan_input_nullable("size")))]
     #[case::dynamic_scan_missing_file_constant_source("`version`", || build_dynamic_scan(dynamic_scan_input_missing("version")))]
     #[case::dynamic_scan_file_constant_absent_from_output("`version`", || {
         let input = dynamic_scan_input_schema();
         let dynamic_scan = dynamic_scan_node(&input, id_schema())?;
         vals(input).dynamic_scan(dynamic_scan)
+    })]
+    #[case::dynamic_scan_file_constant_type_mismatch("same type and nullability", || {
+        let output = schema_with_field(
+            dynamic_scan_output_schema(),
+            StructField::nullable("version", DataType::STRING),
+        );
+        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
+    })]
+    #[case::dynamic_scan_file_constant_input_nullable("same type and nullability", || {
+        let output = schema_with_field(
+            dynamic_scan_output_schema(),
+            StructField::not_null("version", DataType::LONG),
+        );
+        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
+    })]
+    #[case::dynamic_scan_file_constant_output_nullable("same type and nullability", || {
+        let input = schema_with_field(
+            dynamic_scan_input_schema(),
+            StructField::not_null("version", DataType::LONG),
+        );
+        build_dynamic_scan_with_schemas(input, dynamic_scan_output_schema())
+    })]
+    #[case::dynamic_scan_file_constant_metadata_source("metadata column", || {
+        let input = schema_with_field(
+            dynamic_scan_input_schema(),
+            StructField::create_metadata_column("version", MetadataColumnSpec::RowIndex),
+        );
+        build_dynamic_scan_with_schemas(input, dynamic_scan_output_schema())
+    })]
+    #[case::dynamic_scan_file_constant_metadata_output("metadata column", || {
+        let output = schema_with_field(
+            dynamic_scan_output_schema(),
+            StructField::create_metadata_column("version", MetadataColumnSpec::RowIndex),
+        );
+        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
     })]
     fn rejects(#[case] needle: &str, #[case] make: impl Fn() -> DeltaResult<PlanBuilder>) {
         let err = make().unwrap_err();
