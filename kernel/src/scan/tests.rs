@@ -17,6 +17,7 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, Expression as Expr, Predicate as Pred,
 };
@@ -30,8 +31,8 @@ use crate::schema::{
 };
 use crate::transaction::create_table::create_table;
 use crate::{
-    DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
-    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
+    DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
+    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -1766,6 +1767,19 @@ struct RecordingParquetHandler {
     reads: Mutex<Vec<RecordedParquetRead>>,
 }
 
+impl RecordingParquetHandler {
+    fn new(inner: Arc<dyn ParquetHandler>) -> Self {
+        Self {
+            inner,
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_reads(&self) -> Vec<RecordedParquetRead> {
+        std::mem::take(&mut *self.reads.lock().unwrap())
+    }
+}
+
 impl ParquetHandler for RecordingParquetHandler {
     fn read_parquet_files(
         &self,
@@ -1795,45 +1809,6 @@ impl ParquetHandler for RecordingParquetHandler {
     }
 }
 
-struct RecordingParquetEngine {
-    inner: Arc<SyncEngine>,
-    parquet: Arc<RecordingParquetHandler>,
-}
-
-impl RecordingParquetEngine {
-    fn new(inner: Arc<SyncEngine>) -> Self {
-        Self {
-            parquet: Arc::new(RecordingParquetHandler {
-                inner: inner.parquet_handler(),
-                reads: Mutex::new(Vec::new()),
-            }),
-            inner,
-        }
-    }
-
-    fn take_reads(&self) -> Vec<RecordedParquetRead> {
-        std::mem::take(&mut *self.parquet.reads.lock().unwrap())
-    }
-}
-
-impl Engine for RecordingParquetEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet.clone()
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-}
-
 #[rstest]
 #[case::all_struct(StatsOptions::all_struct(), false, false)]
 #[case::all(StatsOptions::all(), true, false)]
@@ -1857,9 +1832,11 @@ fn test_checkpoint_stats_projection_matches_requested_output(
             fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
         });
     let url = Url::from_directory_path(path).unwrap();
-    let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    engine.take_reads();
+    recorder.take_reads();
 
     let predicate: Option<PredicateRef> = skip_stats
         .then(|| Arc::new(Pred::gt(column_expr!("id"), Expr::literal(0i64))) as PredicateRef);
@@ -1873,7 +1850,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         action.unwrap();
     }
 
-    let reads = engine.take_reads();
+    let reads = recorder.take_reads();
     let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
     let expect_parsed_stats = !skip_stats && compatible_structured_stats;
     let expect_json_stats = !skip_stats && (request_json_stats || !expect_parsed_stats);
@@ -1977,9 +1954,11 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
 ) {
     let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    engine.take_reads();
+    recorder.take_reads();
 
     let scan = snapshot
         .scan_builder()
@@ -1990,7 +1969,7 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         action.unwrap();
     }
 
-    let reads = engine.take_reads();
+    let reads = recorder.take_reads();
     assert!(
         reads.iter().any(|read| {
             read.files
@@ -2304,28 +2283,6 @@ impl ParquetHandler for EmptyParquetHandler {
     }
 }
 
-/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`, which
-/// returns [`EmptyParquetHandler`].
-struct EmptyParquetEngine(Arc<SyncEngine>);
-
-impl Engine for EmptyParquetEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.0.evaluation_handler()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.0.json_handler()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        Arc::new(EmptyParquetHandler)
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.0.storage_handler()
-    }
-}
-
 /// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
 /// iterator, `execute` must surface an error rather than silently producing no rows.
 #[test]
@@ -2333,7 +2290,10 @@ fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
     let path =
         std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+    );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
@@ -2354,7 +2314,10 @@ fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
 fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+    );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();

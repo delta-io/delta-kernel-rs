@@ -18,6 +18,7 @@ use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
@@ -43,9 +44,9 @@ use crate::utils::test_utils::{
     create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, EvaluationHandler, Expression,
-    FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, Expression, FileDataReadResultIterator,
+    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -244,39 +245,6 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
         self.0.read_parquet_footer(file)
-    }
-}
-
-struct IgnorePredicateEngine {
-    inner: Arc<SyncEngine>,
-    parquet_handler: Arc<IgnorePredicateParquetHandler>,
-}
-
-impl IgnorePredicateEngine {
-    fn new(inner: Arc<SyncEngine>) -> Self {
-        let parquet_handler = Arc::new(IgnorePredicateParquetHandler(inner.parquet_handler()));
-        Self {
-            inner,
-            parquet_handler,
-        }
-    }
-}
-
-impl Engine for IgnorePredicateEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet_handler.clone()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
     }
 }
 
@@ -1518,7 +1486,9 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    let ignore_predicate_engine = IgnorePredicateEngine::new(sync_engine.clone());
+    let ignore_predicate_engine = DelegatingEngine::new(sync_engine.clone()).with_parquet_handler(
+        Arc::new(IgnorePredicateParquetHandler(sync_engine.parquet_handler())),
+    );
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
     } else {
@@ -1632,7 +1602,9 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    let ignore_predicate_engine = IgnorePredicateEngine::new(sync_engine.clone());
+    let ignore_predicate_engine = DelegatingEngine::new(sync_engine.clone()).with_parquet_handler(
+        Arc::new(IgnorePredicateParquetHandler(sync_engine.parquet_handler())),
+    );
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
     } else {

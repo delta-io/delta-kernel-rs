@@ -93,6 +93,7 @@ mod tests {
 
     use super::*;
     use crate::engine::sync::SyncEngine;
+    use crate::engine::test_delegating::DelegatingEngine;
     use crate::metrics::MetricEvent;
     use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::{DeltaResult, FileMeta, FileSlice};
@@ -131,50 +132,27 @@ mod tests {
         }
     }
 
-    /// Engine that delegates everything to a [`SyncEngine`] except `storage_handler`, which
-    /// returns a [`StubStorageHandler`] configured to yield two list entries.
-    struct StubEngine {
-        sync: Arc<SyncEngine>,
-        storage: Arc<dyn StorageHandler>,
-    }
-
-    impl StubEngine {
-        fn new() -> Self {
-            Self {
-                sync: Arc::new(SyncEngine::new()),
-                storage: Arc::new(StubStorageHandler {
-                    list_results: vec![
-                        FileMeta {
-                            location: Url::parse("memory:///_delta_log/00000000000000000000.json")
-                                .unwrap(),
-                            last_modified: 0,
-                            size: 0,
-                        },
-                        FileMeta {
-                            location: Url::parse("memory:///_delta_log/00000000000000000001.json")
-                                .unwrap(),
-                            last_modified: 0,
-                            size: 0,
-                        },
-                    ],
-                }),
-            }
-        }
-    }
-
-    impl Engine for StubEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            self.sync.evaluation_handler()
-        }
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            Arc::clone(&self.storage)
-        }
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            self.sync.json_handler()
-        }
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            self.sync.parquet_handler()
-        }
+    /// A [`DelegatingEngine`] over a [`SyncEngine`] whose `storage_handler` is a
+    /// [`StubStorageHandler`] configured to yield two list entries.
+    fn stub_engine() -> DelegatingEngine {
+        DelegatingEngine::new(Arc::new(SyncEngine::new())).with_storage_handler(Arc::new(
+            StubStorageHandler {
+                list_results: vec![
+                    FileMeta {
+                        location: Url::parse("memory:///_delta_log/00000000000000000000.json")
+                            .unwrap(),
+                        last_modified: 0,
+                        size: 0,
+                    },
+                    FileMeta {
+                        location: Url::parse("memory:///_delta_log/00000000000000000001.json")
+                            .unwrap(),
+                        last_modified: 0,
+                        size: 0,
+                    },
+                ],
+            },
+        ))
     }
 
     #[test]
@@ -182,7 +160,7 @@ mod tests {
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(Arc::clone(&reporter) as _);
 
-        let engine = MeteredDeltaEngine::new(Arc::new(StubEngine::new()));
+        let engine = MeteredDeltaEngine::new(Arc::new(stub_engine()));
         let url = Url::parse("memory:///_delta_log/").unwrap();
         let iter = engine.storage_handler().list_from(&url).unwrap();
         let _: Vec<_> = iter.collect();
@@ -201,7 +179,7 @@ mod tests {
 
     #[test]
     fn evaluation_handler_passes_through() {
-        let inner: Arc<dyn Engine> = Arc::new(StubEngine::new());
+        let inner: Arc<dyn Engine> = Arc::new(stub_engine());
         let inner_eval = inner.evaluation_handler();
 
         let engine = MeteredDeltaEngine::new(inner);
@@ -210,7 +188,7 @@ mod tests {
 
     #[test]
     fn json_and_parquet_handlers_are_metered() {
-        let engine = MeteredDeltaEngine::new(Arc::new(StubEngine::new()));
+        let engine = MeteredDeltaEngine::new(Arc::new(stub_engine()));
         assert!(engine.json_handler().any_ref().is::<MeteredJsonHandler>());
         assert!(engine
             .parquet_handler()
@@ -221,7 +199,7 @@ mod tests {
     /// Engine that pre-meters a single handler; lets each double-wrap test target one
     /// guard without tripping the others.
     struct PreMeteredEngine {
-        inner: StubEngine,
+        inner: DelegatingEngine,
         meter_storage: bool,
         meter_json: bool,
         meter_parquet: bool,
@@ -256,7 +234,7 @@ mod tests {
 
     fn pre_metered(storage: bool, json: bool, parquet: bool) -> PreMeteredEngine {
         PreMeteredEngine {
-            inner: StubEngine::new(),
+            inner: stub_engine(),
             meter_storage: storage,
             meter_json: json,
             meter_parquet: parquet,
