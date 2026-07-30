@@ -44,9 +44,10 @@ The pattern for partitioned writes is: **group your data by partition values, cr
 # let engine = DefaultEngine::builder(store_from_url(&url)?).build();
 let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction()
     .with_operation("INSERT".to_string())
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // Suppose you have data grouped by partition values already.
 // For each partition, create a WriteContext and write.

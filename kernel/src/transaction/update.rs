@@ -33,10 +33,16 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
+    iceberg_compat_v3_column_defaults_validation, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, ColumnMappingMode, Operation, TableFeature,
 };
-use crate::utils::current_time_ms;
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::transaction::schema_evolution::{
+    apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
+};
+use crate::utils::{current_time_ms, FoldWithOption};
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -120,14 +126,27 @@ impl Transaction {
     ///
     /// Blind append transactions should only add new files and avoid write operations that
     /// depend on existing table state.
-    pub fn with_blind_append(mut self) -> Self {
+    ///
+    /// Staged via [`UpdateTableTransactionBuilder::with_blind_append`] and applied here during
+    /// [`build`]; not part of the public transaction API.
+    ///
+    /// [`UpdateTableTransactionBuilder::with_blind_append`]: super::builder::update_table::UpdateTableTransactionBuilder::with_blind_append
+    /// [`build`]: super::builder::update_table::UpdateTableTransactionBuilder::build
+    #[internal_api]
+    pub(crate) fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
         self
     }
 
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
+    ///
+    /// Staged via [`UpdateTableTransactionBuilder::with_operation`] and applied during [`build`].
+    ///
+    /// [`UpdateTableTransactionBuilder::with_operation`]: super::builder::update_table::UpdateTableTransactionBuilder::with_operation
+    /// [`build`]: super::builder::update_table::UpdateTableTransactionBuilder::build
+    #[internal_api]
+    pub(crate) fn with_operation(mut self, operation: String) -> Self {
         self.operation = Some(operation);
         self
     }
@@ -141,9 +160,106 @@ impl Transaction {
     /// the same domain in a single transaction. If a duplicate domain is included, the `commit`
     /// will fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
-    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+    ///
+    /// Staged via [`UpdateTableTransactionBuilder::with_domain_metadata_removed`] and applied
+    /// during [`build`].
+    ///
+    /// [`UpdateTableTransactionBuilder::with_domain_metadata_removed`]: super::builder::update_table::UpdateTableTransactionBuilder::with_domain_metadata_removed
+    /// [`build`]: super::builder::update_table::UpdateTableTransactionBuilder::build
+    #[internal_api]
+    pub(crate) fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.user_domain_removals.push(domain);
         self
+    }
+
+    /// Apply schema-evolution operations to this transaction, emitting an updated Metadata action
+    /// on commit.
+    ///
+    /// Validates the operations against the current schema, builds the evolved
+    /// [`TableConfiguration`], and marks Metadata for emission. Staged via
+    /// [`UpdateTableTransactionBuilder::add_column`] / [`set_nullable`] and applied during
+    /// [`build`].
+    ///
+    /// Unlike the removed standalone alter-table path, this runs on a regular update transaction,
+    /// so `data_change` keeps its `true` default unless the caller overrides it. That default is
+    /// unobservable for a schema-only commit, which emits no Add/Remove file actions (the only
+    /// place `data_change` is materialized) and has no transaction-level `dataChange` field in
+    /// `commitInfo`.
+    ///
+    /// [`UpdateTableTransactionBuilder::add_column`]: super::builder::update_table::UpdateTableTransactionBuilder::add_column
+    /// [`set_nullable`]: super::builder::update_table::UpdateTableTransactionBuilder::set_nullable
+    /// [`build`]: super::builder::update_table::UpdateTableTransactionBuilder::build
+    pub(crate) fn apply_schema_evolution(
+        mut self,
+        operations: Vec<SchemaOperation>,
+    ) -> DeltaResult<Self> {
+        let table_config = &self.effective_table_config;
+        // Schema evolution is not yet supported on tables with icebergCompatV3 enabled. See
+        // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
+        if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            return Err(Error::unsupported(
+                "Schema evolution is not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        // TODO(#2630): Support schema evolution on tables with column defaults.
+        if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
+            return Err(Error::unsupported(
+                "Schema evolution is not yet supported on tables with allowColumnDefaults enabled",
+            ));
+        }
+
+        let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+        let column_mapping_mode = table_config.column_mapping_mode();
+        let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+        // Whether the pre-evolution schema already carried column-mapping metadata -- the only fact
+        // the strip below needs. Captured as a bool before `apply_schema_operations` consumes
+        // `schema`. Only relevant in `None` mode, where the strip fires.
+        let current_has_cm = column_mapping_mode == ColumnMappingMode::None
+            && schema_has_column_mapping_metadata(&schema);
+        let SchemaEvolutionResult {
+            schema: evolved_schema,
+            new_max_column_id,
+        } = apply_schema_operations(
+            schema,
+            operations,
+            column_mapping_mode,
+            current_max_column_id,
+        )?;
+
+        // Only in `None` mode: if this evolution introduced column-mapping annotations into a table
+        // that was clean before it, strip them; residual annotations already present are left in
+        // place (see `strip_stray_column_mapping_metadata`).
+        let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+            strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
+                .map_or(evolved_schema, Arc::new)
+        } else {
+            evolved_schema
+        };
+
+        let evolved_metadata = table_config
+            .metadata()
+            .clone()
+            .with_schema(evolved_schema.clone())?
+            .fold_with(new_max_column_id, |evolved_metadata, id| {
+                evolved_metadata
+                    .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+            });
+
+        // Validates the evolved metadata against the protocol.
+        let evolved_table_config = TableConfiguration::try_new_with_schema(
+            table_config,
+            evolved_metadata,
+            evolved_schema,
+        )?;
+
+        self.effective_table_config = evolved_table_config;
+        self.should_emit_metadata = true;
+        // Preserve the historical schema-evolution commit label. Applied before the builder
+        // threads the caller's staged config, so an explicit `with_operation(...)` still wins.
+        if self.operation.is_none() {
+            self.operation = Some("ALTER TABLE".to_string());
+        }
+        Ok(self)
     }
 
     /// Remove files from the table in this transaction. This API generally enables the engine to
@@ -165,7 +281,7 @@ impl Transaction {
     /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
     /// // Create a snapshot and transaction
     /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?;
+    /// let mut txn = snapshot.clone().transaction().build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
     ///
     /// // Get file metadata from a scan
     /// let scan = snapshot.scan_builder().build()?;
@@ -246,8 +362,9 @@ impl Transaction {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?
-    ///     .with_operation("UPDATE".to_string());
+    /// let mut txn = snapshot.clone().transaction()
+    ///     .with_operation("UPDATE".to_string())
+    ///     .build(engine, Box::new(FileSystemCommitter::new()))?;
     ///
     /// let scan = snapshot.scan_builder().build()?;
     /// let files: Vec<FilteredEngineData> = scan.scan_metadata(engine)?

@@ -33,8 +33,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_features::{physical_to_logical_column_name, ColumnMappingMode, TableFeature};
 use crate::table_properties::TableProperties;
-use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
-use crate::transaction::Transaction;
+use crate::transaction::builder::update_table::UpdateTableTransactionBuilder;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
@@ -847,27 +846,18 @@ impl Snapshot {
         IncrementalScanBuilder::new(self, base_version)
     }
 
-    /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
+    /// Creates a builder for updating (writing to) this existing table.
     ///
-    /// Note: For tables with clustering enabled, this performs log replay to read clustering
+    /// The returned [`UpdateTableTransactionBuilder`] stages write configuration (operation,
+    /// engine info, blind append, domain metadata, set-transaction, commit info) and
+    /// schema-evolution operations (`add_column`, `set_nullable`) before building a
+    /// [`Transaction`](crate::transaction::Transaction) via
+    /// [`build`](UpdateTableTransactionBuilder::build).
+    ///
+    /// Note: For tables with clustering enabled, `build` performs log replay to read clustering
     /// columns from domain metadata, which may have a performance cost.
-    pub fn transaction(
-        self: Arc<Self>,
-        committer: Box<dyn Committer>,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Transaction> {
-        Transaction::try_new_existing_table(self, committer, engine)
-    }
-
-    /// Creates a builder for altering this table's metadata. Currently supports schema change
-    /// operations.
-    ///
-    /// The returned builder allows chaining operations before building an
-    /// [`AlterTableTransaction`] that can be committed.
-    ///
-    /// [`AlterTableTransaction`]: crate::transaction::AlterTableTransaction
-    pub fn alter_table(self: Arc<Self>) -> AlterTableTransactionBuilder {
-        AlterTableTransactionBuilder::new(self)
+    pub fn transaction(self: Arc<Self>) -> UpdateTableTransactionBuilder {
+        UpdateTableTransactionBuilder::new(self)
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.

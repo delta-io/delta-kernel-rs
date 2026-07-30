@@ -424,10 +424,11 @@ async fn setup_table_with_dms_and_set_txns(
         .unwrap_post_commit_snapshot();
 
     let snap_v1 = snap_v0
-        .transaction(committer(), engine.as_ref())?
+        .transaction()
         .with_operation("WRITE".to_string())
         .with_domain_metadata("myapp.config".to_string(), "v1".to_string())
         .with_transaction_id("my-app".to_string(), 1)
+        .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
         .unwrap_post_commit_snapshot();
 

@@ -20,8 +20,8 @@ use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
     add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
-    create_table_and_load_snapshot, engine_store_setup, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
+    create_table_and_load_snapshot, engine_store_setup, read_actions_from_commit, test_table_setup,
+    test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -53,6 +53,86 @@ fn max_column_id(snap: &Snapshot) -> Option<i64> {
 // ============================================================================
 // Add column tests
 // ============================================================================
+
+/// A schema-evolution-only commit (no caller-supplied operation) labels its `commitInfo` with
+/// `operation: "ALTER TABLE"`, matching the pre-builder behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_column_commit_info_operation_defaults_to_alter_table(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    snapshot
+        .transaction()
+        .add_column(StructField::nullable("country", DataType::STRING))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let commit_infos = read_actions_from_commit(&table_url, 1, "commitInfo")?;
+    let operation = commit_infos[0]["operation"].as_str();
+    assert_eq!(operation, Some("ALTER TABLE"));
+    Ok(())
+}
+
+/// A single transaction can both evolve the schema (add a column) and write data files that
+/// populate the new column. Folding schema evolution into the update builder makes this
+/// combination possible; this pins that the one commit carries both the updated Metadata and the
+/// Add file action, and that the data reads back against the evolved schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_column_and_write_data_in_one_transaction() -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    // Evolve the schema and write a row with the new column in the same transaction.
+    let mut txn = snapshot
+        .transaction()
+        .add_column(StructField::nullable("country", DataType::STRING))
+        .build(engine.as_ref(), committer())?;
+    let evolved_struct = StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("name", DataType::STRING),
+        StructField::nullable("country", DataType::STRING),
+    ])?;
+    let evolved_schema: delta_kernel::arrow::datatypes::SchemaRef =
+        Arc::new((&evolved_struct).try_into_arrow()?);
+    let batch = RecordBatch::try_new(
+        evolved_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["Alice"])),
+            Arc::new(StringArray::from(vec!["US"])),
+        ],
+    )?;
+    let write_context = txn.unpartitioned_write_context()?;
+    let add_meta = engine
+        .write_parquet(
+            &delta_kernel::engine::arrow_data::ArrowEngineData::new(batch),
+            &write_context,
+        )
+        .await?;
+    txn.add_files(add_meta);
+    txn.commit(engine.as_ref())?.unwrap_committed();
+
+    // The single commit carries both the updated Metadata and at least one Add action.
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    assert_eq!(
+        read_actions_from_commit(&table_url, 1, "metaData")?.len(),
+        1
+    );
+    assert!(!read_actions_from_commit(&table_url, 1, "add")?.is_empty());
+
+    // The evolved schema and written row read back correctly.
+    let reloaded = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
+    assert_eq!(reloaded.schema().fields().count(), 3);
+    let scan = reloaded.scan_builder().build()?;
+    let batches = test_utils::read_scan(&scan, engine.clone())?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+    Ok(())
+}
 
 /// End-to-end lifecycle: write, ALTER to add columns, scan, write populated rows, scan again.
 /// Each column is added in its own alter commit with a checkpoint after, exercising
@@ -90,7 +170,7 @@ async fn add_columns_lifecycle(
     let mut current = snapshot;
     for name in &new_col_names {
         let committed = current
-            .alter_table()
+            .transaction()
             .add_column(StructField::nullable(name, DataType::STRING))
             .build(engine.as_ref(), committer())?
             .commit(engine.as_ref())?
@@ -276,7 +356,7 @@ async fn add_complex_type_column(
     let expected_type = field.data_type().clone();
 
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -333,7 +413,7 @@ async fn add_column_failures(
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), properties)?;
 
     let err = snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer());
     assert!(err.is_err());
@@ -357,7 +437,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
 
     // v1: add column "a".
     let v1 = snapshot
-        .alter_table()
+        .transaction()
         .add_column(StructField::nullable("a", DataType::STRING))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -371,7 +451,7 @@ async fn back_to_back_alters_with_checkpoint() -> Result<(), Box<dyn std::error:
 
     // v2: add column "b" on top of the checkpointed snapshot.
     let v2 = v1_ckpt
-        .alter_table()
+        .transaction()
         .add_column(StructField::nullable("b", DataType::INTEGER))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -468,17 +548,18 @@ async fn empty_create_then_add_column(
     );
     let write_err = v0
         .clone()
-        .transaction(committer(), engine.as_ref())?
+        .transaction()
         .with_engine_info("EmptySchemaApp/0.1.0")
+        .build(engine.as_ref(), committer())?
         .unpartitioned_write_context()
         .expect_err("unpartitioned_write_context() must reject empty-schema snapshots");
     assert!(
         write_err.to_string().contains("empty schema")
-            && write_err.to_string().contains("alter_table"),
-        "write_context error must point at alter_table, got: {write_err}"
+            && write_err.to_string().contains("add_column"),
+        "write_context error must point at add_column, got: {write_err}"
     );
 
-    v0.alter_table()
+    v0.transaction()
         .add_column(StructField::nullable("id", DataType::INTEGER))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -580,7 +661,7 @@ async fn set_nullable_succeeds(
     let before = snapshot.schema().field_at_path(column.path()).clone();
 
     snapshot
-        .alter_table()
+        .transaction()
         .set_nullable(column.clone())
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -669,7 +750,7 @@ async fn set_nullable_on_layout_column_with_checkpoint(
 
     // v2: ALTER TABLE -- set the layout column nullable.
     let v2 = v1
-        .alter_table()
+        .transaction()
         .set_nullable(ColumnName::new([col_name]))
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -708,7 +789,7 @@ async fn set_nullable_nonexistent_column_fails() -> DeltaResult<()> {
         create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
 
     let err = snapshot
-        .alter_table()
+        .transaction()
         .set_nullable(column_name!("nonexistent"))
         .build(engine.as_ref(), committer());
     assert!(err.is_err());
@@ -755,7 +836,7 @@ async fn chain_add_column_and_set_nullable(
 
     // Two alter+checkpoint cycles: (add email + nullable id), (add age + nullable name).
     let v1 = snapshot
-        .alter_table()
+        .transaction()
         .add_column(StructField::nullable("email", DataType::STRING))
         .set_nullable(column_name!("id"))
         .build(engine.as_ref(), committer())?
@@ -766,7 +847,7 @@ async fn chain_add_column_and_set_nullable(
         .expect("post-commit snapshot at v1");
     let (_, v1_ckpt) = v1_snap.clone().checkpoint(engine.as_ref(), None)?;
     let v2 = v1_ckpt
-        .alter_table()
+        .transaction()
         .add_column(StructField::nullable("age", DataType::INTEGER))
         .set_nullable(column_name!("name"))
         .build(engine.as_ref(), committer())?
@@ -851,7 +932,7 @@ async fn add_column_with_stray_cm_metadata_on_non_cm_table_is_stripped(
     };
 
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -893,7 +974,7 @@ async fn add_column_strip_is_none_mode_only(
     // A well-formed id+physicalName pair so enabled modes have valid metadata to preserve.
     let field = fixtures::cm_field("added", 99, "phys-added", DataType::STRING);
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -920,13 +1001,15 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
     )?;
 
     let msg = snapshot
-        .alter_table()
+        .transaction()
         .add_column(StructField::nullable("new_col", DataType::STRING))
         .build(engine.as_ref(), committer())
         .unwrap_err()
         .to_string();
     assert!(
-        msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
+        msg.contains(
+            "Schema evolution is not yet supported on tables with icebergCompatV3 enabled"
+        ),
         "unexpected error: {msg}",
     );
 
@@ -944,7 +1027,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
     )]);
 
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -959,7 +1042,7 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
         .expect("CURRENT_DEFAULT metadata must survive ALTER");
     assert_eq!(default.raw_sql(), "42");
 
-    let txn = reloaded.transaction(committer(), engine.as_ref())?;
+    let txn = reloaded.transaction().build(engine.as_ref(), committer())?;
     assert!(
         txn.top_level_column_defaults()?.is_empty(),
         "default metadata must remain inert without allowColumnDefaults",
@@ -985,13 +1068,15 @@ async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dy
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
     let msg = snapshot
-        .alter_table()
+        .transaction()
         .add_column(StructField::nullable("new_col", DataType::STRING))
         .build(&engine, committer())
         .unwrap_err()
         .to_string();
     assert!(
-        msg.contains("ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled"),
+        msg.contains(
+            "Schema evolution is not yet supported on tables with allowColumnDefaults enabled"
+        ),
         "unexpected error: {msg}",
     );
 
@@ -1044,7 +1129,7 @@ async fn add_column_preserves_complete_cm_metadata(
     );
 
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1083,7 +1168,7 @@ async fn add_column_with_only_physical_name_allocates_id(
         fixtures::cm_field_physical_name_only("named_only", "phys-named-only", DataType::STRING);
 
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1121,7 +1206,7 @@ async fn add_column_with_only_id_fills_physical_name(
     let field = fixtures::cm_field_id_only("id_only", supplied_id, DataType::STRING);
 
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1171,7 +1256,7 @@ async fn add_column_with_id_below_max_column_id_succeeds() -> DeltaResult<()> {
     let field = fixtures::cm_field("inserted_below_max", 50, "phys-inserted", DataType::STRING);
 
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())?
         .commit(engine.as_ref())?
@@ -1214,7 +1299,7 @@ async fn add_column_with_id_colliding_existing_field_is_rejected() -> DeltaResul
     let field = fixtures::cm_field("colliding", existing_id, "phys-colliding", DataType::STRING);
 
     let err = snapshot
-        .alter_table()
+        .transaction()
         .add_column(field)
         .build(engine.as_ref(), committer())
         .unwrap_err()
@@ -1268,7 +1353,7 @@ async fn add_column_on_stale_table_leaves_schema_untouched(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     snapshot
-        .alter_table()
+        .transaction()
         .add_column(added_field)
         .build(&engine, committer())?
         .commit(&engine)?

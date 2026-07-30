@@ -46,7 +46,7 @@ use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, StorageHandler};
+use crate::{DeltaResult, Engine, EngineData, Error, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
 ///
@@ -726,6 +726,9 @@ pub struct CreateTableTransactionBuilder {
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
     correlation_id: Option<Arc<str>>,
+    data_change: Option<bool>,
+    domain_metadata_additions: Vec<(String, String)>,
+    engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
 }
 
 impl CreateTableTransactionBuilder {
@@ -741,6 +744,9 @@ impl CreateTableTransactionBuilder {
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
             correlation_id: None,
+            data_change: None,
+            domain_metadata_additions: Vec::new(),
+            engine_commit_info: None,
         }
     }
 
@@ -832,6 +838,35 @@ impl CreateTableTransactionBuilder {
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Set whether this transaction changes data. Defaults to `true`. These are recorded at the
+    /// file level.
+    pub fn with_data_change(mut self, data_change: bool) -> Self {
+        self.data_change = Some(data_change);
+        self
+    }
+
+    /// Set domain metadata to be written to the Delta log for the new table.
+    ///
+    /// Note that each domain can only appear once per transaction; duplicates cause the `commit`
+    /// to fail.
+    pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
+        self.domain_metadata_additions.push((domain, configuration));
+        self
+    }
+
+    /// Set the content of the commitInfo action for this transaction. Kernel always writes a
+    /// commitInfo; this lets engines add their own data. Kernel-owned fields (timestamp,
+    /// inCommitTimestamp, operation, operationParameters, kernelVersion, isBlindAppend, engineInfo,
+    /// txnId) are overridden and should not be set here.
+    pub fn with_commit_info(
+        mut self,
+        engine_commit_info: Box<dyn EngineData>,
+        commit_info_schema: SchemaRef,
+    ) -> Self {
+        self.engine_commit_info = Some((engine_commit_info, commit_info_schema));
         self
     }
 
@@ -959,14 +994,27 @@ impl CreateTableTransactionBuilder {
         validate_interval_type_write_support(&table_configuration.logical_schema())?;
 
         // Create Transaction<CreateTable> with the effective table configuration
-        Transaction::try_new_create_table(
+        let mut txn = Transaction::try_new_create_table(
             table_configuration,
             self.engine_info,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.correlation_id,
-        )
+        )?;
+
+        // Apply staged write configuration.
+        if let Some(data_change) = self.data_change {
+            txn = txn.with_data_change(data_change);
+        }
+        for (domain, configuration) in self.domain_metadata_additions {
+            txn = txn.with_domain_metadata(domain, configuration);
+        }
+        if let Some((engine_commit_info, schema)) = self.engine_commit_info {
+            txn = txn.with_commit_info(engine_commit_info, schema);
+        }
+
+        Ok(txn)
     }
 }
 

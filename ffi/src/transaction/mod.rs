@@ -90,7 +90,7 @@ fn transaction_impl(
     let engine = extern_engine.engine();
     let snapshot = Snapshot::builder_for(url?).build(engine.as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
-    let transaction = snapshot.transaction(committer, engine.as_ref());
+    let transaction = snapshot.transaction().build(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())
 }
 
@@ -118,7 +118,7 @@ fn transaction_with_committer_impl(
     committer: Box<dyn Committer>,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let engine = extern_engine.engine();
-    let transaction = snapshot.transaction(committer, engine.as_ref());
+    let transaction = snapshot.transaction().build(engine.as_ref(), committer);
     Ok(Box::new(transaction?).into())
 }
 
@@ -2954,9 +2954,10 @@ mod tests {
             .build(kernel_engine.as_ref())?;
         let mut add_txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()), kernel_engine.as_ref())?
+            .transaction()
             .with_engine_info("test-engine/1.0")
-            .with_operation("WRITE".to_string());
+            .with_operation("WRITE".to_string())
+            .build(kernel_engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let add_files_schema = add_txn.add_files_schema();
         let add_metadata = test_utils::create_add_files_metadata(
             add_files_schema,

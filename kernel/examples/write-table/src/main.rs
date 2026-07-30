@@ -88,10 +88,11 @@ async fn try_main() -> DeltaResult<()> {
     // Write sample data to the table
     let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction(committer, &engine)?
+        .transaction()
         .with_operation("INSERT".to_string())
         .with_engine_info("default_engine/write-table-example")
-        .with_data_change(true);
+        .with_data_change(true)
+        .build(&engine, committer)?;
 
     // Write the data using the engine
     let write_context = Arc::new(txn.unpartitioned_write_context()?);

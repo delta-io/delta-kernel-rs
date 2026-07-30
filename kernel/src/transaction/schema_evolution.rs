@@ -180,9 +180,9 @@ pub(crate) fn apply_schema_operations(
                     // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
-                    // Stray CM metadata on a mapping-disabled table is handled by the AlterTable
-                    // builder, which strips annotations this ALTER newly introduces from the
-                    // evolved schema.
+                    // Stray CM metadata on a mapping-disabled table is handled by
+                    // `Transaction::apply_schema_evolution`, which strips annotations this
+                    // evolution newly introduces from the evolved schema.
                     field
                 };
                 schema.field_map_mut().insert(field.name().clone(), field);

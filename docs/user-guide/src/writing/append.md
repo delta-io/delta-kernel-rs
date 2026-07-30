@@ -42,10 +42,11 @@ let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
 // 2. Create a transaction
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction()
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 
 // 3. Get write context
 let write_context = Arc::new(txn.unpartitioned_write_context()?);
@@ -86,10 +87,11 @@ writing against:
 
 ```rust,ignore
 let mut txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction()
     .with_operation("INSERT".to_string())
     .with_engine_info("my-app/1.0")
-    .with_data_change(true);
+    .with_data_change(true)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 The builder methods:
@@ -180,12 +182,6 @@ txn.add_files(add_file_metadata);
 
 You can call `add_files` multiple times to write multiple files in one transaction.
 
-> [!NOTE]
-> Methods that produce or register data files (`unpartitioned_write_context`,
-> `partitioned_write_context`, `add_files`, `stats_schema`) are gated by the
-> `SupportsDataFiles` trait bound and are available on standard write transactions but not
-> on metadata-only transaction states (such as a future `AlterTable`).
-
 ## Committing
 
 `commit()` consumes the transaction and returns a `CommitResult`:
@@ -215,9 +211,10 @@ construction:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction()
     .with_operation("INSERT".to_string())
-    .with_blind_append();
+    .with_blind_append()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 Kernel records `isBlindAppend: true` in the commit's `commitInfo` action. This flag
@@ -247,9 +244,10 @@ that action, call `with_commit_info()` with your custom data and its schema:
 
 ```rust,ignore
 let txn = snapshot
-    .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+    .transaction()
     .with_operation("INSERT".to_string())
-    .with_commit_info(engine_commit_info, commit_info_schema);
+    .with_commit_info(engine_commit_info, commit_info_schema)
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
 ```
 
 The `engine_commit_info` argument is a `Box<dyn EngineData>` containing the fields you want
