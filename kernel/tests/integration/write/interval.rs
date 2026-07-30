@@ -7,7 +7,7 @@ use test_utils::load_and_begin_transaction;
 #[cfg(not(feature = "interval-type-in-dev"))]
 use test_utils::{create_table, engine_store_setup};
 
-/// Writing interval data is gated by the `interval-type-in-dev` cargo feature.
+/// Writing an interval feature table is gated by the `interval-type-in-dev` cargo feature.
 #[cfg(not(feature = "interval-type-in-dev"))]
 #[tokio::test]
 async fn test_write_interval_table_gate() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,16 +18,24 @@ async fn test_write_interval_table_gate() -> Result<(), Box<dyn std::error::Erro
 
     let (store, engine, table_location) =
         engine_store_setup("test_interval_requires_feature", None);
-    let table_url = create_table(store, table_location, schema, &[], true, vec![], vec![]).await?;
+    let features = vec!["intervalType-preview"];
+    let table_url = create_table(
+        store,
+        table_location,
+        schema,
+        &[],
+        true,
+        features.clone(),
+        features,
+    )
+    .await?;
 
-    let transaction = load_and_begin_transaction(table_url, &engine)?;
-    let err = transaction
-        .unpartitioned_write_context()
-        .expect_err("interval write contexts should be blocked when the cargo feature is disabled")
+    let err = load_and_begin_transaction(table_url, &engine)
+        .expect_err("interval writes should be blocked when the cargo feature is disabled")
         .to_string();
     assert!(
-        err.contains("interval-type-in-dev"),
-        "error must explain the missing cargo feature; got: {err}",
+        err.contains("intervalType-preview") && err.contains("not supported"),
+        "error must name the unsupported table feature; got: {err}",
     );
     Ok(())
 }

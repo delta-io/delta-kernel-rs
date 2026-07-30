@@ -1614,10 +1614,8 @@ pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
     NonNullFieldChecker.transform_struct(schema).is_err()
 }
 
-#[cfg(not(feature = "interval-type-in-dev"))]
 struct UsesIntervalType;
 
-#[cfg(not(feature = "interval-type-in-dev"))]
 impl<'a> SchemaTransform<'a> for UsesIntervalType {
     transform_output_type!(|'a, T| Result<(), ()>);
 
@@ -1631,7 +1629,6 @@ impl<'a> SchemaTransform<'a> for UsesIntervalType {
 }
 
 /// Returns whether `schema` contains an ANSI interval type at any nesting level.
-#[cfg(not(feature = "interval-type-in-dev"))]
 pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
     UsesIntervalType.transform_struct(schema).is_err()
 }
@@ -3745,7 +3742,6 @@ mod tests {
         assert_eq!(schema_contains_non_null_fields(&schema), expected);
     }
 
-    #[cfg(not(feature = "interval-type-in-dev"))]
     #[test]
     fn test_schema_contains_interval_type() {
         for interval in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {

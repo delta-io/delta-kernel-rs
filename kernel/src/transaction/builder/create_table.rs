@@ -20,8 +20,8 @@ use crate::expressions::ColumnName;
 use crate::schema::validation::{validate_interval_type_write_support, validate_schema};
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
-    normalize_column_names_to_schema_casing, schema_contains_non_null_fields, DataType, SchemaRef,
-    StructType,
+    normalize_column_names_to_schema_casing, schema_contains_interval_type,
+    schema_contains_non_null_fields, DataType, SchemaRef, StructType,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -89,6 +89,9 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
     TableFeature::IcebergCompatV3,
+    // Interval schemas auto-enable this feature. Explicit enablement permits creating a table
+    // before adding interval columns in a later schema evolution.
+    TableFeature::IntervalTypePreview,
 ];
 
 /// The single allow-list of `delta.*` properties accepted during CREATE TABLE. Any `delta.*`
@@ -378,6 +381,17 @@ fn maybe_enable_timestamp_ntz(schema: &SchemaRef, validated: &mut ValidatedTable
     if schema_contains_timestamp_ntz(schema) {
         add_feature_to_lists(
             TableFeature::TimestampWithoutTimezone,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
+}
+
+/// Conditionally adds `intervalType-preview` when the schema contains ANSI interval columns.
+fn maybe_enable_interval_type(schema: &SchemaRef, validated: &mut ValidatedTableProperties) {
+    if schema_contains_interval_type(schema) {
+        add_feature_to_lists(
+            TableFeature::IntervalTypePreview,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -922,6 +936,7 @@ impl CreateTableTransactionBuilder {
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
+        maybe_enable_interval_type(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
 
         // Property-driven auto-enablement: check enablement properties
@@ -1334,6 +1349,17 @@ mod tests {
         },
         &[TableFeature::TimestampWithoutTimezone],
     )]
+    #[case::interval_top_level(
+        schema_ref! { not_null "id": INTEGER, nullable "iv": INTERVAL_YEAR_MONTH },
+        &[TableFeature::IntervalTypePreview],
+    )]
+    #[case::interval_nested(
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_iv": INTERVAL_DAY_TIME },
+        },
+        &[TableFeature::IntervalTypePreview],
+    )]
     #[case::both_variant_and_ntz(
         Arc::new(StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),
@@ -1358,6 +1384,7 @@ mod tests {
 
         maybe_enable_variant_type(&schema, &mut validated);
         maybe_enable_timestamp_ntz(&schema, &mut validated);
+        maybe_enable_interval_type(&schema, &mut validated);
 
         for feature in expected_features {
             assert!(
@@ -1470,6 +1497,7 @@ mod tests {
     #[case::type_widening(TableFeature::TypeWidening, "typeWidening")]
     #[case::catalog_managed(TableFeature::CatalogManaged, "catalogManaged")]
     #[case::invariants(TableFeature::Invariants, "invariants")]
+    #[case::interval_type(TableFeature::IntervalTypePreview, "intervalType-preview")]
     fn test_feature_signal_accepted(#[case] feature: TableFeature, #[case] feature_name: &str) {
         let key = format!("delta.feature.{feature_name}");
         let properties = HashMap::from([(key, "supported".to_string())]);

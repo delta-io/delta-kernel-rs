@@ -64,7 +64,10 @@ fn test_create_table_rejects_interval_clustering(
 mod feature_enabled {
     use delta_kernel::schema::SchemaRef;
     use delta_kernel::snapshot::Snapshot;
-    use delta_kernel::table_features::ColumnMappingMode;
+    use delta_kernel::table_features::{
+        ColumnMappingMode, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
+        TABLE_FEATURES_MIN_WRITER_VERSION,
+    };
     use rstest::rstest;
     use test_utils::cm_properties;
 
@@ -93,7 +96,8 @@ mod feature_enabled {
         ]))
     }
 
-    /// Creating a table with interval columns preserves its schema across column mapping modes.
+    /// Creating a table with interval columns adds `intervalType-preview` and preserves its schema
+    /// across column mapping modes.
     #[rstest]
     fn test_create_table_with_interval_round_trips_schema(
         #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
@@ -113,6 +117,16 @@ mod feature_enabled {
 
         let table_url = delta_kernel::try_parse_uri(&table_path)?;
         let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+
+        let protocol = snapshot.table_configuration().protocol();
+        assert!(protocol.min_reader_version() >= TABLE_FEATURES_MIN_READER_VERSION);
+        assert!(protocol.min_writer_version() >= TABLE_FEATURES_MIN_WRITER_VERSION);
+        assert!(protocol
+            .reader_features()
+            .is_some_and(|features| features.contains(&TableFeature::IntervalTypePreview)));
+        assert!(protocol
+            .writer_features()
+            .is_some_and(|features| features.contains(&TableFeature::IntervalTypePreview)));
 
         let expected_cm_mode = match cm_mode {
             "none" => ColumnMappingMode::None,

@@ -16,6 +16,7 @@ use delta_kernel_derive::internal_api;
 pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
+pub(crate) use interval_type::validate_interval_type_feature_support;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
@@ -35,6 +36,7 @@ mod column_mapping;
 #[cfg(feature = "geo-type-in-dev")]
 mod geospatial;
 mod iceberg_compat;
+mod interval_type;
 mod timestamp_ntz;
 
 /// Minimum reader/writer protocol version that the kernel can handle.
@@ -144,6 +146,12 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
+    /// ANSI interval types, in preview pending protocol ratification (`intervalType-preview`).
+    ///
+    /// Kernel support is gated by the `interval-type-in-dev` cargo feature.
+    #[strum(serialize = "intervalType-preview")]
+    #[serde(rename = "intervalType-preview")]
+    IntervalTypePreview,
     /// Timestamps without timezone support. The canonical protocol feature name is `timestampNtz`.
     ///
     /// `timestampWithoutTimezone` is not a Delta protocol feature name, but some existing tables
@@ -554,6 +562,17 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+static INTERVAL_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "interval-type-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "interval-type-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
@@ -711,6 +730,7 @@ impl TableFeature {
             | TableFeature::CatalogOwnedPreview
             | TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
+            | TableFeature::IntervalTypePreview
             | TableFeature::TimestampWithoutTimezone
             | TableFeature::TypeWidening
             | TableFeature::TypeWideningPreview
@@ -779,6 +799,7 @@ impl TableFeature {
             TableFeature::CatalogOwnedPreview => &CATALOG_OWNED_PREVIEW_INFO,
             TableFeature::ColumnMapping => &COLUMN_MAPPING_INFO,
             TableFeature::DeletionVectors => &DELETION_VECTORS_INFO,
+            TableFeature::IntervalTypePreview => &INTERVAL_TYPE_PREVIEW_INFO,
             TableFeature::TimestampWithoutTimezone => &TIMESTAMP_WITHOUT_TIMEZONE_INFO,
             TableFeature::TypeWidening => &TYPE_WIDENING_INFO,
             TableFeature::TypeWideningPreview => &TYPE_WIDENING_PREVIEW_INFO,
@@ -1030,6 +1051,28 @@ mod tests {
         .unwrap(),
         ExpectRead::Ok
     )]
+    #[cfg_attr(
+        feature = "interval-type-in-dev",
+        case::interval_type_supported(
+            Protocol::try_new_modern(
+                [TableFeature::IntervalTypePreview],
+                [TableFeature::IntervalTypePreview],
+            )
+            .unwrap(),
+            ExpectRead::Ok
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "interval-type-in-dev"),
+        case::interval_type_gated_off(
+            Protocol::try_new_modern(
+                [TableFeature::IntervalTypePreview],
+                [TableFeature::IntervalTypePreview],
+            )
+            .unwrap(),
+            ExpectRead::Unsupported
+        )
+    )]
     // adaptiveMetadata-preview is gated by the `adaptive-metadata-in-dev` cargo feature: readable
     // only when the flag is on, otherwise rejected as unsupported.
     #[cfg_attr(
@@ -1127,6 +1170,7 @@ mod tests {
                 TableFeature::CatalogOwnedPreview => "catalogOwned-preview",
                 TableFeature::ColumnMapping => "columnMapping",
                 TableFeature::DeletionVectors => "deletionVectors",
+                TableFeature::IntervalTypePreview => "intervalType-preview",
                 TableFeature::TimestampWithoutTimezone => "timestampNtz",
                 TableFeature::TypeWidening => "typeWidening",
                 TableFeature::TypeWideningPreview => "typeWidening-preview",

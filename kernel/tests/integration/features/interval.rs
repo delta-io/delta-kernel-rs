@@ -1,4 +1,4 @@
-//! Reader-side behavior for ANSI interval columns.
+//! Reader-side behavior for the `intervalType-preview` table feature.
 
 use std::sync::Arc;
 
@@ -9,12 +9,25 @@ use test_utils::{create_table, engine_store_setup};
 async fn build_scan_over_interval_table(
     name: &str,
     interval: DataType,
+    declare_feature: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "iv", interval,
     )])?);
+    let features = declare_feature
+        .then_some(vec!["intervalType-preview"])
+        .unwrap_or_default();
     let (store, engine, table_location) = engine_store_setup(name, None);
-    let table_url = create_table(store, table_location, schema, &[], true, vec![], vec![]).await?;
+    let table_url = create_table(
+        store,
+        table_location,
+        schema,
+        &[],
+        true,
+        features.clone(),
+        features,
+    )
+    .await?;
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
     snapshot.scan_builder().build()?;
@@ -22,13 +35,42 @@ async fn build_scan_over_interval_table(
 }
 
 #[tokio::test]
-async fn test_scan_interval_table_is_not_gated_by_cargo_feature(
+async fn test_scan_interval_feature_table_respects_kernel_support_gate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (name, interval) in [
         ("interval_read_ym", DataType::INTERVAL_YEAR_MONTH),
         ("interval_read_dt", DataType::INTERVAL_DAY_TIME),
     ] {
-        build_scan_over_interval_table(name, interval).await?;
+        let result = build_scan_over_interval_table(name, interval, true).await;
+        if cfg!(feature = "interval-type-in-dev") {
+            result?;
+        } else {
+            let error = result
+                .expect_err("interval feature tables must be blocked when support is disabled")
+                .to_string();
+            assert!(
+                error.contains("intervalType-preview") && error.contains("not supported"),
+                "error must name the unsupported feature; got: {error}",
+            );
+        }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_scan_featureless_interval_table_is_rejected() -> Result<(), Box<dyn std::error::Error>>
+{
+    let error = build_scan_over_interval_table(
+        "interval_read_featureless",
+        DataType::INTERVAL_DAY_TIME,
+        false,
+    )
+    .await
+    .expect_err("interval columns without the table feature must be rejected")
+    .to_string();
+    assert!(
+        error.contains("required 'intervalType-preview' feature"),
+        "error must explain the missing table feature; got: {error}",
+    );
     Ok(())
 }

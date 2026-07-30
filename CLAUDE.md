@@ -79,8 +79,8 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
 - `interval-type-in-dev` -- ANSI interval type support (experimental, in development). With the
-  cargo feature off, creating or writing tables with interval columns is blocked; reads are
-  unaffected.
+  cargo feature off, tables listing the `intervalType-preview` reader+writer feature are blocked.
+  Tables with interval columns must list the table feature.
 - `geo-type-in-dev` -- geospatial type support (geometry and geography columns) (experimental,
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
@@ -268,7 +268,7 @@ is the source of truth. Key concepts:
   `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
   `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
-  `columnMapping`, `deletionVectors`, `geospatial`, `timestampNtz`,
+  `columnMapping`, `deletionVectors`, `geospatial`, `intervalType-preview`, `timestampNtz`,
   `typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`, `variantShredding`,
   `variantShredding-preview`, `variantType`, `variantType-preview`
 
