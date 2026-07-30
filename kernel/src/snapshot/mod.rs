@@ -14,7 +14,7 @@ use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
-use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
+use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
     try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
@@ -31,7 +31,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{physical_to_logical_column_name, ColumnMappingMode, TableFeature};
+use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
@@ -514,15 +514,16 @@ impl Snapshot {
         self.get_domain_metadata_internal(domain, engine)
     }
 
-    /// Get the logical clustering columns for this snapshot, if clustering is enabled.
+    /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
     ///
-    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
-    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
-    /// clustering metadata is malformed.
+    /// Returns `Ok(Some(infos))` when the ClusteredTable feature is enabled and the
+    /// `delta.clustering` domain has a current entry (`infos` may be empty if the entry lists
+    /// none), `Ok(None)` when the feature is absent or the domain has no current entry, or an
+    /// error if the clustering metadata is malformed. Descriptors are returned in the order the
+    /// columns appear in the domain.
     ///
-    /// The columns are returned as logical [`ColumnName`]s. When column mapping is enabled,
-    /// this converts the physical names stored in domain metadata back to logical names using
-    /// the table schema.
+    /// Each `ClusteringColumnInfo` carries the physical reference (as stored in the domain), the
+    /// logical reference resolved against the table schema, and the column's data type.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     ///
@@ -530,39 +531,40 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
-    ///
-    /// [`ColumnName`]: crate::expressions::ColumnName
-    #[allow(unused)]
     #[internal_api]
-    pub(crate) fn get_logical_clustering_columns(
+    pub(crate) fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        let physical_columns = match self.get_physical_clustering_columns(engine)? {
-            Some(cols) => cols,
-            None => return Ok(None),
+    ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
+        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+            return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
-        if column_mapping_mode == ColumnMappingMode::None {
-            // No column mapping: physical = logical
-            return Ok(Some(physical_columns));
-        }
-        // Convert physical column names to logical names by walking the schema
         let logical_schema = self.table_configuration.logical_schema();
-        let logical_columns = physical_columns
-            .iter()
+        let infos = physical_columns
+            .into_iter()
             .map(|physical_col| {
-                physical_to_logical_column_name(&logical_schema, physical_col, column_mapping_mode)
+                let (logical_col, data_type) = physical_to_logical_column_name_and_type(
+                    &logical_schema,
+                    &physical_col,
+                    column_mapping_mode,
+                )?;
+                Ok(ClusteringColumnInfo::new(
+                    physical_col,
+                    logical_col,
+                    data_type,
+                ))
             })
             .collect::<DeltaResult<Vec<_>>>()?;
-        Ok(Some(logical_columns))
+        Ok(Some(infos))
     }
 
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
     ///
-    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
-    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
-    /// clustering metadata is malformed.
+    /// Returns `Ok(Some(columns))` when the ClusteredTable feature is enabled and the
+    /// `delta.clustering` domain has a current entry (`columns` may be empty if the entry lists
+    /// none), `Ok(None)` when the feature is absent or the domain has no current entry, or an
+    /// error if the clustering metadata is malformed.
     ///
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
@@ -571,6 +573,21 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        match self.get_clustering_domain_metadata(engine)? {
+            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the raw JSON configuration of the `delta.clustering` domain.
+    ///
+    /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
+    /// the domain has no current entry. The JSON has the shape
+    /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
+    pub(crate) fn get_clustering_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -578,10 +595,7 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        match self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)? {
-            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
-            None => Ok(None),
-        }
+        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
@@ -2287,22 +2301,23 @@ mod tests {
         assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
     }
 
+    /// `physical_differs` records whether column mapping is expected to rename the column: with
+    /// mapping on, the domain stores a generated identifier, so only the logical name is
+    /// predictable and the physical one must merely differ from it.
     #[rstest::rstest]
-    #[case::no_clustering(None, None, None)]
-    #[case::clustered_no_column_mapping(
-        Some(vec!["region"]),
-        None,
-        Some(vec![ColumnName::new(["region"])])
-    )]
+    #[case::no_clustering(None, None, None, false)]
+    #[case::clustered_no_column_mapping(Some(vec!["region"]), None, Some("region"), false)]
     #[case::clustered_with_column_mapping(
         Some(vec!["region"]),
         Some("name"),
-        Some(vec![ColumnName::new(["region"])])
+        Some("region"),
+        true
     )]
-    fn test_get_logical_clustering_columns(
+    fn test_get_clustering_column_infos(
         #[case] clustering_cols: Option<Vec<&str>>,
         #[case] column_mapping_mode: Option<&str>,
-        #[case] expected: Option<Vec<ColumnName>>,
+        #[case] expected_logical: Option<&str>,
+        #[case] physical_differs: bool,
     ) {
         use crate::transaction::create_table::create_table;
         use crate::transaction::data_layout::DataLayout;
@@ -2331,8 +2346,23 @@ mod tests {
             .commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-        let result = snapshot.get_logical_clustering_columns(&engine).unwrap();
-        assert_eq!(result, expected);
+        let result = snapshot.get_clustering_column_infos(&engine).unwrap();
+
+        match expected_logical {
+            None => assert_eq!(result, None),
+            Some(logical) => {
+                let infos = result.expect("clustering infos should be present");
+                assert_eq!(infos.len(), 1);
+                let info = &infos[0];
+                assert_eq!(info.logical_column(), &ColumnName::new([logical]));
+                assert_eq!(info.data_type(), &DataType::STRING);
+                if physical_differs {
+                    assert_ne!(info.physical_column(), info.logical_column());
+                } else {
+                    assert_eq!(info.physical_column(), info.logical_column());
+                }
+            }
+        }
     }
 
     // === estimated_owned_heap_size ===
