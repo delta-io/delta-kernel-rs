@@ -26,16 +26,21 @@ use crate::scalar::to_df_scalar;
 /// predicates. Also propagates any error from converting a child expression (an unresolved column
 /// reference, or an interval literal, which has no Arrow representation) and rejects an `IN`
 /// predicate whose right side is not a literal array.
-pub fn to_df_predicate(pred: &KernelPredicate, input_schema: &StructType) -> DeltaResult<DFExpr> {
+pub fn to_df_predicate_expr(
+    pred: &KernelPredicate,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
     match pred {
         KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema),
         KernelPredicate::Not(inner) => {
-            let df_inner = to_df_predicate(inner, input_schema)?;
+            let df_inner = to_df_predicate_expr(inner, input_schema)?;
             Ok(DFExpr::Not(Box::new(df_inner)))
         }
-        KernelPredicate::Unary(unary) => unary_to_df_expr(unary, input_schema),
-        KernelPredicate::Binary(binary) => binary_to_df_expr(binary, input_schema),
-        KernelPredicate::Junction(junction) => junction_to_df_expr(junction, input_schema),
+        KernelPredicate::Unary(unary) => unary_to_df_predicate_expr(unary, input_schema),
+        KernelPredicate::Binary(binary) => binary_to_df_predicate_expr(binary, input_schema),
+        KernelPredicate::Junction(junction) => {
+            junction_to_df_predicate_expr(junction, input_schema)
+        }
         KernelPredicate::Opaque(_) => Err(Error::unsupported(
             "cannot convert an engine-defined Opaque predicate",
         )),
@@ -46,7 +51,7 @@ pub fn to_df_predicate(pred: &KernelPredicate, input_schema: &StructType) -> Del
 }
 
 /// Lowers a unary predicate.
-fn unary_to_df_expr(
+fn unary_to_df_predicate_expr(
     unary: &KernelUnaryPredicate,
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
@@ -57,13 +62,13 @@ fn unary_to_df_expr(
 }
 
 /// Lowers a binary predicate.
-fn binary_to_df_expr(
+fn binary_to_df_predicate_expr(
     binary: &KernelBinaryPredicate,
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
     let op = match binary.op {
         KernelBinaryPredicateOp::In => {
-            return in_to_df_expr(&binary.left, &binary.right, input_schema)
+            return in_to_df_predicate_expr(&binary.left, &binary.right, input_schema)
         }
         KernelBinaryPredicateOp::Equal => Operator::Eq,
         KernelBinaryPredicateOp::LessThan => Operator::Lt,
@@ -82,7 +87,7 @@ fn binary_to_df_expr(
 ///
 /// # Errors
 /// Returns [`Error::unsupported`] if the right operand is not a literal array.
-fn in_to_df_expr(
+fn in_to_df_predicate_expr(
     value: &KernelExpression,
     list: &KernelExpression,
     input_schema: &StructType,
@@ -107,14 +112,14 @@ fn in_to_df_expr(
 
 /// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
 /// left-associative [`conjunction`]/[`disjunction`] helpers.
-fn junction_to_df_expr(
+fn junction_to_df_predicate_expr(
     junction: &KernelJunctionPredicate,
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
     let preds: DeltaResult<Vec<DFExpr>> = junction
         .preds
         .iter()
-        .map(|pred| to_df_predicate(pred, input_schema))
+        .map(|pred| to_df_predicate_expr(pred, input_schema))
         .collect();
     let preds = preds?;
     Ok(match junction.op {
@@ -146,7 +151,9 @@ mod tests {
 
     /// Lowers a predicate against [`test_schema`] and renders it as a DataFusion `Display` string.
     fn lower(pred: Pred) -> String {
-        to_df_predicate(&pred, &test_schema()).unwrap().to_string()
+        to_df_predicate_expr(&pred, &test_schema())
+            .unwrap()
+            .to_string()
     }
 
     /// A literal `Scalar::Array` of longs, for `IN`-list cases.
@@ -232,6 +239,6 @@ mod tests {
         Pred::binary(KernelBinaryPredicateOp::In, column_expr!("a"), column_expr!("b"))
     )]
     fn unsupported_predicate_is_an_error(#[case] pred: Pred) {
-        to_df_predicate(&pred, &test_schema()).unwrap_err();
+        to_df_predicate_expr(&pred, &test_schema()).unwrap_err();
     }
 }
