@@ -2263,8 +2263,7 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that [`StructStats::Columns`] with a nonexistent column name produces empty stats for
-/// that column.
+/// Test that [`StructStats::Columns`] rejects nonexistent columns.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -2272,43 +2271,15 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let scan = snapshot
+    let result = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
         })
-        .build()
-        .unwrap();
+        .build();
 
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    assert!(
-        !scan_metadata_results.is_empty(),
-        "Should have scan metadata"
-    );
-
-    for scan_metadata in scan_metadata_results {
-        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-            .unwrap()
-            .into();
-        let filtered_batch =
-            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-
-        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-
-        // Should have numRecords but no minValues/maxValues/nullCount
-        // (or they exist but are empty structs)
-        assert!(
-            stats_parsed.column_by_name(NUM_RECORDS).is_some(),
-            "Should still have numRecords"
-        );
-    }
+    assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
