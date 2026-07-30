@@ -1,8 +1,10 @@
 //! Live end-to-end tests against a running Unity Catalog server.
 //!
-//! These are gated behind the `integration-test` feature so they are never compiled or run by a
-//! normal `cargo nextest`. Even with the feature enabled, each test skips (passes as a no-op) when
-//! `UC_SERVER_URL` is unset, so a developer can build the suite without a server on hand.
+//! These are gated behind the `integration-test` feature so they are never compiled by a normal
+//! `cargo nextest`, and marked `#[ignore]` so that even with the feature enabled they report as
+//! skipped rather than passing. Run them against a UC server with
+//! `--run-ignored only -E 'test(live_)'` (see the UC CI job). Each also returns early if
+//! `UC_SERVER_URL` is unset.
 //!
 //! Run against a local UC server:
 //! ```bash
@@ -126,6 +128,7 @@ fn snapshot_from_load_table(resp: &LoadTableResponse, engine: &dyn Engine) -> Ar
 /// Skips unless `UC_TEST_TABLE` names an existing managed delta table. This validates the read-path
 /// wire types without requiring storage credentials (it does not read data files).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_load_table_builds_log_tail() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_load_table_builds_log_tail");
@@ -160,18 +163,17 @@ async fn live_load_table_builds_log_tail() {
 }
 
 /// Live CREATE through the full connector flow. The two CREATE endpoints (`staging-tables`,
-/// `tables`) are deliberately not in the REST client, so this test hand-rolls those POSTs with raw
-/// `reqwest` while using kernel for the v0 commit and the typed `tables` body. The inline
-/// `(a)`-`(n)` markers walk the flow.
+/// `tables`) are not yet on the REST client (tracked by #3032), so this test hand-rolls those POSTs
+/// with raw `reqwest` while using kernel for the v0 commit and the typed `tables` body.
 ///
 /// The table enables row tracking and clustering so the create body and the write path exercise the
 /// `delta.rowTracking` and `delta.clustering` domains in one round trip: the initial watermark (-1)
 /// is forwarded at create and advances to 2 after the append (the CTAS concern), and the clustering
 /// columns are forwarded under `delta.clustering`.
 ///
-/// This mutates the catalog, so point it only at a throwaway server or schema. Uses a unique table
-/// name and best-effort DELETEs before and after to keep reruns idempotent.
+/// This mutates the catalog, so point it only at a throwaway server or schema.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running UC server; run with --run-ignored (UC CI job or manual)"]
 async fn live_create_table() {
     let Some((url, token)) = server_env() else {
         eprintln!("UC_SERVER_URL unset; skipping live_create_table");
@@ -179,8 +181,8 @@ async fn live_create_table() {
     };
     let catalog = std::env::var("UC_TEST_CATALOG").unwrap_or_else(|_| "unity".to_string());
     let schema_name = std::env::var("UC_TEST_SCHEMA").unwrap_or_else(|_| "default".to_string());
-    // Unique per run: a leftover table/staging-table from a prior run (best-effort cleanup can
-    // fail) otherwise 409s the staging-tables POST. Suffix keeps reruns collision-free.
+    // Unique per run so reruns never collide on the staging-tables POST (which 409s on a name
+    // already present).
     let name = format!("kernel_rs_create_test_{}", uuid::Uuid::new_v4().simple());
     let name = name.as_str();
 
@@ -189,13 +191,7 @@ async fn live_create_table() {
         .join(&format!("catalogs/{catalog}/schemas/{schema_name}/"))
         .expect("tables base URL");
 
-    // (a) Best-effort cleanup of a prior run; ignore non-2xx/404.
-    let table_url = tables_base
-        .join(&format!("tables/{name}"))
-        .expect("table URL");
-    let _ = http.delete(table_url.clone()).send().await;
-
-    // (b) POST staging-tables -> allocate uuid + storage + staging credentials.
+    // ===== Step 1: POST staging-tables -> allocate uuid + storage + staging credentials =====
     let staging_url = tables_base
         .join("staging-tables")
         .expect("staging-tables URL");
@@ -222,7 +218,7 @@ async fn live_create_table() {
         .await
         .expect("failed to deserialize CreateStagingTableResponse");
 
-    // (c)/(d) Build the engine over the staging storage location.
+    // ===== Step 2: Build the engine over the staging storage location =====
     let table_root =
         normalize_table_root(&Url::parse(&resp.location).expect("location is not a valid URL"));
     let store = store_from_url_opts(
@@ -242,7 +238,8 @@ async fn live_create_table() {
         }
     }
 
-    // (e) Schema with a nested struct so clustering can target both a top-level and a nested
+    // ===== Step 3: Define the schema =====
+    // A nested struct so clustering can target both a top-level and a nested
     // column.
     let schema: SchemaRef = Arc::new(
         StructType::try_new(vec![
@@ -260,9 +257,10 @@ async fn live_create_table() {
         .expect("failed to build schema"),
     );
 
-    // (f)/(g) Commit v0 directly to storage via the UC committer (v0 path does not call the
-    // catalog). Enable row tracking so the create body carries `delta.rowTracking`, and cluster on
-    // `name` and the nested `address.city` so it carries `delta.clustering`.
+    // ===== Step 4: Invoke kernel to write the v0 commit (00.json) via the UC committer =====
+    // The v0 path writes directly to storage and does not call the catalog. Enable row tracking so
+    // the create body carries `delta.rowTracking`, and cluster on `name` and the nested
+    // `address.city` so it carries `delta.clustering`.
     let mut disk_props = get_required_properties_for_disk(&resp.table_id);
     disk_props.insert("delta.enableRowTracking".to_string(), "true".to_string());
     let committer = Box::new(UCCommitter::new(
@@ -284,8 +282,9 @@ async fn live_create_table() {
         .expect("failed to commit create-table transaction")
         .unwrap_committed();
 
-    // (h) Load the post-commit v0 snapshot. The table is catalog-managed, so the snapshot build
-    // requires the catalog's max version; the just-created table is at v0.
+    // ===== Step 5: Load the post-commit v0 snapshot =====
+    // The table is catalog-managed, so the snapshot build requires the catalog's max version; the
+    // just-created table is at v0.
     let snapshot = Snapshot::builder_for(table_root.clone())
         .with_max_catalog_version(0)
         .build(engine.as_ref())
@@ -296,7 +295,7 @@ async fn live_create_table() {
         "post-create snapshot should be at version 0"
     );
 
-    // (i)/(j) Build the typed create body and register the table.
+    // ===== Step 6: Build the typed create body and register the table with UC (POST tables) =====
     let req = build_uc_create_table_request(&snapshot, engine.as_ref(), name)
         .expect("failed to build CreateTableRequest");
     // Empty create forwards the initial row-tracking watermark and the clustering columns.
@@ -337,7 +336,7 @@ async fn live_create_table() {
         );
     }
 
-    // (k) Verify registration: the table loads and its uuid matches the staging table id.
+    // ===== Step 7: Verify registration: the table loads and its uuid matches the staging id =====
     let loaded = client(&url, &token)
         .load_table(&catalog, &schema_name, name)
         .await
@@ -347,7 +346,7 @@ async fn live_create_table() {
         "loaded table uuid should match the staging table id"
     );
 
-    // (m) Append 3 rows through the connector write path, then scan them back.
+    // ===== Step 8: Append 3 rows through the connector write path, then scan them back =====
     let uc = client(&url, &token);
     let pre = uc
         .load_table(&catalog, &schema_name, name)
@@ -405,7 +404,4 @@ async fn live_create_table() {
     let batches = read_scan(&scan, engine.clone() as Arc<dyn Engine>).expect("read_scan failed");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3, "appended rows should be returned by the scan");
-
-    // (n) Best-effort cleanup.
-    let _ = http.delete(table_url).send().await;
 }

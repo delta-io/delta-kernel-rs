@@ -3,6 +3,9 @@
 //! These utilities help connectors create UC-managed tables by providing the required properties
 //! for both the Delta log (disk) and the UC server registration.
 //!
+//! TODO(#3032): add a high-level helper that runs the whole flow (reserve staging table, vend
+//! credentials, kernel v0 commit, register with UC) in one call.
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -37,27 +40,6 @@ use crate::constants::{
     FEATURE_SUPPORTED, ROW_TRACKING_DOMAIN_NAME, UC_TABLE_ID_KEY, V2_CHECKPOINT_FEATURE_KEY,
     VACUUM_PROTOCOL_CHECK_FEATURE_KEY,
 };
-
-/// Convert a kernel `Protocol` into the api crate's wire `Protocol`. The api crate is kernel-free,
-/// so it defines its own serializable transport type rather than reusing `delta_kernel::Protocol`.
-fn to_wire_protocol(protocol: &Protocol) -> WireProtocol {
-    WireProtocol {
-        min_reader_version: protocol.min_reader_version(),
-        min_writer_version: protocol.min_writer_version(),
-        reader_features: protocol
-            .reader_features()
-            .into_iter()
-            .flatten()
-            .map(|f| f.as_ref().to_string())
-            .collect(),
-        writer_features: protocol
-            .writer_features()
-            .into_iter()
-            .flatten()
-            .map(|f| f.as_ref().to_string())
-            .collect(),
-    }
-}
 
 /// Returns the table properties that must be written to disk (in `000.json`) for a UC
 /// catalog-managed table creation.
@@ -183,6 +165,27 @@ pub fn build_uc_create_table_request(
         domain_metadata,
         last_commit_timestamp_ms: in_commit_timestamp_ms,
     })
+}
+
+/// Convert a kernel `Protocol` into the api crate's wire `Protocol`. The api crate is kernel-free,
+/// so it defines its own serializable transport type rather than reusing `delta_kernel::Protocol`.
+fn to_wire_protocol(protocol: &Protocol) -> WireProtocol {
+    WireProtocol {
+        min_reader_version: protocol.min_reader_version(),
+        min_writer_version: protocol.min_writer_version(),
+        reader_features: protocol
+            .reader_features()
+            .into_iter()
+            .flatten()
+            .map(|f| f.as_ref().to_string())
+            .collect(),
+        writer_features: protocol
+            .writer_features()
+            .into_iter()
+            .flatten()
+            .map(|f| f.as_ref().to_string())
+            .collect(),
+    }
 }
 
 #[cfg(test)]

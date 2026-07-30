@@ -91,7 +91,10 @@ jobs:
           UC_TEST_CATALOG: unity
           UC_TEST_SCHEMA: default
           UC_TEST_TABLE: smoke_test_table
-        run: cargo nextest run --locked -p unity-catalog-delta-client-default -p delta-kernel-unity-catalog --features integration-test -E 'test(live_)'
+        # Live tests are `#[ignore]` so a normal `cargo nextest` reports them as skipped rather than
+        # passing. `--run-ignored only -E 'test(live_)'` runs exactly the ignored live tests here,
+        # where a UC server is available.
+        run: cargo nextest run --locked -p unity-catalog-delta-client-default -p delta-kernel-unity-catalog --features integration-test --run-ignored only -E 'test(live_)'
 
       - name: Stop Unity Catalog server
         if: always()

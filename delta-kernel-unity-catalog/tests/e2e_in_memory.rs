@@ -314,7 +314,7 @@ async fn test_append_scan_back_and_incremental_read() -> Result<(), TestError> {
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2, 3]);
 
-    // v2 append: 2 more rows -> incremental read sees v1 + v2.
+    // Append 2 rows. A scan at v2 should see 5 rows.
     let id_col: ArrayRef = Arc::new(Int32Array::from(vec![4, 5]));
     let val_col: ArrayRef = Arc::new(StringArray::from(vec!["d", "e"]));
     insert_data_with(
