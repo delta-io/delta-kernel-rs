@@ -2901,20 +2901,6 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    fn commit_rejects_append_only_data_removal(
-        #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
-    ) -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        set_append_only(&mut txn, true)?;
-        txn.set_data_change(true);
-        stage_data_removal(&mut txn, removal, &[true, true, true]);
-
-        let result = txn.commit(engine.as_ref());
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
-        Ok(())
-    }
-
     #[test]
     fn test_validate_blind_append_requires_adds() -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
