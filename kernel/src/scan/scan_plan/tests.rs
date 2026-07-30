@@ -429,11 +429,13 @@ const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
 const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 
 #[rstest]
+#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_string_map(
     StatsOptions::json_only(),
     PartitionValuesOptions::string_map_only(),
     &[ADD_FIELDS, JSON_STATS_FIELDS]
 )]
+#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_with_struct(
     StatsOptions::json_only(),
     PartitionValuesOptions::with_struct(),
@@ -469,11 +471,13 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
     PartitionValuesOptions::with_struct(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
+#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_string_map(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
     &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
 )]
+#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_with_struct(
     StatsOptions::all(),
     PartitionValuesOptions::with_struct(),
@@ -498,33 +502,60 @@ fn declarative_metadata_has_complete_output_leaf_schema(
     #[case] stats: StatsOptions,
     #[case] partition_values: PartitionValuesOptions,
     #[case] expected_field_groups: &[&[&str]],
-) -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
-    let scan = snapshot
-        .scan_builder()
-        .with_stats(stats)
-        .with_partition_values(partition_values)
-        .build()?;
-    let plan = scan
-        .declarative_metadata_scan_plan(engine.as_ref())?
-        .expect("metadata plan");
-    let actual = engine
-        .plan_executor()
-        .unwrap()
-        .execute_op(PlanOperation::QueryPlan(plan))?
-        .into_data()?
-        .map(|batch| batch?.try_into_record_batch())
-        .collect::<DeltaResult<Vec<_>>>()?;
+) {
+    (|| -> DeltaResult<()> {
+        let json_requested = stats.synthesize_json;
+        let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table(
+            "v1-multi-part-partitioned-struct-stats-only",
+        )?;
+        let scan = snapshot
+            .scan_builder()
+            .with_stats(stats)
+            .with_partition_values(partition_values)
+            .build()?;
+        let plan = scan
+            .declarative_metadata_scan_plan(engine.as_ref())?
+            .expect("metadata plan");
+        let actual = engine
+            .plan_executor()
+            .unwrap()
+            .execute_op(PlanOperation::QueryPlan(plan))?
+            .into_data()?
+            .map(|batch| batch?.try_into_record_batch())
+            .collect::<DeltaResult<Vec<_>>>()?;
 
-    let mut expected: Vec<_> = expected_field_groups
-        .iter()
-        .flat_map(|fields| fields.iter())
-        .map(|field| field.to_string())
-        .collect();
-    expected.sort_unstable();
-    assert_eq!(leaf_paths(&actual), expected);
-    Ok(())
+        if json_requested {
+            for batch in &actual {
+                let add = batch
+                    .column_by_name(ADD_NAME)
+                    .expect("add column")
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("add struct");
+                let stats = add
+                    .column_by_name(STATS)
+                    .expect("requested JSON stats")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("JSON stats");
+                assert_eq!(
+                    stats.null_count(),
+                    0,
+                    "requested JSON stats must be populated"
+                );
+            }
+        }
+
+        let mut expected: Vec<_> = expected_field_groups
+            .iter()
+            .flat_map(|fields| fields.iter())
+            .map(|field| field.to_string())
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(leaf_paths(&actual), expected);
+        Ok(())
+    })()
+    .unwrap()
 }
 
 #[test]
@@ -558,30 +589,85 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> DeltaResult<()>
 }
 
 #[rstest]
+#[case::json_commits(
+    LogState::with_latest_version(2),
+    FeatureSet::new(),
+    checkpoint_json_stats(),
+    StatsOptions::all()
+)]
 #[case::v1_checkpoint_json(
     LogState::with_latest_version(2).with_checkpoint_at([2]),
     FeatureSet::new(),
-    checkpoint_json_stats()
+    checkpoint_json_stats(),
+    StatsOptions::all()
+)]
+#[case::v1_checkpoint_struct(
+    LogState::with_latest_version(2).with_checkpoint_at([2]),
+    FeatureSet::new(),
+    checkpoint_struct_stats(),
+    StatsOptions::all_struct()
+)]
+#[case::v2_checkpoint_json(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([2])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint(),
+    checkpoint_json_stats(),
+    StatsOptions::all()
 )]
 #[case::v2_mixed_struct(
     LogState::with_latest_version(2)
         .with_checkpoint_at([1])
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
-    checkpoint_struct_stats()
+    checkpoint_struct_stats(),
+    StatsOptions::all_struct()
 )]
 #[case::v2_checkpoint_without_stats(
     LogState::with_latest_version(2)
         .with_checkpoint_at([2])
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint(),
-    no_checkpoint_stats()
+    no_checkpoint_stats(),
+    StatsOptions::all_struct()
 )]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
+    #[case] stats: StatsOptions,
 ) -> DeltaResult<()> {
+    assert_metadata_output_options(log_state, features, table_config, stats)
+}
+
+#[rstest]
+#[case::v1(
+    LogState::with_latest_version(2).with_checkpoint_at([2]),
+    FeatureSet::new()
+)]
+#[case::v2(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([2])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+// TODO: https://github.com/delta-io/delta-kernel-rs/issues/3040
+#[should_panic(expected = "requested JSON stats must be populated")]
+fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
+    #[case] log_state: LogState,
+    #[case] features: FeatureSet,
+    #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
+) {
+    assert_metadata_output_options(log_state, features, checkpoint_struct_stats(), stats).unwrap();
+}
+
+fn assert_metadata_output_options(
+    log_state: LogState,
+    features: FeatureSet,
+    table_config: TableConfig,
+    stats: StatsOptions,
+) -> DeltaResult<()> {
+    let json_requested = stats.synthesize_json;
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)
@@ -595,23 +681,47 @@ fn declarative_metadata_output_options_across_log_shapes(
         snapshot
             .clone()
             .scan_builder()
-            .with_stats(StatsOptions::all_struct())
+            .with_stats(stats.clone())
             .with_partition_values(PartitionValuesOptions::with_struct())
             .build()?,
         &engine,
     )?;
     let scan = snapshot
         .scan_builder()
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(stats)
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
-    assert_metadata_eq(
-        &without_columns(&actual, &[STATS])?,
-        &without_columns(&expected, &[STATS])?,
-        "metadata output options across log shapes",
-    )?;
+    if json_requested {
+        for batch in &actual {
+            let stats = batch.column_by_name(STATS).expect("requested JSON stats");
+            let stats = stats
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("JSON stats");
+            assert_eq!(
+                stats.null_count(),
+                0,
+                "requested JSON stats must be populated"
+            );
+        }
+    }
+
+    if json_requested {
+        assert_metadata_eq(
+            &actual,
+            &expected,
+            "metadata output options across log shapes",
+        )?;
+    } else {
+        // Imperative metadata exposes source JSON even when it was not requested.
+        assert_metadata_eq(
+            &actual,
+            &without_columns(&expected, &[STATS])?,
+            "metadata output options across log shapes",
+        )?;
+    }
     Ok(())
 }
 
