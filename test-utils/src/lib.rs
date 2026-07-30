@@ -1029,6 +1029,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
         .with_data_change(data_change);
+    txn.ack_column_defaults();
     if is_blind_append {
         txn = txn.with_blind_append();
     }
@@ -1449,6 +1450,7 @@ pub async fn write_batch_to_table(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
+    txn.ack_column_defaults();
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),
