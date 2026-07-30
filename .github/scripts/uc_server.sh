@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Start or stop the Unity Catalog OSS server built by setup_unitycatalog.sh, for the gated
-# unity-catalog-delta-rest-client live integration tests.
+# Start or stop the Unity Catalog server built by setup_unitycatalog.sh, for the gated
+# unity-catalog-delta-client-default live integration tests.
 #
 # Usage: uc_oss_server.sh {start|stop}
 # Overridable via env: UC_DIR, UC_HOST, UC_PID_FILE, UC_LOG_FILE.
@@ -10,7 +10,7 @@ UC_DIR="${UC_DIR:-$HOME/unitycatalog}"
 UC_HOST="${UC_HOST:-http://localhost:8080}"
 PID_FILE="${UC_PID_FILE:-$UC_DIR/uc-server.pid}"
 LOG_FILE="${UC_LOG_FILE:-$UC_DIR/uc-server.log}"
-# Used to poll the OSS UC server to see when it is ready to accept requests.
+# Used to poll the UC server to see when it is ready to accept requests.
 HEALTH_URL="$UC_HOST/api/2.1/unity-catalog/catalogs"
 
 start() {

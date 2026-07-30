@@ -18,7 +18,7 @@ use crate::kernel_predicates::{
 use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
 use crate::scan::metrics::ScanMetrics;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{Engine, EngineData, Error, ExpressionEvaluator, PredicateEvaluator, RowVisitor as _};
@@ -310,7 +310,23 @@ impl DataSkippingFilter {
         is_add_expr: ExpressionRef,
     ) -> Option<(SchemaRef, ExpressionRef, HashSet<ColumnName>)> {
         let partition_columns: HashSet<ColumnName> = physical_partition_schema
-            .map(|s| s.fields().map(|f| ColumnName::new([f.name()])).collect())
+            .map(|s| {
+                s.fields()
+                    // Intervals are ordered, but interval data skipping is not supported.
+                    .filter(|f| {
+                        matches!(
+                            f.data_type(),
+                            DataType::Primitive(primitive)
+                                if is_skipping_eligible_datatype(primitive)
+                                    || matches!(
+                                        primitive,
+                                        PrimitiveType::Boolean | PrimitiveType::Binary
+                                    )
+                        )
+                    })
+                    .map(|f| ColumnName::new([f.name()]))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let stats_field =
@@ -715,6 +731,18 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
             .map(Pred::literal)
     }
 
+    // TODO(#3011): Rewrite partition CASTs over exact values through the engine evaluator.
+    fn eval_pred_cast(
+        &self,
+        _op: BinaryPredicateOp,
+        _col: &ColumnName,
+        _target: &DataType,
+        _val: &Scalar,
+        _inverted: bool,
+    ) -> Option<Pred> {
+        None
+    }
+
     /// Rewrites an opaque predicate via its `as_data_skipping_predicate`, wrapped with
     /// `OR(NOT is_add, ...)`. Opaque rewrites may embed op-computed verdicts (e.g. an engine
     /// callback behind FFI) that bypass kernel's null-stats folding, so kernel itself must
@@ -823,6 +851,28 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
 
     fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
+    }
+
+    /// Rewrites casts over exact per-Add partition values.
+    fn eval_pred_cast(
+        &self,
+        op: BinaryPredicateOp,
+        col: &ColumnName,
+        target: &DataType,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Pred> {
+        if !self.data_skipping_columns.is_partition_column(col) {
+            return None;
+        }
+        let ord = match op {
+            BinaryPredicateOp::LessThan => Ordering::Less,
+            BinaryPredicateOp::Equal => Ordering::Equal,
+            BinaryPredicateOp::GreaterThan => Ordering::Greater,
+            BinaryPredicateOp::Distinct | BinaryPredicateOp::In => return None,
+        };
+        let cast = Expr::cast(partition_value_expr(col), target.clone());
+        Some(comparison_predicate(ord, cast, val, inverted))
     }
 
     /// Partition NULL checks use the exact parsed value. Data `IS NULL` uses a guarded null count;

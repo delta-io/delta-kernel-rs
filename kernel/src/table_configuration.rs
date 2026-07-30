@@ -26,6 +26,8 @@ use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
     schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
 };
+#[cfg(feature = "geo-type-in-dev")]
+use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
@@ -222,6 +224,9 @@ impl TableConfiguration {
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column).
         validate_column_defaults_metadata(&table_config.logical_schema)?;
+        // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
+        #[cfg(feature = "geo-type-in-dev")]
+        validate_geospatial_feature_support(&table_config)?;
         validate_iceberg_compat_if_needed(&table_config, &V3_VALIDATOR)?;
 
         Ok(table_config)
@@ -1457,6 +1462,39 @@ mod test {
     }
 
     #[test]
+    fn test_timestamp_ntz_legacy_alias_unblocks_read_and_write() {
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "ts",
+            DataType::TIMESTAMP_NTZ,
+        )]));
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+
+        // Build the protocol from the legacy string alias to exercise the real read path.
+        let protocol =
+            Protocol::try_new_modern(["timestampWithoutTimezone"], ["timestampWithoutTimezone"])
+                .unwrap();
+
+        assert_eq!(
+            protocol.reader_features(),
+            Some([TableFeature::TimestampWithoutTimezone].as_slice())
+        );
+        assert_eq!(
+            protocol.writer_features(),
+            Some([TableFeature::TimestampWithoutTimezone].as_slice())
+        );
+
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        table_config
+            .ensure_operation_supported(Operation::Scan)
+            .unwrap();
+        table_config
+            .ensure_operation_supported(Operation::Write)
+            .unwrap();
+    }
+
+    #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
         let schema = schema_ref! { nullable "v": (DataType::unshredded_variant()) };
@@ -1695,6 +1733,13 @@ mod test {
             7,
         );
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+            assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+            assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
+        }
     }
 
     #[test]
@@ -1716,6 +1761,28 @@ mod test {
         assert_result_error_with_message(
             config.ensure_operation_supported(Operation::Write),
             r#"Feature 'typeWidening' is not supported for writes"#,
+        );
+
+        #[cfg(feature = "geo-type-in-dev")]
+        {
+            let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+            assert_result_error_with_message(
+                config.ensure_operation_supported(Operation::Write),
+                r#"Feature 'geospatial' is not supported for writes"#,
+            );
+        }
+    }
+
+    #[cfg(not(feature = "geo-type-in-dev"))]
+    #[rstest]
+    #[case::scan(Operation::Scan)]
+    #[case::cdf(Operation::Cdf)]
+    #[case::write(Operation::Write)]
+    fn test_geospatial_not_supported_without_cargo_feature(#[case] operation: Operation) {
+        let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(operation),
+            "Feature 'geospatial' is not supported",
         );
     }
 

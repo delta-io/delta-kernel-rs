@@ -255,9 +255,9 @@ avoid the overhead of parsing statistics you won't use.
 
 ### Including all statistics in scan metadata
 
-To receive pre-parsed statistics (min/max values, null counts, row counts) for every file
-in your scan metadata, pass `StatsOptions::all_struct()` (struct stats only) or
-`StatsOptions::all()` (both struct stats and the legacy JSON `stats` column):
+To receive pre-parsed statistics (min/max values, null counts, row counts) for every file in your
+scan metadata, pass `StatsOptions::all_struct()` (structured stats without JSON synthesis) or
+`StatsOptions::all()` (both structured stats and the legacy JSON `stats` column):
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -283,9 +283,8 @@ The statistics appear in a `stats_parsed` column in the scan metadata. Which col
 statistics depends on the table's configuration (`delta.dataSkippingStatsColumns` or
 `delta.dataSkippingNumIndexedCols`).
 
-`all_struct` is the cheap path: it omits the synthesized JSON `stats` column entirely.
-If your connector consumes `stats_parsed` directly, this avoids a per-batch `ToJson`
-serialization that scales with the table's stats schema width.
+For compatible checkpoints, `all_struct` leaves `stats` null and avoids reading or synthesizing
+JSON stats. JSON commits and fallback checkpoints preserve existing JSON.
 
 You can combine this with `with_predicate`. When both are set, Kernel performs its own data
 skipping internally and exposes the parsed statistics so your connector can apply
@@ -327,9 +326,9 @@ Only the named columns appear in `stats_parsed`.
 |------|-------------|
 | Default behavior (Kernel skips files internally, no stats exposed) | No call needed (or `StatsOptions::json_only()`) |
 | Disable all stats reading for performance | `StatsOptions::none()` |
-| Expose all struct stats to your connector for custom pruning (cheap path) | `StatsOptions::all_struct()` |
+| Expose all structured stats without JSON synthesis | `StatsOptions::all_struct()` |
 | Expose both struct stats and the JSON `stats` column | `StatsOptions::all()` |
-| Expose stats for specific columns only | `StatsOptions::struct_columns(cols)` |
+| Expose selected structured stats without JSON synthesis | `StatsOptions::struct_columns(cols)` |
 
 `with_stats` takes a single `StatsOptions` value, so each call fully replaces any prior
 configuration. There is no "last call wins" composition to track.

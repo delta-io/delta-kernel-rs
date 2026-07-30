@@ -825,7 +825,7 @@ mod tests {
     };
     use crate::{
         free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
-        KernelStringSlice, NullableCvoid,
+        KernelStringSlice, NullableCvoid, OptionalValue,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -1731,7 +1731,7 @@ mod tests {
         use crate::delta_kernel_unity_catalog::{
             free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
         };
-        use crate::{Handle, NullableCvoid, OptionalValue};
+        use crate::{snapshot_publish_with_committer, Handle, NullableCvoid, OptionalValue};
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
@@ -1742,9 +1742,8 @@ mod tests {
             context.commit_called = true;
 
             let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
-            let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
 
-            context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
+            context.last_commit_table_id = Some(table_id.clone());
 
             // Capture the staged commit file name if present
             if let OptionalValue::Some(commit_info) = request.commit_info {
@@ -1795,10 +1794,16 @@ mod tests {
 
             let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
             let table_id = "test_id";
+            let catalog = "test_catalog";
+            let schema = "test_schema";
+            let table_name = "test_table";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };
@@ -1860,6 +1865,84 @@ mod tests {
 
             // UC committer returns success from our mock callback
             let committed = ok_or_panic(commit_result);
+            let post_commit_snapshot =
+                match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
+                    OptionalValue::Some(snapshot) => snapshot,
+                    OptionalValue::None => {
+                        panic!("UC commit should produce a post-commit snapshot")
+                    }
+                };
+            assert_eq!(unsafe { version(post_commit_snapshot.shallow_copy()) }, 1);
+
+            let publish_committer = unsafe {
+                ok_or_panic(get_uc_committer(
+                    uc_client.shallow_copy(),
+                    kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
+                    allocate_err,
+                ))
+            };
+            let published_snapshot = ok_or_panic(unsafe {
+                snapshot_publish_with_committer(
+                    post_commit_snapshot.shallow_copy(),
+                    publish_committer,
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(unsafe { version(published_snapshot.shallow_copy()) }, 1);
+            assert!(
+                !std::ptr::eq(unsafe { post_commit_snapshot.as_ref() }, unsafe {
+                    published_snapshot.as_ref()
+                },),
+                "first publish should return a new snapshot carrying published state"
+            );
+
+            let published_commit_url = table_url
+                .join("_delta_log/00000000000000000001.json")
+                .unwrap();
+            let published_commit = store
+                .get(&Path::from_url_path(published_commit_url.path()).unwrap())
+                .await?;
+            let published_content = published_commit.bytes().await?;
+            let published_actions: Vec<_> = Deserializer::from_slice(&published_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+            assert!(
+                published_actions.iter().any(|a| a.get("add").is_some()),
+                "Published commit should contain the add action"
+            );
+
+            // Second publish is a no-op when all staged commits are already published.
+            // Publish consumes the committer, so mint a fresh one for the second call.
+            let republish_committer = unsafe {
+                ok_or_panic(get_uc_committer(
+                    uc_client.shallow_copy(),
+                    kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
+                    allocate_err,
+                ))
+            };
+            let republished_snapshot = ok_or_panic(unsafe {
+                snapshot_publish_with_committer(
+                    published_snapshot.shallow_copy(),
+                    republish_committer,
+                    engine.shallow_copy(),
+                )
+            });
+            assert!(
+                std::ptr::eq(unsafe { published_snapshot.as_ref() }, unsafe {
+                    republished_snapshot.as_ref()
+                },),
+                "second publish should short-circuit and return the same snapshot"
+            );
+
+            unsafe { free_snapshot(republished_snapshot) };
+            unsafe { free_snapshot(published_snapshot) };
+            unsafe { free_snapshot(post_commit_snapshot) };
             unsafe { free_committed_transaction(committed) };
 
             let context = recover_test_context(context).unwrap();
@@ -1871,7 +1954,7 @@ mod tests {
 
             {
                 // scope so we don't hold mutex across the await lower down
-                let (last_table_id, _) = context.last_commit_request.unwrap();
+                let last_table_id = context.last_commit_table_id.unwrap();
                 assert_eq!(
                     last_table_id, "test_id",
                     "Table ID should match the one passed to UCCommitter"

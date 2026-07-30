@@ -90,17 +90,43 @@ impl From<kernel::TableType> for TableType {
     }
 }
 
+/// The kind of log-segment load: a full listing from the base up to the target, or an incremental
+/// listing of the commits above an existing segment.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum LogSegmentLoadType {
+    Full,
+    Incremental,
+    Unknown,
+}
+
+impl From<kernel::LogSegmentLoadType> for LogSegmentLoadType {
+    fn from(t: kernel::LogSegmentLoadType) -> Self {
+        match t {
+            kernel::LogSegmentLoadType::Full => Self::Full,
+            kernel::LogSegmentLoadType::Incremental => Self::Incremental,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A log segment was loaded.
 #[repr(C)]
 pub struct LogSegmentLoadSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
     pub duration_ns: u64,
     pub num_commit_files: u64,
     pub num_checkpoint_files: u64,
     pub num_compaction_files: u64,
-    pub has_latest_crc_file: bool,
+    /// Whether the segment had a CRC file. When false, `crc_versions_behind` is 0 and meaningless.
+    pub has_crc: bool,
+    /// Versions the latest CRC file is behind the loaded version (0 when at the loaded version).
+    /// Only meaningful when `has_crc` is true.
+    pub crc_versions_behind: u64,
 }
 
 /// Listing the log segment failed.
@@ -109,6 +135,7 @@ pub struct LogSegmentLoadFailure {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 }
 
 /// How a snapshot load resolved Protocol and Metadata.
@@ -141,6 +168,7 @@ pub struct ProtocolMetadataLoadSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
     pub source: ProtocolMetadataSource,
     pub duration_ns: u64,
 }
@@ -151,6 +179,7 @@ pub struct ProtocolMetadataLoadFailure {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 }
 
 /// A snapshot was built successfully.
@@ -159,6 +188,7 @@ pub struct SnapshotBuildSuccess {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
     pub version: u64,
     pub duration_ns: u64,
 }
@@ -169,6 +199,7 @@ pub struct SnapshotBuildFailure {
     pub operation_id: MetricId,
     pub correlation_id: KernelStringSlice,
     pub table_type: TableType,
+    pub load_type: LogSegmentLoadType,
 }
 
 /// A transaction was committed successfully. `operation` and `correlation_id` are slices into
@@ -332,40 +363,48 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_type,
                 num_commit_files,
                 num_checkpoint_files,
                 num_compaction_files,
-                has_latest_crc_file,
+                crc_versions_behind,
                 duration,
             }) => Self::LogSegmentLoadSuccess(LogSegmentLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
+                load_type: (*load_type).into(),
                 duration_ns: ns(*duration),
                 num_commit_files: *num_commit_files,
                 num_checkpoint_files: *num_checkpoint_files,
                 num_compaction_files: *num_compaction_files,
-                has_latest_crc_file: *has_latest_crc_file,
+                // C has no Option: `has_crc` gates `crc_versions_behind` (0 when absent).
+                has_crc: crc_versions_behind.is_some(),
+                crc_versions_behind: crc_versions_behind.unwrap_or(0),
             }),
             K::LogSegmentLoadFailure(kernel::LogSegmentLoadFailure {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_type,
             }) => Self::LogSegmentLoadFailure(LogSegmentLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
+                load_type: (*load_type).into(),
             }),
             K::ProtocolMetadataLoadSuccess(kernel::ProtocolMetadataLoadSuccess {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_type,
                 source,
                 duration,
             }) => Self::ProtocolMetadataLoadSuccess(ProtocolMetadataLoadSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
+                load_type: (*load_type).into(),
                 source: (*source).into(),
                 duration_ns: ns(*duration),
             }),
@@ -373,21 +412,25 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_type,
             }) => Self::ProtocolMetadataLoadFailure(ProtocolMetadataLoadFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
+                load_type: (*load_type).into(),
             }),
             K::SnapshotBuildSuccess(kernel::SnapshotBuildSuccess {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_type,
                 version,
                 duration,
             }) => Self::SnapshotBuildSuccess(SnapshotBuildSuccess {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
+                load_type: (*load_type).into(),
                 version: *version,
                 duration_ns: ns(*duration),
             }),
@@ -395,10 +438,12 @@ impl MetricEvent {
                 operation_id,
                 correlation_id,
                 table_type,
+                load_type,
             }) => Self::SnapshotBuildFailure(SnapshotBuildFailure {
                 operation_id: (*operation_id).into(),
                 correlation_id: correlation_id_slice(correlation_id.as_deref()),
                 table_type: (*table_type).into(),
+                load_type: (*load_type).into(),
             }),
             K::TransactionCommitSuccess(kernel::TransactionCommitSuccess {
                 operation_id,
@@ -714,6 +759,7 @@ mod tests {
                 operation_id: id,
                 correlation_id: Some("pm-req".into()),
                 table_type: kernel::TableType::CatalogManaged,
+                load_type: kernel::LogSegmentLoadType::Incremental,
                 source: kernel::ProtocolMetadataSource::CrcAdvancedByReplay,
                 duration: Duration::from_nanos(53),
             });
@@ -723,6 +769,7 @@ mod tests {
             };
             assert_eq!(e.operation_id.bytes, id.as_bytes());
             assert!(matches!(e.table_type, TableType::CatalogManaged));
+            assert!(matches!(e.load_type, LogSegmentLoadType::Incremental));
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "pm-req");
@@ -741,10 +788,11 @@ mod tests {
             operation_id: id,
             correlation_id: Some("req-42".into()),
             table_type: kernel::TableType::CatalogManaged,
+            load_type: kernel::LogSegmentLoadType::Full,
             num_commit_files: 3,
             num_checkpoint_files: 1,
             num_compaction_files: 2,
-            has_latest_crc_file: true,
+            crc_versions_behind: Some(5),
             duration: Duration::from_nanos(61),
         });
         with_ffi_event(&event, |ffi| {
@@ -754,10 +802,12 @@ mod tests {
             assert_eq!(e.operation_id.bytes, id.as_bytes());
             assert!(matches!(e.table_type, TableType::CatalogManaged));
             assert_eq!(e.duration_ns, 61);
+            assert!(matches!(e.load_type, LogSegmentLoadType::Full));
             assert_eq!(e.num_commit_files, 3);
             assert_eq!(e.num_checkpoint_files, 1);
             assert_eq!(e.num_compaction_files, 2);
-            assert!(e.has_latest_crc_file);
+            assert!(e.has_crc);
+            assert_eq!(e.crc_versions_behind, 5);
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "req-42");
@@ -770,10 +820,11 @@ mod tests {
             operation_id: kernel::MetricId::new(),
             correlation_id: None,
             table_type: kernel::TableType::PathBased,
+            load_type: kernel::LogSegmentLoadType::Full,
             num_commit_files: 0,
             num_checkpoint_files: 0,
             num_compaction_files: 0,
-            has_latest_crc_file: false,
+            crc_versions_behind: None,
             duration: Duration::from_nanos(0),
         });
         with_ffi_event(&event, |ffi| {
@@ -781,6 +832,7 @@ mod tests {
                 panic!("expected LogSegmentLoadSuccess");
             };
             assert!(matches!(e.table_type, TableType::PathBased));
+            assert!(!e.has_crc);
             let cid: &str =
                 unsafe { TryFromStringSlice::try_from_slice(&e.correlation_id).unwrap() };
             assert_eq!(cid, "");

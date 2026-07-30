@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rstest::rstest;
 
 use super::*;
-use crate::expressions::column_name;
+use crate::expressions::{column_expr_ref, column_name};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, UnimplementedColumnResolver,
 };
@@ -587,6 +587,282 @@ fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] va
     );
 }
 
+#[test]
+fn test_checkpoint_skipping_floating_partition_cast_rewrites_exact_value() {
+    let partition_columns = HashSet::from([column_name!("part_col")]);
+    let pred = Pred::eq(
+        Expr::cast(column_expr!("part_col"), DataType::INTEGER),
+        Scalar::from(42),
+    );
+
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &partition_columns,
+        &HashSet::new(),
+    );
+
+    assert_eq!(
+        skipping_pred.map(|pred| pred.to_string()).as_deref(),
+        Some("CAST(Column(partitionValues_parsed.part_col) AS integer) = 42")
+    );
+}
+
+#[rstest]
+#[case::range(
+    {
+        let cast = Expr::cast(column_expr!("part_col"), DataType::DATE);
+        Pred::and(
+            Pred::ge(cast.clone(), Scalar::Date(20_641)),
+            Pred::lt(cast, Scalar::Date(20_644)),
+        )
+    },
+    Some(concat!(
+        "AND(NOT(CAST(Column(partitionValues_parsed.part_col) AS date) < 20641), ",
+        "CAST(Column(partitionValues_parsed.part_col) AS date) < 20644)"
+    )),
+)]
+#[case::equality(
+    Pred::eq(
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    Some("CAST(Column(partitionValues_parsed.part_col) AS date) = 20641"),
+)]
+#[case::inverted_less(
+    Pred::ge(
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    Some("NOT(CAST(Column(partitionValues_parsed.part_col) AS date) < 20641)"),
+)]
+#[case::inverted_greater(
+    Pred::le(
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    Some("NOT(CAST(Column(partitionValues_parsed.part_col) AS date) > 20641)"),
+)]
+#[case::inverted_equality(
+    Pred::ne(
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    Some("NOT(CAST(Column(partitionValues_parsed.part_col) AS date) = 20641)"),
+)]
+#[case::literal_on_left(
+    Pred::lt(
+        Scalar::Date(20_641),
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+    ),
+    Some("CAST(Column(partitionValues_parsed.part_col) AS date) > 20641"),
+)]
+#[case::distinct(
+    Pred::binary(
+        BinaryPredicateOp::Distinct,
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    None,
+)]
+#[case::in_list(
+    Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    None,
+)]
+fn test_checkpoint_skipping_partition_date_cast_comparisons(
+    #[case] pred: Pred,
+    #[case] expected: Option<&str>,
+) {
+    let partition_columns = test_partition_columns();
+    let actual = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .map(|pred| pred.to_string());
+
+    assert_eq!(actual.as_deref(), expected);
+}
+
+fn partition_date_cast() -> Expr {
+    Expr::cast(column_expr!("part_col"), DataType::DATE)
+}
+
+#[rstest]
+#[case::eq_match(
+    Pred::eq(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    TRUE
+)]
+#[case::eq_nomatch(
+    Pred::eq(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-08",
+    FALSE
+)]
+#[case::lt_true(
+    Pred::lt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-06",
+    TRUE
+)]
+#[case::lt_false(
+    Pred::lt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    FALSE
+)]
+#[case::gt_true(
+    Pred::gt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-08",
+    TRUE
+)]
+#[case::gt_false(
+    Pred::gt(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    FALSE
+)]
+#[case::ge_boundary(
+    Pred::ge(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    TRUE
+)]
+#[case::le_boundary(
+    Pred::le(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    TRUE
+)]
+#[case::ne_match(
+    Pred::ne(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-07",
+    FALSE
+)]
+#[case::ne_nomatch(
+    Pred::ne(partition_date_cast(), Scalar::Date(20_641)),
+    "2026-07-08",
+    TRUE
+)]
+fn test_checkpoint_partition_cast_eval_discriminates_per_operator(
+    #[case] pred: Pred,
+    #[case] partition_value: &str,
+    #[case] expected: Option<bool>,
+) {
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &test_partition_columns(),
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        Scalar::from(partition_value),
+    )]));
+
+    expect_eq!(
+        resolver.eval(&skipping_pred),
+        expected,
+        "{pred:#?} @ {partition_value}"
+    );
+}
+
+#[test]
+fn test_partition_date_cast_is_checkpoint_only() {
+    let partition_columns = test_partition_columns();
+    let partition_cast = Pred::eq(
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    );
+    let data_cast = Pred::eq(
+        Expr::cast(column_expr!("data_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    );
+
+    assert!(
+        as_checkpoint_skipping_predicate(
+            &data_cast,
+            &partition_columns,
+            &HashSet::new(),
+            &HashSet::from([column_name!("data_col")]),
+        )
+        .is_none(),
+        "checkpoint CAST pushdown requires an exact partition value"
+    );
+    assert!(
+        as_data_skipping_predicate_with_partitions(&partition_cast, &partition_columns).is_none(),
+        "in-memory data skipping must not evaluate partition casts"
+    );
+}
+
+#[rstest]
+#[case::null_value(Scalar::Null(DataType::STRING))]
+#[case::invalid_value(Scalar::from("not-a-date"))]
+fn test_checkpoint_partition_cast_reference_eval_is_conservative(#[case] partition_value: Scalar) {
+    let partition_columns = test_partition_columns();
+    let pred = Pred::eq(
+        Expr::cast(column_expr!("part_col"), DataType::DATE),
+        Scalar::Date(20_641),
+    );
+    let skipping_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+        column_name!("partitionValues_parsed.part_col"),
+        partition_value,
+    )]));
+
+    expect_eq!(
+        resolver.eval(&skipping_pred),
+        NULL,
+        "null and invalid partition values must evaluate to NULL"
+    );
+}
+
+#[test]
+fn partition_cast_preserves_supported_in_memory_conjunct() {
+    let partition_columns = test_partition_columns();
+    let pred = Pred::and(
+        Pred::ge(
+            Expr::cast(column_expr!("part_col"), DataType::DATE),
+            Scalar::Date(20_641),
+        ),
+        Pred::gt(column_expr!("data_col"), Scalar::from(100)),
+    );
+
+    let skipping_pred =
+        as_data_skipping_predicate_with_partitions(&pred, &partition_columns).unwrap();
+
+    assert_eq!(
+        skipping_pred.to_string(),
+        "AND(null, Column(stats_parsed.maxValues.data_col) > 100)"
+    );
+
+    let checkpoint_pred = as_checkpoint_skipping_predicate(
+        &pred,
+        &partition_columns,
+        &HashSet::new(),
+        &HashSet::from([column_name!("data_col")]),
+    )
+    .unwrap()
+    .to_string();
+    assert!(
+        checkpoint_pred.contains("CAST(Column(partitionValues_parsed.part_col) AS date)"),
+        "{checkpoint_pred}"
+    );
+    assert!(
+        checkpoint_pred.contains("stats_parsed.maxValues.data_col"),
+        "{checkpoint_pred}"
+    );
+}
+
+// Partition null predicates read `partitionValues_parsed.part_col` directly. FALSE is the pruning
+// verdict; TRUE keeps the row group.
 #[rstest]
 #[case::is_null_null(false, Scalar::Null(DataType::STRING), TRUE)]
 #[case::is_null_value(false, Scalar::from("x"), FALSE)]
@@ -627,6 +903,10 @@ fn test_checkpoint_skipping_partition_missing_stats_keeps_all() {
     for pred in [
         Pred::eq(column_expr!("part_col"), Scalar::from("B")),
         Pred::lt(column_expr!("part_col"), Scalar::from("B")),
+        Pred::eq(
+            Expr::cast(column_expr!("part_col"), DataType::DATE),
+            Scalar::Date(20_641),
+        ),
         Pred::is_null(column_expr!("part_col")),
         Pred::is_not_null(column_expr!("part_col")),
     ] {
@@ -892,6 +1172,25 @@ fn test_partition_timestamp_column_no_adjustment() {
         skipping_pred.to_string(),
         "OR(NOT(Column(is_add)), Column(partitionValues_parsed.ts_part) > 1000000)"
     );
+}
+
+#[rstest]
+fn test_interval_partition_columns_are_not_pruning_columns(
+    #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+) {
+    let partition_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "period", interval,
+    )]));
+    let (_, _, partition_columns) = DataSkippingFilter::build_unified_schema_and_expr(
+        None,
+        column_expr_ref!("stats_parsed"),
+        Some(&partition_schema),
+        column_expr_ref!("partitionValues_parsed"),
+        Arc::new(Expr::literal(true)),
+    )
+    .unwrap();
+
+    assert!(partition_columns.is_empty());
 }
 
 // Tests for partition-aware data skipping

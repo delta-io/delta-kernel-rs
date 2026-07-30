@@ -1,26 +1,29 @@
-name: unity-catalog-oss-test
+name: unity-catalog-test
 
-# Runs the gated `unity-catalog-delta-rest-client` live integration tests against a real Unity
-# Catalog OSS server (built from a pinned commit). Exercises the read-only `get_config` handshake
-# (needs no table) and `load_table` against a table seeded via the Delta-Commits (legacy) API
-# before the test step, plus the mutating create tests (UC_CREATE) against the ephemeral server.
+# Runs the gated `unity-catalog-delta-client-default` and `delta-kernel-unity-catalog` live
+# integration tests against a real Unity Catalog server (built from a pinned commit). Exercises the
+# read-only `get_config` handshake (needs no table), `load_table` against a table seeded via the
+# Delta-Commits (legacy) API before the test step, and the mutating create tests against the
+# throwaway server.
 on:
   push:
     branches: [main, "release/**"]
     paths:
+      - "delta-kernel-unity-catalog/**"
       - "unity-catalog-delta-client-api/**"
-      - "unity-catalog-delta-rest-client/**"
-      - ".github/workflows/unitycatalog_oss_test.yml"
+      - "unity-catalog-delta-client-default/**"
+      - ".github/workflows/unitycatalog_test.yml"
       - ".github/scripts/setup_unitycatalog.sh"
-      - ".github/scripts/uc_oss_server.sh"
+      - ".github/scripts/uc_server.sh"
       - ".github/scripts/seed_uc_table.sh"
   pull_request:
     paths:
+      - "delta-kernel-unity-catalog/**"
       - "unity-catalog-delta-client-api/**"
-      - "unity-catalog-delta-rest-client/**"
-      - ".github/workflows/unitycatalog_oss_test.yml"
+      - "unity-catalog-delta-client-default/**"
+      - ".github/workflows/unitycatalog_test.yml"
       - ".github/scripts/setup_unitycatalog.sh"
-      - ".github/scripts/uc_oss_server.sh"
+      - ".github/scripts/uc_server.sh"
       - ".github/scripts/seed_uc_table.sh"
   workflow_dispatch:
 
@@ -35,8 +38,8 @@ env:
   UC_DIR: ${{ github.workspace }}/.uc-server
 
 jobs:
-  uc-oss-test:
-    name: UC OSS server integration test
+  uc-test:
+    name: UC server integration test
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -68,13 +71,13 @@ jobs:
             ~/.ivy2
             ~/.sbt
             ~/.cache/coursier
-          key: uc-oss-${{ runner.os }}-${{ env.UC_COMMIT }}-${{ hashFiles('.github/scripts/setup_unitycatalog.sh') }}
+          key: uc-${{ runner.os }}-${{ env.UC_COMMIT }}-${{ hashFiles('.github/scripts/setup_unitycatalog.sh') }}
 
       - name: Build Unity Catalog server
         run: bash .github/scripts/setup_unitycatalog.sh
 
       - name: Start Unity Catalog server
-        run: bash .github/scripts/uc_oss_server.sh start
+        run: bash .github/scripts/uc_server.sh start
 
       # Seed a catalog-managed (MANAGED) Delta table so the load_table live test has a table to read.
       - name: Seed a managed table
@@ -84,16 +87,18 @@ jobs:
         env:
           UC_SERVER_URL: http://localhost:8080
           UC_TOKEN: not-used
-          # Fresh OSS server seeds the `unity` catalog with a `default` schema.
+          # Fresh server seeds the `unity` catalog with a `default` schema.
           UC_TEST_CATALOG: unity
           UC_TEST_SCHEMA: default
           UC_TEST_TABLE: smoke_test_table
-          UC_CREATE: "1"
-        run: cargo nextest run --locked -p unity-catalog-delta-rest-client --features integration-test -E 'test(live_)'
+        # Live tests are `#[ignore]` so a normal `cargo nextest` reports them as skipped rather than
+        # passing. `--run-ignored only -E 'test(live_)'` runs exactly the ignored live tests here,
+        # where a UC server is available.
+        run: cargo nextest run --locked -p unity-catalog-delta-client-default -p delta-kernel-unity-catalog --features integration-test --run-ignored only -E 'test(live_)'
 
       - name: Stop Unity Catalog server
         if: always()
-        run: bash .github/scripts/uc_oss_server.sh stop
+        run: bash .github/scripts/uc_server.sh stop
 
       - name: Dump server log on failure
         if: failure()

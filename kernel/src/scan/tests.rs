@@ -1,9 +1,11 @@
+use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ::test_utils::{get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
+use url::Url;
 
 use super::*;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
@@ -1168,31 +1170,45 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 }
 
 // Partition-only scans have no stats schema, so the partition schema must enable the rewrite.
-#[test]
-fn test_build_actions_meta_predicate_partition_only() {
+#[rstest]
+#[case::equality(Pred::eq(
+    column_expr!("modified"),
+    Expr::literal("2021-02-01"),
+), None)]
+#[case::date_cast_range(Pred::and(
+    Pred::ge(
+        Expr::cast(column_expr!("modified"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    Pred::lt(
+        Expr::cast(column_expr!("modified"), DataType::DATE),
+        Scalar::Date(20_644),
+    ),
+), Some("CAST(Column(add.partitionValues_parsed.modified) AS date)"))]
+fn test_build_actions_meta_predicate_partition_only(
+    #[case] predicate: Pred,
+    #[case] expected_cast: Option<&str>,
+) {
     // `app-txn-checkpoint` is partitioned by `modified` (string), no column mapping.
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    let predicate = Arc::new(Pred::eq(
-        column_expr!("modified"),
-        Expr::literal("2021-02-01"),
-    ));
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .build()
         .unwrap();
 
-    let meta_pred = scan.build_actions_meta_predicate();
-    assert!(
-        meta_pred.is_some(),
-        "partition-only predicate should still produce a checkpoint meta-predicate"
-    );
+    let meta_pred = scan
+        .build_actions_meta_predicate()
+        .expect("partition-only predicate should produce a checkpoint meta-predicate");
+    let rendered = meta_pred.to_string();
+    if let Some(expected_cast) = expected_cast {
+        assert!(rendered.contains(expected_cast), "{rendered}");
+    }
     let refs: Vec<String> = meta_pred
-        .unwrap()
         .references()
         .into_iter()
         .map(|c| c.to_string())
@@ -1209,7 +1225,10 @@ fn test_build_actions_meta_predicate_partition_only() {
 #[rstest]
 #[case::name_mode("name")]
 #[case::id_mode("id")]
-fn test_build_actions_meta_predicate_partition_column_mapping(#[case] mode: &str) {
+fn test_build_actions_meta_predicate_partition_column_mapping(
+    #[case] mode: &str,
+    #[values(false, true)] casted: bool,
+) {
     // `partition_cm/{name,id}` use column mapping, partitioned by `category`
     // (physical name col-6dc68f07-711d-4f00-8bd6-1f5bc698e8ad in both fixtures).
     let path =
@@ -1218,20 +1237,26 @@ fn test_build_actions_meta_predicate_partition_column_mapping(#[case] mode: &str
     let engine = SyncEngine::new();
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
-    let predicate = Arc::new(Pred::eq(column_expr!("category"), Expr::literal("a")));
+    let predicate = if casted {
+        Pred::eq(
+            Expr::cast(column_expr!("category"), DataType::DATE),
+            Scalar::Date(20_641),
+        )
+    } else {
+        Pred::eq(column_expr!("category"), Expr::literal("a"))
+    };
     let scan = snapshot
         .scan_builder()
-        .with_predicate(predicate)
+        .with_predicate(Arc::new(predicate))
         .build()
         .unwrap();
 
-    let meta_pred = scan.build_actions_meta_predicate();
-    assert!(
-        meta_pred.is_some(),
-        "partition predicate under column mapping should produce a meta-predicate"
-    );
+    let meta_pred = scan
+        .build_actions_meta_predicate()
+        .expect("partition predicate under column mapping should produce a meta-predicate");
+    let rendered = meta_pred.to_string();
+    assert_eq!(rendered.contains("CAST("), casted, "{rendered}");
     let refs: Vec<String> = meta_pred
-        .unwrap()
         .references()
         .into_iter()
         .map(|c| c.to_string())
@@ -1632,6 +1657,23 @@ fn standard_multi_rg() -> Bytes {
 #[case::partition_eq(Pred::eq(column_expr!("part"), Expr::literal("a")), vec![1, 3])]
 #[case::partition_lt(Pred::lt(column_expr!("part"), Expr::literal("b")), vec![1, 3])]
 #[case::partition_all_pruned(Pred::eq(column_expr!("part"), Expr::literal("z")), vec![])]
+#[case::partition_cast_kept(
+    Pred::eq(
+        Expr::cast(column_expr!("part"), DataType::DATE),
+        Scalar::Date(18_628),
+    ),
+    vec![1, 2, 3, 4]
+)]
+#[case::partition_cast_and_stats(
+    Pred::and(
+        Pred::eq(
+            Expr::cast(column_expr!("part"), DataType::DATE),
+            Scalar::Date(18_628),
+        ),
+        Pred::gt(column_expr!("x"), Expr::literal(150i64)),
+    ),
+    vec![3, 4]
+)]
 #[case::and_stats_and_partition(
     Pred::and(
         Pred::eq(column_expr!("part"), Expr::literal("a")),
@@ -1715,6 +1757,7 @@ fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
 #[derive(Debug)]
 struct RecordedParquetRead {
     files: Vec<String>,
+    physical_schema: schema::SchemaRef,
     predicate: Option<PredicateRef>,
 }
 
@@ -1732,6 +1775,7 @@ impl ParquetHandler for RecordingParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         self.reads.lock().unwrap().push(RecordedParquetRead {
             files: files.iter().map(|file| file.location.to_string()).collect(),
+            physical_schema: physical_schema.clone(),
             predicate: predicate.clone(),
         });
         self.inner
@@ -1788,6 +1832,128 @@ impl Engine for RecordingParquetEngine {
     fn storage_handler(&self) -> Arc<dyn StorageHandler> {
         self.inner.storage_handler()
     }
+}
+
+#[rstest]
+#[case::all_struct(StatsOptions::all_struct(), false, false)]
+#[case::all(StatsOptions::all(), true, false)]
+#[case::none_with_predicate(StatsOptions::none(), false, true)]
+fn test_checkpoint_stats_projection_matches_requested_output(
+    #[values(
+        "v1-single-part-struct-stats-only",
+        "v2-parquet-sidecars-struct-stats-only",
+        "v2-checkpoints-parquet-with-sidecars"
+    )]
+    table: &str,
+    #[case] stats: StatsOptions,
+    #[case] request_json_stats: bool,
+    #[case] skip_stats: bool,
+) {
+    let extracted = load_test_data("tests/data", table).ok();
+    let path = extracted
+        .as_ref()
+        .map(|dir| dir.path().join(table))
+        .unwrap_or_else(|| {
+            fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
+        });
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    engine.take_reads();
+
+    let predicate: Option<PredicateRef> = skip_stats
+        .then(|| Arc::new(Pred::gt(column_expr!("id"), Expr::literal(0i64))) as PredicateRef);
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats)
+        .build()
+        .unwrap();
+    for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
+        action.unwrap();
+    }
+
+    let reads = engine.take_reads();
+    let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
+    let expect_parsed_stats = !skip_stats && compatible_structured_stats;
+    let expect_json_stats = !skip_stats && (request_json_stats || !expect_parsed_stats);
+    let expected_file_fragment = if table.starts_with("v2-") {
+        "_sidecars/"
+    } else {
+        ".checkpoint."
+    };
+    let action_reads: Vec<_> = reads
+        .iter()
+        .filter(|read| {
+            read.files
+                .iter()
+                .any(|file| file.contains(expected_file_fragment))
+                && read.physical_schema.field("add").is_some()
+        })
+        .collect();
+    assert!(!action_reads.is_empty(), "expected checkpoint Add reads");
+    for read in action_reads {
+        let add_field = read
+            .physical_schema
+            .field("add")
+            .expect("checkpoint read schema must contain add");
+        let DataType::Struct(add) = add_field.data_type() else {
+            panic!("checkpoint add field must be a struct");
+        };
+        assert_eq!(
+            add.field("stats").is_some(),
+            expect_json_stats,
+            "JSON checkpoint stats projection must match the requested output"
+        );
+        assert_eq!(
+            add.field("stats_parsed").is_some(),
+            expect_parsed_stats,
+            "structured checkpoint stats projection must match the requested output"
+        );
+    }
+}
+
+#[test]
+fn test_all_struct_parses_json_commit_stats() {
+    let path = fs::canonicalize(PathBuf::from(
+        "./tests/data/v1-single-part-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    // The table's checkpoint is at version 5, so version 4 replays only JSON commits.
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(4)
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+
+    let mut file_count = 0;
+    for scan_metadata in scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered = filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+        let stats_parsed = get_column!(filtered, "stats_parsed", StructArray);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
+
+        for row in 0..filtered.num_rows() {
+            assert!(!stats_parsed.is_null(row));
+            assert_eq!(num_records.value(row), 1);
+            file_count += 1;
+        }
+    }
+    assert_eq!(file_count, 4);
 }
 
 #[rstest]

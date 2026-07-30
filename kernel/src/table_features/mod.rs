@@ -12,6 +12,8 @@ pub(crate) use column_mapping::{
     validate_column_mapping_id, StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
+#[cfg(feature = "geo-type-in-dev")]
+pub(crate) use geospatial::validate_geospatial_feature_support;
 pub(crate) use iceberg_compat::v3::{iceberg_compat_v3_column_defaults_validation, V3_VALIDATOR};
 pub(crate) use iceberg_compat::validate_iceberg_compat_if_needed;
 use itertools::Itertools;
@@ -30,6 +32,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 mod column_mapping;
+#[cfg(feature = "geo-type-in-dev")]
+mod geospatial;
 mod iceberg_compat;
 mod timestamp_ntz;
 
@@ -140,9 +144,14 @@ pub(crate) enum TableFeature {
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
-    /// timestamps without timezone support
-    #[strum(serialize = "timestampNtz")]
-    #[serde(rename = "timestampNtz")]
+    /// Timestamps without timezone support. The canonical protocol feature name is `timestampNtz`.
+    ///
+    /// `timestampWithoutTimezone` is not a Delta protocol feature name, but some existing tables
+    /// carry it in their reader/writer feature arrays. Kernel accepts it on read for compatibility
+    /// with those tables and always writes the canonical `timestampNtz`. See
+    /// <https://github.com/delta-io/delta-kernel-rs/issues/2557>.
+    #[strum(to_string = "timestampNtz", serialize = "timestampWithoutTimezone")]
+    #[serde(rename = "timestampNtz", alias = "timestampWithoutTimezone")]
     TimestampWithoutTimezone,
     // Allow columns to change type
     TypeWidening,
@@ -169,6 +178,10 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "adaptiveMetadata-preview")]
     #[serde(rename = "adaptiveMetadata-preview")]
     AdaptiveMetadataPreview,
+    /// Geospatial type support (geometry and geography columns)
+    #[strum(serialize = "geospatial")]
+    #[serde(rename = "geospatial")]
+    GeospatialType,
 
     #[serde(untagged)]
     #[strum(default)]
@@ -658,6 +671,23 @@ static ADAPTIVE_METADATA_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// TODO(#2949): drop the `geo-type-in-dev` gate once full geospatial support ships.
+static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::ReaderWriter,
+    min_legacy_version: None,
+    feature_requirements: &[],
+    #[cfg(feature = "geo-type-in-dev")]
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'geospatial' is not supported for writes",
+        )),
+    }),
+    #[cfg(not(feature = "geo-type-in-dev"))]
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 /// By definition, kernel cannot know how to handle unknown features and must assume they're always
 /// enabled if supported in protocol. However, the read path ignores all writer-only features,
 /// including unknown ones. Unknown features are never inferred from legacy protocol versions.
@@ -690,7 +720,8 @@ impl TableFeature {
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShredding
             | TableFeature::VariantShreddingPreview
-            | TableFeature::AdaptiveMetadataPreview => FeatureType::ReaderWriter,
+            | TableFeature::AdaptiveMetadataPreview
+            | TableFeature::GeospatialType => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -758,6 +789,7 @@ impl TableFeature {
             TableFeature::VariantShredding => &VARIANT_SHREDDING_INFO,
             TableFeature::VariantShreddingPreview => &VARIANT_SHREDDING_PREVIEW_INFO,
             TableFeature::AdaptiveMetadataPreview => &ADAPTIVE_METADATA_PREVIEW_INFO,
+            TableFeature::GeospatialType => &GEOSPATIAL_TYPE_INFO,
 
             // Unknown features: not supported by kernel, no legacy version inference.
             TableFeature::Unknown(_) => &UNKNOWN_FEATURE_INFO,
@@ -1038,6 +1070,40 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_ntz_legacy_alias() {
+        assert_eq!(
+            TableFeature::from("timestampNtz"),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            TableFeature::from("timestampWithoutTimezone"),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampNtz\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+        assert_eq!(
+            serde_json::from_str::<TableFeature>("\"timestampWithoutTimezone\"").unwrap(),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.to_string(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            TableFeature::TimestampWithoutTimezone.as_ref(),
+            "timestampNtz"
+        );
+        assert_eq!(
+            serde_json::to_string(&TableFeature::TimestampWithoutTimezone).unwrap(),
+            "\"timestampNtz\""
+        );
+    }
+
+    #[test]
     fn test_roundtrip_table_features() {
         use strum::IntoEnumIterator as _;
 
@@ -1072,6 +1138,7 @@ mod tests {
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
                 TableFeature::AdaptiveMetadataPreview => "adaptiveMetadata-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
+                TableFeature::GeospatialType => "geospatial",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 

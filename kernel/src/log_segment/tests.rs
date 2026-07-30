@@ -32,8 +32,12 @@ use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, adds_only_batch, remove_only_batch,
     sidecar_batch_with_given_paths, sidecar_batch_with_given_paths_and_sizes,
 };
-use crate::scan::{CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA};
-use crate::schema::{schema, schema_ref, DataType, SchemaRef, StructField, StructType};
+use crate::scan::{
+    CHECKPOINT_READ_SCHEMA, CHECKPOINT_READ_SCHEMA_NO_JSON_STATS, COMMIT_READ_SCHEMA,
+};
+use crate::schema::{
+    schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+};
 use crate::utils::test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, string_array_to_engine_data, Action,
@@ -2451,6 +2455,78 @@ fn test_validate_listed_log_file_out_of_order_commit_files() {
 }
 
 #[test]
+fn test_try_new_crc_at_end_version_is_ok() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )),
+            latest_crc_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.crc"
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_try_new_crc_newer_than_end_version_is_err() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )),
+            latest_crc_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000003.crc"
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn test_try_new_crc_older_than_checkpoint_is_err() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000004.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000004.json",
+            )),
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000003.checkpoint.parquet",
+            )],
+            latest_crc_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.crc"
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
 fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -3367,6 +3443,27 @@ fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField
     }
 }
 
+fn create_checkpoint_file_schema_with_stats_parsed(
+    min_values_fields: Vec<StructField>,
+    include_json_stats: bool,
+) -> DeltaResult<SchemaRef> {
+    let stats_parsed = StructField::nullable(
+        "stats_parsed",
+        schema! {
+            nullable (NUM_RECORDS): LONG,
+            nullable (MIN_VALUES): { ..(min_values_fields.clone()) },
+            nullable (MAX_VALUES): { ..(min_values_fields) },
+        },
+    );
+    let patch = SchemaStructPatchBuilder::new().append_at(["add"], stats_parsed);
+    let patch = if include_json_stats {
+        patch
+    } else {
+        patch.drop_at(["add"], "stats")
+    };
+    Ok(Arc::new(patch.build(get_commit_schema().as_ref())?))
+}
+
 // Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
 fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
     schema! {
@@ -3384,6 +3481,99 @@ fn create_checkpoint_schema_without_stats_parsed() -> StructType {
             nullable "stats": STRING,
         },
     }
+}
+
+#[rstest]
+#[case::missing_with_json(false, true, false, true)]
+#[case::partial_with_json(true, true, true, false)]
+#[case::partial_without_json(true, false, true, false)]
+#[tokio::test]
+async fn test_checkpoint_stream_resolves_stats_projection(
+    #[case] include_parsed_stats: bool,
+    #[case] include_json_stats: bool,
+    #[case] expect_parsed_stats: bool,
+    #[case] expect_json_stats: bool,
+) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let checkpoint_schema = if include_parsed_stats {
+        create_checkpoint_file_schema_with_stats_parsed(
+            vec![StructField::nullable("other", DataType::LONG)],
+            include_json_stats,
+        )?
+    } else {
+        get_commit_schema().clone()
+    };
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(checkpoint_schema),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::LONG)]);
+
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
+        None, // meta_predicate
+        Some(&stats_schema),
+        None, // partition_schema
+        None, // cancellation_token
+    )?;
+
+    assert_eq!(
+        checkpoint_result.checkpoint_info.has_stats_parsed,
+        expect_parsed_stats
+    );
+    let add_field = checkpoint_result
+        .checkpoint_info
+        .checkpoint_read_schema
+        .field("add")
+        .expect("checkpoint read schema must contain add");
+    let DataType::Struct(add) = add_field.data_type() else {
+        panic!("checkpoint add field must be a struct");
+    };
+    assert_eq!(add.field("stats").is_some(), expect_json_stats);
+    assert_eq!(add.field("stats_parsed").is_some(), expect_parsed_stats);
+
+    let read_schema = checkpoint_result
+        .checkpoint_info
+        .checkpoint_read_schema
+        .clone();
+    let mut actions = checkpoint_result.actions;
+    let batch = actions
+        .next()
+        .expect("checkpoint stream must yield one batch")?;
+    assert!(!batch.is_log_batch);
+    assert_eq!(
+        batch.actions.has_field(&ColumnName::new(["add", "stats"])),
+        expect_json_stats,
+        "checkpoint batch JSON stats projection must match the resolved schema"
+    );
+    if include_json_stats {
+        assert_batch_matches(batch.actions, add_batch_simple(read_schema));
+    } else {
+        assert!(!batch.actions.is_empty());
+    }
+    assert!(actions.next().is_none());
+
+    Ok(())
 }
 
 #[test]

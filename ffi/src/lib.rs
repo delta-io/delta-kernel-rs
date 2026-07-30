@@ -78,6 +78,7 @@ mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
 pub mod test_ffi;
 pub mod transaction;
+use transaction::MutableCommitter;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
@@ -367,6 +368,58 @@ mod private {
         len: usize,
     }
 
+    /// An owned byte buffer allocated by the kernel. Any time the engine receives a
+    /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
+    /// must free it by calling [super::free_kernel_bytes] exactly once.
+    #[cfg(feature = "declarative-plans")]
+    #[repr(C)]
+    pub struct KernelOwnedBytes {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl KernelOwnedBytes {
+        /// Converts this buffer back into a `Vec<u8>`.
+        ///
+        /// # Safety
+        ///
+        /// The buffer must have been originally created `From<Vec<u8>>`, and must not have already
+        /// been consumed by a previous call to this method.
+        pub unsafe fn into_vec(self) -> Vec<u8> {
+            if self.len == 0 {
+                Default::default()
+            } else {
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
+            }
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl From<Vec<u8>> for KernelOwnedBytes {
+        fn from(val: Vec<u8>) -> Self {
+            let len = val.len();
+            let boxed = val.into_boxed_slice();
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            let ptr = unsafe { NonNull::new_unchecked(leaked_ptr) };
+            KernelOwnedBytes { ptr, len }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The engine assumes ownership of the buffer memory when kernel passes it a
+    /// [KernelOwnedBytes], but must only free it by calling [super::free_kernel_bytes]. Since the
+    /// global allocator is threadsafe, it doesn't matter which engine thread invokes that method.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Send for KernelOwnedBytes {}
+    /// # Safety
+    ///
+    /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Sync for KernelOwnedBytes {}
+
     impl KernelBoolSlice {
         /// Creates an empty slice.
         pub fn empty() -> KernelBoolSlice {
@@ -474,6 +527,8 @@ mod private {
         }
     }
 }
+#[cfg(feature = "declarative-plans")]
+pub use private::KernelOwnedBytes;
 pub use private::{KernelBoolSlice, KernelRowIndexArray};
 
 /// # Safety
@@ -491,6 +546,17 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 #[no_mangle]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
+}
+
+/// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
+    let _ = unsafe { bytes.into_vec() };
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void
@@ -1236,6 +1302,36 @@ pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot_ref
         .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
         .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
+        .into_extern_result(&engine_ref)
+}
+
+/// Publish unpublished catalog commits on a catalog-managed snapshot.
+///
+/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
+/// nothing to publish. Errors when unpublished commits exist but the table is not
+/// catalog-managed or the committer is not a catalog committer.
+///
+/// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
+/// committer is consumed (do not free). The returned snapshot carries the published watermark
+/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
+/// checkpoint.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
+/// consumed and must not be used or freed afterward.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_publish_with_committer(
+    snapshot: Handle<SharedSnapshot>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let committer = unsafe { committer.into_inner() };
+    snapshot_ref
+        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+        .map(|updated| updated.into())
         .into_extern_result(&engine_ref)
 }
 

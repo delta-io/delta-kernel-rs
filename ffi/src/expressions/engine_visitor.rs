@@ -93,6 +93,10 @@ pub struct EngineExpressionVisitor {
     /// Visit a 32bit integer `date` representing days since UNIX epoch 1970-01-01.  The `date`
     /// belongs to the list identified by `sibling_list_id`.
     pub visit_literal_date: VisitLiteralFn<i32>,
+    /// Visit an `interval year to month` literal as a signed month count.
+    pub visit_literal_interval_year_month: VisitLiteralFn<i32>,
+    /// Visit an `interval day to second` literal as a signed microsecond count.
+    pub visit_literal_interval_day_time: VisitLiteralFn<i64>,
     /// Visit binary data at the `buffer` with length `len` belonging to the list identified by
     /// `sibling_list_id`.
     pub visit_literal_binary:
@@ -132,10 +136,9 @@ pub struct EngineExpressionVisitor {
     ),
     /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
     ///
-    /// The `type_tag` identifies the data type using the `NullTypeTag` encoding. For decimal
-    /// nulls (`type_tag == 12`), `precision` and `scale` carry the decimal type parameters;
-    /// for all other types, they are zero. Non-primitive types (struct, array, map, variant)
-    /// use `type_tag == 255`.
+    /// The `type_tag` identifies reconstructible primitive types with tags 0-14. Decimal nulls
+    /// use tag 12 with `precision` and `scale`; interval year-month and day-time nulls use tags
+    /// 13 and 14. Non-primitive types and `void` use the sentinel tag 255.
     pub visit_literal_null: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -588,6 +591,22 @@ fn visit_expression_scalar(
                 scale
             )
         }
+        Scalar::IntervalYearMonth(val) => {
+            call!(
+                visitor,
+                visit_literal_interval_year_month,
+                sibling_list_id,
+                *val
+            )
+        }
+        Scalar::IntervalDayTime(val) => {
+            call!(
+                visitor,
+                visit_literal_interval_day_time,
+                sibling_list_id,
+                *val
+            )
+        }
         Scalar::Struct(struct_data) => {
             visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
         }
@@ -729,4 +748,184 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
     let top_level = call!(visitor, make_field_list, 1);
     visit_predicate_impl(visitor, predicate, top_level);
     top_level
+}
+
+#[cfg(test)]
+mod tests {
+    use delta_kernel::expressions::{Expression, Scalar};
+    use rstest::rstest;
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum LiteralEvent {
+        IntervalYearMonth { sibling_list_id: usize, value: i32 },
+        IntervalDayTime { sibling_list_id: usize, value: i64 },
+    }
+
+    #[derive(Default)]
+    struct TestExpressionBuilder {
+        next_list_id: usize,
+        events: Vec<LiteralEvent>,
+    }
+
+    extern "C" fn make_field_list(data: *mut c_void, _reserve: usize) -> usize {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let list_id = builder.next_list_id;
+        builder.next_list_id += 1;
+        list_id
+    }
+
+    extern "C" fn visit_literal_interval_year_month(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i32,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::IntervalYearMonth {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    extern "C" fn visit_literal_interval_day_time(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i64,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::IntervalDayTime {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    macro_rules! ignore_fn {
+        ($fn_name:ident $(, $arg_type:ty)*) => {
+            extern "C" fn $fn_name(
+                _data: *mut c_void,
+                _sibling_list_id: usize,
+                $(_: $arg_type),*
+            ) {
+            }
+        };
+    }
+
+    ignore_fn!(ignore_i32, i32);
+    ignore_fn!(ignore_i64, i64);
+    ignore_fn!(ignore_i16, i16);
+    ignore_fn!(ignore_i8, i8);
+    ignore_fn!(ignore_f32, f32);
+    ignore_fn!(ignore_f64, f64);
+    ignore_fn!(ignore_bool, bool);
+    ignore_fn!(ignore_string_slice, KernelStringSlice);
+    ignore_fn!(ignore_binary, *const u8, usize);
+    ignore_fn!(ignore_decimal, i64, u64, u8, u8);
+    ignore_fn!(ignore_struct_literal, usize, usize);
+    ignore_fn!(ignore_child_list, usize);
+    ignore_fn!(ignore_map_literal, usize, usize);
+    ignore_fn!(ignore_null, u8, u8, u8);
+    ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
+    ignore_fn!(ignore_column, KernelStringSlice);
+    ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
+    ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
+    ignore_fn!(ignore_opaque_expr, Handle<SharedOpaqueExpressionOp>, usize);
+    ignore_fn!(ignore_opaque_pred, Handle<SharedOpaquePredicateOp>, usize);
+
+    fn test_visitor(builder: &mut TestExpressionBuilder) -> EngineExpressionVisitor {
+        EngineExpressionVisitor {
+            data: builder as *mut _ as *mut c_void,
+            make_field_list,
+            visit_literal_int: ignore_i32,
+            visit_literal_long: ignore_i64,
+            visit_literal_short: ignore_i16,
+            visit_literal_byte: ignore_i8,
+            visit_literal_float: ignore_f32,
+            visit_literal_double: ignore_f64,
+            visit_literal_string: ignore_string_slice,
+            visit_literal_bool: ignore_bool,
+            visit_literal_timestamp: ignore_i64,
+            visit_literal_timestamp_ntz: ignore_i64,
+            visit_literal_date: ignore_i32,
+            visit_literal_interval_year_month,
+            visit_literal_interval_day_time,
+            visit_literal_binary: ignore_binary,
+            visit_literal_decimal: ignore_decimal,
+            visit_literal_struct: ignore_struct_literal,
+            visit_literal_array: ignore_child_list,
+            visit_literal_map: ignore_map_literal,
+            visit_literal_null: ignore_null,
+            visit_and: ignore_child_list,
+            visit_or: ignore_child_list,
+            visit_not: ignore_child_list,
+            visit_is_null: ignore_child_list,
+            visit_to_json: ignore_child_list,
+            visit_parse_json: ignore_parse_json,
+            visit_map_to_struct: ignore_child_list,
+            visit_lt: ignore_child_list,
+            visit_gt: ignore_child_list,
+            visit_eq: ignore_child_list,
+            visit_distinct: ignore_child_list,
+            visit_in: ignore_child_list,
+            visit_add: ignore_child_list,
+            visit_minus: ignore_child_list,
+            visit_multiply: ignore_child_list,
+            visit_divide: ignore_child_list,
+            visit_coalesce: ignore_child_list,
+            visit_array: ignore_child_list,
+            visit_column: ignore_column,
+            visit_struct_expr: ignore_child_list,
+            visit_struct_patch_expr: ignore_struct_patch,
+            visit_field_patch: ignore_field_patch,
+            visit_opaque_expr: ignore_opaque_expr,
+            visit_opaque_pred: ignore_opaque_pred,
+            visit_unknown: ignore_column,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(26)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(987_654)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(-13)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: -13 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(i32::MIN)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MIN }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(i32::MAX)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MAX }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(-86_400_000_000)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: -86_400_000_000 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(i64::MIN)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MIN }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(i64::MAX)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
+    )]
+    fn visit_expression_uses_interval_literal_callbacks(
+        #[case] expression: Expression,
+        #[case] expected: LiteralEvent,
+    ) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(builder.events, vec![expected]);
+    }
 }
