@@ -60,42 +60,43 @@ pub(crate) fn build_metadata_scan_plan(
         return Ok(None);
     }
 
+    let stats_schema = state.physical_stats_schema.as_ref();
+    let partition_schema = state.physical_partition_schema.as_ref();
     let prune = stats_skipping_predicate(state);
     let prune = prune.as_ref();
-    let add_field = add_field_with_parsed_stats_and_partitions(
-        state.physical_stats_schema.as_ref(),
-        state.physical_partition_schema.as_ref(),
-    )?;
+
+    // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's dedup
+    // carrier and both terminal `{ add }` projections, so every arm agrees on the union schema.
+    let add_field = add_field_with_parsed_stats_and_partitions(stats_schema, partition_schema)?;
     let (output_expr, output_schema) = metadata_output_projection(
         &add_field,
         stats,
         partition_values,
-        state.physical_partition_schema.as_ref(),
+        partition_schema,
         physical_stats_output_schema,
     )?;
 
-    let commit_actions = commit_arm(
-        log_segment,
-        state.physical_stats_schema.as_ref(),
-        state.physical_partition_schema.as_ref(),
-    )?
-    .try_fold_with(prune, |p, prune| {
-        // We filter so that:
-        // * All remove actions are kept
-        // * Add actions that do not match the partition pruning or stats predicate are removed.
-        //
-        // NOTE: It is important that add actions are filtered by the partition predicate
-        // because partition filtering may not be applied on data rows. On the other
-        // hand, failing to skip based on data columns is safe because the data
-        // predicate will also be evaluated on data rows. Thus it is crucial that we partition
-        // prune adds here.
-        //
-        // NOTE: It is not safe to prune remove actions using the partition filter. This is
-        // because a NULL result for `remove.partitionValues.partCol` may be due to
-        // `remove.partitionValues` being NULL, or it may be from `partCol` being
-        // NULL. Thus, we simply do not prune removes.
-        p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
-    })?;
+    let commit_actions = commit_arm(log_segment, stats_schema, partition_schema)?.try_fold_with(
+        prune,
+        |p, prune| {
+            // We filter so that:
+            // * All remove actions are kept
+            // * Add actions that do not match the partition pruning or stats predicate are removed.
+            //
+            // NOTE: It is important that add actions are filtered by the partition predicate
+            // because partition filtering may not be applied on data rows. On the other
+            // hand, failing to skip based on data columns is safe because the data
+            // predicate will also be evaluated on data rows. Thus it is crucial that we partition
+            // prune adds here.
+            //
+            // NOTE: It is not safe to prune remove actions using the partition filter. This is
+            // because a NULL result for `remove.partitionValues.partCol` may be due to
+            // `remove.partitionValues` being NULL, or it may be from `partCol` being
+            // NULL. Thus, we simply do not prune removes.
+            p.filter(Predicate::or(col!("add").is_null(), prune.clone()))
+        },
+    )?;
+
     let deduped_commit = commit_actions
         // Wrap `add` so removes, whose inner `add` is null, survive `MaxNonNullBy`. Unwrap it
         // after aggregation.
@@ -112,13 +113,8 @@ pub(crate) fn build_metadata_scan_plan(
         // We unwrap `add.add` to the top level now that MaxNonNullBy is complete.
         .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
 
-    let checkpoint_adds = checkpoint_arm(
-        log_segment,
-        shape,
-        state.physical_stats_schema.as_ref(),
-        state.physical_partition_schema.as_ref(),
-    )?
-    .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
+    let checkpoint_adds = checkpoint_arm(log_segment, shape, stats_schema, partition_schema)?
+        .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
 
     let checkpoint_live_adds = checkpoint_adds
         .anti_join(
@@ -371,6 +367,58 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
     ])
 }
 
+trait ProjectionStructPatchBuilderExt<'a> {
+    /// Parse add stats and partition values, preferring compatible parsed input columns.
+    fn with_parsed_add_stats_and_partitions(
+        self,
+        stats_schema: Option<&SchemaRef>,
+        partition_schema: Option<&SchemaRef>,
+    ) -> Self;
+}
+
+impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
+    fn with_parsed_add_stats_and_partitions(
+        mut self,
+        stats_schema: Option<&SchemaRef>,
+        partition_schema: Option<&SchemaRef>,
+    ) -> Self {
+        let has_stats_parsed = self
+            .input_schema()
+            .field_at(&column_name!("add.stats_parsed"))
+            .is_ok();
+        let has_partition_values_parsed = self
+            .input_schema()
+            .field_at(&column_name!("add.partitionValues_parsed"))
+            .is_ok();
+        let add = [ADD_NAME];
+        self = match stats_schema {
+            Some(ss) => {
+                let field = StructField::nullable(STATS_PARSED, ss.as_ref().clone());
+                let expr = Expr::parse_json(col!("add.stats"), Arc::clone(ss));
+                if has_stats_parsed {
+                    self
+                } else {
+                    self.append_at(add, field, expr)
+                }
+            }
+            None => self,
+        };
+        match partition_schema {
+            Some(ps) => {
+                let field = StructField::nullable(PARTITION_VALUES_PARSED, ps.as_ref().clone());
+                let expr = Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES));
+                if has_partition_values_parsed {
+                    let expr = Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), expr]);
+                    self.replace_at(add, PARTITION_VALUES_PARSED, field, expr)
+                } else {
+                    self.append_at(add, field, expr)
+                }
+            }
+            None => self,
+        }
+    }
+}
+
 /// The `add` field produced by [`with_parsed_add_stats_and_partitions`].
 fn add_field_with_parsed_stats_and_partitions(
     stats_schema: Option<&SchemaRef>,
@@ -443,58 +491,6 @@ fn metadata_output_projection(
         (StructField::nullable(ADD_NAME, add_schema.as_ref().clone()))
     };
     Ok((Arc::new(Expr::struct_from([add_expr])), schema))
-}
-
-trait ProjectionStructPatchBuilderExt<'a> {
-    /// Parse add stats and partition values, preferring compatible parsed input columns.
-    fn with_parsed_add_stats_and_partitions(
-        self,
-        stats_schema: Option<&SchemaRef>,
-        partition_schema: Option<&SchemaRef>,
-    ) -> Self;
-}
-
-impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a> {
-    fn with_parsed_add_stats_and_partitions(
-        self,
-        stats_schema: Option<&SchemaRef>,
-        partition_schema: Option<&SchemaRef>,
-    ) -> Self {
-        let add = [ADD_NAME];
-        let has_stats_parsed = self
-            .input_schema()
-            .field_at(&column_name!("add.stats_parsed"))
-            .is_ok();
-        let patch = match (stats_schema, has_stats_parsed) {
-            (Some(stats_schema), false) => self.append_at(
-                add,
-                StructField::nullable(STATS_PARSED, stats_schema.as_ref().clone()),
-                Expr::parse_json(col!(ADD_NAME, STATS), Arc::clone(stats_schema)),
-            ),
-            _ => self,
-        };
-
-        let Some(partition_schema) = partition_schema else {
-            return patch;
-        };
-        let has_partition_values_parsed = patch
-            .input_schema()
-            .field_at(&column_name!("add.partitionValues_parsed"))
-            .is_ok();
-        let field =
-            StructField::nullable(PARTITION_VALUES_PARSED, partition_schema.as_ref().clone());
-        let parsed = Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES));
-        if has_partition_values_parsed {
-            patch.replace_at(
-                add,
-                PARTITION_VALUES_PARSED,
-                field,
-                Expr::coalesce([col!(ADD_NAME, PARTITION_VALUES_PARSED), parsed]),
-            )
-        } else {
-            patch.append_at(add, field, parsed)
-        }
-    }
 }
 
 fn project_struct(root: ColumnName, schema: &StructType) -> Expr {
