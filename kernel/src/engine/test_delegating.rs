@@ -14,6 +14,18 @@ pub(crate) struct DelegatingEngine {
     storage: Option<Arc<dyn StorageHandler>>,
     json: Option<Arc<dyn JsonHandler>>,
     parquet: Option<Arc<dyn ParquetHandler>>,
+    #[cfg(feature = "declarative-plans")]
+    plan_executor: PlanExecutorOverride,
+}
+
+/// How [`DelegatingEngine`] resolves `plan_executor`. Unlike the other handlers, `None` is
+/// itself a valid override (forcing an engine to report no executor), so it needs a distinct
+/// variant from inheriting the inner engine's executor.
+#[cfg(feature = "declarative-plans")]
+enum PlanExecutorOverride {
+    Inherit,
+    None,
+    Some(Arc<dyn PlanExecutor>),
 }
 
 impl DelegatingEngine {
@@ -23,6 +35,8 @@ impl DelegatingEngine {
             storage: None,
             json: None,
             parquet: None,
+            #[cfg(feature = "declarative-plans")]
+            plan_executor: PlanExecutorOverride::Inherit,
         }
     }
 
@@ -38,6 +52,18 @@ impl DelegatingEngine {
 
     pub(crate) fn with_parquet_handler(mut self, handler: Arc<dyn ParquetHandler>) -> Self {
         self.parquet = Some(handler);
+        self
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn with_plan_executor(mut self, executor: Arc<dyn PlanExecutor>) -> Self {
+        self.plan_executor = PlanExecutorOverride::Some(executor);
+        self
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn without_plan_executor(mut self) -> Self {
+        self.plan_executor = PlanExecutorOverride::None;
         self
     }
 }
@@ -66,7 +92,11 @@ impl Engine for DelegatingEngine {
     }
 
     #[cfg(feature = "declarative-plans")]
-    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
-        self.inner.plan_executor()
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        match &self.plan_executor {
+            PlanExecutorOverride::Inherit => self.inner.plan_executor(),
+            PlanExecutorOverride::None => None,
+            PlanExecutorOverride::Some(executor) => Some(executor.clone()),
+        }
     }
 }
