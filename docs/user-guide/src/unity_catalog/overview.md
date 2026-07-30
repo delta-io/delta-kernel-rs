@@ -59,10 +59,11 @@ gRPC, or in-memory) without changing the code that depends on these traits.
 
 This crate provides the concrete REST-over-HTTP implementations:
 
-- **`UCClient`**: calls the UC Delta-Tables read APIs. `load_table` returns a
-  table's metadata plus its inline log tail in one call, and
-  `get_table_credentials` vends temporary cloud credentials scoped to the
-  table's storage.
+- **`UCClient`**: calls the UC Delta-Tables APIs. `load_table` returns a table's
+  metadata plus its inline log tail in one call, `get_table_credentials` vends
+  temporary cloud credentials scoped to the table's storage, and
+  `create_staging_table` / `create_table` reserve and register a new
+  catalog-managed table.
 - **`UCUpdateTableRestClient`**: implements `UpdateTableClient` over HTTP. It
   submits staged commits to the UC `update_table` endpoint, where Unity Catalog
   ratifies them.

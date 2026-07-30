@@ -1,7 +1,8 @@
 use reqwest::StatusCode;
 use tracing::instrument;
 use unity_catalog_delta_client_api::{
-    CatalogConfig, CommitReport, CredentialsResponse, LoadTableResponse, MetricsReport, Operation,
+    CatalogConfig, CommitReport, CreateStagingTableRequest, CreateStagingTableResponse,
+    CreateTableRequest, CredentialsResponse, LoadTableResponse, MetricsReport, Operation,
     ReportMetricsRequest,
 };
 use url::Url;
@@ -133,5 +134,46 @@ impl UCClient {
         })
         .await?;
         handle_empty_response(response).await
+    }
+
+    /// `POST /delta/v1/catalogs/{catalog}/schemas/{schema}/staging-tables`: reserve a staging
+    /// table, allocating its UUID and storage location and returning temporary credentials for
+    /// the version 0 commit.
+    #[instrument(skip(self, request))]
+    pub async fn create_staging_table(
+        &self,
+        catalog: &str,
+        schema: &str,
+        request: CreateStagingTableRequest,
+    ) -> Result<CreateStagingTableResponse> {
+        let path = format!("delta/v1/catalogs/{catalog}/schemas/{schema}/staging-tables");
+        self.post_create(path, &request).await
+    }
+
+    /// `POST /delta/v1/catalogs/{catalog}/schemas/{schema}/tables`: register a table with the
+    /// catalog after its version 0 commit, promoting the staging table. Returns the registered
+    /// table as a `LoadTableResponse`.
+    #[instrument(skip(self, request))]
+    pub async fn create_table(
+        &self,
+        catalog: &str,
+        schema: &str,
+        request: CreateTableRequest,
+    ) -> Result<LoadTableResponse> {
+        let path = format!("delta/v1/catalogs/{catalog}/schemas/{schema}/tables");
+        self.post_create(path, &request).await
+    }
+
+    /// Single-attempt `POST` for the non-idempotent create endpoints. No retry: a create the
+    /// server accepted but whose response was lost would resubmit and fail with a `409` conflict,
+    /// masking success.
+    async fn post_create<Req, Resp>(&self, path: String, request: &Req) -> Result<Resp>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let url = self.base_url.join(&path)?;
+        let response = self.http_client.post(url).json(request).send().await?;
+        handle_response(response).await
     }
 }

@@ -38,9 +38,8 @@ use delta_kernel_unity_catalog::{
 };
 use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
-    CreateStagingTableRequest, CreateStagingTableResponse, LoadTableResponse, TableIdentifier,
+    CreateStagingTableRequest, LoadTableResponse, TableIdentifier,
 };
-use unity_catalog_delta_rest_client::http::build_http_client;
 use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 use url::Url;
 
@@ -60,22 +59,6 @@ fn client_config(url: &str, token: &str) -> ClientConfig {
 
 fn client(url: &str, token: &str) -> UCClient {
     UCClient::new(client_config(url, token)).expect("failed to build UCClient")
-}
-
-/// Returns the base URL (`<workspace>/api/2.1/unity-catalog/delta/v1/`) plus an authed
-/// `reqwest::Client` for the staging-tables/tables POSTs.
-///
-/// TODO(remove): fold into UCClient once it exposes a typed staging-tables method.
-fn raw_delta_rest_client(url: &str, token: &str) -> (Url, reqwest::Client) {
-    let config = ClientConfig::build(url, token)
-        .build()
-        .expect("failed to build ClientConfig");
-    let base = config
-        .workspace_url
-        .join("delta/v1/")
-        .expect("failed to join delta/v1/ onto workspace URL");
-    let http = build_http_client(&config).expect("failed to build reqwest client");
-    (base, http)
 }
 
 /// Normalize a UC table location to a root URL ending in `/`. UC returns the location without a
@@ -133,9 +116,8 @@ async fn live_load_table_builds_log_tail() {
     );
 }
 
-/// Live CREATE through the full connector flow. The two CREATE endpoints (`staging-tables`,
-/// `tables`) are not yet on the REST client (tracked by #3032), so this test hand-rolls those POSTs
-/// with raw `reqwest` while using kernel for the v0 commit and the typed `tables` body.
+/// Live CREATE through the full connector flow: `UCClient::create_staging_table` to reserve,
+/// kernel for the v0 commit, then `UCClient::create_table` to register.
 ///
 /// The table enables row tracking and clustering so the create body and the write path exercise the
 /// `delta.rowTracking` and `delta.clustering` domains in one round trip: the initial watermark (-1)
@@ -157,37 +139,19 @@ async fn live_create_table() {
     let name = format!("kernel_rs_create_test_{}", uuid::Uuid::new_v4().simple());
     let name = name.as_str();
 
-    let (base, http) = raw_delta_rest_client(&url, &token);
-    let tables_base = base
-        .join(&format!("catalogs/{catalog}/schemas/{schema_name}/"))
-        .expect("tables base URL");
+    let uc_client = client(&url, &token);
 
-    // ===== Step 1: POST staging-tables -> allocate uuid + storage + staging credentials =====
-    let staging_url = tables_base
-        .join("staging-tables")
-        .expect("staging-tables URL");
-    let staging_req = CreateStagingTableRequest {
-        name: name.to_string(),
-    };
-    let staging_req_json =
-        serde_json::to_string_pretty(&staging_req).expect("serialize CreateStagingTableRequest");
-    let staging_resp = http
-        .post(staging_url)
-        .json(&staging_req)
-        .send()
+    // ===== Step 1: reserve a staging table -> allocate uuid + storage + staging credentials =====
+    let resp = uc_client
+        .create_staging_table(
+            &catalog,
+            &schema_name,
+            CreateStagingTableRequest {
+                name: name.to_string(),
+            },
+        )
         .await
-        .expect("staging-tables POST failed");
-    let staging_status = staging_resp.status();
-    if !staging_status.is_success() {
-        let body = staging_resp.text().await.unwrap_or_default();
-        panic!(
-            "staging-tables POST returned {staging_status}\nrequest body:\n{staging_req_json}\nresponse body:\n{body}"
-        );
-    }
-    let resp: CreateStagingTableResponse = staging_resp
-        .json()
-        .await
-        .expect("failed to deserialize CreateStagingTableResponse");
+        .expect("create_staging_table failed");
 
     // ===== Step 2: Build the engine over the staging storage location =====
     let table_root =
@@ -292,23 +256,13 @@ async fn live_create_table() {
             "{key} should be present in the create body"
         );
     }
-    let req_json = serde_json::to_string_pretty(&req).expect("serialize CreateTableRequest");
-    let create_resp = http
-        .post(tables_base.join("tables").expect("tables URL"))
-        .json(&req)
-        .send()
+    uc_client
+        .create_table(&catalog, &schema_name, req)
         .await
-        .expect("tables POST failed");
-    let create_status = create_resp.status();
-    if !create_status.is_success() {
-        let body = create_resp.text().await.unwrap_or_default();
-        panic!(
-            "tables POST returned {create_status}\nrequest body:\n{req_json}\nresponse body:\n{body}"
-        );
-    }
+        .expect("create_table failed");
 
     // ===== Step 7: Verify registration: the table loads and its uuid matches the staging id =====
-    let loaded = client(&url, &token)
+    let loaded = uc_client
         .load_table(&catalog, &schema_name, name)
         .await
         .expect("load_table after create failed");
