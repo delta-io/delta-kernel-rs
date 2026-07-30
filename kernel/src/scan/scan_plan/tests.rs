@@ -511,6 +511,7 @@ fn declarative_metadata_has_complete_output_leaf_schema(
         .expect("metadata plan");
     let actual = engine
         .plan_executor()
+        .unwrap()
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?
         .map(|batch| batch?.try_into_record_batch())
