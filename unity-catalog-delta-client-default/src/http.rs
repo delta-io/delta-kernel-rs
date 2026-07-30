@@ -20,7 +20,7 @@ pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
         // Identifies the calling client to UC.
         (
             header::USER_AGENT,
-            header::HeaderValue::from_str(&config.user_agent)?,
+            header::HeaderValue::from_str(config.user_agent())?,
         ),
     ]);
 
@@ -118,5 +118,30 @@ async fn error_from_response(response: Response) -> Error {
             status: status.as_u16(),
             message: error_body,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClientConfig;
+
+    #[test]
+    fn build_http_client_accepts_composed_user_agent() {
+        let config = ClientConfig::build("example.com", "t", "Spark/3.5.0")
+            .build()
+            .unwrap();
+        build_http_client(&config).expect("composed user_agent must be a valid header value");
+    }
+
+    #[test]
+    fn build_http_client_rejects_invalid_engine_user_agent_chars() {
+        let config = ClientConfig::build("example.com", "t", "bad\nengine")
+            .build()
+            .unwrap();
+        assert!(matches!(
+            build_http_client(&config),
+            Err(Error::InvalidHeaderValue(_))
+        ));
     }
 }

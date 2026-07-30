@@ -78,7 +78,7 @@ use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
 use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
-let config = ClientConfig::build(&endpoint, &token).build()?;
+let config = ClientConfig::build(&endpoint, &token, "MyEngine/1.0").build()?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
 // Build the engine over the staging storage location using the staging credentials

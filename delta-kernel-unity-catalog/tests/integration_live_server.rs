@@ -40,7 +40,10 @@ use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
     CreateStagingTableRequest, CreateStagingTableResponse, LoadTableResponse, TableIdentifier,
 };
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_client_default::http::build_http_client;
+use unity_catalog_delta_client_default::{
+    default_engine_user_agent, ClientConfig, UCClient, UCUpdateTableRestClient,
+};
 use url::Url;
 
 /// Returns `(server_url, token)` from the environment, or `None` to signal the caller to skip.
@@ -51,59 +54,34 @@ fn server_env() -> Option<(String, String)> {
     Some((url, token))
 }
 
-/// Builds a `ClientConfig`, applying `UC_USER_AGENT` when set. Some catalogs require a specific
-/// `User-Agent` value and reject others; others ignore the header entirely.
+/// Engine identity for the `User-Agent`, overridable via `UC_USER_AGENT`.
+fn engine_user_agent() -> String {
+    std::env::var("UC_USER_AGENT").unwrap_or_else(|_| default_engine_user_agent())
+}
+
 fn client_config(url: &str, token: &str) -> ClientConfig {
-    let mut builder = ClientConfig::build(url, token);
-    if let Ok(user_agent) = std::env::var("UC_USER_AGENT") {
-        builder = builder.with_user_agent(user_agent);
-    }
-    builder.build().expect("failed to build ClientConfig")
+    ClientConfig::build(url, token, engine_user_agent())
+        .build()
+        .expect("failed to build ClientConfig")
 }
 
 fn client(url: &str, token: &str) -> UCClient {
     UCClient::new(client_config(url, token)).expect("failed to build UCClient")
 }
 
-/// Default `User-Agent` when `UC_USER_AGENT` is unset. Derived from the crate version to match the
-/// production default.
-const DEFAULT_USER_AGENT: &str = concat!(
-    "Delta/",
-    env!("CARGO_PKG_VERSION"),
-    " delta-kernel-rs/",
-    env!("CARGO_PKG_VERSION")
-);
-
 /// Returns the base URL (`<workspace>/api/2.1/unity-catalog/delta/v1/`) plus an authed
-/// `reqwest::Client` for the hand-rolled staging-tables/tables POSTs.
+/// `reqwest::Client` for the staging-tables/tables POSTs.
+///
+/// TODO(remove): fold into UCClient once it exposes a typed staging-tables method.
 fn raw_delta_rest_client(url: &str, token: &str) -> (Url, reqwest::Client) {
-    let base = ClientConfig::build(url, token)
+    let config = ClientConfig::build(url, token, engine_user_agent())
         .build()
-        .expect("failed to build ClientConfig")
+        .expect("failed to build ClientConfig");
+    let base = config
         .workspace_url
         .join("delta/v1/")
         .expect("failed to join delta/v1/ onto workspace URL");
-    let user_agent =
-        std::env::var("UC_USER_AGENT").unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string());
-
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .expect("invalid bearer token"),
-    );
-    headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        reqwest::header::HeaderValue::from_static("application/json"),
-    );
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_str(&user_agent).expect("invalid user agent"),
-    );
-    let http = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .expect("failed to build reqwest client");
+    let http = build_http_client(&config).expect("failed to build reqwest client");
     (base, http)
 }
 

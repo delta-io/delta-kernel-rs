@@ -10,7 +10,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ClientConfig::build("uc.awesome.org", "your-token").build()?;
+//!     let config = ClientConfig::build("uc.awesome.org", "your-token", "MyEngine/1.0").build()?;
 //!     let client = UCClient::new(config)?;
 //!
 //!     let resp = client.load_table("main", "default", "my_table").await?;
@@ -28,5 +28,5 @@ pub mod http;
 mod tests;
 
 pub use clients::{UCClient, UCUpdateTableRestClient};
-pub use config::{ClientConfig, ClientConfigBuilder};
+pub use config::{default_engine_user_agent, ClientConfig, ClientConfigBuilder};
 pub use error::{Error, Result};

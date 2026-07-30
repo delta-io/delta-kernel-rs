@@ -2,13 +2,19 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-/// Default `User-Agent` identifying this client. Override via
-/// [`ClientConfigBuilder::with_user_agent`] if UC expects a particular value.
-fn default_user_agent() -> String {
+/// The engine identity to pass to [`ClientConfig::build`] when the caller has no engine of its own
+/// (e.g. this crate's own tools and tests). Keyed off this crate's version.
+pub fn default_engine_user_agent() -> String {
+    format!("Default-Engine/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Prepend the caller's engine identity to the kernel `User-Agent`; some catalogs reject unknown
+/// agents.
+fn build_user_agent(engine_user_agent: &str) -> String {
     format!(
-        "Delta/{v} delta-kernel-rs/{v}",
+        "{engine_user_agent} Delta-Kernel-Rust/{v}",
         v = env!("CARGO_PKG_VERSION")
     )
 }
@@ -17,7 +23,7 @@ fn default_user_agent() -> String {
 pub struct ClientConfig {
     pub workspace_url: Url,
     pub token: String,
-    pub user_agent: String,
+    user_agent: String,
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub max_retries: u32,
@@ -42,7 +48,29 @@ impl std::fmt::Debug for ClientConfig {
 }
 
 impl ClientConfig {
-    fn new(workspace: impl Into<String>, token: impl Into<String>) -> Result<Self> {
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    pub fn build(
+        workspace: impl Into<String>,
+        token: impl Into<String>,
+        engine_user_agent: impl Into<String>,
+    ) -> ClientConfigBuilder {
+        ClientConfigBuilder::new(workspace, token, engine_user_agent)
+    }
+
+    fn new(
+        workspace: impl Into<String>,
+        token: impl Into<String>,
+        engine_user_agent: &str,
+    ) -> Result<Self> {
+        if engine_user_agent.trim().is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "engine User-Agent must not be empty".to_string(),
+            ));
+        }
+
         let workspace_str = workspace.into();
         // add http(s) prefix if not present
         let base_url =
@@ -62,7 +90,7 @@ impl ClientConfig {
         Ok(Self {
             workspace_url,
             token: token.into(),
-            user_agent: default_user_agent(),
+            user_agent: build_user_agent(engine_user_agent),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             max_retries: 3,
@@ -70,16 +98,12 @@ impl ClientConfig {
             retry_max_delay: Duration::from_secs(10),
         })
     }
-
-    pub fn build(workspace: impl Into<String>, token: impl Into<String>) -> ClientConfigBuilder {
-        ClientConfigBuilder::new(workspace, token)
-    }
 }
 
 pub struct ClientConfigBuilder {
     workspace: String,
     token: String,
-    user_agent: String,
+    engine_user_agent: String,
     timeout: Duration,
     connect_timeout: Duration,
     max_retries: u32,
@@ -88,23 +112,21 @@ pub struct ClientConfigBuilder {
 }
 
 impl ClientConfigBuilder {
-    fn new(workspace: impl Into<String>, token: impl Into<String>) -> Self {
+    fn new(
+        workspace: impl Into<String>,
+        token: impl Into<String>,
+        engine_user_agent: impl Into<String>,
+    ) -> Self {
         Self {
             workspace: workspace.into(),
             token: token.into(),
-            user_agent: default_user_agent(),
+            engine_user_agent: engine_user_agent.into(),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             max_retries: 3,
             retry_base_delay: Duration::from_millis(500),
             retry_max_delay: Duration::from_secs(10),
         }
-    }
-
-    /// Override the `User-Agent` header with the value the catalog expects for your connector.
-    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
-        self.user_agent = user_agent.into();
-        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -129,8 +151,7 @@ impl ClientConfigBuilder {
     }
 
     pub fn build(self) -> Result<ClientConfig> {
-        let mut config = ClientConfig::new(self.workspace, self.token)?;
-        config.user_agent = self.user_agent;
+        let mut config = ClientConfig::new(self.workspace, self.token, &self.engine_user_agent)?;
         config.timeout = self.timeout;
         config.connect_timeout = self.connect_timeout;
         config.max_retries = self.max_retries;
@@ -146,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_client_config_builder() {
-        let config = ClientConfig::build("example.com", "token123")
+        let config = ClientConfig::build("example.com", "token123", "Spark/3.5.0")
             .with_timeout(Duration::from_secs(60))
             .with_connect_timeout(Duration::from_secs(5))
             .with_max_retries(5)
@@ -168,7 +189,8 @@ mod tests {
 
     #[test]
     fn test_client_config() {
-        let config = ClientConfig::new("some-workspace.something.com", "token").unwrap();
+        let config =
+            ClientConfig::new("some-workspace.something.com", "token", "Spark/3.5.0").unwrap();
         assert!(config
             .workspace_url
             .as_str()
@@ -177,20 +199,35 @@ mod tests {
     }
 
     #[test]
-    fn with_user_agent_overrides_default() {
-        let default = ClientConfig::build("example.com", "t").build().unwrap();
-        assert_eq!(default.user_agent, default_user_agent());
-
-        let overridden = ClientConfig::build("example.com", "t")
-            .with_user_agent("MyConnector/1.2.3")
+    fn user_agent_appends_kernel_token_to_engine_identity() {
+        let config = ClientConfig::build("example.com", "t", "Spark/3.5.0")
             .build()
             .unwrap();
-        assert_eq!(overridden.user_agent, "MyConnector/1.2.3");
+        assert_eq!(
+            config.user_agent,
+            format!(
+                "Spark/3.5.0 Delta-Kernel-Rust/{}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn empty_engine_user_agent_is_rejected() {
+        for engine_user_agent in ["", "   "] {
+            let err = ClientConfig::build("example.com", "t", engine_user_agent)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidConfiguration(_)),
+                "expected InvalidConfiguration for {engine_user_agent:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]
     fn debug_redacts_bearer_token() {
-        let config = ClientConfig::build("example.com", "super-secret-token")
+        let config = ClientConfig::build("example.com", "super-secret-token", "Spark/3.5.0")
             .build()
             .unwrap();
         let debug = format!("{config:?}");

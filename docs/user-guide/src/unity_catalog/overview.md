@@ -222,7 +222,7 @@ often benefit from raising timeouts or the retry budget.
 use std::time::Duration;
 use unity_catalog_delta_client_default::ClientConfig;
 
-let config = ClientConfig::build(&endpoint, &token)
+let config = ClientConfig::build(&endpoint, &token, "MyEngine/1.0")
     .with_timeout(Duration::from_secs(60))
     .with_max_retries(5)
     .with_retry_delays(Duration::from_millis(200), Duration::from_secs(5))

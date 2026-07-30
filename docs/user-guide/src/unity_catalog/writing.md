@@ -27,7 +27,7 @@ use std::sync::Arc;
 use unity_catalog_delta_client_api::Operation;
 use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
-let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
+let config = ClientConfig::build("my-workspace.cloud.databricks.com", token, "MyEngine/1.0").build()?;
 let uc_client = UCClient::new(config.clone())?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
@@ -254,7 +254,7 @@ use unity_catalog_delta_client_api::{Operation, TableIdentifier};
 use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 // 1. Set up clients
-let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
+let config = ClientConfig::build("my-workspace.cloud.databricks.com", token, "MyEngine/1.0").build()?;
 let uc_client = UCClient::new(config.clone())?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
