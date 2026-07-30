@@ -152,9 +152,8 @@ fn build_data_skipping_schemas(
     // `DataSkippingFilter` needs stats for every column its predicate references. Refs
     // without stats fold to NULL and pruning collapses to "keep every file", even when
     // the caller separately requested stats for some other set of columns via
-    // `StructStats::Columns`. Union the two so the schema serves both. References outside the
-    // table's data schema, such as CDF metadata columns, cannot have Add stats and are omitted.
-    // Explicit stats-output requests are validated separately.
+    // `StructStats::Columns`. Union the two so the schema serves both. Unresolvable
+    // refs (e.g. a predicate typo) are dropped here.
     let union_to_physical = |requested_logical: &[ColumnName]| -> Vec<ColumnName> {
         let mut union_logical: Vec<ColumnName> = requested_logical.to_vec();
         let existing: HashSet<&ColumnName> = requested_logical.iter().collect();
@@ -233,7 +232,8 @@ impl StateInfo {
     /// 2633).
     /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
-    /// `stats` - Engine-facing stats output options.
+    /// `stats` - Engine-facing stats options. Drives which stats columns appear in scan
+    ///   metadata output and whether the JSON synthesis fallback fires.
     /// `partition_values` - Engine-facing partition value options. Drives whether the typed
     ///   `partitionValues_parsed` column appears in scan metadata output.
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed

@@ -93,17 +93,29 @@ pub use crate::parallel::parallel_scan_metadata::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
 };
 
-/// Configures stats fields in scan metadata output.
+/// Configures structured-stats output and JSON synthesis in scan metadata.
+/// Existing JSON passes through for commits and checkpoints without compatible structured stats
+/// unless stats are disabled.
 ///
 /// Most consumers should pick one of the named constructors:
-/// - [`Self::json_only`] (default) -- source JSON stats only.
-/// - [`Self::all_struct`] -- all indexed struct stats only.
-/// - [`Self::struct_columns`] -- selected struct stats only.
+/// - [`Self::json_only`] (default) -- JSON stats only.
+/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Compatible checkpoints omit
+///   JSON stats; commits and checkpoints without compatible structured stats pass existing JSON
+///   through.
+/// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
 /// - [`Self::all`] -- both representations.
-/// - [`Self::none`] -- neither representation.
+/// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
+///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
 #[derive(Clone, Debug)]
 pub struct StatsOptions {
-    /// Whether to include the source JSON `stats` field. Missing source JSON remains null.
+    /// Whether to surface JSON stats on parsed-stats checkpoints (where the
+    /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
+    /// re-serializes the struct stats into JSON so engines that read JSON stats
+    /// see a populated value; when false, JSON stats are left null on such
+    /// checkpoints and the engine consumes the struct stats directly.
+    ///
+    /// No effect on tables that write JSON stats directly, or on commit JSON --
+    /// the existing JSON is passed through regardless.
     pub(crate) synthesize_json: bool,
 
     /// Which struct stats columns to emit in `stats_parsed`.
@@ -113,7 +125,9 @@ pub struct StatsOptions {
 /// Which struct stats columns appear in `stats_parsed` in scan metadata output.
 #[derive(Clone, Debug)]
 pub enum StructStats {
-    /// Don't emit `stats_parsed`. Predicate-referenced stats may still be read for pruning.
+    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
+    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
+    /// disables stats reading entirely.
     None,
     /// Emit all indexed stats columns.
     All,
@@ -137,7 +151,9 @@ impl StatsOptions {
         Self::default()
     }
 
-    /// All indexed struct stats without JSON output.
+    /// All struct stats without JSON synthesis. Compatible checkpoints omit JSON stats and avoid
+    /// per-batch `ToJson`; commits and checkpoints without compatible structured stats pass
+    /// existing JSON through.
     pub fn all_struct() -> Self {
         Self {
             synthesize_json: false,
@@ -145,7 +161,8 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats projected to the specified indexed columns without JSON output.
+    /// Struct stats projected to the specified columns without JSON synthesis. Like
+    /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
@@ -153,7 +170,7 @@ impl StatsOptions {
         }
     }
 
-    /// Source JSON and all indexed struct stats.
+    /// Both JSON and struct stats. Pays for both representations.
     pub fn all() -> Self {
         Self {
             synthesize_json: true,
@@ -161,7 +178,12 @@ impl StatsOptions {
         }
     }
 
-    /// No stats output. Predicate-referenced stats may still be read for pruning.
+    /// **Disables all stats work**: no stats output, no internal data skipping (even
+    /// when a predicate is set). Kernel reads no stats columns from parquet at all.
+    /// Use when the engine handles its own pruning.
+    ///
+    /// To get internal predicate-based skipping without `stats_parsed` output, use
+    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `All`/`Columns(_)`.
     pub fn none() -> Self {
         Self {
             synthesize_json: false,
@@ -284,7 +306,8 @@ impl ScanBuilder {
     /// Configure stats output for the scan. See [`StatsOptions`].
     ///
     /// Defaults to [`StatsOptions::default`] (JSON only). Engines that consume
-    /// `stats_parsed` directly should pass [`StatsOptions::all_struct`].
+    /// `stats_parsed` directly should pass [`StatsOptions::all_struct`] so compatible
+    /// checkpoints omit JSON stats and skip `ToJson` synthesis.
     pub fn with_stats(mut self, stats: StatsOptions) -> Self {
         self.stats = stats;
         self
@@ -668,8 +691,6 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
-    /// Caller-facing `stats_parsed` shape derived from `StatsOptions`, excluding pruning-only
-    /// stats.
     physical_stats_output_schema: Option<SchemaRef>,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
@@ -690,12 +711,12 @@ fn build_physical_stats_output_schema(
         StructStats::Columns(columns) => {
             let logical_schema = table_configuration.logical_schema();
             let column_mapping_mode = table_configuration.column_mapping_mode();
-            let physical_columns = columns
+            let physical_columns: Vec<_> = columns
                 .iter()
                 .map(|column| {
                     get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
                 })
-                .try_collect::<_, Vec<_>, _>()?;
+                .try_collect()?;
             let stats_schema = table_configuration
                 .build_expected_stats_schemas(None, Some(&physical_columns))?
                 .physical;
@@ -1050,6 +1071,7 @@ impl Scan {
     ///
     /// Returns an error if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        let log_segment = self.snapshot.log_segment();
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
         let plan_executor = engine.plan_executor();
@@ -1058,7 +1080,14 @@ impl Scan {
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
         )?;
-        self.build_metadata_scan_plan(&shape)
+        scan_plan::build_metadata_scan_plan(
+            &self.state_info,
+            log_segment,
+            &shape,
+            &self.stats,
+            &self.partition_values,
+            self.physical_stats_output_schema.as_ref(),
+        )
     }
 
     // Factored out to facilitate testing
