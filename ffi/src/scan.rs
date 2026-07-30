@@ -1729,17 +1729,40 @@ mod tests {
             free_scan, scan_builder, scan_builder_build, scan_builder_with_predicate,
             scan_declarative_metadata_plan, EnginePredicate,
         };
+        use crate::error::EngineExecResult;
         use crate::expressions::kernel_visitor::{
             visit_expression_literal_bool, KernelExpressionVisitorState,
         };
-        use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
-        use crate::{free_engine, free_snapshot, OptionalValue};
+        use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
+        use crate::handle::Handle;
+        use crate::plans::result::CPlanResult;
+        use crate::plans::{get_plan_based_engine, get_plan_executor};
+        use crate::{
+            free_engine, free_snapshot, KernelBytesSlice, NullableCvoid, OptionalValue,
+            SharedExternEngine,
+        };
 
         extern "C" fn visit_false(
             _predicate: *mut c_void,
             state: &mut KernelExpressionVisitorState,
         ) -> usize {
             visit_expression_literal_bool(state, false)
+        }
+
+        extern "C" fn unreachable_executor(
+            _context: NullableCvoid,
+            _plan_proto: KernelBytesSlice,
+            _out: *mut EngineExecResult<CPlanResult>,
+        ) {
+            unreachable!("plan executor does not run: these tables have no checkpoint");
+        }
+
+        /// Wrap a fallback engine in a `PlanBasedEngine` so it exposes a `PlanExecutor`.
+        unsafe fn plan_based_engine(
+            fallback: &Handle<SharedExternEngine>,
+        ) -> Handle<SharedExternEngine> {
+            let executor = unsafe { get_plan_executor(None, unreachable_executor) };
+            unsafe { get_plan_based_engine(executor, fallback.shallow_copy(), allocate_err) }
         }
 
         #[tokio::test]
@@ -1753,9 +1776,10 @@ mod tests {
 
             let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
             let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+            let plan_engine = unsafe { plan_based_engine(&engine) };
 
             let result = unsafe {
-                scan_declarative_metadata_plan(scan.shallow_copy(), engine.shallow_copy())
+                scan_declarative_metadata_plan(scan.shallow_copy(), plan_engine.shallow_copy())
             };
             let bytes = match ok_or_panic(result) {
                 OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
@@ -1770,6 +1794,7 @@ mod tests {
 
             unsafe { free_scan(scan) };
             unsafe { free_snapshot(snapshot) };
+            unsafe { free_engine(plan_engine) };
             unsafe { free_engine(engine) };
         }
 
@@ -1795,9 +1820,10 @@ mod tests {
                 ))
             };
             let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+            let plan_engine = unsafe { plan_based_engine(&engine) };
 
             let result = unsafe {
-                scan_declarative_metadata_plan(scan.shallow_copy(), engine.shallow_copy())
+                scan_declarative_metadata_plan(scan.shallow_copy(), plan_engine.shallow_copy())
             };
             assert!(
                 matches!(ok_or_panic(result), OptionalValue::None),
@@ -1806,6 +1832,7 @@ mod tests {
 
             unsafe { free_scan(scan) };
             unsafe { free_snapshot(snapshot) };
+            unsafe { free_engine(plan_engine) };
             unsafe { free_engine(engine) };
         }
     }
