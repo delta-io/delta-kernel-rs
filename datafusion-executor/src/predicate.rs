@@ -1,69 +1,66 @@
-//! Conversion from a kernel [`Predicate`] to a boolean-valued DataFusion [`Expr`].
+//! Conversion from a kernel [`Predicate`](KernelPredicate) to a boolean-valued DataFusion
+//! [`Expr`](DFExpr).
 
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, disjunction};
-use datafusion::logical_expr::{binary_expr, lit, Expr, Operator};
+use datafusion::logical_expr::{binary_expr, lit, Expr as DFExpr, Operator};
 use delta_kernel::expressions::{
-    BinaryPredicate, BinaryPredicateOp, Expression, JunctionPredicate, JunctionPredicateOp,
-    Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
+    BinaryPredicate, BinaryPredicateOp, Expression as KernelExpression, JunctionPredicate,
+    JunctionPredicateOp, Predicate as KernelPredicate, Scalar as KernelScalar, UnaryPredicate,
+    UnaryPredicateOp,
 };
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
-use crate::expression::kernel_to_df_expr;
-use crate::scalar::kernel_to_df_scalar;
+use crate::expression::to_df_expr;
+use crate::scalar::to_df_scalar;
 
-/// Converts a kernel [`Predicate`] into a boolean-valued DataFusion [`Expr`], validating column
-/// references against `input_schema` (threaded to the expression converter).
+/// Converts a kernel [`Predicate`](KernelPredicate) into a boolean-valued DataFusion
+/// [`Expr`](DFExpr), validating column references against `input_schema` (threaded to the
+/// expression converter).
 ///
 /// # Errors
 /// Returns [`Error::unsupported`] for engine-defined (`Opaque`) or opaque-to-both (`Unknown`)
 /// predicates Also propagates any error from converting a child expression (an unresolved column
 /// reference, or an interval literal, which has no Arrow representation) and rejects an `IN`
 /// predicate whose right side is not a literal array.
-pub fn kernel_predicate_to_df_expr(
-    pred: &Predicate,
-    input_schema: &StructType,
-) -> DeltaResult<Expr> {
+pub fn to_df_predicate(pred: &KernelPredicate, input_schema: &StructType) -> DeltaResult<DFExpr> {
     match pred {
-        Predicate::BooleanExpression(expr) => kernel_to_df_expr(expr, input_schema),
-        Predicate::Not(inner) => Ok(Expr::Not(Box::new(kernel_predicate_to_df_expr(
-            inner,
-            input_schema,
-        )?))),
-        Predicate::Unary(unary) => kernel_unary_to_expr(unary, input_schema),
-        Predicate::Binary(binary) => kernel_binary_to_expr(binary, input_schema),
-        Predicate::Junction(junction) => kernel_junction_to_expr(junction, input_schema),
-        Predicate::Opaque(_) => Err(Error::unsupported(
+        KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema),
+        KernelPredicate::Not(inner) => {
+            Ok(DFExpr::Not(Box::new(to_df_predicate(inner, input_schema)?)))
+        }
+        KernelPredicate::Unary(unary) => unary_to_df_expr(unary, input_schema),
+        KernelPredicate::Binary(binary) => binary_to_df_expr(binary, input_schema),
+        KernelPredicate::Junction(junction) => junction_to_df_expr(junction, input_schema),
+        KernelPredicate::Opaque(_) => Err(Error::unsupported(
             "cannot convert an engine-defined Opaque predicate",
         )),
-        Predicate::Unknown(name) => Err(Error::unsupported(format!(
+        KernelPredicate::Unknown(name) => Err(Error::unsupported(format!(
             "cannot convert Unknown predicate {name:?}"
         ))),
     }
 }
 
 /// Lowers a unary predicate.
-fn kernel_unary_to_expr(unary: &UnaryPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
-    let expr = kernel_to_df_expr(&unary.expr, input_schema)?;
+fn unary_to_df_expr(unary: &UnaryPredicate, input_schema: &StructType) -> DeltaResult<DFExpr> {
+    let expr = to_df_expr(&unary.expr, input_schema)?;
     Ok(match unary.op {
-        UnaryPredicateOp::IsNull => Expr::IsNull(Box::new(expr)),
+        UnaryPredicateOp::IsNull => DFExpr::IsNull(Box::new(expr)),
     })
 }
 
 /// Lowers a binary predicate.
-fn kernel_binary_to_expr(binary: &BinaryPredicate, input_schema: &StructType) -> DeltaResult<Expr> {
+fn binary_to_df_expr(binary: &BinaryPredicate, input_schema: &StructType) -> DeltaResult<DFExpr> {
     let op = match binary.op {
-        BinaryPredicateOp::In => {
-            return kernel_in_to_expr(&binary.left, &binary.right, input_schema)
-        }
+        BinaryPredicateOp::In => return in_to_df_expr(&binary.left, &binary.right, input_schema),
         BinaryPredicateOp::Equal => Operator::Eq,
         BinaryPredicateOp::LessThan => Operator::Lt,
         BinaryPredicateOp::GreaterThan => Operator::Gt,
         BinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
     };
-    let left = kernel_to_df_expr(&binary.left, input_schema)?;
-    let right = kernel_to_df_expr(&binary.right, input_schema)?;
+    let left = to_df_expr(&binary.left, input_schema)?;
+    let right = to_df_expr(&binary.right, input_schema)?;
     Ok(binary_expr(left, op, right))
 }
 
@@ -74,12 +71,12 @@ fn kernel_binary_to_expr(binary: &BinaryPredicate, input_schema: &StructType) ->
 ///
 /// # Errors
 /// Returns [`Error::unsupported`] if the right operand is not a literal array.
-fn kernel_in_to_expr(
-    value: &Expression,
-    list: &Expression,
+fn in_to_df_expr(
+    value: &KernelExpression,
+    list: &KernelExpression,
     input_schema: &StructType,
-) -> DeltaResult<Expr> {
-    let Expression::Literal(Scalar::Array(array)) = list else {
+) -> DeltaResult<DFExpr> {
+    let KernelExpression::Literal(KernelScalar::Array(array)) = list else {
         return Err(Error::unsupported(
             "converting an IN predicate requires a literal array on the right-hand side",
         ));
@@ -87,22 +84,26 @@ fn kernel_in_to_expr(
     let elements = array
         .array_elements()
         .iter()
-        .map(|scalar| Ok(lit(kernel_to_df_scalar(scalar)?)))
+        .map(|scalar| Ok(lit(to_df_scalar(scalar)?)))
         .collect::<DeltaResult<Vec<_>>>()?;
-    let value = kernel_to_df_expr(value, input_schema)?;
-    Ok(Expr::InList(InList::new(Box::new(value), elements, false)))
+    let value = to_df_expr(value, input_schema)?;
+    Ok(DFExpr::InList(InList::new(
+        Box::new(value),
+        elements,
+        false,
+    )))
 }
 
 /// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
 /// left-associative [`conjunction`]/[`disjunction`] helpers.
-fn kernel_junction_to_expr(
+fn junction_to_df_expr(
     junction: &JunctionPredicate,
     input_schema: &StructType,
-) -> DeltaResult<Expr> {
+) -> DeltaResult<DFExpr> {
     let preds = junction
         .preds
         .iter()
-        .map(|pred| kernel_predicate_to_df_expr(pred, input_schema))
+        .map(|pred| to_df_predicate(pred, input_schema))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(match junction.op {
         // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics
@@ -133,9 +134,7 @@ mod tests {
 
     /// Lowers a predicate against [`test_schema`] and renders it as a DataFusion `Display` string.
     fn lower(pred: Pred) -> String {
-        kernel_predicate_to_df_expr(&pred, &test_schema())
-            .unwrap()
-            .to_string()
+        to_df_predicate(&pred, &test_schema()).unwrap().to_string()
     }
 
     #[rstest]
@@ -177,13 +176,17 @@ mod tests {
     fn in_lowers_to_in_list() {
         let array = ArrayData::try_new(
             ArrayType::new(DataType::LONG, false),
-            vec![Scalar::Long(1), Scalar::Long(2), Scalar::Long(3)],
+            vec![
+                KernelScalar::Long(1),
+                KernelScalar::Long(2),
+                KernelScalar::Long(3),
+            ],
         )
         .unwrap();
         let kernel = Pred::binary(
             BinaryPredicateOp::In,
             column_expr!("a"),
-            Expr_::literal(Scalar::Array(array)),
+            Expr_::literal(KernelScalar::Array(array)),
         );
         assert_eq!(lower(kernel), "a IN ([Int64(1), Int64(2), Int64(3)])");
     }
@@ -192,13 +195,13 @@ mod tests {
     fn not_in_lowers_to_negated_in_list() {
         let array = ArrayData::try_new(
             ArrayType::new(DataType::LONG, false),
-            vec![Scalar::Long(1), Scalar::Long(2)],
+            vec![KernelScalar::Long(1), KernelScalar::Long(2)],
         )
         .unwrap();
         let inner = Pred::binary(
             BinaryPredicateOp::In,
             column_expr!("a"),
-            Expr_::literal(Scalar::Array(array)),
+            Expr_::literal(KernelScalar::Array(array)),
         );
         assert_eq!(lower(Pred::not(inner)), "NOT a IN ([Int64(1), Int64(2)])");
     }
@@ -233,6 +236,6 @@ mod tests {
 
     #[test]
     fn unknown_predicate_is_unsupported() {
-        kernel_predicate_to_df_expr(&Pred::Unknown("mystery".into()), &test_schema()).unwrap_err();
+        to_df_predicate(&Pred::Unknown("mystery".into()), &test_schema()).unwrap_err();
     }
 }
