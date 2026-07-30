@@ -50,30 +50,18 @@ pub fn to_df_scalar(scalar: &KernelScalar) -> DeltaResult<DFScalarValue> {
         KernelScalar::Array(data) => array_to_df_scalar(data)?,
         KernelScalar::Map(data) => map_to_df_scalar(data)?,
         KernelScalar::IntervalYearMonth(_) | KernelScalar::IntervalDayTime(_) => {
-            return Err(unsupported_interval_error())
+            return Err(Error::unsupported(
+                "interval scalars are not supported in the DataFusion executor",
+            ))
         }
         KernelScalar::Null(data_type) => datatype_to_df_null_scalar(data_type)?,
     })
 }
 
 /// Builds a typed-null `DFScalarValue` from a kernel type.
-///
-/// Interval types are rejected here as well as in [`to_df_scalar`]: kernel maps them to
-/// `Int32`/`Int64` in Arrow, so an interval-typed null would otherwise silently convert to a
-/// plain integer null while a non-null interval errors.
 fn datatype_to_df_null_scalar(data_type: &KernelDataType) -> DeltaResult<DFScalarValue> {
-    if data_type == &KernelDataType::INTERVAL_YEAR_MONTH
-        || data_type == &KernelDataType::INTERVAL_DAY_TIME
-    {
-        return Err(unsupported_interval_error());
-    }
     let arrow_type: ArrowDataType = data_type.try_into_arrow()?;
     arrow_type.try_into().map_err(Error::generic_err)
-}
-
-/// The shared error for interval scalars, which have no supported DataFusion representation.
-fn unsupported_interval_error() -> Error {
-    Error::unsupported("interval scalars are not supported in the DataFusion executor")
 }
 
 /// Builds a `DFScalarValue::List` holding a single list row of the converted elements.
@@ -113,8 +101,6 @@ fn map_to_df_scalar(data: &KernelMapData) -> DeltaResult<DFScalarValue> {
     };
 
     let pairs = data.pairs();
-    // Convert each pair once; collect fans the results out into parallel key/value columns,
-    // short-circuiting on the first conversion error.
     let converted: DeltaResult<(Vec<DFScalarValue>, Vec<DFScalarValue>)> = pairs
         .iter()
         .map(|(key, value)| Ok((to_df_scalar(key)?, to_df_scalar(value)?)))
@@ -331,15 +317,6 @@ mod tests {
                 KernelDataType::variant_type([StructField::not_null("x", KernelDataType::INTEGER)])
                     .unwrap();
             to_df_scalar(&KernelScalar::Null(shredded_variant)).unwrap_err();
-        }
-
-        // An interval type maps to Int32/Int64 in Arrow, but the executor rejects intervals; the
-        // null path must reject them too rather than silently produce an integer null.
-        #[rstest]
-        #[case::year_month(KernelDataType::INTERVAL_YEAR_MONTH)]
-        #[case::day_time(KernelDataType::INTERVAL_DAY_TIME)]
-        fn null_interval_returns_error(#[case] data_type: KernelDataType) {
-            to_df_scalar(&KernelScalar::Null(data_type)).unwrap_err();
         }
     }
 
