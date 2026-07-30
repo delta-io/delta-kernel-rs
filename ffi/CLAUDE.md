@@ -182,3 +182,37 @@ Feature flags:
 - `arrow-59`, `arrow-58`
 - `delta-kernel-unity-catalog`
 - `tracing`
+
+## Testing under Miri
+
+CI runs this crate's tests under Miri (the `miri` job in `build.yml`) to catch undefined
+behavior in the `unsafe` FFI boundary: raw-pointer reads/writes, `unsafe impl Send/Sync`,
+`Handle` conversions (`as_ref` / `clone_as_arc` / `into_inner`), and `free_*`. Miri is a MIR
+interpreter, so it runs 10x-100x slower than native and is billed by the interpreted
+instruction, not wall-clock work.
+
+The consequence: a test is expensive under Miri in proportion to how much *code it executes*,
+not how much it asserts. Tests that construct heavyweight but **safe** machinery -- a
+reqwest/rustls client (crypto init), a multi-threaded tokio runtime, an Arrow/parquet write --
+cost minutes under the interpreter while exercising none of our `unsafe`. That time buys no
+UB detection.
+
+Guidance for adding or triaging FFI tests:
+
+- **Keep under Miri** any test that executes `unsafe` whose correctness Miri can check. This is
+  the reason the job exists; do not skip these for speed.
+- **`#[cfg_attr(miri, ignore)]` is legitimate for two reasons, and only these two:**
+  1. Miri cannot run it (e.g. an unsupported foreign function like `linkat`).
+  2. The test executes no `unsafe`, OR only `unsafe` that a kept test already covers, AND it is
+     expensive under Miri. Skipping for cost alone (without the coverage argument) is not
+     acceptable -- it silently drops UB coverage.
+- When you skip under reason 2, **prove the coverage is preserved**: the kept tests' set of
+  `unsafe` FFI functions must be a superset of the skipped test's. Name the covering test in the
+  `ignore` reason or a nearby comment so a future reader can re-check it.
+- Prefer picking the **cheapest** test that crosses a given `unsafe` path over keeping several
+  that cross the same path with more safe work each.
+- `rest_engine` and the checkpoint tests in `lib.rs` document worked examples of this split.
+- `-Zmiri-provenance-gc=1000000` on the Miri step is a pure speed knob (GC frequency) and does
+  not weaken detection. Do NOT add `-Zmiri-disable-stacked-borrows`, `-disable-validation`,
+  `-disable-data-race-detector`, or `-Zmiri-preemption-rate=0`: the first three are unsound, and
+  the last reduces data-race schedule exploration.
