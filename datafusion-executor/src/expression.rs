@@ -1,7 +1,5 @@
 //! Conversion from a kernel [`Expression`](KernelExpression) to a DataFusion [`Expr`](DFExpr).
 
-// Each foreign type is aliased with its source crate (`Kernel*`/`DF*`) so every use site reads
-// unambiguously across the two crates this converter bridges.
 use datafusion::common::Column as DFColumn;
 use datafusion::functions::core::expr_fn::{coalesce, get_field_path};
 use datafusion::functions_nested::expr_fn::make_array;
@@ -123,7 +121,7 @@ fn variadic_to_df_expr(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{column_expr, Expression as Expr_};
+    use delta_kernel::expressions::{column_expr, Expression as KernelExpr};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use rstest::rstest;
 
@@ -148,92 +146,88 @@ mod tests {
 
     /// Lowers an expression against [`test_schema`] and renders it as a DataFusion `Display`
     /// string.
-    fn lower(expr: Expr_) -> String {
+    fn lower(expr: KernelExpr) -> String {
         to_df_expr(&expr, &test_schema()).unwrap().to_string()
     }
 
     #[rstest]
-    #[case::i32(Expr_::literal(7i32), "Int32(7)")]
-    #[case::i64(Expr_::literal(42i64), "Int64(42)")]
-    #[case::string(Expr_::literal("abc"), "Utf8(\"abc\")")]
-    #[case::boolean(Expr_::literal(true), "Boolean(true)")]
-    #[case::null(Expr_::null_literal(DataType::LONG), "Int64(NULL)")]
-    fn literal_lowers_to_scalar(#[case] kernel: Expr_, #[case] expected: &str) {
+    #[case::i32(KernelExpr::literal(7i32), "Int32(7)")]
+    #[case::i64(KernelExpr::literal(42i64), "Int64(42)")]
+    #[case::string(KernelExpr::literal("abc"), "Utf8(\"abc\")")]
+    #[case::boolean(KernelExpr::literal(true), "Boolean(true)")]
+    #[case::null(KernelExpr::null_literal(DataType::LONG), "Int64(NULL)")]
+    fn literal_lowers_to_scalar(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     #[rstest]
-    #[case::single(Expr_::column(["a"]), "a")]
-    #[case::depth_2(Expr_::column(["a", "b"]), "get_field(a, Utf8(\"b\"))")]
+    #[case::single(KernelExpr::column(["a"]), "a")]
+    #[case::depth_2(KernelExpr::column(["a", "b"]), "get_field(a, Utf8(\"b\"))")]
     #[case::depth_3(
-        Expr_::column(["a", "b", "c"]),
+        KernelExpr::column(["a", "b", "c"]),
         "get_field(a, Utf8(\"b\"), Utf8(\"c\"))"
     )]
-    fn column_lowers_to_nested_field_access(#[case] kernel: Expr_, #[case] expected: &str) {
+    fn column_lowers_to_nested_field_access(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     #[rstest]
-    #[case::plus(column_expr!("a") + Expr_::literal(1i64), "a + Int64(1)")]
-    #[case::minus(column_expr!("a") - Expr_::literal(1i64), "a - Int64(1)")]
-    #[case::multiply(column_expr!("a") * Expr_::literal(2i64), "a * Int64(2)")]
-    #[case::divide(column_expr!("a") / Expr_::literal(2i64), "a / Int64(2)")]
-    fn arithmetic_binary_lowers_to_binary_expr(#[case] kernel: Expr_, #[case] expected: &str) {
+    #[case::plus(column_expr!("a") + KernelExpr::literal(1i64), "a + Int64(1)")]
+    #[case::minus(column_expr!("a") - KernelExpr::literal(1i64), "a - Int64(1)")]
+    #[case::multiply(column_expr!("a") * KernelExpr::literal(2i64), "a * Int64(2)")]
+    #[case::divide(column_expr!("a") / KernelExpr::literal(2i64), "a / Int64(2)")]
+    fn arithmetic_binary_lowers_to_binary_expr(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
-    /// Nested arithmetic lowers to the matching operator tree. DataFusion's `Display`
-    /// parenthesizes a child only when its precedence is strictly lower than the parent's, so the
-    /// `precedence_pins_grouping` case is deliberate: lower-precedence `Plus`/`Minus` operands
-    /// under a higher-precedence `Multiply` MUST print parentheses, which makes the assertion
-    /// sensitive to re-association -- a wrongly-flattened tree renders differently.
+    /// Nested arithmetic lowers to the matching operator tree.
     #[rstest]
     #[case::precedence_pins_grouping(
-        (column_expr!("x") + Expr_::literal(1i64)) * (column_expr!("b") - Expr_::literal(2i64)),
+        (column_expr!("x") + KernelExpr::literal(1i64)) * (column_expr!("b") - KernelExpr::literal(2i64)),
         "(x + Int64(1)) * (b - Int64(2))"
     )]
     #[case::nested_field_and_all_ops(
-        (Expr_::column(["a", "b", "c"]) * Expr_::literal(5i64)
+        (KernelExpr::column(["a", "b", "c"]) * KernelExpr::literal(5i64)
             - (column_expr!("b") + column_expr!("x")))
-            / Expr_::literal(20i64),
+            / KernelExpr::literal(20i64),
         "(get_field(a, Utf8(\"b\"), Utf8(\"c\")) * Int64(5) - b + x) / Int64(20)"
     )]
-    fn nested_arithmetic_lowers_to_operator_tree(#[case] kernel: Expr_, #[case] expected: &str) {
+    fn nested_arithmetic_lowers_to_operator_tree(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     #[rstest]
     #[case::coalesce(
-        Expr_::coalesce([column_expr!("a"), column_expr!("b"), Expr_::literal(0i64)]),
+        KernelExpr::coalesce([column_expr!("a"), column_expr!("b"), KernelExpr::literal(0i64)]),
         "coalesce(a, b, Int64(0))"
     )]
     #[case::array(
-        Expr_::array([Expr_::literal(1i64), Expr_::literal(2i64)]),
+        KernelExpr::array([KernelExpr::literal(1i64), KernelExpr::literal(2i64)]),
         "make_array(Int64(1), Int64(2))"
     )]
     #[case::nested_coalesce(
-        Expr_::coalesce([Expr_::coalesce([column_expr!("a"), column_expr!("b")]), column_expr!("x")]),
+        KernelExpr::coalesce([KernelExpr::coalesce([column_expr!("a"), column_expr!("b")]), column_expr!("x")]),
         "coalesce(coalesce(a, b), x)"
     )]
     #[case::nested_array(
-        Expr_::array([
-            Expr_::array([Expr_::literal(1i64), Expr_::literal(2i64)]),
-            Expr_::array([Expr_::literal(3i64), Expr_::literal(4i64)]),
+        KernelExpr::array([
+            KernelExpr::array([KernelExpr::literal(1i64), KernelExpr::literal(2i64)]),
+            KernelExpr::array([KernelExpr::literal(3i64), KernelExpr::literal(4i64)]),
         ]),
         "make_array(make_array(Int64(1), Int64(2)), make_array(Int64(3), Int64(4)))"
     )]
-    fn variadic_lowers_to_call(#[case] kernel: Expr_, #[case] expected: &str) {
+    fn variadic_lowers_to_call(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     /// A column reference that does not resolve against the input schema fails at conversion time,
     /// not later during DataFusion analysis. Covers each `field_at` failure mode.
     #[rstest]
-    #[case::empty(Expr_::Column(KernelColumnName::default()))]
-    #[case::unknown_root(Expr_::column(["nope"]))]
-    #[case::unknown_nested(Expr_::column(["a", "b", "missing"]))]
-    #[case::descend_into_non_struct(Expr_::column(["x", "y"]))]
-    fn unresolved_column_is_an_error(#[case] kernel: Expr_) {
+    #[case::empty(KernelExpr::Column(KernelColumnName::default()))]
+    #[case::unknown_root(KernelExpr::column(["nope"]))]
+    #[case::unknown_nested(KernelExpr::column(["a", "b", "missing"]))]
+    #[case::descend_into_non_struct(KernelExpr::column(["x", "y"]))]
+    fn unresolved_column_is_an_error(#[case] kernel: KernelExpr) {
         to_df_expr(&kernel, &test_schema()).unwrap_err();
     }
 }
