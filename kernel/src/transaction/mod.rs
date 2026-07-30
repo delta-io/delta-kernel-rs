@@ -1551,10 +1551,11 @@ fn build_remove_struct_patch(
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
 ) -> DeltaResult<ExpressionStructPatch> {
+    // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
+    // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
     let extended_file_metadata = Predicate::and_from([
         col!(SIZE_NAME).is_not_null(),
         col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-        col!(FILE_CONSTANT_VALUES_NAME, TAGS_NAME).is_not_null(),
     ]);
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
@@ -2046,7 +2047,6 @@ mod tests {
         let expected = Expression::from_pred(Predicate::and_from([
             col!(SIZE_NAME).is_not_null(),
             col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
-            col!(FILE_CONSTANT_VALUES_NAME, TAGS_NAME).is_not_null(),
         ]));
         assert_eq!(extended_file_metadata.as_ref(), &expected);
         Ok(())

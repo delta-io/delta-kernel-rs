@@ -198,26 +198,27 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Verifies `extendedFileMetadata` is true exactly when `size`, `partitionValues`, and `tags`
-/// are all present.
+/// Verifies `extendedFileMetadata` is true exactly when `size` and `partitionValues` are present;
+/// `tags` does not affect it.
 #[rstest::rstest]
-#[case::all_present(&[])]
-#[case::missing_size(&[ExtendedMetadataField::Size])]
-#[case::missing_partition_values(&[ExtendedMetadataField::PartitionValues])]
-#[case::missing_tags(&[ExtendedMetadataField::Tags])]
+#[case::all_present(&[], true)]
+#[case::missing_size(&[ExtendedMetadataField::Size], false)]
+#[case::missing_partition_values(&[ExtendedMetadataField::PartitionValues], false)]
+#[case::missing_tags(&[ExtendedMetadataField::Tags], true)]
 #[case::only_size(&[
     ExtendedMetadataField::PartitionValues,
     ExtendedMetadataField::Tags,
-])]
-#[case::only_partition_values(&[ExtendedMetadataField::Size, ExtendedMetadataField::Tags])]
+], false)]
+#[case::only_partition_values(&[ExtendedMetadataField::Size, ExtendedMetadataField::Tags], false)]
 #[case::only_tags(&[
     ExtendedMetadataField::Size,
     ExtendedMetadataField::PartitionValues,
-])]
-#[case::none_present(&ExtendedMetadataField::ALL)]
+], false)]
+#[case::none_present(&ExtendedMetadataField::ALL, false)]
 #[tokio::test]
 async fn test_remove_scanned_file_sets_extended_metadata(
     #[case] missing_fields: &[ExtendedMetadataField],
+    #[case] expected_extended_file_metadata: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
@@ -257,7 +258,10 @@ async fn test_remove_scanned_file_sets_extended_metadata(
     let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
     assert_eq!(remove_actions.len(), 1);
     let remove = &remove_actions[0];
-    assert_eq!(remove["extendedFileMetadata"], missing_fields.is_empty());
+    assert_eq!(
+        remove["extendedFileMetadata"],
+        expected_extended_file_metadata
+    );
     for field in ExtendedMetadataField::ALL {
         let present = remove
             .get(field.name())
