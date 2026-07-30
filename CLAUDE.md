@@ -81,9 +81,6 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
-- `interval-type-in-dev` -- ANSI interval type support (experimental, in development). With the
-  cargo feature off, creating or writing tables with interval columns is blocked; reads are
-  unaffected.
 - `geo-type-in-dev` -- geospatial type support (geometry and geography columns) (experimental,
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported

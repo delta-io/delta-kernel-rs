@@ -258,8 +258,8 @@ jobs:
         if: matrix.config == 'no-declarative-plans'
         shell: bash
         run: |
-          cargo nextest run --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,interval-type-in-dev,default-engine-base -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
-          cargo test --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,interval-type-in-dev,default-engine-base --doc
+          cargo nextest run --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,default-engine-base -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+          cargo test --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,default-engine-base --doc
 
   # Fails red on trybuild drift, but kept out of required checks so it never blocks a merge.
   invalid-handle-code:

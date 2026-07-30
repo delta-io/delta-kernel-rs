@@ -943,7 +943,6 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     Ok(())
 }
 
-#[cfg(feature = "interval-type-in-dev")]
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
