@@ -140,17 +140,14 @@ pub(crate) fn build_metadata_scan_plan(
 ///            stats_parsed, partitionValues_parsed
 ///          ),
 ///          add.stats_parsed AS stats_parsed,
-///          COALESCE(
-///            add.partitionValues_parsed,
-///            MAP_TO_STRUCT(add.partitionValues, partition_schema)
-///          ) AS partitionValues_parsed
+///          MAP_TO_STRUCT(add.partitionValues, partition_schema) AS partitionValues_parsed
 ///        ) AS add,
 ///        version, add.path IS NOT NULL AS is_add, file_key(add) AS key
 /// FROM checkpoint_actions
 /// WHERE add.path IS NOT NULL
 ///
 /// When the checkpoint lacks native parsed stats, `FROM_JSON(add.stats, stats_schema)`
-/// replaces `add.stats_parsed` above.
+/// replaces `add.stats_parsed` above. A parsed field is omitted when its schema is absent.
 fn checkpoint_arm(
     log_segment: &LogSegment,
     shape: &CheckpointShape,
@@ -214,6 +211,8 @@ fn checkpoint_arm(
 ///        file_key(COALESCE(add, remove)) AS key
 /// FROM json_commits
 /// WHERE add.path IS NOT NULL OR remove.path IS NOT NULL
+///
+/// A parsed field is omitted when its schema is absent.
 fn commit_arm(
     log_segment: &LogSegment,
     stats_schema: Option<&SchemaRef>,
@@ -463,10 +462,11 @@ fn metadata_output_projection(
         StructStats::None if has_stats_parsed => projection.drop(STATS_PARSED),
         StructStats::None => projection,
         StructStats::Columns(_) | StructStats::All => match physical_stats_output_schema {
+            // Use the output stats schema computed in [`StateInfo`]
             Some(stats_schema) => projection.replace(
                 STATS_PARSED,
                 StructField::nullable(STATS_PARSED, stats_schema.as_ref().clone()),
-                project_struct(column_name!("add.stats_parsed"), stats_schema),
+                project_nested_struct_to_schema(column_name!("add.stats_parsed"), stats_schema),
             ),
             None if has_stats_parsed => projection.drop(STATS_PARSED),
             None => projection,
@@ -478,7 +478,10 @@ fn metadata_output_projection(
         (true, Some(partition_schema)) => projection.replace(
             PARTITION_VALUES_PARSED,
             StructField::nullable(PARTITION_VALUES_PARSED, partition_schema.as_ref().clone()),
-            project_struct(column_name!("add.partitionValues_parsed"), partition_schema),
+            project_nested_struct_to_schema(
+                column_name!("add.partitionValues_parsed"),
+                partition_schema,
+            ),
         ),
         (false, Some(_)) => projection.drop(PARTITION_VALUES_PARSED),
         // No partition schema means the table is unpartitioned, so there is no typed field.
@@ -493,11 +496,13 @@ fn metadata_output_projection(
     Ok((Arc::new(Expr::struct_from([add_expr])), schema))
 }
 
-fn project_struct(root: ColumnName, schema: &StructType) -> Expr {
+/// Rebuilds `root` to match a narrowed schema while preserving a null parent struct. A direct
+/// column reference would retain fields not requested by the caller.
+fn project_nested_struct_to_schema(root: ColumnName, schema: &StructType) -> Expr {
     let fields = schema.fields().map(|field| {
         let column = root.join(&ColumnName::new([field.name()]));
         match field.data_type() {
-            DataType::Struct(schema) => project_struct(column, schema),
+            DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
             _ => Expr::from(column),
         }
     });
@@ -593,23 +598,6 @@ mod tests {
             partition_values,
         )
         .expect("state info")
-    }
-
-    fn build_plan(
-        state: &StateInfo,
-        log_segment: &LogSegment,
-        shape: &CheckpointShape,
-        stats: &StatsOptions,
-        partition_values: &PartitionValuesOptions,
-    ) -> DeltaResult<Option<Plan>> {
-        build_metadata_scan_plan(
-            state,
-            log_segment,
-            shape,
-            stats,
-            partition_values,
-            state.physical_stats_schema.as_ref(),
-        )
     }
 
     fn data_schema() -> SchemaRef {
@@ -824,8 +812,15 @@ mod tests {
             &["file:///_delta_log/00000000000000000001.json"],
             Some(checkpoint_path(file_type)),
         );
-        let plan =
-            build_plan(&state, &segment, &shape, &stats, &partition_values)?.expect("non-empty");
+        let plan = build_metadata_scan_plan(
+            &state,
+            &segment,
+            &shape,
+            &stats,
+            &partition_values,
+            state.physical_stats_schema.as_ref(),
+        )?
+        .expect("non-empty");
 
         let mut expected: Vec<&str> = COMMIT_ARM_TAGS.to_vec();
         expected.extend(checkpoint_arm_tags);
@@ -851,12 +846,13 @@ mod tests {
             partition_values.clone(),
         );
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(FileType::Parquet)));
-        let plan = build_plan(
+        let plan = build_metadata_scan_plan(
             &state,
             &segment,
             &shape(CheckpointType::Manifest, parsed_stats),
             &stats,
             &partition_values,
+            state.physical_stats_schema.as_ref(),
         )?
         .expect("non-empty");
 
@@ -897,12 +893,13 @@ mod tests {
             &["file:///_delta_log/00000000000000000001.json"],
             None,
         );
-        let plan = build_plan(
+        let plan = build_metadata_scan_plan(
             &state,
             &segment,
             &no_checkpoint(),
             &stats,
             &partition_values,
+            state.physical_stats_schema.as_ref(),
         )?
         .expect("non-empty");
         assert_eq!(tags(&plan), COMMIT_ARM_TAGS.to_vec());
@@ -929,8 +926,15 @@ mod tests {
             partition_values.clone(),
         );
         let segment = log_segment(log_root(), &[], Some(checkpoint_path(file_type)));
-        let plan =
-            build_plan(&state, &segment, &shape, &stats, &partition_values)?.expect("non-empty");
+        let plan = build_metadata_scan_plan(
+            &state,
+            &segment,
+            &shape,
+            &stats,
+            &partition_values,
+            state.physical_stats_schema.as_ref(),
+        )?
+        .expect("non-empty");
         assert_eq!(tags(&plan), checkpoint_arm_tags);
         Ok(())
     }
@@ -947,12 +951,13 @@ mod tests {
             partition_values.clone(),
         );
         let segment = log_segment(log_root(), &[], None);
-        assert!(build_plan(
+        assert!(build_metadata_scan_plan(
             &state,
             &segment,
             &no_checkpoint(),
             &stats,
             &partition_values,
+            state.physical_stats_schema.as_ref(),
         )?
         .is_none());
         Ok(())
@@ -971,12 +976,13 @@ mod tests {
         );
         assert_eq!(state.physical_predicate, PhysicalPredicate::StaticSkipAll);
         let segment = log_segment(log_root(), &[], None);
-        assert!(build_plan(
+        assert!(build_metadata_scan_plan(
             &state,
             &segment,
             &shape(CheckpointType::Leaf, None),
             &stats,
             &partition_values,
+            state.physical_stats_schema.as_ref(),
         )?
         .is_none());
         Ok(())
@@ -1023,12 +1029,13 @@ mod tests {
             ],
             None,
         );
-        let plan = build_plan(
+        let plan = build_metadata_scan_plan(
             &state,
             &segment,
             &no_checkpoint(),
             &stats,
             &partition_values,
+            state.physical_stats_schema.as_ref(),
         )?
         .expect("non-empty");
 
@@ -1086,13 +1093,14 @@ mod tests {
             &[],
             Some("memory:///_delta_log/00000000000000000000.checkpoint.parquet"),
         );
-        let plan = build_plan(
+        let plan = build_metadata_scan_plan(
             &state,
             &segment,
             // Leaf with no compatible parsed stats -> parse add.stats instead.
             &shape(CheckpointType::Leaf, None),
             &stats,
             &partition_values,
+            state.physical_stats_schema.as_ref(),
         )?
         .expect("non-empty");
 

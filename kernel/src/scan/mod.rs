@@ -699,6 +699,9 @@ pub struct Scan {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
+/// Builds the caller-visible physical `stats_parsed` schema. Unlike
+/// `StateInfo::physical_stats_schema`, it excludes predicate-only columns. Returns `None` when no
+/// eligible struct stats are requested and errors if a requested column cannot be resolved.
 fn build_physical_stats_output_schema(
     table_configuration: &TableConfiguration,
     state_info: &StateInfo,
