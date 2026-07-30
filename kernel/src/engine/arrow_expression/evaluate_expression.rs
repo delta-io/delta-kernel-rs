@@ -1091,17 +1091,19 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, LargeStringArray, MapBuilder,
-        StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StructArray,
+        TimestampMicrosecondArray,
     };
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        col, column_expr, column_expr_ref, lit, BinaryExpressionOp, Expression as Expr,
-        ExpressionStructPatchBuilder,
+        col, column_expr, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
+        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, Predicate as Pred,
     };
-    use crate::schema::{schema, schema_ref, DataType, StructField, StructType};
+    use crate::schema::{schema, schema_ref, ArrayType, DataType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     fn create_test_batch() -> RecordBatch {
@@ -1866,6 +1868,224 @@ mod tests {
         assert_result_error_with_message(result, "Incorrect datatype");
     }
 
+    fn divide(left: Expr, right: Expr) -> Expr {
+        Expr::binary(BinaryExpressionOp::Divide, left, right)
+    }
+
+    #[rstest]
+    #[case::equal_non_null(Some(1), Some(1), false)]
+    #[case::unequal_non_null(Some(1), Some(2), true)]
+    #[case::both_null(None, None, false)]
+    #[case::left_null(None, Some(1), true)]
+    #[case::right_null(Some(1), None, true)]
+    fn test_distinct_is_null_safe(
+        #[case] left: Option<i32>,
+        #[case] right: Option<i32>,
+        #[case] expected: bool,
+    ) {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("l", ArrowDataType::Int32, true),
+            ArrowField::new("r", ArrowDataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![left])),
+                Arc::new(Int32Array::from(vec![right])),
+            ],
+        )
+        .unwrap();
+
+        let pred = Pred::distinct(column_expr!("l"), column_expr!("r"));
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(result.value(0), expected);
+    }
+
+    /// `{ n: 1 }` plus a `list` column holding `[1, 2]`, covering both element sources `IN`
+    /// accepts.
+    fn in_batch() -> RecordBatch {
+        let item = Arc::new(ArrowField::new("item", ArrowDataType::Int32, true));
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        );
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("n", ArrowDataType::Int32, true),
+            ArrowField::new("list", ArrowDataType::List(item), true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![1])), Arc::new(list)],
+        )
+        .unwrap()
+    }
+
+    fn int_array_literal() -> Expr {
+        let elements =
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), vec![1, 2]).unwrap();
+        Expr::Literal(Scalar::Array(elements))
+    }
+
+    /// A NULL needle is not null-propagating: it answers `false` rather than NULL.
+    #[rstest]
+    #[case::present_in_literal_array(Some(2), true, true)]
+    #[case::absent_from_literal_array(Some(9), false, true)]
+    #[case::null_needle_in_literal_array(None, false, true)]
+    #[case::present_in_list_column(Some(2), true, false)]
+    #[case::absent_from_list_column(Some(9), false, false)]
+    #[case::null_needle_in_list_column(None, false, false)]
+    fn test_in_matches_membership_and_never_nulls(
+        #[case] needle: Option<i32>,
+        #[case] expected: bool,
+        #[case] literal_elements: bool,
+    ) {
+        let batch = in_batch();
+        let needle = match needle {
+            Some(n) => lit(n),
+            None => Expr::null_literal(DataType::INTEGER),
+        };
+        let elements = if literal_elements {
+            int_array_literal()
+        } else {
+            column_expr!("list")
+        };
+
+        let pred = Pred::binary(BinaryPredicateOp::In, needle, elements);
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(result.value(0), expected);
+    }
+
+    /// Only a literal left operand is supported, so a column needle is rejected regardless of where
+    /// the elements come from, as is a right operand that holds no elements at all.
+    #[rstest]
+    #[case::column_in_literal_array(int_array_literal())]
+    #[case::column_in_column(column_expr!("list"))]
+    #[case::non_array_right_operand(lit(1))]
+    fn test_in_rejects_unsupported_operand_shapes(#[case] elements: Expr) {
+        let pred = Pred::binary(BinaryPredicateOp::In, column_expr!("n"), elements);
+        assert_result_error_with_message(
+            evaluate_predicate(&pred, &in_batch(), false),
+            "Invalid right value for (NOT) IN comparison",
+        );
+    }
+
+    #[rstest]
+    #[case::is_null(false, &[false, true])]
+    #[case::is_not_null(true, &[true, false])]
+    fn test_is_null_never_yields_null(#[case] inverted: bool, #[case] expected: &[bool]) {
+        let schema = ArrowSchema::new(vec![ArrowField::new("n", ArrowDataType::Int32, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+
+        let pred = Pred::is_null(column_expr!("n"));
+        let result = evaluate_predicate(&pred, &batch, inverted).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(result.values().iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[rstest]
+    #[case::and_false_beats_null(JunctionPredicateOp::And, Some(false), None, Some(false))]
+    #[case::and_null_left_false_right(JunctionPredicateOp::And, None, Some(false), Some(false))]
+    #[case::and_true_with_null_is_null(JunctionPredicateOp::And, Some(true), None, None)]
+    #[case::and_both_null_is_null(JunctionPredicateOp::And, None, None, None)]
+    #[case::or_true_beats_null(JunctionPredicateOp::Or, Some(true), None, Some(true))]
+    #[case::or_null_left_true_right(JunctionPredicateOp::Or, None, Some(true), Some(true))]
+    #[case::or_false_with_null_is_null(JunctionPredicateOp::Or, Some(false), None, None)]
+    #[case::or_both_null_is_null(JunctionPredicateOp::Or, None, None, None)]
+    fn test_junction_uses_kleene_logic(
+        #[case] op: JunctionPredicateOp,
+        #[case] left: Option<bool>,
+        #[case] right: Option<bool>,
+        #[case] expected: Option<bool>,
+    ) {
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", ArrowDataType::Int32, false)]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+
+        let operand = |v: Option<bool>| match v {
+            Some(b) => Pred::literal(b),
+            None => Pred::null_literal(),
+        };
+        let pred = Pred::junction(op, [operand(left), operand(right)]);
+
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
+        let actual = result.is_valid(0).then(|| result.value(0));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_divide_integer_truncates_and_rejects_zero_divisor() {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("n", ArrowDataType::Int32, false),
+            ArrowField::new("d", ArrowDataType::Int32, false),
+            ArrowField::new("zero", ArrowDataType::Int32, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        let quotient = evaluate_expression(
+            &divide(column_expr!("n"), column_expr!("d")),
+            &batch,
+            Some(&DataType::INTEGER),
+        )
+        .unwrap();
+        assert_eq!(
+            quotient.as_any().downcast_ref::<Int32Array>().unwrap(),
+            &Int32Array::from(vec![3])
+        );
+
+        let result = evaluate_expression(
+            &divide(column_expr!("n"), column_expr!("zero")),
+            &batch,
+            Some(&DataType::INTEGER),
+        );
+        assert_result_error_with_message(result, "Divide by zero");
+    }
+
+    #[test]
+    fn test_divide_float_by_zero_yields_infinity_and_nan() {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("n", ArrowDataType::Float64, false),
+            ArrowField::new("zero", ArrowDataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(vec![7.0])),
+                Arc::new(Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+
+        let eval = |expr| {
+            let array = evaluate_expression(&expr, &batch, Some(&DataType::DOUBLE)).unwrap();
+            assert_eq!(array.null_count(), 0);
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0)
+        };
+
+        assert!(eval(divide(column_expr!("n"), column_expr!("zero"))).is_infinite());
+        assert!(eval(divide(column_expr!("zero"), column_expr!("zero"))).is_nan());
+    }
+
     fn create_json_batch() -> RecordBatch {
         let schema = ArrowSchema::new(vec![ArrowField::new("json_col", ArrowDataType::Utf8, true)]);
         let json_strings = StringArray::from(vec![
@@ -1874,6 +2094,119 @@ mod tests {
             Some(r#"{"a": 3, "b": "test"}"#),
         ]);
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap()
+    }
+
+    #[rstest]
+    #[case::keeps_on_true(Some(true), false)]
+    #[case::nulls_on_false(Some(false), true)]
+    #[case::nulls_on_null(None, true)]
+    fn test_struct_nullability_predicate_keeps_only_true_rows(
+        #[case] predicate: Option<bool>,
+        #[case] expect_null_struct: bool,
+    ) {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("v", ArrowDataType::Int32, true),
+            ArrowField::new("p", ArrowDataType::Boolean, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(BooleanArray::from(vec![predicate])),
+            ],
+        )
+        .unwrap();
+
+        let output_type = DataType::Struct(Box::new(StructType::new_unchecked(vec![
+            StructField::nullable("v", DataType::INTEGER),
+        ])));
+        let expr = Expr::struct_with_nullability_from(
+            [Arc::new(column_expr!("v"))],
+            Arc::new(Expr::from_pred(Pred::from_expr(column_expr!("p")))),
+        );
+
+        let result = evaluate_expression(&expr, &batch, Some(&output_type)).unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(result.is_null(0), expect_null_struct);
+    }
+
+    /// Base64 would render `0xABCD` as `q80=`.
+    #[test]
+    fn test_to_json_encodes_binary_as_hex_and_nests_structs_and_arrays() {
+        let item = Arc::new(ArrowField::new("item", ArrowDataType::Int32, true));
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        );
+        let inner = Fields::from(vec![Arc::new(ArrowField::new(
+            "z",
+            ArrowDataType::Int32,
+            true,
+        ))]);
+        let nested = StructArray::new(
+            inner.clone(),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+            None,
+        );
+        let fields = Fields::from(vec![
+            Arc::new(ArrowField::new("b", ArrowDataType::Binary, true)),
+            Arc::new(ArrowField::new("l", ArrowDataType::List(item), true)),
+            Arc::new(ArrowField::new("n", ArrowDataType::Struct(inner), true)),
+        ]);
+        let value = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![&[0xABu8, 0xCDu8][..]])),
+                Arc::new(list),
+                Arc::new(nested),
+            ],
+            None,
+        );
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            ArrowDataType::Struct(fields),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
+
+        let expr = Expr::unary(UnaryExpressionOp::ToJson, column_expr!("s"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result.value(0), r#"{"b":"abcd","l":[1,2],"n":{"z":7}}"#);
+    }
+
+    /// An empty string is not valid JSON, so it does not parse to an empty struct. A NULL input
+    /// decodes as `{}` and leaves the batch intact.
+    ///
+    /// Nulling the whole batch for one unparseable row is a limitation rather than a guarantee: the
+    /// `arrow-json` error names no row, so the fallback can only blanket the array it was given,
+    /// discarding stats from rows that parsed fine.
+    #[rstest]
+    #[case::empty_string(vec![Some("")], 1)]
+    #[case::malformed(vec![Some("{not json")], 1)]
+    #[case::one_bad_input_nulls_whole_batch(vec![Some(""), Some(r#"{"a":1}"#)], 2)]
+    #[case::null_input_is_empty_object(vec![None], 0)]
+    fn test_parse_json_permissively_nulls_unparseable_batches(
+        #[case] input: Vec<Option<&str>>,
+        #[case] expected_null_count: usize,
+    ) {
+        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "a",
+            DataType::LONG,
+        )]));
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(input.clone()))],
+        )
+        .unwrap();
+
+        let expr = Expr::parse_json(column_expr!("s"), output_schema);
+        let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
+        assert_eq!(result.len(), input.len());
+        assert_eq!(result.null_count(), expected_null_count);
     }
 
     #[test]

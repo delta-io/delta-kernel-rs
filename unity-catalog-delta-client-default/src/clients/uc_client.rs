@@ -1,18 +1,13 @@
-// TODO(https://github.com/delta-io/delta-kernel-rs/issues/2251): Replace UCClient with
-// trait-based clients (GetTableClient, GetCredentialsClient) once those traits are added
-// to unity-catalog-delta-client-api.
 use reqwest::StatusCode;
 use tracing::instrument;
 use unity_catalog_delta_client_api::{
-    CatalogConfig, CredentialsResponse, LoadTableResponse, Operation, TemporaryTableCredentials,
+    CatalogConfig, CredentialsResponse, LoadTableResponse, Operation,
 };
 use url::Url;
 
 use crate::config::ClientConfig;
 use crate::error::Result;
 use crate::http::{build_http_client, execute_with_retry, handle_response};
-use crate::models::credentials::CredentialsRequest;
-use crate::models::tables::TablesResponse;
 
 /// Builds the Delta-Tables per-table resource path
 /// (`delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`) that the `load_table` and
@@ -48,25 +43,8 @@ impl UCClient {
         }
     }
 
-    /// Resolve the table by name.
-    #[instrument(skip(self))]
-    pub async fn get_table(&self, table_name: &str) -> Result<TablesResponse> {
-        let url = self.base_url.join(&format!("tables/{table_name}"))?;
-
-        let response =
-            execute_with_retry(&self.config, || self.http_client.get(url.clone()).send()).await?;
-
-        match response.status() {
-            StatusCode::NOT_FOUND => Err(unity_catalog_delta_client_api::Error::TableNotFound(
-                table_name.to_string(),
-            )
-            .into()),
-            _ => handle_response(response).await,
-        }
-    }
-
-    /// `GET /delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}` (`load_table`): reads a
-    /// catalog-managed table's full metadata plus any unpublished commits. Read-only.
+    /// `GET /delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`:
+    /// fetch the table's metadata plus inline unpublished commits.
     #[instrument(skip(self))]
     pub async fn load_table(
         &self,
@@ -87,31 +65,9 @@ impl UCClient {
         }
     }
 
-    /// Get temporary cloud storage credentials for accessing a table.
-    #[instrument(skip(self))]
-    pub async fn get_credentials(
-        &self,
-        table_id: &str,
-        operation: Operation,
-    ) -> Result<TemporaryTableCredentials> {
-        let url = self.base_url.join("temporary-table-credentials")?;
-
-        let request_body = CredentialsRequest::new(table_id, operation);
-        let response = execute_with_retry(&self.config, || {
-            self.http_client
-                .post(url.clone())
-                .json(&request_body)
-                .send()
-        })
-        .await?;
-
-        handle_response(response).await
-    }
-
     /// Vend temporary cloud-storage credentials for the table via the Delta-Tables
     /// `GET .../catalogs/{catalog}/schemas/{schema}/tables/{table}/credentials?operation=...`
     /// endpoint.
-    // TODO: remove `get_credentials` once the read path swaps onto this Delta-Tables endpoint.
     #[instrument(skip(self))]
     pub async fn get_table_credentials(
         &self,

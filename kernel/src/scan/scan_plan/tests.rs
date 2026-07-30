@@ -93,6 +93,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
     };
     let batches = engine
         .plan_executor()
+        .unwrap()
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?;
 
@@ -750,6 +751,7 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Delta
         .expect("metadata plan");
     let batches = engine
         .plan_executor()
+        .unwrap()
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?;
 
@@ -942,4 +944,45 @@ fn assert_declarative_metadata_matches_imperative(
     let actual = declarative_metadata(&scan, &engine)?;
 
     assert_metadata_eq(&actual, &expected, table.description())
+}
+
+// Forwards every handler to an inner [`SyncEngine`] but provides no [`PlanExecutor`], exercising
+// the `None` arm that `declarative_metadata_scan_plan` rejects.
+struct NoPlanEngine(Arc<SyncEngine>);
+
+impl Engine for NoPlanEngine {
+    fn evaluation_handler(&self) -> Arc<dyn crate::EvaluationHandler> {
+        self.0.evaluation_handler()
+    }
+    fn storage_handler(&self) -> Arc<dyn crate::StorageHandler> {
+        self.0.storage_handler()
+    }
+    fn json_handler(&self) -> Arc<dyn crate::JsonHandler> {
+        self.0.json_handler()
+    }
+    fn parquet_handler(&self) -> Arc<dyn crate::ParquetHandler> {
+        self.0.parquet_handler()
+    }
+    fn plan_executor(&self) -> Option<Arc<dyn crate::plans::PlanExecutor>> {
+        None
+    }
+}
+
+#[test]
+fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
+        .build()
+        .expect("build checkpoint-plus-commits table");
+    let sync_engine = Arc::new(SyncEngine::new_with_store(table.store().clone()));
+    let snapshot = Snapshot::builder_for(table.table_root()).build(sync_engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+
+    let no_plan_engine = NoPlanEngine(sync_engine);
+    let err = scan
+        .declarative_metadata_scan_plan(&no_plan_engine)
+        .unwrap_err();
+
+    assert!(matches!(err, crate::Error::Unsupported(_)));
+    Ok(())
 }

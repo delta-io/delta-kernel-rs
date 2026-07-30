@@ -1083,12 +1083,24 @@ pub trait Engine: AsAny {
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 
-    /// Get the connector provided [`PlanExecutor`].
+    /// Get the connector provided [`PlanExecutor`], or `None` if this engine provides none.
     ///
-    /// The default implementation returns a trivial executor that errors on every operation.
+    /// The default implementation returns `None`. A connector opts into plan-based execution by
+    /// overriding this to return its executor.
     #[cfg(feature = "declarative-plans")]
-    fn plan_executor(&self) -> Arc<dyn PlanExecutor> {
-        Arc::new(())
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        None
+    }
+
+    /// Get the connector provided [`PlanExecutor`], erroring if this engine provides none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
+    #[cfg(feature = "declarative-plans")]
+    fn require_plan_executor(&self) -> DeltaResult<Arc<dyn PlanExecutor>> {
+        self.plan_executor()
+            .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))
     }
 }
 
