@@ -75,8 +75,6 @@ async fn append_only_enforces_data_change_for_file_actions(
     #[case] selection_vector: &[bool],
     #[case] expected_error: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // NOTE: The data_change=false cases do not preserve removed records in replacement AddFiles.
-    // This is not a valid rearrangement, we construct such commit only for testing.
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let table_url = Url::from_directory_path(&table_path).unwrap();
     let schema = schema_ref! { nullable "number": INTEGER };
@@ -118,6 +116,8 @@ async fn append_only_enforces_data_change_for_file_actions(
     let mut txn = begin_transaction(snapshot, engine.as_ref())?
         .with_operation("DELETE".to_string())
         .with_data_change(data_change);
+    // NOTE: The data_change=false cases do not preserve removed records in replacement AddFiles.
+    // This is not a valid rearrangement, we construct such commit only for testing.
     let commit_result = match operation {
         AppendOnlyWrite::Remove => {
             for scan_files in staged_batches {

@@ -1797,6 +1797,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStoreExt as _;
+    use crate::scan::log_replay::PATH_NAME;
     use crate::schema::{schema_ref, MapType};
     use crate::table_features::ColumnMappingMode;
     use crate::table_properties::APPEND_ONLY;
@@ -2767,7 +2768,7 @@ mod tests {
             .fields()
             .iter()
             .map(|field| {
-                if field.name() == "path" {
+                if field.name() == PATH_NAME {
                     Arc::new(StringArray::from_iter_values(
                         (0..row_count).map(|index| format!("file-{index}.parquet")),
                     )) as ArrayRef
