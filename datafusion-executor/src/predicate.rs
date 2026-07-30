@@ -56,9 +56,9 @@ fn unary_to_df_predicate_expr(
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
     let expr = to_df_expr(&unary.expr, input_schema)?;
-    Ok(match unary.op {
-        KernelUnaryPredicateOp::IsNull => DFExpr::IsNull(Box::new(expr)),
-    })
+    match unary.op {
+        KernelUnaryPredicateOp::IsNull => Ok(DFExpr::IsNull(Box::new(expr))),
+    }
 }
 
 /// Lowers a binary predicate.
@@ -121,11 +121,11 @@ fn junction_to_df_predicate_expr(
         .iter()
         .map(|pred| to_df_predicate_expr(pred, input_schema))
         .collect();
-    Ok(match junction.op {
-        // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics
-        KernelJunctionPredicateOp::And => conjunction(preds?).unwrap_or_else(|| lit(true)),
-        KernelJunctionPredicateOp::Or => disjunction(preds?).unwrap_or_else(|| lit(false)),
-    })
+    // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics.
+    match junction.op {
+        KernelJunctionPredicateOp::And => Ok(conjunction(preds?).unwrap_or_else(|| lit(true))),
+        KernelJunctionPredicateOp::Or => Ok(disjunction(preds?).unwrap_or_else(|| lit(false))),
+    }
 }
 
 #[cfg(test)]
