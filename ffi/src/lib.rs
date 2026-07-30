@@ -2697,9 +2697,10 @@ mod tests {
     // the first checkpoint.)
     //
     // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
-    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter), and its unsafe
-    // is covered by the anchor test_setting_multithread_executor. AlreadyExists/overwrite is safe
-    // kernel logic. Runs under normal cargo test / nextest.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. AlreadyExists/overwrite is safe kernel
+    // logic. Runs under normal cargo test / nextest.
     #[cfg_attr(
         miri,
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
@@ -2743,9 +2744,10 @@ mod tests {
     // `checkpoint_snapshot` returns `AlreadyExists` (same table version). Also validates the
     // `_delta_log/_last_checkpoint` content (version, numOfAddFiles, size, sizeInBytes), which
     // `test_checkpoint_snapshot_sidecar_shape` doesn't cover.
-    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter), and its unsafe
-    // is covered by the anchor test_setting_multithread_executor. _last_checkpoint content is safe
-    // kernel logic. Runs under normal cargo test / nextest.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. _last_checkpoint content is safe kernel
+    // logic. Runs under normal cargo test / nextest.
     #[cfg_attr(
         miri,
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
@@ -2808,12 +2810,10 @@ mod tests {
     // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to
     // build engine without existing tokio runtime.
     //
-    // This is the Miri anchor for checkpoint FFI. NEVER mark it #[cfg_attr(miri, ignore)]. The
-    // other checkpoint tests are skipped under Miri (they write parquet, which is minutes of safe
-    // work under the interpreter); they are only safe to skip because this test still runs their
-    // shared unsafe under Miri: a success-path checkpoint_snapshot -> Written-handle ->
-    // free_snapshot. It also uniquely covers the engine-builder unsafe (get_engine_builder /
-    // set_builder_with_multithreaded_executor / builder_build). Skipping it silently drops both.
+    // Miri anchor for checkpoint FFI: covers the success-path checkpoint_snapshot -> Written
+    // handle -> free_snapshot that the skipped checkpoint tests share, and uniquely covers
+    // set_builder_with_multithreaded_executor (no other test calls it). Skipping it drops that
+    // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {

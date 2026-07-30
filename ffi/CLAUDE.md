@@ -217,8 +217,8 @@ Guidance for adding or triaging FFI tests:
 - **`#[cfg_attr(miri, ignore)]` is legitimate for two reasons, and only these two:**
   1. Miri cannot run it (e.g. an unsupported foreign function like `linkat`).
   2. The test executes no `unsafe`, OR only `unsafe` that a kept test already covers, AND it is
-     expensive under Miri. Skipping for cost alone (without the coverage argument) is not
-     acceptable -- it silently drops UB coverage.
+     expensive under Miri. Skip only with the coverage argument; skipping for cost alone drops
+     UB coverage.
 - When you skip under reason 2, **prove the coverage is preserved**: the kept tests' set of
   `unsafe` FFI functions must be a superset of the skipped test's. Name the covering test in the
   `ignore` reason or a nearby comment so a future reader can re-check it.
