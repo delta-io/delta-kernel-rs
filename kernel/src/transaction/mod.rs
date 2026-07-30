@@ -1778,8 +1778,10 @@ mod tests {
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::CommitInfo;
+    use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
     use crate::arrow::array::{
-        ArrayRef, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
+        new_null_array, ArrayRef, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
+        StructArray,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
@@ -2758,9 +2760,62 @@ mod tests {
         Ok(())
     }
 
+    fn make_scan_files(selection_vector: &[bool]) -> FilteredEngineData {
+        let schema: ArrowSchema = scan_row_schema().as_ref().try_into_arrow().unwrap();
+        let row_count = selection_vector.len();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "path" {
+                    Arc::new(StringArray::from_iter_values(
+                        (0..row_count).map(|index| format!("file-{index}.parquet")),
+                    )) as ArrayRef
+                } else if field.name() == SIZE_NAME {
+                    Arc::new(Int64Array::from(vec![1; row_count]))
+                } else if field.name() == FILE_CONSTANT_VALUES_NAME {
+                    let ArrowDataType::Struct(fields) = field.data_type() else {
+                        panic!("fileConstantValues should be a struct");
+                    };
+                    let child_arrays = fields
+                        .iter()
+                        .map(|field| {
+                            if field.name() == PARTITION_VALUES_NAME {
+                                let names = MapFieldNames {
+                                    entry: "key_value".to_string(),
+                                    key: "key".to_string(),
+                                    value: "value".to_string(),
+                                };
+                                let mut builder = MapBuilder::new(
+                                    Some(names),
+                                    StringBuilder::new(),
+                                    StringBuilder::new(),
+                                );
+                                for _ in 0..row_count {
+                                    builder.append(true).unwrap();
+                                }
+                                Arc::new(builder.finish()) as ArrayRef
+                            } else {
+                                new_null_array(field.data_type(), row_count)
+                            }
+                        })
+                        .collect();
+                    Arc::new(StructArray::new(fields.clone(), child_arrays, None))
+                } else {
+                    new_null_array(field.data_type(), row_count)
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
+        FilteredEngineData::try_new(
+            Box::new(ArrowEngineData::new(batch)),
+            selection_vector.to_vec(),
+        )
+        .unwrap()
+    }
+
     fn stage_data_removal(txn: &mut Transaction, removal: DataRemoval, selection_vector: &[bool]) {
-        let data = string_array_to_engine_data(StringArray::from(vec!["dummy"; 3]));
-        let data = FilteredEngineData::try_new(data, selection_vector.to_vec()).unwrap();
+        let data = make_scan_files(selection_vector);
         match removal {
             DataRemoval::RemoveFile => txn.remove_files(data),
             DataRemoval::DeletionVectorUpdate => txn.dv_matched_files.push(data),
@@ -2787,43 +2842,47 @@ mod tests {
     }
 
     #[rstest]
-    #[case::append_only_disabled(false, true, false)]
-    #[case::no_data_change(true, false, false)]
-    #[case::data_change(true, true, true)]
+    #[case::append_only_disabled(
+        false, /* append_only */
+        true, /* data_change */
+        &[true, true, true], /* selection_vector */
+        false, /* expected_error */
+    )]
+    #[case::no_data_change(
+        true, /* append_only */
+        false, /* data_change */
+        &[true, true, true], /* selection_vector */
+        false, /* expected_error */
+    )]
+    #[case::all_unselected(
+        true, /* append_only */
+        true, /* data_change */
+        &[false, false, false], /* selection_vector */
+        false, /* expected_error */
+    )]
+    #[case::partial_selected(
+        true, /* append_only */
+        true, /* data_change */
+        &[false, true, false], /* selection_vector */
+        true, /* expected_error */
+    )]
+    #[case::all_selected(
+        true, /* append_only */
+        true, /* data_change */
+        &[true, true, true], /* selection_vector */
+        true, /* expected_error */
+    )]
     fn validate_append_only_semantics(
         #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
+        #[values(0, 1)] batch_index: usize,
         #[case] append_only: bool,
         #[case] data_change: bool,
+        #[case] selection_vector: &[bool],
         #[case] expected_error: bool,
     ) -> DeltaResult<()> {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         set_append_only(&mut txn, append_only)?;
         txn.set_data_change(data_change);
-        stage_data_removal(&mut txn, removal, &[]);
-
-        let result = txn.validate_append_only_semantics();
-        if expected_error {
-            assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
-        } else {
-            result?;
-        }
-        Ok(())
-    }
-
-    #[rstest]
-    #[case::all_unselected(&[false, false, false], false)]
-    #[case::selected(&[false, true, false], true)]
-    #[case::implicit_selected_tail(&[false], true)]
-    #[case::all_selected(&[], true)]
-    fn validate_append_only_semantics_across_batches(
-        #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
-        #[values(0, 1)] batch_index: usize,
-        #[case] selection_vector: &[bool],
-        #[case] expected_error: bool,
-    ) -> DeltaResult<()> {
-        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
-        set_append_only(&mut txn, true)?;
-        txn.set_data_change(true);
         for index in 0..2 {
             let selection_vector = if index == batch_index {
                 selection_vector
@@ -2849,7 +2908,7 @@ mod tests {
         let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
         set_append_only(&mut txn, true)?;
         txn.set_data_change(true);
-        stage_data_removal(&mut txn, removal, &[]);
+        stage_data_removal(&mut txn, removal, &[true, true, true]);
 
         let result = txn.commit(engine.as_ref());
         assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
