@@ -24,6 +24,7 @@ use crate::expressions::{
     col, column_name, lit, ArrayData, ColumnName, ExpressionStructPatch,
     ExpressionStructPatchBuilder, Scalar,
 };
+use crate::log_replay::HasSelectionVector;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::metrics::{CommitFailureReason, MetricId};
@@ -377,6 +378,7 @@ impl<S> Transaction<S> {
         }
 
         self.validate_blind_append_semantics()?;
+        self.validate_append_only_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
 
         // Validate that the schema supports data writes when files are being added. Reads and
@@ -772,6 +774,29 @@ impl<S> Transaction<S> {
             Error::invalid_transaction_state("Blind append cannot update deletion vectors")
         );
 
+        Ok(())
+    }
+
+    fn validate_append_only_semantics(&self) -> DeltaResult<()> {
+        if !self.data_change
+            || !self
+                .effective_table_config
+                .is_feature_enabled(&TableFeature::AppendOnly)
+        {
+            return Ok(());
+        }
+
+        let removes_data = self
+            .remove_files_metadata
+            .iter()
+            .chain(&self.dv_matched_files)
+            .any(HasSelectionVector::has_selected_rows);
+        require!(
+            !removes_data,
+            Error::invalid_transaction_state(
+                "Append-only tables cannot remove files or update deletion vectors when data_change is true",
+            )
+        );
         Ok(())
     }
 
@@ -1772,6 +1797,7 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::schema::{schema_ref, MapType};
     use crate::table_features::ColumnMappingMode;
+    use crate::table_properties::APPEND_ONLY;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
     use crate::utils::test_utils::{
@@ -2711,6 +2737,36 @@ mod tests {
         txn.add_files(Box::new(ArrowEngineData::new(batch)));
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum DataRemoval {
+        RemoveFile,
+        DeletionVectorUpdate,
+    }
+
+    fn set_append_only(txn: &mut Transaction, enabled: bool) -> DeltaResult<()> {
+        let metadata = txn
+            .effective_table_config
+            .metadata()
+            .clone()
+            .with_configuration_entry(APPEND_ONLY, enabled.to_string());
+        txn.effective_table_config = TableConfiguration::try_new_from(
+            &txn.effective_table_config,
+            Some(metadata),
+            None,
+            txn.effective_table_config.version(),
+        )?;
+        Ok(())
+    }
+
+    fn stage_data_removal(txn: &mut Transaction, removal: DataRemoval, selection_vector: &[bool]) {
+        let data = string_array_to_engine_data(StringArray::from(vec!["dummy"; 3]));
+        let data = FilteredEngineData::try_new(data, selection_vector.to_vec()).unwrap();
+        match removal {
+            DataRemoval::RemoveFile => txn.remove_files(data),
+            DataRemoval::DeletionVectorUpdate => txn.dv_matched_files.push(data),
+        }
+    }
+
     /// Build a transaction on a writable copy of the `table-without-dv-small` fixture.
     fn create_existing_table_txn() -> DeltaResult<(Arc<dyn Engine>, Transaction, tempfile::TempDir)>
     {
@@ -2727,6 +2783,76 @@ mod tests {
         txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
         txn.validate_blind_append_semantics()?;
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::append_only_disabled(false, true, false)]
+    #[case::no_data_change(true, false, false)]
+    #[case::data_change(true, true, true)]
+    fn validate_append_only_semantics(
+        #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
+        #[case] append_only: bool,
+        #[case] data_change: bool,
+        #[case] expected_error: bool,
+    ) -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        set_append_only(&mut txn, append_only)?;
+        txn.set_data_change(data_change);
+        stage_data_removal(&mut txn, removal, &[]);
+
+        let result = txn.validate_append_only_semantics();
+        if expected_error {
+            assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        } else {
+            result?;
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::all_unselected(&[false, false, false], false)]
+    #[case::selected(&[false, true, false], true)]
+    #[case::implicit_selected_tail(&[false], true)]
+    #[case::all_selected(&[], true)]
+    fn validate_append_only_semantics_across_batches(
+        #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
+        #[values(0, 1)] batch_index: usize,
+        #[case] selection_vector: &[bool],
+        #[case] expected_error: bool,
+    ) -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        set_append_only(&mut txn, true)?;
+        txn.set_data_change(true);
+        for index in 0..2 {
+            let selection_vector = if index == batch_index {
+                selection_vector
+            } else {
+                &[false, false, false]
+            };
+            stage_data_removal(&mut txn, removal, selection_vector);
+        }
+
+        let result = txn.validate_append_only_semantics();
+        if expected_error {
+            assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        } else {
+            result?;
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    fn commit_rejects_append_only_data_removal(
+        #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
+    ) -> DeltaResult<()> {
+        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        set_append_only(&mut txn, true)?;
+        txn.set_data_change(true);
+        stage_data_removal(&mut txn, removal, &[]);
+
+        let result = txn.commit(engine.as_ref());
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
         Ok(())
     }
 
