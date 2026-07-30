@@ -220,7 +220,6 @@ impl TableConfiguration {
 
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
-        validate_interval_type_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column).
@@ -731,6 +730,8 @@ impl TableConfiguration {
                 "Column invariants are not yet supported",
             ));
         }
+
+        validate_interval_type_feature_support(self)?;
 
         Ok(())
     }
@@ -1735,6 +1736,10 @@ mod test {
         );
         assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
 
+        let config = create_mock_table_config(&[], &[TableFeature::IntervalTypePreview]);
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+        assert!(config.ensure_operation_supported(Operation::Cdf).is_ok());
+
         #[cfg(feature = "geo-type-in-dev")]
         {
             let config = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
@@ -1763,6 +1768,17 @@ mod test {
             config.ensure_operation_supported(Operation::Write),
             r#"Feature 'typeWidening' is not supported for writes"#,
         );
+
+        let config = create_mock_table_config(&[], &[TableFeature::IntervalTypePreview]);
+        if cfg!(feature = "interval-type-in-dev") {
+            assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+        } else {
+            assert_result_error_with_message(
+                config.ensure_operation_supported(Operation::Write),
+                "Feature 'intervalType-preview' requires the 'interval-type-in-dev' cargo \
+                 feature for writes",
+            );
+        }
 
         #[cfg(feature = "geo-type-in-dev")]
         {

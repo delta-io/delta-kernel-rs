@@ -3,9 +3,28 @@
 use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, StructField, StructType};
-use test_utils::load_and_begin_transaction;
-#[cfg(not(feature = "interval-type-in-dev"))]
-use test_utils::{create_table, engine_store_setup};
+use test_utils::{create_table, engine_store_setup, load_and_begin_transaction};
+
+#[tokio::test]
+async fn test_write_featureless_interval_table_is_rejected(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "iv",
+        DataType::INTERVAL_DAY_TIME,
+    )])?);
+    let (store, engine, table_location) =
+        engine_store_setup("test_interval_requires_table_feature", None);
+    let table_url = create_table(store, table_location, schema, &[], true, vec![], vec![]).await?;
+
+    let err = load_and_begin_transaction(table_url, &engine)
+        .expect_err("featureless interval tables must not be writable")
+        .to_string();
+    assert!(
+        err.contains("required 'intervalType-preview' feature"),
+        "error must explain the missing table feature; got: {err}",
+    );
+    Ok(())
+}
 
 /// Writing an interval feature table is gated by the `interval-type-in-dev` cargo feature.
 #[cfg(not(feature = "interval-type-in-dev"))]
@@ -34,8 +53,8 @@ async fn test_write_interval_table_gate() -> Result<(), Box<dyn std::error::Erro
         .expect_err("interval writes should be blocked when the cargo feature is disabled")
         .to_string();
     assert!(
-        err.contains("intervalType-preview") && err.contains("not supported"),
-        "error must name the unsupported table feature; got: {err}",
+        err.contains("intervalType-preview") && err.contains("interval-type-in-dev"),
+        "error must name the table and cargo features; got: {err}",
     );
     Ok(())
 }

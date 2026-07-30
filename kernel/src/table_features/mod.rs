@@ -569,7 +569,13 @@ static INTERVAL_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     #[cfg(feature = "interval-type-in-dev")]
     kernel_support: KernelSupport::Supported,
     #[cfg(not(feature = "interval-type-in-dev"))]
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Custom(|_, _, operation| match operation {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'intervalType-preview' requires the 'interval-type-in-dev' cargo feature \
+             for writes",
+        )),
+    }),
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -1051,27 +1057,13 @@ mod tests {
         .unwrap(),
         ExpectRead::Ok
     )]
-    #[cfg_attr(
-        feature = "interval-type-in-dev",
-        case::interval_type_supported(
-            Protocol::try_new_modern(
-                [TableFeature::IntervalTypePreview],
-                [TableFeature::IntervalTypePreview],
-            )
-            .unwrap(),
-            ExpectRead::Ok
+    #[case::interval_type(
+        Protocol::try_new_modern(
+            [TableFeature::IntervalTypePreview],
+            [TableFeature::IntervalTypePreview],
         )
-    )]
-    #[cfg_attr(
-        not(feature = "interval-type-in-dev"),
-        case::interval_type_gated_off(
-            Protocol::try_new_modern(
-                [TableFeature::IntervalTypePreview],
-                [TableFeature::IntervalTypePreview],
-            )
-            .unwrap(),
-            ExpectRead::Unsupported
-        )
+        .unwrap(),
+        ExpectRead::Ok
     )]
     // adaptiveMetadata-preview is gated by the `adaptive-metadata-in-dev` cargo feature: readable
     // only when the flag is on, otherwise rejected as unsupported.
