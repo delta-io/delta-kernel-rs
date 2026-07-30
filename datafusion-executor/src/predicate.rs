@@ -121,11 +121,10 @@ fn junction_to_df_predicate_expr(
         .iter()
         .map(|pred| to_df_predicate_expr(pred, input_schema))
         .collect();
-    let preds = preds?;
     Ok(match junction.op {
         // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics
-        KernelJunctionPredicateOp::And => conjunction(preds).unwrap_or_else(|| lit(true)),
-        KernelJunctionPredicateOp::Or => disjunction(preds).unwrap_or_else(|| lit(false)),
+        KernelJunctionPredicateOp::And => conjunction(preds?).unwrap_or_else(|| lit(true)),
+        KernelJunctionPredicateOp::Or => disjunction(preds?).unwrap_or_else(|| lit(false)),
     })
 }
 
