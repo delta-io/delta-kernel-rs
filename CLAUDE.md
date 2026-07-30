@@ -48,19 +48,19 @@ cargo +nightly fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                                    | Directory                                  | Description                                             |
-|------------------------------------------|--------------------------------------------|---------------------------------------------------------|
-| `delta_kernel`                           | `kernel/`                                  | Core library                                            |
-| `delta_kernel_default_engine`            | `default-engine/`                          | Default Arrow/Tokio `Engine` implementation             |
-| `delta_kernel_ffi`                       | `ffi/`                                     | C/C++ FFI bindings                                      |
-| `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
-| `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
-| `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
-| `delta_kernel_workloads`                 | `workloads/`                               | Shared workload spec types + SQL predicate parser       |
-| `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
-| `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
-| `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
-| `unity-catalog-delta-rest-client`        | `unity-catalog-delta-rest-client/`         | Unity Catalog REST client                               |
+| Crate                             | Directory                          | Description                                               |
+|-----------------------------------|------------------------------------|-----------------------------------------------------------|
+| `delta_kernel`                    | `kernel/`                          | Core library                                              |
+| `delta_kernel_default_engine`     | `default-engine/`                  | Default Arrow/Tokio `Engine` implementation               |
+| `delta_kernel_ffi`                | `ffi/`                             | C/C++ FFI bindings                                        |
+| `delta_kernel_derive`             | `derive-macros/`                   | Proc macros                                               |
+| `acceptance`                      | `acceptance/`                      | Acceptance tests (DAT)                                    |
+| `test_utils`                      | `test-utils/`                      | Shared test utilities                                     |
+| `delta_kernel_workloads`          | `workloads/`                       | Shared workload spec types + SQL predicate parser         |
+| `feature_tests`                   | `feature-tests/`                   | Feature flag tests                                        |
+| `delta-kernel-unity-catalog`      | `delta-kernel-unity-catalog/`      | Unity Catalog integration (UCCommitter, snapshot helpers) |
+| `unity-catalog-delta-client-api`  | `unity-catalog-delta-client-api/`  | Unity Catalog client traits and shared models             |
+| `unity-catalog-delta-client-default` | `unity-catalog-delta-client-default/` | Unity Catalog REST client                                 |
 
 ### Feature Flags
 
@@ -332,6 +332,10 @@ Keep this list updated when new protocol features are added to kernel.
   data-dependent schema manipulation.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
+- Order a file so the most important APIs and impls come first; put private helper functions
+  toward the bottom. A reader scanning top to bottom should hit the public surface before the
+  private plumbing. (Order-sensitive items like `macro_rules!` used within the file are exempt --
+  they must precede their use.)
 
 ## Comment & Doc Style
 

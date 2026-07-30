@@ -1,7 +1,7 @@
 # Creating Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-rest-client, unity-catalog-delta-client-api -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-default, unity-catalog-delta-client-api -->
 
 To create a new Unity Catalog-managed Delta table, you register the table with
 your UC server to obtain a table ID and storage location, write a version 0
@@ -10,13 +10,14 @@ second set of properties back to UC to finalize registration.
 
 Before reading this page, make sure you understand
 [Creating a Table](../writing/create_table.md) and the
-[Unity Catalog integration overview](./overview.md).
+[Unity Catalog Integration overview](./overview.md).
 
 > [!WARNING]
-> Steps 1 and 5 below call UC endpoints that are not yet exposed by the Rust
-> `unity-catalog-delta-rest-client` crate. Route those calls through your
-> connector's own UC client. They are planned for inclusion in the
-> `unity-catalog-delta-client-api` crate.
+> The create flow is not yet wired end-to-end. `UCCommitter::commit` currently
+> rejects version 0 (see #2826), so Step 3 does not work yet. This page
+> documents the intended flow. In addition, Steps 1 and 5 call UC endpoints that
+> the Rust `unity-catalog-delta-client-default` crate does not yet expose. Route
+> those through your connector's own UC client.
 
 ## Prerequisites
 
@@ -27,7 +28,7 @@ Before reading this page, make sure you understand
 ## Step 1: Reserve the table in Unity Catalog
 
 ```rust,ignore
-// TODO: not yet exposed by `unity-catalog-delta-rest-client`. Call through
+// TODO: not yet exposed by `unity-catalog-delta-client-default`. Call through
 // your connector's own UC client.
 let staging_info = my_uc_client.get_staging_table(
     "main.default.my_table",
@@ -65,19 +66,25 @@ use std::sync::Arc;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::UCCommitter;
-use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCCommitsRestClient};
+use unity_catalog_delta_client_api::{Operation, TableIdentifier};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 let config = ClientConfig::build(&endpoint, &token).build()?;
 let uc_client = UCClient::new(config.clone())?;
-let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
+let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
 // Credentials. Use ReadWrite so the engine can write 000.json into storage.
-let creds = uc_client.get_credentials(&table_id, Operation::ReadWrite).await?;
+let creds = uc_client
+    .get_table_credentials("main", "default", "my_table", Operation::ReadWrite)
+    .await?;
 let engine = build_engine_with_credentials(&table_uri, &creds)?;
 
 // Build the create-table transaction with the disk-bound properties.
-let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+let committer = Box::new(UCCommitter::new(
+    update_client.clone(),
+    table_id.clone(),
+    TableIdentifier::new("main", "default", "my_table"),
+));
 let create_txn = create_table(table_uri.as_str(), Arc::new(schema), "MyApp/1.0")
     .with_table_properties(disk_props)
     .build(&engine, committer)?;
@@ -98,8 +105,8 @@ let post_commit_snapshot = match create_txn.commit(&engine)? {
 };
 ```
 
-On version 0, `UCCommitter` writes `_delta_log/00000000000000000000.json`
-directly and skips the UC commits API.
+Once wired (#2826), version 0 has `UCCommitter` write
+`_delta_log/00000000000000000000.json` directly and skip the UC commits API.
 
 See `build_engine_with_credentials` in
 [Step 4 of Reading UC Tables](./reading.md#step-4-build-an-engine-with-vended-credentials)
@@ -134,7 +141,7 @@ The returned map contains:
 ## Step 5: Finalize the table in Unity Catalog
 
 ```rust,ignore
-// TODO: not yet exposed by `unity-catalog-delta-rest-client`. Call through
+// TODO: not yet exposed by `unity-catalog-delta-client-default`. Call through
 // your connector's own UC client.
 my_uc_client.create_table(&table_id, uc_props).await?;
 ```
