@@ -5,9 +5,11 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, disjunction};
 use datafusion::logical_expr::{binary_expr, lit, Expr as DFExpr, Operator};
 use delta_kernel::expressions::{
-    BinaryPredicate, BinaryPredicateOp, Expression as KernelExpression, JunctionPredicate,
-    JunctionPredicateOp, Predicate as KernelPredicate, Scalar as KernelScalar, UnaryPredicate,
-    UnaryPredicateOp,
+    BinaryPredicate as KernelBinaryPredicate, BinaryPredicateOp as KernelBinaryPredicateOp,
+    Expression as KernelExpression, JunctionPredicate as KernelJunctionPredicate,
+    JunctionPredicateOp as KernelJunctionPredicateOp, Predicate as KernelPredicate,
+    Scalar as KernelScalar, UnaryPredicate as KernelUnaryPredicate,
+    UnaryPredicateOp as KernelUnaryPredicateOp,
 };
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
@@ -21,14 +23,15 @@ use crate::scalar::to_df_scalar;
 ///
 /// # Errors
 /// Returns [`Error::unsupported`] for engine-defined (`Opaque`) or opaque-to-both (`Unknown`)
-/// predicates Also propagates any error from converting a child expression (an unresolved column
+/// predicates. Also propagates any error from converting a child expression (an unresolved column
 /// reference, or an interval literal, which has no Arrow representation) and rejects an `IN`
 /// predicate whose right side is not a literal array.
 pub fn to_df_predicate(pred: &KernelPredicate, input_schema: &StructType) -> DeltaResult<DFExpr> {
     match pred {
         KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema),
         KernelPredicate::Not(inner) => {
-            Ok(DFExpr::Not(Box::new(to_df_predicate(inner, input_schema)?)))
+            let df_inner = to_df_predicate(inner, input_schema)?;
+            Ok(DFExpr::Not(Box::new(df_inner)))
         }
         KernelPredicate::Unary(unary) => unary_to_df_expr(unary, input_schema),
         KernelPredicate::Binary(binary) => binary_to_df_expr(binary, input_schema),
@@ -43,21 +46,29 @@ pub fn to_df_predicate(pred: &KernelPredicate, input_schema: &StructType) -> Del
 }
 
 /// Lowers a unary predicate.
-fn unary_to_df_expr(unary: &UnaryPredicate, input_schema: &StructType) -> DeltaResult<DFExpr> {
+fn unary_to_df_expr(
+    unary: &KernelUnaryPredicate,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
     let expr = to_df_expr(&unary.expr, input_schema)?;
     Ok(match unary.op {
-        UnaryPredicateOp::IsNull => DFExpr::IsNull(Box::new(expr)),
+        KernelUnaryPredicateOp::IsNull => DFExpr::IsNull(Box::new(expr)),
     })
 }
 
 /// Lowers a binary predicate.
-fn binary_to_df_expr(binary: &BinaryPredicate, input_schema: &StructType) -> DeltaResult<DFExpr> {
+fn binary_to_df_expr(
+    binary: &KernelBinaryPredicate,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
     let op = match binary.op {
-        BinaryPredicateOp::In => return in_to_df_expr(&binary.left, &binary.right, input_schema),
-        BinaryPredicateOp::Equal => Operator::Eq,
-        BinaryPredicateOp::LessThan => Operator::Lt,
-        BinaryPredicateOp::GreaterThan => Operator::Gt,
-        BinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
+        KernelBinaryPredicateOp::In => {
+            return in_to_df_expr(&binary.left, &binary.right, input_schema)
+        }
+        KernelBinaryPredicateOp::Equal => Operator::Eq,
+        KernelBinaryPredicateOp::LessThan => Operator::Lt,
+        KernelBinaryPredicateOp::GreaterThan => Operator::Gt,
+        KernelBinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
     };
     let left = to_df_expr(&binary.left, input_schema)?;
     let right = to_df_expr(&binary.right, input_schema)?;
@@ -81,15 +92,15 @@ fn in_to_df_expr(
             "converting an IN predicate requires a literal array on the right-hand side",
         ));
     };
-    let elements = array
+    let elements: DeltaResult<Vec<DFExpr>> = array
         .array_elements()
         .iter()
         .map(|scalar| Ok(lit(to_df_scalar(scalar)?)))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect();
     let value = to_df_expr(value, input_schema)?;
     Ok(DFExpr::InList(InList::new(
         Box::new(value),
-        elements,
+        elements?,
         false,
     )))
 }
@@ -97,18 +108,19 @@ fn in_to_df_expr(
 /// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
 /// left-associative [`conjunction`]/[`disjunction`] helpers.
 fn junction_to_df_expr(
-    junction: &JunctionPredicate,
+    junction: &KernelJunctionPredicate,
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
-    let preds = junction
+    let preds: DeltaResult<Vec<DFExpr>> = junction
         .preds
         .iter()
         .map(|pred| to_df_predicate(pred, input_schema))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        .collect();
+    let preds = preds?;
     Ok(match junction.op {
         // An empty junction lowers `AND` to `true` and `OR` to `false`, keeping kernel semantics
-        JunctionPredicateOp::And => conjunction(preds).unwrap_or_else(|| lit(true)),
-        JunctionPredicateOp::Or => disjunction(preds).unwrap_or_else(|| lit(false)),
+        KernelJunctionPredicateOp::And => conjunction(preds).unwrap_or_else(|| lit(true)),
+        KernelJunctionPredicateOp::Or => disjunction(preds).unwrap_or_else(|| lit(false)),
     })
 }
 
@@ -137,7 +149,15 @@ mod tests {
         to_df_predicate(&pred, &test_schema()).unwrap().to_string()
     }
 
+    /// A literal `Scalar::Array` of longs, for `IN`-list cases.
+    fn long_array(values: impl IntoIterator<Item = i64>) -> Expr_ {
+        let elements: Vec<KernelScalar> = values.into_iter().map(KernelScalar::Long).collect();
+        let array = ArrayData::try_new(ArrayType::new(DataType::LONG, false), elements).unwrap();
+        Expr_::literal(KernelScalar::Array(array))
+    }
+
     #[rstest]
+    // Primitive comparisons lower to a native binary op.
     #[case::eq(column_expr!("a").eq(Expr_::literal(1i64)), "a = Int64(1)")]
     #[case::lt(column_expr!("a").lt(Expr_::literal(1i64)), "a < Int64(1)")]
     #[case::gt(column_expr!("a").gt(Expr_::literal(1i64)), "a > Int64(1)")]
@@ -145,68 +165,23 @@ mod tests {
         column_expr!("a").distinct(Expr_::literal(1i64)),
         "a IS DISTINCT FROM Int64(1)"
     )]
-    fn comparison_lowers_to_binary_expr(#[case] kernel: Pred, #[case] expected: &str) {
-        assert_eq!(lower(kernel), expected);
-    }
-
-    // Kernel has no <=/>=/!= operators: they are Not of a primitive comparison, so they render as
-    // a negated form rather than a native LtEq/GtEq/NotEq.
-    #[rstest]
+    // Kernel has no <=/>=/!= ops: each is `Not` of a primitive comparison, so it renders negated.
     #[case::ne(column_expr!("a").ne(Expr_::literal(1i64)), "NOT a = Int64(1)")]
     #[case::le(column_expr!("a").le(Expr_::literal(1i64)), "NOT a > Int64(1)")]
     #[case::ge(column_expr!("a").ge(Expr_::literal(1i64)), "NOT a < Int64(1)")]
-    fn derived_comparison_lowers_to_negated_primitive(
-        #[case] kernel: Pred,
-        #[case] expected: &str,
-    ) {
-        assert_eq!(lower(kernel), expected);
-    }
-
-    #[test]
-    fn is_null_lowers_to_is_null() {
-        assert_eq!(lower(column_expr!("a").is_null()), "a IS NULL");
-    }
-
-    #[test]
-    fn is_not_null_lowers_to_negated_is_null() {
-        assert_eq!(lower(column_expr!("a").is_not_null()), "NOT a IS NULL");
-    }
-
-    #[test]
-    fn in_lowers_to_in_list() {
-        let array = ArrayData::try_new(
-            ArrayType::new(DataType::LONG, false),
-            vec![
-                KernelScalar::Long(1),
-                KernelScalar::Long(2),
-                KernelScalar::Long(3),
-            ],
-        )
-        .unwrap();
-        let kernel = Pred::binary(
-            BinaryPredicateOp::In,
-            column_expr!("a"),
-            Expr_::literal(KernelScalar::Array(array)),
-        );
-        assert_eq!(lower(kernel), "a IN ([Int64(1), Int64(2), Int64(3)])");
-    }
-
-    #[test]
-    fn not_in_lowers_to_negated_in_list() {
-        let array = ArrayData::try_new(
-            ArrayType::new(DataType::LONG, false),
-            vec![KernelScalar::Long(1), KernelScalar::Long(2)],
-        )
-        .unwrap();
-        let inner = Pred::binary(
-            BinaryPredicateOp::In,
-            column_expr!("a"),
-            Expr_::literal(KernelScalar::Array(array)),
-        );
-        assert_eq!(lower(Pred::not(inner)), "NOT a IN ([Int64(1), Int64(2)])");
-    }
-
-    #[rstest]
+    // Unary.
+    #[case::is_null(column_expr!("a").is_null(), "a IS NULL")]
+    #[case::is_not_null(column_expr!("a").is_not_null(), "NOT a IS NULL")]
+    // IN / NOT IN.
+    #[case::in_list(
+        Pred::binary(KernelBinaryPredicateOp::In, column_expr!("a"), long_array([1, 2, 3])),
+        "a IN ([Int64(1), Int64(2), Int64(3)])"
+    )]
+    #[case::not_in(
+        Pred::not(Pred::binary(KernelBinaryPredicateOp::In, column_expr!("a"), long_array([1, 2]))),
+        "NOT a IN ([Int64(1), Int64(2)])"
+    )]
+    // Junctions fold left-associatively.
     #[case::and(
         Pred::and(column_expr!("a").is_null(), column_expr!("b").is_null()),
         "a IS NULL AND b IS NULL"
@@ -215,27 +190,48 @@ mod tests {
         Pred::or(column_expr!("a").is_null(), column_expr!("b").is_null()),
         "a IS NULL OR b IS NULL"
     )]
-    fn junction_lowers_to_folded_binary_expr(#[case] kernel: Pred, #[case] expected: &str) {
-        assert_eq!(lower(kernel), expected);
-    }
-
-    #[test]
-    fn multi_element_and_folds_left_associatively() {
-        let kernel = Pred::and_from([
+    #[case::multi_and(
+        Pred::and_from([
             column_expr!("a").is_null(),
             column_expr!("b").is_null(),
             column_expr!("c").is_null(),
-        ]);
-        assert_eq!(lower(kernel), "a IS NULL AND b IS NULL AND c IS NULL");
+        ]),
+        "a IS NULL AND b IS NULL AND c IS NULL"
+    )]
+    // A bare boolean expression delegates straight to the expression converter.
+    #[case::boolean_expression(Pred::from_expr(column_expr!("a")), "a")]
+    // Nesting: predicates compose recursively. DataFusion's Display does not parenthesize the
+    // junction under a `Not`, though the underlying `Expr` tree is still `Not(And(..))`.
+    #[case::not_of_junction(
+        Pred::not(Pred::and(column_expr!("a").is_null(), column_expr!("b").is_null())),
+        "NOT a IS NULL AND b IS NULL"
+    )]
+    #[case::junction_of_junction(
+        Pred::or(
+            Pred::and(column_expr!("a").is_null(), column_expr!("b").is_null()),
+            column_expr!("c").is_null(),
+        ),
+        "a IS NULL AND b IS NULL OR c IS NULL"
+    )]
+    #[case::and_of_comparisons(
+        Pred::and(
+            column_expr!("a").eq(Expr_::literal(1i64)),
+            column_expr!("b").gt(Expr_::literal(2i64)),
+        ),
+        "a = Int64(1) AND b > Int64(2)"
+    )]
+    fn predicate_lowers_to_expected(#[case] kernel: Pred, #[case] expected: &str) {
+        assert_eq!(lower(kernel), expected);
     }
 
-    #[test]
-    fn boolean_expression_delegates_to_expression_converter() {
-        assert_eq!(lower(Pred::from_expr(column_expr!("a"))), "a");
-    }
-
-    #[test]
-    fn unknown_predicate_is_unsupported() {
-        to_df_predicate(&Pred::Unknown("mystery".into()), &test_schema()).unwrap_err();
+    #[rstest]
+    // Engine-defined and opaque-to-both predicates have no DataFusion equivalent.
+    #[case::unknown(Pred::Unknown("mystery".into()))]
+    // An `IN` whose right side is not a literal array cannot be lowered.
+    #[case::in_without_literal_array(
+        Pred::binary(KernelBinaryPredicateOp::In, column_expr!("a"), column_expr!("b"))
+    )]
+    fn unsupported_predicate_is_an_error(#[case] pred: Pred) {
+        to_df_predicate(&pred, &test_schema()).unwrap_err();
     }
 }
