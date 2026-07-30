@@ -135,7 +135,7 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
 /// A [`StorageHandler`] wrapper that counts the number of `list_from` calls and the number of
 /// items consumed from the returned iterators. Used to verify that
 /// `list_with_backward_checkpoint_scan` issues the expected number of storage listing requests,
-/// and that listing terminates without consuming files past the version-named region.
+/// and that single-directory listing never yields files from subdirectories.
 struct CountingStorageHandler {
     inner: Arc<dyn StorageHandler>,
     list_from_count: AtomicU32,
@@ -473,14 +473,14 @@ async fn test_listing_omits_staged_commits() {
 }
 
 #[tokio::test]
-async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() {
+async fn test_listing_never_consumes_staged_commits_in_subdirectory() {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
     ];
-    // Staged commits sort after every version-named file ('_' > '9'), so a sorted listing
-    // reaches them only after all relevant files. None should be consumed beyond the first.
+    // Staged commits live under `_delta_log/_staged_commits/`. Single-directory listing never
+    // descends into that subdirectory, so none are ever consumed.
     log_files
         .extend((0..100).map(|v| (v, LogPathFileType::StagedCommit, CommitSource::Filesystem)));
 
@@ -493,19 +493,19 @@ async fn test_listing_stops_at_first_staged_commit_without_consuming_the_rest() 
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the single staged commit that stops the listing
-    assert_eq!(storage.items_listed(), 4);
+    // Only the 3 direct-child commits are listed; the 100 staged commits in the subdirectory
+    // are never consumed.
+    assert_eq!(storage.items_listed(), 3);
 }
 
-// Any path past the version-named region stops the listing, not just `_staged_commits/`:
-// checkpoint sidecars under `_sidecars/` and non-underscore names whose first byte sorts
-// past '9' (e.g. 'Z'). Both sentinels sort before `_staged_commits/`, so no staged commit
-// is ever consumed.
+// Direct-child paths that are not version-named log files (e.g. checkpoint sidecar references
+// mistakenly at the top level, or `_last_checkpoint`) are listed but discarded by parsing, and
+// do not affect the commit/checkpoint set.
 #[rstest]
-#[case::sidecar("_delta_log/_sidecars/016ae953-37a9-438e-8683-9a9a4a79a395.parquet")]
+#[case::last_checkpoint("_delta_log/_last_checkpoint")]
 #[case::non_underscore_sentinel("_delta_log/Zsentinel")]
 #[tokio::test]
-async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_path: &str) {
+async fn test_listing_ignores_direct_child_non_log_files(#[case] sentinel_path: &str) {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -522,14 +522,12 @@ async fn test_listing_stops_at_first_non_version_named_path(#[case] sentinel_pat
     assert_eq!(commits.len(), 3);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 3 commits plus the sentinel that stops the listing
+    // 3 direct-child commits plus the sentinel; the 50 staged commits are never consumed.
     assert_eq!(storage.items_listed(), 4);
 }
 
 #[tokio::test]
-async fn test_listing_stops_at_last_checkpoint_marker() {
-    // In a real table `_last_checkpoint` sorts before `_staged_commits/` ('_la' < '_st'), so
-    // it is the path that stops the listing.
+async fn test_listing_with_checkpoint_and_crc_omits_staged_commits() {
     let mut log_files = vec![
         (0, LogPathFileType::Commit, CommitSource::Filesystem),
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -557,8 +555,8 @@ async fn test_listing_stops_at_last_checkpoint_marker() {
     assert_eq!(latest_crc.unwrap().version, 2);
     assert_eq!(latest_commit.unwrap().version, 2);
     assert_eq!(max_pub, Some(2));
-    // 5 version-named files plus the `_last_checkpoint` that stops the listing; no staged
-    // commit is ever consumed
+    // 5 version-named direct children (3 commits + checkpoint + crc) plus `_last_checkpoint`;
+    // the 50 staged commits in the subdirectory are never consumed.
     assert_eq!(storage.items_listed(), 6);
 }
 
