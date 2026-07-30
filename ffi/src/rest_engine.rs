@@ -377,28 +377,13 @@ mod tests {
     use crate::ffi_test_utils::allocate_err;
     use crate::kernel_string_slice;
 
-    // ================================ Miri policy for this module ================================
+    // Miri policy for this module. See ffi/CLAUDE.md "Testing under Miri" for the policy;
+    // tests below are grouped by their relationship to `unsafe`, in file order:
     //
-    // CI runs these tests under Miri to catch undefined behavior in this module's `unsafe` FFI:
-    // the raw-pointer reads in `take_auth_pairs_from_c`, the `unsafe impl Send/Sync for
-    // FfiAuthHeaderProvider`, and `FfiAuthHeaderProvider::collect` (which dereferences a
-    // `*mut CAuthHeaders` the C caller filled in). Miri interprets MIR instead of running native
-    // code, so it is far slower than a normal run; we skip tests it cannot usefully check.
-    //
-    // The tests are grouped by their relationship to `unsafe`, in file order:
-    //
-    //   1. Pure-logic tests: no `unsafe`, cheap. Run under Miri because there is no reason not to.
-    //
-    //   2. Unsafe-FFI tests: execute this module's `unsafe` directly. These are why the Miri job
-    //      exists; never mark them `#[cfg_attr(miri, ignore)]`.
-    //
-    //   3. Client-build tests: `#[cfg_attr(miri, ignore)]`. They execute no `unsafe` from this
-    //      crate (the lone unsafe call sits behind a per-request closure they never fire) and are
-    //      slow under Miri because `build_rest_client` builds the reqwest/rustls crypto stack.
-    //      Skipping them drops no coverage: group 2 already covers the only `unsafe` they touch.
-    //      See that group's banner for details.
-    //
-    // =============================================================================================
+    //   1. Pure-logic tests: no `unsafe`. Run under Miri.
+    //   2. Unsafe-FFI tests: exercise this module's `unsafe` directly. Run under Miri.
+    //   3. Client-build tests: reach `build_rest_client`. Their `unsafe` is a subset of what groups
+    //      1-2 run under Miri, so the slow ones are `#[cfg_attr(miri, ignore)]`.
 
     fn test_allocate_error() -> AllocateErrorFn {
         allocate_err
@@ -526,12 +511,11 @@ mod tests {
         assert!(rest_endpoint_config_from_c(&config).is_err());
     }
 
-    // === Group 2: unsafe-FFI tests (MUST run under Miri) ===
+    // === Group 2: unsafe-FFI tests (kept under Miri) ===
     //
     // These exercise `take_auth_pairs_from_c` (raw-pointer reads of a C-filled `*mut CAuthHeaders`)
     // and `FfiAuthHeaderProvider::collect` (which upcalls the C callback and dereferences its
-    // output): the undefined-behavior surface Miri exists to check here. Never mark any test in
-    // this group `#[cfg_attr(miri, ignore)]`.
+    // output): the undefined-behavior surface Miri checks here.
 
     #[test]
     fn auth_pairs_from_c_takes_handles() {
@@ -584,21 +568,26 @@ mod tests {
 
     // === Group 3: client-build tests (call build_rest_object_store) ===
     //
-    // None of these execute this crate's `unsafe`: `build_rest_object_store` has no `unsafe`, and
-    // its one unsafe path (`FfiAuthHeaderProvider::collect`) sits behind a per-request closure that
-    // only fires when the store serves an HTTP request, which these build-only tests never do.
-    // Their only Miri-relevant cost is `build_rest_client`, which builds the reqwest/rustls client
-    // and initializes the crypto provider: minutes of safe arithmetic under the interpreter.
+    // These execute no `unsafe` beyond what groups 1-2 already run under Miri.
+    // `build_rest_object_store` has no `unsafe`; the `try_from_slice` in their config setup
+    // (via `rest_endpoint_config_from_c`) is covered by group 1, and
+    // `FfiAuthHeaderProvider::collect` by group 2 (it sits behind a per-request closure these
+    // build-only tests never fire). Their only Miri-relevant cost is `build_rest_client`, which
+    // builds the reqwest/rustls client and initializes the crypto provider: minutes of safe
+    // arithmetic under the interpreter.
     //
     // Split accordingly:
     //
-    //   3a. Input rejected BEFORE `build_rest_client` runs. Cheap, so kept under Miri.
+    //   3a. Rejected cheaply, before rustls crypto init. Kept under Miri.
     //
-    //   3b. Client built fully (success cases, plus errors parsed AFTER the build). Marked
-    //       `#[cfg_attr(miri, ignore)]`: they run no `unsafe`, so skipping drops no coverage
-    //       (group 2 already covers the unsafe FFI). They still run under `cargo test` / nextest.
+    //   3b. Client built fully (success cases, plus errors parsed after the build). Marked
+    //       `#[cfg_attr(miri, ignore)]`: skipping drops no coverage (groups 1-2 already cover
+    //       their `unsafe`). They still run under `cargo test` / nextest.
 
-    // --- 3a: rejected before the client is built (cheap; run under Miri) ---
+    // --- 3a: rejected before rustls crypto init (cheap; run under Miri) ---
+    //
+    // Invalid timeout and header value reject inside `build_rest_object_store`; partial mTLS
+    // rejects inside `build_rest_client` but before `builder.build()`, so no crypto stack is built.
 
     #[test]
     fn build_rejects_invalid_timeout() {
@@ -636,11 +625,11 @@ mod tests {
         );
     }
 
-    // --- 3b: build the reqwest/rustls client (no unsafe; ~minutes under Miri, so skipped) ---
+    // --- 3b: build the reqwest/rustls client (~minutes under Miri, so skipped) ---
     //
     // Every test below is `#[cfg_attr(miri, ignore)]` because it reaches `build_rest_client` and
-    // pays the full rustls crypto-init cost under the interpreter while executing none of this
-    // crate's `unsafe`. See the group-3 banner above.
+    // pays the full rustls crypto-init cost under the interpreter. Their `unsafe` is already run
+    // under Miri by groups 1-2, so skipping drops no coverage. See the group-3 banner above.
 
     #[test]
     #[cfg_attr(
