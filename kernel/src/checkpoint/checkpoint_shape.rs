@@ -10,15 +10,17 @@
 // No in-crate caller yet; following PRs will use this.
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{LEAF_CHECKPOINT_ACTIONS_SCHEMA, SIDECAR_NAME};
+use crate::actions::{ADD_NAME, LEAF_CHECKPOINT_ACTIONS_SCHEMA, SIDECAR_NAME, STATS_PARSED};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
-use crate::schema::SchemaRef;
+use crate::schema::{DataType, SchemaRef, StructField};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, FileMeta};
 
@@ -194,6 +196,31 @@ impl CheckpointShape {
         }
     }
 
+    fn add_field(&self, name: &str) -> Option<&StructField> {
+        let DataType::Struct(add) = self
+            .leaf_checkpoint_schema
+            .as_ref()?
+            .field(ADD_NAME)?
+            .data_type()
+        else {
+            return None;
+        };
+        add.field(name)
+    }
+
+    /// Whether the checkpoint contains JSON-encoded stats.
+    pub(crate) fn has_json_stats(&self) -> bool {
+        self.add_field("stats").is_some()
+    }
+
+    /// Return the checkpoint's complete native parsed-stats schema.
+    pub(crate) fn stats_parsed_schema(&self) -> Option<SchemaRef> {
+        let DataType::Struct(stats) = self.add_field(STATS_PARSED)?.data_type() else {
+            return None;
+        };
+        Some(Arc::new(stats.as_ref().clone()))
+    }
+
     /// Return `stats_schema` when the checkpoint has compatible parsed stats.
     pub(crate) fn compatible_stats_parsed_schema<'a>(
         &self,
@@ -205,6 +232,22 @@ impl CheckpointShape {
                 LogSegment::schema_has_compatible_stats_parsed(checkpoint_schema, stats_schema)
             })
             .then_some(stats_schema)
+    }
+
+    /// Return `partition_schema` when the checkpoint has compatible parsed partition values.
+    pub(crate) fn compatible_partition_values_parsed_schema(
+        &self,
+        partition_schema: &SchemaRef,
+    ) -> Option<SchemaRef> {
+        self.leaf_checkpoint_schema
+            .as_ref()
+            .filter(|checkpoint_schema| {
+                LogSegment::schema_has_compatible_partition_values_parsed(
+                    checkpoint_schema,
+                    partition_schema,
+                )
+            })
+            .map(|_| partition_schema.clone())
     }
 }
 

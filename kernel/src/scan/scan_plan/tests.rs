@@ -52,7 +52,15 @@ fn normalized_metadata_batch(
     if let Some(partitions) = partitions_parsed {
         columns.push(("partitionValues_parsed", partitions));
     }
-    Ok(RecordBatch::try_from_iter(columns)?)
+    // Arrow infers non-nullable fields for all-valid computed arrays; these metadata fields remain
+    // nullable by contract.
+    Ok(RecordBatch::try_from_iter_with_nullable(
+        columns.into_iter().map(|(name, column)| {
+            let nullable = matches!(name, STATS | STATS_PARSED | PARTITION_VALUES_PARSED)
+                || column.is_nullable();
+            (name, column, nullable)
+        }),
+    )?)
 }
 
 fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<RecordBatch>> {
@@ -159,14 +167,14 @@ fn without_columns(batches: &[RecordBatch], excluded: &[&str]) -> DeltaResult<Ve
     batches
         .iter()
         .map(|batch| {
-            RecordBatch::try_from_iter(
+            RecordBatch::try_from_iter_with_nullable(
                 batch
                     .schema()
                     .fields()
                     .iter()
                     .zip(batch.columns())
                     .filter(|(field, _)| !excluded.contains(&field.name().as_str()))
-                    .map(|(field, column)| (field.name(), column.clone())),
+                    .map(|(field, column)| (field.name(), column.clone(), field.is_nullable())),
             )
             .map_err(Into::into)
         })
@@ -393,7 +401,6 @@ const ADD_FIELDS: &[&str] = &[
     "add.size",
     "add.modificationTime",
     "add.dataChange",
-    "add.partitionValues",
     "add.deletionVector.storageType",
     "add.deletionVector.pathOrInlineDv",
     "add.deletionVector.offset",
@@ -404,6 +411,7 @@ const ADD_FIELDS: &[&str] = &[
     "add.tags",
     "add.clusteringProvider",
 ];
+const STRING_PARTITION_FIELDS: &[&str] = &["add.partitionValues"];
 const ALL_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.numRecords",
     "add.stats_parsed.nullCount.id",
@@ -444,58 +452,105 @@ const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
 const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 
 #[rstest]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_string_map(
     StatsOptions::json_only(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, JSON_STATS_FIELDS]
+    &[ADD_FIELDS, JSON_STATS_FIELDS, STRING_PARTITION_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::json_only_with_struct(
     StatsOptions::json_only(),
     PartitionValuesOptions::with_struct(),
+    &[
+        ADD_FIELDS,
+        JSON_STATS_FIELDS,
+        STRING_PARTITION_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
+)]
+#[case::json_only_struct_only(
+    StatsOptions::json_only(),
+    PartitionValuesOptions::struct_only(),
     &[ADD_FIELDS, JSON_STATS_FIELDS, PARTITION_PARSED_FIELDS]
 )]
 #[case::all_struct_string_map(
     StatsOptions::all_struct(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS]
+    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, STRING_PARTITION_FIELDS]
 )]
 #[case::all_struct_with_struct(
     StatsOptions::all_struct(),
     PartitionValuesOptions::with_struct(),
+    &[
+        ADD_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        STRING_PARTITION_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
+)]
+#[case::all_struct_struct_only(
+    StatsOptions::all_struct(),
+    PartitionValuesOptions::struct_only(),
     &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
 )]
 #[case::struct_columns_string_map(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS]
+    &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, STRING_PARTITION_FIELDS]
 )]
 #[case::struct_columns_with_struct(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     PartitionValuesOptions::with_struct(),
+    &[
+        ADD_FIELDS,
+        ID_STATS_PARSED_FIELDS,
+        STRING_PARTITION_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
+)]
+#[case::struct_columns_struct_only(
+    StatsOptions::struct_columns(vec![column_name!("id")]),
+    PartitionValuesOptions::struct_only(),
     &[ADD_FIELDS, ID_STATS_PARSED_FIELDS, PARTITION_PARSED_FIELDS]
 )]
 #[case::empty_struct_columns_string_map(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS]
+    &[ADD_FIELDS, STRING_PARTITION_FIELDS]
 )]
 #[case::empty_struct_columns_with_struct(
     StatsOptions::struct_columns(vec![]),
     PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, STRING_PARTITION_FIELDS, PARTITION_PARSED_FIELDS]
+)]
+#[case::empty_struct_columns_struct_only(
+    StatsOptions::struct_columns(vec![]),
+    PartitionValuesOptions::struct_only(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_string_map(
     StatsOptions::all(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS, ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
+    &[
+        ADD_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        JSON_STATS_FIELDS,
+        STRING_PARTITION_FIELDS,
+    ]
 )]
-#[should_panic(expected = "requested JSON stats must be populated")]
 #[case::all_with_struct(
     StatsOptions::all(),
     PartitionValuesOptions::with_struct(),
+    &[
+        ADD_FIELDS,
+        ALL_STATS_PARSED_FIELDS,
+        JSON_STATS_FIELDS,
+        STRING_PARTITION_FIELDS,
+        PARTITION_PARSED_FIELDS,
+    ]
+)]
+#[case::all_struct_only(
+    StatsOptions::all(),
+    PartitionValuesOptions::struct_only(),
     &[
         ADD_FIELDS,
         ALL_STATS_PARSED_FIELDS,
@@ -506,11 +561,16 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
 #[case::none_string_map(
     StatsOptions::none(),
     PartitionValuesOptions::string_map_only(),
-    &[ADD_FIELDS]
+    &[ADD_FIELDS, STRING_PARTITION_FIELDS]
 )]
 #[case::none_with_struct(
     StatsOptions::none(),
     PartitionValuesOptions::with_struct(),
+    &[ADD_FIELDS, STRING_PARTITION_FIELDS, PARTITION_PARSED_FIELDS]
+)]
+#[case::none_struct_only(
+    StatsOptions::none(),
+    PartitionValuesOptions::struct_only(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
 fn declarative_metadata_has_exact_leaf_schema_across_output_options(
@@ -520,6 +580,8 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 ) {
     (|| -> DeltaResult<()> {
         let json_requested = stats.synthesize_json;
+        let string_partitions_requested = partition_values.string_map;
+        let parsed_partitions_requested = partition_values.parsed_struct;
         let (engine, snapshot, _tempdir) =
             load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let scan = snapshot
@@ -567,6 +629,53 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
             .collect();
         expected.sort_unstable();
         assert_eq!(leaf_paths(&actual), expected);
+
+        let partition_values = |field_name| -> DeltaResult<Vec<String>> {
+            let batches = actual
+                .iter()
+                .map(|batch| {
+                    let add = batch
+                        .column_by_name(ADD_NAME)
+                        .expect("add column")
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .expect("add struct");
+                    RecordBatch::try_from_iter([(
+                        field_name,
+                        add.column_by_name(field_name)
+                            .unwrap_or_else(|| panic!("add.{field_name}"))
+                            .clone(),
+                    )])
+                    .map_err(Into::into)
+                })
+                .collect::<DeltaResult<Vec<_>>>()?;
+            let formatted = pretty_format_batches(&batches)?.to_string();
+            let mut values: Vec<_> = formatted
+                .lines()
+                .filter_map(|line| {
+                    let value = line.trim().strip_prefix('|')?.strip_suffix('|')?.trim();
+                    value.starts_with("{part:").then(|| value.to_string())
+                })
+                .collect();
+            values.sort_unstable();
+            Ok(values)
+        };
+        let expected_partitions = [
+            "{part: 0}".to_string(),
+            "{part: 1}".to_string(),
+            "{part: 1}".to_string(),
+            "{part: 2}".to_string(),
+            "{part: 2}".to_string(),
+        ];
+        if string_partitions_requested {
+            assert_eq!(partition_values(PARTITION_VALUES)?, expected_partitions);
+        }
+        if parsed_partitions_requested {
+            assert_eq!(
+                partition_values(PARTITION_VALUES_PARSED)?,
+                expected_partitions
+            );
+        }
         Ok(())
     })()
     .unwrap()
@@ -664,8 +773,16 @@ fn declarative_metadata_output_options_across_log_shapes(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint()
 )]
-// TODO: https://github.com/delta-io/delta-kernel-rs/issues/3040
-#[should_panic(expected = "requested JSON stats must be populated")]
+#[case::v1_with_commit(
+    LogState::with_latest_version(2).with_checkpoint_at([1]),
+    FeatureSet::new()
+)]
+#[case::v2_with_commit(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([1])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
 fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
@@ -718,17 +835,45 @@ fn assert_metadata_output_options(
                 0,
                 "requested JSON stats must be populated"
             );
+            for stats in stats.iter().flatten() {
+                let stats: serde_json::Value = serde_json::from_str(stats)?;
+                for path in [
+                    "/numRecords",
+                    "/nullCount/value",
+                    "/minValues/value",
+                    "/maxValues/value",
+                    "/tightBounds",
+                ] {
+                    assert!(
+                        stats.pointer(path).is_some(),
+                        "missing JSON stats field {path}"
+                    );
+                }
+            }
         }
     }
 
-    if json_requested {
+    let imperative_is_missing_json_stats = json_requested
+        && expected.iter().any(|batch| {
+            batch
+                .column_by_name(STATS)
+                .is_some_and(|stats| stats.null_count() > 0)
+        });
+    if imperative_is_missing_json_stats {
+        // The imperative path cannot synthesize JSON for struct-only checkpoints.
+        assert_metadata_eq(
+            &without_columns(&actual, &[STATS])?,
+            &without_columns(&expected, &[STATS])?,
+            "metadata output options across log shapes",
+        )?;
+    } else if json_requested {
         assert_metadata_eq(
             &actual,
             &expected,
             "metadata output options across log shapes",
         )?;
     } else {
-        // Imperative metadata exposes source JSON even when it was not requested.
+        // The imperative path exposes source JSON even when it was not requested.
         assert_metadata_eq(
             &actual,
             &without_columns(&expected, &[STATS])?,
