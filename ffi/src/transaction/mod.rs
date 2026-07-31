@@ -800,7 +800,7 @@ mod tests {
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_error, recover_string,
+        engine_handle_for_store, ok_or_panic, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
@@ -1305,22 +1305,19 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_partitioned_write_context_rejects_unpartitioned_table(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
             "number",
             DataType::INTEGER,
         )])?);
-        let (_tmp_test_dir, tables) =
-            setup_local_test_tables(schema, &[], "test_unpartitioned").await?;
+        let tables = setup_test_tables(schema, &[], None, "test_unpartitioned").await?;
 
-        for (table_url, _engine, _store, _table_name) in tables {
-            let table_path = table_url.to_file_path().unwrap();
-            let table_path_str = table_path.to_str().unwrap();
-            let engine = get_default_engine(table_path_str);
+        for (table_url, _engine, store, _table_name) in tables {
+            let table_url_str = table_url.as_str();
+            let engine = engine_handle_for_store(store);
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
 
             // Supplying partition values for a non-partitioned table is an error, and the call
@@ -1336,7 +1333,11 @@ mod tests {
                 )
             });
             let result = unsafe {
-                get_partitioned_write_context(txn, partition_values, engine.shallow_copy())
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
             };
             let err = match result {
                 ExternResult::Err(e) => unsafe { recover_error(e) },
@@ -1347,6 +1348,7 @@ mod tests {
                 "unexpected error: {}",
                 err.message
             );
+            unsafe { free_transaction(txn) };
             unsafe { free_engine(engine) };
         }
 
