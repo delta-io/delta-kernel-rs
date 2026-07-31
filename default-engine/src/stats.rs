@@ -523,14 +523,22 @@ impl StatsAccumulator {
 /// characters for max values. See the `stats_schema` module documentation for the full stats
 /// value rules.
 ///
-/// # Arguments
-/// * `batch` - The RecordBatch to collect statistics from
-/// * `stats_columns` - Column names that should have `nullCount` collected (allowlist). Only these
-///   columns appear in nullCount/minValues/maxValues.
+/// # Parameters
 ///
-/// Collect statistics using the kernel physical schema to preserve logical type distinctions that
-/// are erased in Arrow arrays.
-pub(crate) fn collect_stats(
+/// - `batch`: The record batch to collect statistics from.
+/// - `stats_columns`: The columns to include in `nullCount`, `minValues`, and `maxValues`.
+/// - `physical_schema`: The kernel physical schema, used to preserve logical type distinctions that
+///   are erased in Arrow arrays.
+///
+/// # Returns
+///
+/// A single-row struct array containing the collected file statistics.
+///
+/// # Errors
+///
+/// Returns an error if a column cannot be converted to its expected Arrow type or the output stats
+/// array cannot be constructed.
+pub fn collect_stats(
     batch: &RecordBatch,
     stats_columns: &[ColumnName],
     physical_schema: &StructType,

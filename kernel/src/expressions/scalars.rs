@@ -361,7 +361,9 @@ impl Scalar {
         Some(result)
     }
 
-    /// Attempts to divide two scalars, returning None if they were incompatible.
+    /// Attempts to divide two scalars, truncating toward zero. Returns None if they were
+    /// incompatible, if `other` is zero, or on overflow. Only the integral types divide; a float or
+    /// decimal operand is treated as incompatible.
     pub fn try_div(&self, other: &Scalar) -> Option<Scalar> {
         use Scalar::*;
         let result = match (self, other) {
@@ -1084,6 +1086,18 @@ mod tests {
     use crate::expressions::{column_expr, BinaryPredicateOp};
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
+
+    #[rstest]
+    #[case::truncates(Scalar::Integer(7), Scalar::Integer(2), Some(Scalar::Integer(3)))]
+    #[case::zero_divisor(Scalar::Integer(7), Scalar::Integer(0), None)]
+    #[case::floats_unsupported(Scalar::Double(7.0), Scalar::Double(2.0), None)]
+    fn test_try_div_truncates_and_returns_none_for_zero_divisor_and_floats(
+        #[case] left: Scalar,
+        #[case] right: Scalar,
+        #[case] expected: Option<Scalar>,
+    ) {
+        assert_eq!(left.try_div(&right), expected);
+    }
 
     #[test]
     fn test_void_parse_scalar() {

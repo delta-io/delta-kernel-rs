@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Clone and build the Unity Catalog OSS server at a pinned commit so the gated
-# unity-catalog-delta-rest-client live integration tests can run against a real server in CI.
+# Clone and build the Unity Catalog server at a pinned commit so the gated
+# unity-catalog-delta-client-default live integration tests can run against a real server in CI.
 #
 # Pinned to a commit that serves the Delta-Tables API the kernel UC crate targets. The published
 # `:latest` artifacts/images predate these endpoints, so building from this commit is required.

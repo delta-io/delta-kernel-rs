@@ -1742,9 +1742,8 @@ mod tests {
             context.commit_called = true;
 
             let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
-            let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
 
-            context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
+            context.last_commit_table_id = Some(table_id.clone());
 
             // Capture the staged commit file name if present
             if let OptionalValue::Some(commit_info) = request.commit_info {
@@ -1795,10 +1794,16 @@ mod tests {
 
             let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
             let table_id = "test_id";
+            let catalog = "test_catalog";
+            let schema = "test_schema";
+            let table_name = "test_table";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };
@@ -1873,6 +1878,9 @@ mod tests {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };
@@ -1912,6 +1920,9 @@ mod tests {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };
@@ -1943,7 +1954,7 @@ mod tests {
 
             {
                 // scope so we don't hold mutex across the await lower down
-                let (last_table_id, _) = context.last_commit_request.unwrap();
+                let last_table_id = context.last_commit_table_id.unwrap();
                 assert_eq!(
                     last_table_id, "test_id",
                     "Table ID should match the one passed to UCCommitter"

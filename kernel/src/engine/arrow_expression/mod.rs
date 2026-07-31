@@ -1,7 +1,8 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
+pub(crate) use evaluate_expression::extract_column;
+use evaluate_expression::{evaluate_expression, evaluate_predicate};
 use itertools::Itertools;
 use tracing::debug;
 

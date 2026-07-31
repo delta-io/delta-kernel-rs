@@ -432,6 +432,48 @@ pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handl
     scan.physical_schema().clone().into()
 }
 
+/// Build the declarative metadata-scan [`Plan`](delta_kernel::plans::ir::plan::Plan) for a scan and
+/// return it as proto-serialized [`Operation`](delta_kernel::Operation) bytes.
+///
+/// On success, returns an [`OptionalValue`]:
+/// - [`OptionalValue::Some`] wraps a [`KernelOwnedBytes`](crate::KernelOwnedBytes) buffer holding
+///   the proto-serialized `delta.kernel.operation.Operation` message (a `QueryPlan`). The engine
+///   owns the buffer and must free it with [`free_kernel_bytes`](crate::free_kernel_bytes).
+/// - [`OptionalValue::None`] means there is no plan to execute because the scan's predicate
+///   statically skips all files.
+///
+/// # Safety
+///
+/// Caller must pass a valid [`SharedScan`] handle and a valid [`SharedExternEngine`] handle. This
+/// function borrows but does not consume either handle; the caller retains ownership of both.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn scan_declarative_metadata_plan(
+    scan: Handle<SharedScan>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<crate::KernelOwnedBytes>> {
+    let scan = unsafe { scan.as_ref() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let inner_engine = extern_engine.engine();
+    scan_declarative_metadata_plan_impl(scan, inner_engine.as_ref())
+        .into_extern_result(&extern_engine)
+}
+
+#[cfg(feature = "declarative-plans")]
+fn scan_declarative_metadata_plan_impl(
+    scan: &Scan,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<OptionalValue<crate::KernelOwnedBytes>> {
+    let plan = scan.declarative_metadata_scan_plan(engine)?;
+    Ok(plan
+        .map(|plan| {
+            delta_kernel::Operation::QueryPlan(plan)
+                .to_proto_bytes()
+                .into()
+        })
+        .into())
+}
+
 // Intentionally opaque to the engine.
 //
 // TODO: This approach liberates the engine from having to worry about mutual exclusion, but that
@@ -1673,5 +1715,125 @@ mod tests {
         }
         let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
         assert_eq!(test_map, final_map);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    mod declarative_metadata_plan {
+        use std::ffi::c_void;
+
+        use delta_kernel::plans::proto::operation as proto_op;
+        use prost::Message as _;
+        use test_utils::{actions_to_string, TestAction};
+
+        use super::super::{
+            free_scan, scan_builder, scan_builder_build, scan_builder_with_predicate,
+            scan_declarative_metadata_plan, EnginePredicate,
+        };
+        use crate::error::EngineExecResult;
+        use crate::expressions::kernel_visitor::{
+            visit_expression_literal_bool, KernelExpressionVisitorState,
+        };
+        use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
+        use crate::handle::Handle;
+        use crate::plans::result::CPlanResult;
+        use crate::plans::{get_plan_based_engine, get_plan_executor};
+        use crate::{
+            free_engine, free_snapshot, KernelBytesSlice, NullableCvoid, OptionalValue,
+            SharedExternEngine,
+        };
+
+        extern "C" fn visit_false(
+            _predicate: *mut c_void,
+            state: &mut KernelExpressionVisitorState,
+        ) -> usize {
+            visit_expression_literal_bool(state, false)
+        }
+
+        extern "C" fn unreachable_executor(
+            _context: NullableCvoid,
+            _plan_proto: KernelBytesSlice,
+            _out: *mut EngineExecResult<CPlanResult>,
+        ) {
+            unreachable!("plan executor does not run: these tables have no checkpoint");
+        }
+
+        /// Wrap a fallback engine in a `PlanBasedEngine` so it exposes a `PlanExecutor`.
+        unsafe fn plan_based_engine(
+            fallback: &Handle<SharedExternEngine>,
+        ) -> Handle<SharedExternEngine> {
+            let executor = unsafe { get_plan_executor(None, unreachable_executor) };
+            unsafe { get_plan_based_engine(executor, fallback.shallow_copy(), allocate_err) }
+        }
+
+        #[tokio::test]
+        async fn returns_query_plan_bytes() {
+            let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+                TestAction::Metadata,
+                TestAction::Add("part-1.parquet".to_string()),
+            ]))
+            .await
+            .unwrap();
+
+            let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+            let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+            let plan_engine = unsafe { plan_based_engine(&engine) };
+
+            let result = unsafe {
+                scan_declarative_metadata_plan(scan.shallow_copy(), plan_engine.shallow_copy())
+            };
+            let bytes = match ok_or_panic(result) {
+                OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
+                OptionalValue::None => panic!("expected a plan for a scan with no static skip"),
+            };
+
+            let op = proto_op::Operation::decode(bytes.as_slice()).expect("decode succeeds");
+            assert!(
+                matches!(op.op, Some(proto_op::operation::Op::QueryPlan(_))),
+                "expected a QueryPlan operation",
+            );
+
+            unsafe { free_scan(scan) };
+            unsafe { free_snapshot(snapshot) };
+            unsafe { free_engine(plan_engine) };
+            unsafe { free_engine(engine) };
+        }
+
+        #[tokio::test]
+        async fn returns_none_when_statically_skipped() {
+            let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+                TestAction::Metadata,
+                TestAction::Add("part-1.parquet".to_string()),
+            ]))
+            .await
+            .unwrap();
+
+            let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+            let mut predicate = EnginePredicate {
+                predicate: std::ptr::null_mut(),
+                visitor: visit_false,
+            };
+            let builder = unsafe {
+                ok_or_panic(scan_builder_with_predicate(
+                    builder,
+                    engine.shallow_copy(),
+                    &mut predicate,
+                ))
+            };
+            let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+            let plan_engine = unsafe { plan_based_engine(&engine) };
+
+            let result = unsafe {
+                scan_declarative_metadata_plan(scan.shallow_copy(), plan_engine.shallow_copy())
+            };
+            assert!(
+                matches!(ok_or_panic(result), OptionalValue::None),
+                "expected None for a statically-skipped scan",
+            );
+
+            unsafe { free_scan(scan) };
+            unsafe { free_snapshot(snapshot) };
+            unsafe { free_engine(plan_engine) };
+            unsafe { free_engine(engine) };
+        }
     }
 }

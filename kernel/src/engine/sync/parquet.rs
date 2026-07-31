@@ -125,7 +125,7 @@ impl ParquetHandler for SyncParquetHandler {
     }
 }
 
-/// Read the [`ParquetFooter`] (schema) of `file`
+/// Read the [`ParquetFooter`] (schema) of `file`.
 pub(super) fn parquet_footer(
     store: Option<&Arc<DynObjectStore>>,
     file: &FileMeta,

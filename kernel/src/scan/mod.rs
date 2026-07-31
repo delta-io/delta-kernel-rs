@@ -17,6 +17,8 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
@@ -28,6 +30,8 @@ use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -47,6 +51,8 @@ pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod scan_plan;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
@@ -1014,6 +1020,29 @@ impl Scan {
             emit_scan_metadata_completed(&event);
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Builds a declarative plan that produces the scan's live `add` actions.
+    ///
+    /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
+    /// no Delta metadata matches this scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
+    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        let log_segment = self.snapshot.log_segment();
+        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
+        // whether the checkpoint carries a compatible parsed-stats column.
+        let plan_executor = engine.require_plan_executor()?;
+        let shape = CheckpointShape::try_new(
+            plan_executor.as_ref(),
+            &self.snapshot,
+            self.state_info.physical_stats_schema.as_ref(),
+        )?;
+        scan_plan::build_metadata_scan_plan(&self.state_info, log_segment, &shape)
     }
 
     // Factored out to facilitate testing
