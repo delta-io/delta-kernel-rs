@@ -2611,6 +2611,10 @@ mod tests {
     // Skipped under Miri: writes checkpoint parquet (minutes of safe work under the interpreter),
     // and its unsafe is covered by the anchor test_setting_multithread_executor. Sidecar-shape is
     // safe kernel logic. Runs (all cases) under normal cargo test / nextest.
+    //
+    // DO NOT ADD `unsafe` TO THIS TEST, or to the other Miri-skipped checkpoint tests below. Miri
+    // never runs them, so `unsafe` added here is never checked for undefined behavior and nothing
+    // in CI reports the gap. Put it in the anchor test instead.
     #[cfg_attr(
         miri,
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
