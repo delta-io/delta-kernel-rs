@@ -330,8 +330,6 @@ pub(crate) fn build_rest_object_store(
             })
             .transpose()?,
     };
-    let client = build_rest_client(&tls)?;
-
     let max_retries = options
         .get(REST_BUILDER_OPTION_RETRY_MAX_RETRIES)
         .map(|s| {
@@ -348,6 +346,10 @@ pub(crate) fn build_rest_object_store(
         REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS,
         options.get(REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS),
     )?;
+
+    // Validate every option before building the client: constructing the reqwest/rustls client
+    // initializes a crypto provider, which is minutes of work under the Miri interpreter.
+    let client = build_rest_client(&tls)?;
 
     Ok(Arc::new(
         RestObjectStore::new(base_url.to_string(), client, auth, Arc::new(config))
@@ -376,6 +378,14 @@ mod tests {
     use super::*;
     use crate::ffi_test_utils::allocate_err;
     use crate::kernel_string_slice;
+
+    // Miri policy for this module. See ffi/CLAUDE.md "Testing under Miri" for the policy;
+    // tests below are grouped by their relationship to `unsafe`, in file order:
+    //
+    //   1. Pure-logic tests: no `unsafe`. Run under Miri.
+    //   2. Unsafe-FFI tests: exercise this module's `unsafe` directly. Run under Miri.
+    //   3. Client-build tests: reach `build_rest_client`. Their `unsafe` is a subset of what groups
+    //      1-2 run under Miri, so the slow ones are `#[cfg_attr(miri, ignore)]`.
 
     fn test_allocate_error() -> AllocateErrorFn {
         allocate_err
@@ -450,6 +460,8 @@ mod tests {
         }
     }
 
+    // === Group 1: pure-logic tests (no unsafe; run under Miri, cheap) ===
+
     #[test]
     fn rest_builder_option_keys_match_c_exports() {
         option_key_bytes_match_const(
@@ -501,6 +513,12 @@ mod tests {
         assert!(rest_endpoint_config_from_c(&config).is_err());
     }
 
+    // === Group 2: unsafe-FFI tests (kept under Miri) ===
+    //
+    // These exercise `take_auth_pairs_from_c` (raw-pointer reads of a C-filled `*mut CAuthHeaders`)
+    // and `FfiAuthHeaderProvider::collect` (which upcalls the C callback and dereferences its
+    // output): the undefined-behavior surface Miri checks here.
+
     #[test]
     fn auth_pairs_from_c_takes_handles() {
         let mut storage = MaybeUninit::<CAuthHeaders>::uninit();
@@ -550,78 +568,34 @@ mod tests {
         assert_eq!(ttl, Some(Duration::from_millis(60_000)));
     }
 
-    #[test]
-    fn build_succeeds_with_refreshing_auth_callback() {
-        let rest = rest_builder_state_from_ffi(
-            &test_c_rest_endpoint_config(),
-            Some(fill_auth_direct),
-            None,
-            test_allocate_error(),
-        )
-        .unwrap();
-        assert!(build_rest_object_store(&test_base_url(), &HashMap::new(), &rest).is_ok());
-    }
+    // === Group 3: client-build tests (call build_rest_object_store) ===
+    //
+    // These execute no `unsafe` beyond what groups 1-2 already run under Miri.
+    // `build_rest_object_store` has no `unsafe`; the `try_from_slice` in their config setup
+    // (via `rest_endpoint_config_from_c`) is covered by group 1, and
+    // `FfiAuthHeaderProvider::collect` by group 2 (it sits behind a per-request closure these
+    // build-only tests never fire). Their only Miri-relevant cost is `build_rest_client`, which
+    // builds the reqwest/rustls client and initializes the crypto provider: minutes of safe
+    // arithmetic under the interpreter.
+    //
+    // Split accordingly:
+    //
+    //   3a. Rejected cheaply, before rustls crypto init. Kept under Miri.
+    //
+    //   3b. Client built fully (the success cases). Marked `#[cfg_attr(miri, ignore)]`: skipping
+    //       drops no coverage (groups 1-2 already cover their `unsafe`). They still run under
+    //       `cargo test` / nextest.
 
-    #[test]
-    fn build_succeeds_with_header_options_fallback() {
-        let mut options = HashMap::new();
-        options.insert(
-            format!("{}Authorization", REST_BUILDER_OPTION_HEADER_PREFIX),
-            "Bearer x".into(),
-        );
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state()).is_ok()
-        );
-    }
-
-    #[test]
-    fn build_succeeds_with_prefixes_and_resilience_options() {
-        let prefix = "/TablesById/u";
-        let mut config = test_c_rest_endpoint_config();
-        config.files_prefix = kernel_string_slice!(prefix);
-        config.entry_strip_prefix = kernel_string_slice!(prefix);
-        let rest = rest_builder_state_from_ffi(&config, None, None, test_allocate_error()).unwrap();
-
-        let mut options = HashMap::new();
-        options.insert(
-            format!("{}Authorization", REST_BUILDER_OPTION_HEADER_PREFIX),
-            "Bearer x".into(),
-        );
-        options.insert(REST_BUILDER_OPTION_RETRY_MAX_RETRIES.into(), "3".into());
-        options.insert(
-            REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS.into(),
-            "true".into(),
-        );
-        assert!(build_rest_object_store(&test_base_url(), &options, &rest).is_ok());
-    }
+    // === 3a: rejected before rustls crypto init (cheap; run under Miri) ===
+    //
+    // `build_rest_object_store` validates every option before building the client, so a bad option
+    // rejects without paying crypto init. Partial mTLS rejects inside `build_rest_client` itself,
+    // but before `builder.build()`, so no crypto stack is built either.
 
     #[test]
     fn build_rejects_invalid_timeout() {
         let mut options = HashMap::new();
         options.insert(REST_BUILDER_OPTION_TLS_TIMEOUT_SECS.into(), "nope".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn build_rejects_invalid_max_retries() {
-        let mut options = HashMap::new();
-        options.insert(REST_BUILDER_OPTION_RETRY_MAX_RETRIES.into(), "nope".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn build_rejects_invalid_verify_on_ambiguous() {
-        let mut options = HashMap::new();
-        options.insert(
-            REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS.into(),
-            "nope".into(),
-        );
         assert!(
             build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
                 .is_err()
@@ -652,5 +626,94 @@ mod tests {
             build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn build_rejects_invalid_max_retries() {
+        let mut options = HashMap::new();
+        options.insert(REST_BUILDER_OPTION_RETRY_MAX_RETRIES.into(), "nope".into());
+        assert!(
+            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn build_rejects_invalid_verify_on_ambiguous() {
+        let mut options = HashMap::new();
+        options.insert(
+            REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS.into(),
+            "nope".into(),
+        );
+        assert!(
+            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
+                .is_err()
+        );
+    }
+
+    // === 3b: build the reqwest/rustls client (~minutes under Miri, so skipped) ===
+    //
+    // Every test below is `#[cfg_attr(miri, ignore)]` because it builds the client and pays the
+    // full rustls crypto-init cost under the interpreter. Their `unsafe` is already run under Miri
+    // by groups 1-2, so skipping drops no coverage. See the group-3 banner above.
+    //
+    // DO NOT ADD `unsafe` TO A TEST BELOW. Miri never runs them, so `unsafe` added here is never
+    // checked for undefined behavior and nothing in CI reports the gap. Put it in a group 1-2 test.
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "builds reqwest/rustls client (no unsafe); crypto init is minutes under Miri"
+    )]
+    fn build_succeeds_with_refreshing_auth_callback() {
+        let rest = rest_builder_state_from_ffi(
+            &test_c_rest_endpoint_config(),
+            Some(fill_auth_direct),
+            None,
+            test_allocate_error(),
+        )
+        .unwrap();
+        assert!(build_rest_object_store(&test_base_url(), &HashMap::new(), &rest).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "builds reqwest/rustls client (no unsafe); crypto init is minutes under Miri"
+    )]
+    fn build_succeeds_with_header_options_fallback() {
+        let mut options = HashMap::new();
+        options.insert(
+            format!("{}Authorization", REST_BUILDER_OPTION_HEADER_PREFIX),
+            "Bearer x".into(),
+        );
+        assert!(
+            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state()).is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "builds reqwest/rustls client (no unsafe); crypto init is minutes under Miri"
+    )]
+    fn build_succeeds_with_prefixes_and_resilience_options() {
+        let prefix = "/TablesById/u";
+        let mut config = test_c_rest_endpoint_config();
+        config.files_prefix = kernel_string_slice!(prefix);
+        config.entry_strip_prefix = kernel_string_slice!(prefix);
+        let rest = rest_builder_state_from_ffi(&config, None, None, test_allocate_error()).unwrap();
+
+        let mut options = HashMap::new();
+        options.insert(
+            format!("{}Authorization", REST_BUILDER_OPTION_HEADER_PREFIX),
+            "Bearer x".into(),
+        );
+        options.insert(REST_BUILDER_OPTION_RETRY_MAX_RETRIES.into(), "3".into());
+        options.insert(
+            REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS.into(),
+            "true".into(),
+        );
+        assert!(build_rest_object_store(&test_base_url(), &options, &rest).is_ok());
     }
 }
