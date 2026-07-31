@@ -1,8 +1,6 @@
 //! Statistics collection for Delta Lake file writes: min, max, and null count per column.
 //!
-//! [`FileStatsAccumulator`] ingests one [`RecordBatch`] per row group and merges their statistics
-//! into a single file-level statistics struct, for connectors that write a file as multiple row
-//! groups.
+//! [`FileStatsAccumulator`] merges per-row-group statistics into one file-level statistics struct.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -608,9 +606,8 @@ fn collect_stats_raw(
 ///
 /// Every batch must have the same Arrow schema, since the statistics shape derives from it:
 /// [`FileStatsAccumulator::merge`] rejects a batch whose Arrow schema differs from that of the
-/// first batch merged. A failed merge poisons the accumulator: every later [`merge`] and
-/// [`finish`] returns an error, so a file whose row groups did not all merge cannot publish
-/// partial statistics.
+/// first batch merged. A failed merge is terminal: every later [`merge`] and [`finish`] returns an
+/// error, so a file whose row groups did not all merge cannot publish partial statistics.
 ///
 /// [`merge`]: FileStatsAccumulator::merge
 /// [`finish`]: FileStatsAccumulator::finish
@@ -660,7 +657,7 @@ pub struct FileStatsAccumulator {
     state: AccumulatorState,
 }
 
-/// Makes the poisoned state representable, so a failed merge cannot be forgotten.
+/// Makes the terminal state representable, so a failed merge cannot be forgotten.
 #[derive(Debug)]
 enum AccumulatorState {
     /// One raw statistics row per row group merged so far.
@@ -669,7 +666,7 @@ enum AccumulatorState {
     Failed,
 }
 
-const POISONED: &str = "statistics accumulator was poisoned by a failed merge";
+const FAILED: &str = "statistics accumulator failed a previous merge";
 
 impl FileStatsAccumulator {
     /// Create an empty accumulator that collects statistics for `stats_columns` (the same
@@ -687,25 +684,24 @@ impl FileStatsAccumulator {
 
     /// Collect one row group's raw statistics and add them to the accumulator.
     ///
-    /// Returns an error, poisoning the accumulator, if `batch` has a different Arrow schema than
-    /// the first batch merged, if it produces a different statistics shape, or if statistics
-    /// collection fails. Returns an error if the accumulator is already poisoned.
+    /// Returns an error if the accumulator already failed a merge, or if this one fails: `batch`
+    /// has a different Arrow schema than the first batch merged, it produces a different statistics
+    /// shape, or statistics collection fails.
     pub fn merge(&mut self, batch: &RecordBatch) -> DeltaResult<()> {
-        // Poison up front so that every early return below - including every `?` - leaves the
-        // accumulator unpublishable without having to say so.
-        let AccumulatorState::Open(mut row_groups) =
-            std::mem::replace(&mut self.state, AccumulatorState::Failed)
-        else {
-            return Err(Error::generic(POISONED));
+        // Catch every error path in one place, so no failure can leave publishable state behind.
+        self.try_merge(batch)
+            .inspect_err(|_| self.state = AccumulatorState::Failed)
+    }
+
+    fn try_merge(&mut self, batch: &RecordBatch) -> DeltaResult<()> {
+        let AccumulatorState::Open(row_groups) = &mut self.state else {
+            return Err(Error::stats_validation(FAILED));
         };
-        // The Arrow schema is checked rather than the derived stats shape, which is lossy: columns
-        // outside `stats_columns` do not appear in it, field nullability and metadata are dropped,
-        // and every nullCount-only leaf collapses to the same Int64 leaf even though `Null` columns
-        // count rows where list-like columns count nulls.
+        // Comparing derived stats shapes instead would collapse every nullCount-only leaf to the
+        // same Int64.
         let first_schema = self.batch_schema.get_or_insert_with(|| batch.schema());
         if first_schema != &batch.schema() {
-            // `Debug` rather than `Display`: schema equality covers field metadata, which
-            // `Display` omits, so a metadata-only difference would print two identical halves.
+            // `Debug`: schema equality covers the schema's metadata map, which `Display` omits.
             return Err(Error::schema(format!(
                 "all row groups in a file must have the same schema; expected {:?} but got {:?}",
                 first_schema,
@@ -714,9 +710,8 @@ impl FileStatsAccumulator {
         }
         let batch_stats =
             collect_stats_raw(batch, &self.stats_columns, &self.null_count_only_columns)?;
-        // Equal batch schemas do not guarantee equal stats shapes: schema equality can ignore a
-        // struct column's nested field names, which statistics collection filters on. Fail fast
-        // here, where the offending batch is still nameable.
+        // Schema equality can ignore a struct column's nested field names, which statistics
+        // collection filters on, so equal schemas can still derive different stats shapes.
         if let Some(first) = row_groups.first() {
             if first.data_type() != batch_stats.data_type() {
                 return Err(Error::schema(format!(
@@ -728,7 +723,6 @@ impl FileStatsAccumulator {
             }
         }
         row_groups.push(batch_stats);
-        self.state = AccumulatorState::Open(row_groups);
         Ok(())
     }
 
@@ -741,11 +735,11 @@ impl FileStatsAccumulator {
     /// `numRecords` is rejected by tables that require it (IcebergCompat tables, and any file
     /// carrying a deletion vector).
     ///
-    /// Returns `Err` if the accumulator is poisoned, or if the accumulated statistics cannot be
-    /// reduced into a single row.
+    /// Returns `Err` if a merge failed, or if the accumulated statistics cannot be reduced into a
+    /// single row.
     pub fn finish(self) -> DeltaResult<Option<StructArray>> {
         let AccumulatorState::Open(row_groups) = self.state else {
-            return Err(Error::generic(POISONED));
+            return Err(Error::stats_validation(FAILED));
         };
         if row_groups.is_empty() {
             return Ok(None);
@@ -794,11 +788,11 @@ fn reduce_stats_children(
     array: &ArrayRef,
     reduce: &dyn Fn(&ArrayRef) -> DeltaResult<ArrayRef>,
 ) -> DeltaResult<ArrayRef> {
-    let strukt = array
+    let struct_array = array
         .as_struct_opt()
         .ok_or_else(|| Error::internal_error("expected struct in stats sub-tree"))?;
-    let fields = strukt.fields().clone();
-    let cols = strukt
+    let fields = struct_array.fields().clone();
+    let cols = struct_array
         .columns()
         .iter()
         .map(|col| match col.as_struct_opt() {
@@ -1956,10 +1950,9 @@ mod tests {
             .value(0)
     }
 
-    /// Reads a string leaf directly under `strukt`, `None` if the bound is null. Strings need their
-    /// own accessor because `as_primitive` does not cover them.
-    fn string_leaf<'a>(strukt: &'a StructArray, field_name: &str) -> Option<&'a str> {
-        let leaf = strukt
+    /// Reads a string leaf directly under `struct_array`, `None` if the bound is null.
+    fn string_leaf<'a>(struct_array: &'a StructArray, field_name: &str) -> Option<&'a str> {
+        let leaf = struct_array
             .column_by_name(field_name)
             .unwrap()
             .as_string_opt::<i32>()
@@ -1967,8 +1960,6 @@ mod tests {
         leaf.is_valid(0).then(|| leaf.value(0))
     }
 
-    // Merge two flat batches; numRecords/nullCount sum, min/max cross the boundary, tightBounds
-    // ANDs.
     #[test]
     fn test_file_stats_accumulator_merges_two_batches() {
         let schema = Arc::new(Schema::new(vec![
@@ -2020,7 +2011,6 @@ mod tests {
             .value(0));
     }
 
-    // A column all-null in one batch but valued in the other keeps the valued batch's min/max.
     #[test]
     fn test_file_stats_accumulator_min_max_skips_all_null_batch() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
@@ -2187,10 +2177,8 @@ mod tests {
     }
 
     /// Loads the PySpark-generated `stats-writing-all-types` fixture: the whole parquet file as one
-    /// batch, and Spark's own stats for it, taken from the `add` action of commit 1.
-    ///
-    /// The fixture covers every supported stat type: integers, floats, date, timestamp,
-    /// timestamp_ntz, string, decimal, boolean, binary, array, map, and nested structs.
+    /// batch, and Spark's own stats for it, taken from the `add` action of commit 1. The fixture
+    /// covers every supported stat type.
     fn load_spark_all_types_fixture() -> (RecordBatch, serde_json::Value) {
         let test_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../kernel/tests/data/stats-writing-all-types/delta");
@@ -2226,8 +2214,7 @@ mod tests {
         (whole, spark_stats)
     }
 
-    /// Asserts kernel's stats struct agrees with Spark's stats JSON on numRecords and on every
-    /// nullCount/minValues/maxValues key Spark published.
+    /// Asserts kernel's stats agree with Spark's on numRecords and every key Spark published.
     fn assert_matches_spark_stats(kernel_stats: &StructArray, spark_stats: &serde_json::Value) {
         let json_array = to_json(kernel_stats).expect("convert stats to JSON");
         let json_strings = json_array.as_string::<i32>();
@@ -2249,7 +2236,6 @@ mod tests {
         }
     }
 
-    // Recomputing the fixture's stats over the whole file must reproduce Spark's own stats.
     #[test]
     fn test_collect_stats_matches_spark() {
         let (whole, spark_stats) = load_spark_all_types_fixture();
@@ -2302,7 +2288,6 @@ mod tests {
         assert_eq!(nested_b(MAX_VALUES), Some("z"));
     }
 
-    // Decimal precision/scale survives the merge (min/max via compute_leaf_agg).
     #[test]
     fn test_file_stats_accumulator_preserves_decimal() {
         let dt = DataType::Decimal128(10, 2);
@@ -2330,7 +2315,7 @@ mod tests {
         assert_eq!(flat_stat::<Decimal128Type>(&merged, MAX_VALUES, "d"), 900);
     }
 
-    // Float NaN ordering matches compute_leaf_agg: NaN wins max, loses min.
+    // NaN wins max and loses min, matching `compute_leaf_agg`.
     #[test]
     fn test_file_stats_accumulator_float_nan_ordering() {
         let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
@@ -2351,8 +2336,6 @@ mod tests {
         assert!(flat_stat::<Float64Type>(&merged, MAX_VALUES, "f").is_nan());
     }
 
-    // Merged string bounds must be byte-identical to single-shot collect_stats, including for
-    // multi-byte text and for values that have no representable max bound.
     #[rstest::rstest]
     #[case::ascii(
         "a".repeat(50),
@@ -2360,9 +2343,8 @@ mod tests {
         Some("a".repeat(32)),
         Some(format!("{}\x7F", "b".repeat(32)))
     )]
-    // A value over 32 bytes but under 32 chars publishes no max: `truncate_max_string` gates entry
-    // on byte length but searches for a truncation point over a char count, so the search range is
-    // empty and it falls through to `None`.
+    // Over 32 bytes but under 32 chars: `truncate_max_string` gates on byte length but searches for
+    // the truncation point by char count, so the range is empty and no max is published.
     #[case::no_max_bound_published(
         "\u{6f22}".repeat(11),
         "a".to_string(),
@@ -2406,7 +2388,6 @@ mod tests {
         assert_eq!(value(&merged, MIN_VALUES), expected_min);
         assert_eq!(value(&merged, MAX_VALUES), expected_max);
 
-        // The published bounds must contain both values.
         if let Some(min) = value(&merged, MIN_VALUES) {
             assert!(min.as_str() <= v1.as_str() && min.as_str() <= v2.as_str());
         }
@@ -2415,10 +2396,7 @@ mod tests {
         }
     }
 
-    // Split the all-types fixture across `n_row_groups` row groups, merge through
-    // FileStatsAccumulator, and assert the merged file-level stats match Spark's stats from the
-    // delta log and, byte for byte, single-shot collection over the whole file. Splits past the
-    // fixture's row count exercise merging empty row groups.
+    // Splits past the fixture's row count exercise merging empty row groups.
     #[rstest::rstest]
     fn test_file_stats_accumulator_matches_spark(#[values(1, 2, 3, 4, 6)] n_row_groups: usize) {
         let (whole, spark_stats) = load_spark_all_types_fixture();
@@ -2437,8 +2415,8 @@ mod tests {
         let merged = acc.finish().unwrap().expect("merged stats");
 
         assert_matches_spark_stats(&merged, &spark_stats);
-        // Spark's stats JSON omits sections and columns it published no bounds for, and carries no
-        // tightBounds at all, so comparing against single-shot collection covers what it cannot.
+        // Spark's JSON omits bounds it did not publish and never carries tightBounds, so only
+        // single-shot collection covers those.
         let single = super::collect_stats(&whole, &stats_columns, &physical_schema).unwrap();
         assert_eq!(
             to_json(&merged).unwrap().as_string::<i32>().value(0),
@@ -2446,9 +2424,8 @@ mod tests {
         );
     }
 
-    // Happy path: finish returns Ok(None) with no row groups and Ok(Some(stats)) otherwise. A
-    // zero-row row group is a merged row group: it contributes a numRecords term and null bounds,
-    // and must not shift the other sections' leaves relative to the valued row groups.
+    // A zero-row row group still counts as merged: it contributes numRecords and null bounds, so
+    // only an accumulator that merged nothing yields `None`.
     #[rstest::rstest]
     #[case::no_row_groups(vec![], None, None)]
     #[case::one_row_group(vec![vec![1i64, 2, 3]], Some(3), Some((1, 3)))]
@@ -2499,8 +2476,7 @@ mod tests {
             .value(0));
     }
 
-    // Every Arrow string type takes its own arm in compute_leaf_agg, so each must merge and
-    // truncate the same way single-shot collection does.
+    // Every Arrow string type takes its own arm in `compute_leaf_agg`.
     #[rstest::rstest]
     fn test_file_stats_accumulator_string_types_match_single_shot(
         #[values(DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View)] string_type: DataType,
@@ -2539,8 +2515,8 @@ mod tests {
         );
     }
 
-    // A malformed stats tree is a kernel bug, not bad caller input, so every reduce guard must
-    // report `InternalError`. The message pins which guard fired.
+    // A malformed stats tree is a kernel bug, not bad caller input, so the guards report
+    // `InternalError`.
     fn assert_internal_error(result: DeltaResult<impl std::fmt::Debug>, needle: &str) {
         let err = result.expect_err("must be rejected");
         // `Error::internal_error` captures a backtrace, which wraps the variant in `Backtraced`.
@@ -2558,8 +2534,6 @@ mod tests {
         );
     }
 
-    // The reduce rejects a stats struct with an unrecognized top-level section rather than
-    // silently dropping or mis-reducing it.
     #[test]
     fn test_reduce_stats_rejects_unexpected_field() {
         let stats = StructArray::try_new(
@@ -2571,7 +2545,6 @@ mod tests {
         assert_internal_error(reduce_stats(&stats), "unknown stats section");
     }
 
-    // A stats section that is not a struct cannot be walked child-wise.
     #[test]
     fn test_reduce_stats_children_rejects_non_struct() {
         let leaf = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
@@ -2581,7 +2554,6 @@ mod tests {
         );
     }
 
-    // The count and tightBounds reducers guard their downcasts instead of panicking.
     #[test]
     fn test_leaf_reducers_reject_wrong_type() {
         let strings = Arc::new(StringArray::from(vec!["a"])) as ArrayRef;
@@ -2592,14 +2564,27 @@ mod tests {
         );
     }
 
-    // A null count carries no defined value, and a null tightBounds must not be assumed tight, so
-    // neither reducer may invent one.
+    // Neither reducer may invent a value: a null count is unknown, not zero, and a null
+    // tightBounds must not be assumed tight.
     #[test]
     fn test_leaf_reducers_reject_null_leaves() {
         let counts = Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef;
         assert_internal_error(reduce_count_leaf(&counts), "null count leaf");
         let tight = Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef;
         assert_internal_error(reduce_bool_and_leaf(&tight), "null tightBounds leaf");
+    }
+
+    #[rstest::rstest]
+    #[case::all_tight(vec![true, true], true)]
+    #[case::one_wide(vec![true, false, true], false)]
+    #[case::all_wide(vec![false, false], false)]
+    fn test_reduce_bool_and_leaf_ands_across_row_groups(
+        #[case] row_groups: Vec<bool>,
+        #[case] expected: bool,
+    ) {
+        let leaf = Arc::new(BooleanArray::from(row_groups)) as ArrayRef;
+        let merged = reduce_bool_and_leaf(&leaf).unwrap();
+        assert_eq!(merged.as_boolean().value(0), expected);
     }
 
     fn batch_of(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
@@ -2610,17 +2595,17 @@ mod tests {
         Arc::new(Int64Array::from(values.to_vec()))
     }
 
-    // A one-row batch with a single struct column `s` whose fields are named in the given order.
+    // A one-row batch with one struct column `s` whose fields are named in the given order.
     fn nested_batch(field_names: [&str; 2], values: [i64; 2]) -> RecordBatch {
         let fields: Fields = field_names
             .iter()
             .map(|name| Field::new(*name, DataType::Int64, true))
             .collect();
         let columns = values.iter().map(|v| i64s(&[*v])).collect();
-        let strukt = Arc::new(StructArray::try_new(fields.clone(), columns, None).unwrap());
+        let struct_array = Arc::new(StructArray::try_new(fields.clone(), columns, None).unwrap());
         batch_of(
             vec![Field::new("s", DataType::Struct(fields), true)],
-            vec![strukt],
+            vec![struct_array],
         )
     }
 
@@ -2634,9 +2619,7 @@ mod tests {
         )
     }
 
-    // Batches must agree on their full Arrow schema, not merely on the stats shape they derive:
-    // that shape drops non-stats columns, erases nullability, and collapses every nullCount-only
-    // type to the same Int64 leaf.
+    // Each case differs only in ways the derived stats shape would not catch.
     #[rstest::rstest]
     #[case::reordered_columns(
         batch_of(
@@ -2667,8 +2650,7 @@ mod tests {
         batch_of(vec![Field::new("a", DataType::Int64, false)], vec![i64s(&[3, 4])]),
         vec![column_name!("a")]
     )]
-    // Both arms produce an Int64 nullCount leaf, but `Null` counts rows while a list counts nulls,
-    // so merging them would sum two different measures.
+    // Both derive an Int64 nullCount leaf, but `Null` counts rows while a list counts nulls.
     #[case::void_column_vs_list_column(
         batch_of(
             vec![Field::new("c", DataType::Null, true)],
@@ -2692,19 +2674,23 @@ mod tests {
             matches!(err, Error::Schema(_)),
             "expected a schema error, got: {err}"
         );
-        // The failed merge poisoned the accumulator, so the first row group's statistics can never
-        // be published on their own.
-        assert_result_error_with_message(acc.merge(&first), POISONED);
-        assert_result_error_with_message(acc.finish(), POISONED);
+        // A failed merge is terminal, so the first row group can never be published on its own.
+        assert_result_error_with_message(acc.merge(&first), FAILED);
+        let err = acc
+            .finish()
+            .expect_err("an accumulator that failed a merge must not publish statistics");
+        // Its own variant, so callers can match the failure without matching on the message.
+        assert!(
+            matches!(&err, Error::StatsValidation(msg) if msg == FAILED),
+            "expected a stats validation error, got: {err}"
+        );
     }
 
-    // `RecordBatch` schema equality ignores a struct column's nested field names when the caller
-    // opts out of matching them, but statistics collection filters on those names. Two batches can
-    // therefore compare schema-equal yet derive different statistics shapes.
     #[test]
     fn test_file_stats_accumulator_rejects_differing_stats_shape() {
         let declared = nested_batch(["x", "y"], [1, 2]);
-        // Same schema, but the column underneath carries differently named nested fields.
+        // `with_match_field_names(false)` is the only way to get a schema-equal batch whose nested
+        // field names differ.
         let renamed = RecordBatch::try_new_with_options(
             declared.schema(),
             nested_batch(["p", "q"], [3, 4]).columns().to_vec(),
@@ -2726,11 +2712,11 @@ mod tests {
             matches!(err, Error::Schema(_)),
             "expected a schema error, got: {err}"
         );
-        assert_result_error_with_message(acc.finish(), POISONED);
+        assert_result_error_with_message(acc.finish(), FAILED);
     }
 
-    // A connector accumulating across row groups holds the accumulator in its writer struct, so
-    // `merge` must be callable through `&mut self`. This test exists to compile.
+    // Exists to compile: a connector holds the accumulator in its writer struct, so `merge` must be
+    // callable through `&mut self`.
     #[test]
     fn test_file_stats_accumulator_usable_as_struct_field() {
         struct Writer {
@@ -2753,7 +2739,6 @@ mod tests {
     }
 
     // Arrow erases interval columns to plain integers, so only the kernel schema can classify them.
-    // An interval has no ordering usable for data skipping and must get nullCount alone.
     #[rstest::rstest]
     fn test_file_stats_accumulator_interval_column_gets_null_count_only(
         #[values(KernelDataType::INTERVAL_YEAR_MONTH, KernelDataType::INTERVAL_DAY_TIME)]
@@ -2798,13 +2783,11 @@ mod tests {
                     .is_none(),
                 "interval column must not appear in {section}"
             );
-            // The sibling non-interval column still gets bounds, so the exclusion is targeted.
+            // The sibling column still gets bounds, so the exclusion is targeted.
             assert!(child_struct(&merged, section).column_by_name("n").is_some());
         }
     }
 
-    // A nested string leaf must truncate exactly as a top-level one does, and an all-null nested
-    // leaf must publish a null bound rather than an invented one.
     #[test]
     fn test_file_stats_accumulator_nested_string_truncates_and_handles_all_nulls() {
         let inner = Fields::from(vec![
@@ -2819,7 +2802,7 @@ mod tests {
         let physical_schema = StructType::try_from_arrow(schema.as_ref()).unwrap();
         let mk = |long: Vec<&str>| {
             let nulls = vec![None as Option<&str>; long.len()];
-            let strukt = StructArray::try_new(
+            let struct_array = StructArray::try_new(
                 inner.clone(),
                 vec![
                     Arc::new(StringArray::from(long)) as ArrayRef,
@@ -2828,10 +2811,10 @@ mod tests {
                 None,
             )
             .unwrap();
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(strukt) as ArrayRef]).unwrap()
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array) as ArrayRef]).unwrap()
         };
-        // Both exceed the 32-char prefix, and the file-level max comes from the second row group,
-        // so a merge that truncated before reducing could not produce the right bound.
+        // Both exceed the 32-char prefix and the file-level max comes from the second row group, so
+        // truncating before reducing would give the wrong bound.
         let short_prefix = format!("{}zzz", "a".repeat(40));
         let long_prefix = format!("{}aaa", "b".repeat(40));
         let cols = vec![column_name!("s", "long"), column_name!("s", "empty")];
