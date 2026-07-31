@@ -1337,3 +1337,307 @@ fn find_complete_checkpoint_version_cases(
 ) {
     assert_eq!(find_complete_checkpoint_version(&files), expected);
 }
+
+/// Builds a `ParsedLogPath` by parsing a real log file name, so `filename`, `extension` and
+/// `file_type` agree. Unlike [`make_parsed_log_path_with_source`], whose url is always
+/// `<version>.json`, this works for checkpoint paths -- whose file name takes part in checkpoint
+/// selection.
+fn parse_log_path(filename: &str) -> ParsedLogPath {
+    let url = Url::parse(&format!("memory:///_delta_log/{filename}")).unwrap();
+    ParsedLogPath::try_from(FileMeta {
+        location: url,
+        last_modified: 0,
+        size: FILESYSTEM_SIZE_MARKER,
+    })
+    .unwrap_or_else(|e| panic!("{filename} is not a log path: {e}"))
+    .unwrap_or_else(|| panic!("{filename} is not a log path"))
+}
+
+fn multipart_checkpoint_name(version: Version, part_num: u32, num_parts: u32) -> String {
+    format!("{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+}
+
+/// Mirrors Delta-Spark's `CheckpointInstanceSuite`: a single-part checkpoint sorts below a
+/// multi-part one, more parts beats fewer, and single-file checkpoints break ties on file name.
+#[test]
+fn checkpoint_instance_orders_like_delta_spark() {
+    let classic = CheckpointInstance::single("00000000000000000005.checkpoint.parquet".to_string());
+    let uuid = CheckpointInstance::single(
+        "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet".to_string(),
+    );
+
+    assert!(classic < CheckpointInstance::multi_part(2));
+    assert!(CheckpointInstance::multi_part(2) < CheckpointInstance::multi_part(11));
+    assert!(classic < CheckpointInstance::multi_part(11));
+    // Hex digits all sort below 'p', so a classic checkpoint wins over a uuid-named one.
+    assert!(uuid < classic);
+}
+
+/// Two writers checkpointed the same version with different part counts, and both checkpoints are
+/// complete. The one with more parts wins.
+#[tokio::test]
+async fn two_complete_checkpoints_at_one_version_selects_more_parts() {
+    let mut log_files: Vec<_> = (0..=6)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    for part_num in 1..=2 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 2,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    for part_num in 1..=11 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 11,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (commit_files, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    let selected: Vec<_> = checkpoint_parts.iter().map(|p| &p.filename).collect();
+    let expected: Vec<_> = (1..=11)
+        .map(|p| multipart_checkpoint_name(4, p, 11))
+        .collect();
+    assert_eq!(selected, expected.iter().collect::<Vec<_>>());
+    let commit_versions: Vec<_> = commit_files.iter().map(|c| c.version).collect();
+    assert_eq!(commit_versions, vec![5, 6]);
+}
+
+/// A torn checkpoint loses to a complete one even though it outranks it: rank orders the
+/// candidates, but only complete ones are candidates at all.
+#[tokio::test]
+async fn torn_higher_ranked_checkpoint_loses_to_complete_lower_ranked() {
+    let mut log_files: Vec<_> = (0..=6)
+        .map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem))
+        .collect();
+    for part_num in 1..=2 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 2,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    // A writer got 3 of its 11 parts out before dying, so this group outranks the 2-part one but is
+    // unusable.
+    for part_num in 1..=3 {
+        log_files.push((
+            4,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 11,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (commit_files, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    let selected: Vec<_> = checkpoint_parts.iter().map(|p| &p.filename).collect();
+    let expected: Vec<_> = (1..=2)
+        .map(|p| multipart_checkpoint_name(4, p, 2))
+        .collect();
+    assert_eq!(selected, expected.iter().collect::<Vec<_>>());
+    let commit_versions: Vec<_> = commit_files.iter().map(|c| c.version).collect();
+    assert_eq!(commit_versions, vec![5, 6]);
+}
+
+/// The same rank-versus-completeness rule when the surviving candidate is a single-file checkpoint:
+/// a torn multi-part group outranks the classic checkpoint but still loses to it.
+#[tokio::test]
+async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
+    let mut log_files = vec![
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            1,
+            LogPathFileType::SinglePartCheckpoint,
+            CommitSource::Filesystem,
+        ),
+    ];
+    for part_num in 1..=2 {
+        log_files.push((
+            1,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num,
+                num_parts: 3,
+            },
+            CommitSource::Filesystem,
+        ));
+    }
+    let (storage, log_root) = create_storage(log_files).await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.parquet"
+    );
+}
+
+/// A uuid-named checkpoint and a complete multi-part checkpoint at one version. The multi-part one
+/// wins: kernel ranks uuid-named (V2) checkpoints alongside classic ones rather than above
+/// multi-part ones as Delta-Spark does.
+#[tokio::test]
+async fn uuid_and_multipart_checkpoints_at_one_version_selects_multipart() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 2, 2)),
+            "_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 2);
+    for part in &checkpoint_parts {
+        assert!(matches!(
+            part.file_type,
+            LogPathFileType::MultiPartCheckpoint { num_parts: 2, .. }
+        ));
+    }
+}
+
+/// Two uuid-named checkpoints at one version each stand alone -- each writer picks a fresh uuid, so
+/// they are distinct checkpoints, not parts of one -- and the greater file name wins.
+#[tokio::test]
+async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![(1, LogPathFileType::Commit, CommitSource::Filesystem)],
+        &[
+            "_delta_log/00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet",
+            "_delta_log/00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.22222222-2222-2222-2222-222222222222.parquet"
+    );
+}
+
+/// A classic checkpoint beats a uuid-named one at the same version: both rank `Single`, and every
+/// hex digit sorts below the `p` of `parquet`.
+#[tokio::test]
+async fn classic_checkpoint_beats_uuid_checkpoint_at_one_version() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::SinglePartCheckpoint, CommitSource::Filesystem),
+        ],
+        &["_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.parquet"
+    );
+}
+
+/// A 1-of-1 multi-part checkpoint outranks a classic one at the same version, following
+/// Delta-Spark's format ordinals. Both are complete single-file V1 checkpoints, so they replay to
+/// the same state.
+#[tokio::test]
+async fn one_of_one_multipart_checkpoint_beats_classic_checkpoint() {
+    let (storage, log_root) = create_storage(vec![
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            1,
+            LogPathFileType::SinglePartCheckpoint,
+            CommitSource::Filesystem,
+        ),
+        (
+            1,
+            LogPathFileType::MultiPartCheckpoint {
+                part_num: 1,
+                num_parts: 1,
+            },
+            CommitSource::Filesystem,
+        ),
+    ])
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        multipart_checkpoint_name(1, 1, 1)
+    );
+}
+
+#[rstest]
+// A classic checkpoint and a 1-of-1 multi-part checkpoint at one version: each is complete on its
+// own, and they occupy separate groups.
+#[case::single_and_one_of_one_same_version(
+        vec![
+            parse_log_path(&multipart_checkpoint_name(5, 1, 1)),
+            parse_log_path("00000000000000000005.checkpoint.parquet"),
+        ],
+        Some(5)
+    )]
+// A complete 2-part and a complete 11-part checkpoint at one version.
+#[case::two_complete_multipart_same_version(
+        (1..=2).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=11).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        Some(10)
+    )]
+// A torn 11-part group beside a complete 2-part one at the same version: the version still counts
+// as checkpointed, on the strength of the complete group alone.
+#[case::torn_beside_complete_same_version(
+        (1..=2).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=3).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        Some(10)
+    )]
+// Every group at the version is torn, so the version is not checkpointed.
+#[case::all_torn_same_version(
+        (1..=1).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
+            .chain((1..=3).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))
+            .sorted_by_key(|f| f.filename.clone())
+            .collect(),
+        None
+    )]
+fn find_complete_checkpoint_version_same_version_cases(
+    #[case] files: Vec<ParsedLogPath>,
+    #[case] expected: Option<u64>,
+) {
+    assert_eq!(find_complete_checkpoint_version(&files), expected);
+}

@@ -32,7 +32,8 @@ mod tests;
 ///   contain gaps.
 /// - `ascending_compaction_files`: All compaction commit files found, sorted by version.
 /// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty
-///   if no checkpoint found.
+///   if no checkpoint found. A version can hold several complete checkpoints; see
+///   `group_checkpoint_parts` for which one this is.
 /// - `latest_crc_file`: The CRC file with the highest version, only if version >= checkpoint
 ///   version.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were
@@ -101,39 +102,114 @@ pub(crate) fn list_delta_log_from_storage(
     Ok(files)
 }
 
+/// Rank of a checkpoint's [`LogPathFileType`], ordered like Delta-Spark's
+/// `CheckpointInstance.Format` ordinals (`SINGLE` = 0, `WITH_PARTS` = 1), which its comparison uses
+/// as the sort key just after version. A separate enum because `LogPathFileType` also covers
+/// non-checkpoint files, and its variants are not declared in this order.
+///
+/// Named for those ordinals, but the rank follows a checkpoint's *name*, not its spec version: a
+/// classic-named file may itself be a V2 checkpoint carrying sidecars, which is why
+/// `LogSegment::get_file_actions_schema_and_sidecars` probes for a sidecar column instead.
+///
+/// TODO: Delta-Spark gives uuid-named checkpoints a third, higher ordinal (`V2` = 2). Promoting
+/// them changes which file a table holding both formats reads, and a json one has no parquet footer
+/// to fall back on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CheckpointFormatRank {
+    /// [`SinglePartCheckpoint`] and [`UuidCheckpoint`]: one whole file.
+    Single,
+    /// [`MultiPartCheckpoint`]
+    WithParts,
+}
+
+/// Identifies one checkpoint among the checkpoints at a single version, and orders it against its
+/// siblings.
+///
+/// Ordered like Delta-Spark's `CheckpointInstance`, which compares
+/// `(version, format, num_parts, file_name)` -- minus the leading version, because everything
+/// compared here already shares a version. Field order below is therefore the sort order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CheckpointInstance {
+    format: CheckpointFormatRank,
+    /// How many files this checkpoint spans, or `None` for a single-file checkpoint -- matching
+    /// Delta-Spark's `Option[Int]`, whose `None` also sorts below every `Some`.
+    num_parts: Option<u32>,
+    /// Set only for single-file checkpoints, where the file name is what distinguishes two
+    /// checkpoints at the same version. `None` for a multi-part checkpoint, so that all of its
+    /// parts map to one instance: a multi-part file name is fully determined by
+    /// `(version, part_num, num_parts)`, so `num_parts` already pins the identity.
+    filename: Option<String>,
+}
+
+impl CheckpointInstance {
+    /// The instance shared by every part of the `num_parts`-part checkpoint at this version.
+    fn multi_part(num_parts: u32) -> Self {
+        Self {
+            format: CheckpointFormatRank::WithParts,
+            num_parts: Some(num_parts),
+            filename: None,
+        }
+    }
+
+    /// The instance for a checkpoint that is one whole file.
+    fn single(filename: String) -> Self {
+        Self {
+            format: CheckpointFormatRank::Single,
+            num_parts: None,
+            filename: Some(filename),
+        }
+    }
+
+    /// Whether `part_files` holds every part this checkpoint needs.
+    fn is_complete(&self, part_files: &[ParsedLogPath]) -> bool {
+        // `num_parts` is guaranteed to be non-negative and within `usize` range
+        self.num_parts.unwrap_or(1) as usize == part_files.len()
+    }
+}
+
 /// Groups all checkpoint parts according to the checkpoint they belong to.
 ///
-/// NOTE: There could be a single-part and/or any number of uuid-based checkpoints. They
-/// are all equivalent, and this routine keeps only one of them (arbitrarily chosen).
-#[internal_api]
-fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
-    let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
+/// Several _complete_ checkpoints can legitimately share a version: writers choose how many parts
+/// to split a checkpoint into independently, and a V2 writer embeds a fresh uuid in each file name.
+/// Each distinct checkpoint therefore gets its own [`CheckpointInstance`] key and they never
+/// overwrite one another, so the caller can pick a winner deterministically (see
+/// [`ListingAccumulator::flush_checkpoint_group`]).
+///
+/// `parts` must arrive in ascending file name order, which is what log listing produces: a
+/// multi-part checkpoint only accumulates while its parts arrive in order.
+fn group_checkpoint_parts(
+    parts: Vec<ParsedLogPath>,
+) -> HashMap<CheckpointInstance, Vec<ParsedLogPath>> {
+    debug_assert!(
+        parts.is_sorted_by_key(|p| &p.filename),
+        "checkpoint parts must arrive in ascending file name order"
+    );
+    let mut checkpoints: HashMap<CheckpointInstance, Vec<ParsedLogPath>> = HashMap::new();
     for part_file in parts {
         match &part_file.file_type {
-            SinglePartCheckpoint
-            | UuidCheckpoint
-            | MultiPartCheckpoint {
-                part_num: 1,
-                num_parts: 1,
-            } => {
-                // All single-file checkpoints are equivalent, just keep one
-                checkpoints.insert(1, vec![part_file]);
+            SinglePartCheckpoint | UuidCheckpoint => {
+                // A single-file checkpoint is complete on its own. Keying on file name keeps
+                // distinct same-version checkpoints (e.g. several uuid-named ones) separate.
+                let instance = CheckpointInstance::single(part_file.filename.clone());
+                checkpoints.insert(instance, vec![part_file]);
             }
             MultiPartCheckpoint {
                 part_num: 1,
                 num_parts,
             } => {
-                // Start a new multi-part checkpoint with at least 2 parts
-                checkpoints.insert(*num_parts, vec![part_file]);
+                // Start a new multi-part checkpoint
+                checkpoints.insert(CheckpointInstance::multi_part(*num_parts), vec![part_file]);
             }
             MultiPartCheckpoint {
                 part_num,
                 num_parts,
             } => {
-                // Continue a new multi-part checkpoint with at least 2 parts.
+                // Continue a multi-part checkpoint.
                 // Checkpoint parts are required to be in-order from log listing to build
                 // a multi-part checkpoint
-                if let Some(part_files) = checkpoints.get_mut(num_parts) {
+                if let Some(part_files) =
+                    checkpoints.get_mut(&CheckpointInstance::multi_part(*num_parts))
+                {
                     // `part_num` is guaranteed to be non-negative and within `usize` range
                     if *part_num as usize == 1 + part_files.len() {
                         // Safe to append because all previous parts exist
@@ -159,7 +235,7 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
             let owned: Vec<ParsedLogPath> = parts.cloned().collect();
             group_checkpoint_parts(owned)
                 .iter()
-                .any(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+                .any(|(instance, part_files)| instance.is_complete(part_files))
                 .then_some(version)
         })
         .last()
@@ -289,8 +365,14 @@ impl ListingAccumulator {
         }
     }
 
-    /// Groups and finds the first complete checkpoint for this version.
-    /// All checkpoints for the same version are equivalent, so we only take one.
+    /// Selects this version's checkpoint: the greatest _complete_ checkpoint in
+    /// [`CheckpointInstance`] order.
+    ///
+    /// Any of a version's complete checkpoints (see [`group_checkpoint_parts`]) replays to the same
+    /// table state, but the choice must be stable across processes, hence the maximum rather than
+    /// whichever entry a [`HashMap`] happens to yield first. Delta-Spark selects the same way:
+    /// group by checkpoint identity, keep the groups complete against their own part count,
+    /// take the max.
     ///
     /// If this version has a complete checkpoint, we can drop the existing commit and
     /// compaction files we collected so far -- except we must keep the latest commit.
@@ -298,8 +380,8 @@ impl ListingAccumulator {
         let pending_checkpoint_parts = std::mem::take(&mut self.pending_checkpoint_parts);
         if let Some((_, complete_checkpoint)) = group_checkpoint_parts(pending_checkpoint_parts)
             .into_iter()
-            // `num_parts` is guaranteed to be non-negative and within `usize` range
-            .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+            .filter(|(instance, part_files)| instance.is_complete(part_files))
+            .max_by(|(a, _), (b, _)| a.cmp(b))
         {
             self.output.checkpoint_parts = complete_checkpoint;
             // Keep the commit at the checkpoint version (if any) before clearing all older commits.
@@ -559,6 +641,10 @@ impl LogSegmentFiles {
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that
     /// all the returned [`ParsedLogPath`]s will have a version less than or equal to the
     /// `end_version`.
+    ///
+    /// The hint only tells us where to start listing; it never influences which checkpoint is
+    /// selected at a version. A hint that turns out to describe a different checkpoint than the one
+    /// selected is logged and ignored, not an error.
     pub(crate) fn list_with_checkpoint_hint(
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
@@ -587,12 +673,22 @@ impl LogSegmentFiles {
             checkpoint_metadata.version,
             latest_checkpoint.version
         );
-        } else if listed_files.checkpoint_parts.len() != checkpoint_metadata.parts.unwrap_or(1) {
-            return Err(Error::InvalidCheckpoint(format!(
-                "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
-                checkpoint_metadata.parts.unwrap_or(1),
-                listed_files.checkpoint_parts.len()
-            )));
+        } else if !checkpoint_metadata
+            .applies_to(latest_checkpoint.version, &listed_files.checkpoint_parts)
+        {
+            // Not corruption: the hint describes a checkpoint other than the one selected at this
+            // version (see `group_checkpoint_parts`). A torn checkpoint instead leaves
+            // `checkpoint_parts` empty, which the caller reports as an error. `applies_to` is also
+            // what makes `LogSegment::checkpoint_hint` yield `None`, so this logs exactly when the
+            // hint's fields are dropped and readers fall back to the checkpoint footer.
+            warn!(
+                version = checkpoint_metadata.version,
+                hint_parts = checkpoint_metadata.parts.unwrap_or(1),
+                selected_parts = listed_files.checkpoint_parts.len(),
+                selected_checkpoint_part = %latest_checkpoint.filename,
+                "_last_checkpoint hint describes a different checkpoint than the one selected at \
+                 this version; ignoring the hint's checkpoint-specific fields"
+            );
         }
         Ok(listed_files)
     }

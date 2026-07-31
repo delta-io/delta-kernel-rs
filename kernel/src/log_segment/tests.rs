@@ -627,7 +627,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
 }
 
 #[tokio::test]
-async fn build_snapshot_with_bad_checkpoint_hint_fails() {
+async fn build_snapshot_ignores_checkpoint_hint_with_mismatched_part_count() {
     let checkpoint_metadata = LastCheckpointHint {
         v2_checkpoint: None,
         version: 5,
@@ -649,11 +649,86 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
             delta_path_for_version(3, "checkpoint.parquet"),
             delta_path_for_version(3, "json"),
             delta_path_for_version(4, "json"),
+            // Two complete checkpoints at v5: the classic one the hint describes, and the 2-part
+            // one that outranks it.
+            delta_path_for_version(5, "checkpoint.parquet"),
             delta_path_for_multipart_checkpoint(5, 1, 2),
             delta_path_for_multipart_checkpoint(5, 2, 2),
             delta_path_for_version(5, "json"),
             delta_path_for_version(6, "json"),
             delta_path_for_version(7, "json"),
+        ],
+        Some(&checkpoint_metadata),
+    )
+    .await;
+
+    // The 2-part checkpoint at v5 is selected, so the hint describing the classic one is not
+    // applied.
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![], // log_tail
+        Some(checkpoint_metadata),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(log_segment.checkpoint_version, Some(5));
+    assert_eq!(log_segment.end_version, 7);
+    let checkpoint_filenames = log_segment
+        .listed
+        .checkpoint_parts
+        .iter()
+        .map(|p| p.filename.as_str())
+        .collect_vec();
+    assert_eq!(
+        checkpoint_filenames,
+        vec![
+            "00000000000000000005.checkpoint.0000000001.0000000002.parquet",
+            "00000000000000000005.checkpoint.0000000002.0000000002.parquet",
+        ]
+    );
+
+    // The hint is retained but does not describe the selected checkpoint, so none of its fields are
+    // trusted -- readers fall back to the checkpoint footer.
+    assert!(log_segment.last_checkpoint_metadata.is_some());
+    assert!(log_segment.checkpoint_hint().is_none());
+
+    let commit_versions = log_segment
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect_vec();
+    assert_eq!(commit_versions, vec![6, 7]);
+}
+
+/// Two complete checkpoints at v5, one of 2 parts and one of 3, with the hint naming the 3-part
+/// one. The 3-part checkpoint wins on part count, so the hint applies and its fields stay usable.
+#[tokio::test]
+async fn build_snapshot_applies_checkpoint_hint_matching_selected_checkpoint() {
+    let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
+        version: 5,
+        size: 10,
+        parts: Some(3),
+        size_in_bytes: None,
+        num_of_add_files: None,
+        checkpoint_schema: None,
+        checksum: None,
+        tags: None,
+    };
+
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(4, "json"),
+            delta_path_for_multipart_checkpoint(5, 1, 2),
+            delta_path_for_multipart_checkpoint(5, 2, 2),
+            delta_path_for_multipart_checkpoint(5, 1, 3),
+            delta_path_for_multipart_checkpoint(5, 2, 3),
+            delta_path_for_multipart_checkpoint(5, 3, 3),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(6, "json"),
         ],
         Some(&checkpoint_metadata),
     )
@@ -665,12 +740,12 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-    );
-    assert_result_error_with_message(
-        log_segment,
-        "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
-        it has 2",
     )
+    .unwrap();
+
+    assert_eq!(log_segment.checkpoint_version, Some(5));
+    assert_eq!(log_segment.listed.checkpoint_parts.len(), 3);
+    assert!(log_segment.checkpoint_hint().is_some());
 }
 
 #[tokio::test]
