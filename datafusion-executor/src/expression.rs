@@ -21,10 +21,6 @@ use crate::scalar::to_df_scalar;
 /// `Array` of structs) take from it the field names and per-child types a constructor needs but the
 /// expression does not carry. Other arms ignore it, so callers without one pass `None`.
 ///
-/// The target type is threaded down but never used to `cast` a leaf: it flows to container arms
-/// that need names/types, matching kernel's Arrow evaluator (which validates a leaf's type but
-/// keeps the source type rather than coercing it).
-///
 /// # Errors
 /// Returns an error for a column that does not resolve against `input_schema`; a struct-shaped arm
 /// without a struct `output_type` or with a mismatched field count; an `Array` arm whose
