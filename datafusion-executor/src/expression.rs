@@ -192,7 +192,10 @@ mod tests {
             / KernelExpr::literal(20i64),
         "(get_field(a, Utf8(\"b\"), Utf8(\"c\")) * Int64(5) - b + x) / Int64(20)"
     )]
-    fn nested_arithmetic_lowers_to_operator_tree(#[case] kernel: KernelExpr, #[case] expected: &str) {
+    fn nested_arithmetic_lowers_to_operator_tree(
+        #[case] kernel: KernelExpr,
+        #[case] expected: &str,
+    ) {
         assert_eq!(lower(kernel), expected);
     }
 
