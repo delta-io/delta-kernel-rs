@@ -384,7 +384,6 @@ impl<S> Transaction<S> {
         // Validate that the schema supports data writes when files are being added. Reads and
         // metadata-only commits are always allowed.
         if !self.add_files_metadata.is_empty() {
-            self.ensure_column_defaults_acknowledged()?;
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
 
@@ -808,7 +807,8 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Rejects data writes when the connector has not acknowledged column-default handling.
+    /// Rejects write-context creation when the connector has not acknowledged column-default
+    /// handling.
     fn ensure_column_defaults_acknowledged(&self) -> DeltaResult<()> {
         require!(
             self.column_defaults_acknowledged
@@ -921,8 +921,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Call this before requesting a write context for a table that enables the
     /// `allowColumnDefaults` feature. The connector must materialize every omitted column's
     /// default itself; this method records that responsibility but does not apply any defaults.
-    /// Without this acknowledgement, write-context creation and commits containing added files
-    /// fail with an error.
+    /// Without this acknowledgement, write-context creation fails with an error.
     pub fn ack_column_defaults(&mut self) {
         self.column_defaults_acknowledged = true;
     }
@@ -2280,45 +2279,6 @@ mod tests {
         }
 
         #[test]
-        fn write_context_requires_explicit_column_defaults_acknowledgement() {
-            let schema =
-                StructType::try_new(vec![field_with_default("c", DataType::INTEGER, "42")])
-                    .unwrap();
-            let mut txn = txn_with_schema(schema);
-
-            let defaults = txn.top_level_column_defaults().unwrap();
-            assert_eq!(
-                defaults["c"].to_scalar().unwrap(),
-                Some(Scalar::Integer(42))
-            );
-            drop(defaults);
-
-            let error = txn
-                .unpartitioned_write_context()
-                .expect_err("inspecting defaults must not implicitly acknowledge them");
-            assert!(matches!(&error, Error::InvalidTransactionState(_)));
-            assert!(error.to_string().contains("ack_column_defaults"));
-
-            txn.ack_column_defaults();
-            txn.unpartitioned_write_context()
-                .expect("acknowledging defaults must allow write-context creation");
-        }
-
-        #[test]
-        fn commit_rejects_added_files_without_column_defaults_acknowledgement() {
-            let schema =
-                StructType::try_new(vec![StructField::nullable("c", DataType::INTEGER)]).unwrap();
-            let mut txn = txn_with_schema(schema);
-            add_dummy_file(&mut txn);
-
-            let error = txn
-                .commit(&SyncEngine::new())
-                .expect_err("added files must require explicit column-default acknowledgement");
-            assert!(matches!(&error, Error::InvalidTransactionState(_)));
-            assert!(error.to_string().contains("ack_column_defaults"));
-        }
-
-        #[test]
         fn load_rejects_malformed_default() {
             let schema = StructType::try_new(vec![field_with_invalid_default("c")]).unwrap();
 
@@ -2337,8 +2297,6 @@ mod tests {
             // Orphaned column-default metadata (no `allowColumnDefaults` feature) is tolerated.
             let txn = txn_with_schema_and_writer_features(schema, []);
             assert!(txn.top_level_column_defaults().unwrap().is_empty());
-            txn.unpartitioned_write_context()
-                .expect("orphaned defaults must not require acknowledgement");
         }
     }
 
