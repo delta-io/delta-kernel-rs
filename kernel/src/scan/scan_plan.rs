@@ -10,7 +10,7 @@ use url::Url;
 
 use super::data_skipping::as_sql_data_skipping_predicate_with_stats_columns;
 use super::state_info::StateInfo;
-use super::{PartitionValuesOptions, PhysicalPredicate, StatsOptions, StructStats};
+use super::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{
     ADD_FIELD, ADD_NAME, ADD_SCHEMA, REMOVE_FIELD, SIDECAR_FIELD, SIDECAR_NAME, STATS_PARSED,
@@ -22,14 +22,15 @@ use crate::expressions::{
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
 use crate::plans::ir::plan::Plan;
+use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, PlanBuilder};
+use crate::utils::{CollectInto, FoldWithOption as _};
+use crate::{DeltaResult, Error, PlanBuilder};
 
 // === Internal column names ===
 
@@ -367,7 +368,10 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 }
 
 trait ProjectionStructPatchBuilderExt<'a> {
-    /// Parse add stats and partition values, preferring compatible parsed input columns.
+    /// Parses add stats and partition values, preferring compatible parsed fields.
+    ///
+    /// When `stats_schema` is present, the input must contain either `add.stats_parsed` or the
+    /// fallback `add.stats` JSON field.
     fn with_parsed_add_stats_and_partitions(
         self,
         stats_schema: Option<&SchemaRef>,
@@ -383,12 +387,10 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
     ) -> Self {
         let has_stats_parsed = self
             .input_schema()
-            .field_at(&column_name!("add.stats_parsed"))
-            .is_ok();
+            .contains_col([ADD_NAME, STATS_PARSED_NAME]);
         let has_partition_values_parsed = self
             .input_schema()
-            .field_at(&column_name!("add.partitionValues_parsed"))
-            .is_ok();
+            .contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
         let add = [ADD_NAME];
         self = match stats_schema {
             Some(ss) => {
@@ -436,6 +438,29 @@ fn add_field_with_parsed_stats_and_partitions(
     Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
 }
 
+/// Builds the output projection for requested stats and partition values.
+///
+/// The output schema is:
+/// ```text
+/// add: struct<
+///   path: string,
+///   partitionValues: map<string, string>,
+///   size: long,
+///   modificationTime: long,
+///   dataChange: boolean,
+///   stats: string,                         // when JSON stats are requested
+///   tags: map<string, string>,
+///   deletionVector: struct<...>,
+///   baseRowId: long,
+///   defaultRowCommitVersion: long,
+///   clusteringProvider: string,
+///   stats_parsed: struct<...>,             // when parsed stats are requested
+///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
+/// >
+/// ```
+/// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
+/// partition values are selected independently and omitted for unpartitioned tables. Fields needed
+/// only for pruning are omitted.
 fn metadata_output_projection(
     add_field: &StructField,
     stats: &StatsOptions,
@@ -444,49 +469,56 @@ fn metadata_output_projection(
     physical_stats_output_schema: Option<&SchemaRef>,
 ) -> DeltaResult<(ExpressionRef, SchemaRef)> {
     let input_schema = schema_ref! { (add_field.clone()) };
-    let add = [ADD_NAME];
-    let has_stats_parsed = input_schema
-        .field_at(&column_name!("add.stats_parsed"))
-        .is_ok();
-    let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, add);
+    let has_stats_parsed = input_schema.contains_col([ADD_NAME, STATS_PARSED_NAME]);
+    let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, [ADD_NAME]);
 
-    /* JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither. */
-    let projection = if stats.synthesize_json {
-        projection
-    } else {
-        projection.drop(STATS)
+    // JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither.
+    let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
+    let projection = match (stats.synthesize_json, has_json_stats) {
+        (true, true) | (false, false) => projection,
+        (true, false) => {
+            return Err(Error::internal_error(
+                "JSON stats were requested, but add.stats is missing from the metadata schema",
+            ));
+        }
+        (false, true) => projection.drop(STATS),
     };
 
-    /* Parsed stats output. */
-    let projection = match &stats.struct_stats {
-        StructStats::None if has_stats_parsed => projection.drop(STATS_PARSED),
-        StructStats::None => projection,
-        StructStats::Columns(_) | StructStats::All => match physical_stats_output_schema {
-            // Use the output stats schema computed in [`StateInfo`]
-            Some(stats_schema) => projection.replace(
-                STATS_PARSED,
-                StructField::nullable(STATS_PARSED, stats_schema.as_ref().clone()),
-                project_nested_struct_to_schema(column_name!("add.stats_parsed"), stats_schema),
-            ),
-            None if has_stats_parsed => projection.drop(STATS_PARSED),
-            None => projection,
-        },
+    // Parsed stats output.
+    let projection = match (physical_stats_output_schema, has_stats_parsed) {
+        (Some(stats_schema), _) => projection.replace(
+            STATS_PARSED,
+            StructField::nullable(STATS_PARSED, stats_schema.as_ref().clone()),
+            project_nested_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], stats_schema),
+        ),
+        (None, true) => projection.drop(STATS_PARSED),
+        (None, false) => projection,
     };
 
-    /* Parsed partition-values output. */
-    let projection = match (partition_values.parsed_struct, partition_schema) {
-        (true, Some(partition_schema)) => projection.replace(
+    // Parsed partition-values output.
+    let has_partition_values_parsed =
+        input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
+    let partition_output_schema = partition_values
+        .parsed_struct
+        .then_some(partition_schema)
+        .flatten();
+    let projection = match (partition_output_schema, has_partition_values_parsed) {
+        (Some(partition_schema), true) => projection.replace(
             PARTITION_VALUES_PARSED,
             StructField::nullable(PARTITION_VALUES_PARSED, partition_schema.as_ref().clone()),
             project_nested_struct_to_schema(
-                column_name!("add.partitionValues_parsed"),
+                [ADD_NAME, PARTITION_VALUES_PARSED_NAME],
                 partition_schema,
             ),
         ),
-        (false, Some(_)) => projection.drop(PARTITION_VALUES_PARSED),
-        // No partition schema means the table is unpartitioned, so there is no typed field.
-        (true, None) => projection,
-        _ => projection,
+        (Some(_), false) => {
+            return Err(Error::internal_error(
+                "parsed partition values were requested, but add.partitionValues_parsed is \
+                 missing",
+            ));
+        }
+        (None, true) => projection.drop(PARTITION_VALUES_PARSED),
+        (None, false) => projection,
     };
 
     let (add_schema, add_expr) = projection.build()?;
@@ -498,7 +530,11 @@ fn metadata_output_projection(
 
 /// Rebuilds `root` to match a narrowed schema while preserving a null parent struct. A direct
 /// column reference would retain fields not requested by the caller.
-fn project_nested_struct_to_schema(root: ColumnName, schema: &StructType) -> Expr {
+fn project_nested_struct_to_schema(
+    root: impl CollectInto<ColumnName>,
+    schema: &StructType,
+) -> Expr {
+    let root = root.collect_into();
     let fields = schema.fields().map(|field| {
         let column = root.join(&ColumnName::new([field.name()]));
         match field.data_type() {

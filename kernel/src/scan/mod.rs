@@ -700,9 +700,12 @@ pub struct Scan {
     cancellation_token: Option<CancellationTokenRef>,
 }
 
-/// Builds the caller-visible physical `stats_parsed` schema. Unlike
-/// `StateInfo::physical_stats_schema`, it excludes predicate-only columns. Returns `None` when no
-/// eligible struct stats are requested and errors if a requested column cannot be resolved.
+/// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
+///
+/// For example, if the caller requests `[a, b]` and the predicate references `c`,
+/// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
+/// Returns `None` when no eligible struct stats are requested and errors when a requested column
+/// cannot be resolved.
 fn build_physical_stats_output_schema(
     table_configuration: &TableConfiguration,
     state_info: &StateInfo,
@@ -725,12 +728,17 @@ fn build_physical_stats_output_schema(
                 .build_expected_stats_schemas(None, Some(&physical_columns))?
                 .physical;
 
-            Ok(stats_schema
-                .field(NULL_COUNT)
-                .is_some()
-                .then_some(stats_schema))
+            Ok(stats_schema_with_data_columns(stats_schema))
         }
     }
+}
+
+/// Returns `schema` only when it contains stats for at least one data column.
+///
+/// Expected stats schemas always contain `numRecords` and `tightBounds`. `nullCount` is present
+/// only when at least one data column survives stats filtering.
+fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
+    schema.field(NULL_COUNT).is_some().then_some(schema)
 }
 
 impl std::fmt::Debug for Scan {

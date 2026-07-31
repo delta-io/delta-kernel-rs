@@ -20,7 +20,9 @@ use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
 
-fn comparable_metadata_batch(
+// Normalizes metadata for comparison: the imperative path splits fields between the data batch
+// and fileConstantValues, while the declarative path returns them in an add struct.
+fn normalized_metadata_batch(
     field: impl Fn(&str) -> ArrayRef,
     json_stats: Option<ArrayRef>,
     stats_parsed: Option<ArrayRef>,
@@ -68,7 +70,7 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<Recor
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("file constants struct");
-        batches.push(comparable_metadata_batch(
+        batches.push(normalized_metadata_batch(
             |name| {
                 batch
                     .column_by_name(name)
@@ -109,7 +111,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("add struct");
-        projected.push(comparable_metadata_batch(
+        projected.push(normalized_metadata_batch(
             |name| {
                 add.column_by_name(name)
                     .unwrap_or_else(|| panic!("add.{name}"))
@@ -279,7 +281,7 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
 
 #[rstest]
 #[case::json_only(StatsOptions::json_only(), &[JSON_STATS_FIELDS])]
-#[case::all_struct(StatsOptions::all_struct(), &[ALL_STATS_PARSED_FIELDS])]
+#[case::all_struct(StatsOptions::all_struct(), &[PARSED_STATS_TABLE_ALL_STATS_FIELDS])]
 #[case::struct_columns(
     StatsOptions::struct_columns(vec![column_name!("id")]),
     &[ID_STATS_PARSED_FIELDS]
@@ -287,15 +289,14 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
 #[case::empty_struct_columns(StatsOptions::struct_columns(vec![]), &[])]
 #[case::all(
     StatsOptions::all(),
-    &[ALL_STATS_PARSED_FIELDS, JSON_STATS_FIELDS]
+    &[PARSED_STATS_TABLE_ALL_STATS_FIELDS, JSON_STATS_FIELDS]
 )]
 #[case::none(StatsOptions::none(), &[])]
-fn declarative_metadata_respects_output_options(
+fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
 ) -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::utils::test_utils::load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
+    let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
     let expected_stats = if no_stats {
@@ -303,7 +304,7 @@ fn declarative_metadata_respects_output_options(
     } else {
         stats.clone()
     };
-    let predicate: PredicateRef = column_expr!("value").gt(Expr::literal("value_2")).into();
+    let predicate: PredicateRef = column_expr!("id").gt(Expr::literal(0i64)).into();
     let expected_builder = snapshot
         .clone()
         .scan_builder()
@@ -311,17 +312,24 @@ fn declarative_metadata_respects_output_options(
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate.clone());
     let expected = imperative_metadata(expected_builder.build()?, engine.as_ref())?;
-    // This fixture stores only parsed checkpoint stats. Imperative metadata synthesizes JSON,
-    // while declarative metadata preserves the source JSON field, so compare other fields here.
-    let expected = without_columns(&expected, &[STATS])?;
     let builder = snapshot
         .scan_builder()
-        .with_stats(stats)
+        .with_stats(stats.clone())
         .with_partition_values(PartitionValuesOptions::with_struct())
         .with_predicate(predicate);
     let scan = builder.build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
-    let actual_stats_fields: Vec<_> = leaf_paths(&actual)
+    let actual_fields = leaf_paths(&actual);
+    let imperative_fields = leaf_paths(&expected);
+    let unexpected_fields: Vec<_> = actual_fields
+        .iter()
+        .filter(|field| !imperative_fields.contains(field))
+        .collect();
+    assert!(
+        unexpected_fields.is_empty(),
+        "declarative metadata fields missing from imperative output: {unexpected_fields:?}"
+    );
+    let actual_stats_fields: Vec<_> = actual_fields
         .into_iter()
         .filter(|field| field == STATS || field.starts_with("stats_parsed."))
         .collect();
@@ -337,58 +345,44 @@ fn declarative_metadata_respects_output_options(
         .collect();
     expected_stats_fields.sort_unstable();
     assert_eq!(actual_stats_fields, expected_stats_fields);
-    match &struct_stats {
-        StructStats::None | StructStats::Columns(_) => {
-            // Imperative metadata exposes stats needed internally by its predicate, while the
-            // declarative path projects caller-requested output. Assert that mismatch before
-            // removing stats from the comparison so normalization cannot hide it.
-            let declarative_schema = actual.first().expect("declarative metadata").schema();
-            let imperative_schema = expected.first().expect("imperative metadata").schema();
-            let declarative_stats = declarative_schema.field_with_name(STATS_PARSED).ok();
-            let imperative_stats = imperative_schema
-                .field_with_name(STATS_PARSED)
-                .expect("imperative predicate stats");
-            assert_ne!(declarative_stats, Some(imperative_stats));
-
-            assert_metadata_eq(
-                &without_columns(&actual, &[STATS, STATS_PARSED])?,
-                &without_columns(&expected, &[STATS_PARSED])?,
-                "metadata output options",
-            )
-        }
-        StructStats::All => assert_metadata_eq(
-            &without_columns(&actual, &[STATS])?,
-            &expected,
-            "metadata output options",
-        ),
+    // Imperative metadata exposes source and predicate stats even when they were not requested.
+    // Compare only the caller-requested stats after checking the declarative schema above.
+    let parsed_stats_requested = match &struct_stats {
+        StructStats::None => false,
+        StructStats::Columns(columns) => !columns.is_empty(),
+        StructStats::All => true,
+    };
+    if !parsed_stats_requested {
+        let declarative_schema = actual.first().expect("declarative metadata").schema();
+        let imperative_schema = expected.first().expect("imperative metadata").schema();
+        assert!(declarative_schema.field_with_name(STATS_PARSED).is_err());
+        imperative_schema
+            .field_with_name(STATS_PARSED)
+            .expect("imperative predicate stats");
     }
-}
-
-#[test]
-fn declarative_metadata_preserves_requested_json_stats() -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::utils::test_utils::load_test_table("data-reader-timestamp_ntz")?;
-    let predicate = Arc::new(column_expr!("id").gt(Expr::literal(0i32)));
-    let expected = imperative_metadata(
-        snapshot
-            .clone()
-            .scan_builder()
-            .with_predicate(predicate.clone())
-            .with_stats(StatsOptions::json_only())
-            .build()?,
-        engine.as_ref(),
-    )?;
-    let scan = snapshot
-        .scan_builder()
-        .with_predicate(predicate)
-        .with_stats(StatsOptions::json_only())
-        .build()?;
-    let actual = declarative_metadata(&scan, engine.as_ref())?;
-
+    let ignored_stats = match (stats.synthesize_json, parsed_stats_requested) {
+        (true, true) => {
+            // Both representations were requested, so the outputs are directly comparable.
+            &[][..]
+        }
+        (true, false) => {
+            // Only JSON was requested; imperative metadata also exposes predicate stats.
+            &[STATS_PARSED][..]
+        }
+        (false, true) => {
+            // Only parsed stats were requested; imperative metadata also retains source JSON.
+            &[STATS][..]
+        }
+        (false, false) => {
+            // Neither representation was requested, but imperative metadata retains source JSON
+            // and predicate-required parsed stats.
+            &[STATS, STATS_PARSED][..]
+        }
+    };
     assert_metadata_eq(
         &actual,
-        &without_columns(&expected, &[STATS_PARSED])?,
-        "preserved JSON stats",
+        &without_columns(&expected, ignored_stats)?,
+        "metadata output options",
     )
 }
 
@@ -423,6 +417,25 @@ const ID_STATS_PARSED_FIELDS: &[&str] = &[
     "add.stats_parsed.nullCount.id",
     "add.stats_parsed.minValues.id",
     "add.stats_parsed.maxValues.id",
+    "add.stats_parsed.tightBounds",
+];
+const PARSED_STATS_TABLE_ALL_STATS_FIELDS: &[&str] = &[
+    "add.stats_parsed.numRecords",
+    "add.stats_parsed.nullCount.id",
+    "add.stats_parsed.nullCount.name",
+    "add.stats_parsed.nullCount.age",
+    "add.stats_parsed.nullCount.salary",
+    "add.stats_parsed.nullCount.ts_col",
+    "add.stats_parsed.minValues.id",
+    "add.stats_parsed.minValues.name",
+    "add.stats_parsed.minValues.age",
+    "add.stats_parsed.minValues.salary",
+    "add.stats_parsed.minValues.ts_col",
+    "add.stats_parsed.maxValues.id",
+    "add.stats_parsed.maxValues.name",
+    "add.stats_parsed.maxValues.age",
+    "add.stats_parsed.maxValues.salary",
+    "add.stats_parsed.maxValues.ts_col",
     "add.stats_parsed.tightBounds",
 ];
 const JSON_STATS_FIELDS: &[&str] = &["add.stats"];
@@ -498,7 +511,7 @@ const PARTITION_PARSED_FIELDS: &[&str] = &["add.partitionValues_parsed.part"];
     PartitionValuesOptions::with_struct(),
     &[ADD_FIELDS, PARTITION_PARSED_FIELDS]
 )]
-fn declarative_metadata_has_complete_output_leaf_schema(
+fn declarative_metadata_has_exact_leaf_schema_across_output_options(
     #[case] stats: StatsOptions,
     #[case] partition_values: PartitionValuesOptions,
     #[case] expected_field_groups: &[&[&str]],
