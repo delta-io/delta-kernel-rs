@@ -341,7 +341,6 @@ fn struct_patch_to_df_expr(
 ///   value's scale to match the target's exactly (and hard-errors otherwise).
 ///
 /// # Errors
-///
 /// Returns an error when `output_type` is absent, not a struct, or has a non-primitive field, or
 /// from lowering the map expression.
 fn map_to_struct_to_df_expr(
@@ -379,15 +378,6 @@ fn map_to_struct_to_df_expr(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use datafusion::arrow::array::{
-        Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int32Array, MapBuilder,
-        RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
-    };
-    use datafusion::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
-    use datafusion::common::DFSchema;
-    use datafusion::execution::context::SessionContext;
     use delta_kernel::expressions::{
         column_expr, Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
     };
@@ -841,22 +831,6 @@ mod tests {
         );
     }
 
-    // === Execution ===
-
-    /// Builds a physical expr against `batch`'s schema (running DataFusion's simplification + type
-    /// coercion, which Display-string assertions cannot exercise), evaluates it, returns the array.
-    fn eval_against(expr: DFExpr, batch: &RecordBatch) -> ArrayRef {
-        let df_schema = DFSchema::try_from(batch.schema()).unwrap();
-        let physical = SessionContext::new()
-            .create_physical_expr(expr, &df_schema)
-            .unwrap();
-        physical
-            .evaluate(batch)
-            .unwrap()
-            .into_array(batch.num_rows())
-            .unwrap()
-    }
-
     // === MapToStruct ===
 
     /// Input schema for map tests: `{ pv: map<string, string> }`.
@@ -868,71 +842,54 @@ mod tests {
         .unwrap()
     }
 
-    /// A `{ region: string, id: integer }` target struct for map tests.
-    fn region_id_struct() -> StructType {
-        StructType::try_new([
+    /// Lowers a `MapToStruct` over `pv` targeting `output_schema` and renders it as a `Display`
+    /// string.
+    fn lower_map_to_struct(output_schema: StructType) -> String {
+        let kernel = KernelExpr::map_to_struct(column_expr!("pv"));
+        let target: DataType = output_schema.into();
+        to_df_expr(&kernel, &pv_map_schema(), Some(&target))
+            .unwrap()
+            .to_string()
+    }
+
+    /// Each target field extracts its value with `cast(get_field(pv, name), T)`, and the whole
+    /// rebuild is wrapped in a null-map guard. Runtime cast/parse semantics (empty-string,
+    /// temporal, decimal, duplicate keys, null masking) are arrow's, verified end-to-end rather
+    /// than here.
+    #[test]
+    fn map_to_struct_lowers_to_named_struct_over_get_field() {
+        let target = StructType::try_new([
             StructField::nullable("region", DataType::STRING),
             StructField::nullable("id", DataType::INTEGER),
         ])
-        .unwrap()
+        .unwrap();
+        let rendered = lower_map_to_struct(target);
+        assert_eq!(
+            rendered,
+            "CASE WHEN pv IS NOT NULL THEN named_struct(\
+             Utf8(\"region\"), CAST(get_field(pv, Utf8(\"region\")) AS Utf8), \
+             Utf8(\"id\"), CAST(nullif(get_field(pv, Utf8(\"id\")), Utf8(\"\")) AS Int32)) \
+             ELSE NULL END"
+        );
     }
 
-    /// Builds a one-column `pv: map<string, string>` batch; each row is an optional list of
-    /// entries (`None` = a null map row).
-    fn map_batch(rows: Vec<Option<Vec<(&str, &str)>>>) -> RecordBatch {
-        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-        for row in rows {
-            match row {
-                Some(entries) => {
-                    for (k, v) in entries {
-                        builder.keys().append_value(k);
-                        builder.values().append_value(v);
-                    }
-                    builder.append(true).unwrap();
-                }
-                None => builder.append(false).unwrap(),
-            }
-        }
-        let map = builder.finish();
-        let schema = ArrowSchema::new(vec![ArrowField::new("pv", map.data_type().clone(), true)]);
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map)]).unwrap()
-    }
-
-    /// Lowers a `MapToStruct` over `pv` targeting `output_schema`, evaluates it against `batch`,
-    /// and returns the resulting struct array.
-    fn eval_map_to_struct(output_schema: &StructType, batch: &RecordBatch) -> StructArray {
-        let kernel = KernelExpr::map_to_struct(column_expr!("pv"));
-        let output_type: DataType = output_schema.clone().into();
-        let expr = to_df_expr(&kernel, &pv_map_schema(), Some(&output_type)).unwrap();
-        eval_against(expr, batch)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap()
-            .clone()
-    }
-
-    #[test]
-    fn map_to_struct_lowers_to_named_struct_over_get_field() {
-        let kernel = KernelExpr::map_to_struct(column_expr!("pv"));
-        let target: DataType = region_id_struct().into();
-        let rendered = to_df_expr(&kernel, &pv_map_schema(), Some(&target))
-            .unwrap()
-            .to_string();
-        // Null-map guard wraps the rebuild; text field is a bare cast, non-text goes through
-        // nullif.
-        assert!(
-            rendered.starts_with("CASE WHEN pv IS NOT NULL THEN named_struct("),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("CAST(get_field(pv, Utf8(\"region\")) AS Utf8)"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("CAST(nullif(get_field(pv, Utf8(\"id\")), Utf8(\"\")) AS Int32)"),
-            "{rendered}"
-        );
-        assert!(rendered.ends_with("END"), "{rendered}");
+    /// String and Binary targets keep the raw value (empty string is a valid value), so they lower
+    /// to a bare `cast`; every other primitive first maps an empty string to null via `nullif`.
+    #[rstest]
+    #[case::string_bare_cast(DataType::STRING, "CAST(get_field(pv, Utf8(\"f\")) AS Utf8)")]
+    #[case::binary_bare_cast(DataType::BINARY, "CAST(get_field(pv, Utf8(\"f\")) AS Binary)")]
+    #[case::integer_wraps_nullif(
+        DataType::INTEGER,
+        "CAST(nullif(get_field(pv, Utf8(\"f\")), Utf8(\"\")) AS Int32)"
+    )]
+    fn map_to_struct_field_value_lowering(
+        #[case] field_type: DataType,
+        #[case] expected_value: &str,
+    ) {
+        let target = StructType::try_new([StructField::nullable("f", field_type)]).unwrap();
+        let expected =
+            format!("CASE WHEN pv IS NOT NULL THEN named_struct(Utf8(\"f\"), {expected_value}) ELSE NULL END");
+        assert_eq!(lower_map_to_struct(target), expected);
     }
 
     #[test]
@@ -948,151 +905,5 @@ mod tests {
             .into();
         let kernel = KernelExpr::map_to_struct(column_expr!("pv"));
         to_df_expr(&kernel, &pv_map_schema(), Some(&target)).unwrap_err();
-    }
-
-    #[test]
-    fn map_to_struct_parses_present_values_and_nulls_missing_keys() {
-        // Row 0 has both keys; row 1 is missing `id`.
-        let batch = map_batch(vec![
-            Some(vec![("region", "us"), ("id", "7")]),
-            Some(vec![("region", "eu")]),
-        ]);
-        let structs = eval_map_to_struct(&region_id_struct(), &batch);
-        let region = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let id = structs
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(region.value(0), "us");
-        assert_eq!(id.value(0), 7);
-        assert_eq!(region.value(1), "eu");
-        assert!(id.is_null(1), "missing key -> null");
-    }
-
-    #[rstest]
-    // Empty string is a value for String/Binary (empty) but null for a numeric type.
-    #[case::string_keeps_empty(DataType::STRING, true)]
-    #[case::binary_keeps_empty(DataType::BINARY, true)]
-    #[case::integer_nulls_empty(DataType::INTEGER, false)]
-    fn map_to_struct_empty_string_cast_semantics(
-        #[case] field_type: DataType,
-        #[case] expect_valid: bool,
-    ) {
-        let target = StructType::try_new([StructField::nullable("f", field_type)]).unwrap();
-        let batch = map_batch(vec![Some(vec![("f", "")])]);
-        let structs = eval_map_to_struct(&target, &batch);
-        assert_eq!(structs.column(0).is_valid(0), expect_valid);
-    }
-
-    #[test]
-    fn map_to_struct_unparseable_value_is_a_hard_error() {
-        let target: DataType =
-            StructType::try_new([StructField::nullable("id", DataType::INTEGER)])
-                .unwrap()
-                .into();
-        let batch = map_batch(vec![Some(vec![("id", "not-a-number")])]);
-        let kernel = KernelExpr::map_to_struct(column_expr!("pv"));
-        let expr = to_df_expr(&kernel, &pv_map_schema(), Some(&target)).unwrap();
-        let df_schema = DFSchema::try_from(batch.schema()).unwrap();
-        let physical = SessionContext::new()
-            .create_physical_expr(expr, &df_schema)
-            .unwrap();
-        physical.evaluate(&batch).unwrap_err();
-    }
-
-    #[test]
-    fn map_to_struct_null_map_row_yields_null_struct() {
-        // Row 1's map is null; even with non-nullable-looking targets the struct row is null.
-        let batch = map_batch(vec![Some(vec![("region", "us"), ("id", "1")]), None]);
-        let structs = eval_map_to_struct(&region_id_struct(), &batch);
-        assert!(structs.is_valid(0));
-        assert!(structs.is_null(1), "null map row -> null struct");
-    }
-
-    /// Characterizes the documented divergence from kernel: `get_field` takes the leftmost
-    /// duplicate entry, while the kernel evaluator takes the rightmost.
-    #[test]
-    fn map_to_struct_duplicate_keys_diverge_taking_leftmost() {
-        let target = StructType::try_new([StructField::nullable("id", DataType::INTEGER)]).unwrap();
-        let batch = map_batch(vec![Some(vec![("id", "1"), ("id", "2")])]);
-        let structs = eval_map_to_struct(&target, &batch);
-        let id = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(id.value(0), 1);
-    }
-
-    #[test]
-    fn map_to_struct_present_empty_map_yields_present_struct_with_null_fields() {
-        // A present-but-empty map `{}` is a non-null row that matches no keys: the struct stays
-        // present with all fields null (only a null map row nulls the whole struct).
-        let batch = map_batch(vec![Some(vec![])]);
-        let structs = eval_map_to_struct(&region_id_struct(), &batch);
-        assert!(structs.is_valid(0), "present empty map -> present struct");
-        assert!(structs.column(0).is_null(0));
-        assert!(structs.column(1).is_null(0));
-    }
-
-    /// The temporal casts are load-bearing: kernel parses partition timestamps/dates through the
-    /// same arrow parsers, so `cast` must reproduce the UTC-normalized instant and epoch day.
-    #[test]
-    fn map_to_struct_parses_date_and_utc_normalized_timestamp() {
-        let target = StructType::try_new([
-            StructField::nullable("d", DataType::DATE),
-            StructField::nullable("ts", DataType::TIMESTAMP),
-        ])
-        .unwrap();
-        let batch = map_batch(vec![Some(vec![
-            ("d", "2024-01-15"),
-            ("ts", "2024-06-15T14:30:00+05:00"),
-        ])]);
-        let structs = eval_map_to_struct(&target, &batch);
-        let d = structs
-            .column(0)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .unwrap();
-        let ts = structs
-            .column(1)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        assert_eq!(d.value(0), 19737);
-        assert_eq!(ts.value(0), 1_718_443_800_000_000);
-    }
-
-    fn eval_single_field(field_type: DataType, value: &str) -> ArrayRef {
-        let target = StructType::try_new([StructField::nullable("f", field_type)]).unwrap();
-        let batch = map_batch(vec![Some(vec![("f", value)])]);
-        eval_map_to_struct(&target, &batch).column(0).clone()
-    }
-
-    /// Booleans parse for canonical values; the documented divergence is that arrow's cast also
-    /// accepts non-canonical strings kernel rejects (e.g. `"yes"` -> true).
-    #[rstest]
-    #[case::t("true", true)]
-    #[case::f("false", false)]
-    #[case::diverge_yes("yes", true)]
-    #[case::diverge_one("1", true)]
-    fn map_to_struct_boolean_cast(#[case] value: &str, #[case] expected: bool) {
-        let col = eval_single_field(DataType::BOOLEAN, value);
-        let b = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(b.value(0), expected);
-    }
-
-    /// A matching-scale decimal parses; the documented divergence is that arrow's cast silently
-    /// rescales a differently-scaled value (`"1.5"` -> `1.50`) where kernel hard-errors.
-    #[test]
-    fn map_to_struct_decimal_cast_rescales() {
-        let col = eval_single_field(DataType::decimal(5, 2).unwrap(), "1.5");
-        let d = col.as_any().downcast_ref::<Decimal128Array>().unwrap();
-        assert_eq!(d.value(0), 150); // 1.50 at scale 2
     }
 }
