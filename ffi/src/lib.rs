@@ -2612,9 +2612,8 @@ mod tests {
     // and its unsafe is covered by the anchor test_setting_multithread_executor. Sidecar-shape is
     // safe kernel logic. Runs (all cases) under normal cargo test / nextest.
     //
-    // DO NOT ADD `unsafe` TO THIS TEST, or to the other Miri-skipped checkpoint tests below. Miri
-    // never runs them, so `unsafe` added here is never checked for undefined behavior and nothing
-    // in CI reports the gap. Put it in the anchor test instead.
+    // DO NOT ADD `unsafe` HERE: Miri never runs this test, so `unsafe` added here is never checked
+    // for undefined behavior. Put it in the anchor test instead.
     #[cfg_attr(
         miri,
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
@@ -2705,6 +2704,8 @@ mod tests {
     // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
     // version()/SharedSnapshot::as_ref by test_snapshot. AlreadyExists/overwrite is safe kernel
     // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD `unsafe` HERE: Miri never runs this test, so `unsafe` added here is never checked
+    // for undefined behavior. Put it in the anchor test instead.
     #[cfg_attr(
         miri,
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
@@ -2752,6 +2753,8 @@ mod tests {
     // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
     // version()/SharedSnapshot::as_ref by test_snapshot. _last_checkpoint content is safe kernel
     // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD `unsafe` HERE: Miri never runs this test, so `unsafe` added here is never checked
+    // for undefined behavior. Put it in the anchor test instead.
     #[cfg_attr(
         miri,
         ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
