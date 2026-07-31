@@ -29,7 +29,7 @@ pub fn to_df_predicate_expr(
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
     match pred {
-        KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema),
+        KernelPredicate::BooleanExpression(expr) => to_df_expr(expr, input_schema, None),
         KernelPredicate::Not(inner) => {
             let df_inner = to_df_predicate_expr(inner, input_schema)?;
             Ok(DFExpr::Not(Box::new(df_inner)))
@@ -53,7 +53,7 @@ fn unary_to_df_predicate_expr(
     unary: &KernelUnaryPredicate,
     input_schema: &StructType,
 ) -> DeltaResult<DFExpr> {
-    let expr = to_df_expr(&unary.expr, input_schema)?;
+    let expr = to_df_expr(&unary.expr, input_schema, None)?;
     match unary.op {
         KernelUnaryPredicateOp::IsNull => Ok(DFExpr::IsNull(Box::new(expr))),
     }
@@ -73,8 +73,8 @@ fn binary_to_df_predicate_expr(
         KernelBinaryPredicateOp::GreaterThan => Operator::Gt,
         KernelBinaryPredicateOp::Distinct => Operator::IsDistinctFrom,
     };
-    let left = to_df_expr(&binary.left, input_schema)?;
-    let right = to_df_expr(&binary.right, input_schema)?;
+    let left = to_df_expr(&binary.left, input_schema, None)?;
+    let right = to_df_expr(&binary.right, input_schema, None)?;
     Ok(binary_expr(left, op, right))
 }
 
