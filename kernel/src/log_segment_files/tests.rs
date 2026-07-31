@@ -1358,19 +1358,30 @@ fn multipart_checkpoint_name(version: Version, part_num: u32, num_parts: u32) ->
 }
 
 /// Mirrors Delta-Spark's `CheckpointInstanceSuite`: a single-part checkpoint sorts below a
-/// multi-part one, more parts beats fewer, and single-file checkpoints break ties on file name.
+/// multi-part one, more parts beats fewer, a V2 checkpoint outranks both, and single-file
+/// checkpoints break ties on file name.
 #[test]
 fn checkpoint_instance_orders_like_delta_spark() {
-    let classic = CheckpointInstance::single("00000000000000000005.checkpoint.parquet".to_string());
-    let uuid = CheckpointInstance::single(
+    let classic = CheckpointInstance::single_file(
+        CheckpointFormatRank::Single,
+        "00000000000000000005.checkpoint.parquet".to_string(),
+    );
+    let uuid_a = CheckpointInstance::single_file(
+        CheckpointFormatRank::V2,
         "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet".to_string(),
+    );
+    let uuid_b = CheckpointInstance::single_file(
+        CheckpointFormatRank::V2,
+        "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet".to_string(),
     );
 
     assert!(classic < CheckpointInstance::multi_part(2));
     assert!(CheckpointInstance::multi_part(2) < CheckpointInstance::multi_part(11));
     assert!(classic < CheckpointInstance::multi_part(11));
-    // Hex digits all sort below 'p', so a classic checkpoint wins over a uuid-named one.
-    assert!(uuid < classic);
+    assert!(uuid_a > CheckpointInstance::multi_part(11));
+    assert!(uuid_a > classic);
+    // Two V2 checkpoints at one version break the tie on file name.
+    assert!(uuid_a < uuid_b);
 }
 
 /// Two writers checkpointed the same version with different part counts, and both checkpoints are
@@ -1491,11 +1502,10 @@ async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
     );
 }
 
-/// A uuid-named checkpoint and a complete multi-part checkpoint at one version. The multi-part one
-/// wins: kernel ranks uuid-named (V2) checkpoints alongside classic ones rather than above
-/// multi-part ones as Delta-Spark does.
+/// A uuid-named (V2) checkpoint and a complete multi-part (V1) checkpoint at one version. The V2
+/// one wins, matching Delta-Spark's `Format.V2 > Format.WITH_PARTS`.
 #[tokio::test]
-async fn uuid_and_multipart_checkpoints_at_one_version_selects_multipart() {
+async fn uuid_and_multipart_checkpoints_at_one_version_selects_uuid() {
     let (storage, log_root) = create_storage_with_raw_paths(
         vec![
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -1512,13 +1522,11 @@ async fn uuid_and_multipart_checkpoints_at_one_version_selects_multipart() {
     let (_, _, checkpoint_parts, _, _, _) =
         list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
 
-    assert_eq!(checkpoint_parts.len(), 2);
-    for part in &checkpoint_parts {
-        assert!(matches!(
-            part.file_type,
-            LogPathFileType::MultiPartCheckpoint { num_parts: 2, .. }
-        ));
-    }
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    );
 }
 
 /// Two uuid-named checkpoints at one version each stand alone -- each writer picks a fresh uuid, so
@@ -1544,10 +1552,10 @@ async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
     );
 }
 
-/// A classic checkpoint beats a uuid-named one at the same version: both rank `Single`, and every
-/// hex digit sorts below the `p` of `parquet`.
+/// A uuid-named (V2) checkpoint beats a classic (V1) one at the same version, matching
+/// Delta-Spark's `Format.V2 > Format.SINGLE`.
 #[tokio::test]
-async fn classic_checkpoint_beats_uuid_checkpoint_at_one_version() {
+async fn uuid_checkpoint_beats_classic_checkpoint_at_one_version() {
     let (storage, log_root) = create_storage_with_raw_paths(
         vec![
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
@@ -1563,7 +1571,39 @@ async fn classic_checkpoint_beats_uuid_checkpoint_at_one_version() {
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(
         checkpoint_parts[0].filename,
-        "00000000000000000001.checkpoint.parquet"
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    );
+}
+
+/// A json V2 checkpoint outranks the V1 checkpoints at its version just like a parquet one does.
+/// A json checkpoint has no parquet footer, so selecting it routes schema discovery through the
+/// sidecar path rather than a footer read (see `LogSegment::get_file_actions_schema_and_sidecars`).
+#[tokio::test]
+async fn json_uuid_checkpoint_beats_v1_checkpoints_at_one_version() {
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                1,
+                LogPathFileType::SinglePartCheckpoint,
+                CommitSource::Filesystem,
+            ),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(1, 2, 2)),
+            "_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json",
+        ],
+    )
+    .await;
+
+    let (_, _, checkpoint_parts, _, _, _) =
+        list_and_destructure(storage.as_ref(), &log_root, vec![], None, None);
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(
+        checkpoint_parts[0].filename,
+        "00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json"
     );
 }
 

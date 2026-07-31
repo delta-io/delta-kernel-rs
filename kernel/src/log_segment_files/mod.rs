@@ -103,23 +103,21 @@ pub(crate) fn list_delta_log_from_storage(
 }
 
 /// Rank of a checkpoint's [`LogPathFileType`], ordered like Delta-Spark's
-/// `CheckpointInstance.Format` ordinals (`SINGLE` = 0, `WITH_PARTS` = 1), which its comparison uses
-/// as the sort key just after version. A separate enum because `LogPathFileType` also covers
-/// non-checkpoint files, and its variants are not declared in this order.
+/// `CheckpointInstance.Format` ordinals (`SINGLE` = 0, `WITH_PARTS` = 1, `V2` = 2), which its
+/// comparison uses as the sort key just after version. A separate enum because `LogPathFileType`
+/// also covers non-checkpoint files, and its variants are not declared in this order.
 ///
 /// Named for those ordinals, but the rank follows a checkpoint's *name*, not its spec version: a
 /// classic-named file may itself be a V2 checkpoint carrying sidecars, which is why
 /// `LogSegment::get_file_actions_schema_and_sidecars` probes for a sidecar column instead.
-///
-/// TODO: Delta-Spark gives uuid-named checkpoints a third, higher ordinal (`V2` = 2). Promoting
-/// them changes which file a table holding both formats reads, and a json one has no parquet footer
-/// to fall back on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CheckpointFormatRank {
-    /// [`SinglePartCheckpoint`] and [`UuidCheckpoint`]: one whole file.
+    /// [`SinglePartCheckpoint`]
     Single,
     /// [`MultiPartCheckpoint`]
     WithParts,
+    /// [`UuidCheckpoint`]
+    V2,
 }
 
 /// Identifies one checkpoint among the checkpoints at a single version, and orders it against its
@@ -134,8 +132,8 @@ struct CheckpointInstance {
     /// How many files this checkpoint spans, or `None` for a single-file checkpoint -- matching
     /// Delta-Spark's `Option[Int]`, whose `None` also sorts below every `Some`.
     num_parts: Option<u32>,
-    /// Set only for single-file checkpoints, where the file name is what distinguishes two
-    /// checkpoints at the same version. `None` for a multi-part checkpoint, so that all of its
+    /// Set for the single-file formats (`Single`, `V2`), where the file name is what distinguishes
+    /// two checkpoints at the same version. `None` for a multi-part checkpoint, so that all of its
     /// parts map to one instance: a multi-part file name is fully determined by
     /// `(version, part_num, num_parts)`, so `num_parts` already pins the identity.
     filename: Option<String>,
@@ -151,10 +149,10 @@ impl CheckpointInstance {
         }
     }
 
-    /// The instance for a checkpoint that is one whole file.
-    fn single(filename: String) -> Self {
+    /// The instance for a checkpoint that is one whole file, ranked `Single` or `V2` by its name.
+    fn single_file(format: CheckpointFormatRank, filename: String) -> Self {
         Self {
-            format: CheckpointFormatRank::Single,
+            format,
             num_parts: None,
             filename: Some(filename),
         }
@@ -187,10 +185,17 @@ fn group_checkpoint_parts(
     let mut checkpoints: HashMap<CheckpointInstance, Vec<ParsedLogPath>> = HashMap::new();
     for part_file in parts {
         match &part_file.file_type {
+            // A single-file checkpoint is complete on its own. Keying on file name keeps distinct
+            // same-version checkpoints separate -- notably uuid-named ones, since each writer picks
+            // a fresh uuid. Ranking is blind to whether the table declares the `v2Checkpoint`
+            // reader feature, as Delta-Spark's is: the Protocol action lives *inside* the
+            // checkpoint being chosen, so listing cannot know it.
             SinglePartCheckpoint | UuidCheckpoint => {
-                // A single-file checkpoint is complete on its own. Keying on file name keeps
-                // distinct same-version checkpoints (e.g. several uuid-named ones) separate.
-                let instance = CheckpointInstance::single(part_file.filename.clone());
+                let format = match part_file.file_type {
+                    UuidCheckpoint => CheckpointFormatRank::V2,
+                    _ => CheckpointFormatRank::Single,
+                };
+                let instance = CheckpointInstance::single_file(format, part_file.filename.clone());
                 checkpoints.insert(instance, vec![part_file]);
             }
             MultiPartCheckpoint {
@@ -368,11 +373,12 @@ impl ListingAccumulator {
     /// Selects this version's checkpoint: the greatest _complete_ checkpoint in
     /// [`CheckpointInstance`] order.
     ///
-    /// Any of a version's complete checkpoints (see [`group_checkpoint_parts`]) replays to the same
-    /// table state, but the choice must be stable across processes, hence the maximum rather than
-    /// whichever entry a [`HashMap`] happens to yield first. Delta-Spark selects the same way:
-    /// group by checkpoint identity, keep the groups complete against their own part count,
-    /// take the max.
+    /// Any of a version's complete checkpoints (see [`group_checkpoint_parts`]) describes the same
+    /// table state, though not necessarily by the same read path -- a V2 manifest resolves sidecars
+    /// where a V1 checkpoint holds its actions inline. The choice must be stable across processes,
+    /// hence the maximum rather than whichever entry a [`HashMap`] happens to yield first.
+    /// Delta-Spark selects the same way: group by checkpoint identity, keep the groups complete
+    /// against their own part count, take the max.
     ///
     /// If this version has a complete checkpoint, we can drop the existing commit and
     /// compaction files we collected so far -- except we must keep the latest commit.
