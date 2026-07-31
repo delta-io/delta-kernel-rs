@@ -114,6 +114,12 @@ arrow-expression = ["need-arrow"]
 # Schema diffing functionality (experimental)
 schema-diff = []
 
+# Enables the kernel-owned, versioned transport for `WriteState` (encode/decode). Distributed
+# writers turn this on to ship a `WriteState` from the driver to remote writers; single-process
+# writers never need it. serde/serde_json are already core kernel dependencies, so this only gates
+# the transport API surface.
+write-transport = []
+
 # Declarative plan IR (experimental).
 declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored"]
 
