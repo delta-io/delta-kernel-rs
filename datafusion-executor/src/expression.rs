@@ -113,10 +113,10 @@ fn variadic_to_df_expr(
         .iter()
         .map(|e| to_df_expr(e, input_schema))
         .collect();
-    Ok(match variadic.op {
-        VariadicExpressionOp::Coalesce => coalesce(args?),
-        VariadicExpressionOp::Array => make_array(args?),
-    })
+    match variadic.op {
+        VariadicExpressionOp::Coalesce => Ok(coalesce(args?)),
+        VariadicExpressionOp::Array => Ok(make_array(args?)),
+    }
 }
 
 #[cfg(test)]
