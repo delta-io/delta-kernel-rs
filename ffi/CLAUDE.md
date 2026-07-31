@@ -201,14 +201,23 @@ Guidance for adding or triaging FFI tests:
 
 - **Keep under Miri** any test that executes `unsafe` whose correctness Miri can check. This is
   the reason the job exists; do not skip these for speed.
+- **Never add new `unsafe` to a Miri-ignored test.** An ignored test is invisible to Miri, so
+  `unsafe` introduced in one is never checked for undefined behavior, and nothing in CI reports
+  the gap. When a change needs new `unsafe` in an ignored test, either exercise that `unsafe`
+  from a test that runs under Miri, or un-skip the test.
 - **`#[cfg_attr(miri, ignore)]` is legitimate for two reasons, and only these two:**
-  1. Miri cannot run it (e.g. an unsupported foreign function like `linkat`).
+  1. Miri cannot run it (e.g. an unsupported foreign function). Before accepting this, check
+     whether the blocker is avoidable: local-filesystem storage reaches `std::fs::hard_link`
+     (`linkat`), which Miri rejects, but in-memory storage does not. Prefer an in-memory store.
   2. The test executes no `unsafe`, OR only `unsafe` that a kept test already covers, AND it is
      expensive under Miri. Skip only with the coverage argument; skipping for cost alone drops
      UB coverage.
 - When you skip under reason 2, **prove the coverage is preserved**: the kept tests' set of
   `unsafe` FFI functions must be a superset of the skipped test's. Name the covering test in the
   `ignore` reason or a nearby comment so a future reader can re-check it.
+- Miri's leak check also flags handles a test itself forgot to free. Triage before assuming a bug
+  in the code under test: a missing `free_*` in the test is a test fix, while an unjoined
+  background thread at teardown can be an artifact of how the test ends.
 - Prefer picking the **cheapest** test that crosses a given `unsafe` path over keeping several
   that cross the same path with more safe work each.
 - `rest_engine` and the checkpoint tests in `lib.rs` document worked examples of this split.
