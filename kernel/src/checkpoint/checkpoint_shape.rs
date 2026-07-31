@@ -16,13 +16,13 @@ use url::Url;
 
 use super::CHECKPOINT_ACTIONS_SCHEMA_V2;
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{ADD_NAME, SIDECAR_NAME};
+use crate::actions::{ADD_NAME, SIDECAR_NAME, STATS_PARSED};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::scan::log_replay::PARTITION_VALUES_PARSED_NAME;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, FileMeta};
 
@@ -229,6 +229,31 @@ impl CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
             leaf_checkpoint_schema,
         }
+    }
+
+    fn add_field(&self, name: &str) -> Option<&StructField> {
+        let DataType::Struct(add) = self
+            .leaf_checkpoint_schema
+            .as_ref()?
+            .field(ADD_NAME)?
+            .data_type()
+        else {
+            return None;
+        };
+        add.field(name)
+    }
+
+    /// Whether the checkpoint contains JSON-encoded stats.
+    pub(crate) fn has_json_stats(&self) -> bool {
+        self.add_field("stats").is_some()
+    }
+
+    /// Return the checkpoint's complete native parsed-stats schema.
+    pub(crate) fn stats_parsed_schema(&self) -> Option<SchemaRef> {
+        let DataType::Struct(stats) = self.add_field(STATS_PARSED)?.data_type() else {
+            return None;
+        };
+        Some(Arc::new(stats.as_ref().clone()))
     }
 
     /// Returns `stats_schema` when the checkpoint has compatible parsed stats.
