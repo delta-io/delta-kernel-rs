@@ -1533,13 +1533,11 @@ mod tests {
     /// Create a table with the `domainMetadata` writer feature enabled and return the table
     /// URL, object store, and FFI engine handle.
     async fn setup_domain_metadata_table(
-        dir_url: &Url,
         name: &str,
     ) -> Result<(Url, Arc<DynObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
     {
         let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
-        let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup(name, Some(dir_url));
+        let (store, _test_engine, table_location) = test_utils::engine_store_setup(name, None);
         let table_url = test_utils::create_table(
             store.clone(),
             table_location,
@@ -1550,21 +1548,14 @@ mod tests {
             vec!["domainMetadata"],
         )
         .await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
-        let engine = get_default_engine(table_path_str);
+        let engine = engine_handle_for_store(Arc::clone(&store));
         Ok((table_url, store, engine))
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_add_and_remove() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-        let (table_url, store, engine) =
-            setup_domain_metadata_table(&tmp_dir_url, "test_dm").await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
+        let (table_url, store, engine) = setup_domain_metadata_table("test_dm").await?;
+        let table_path_str = table_url.as_str();
 
         // === Transaction 1: add domain metadata ===
         let txn = ok_or_panic(unsafe {
@@ -1618,12 +1609,8 @@ mod tests {
     #[tokio::test]
     async fn test_domain_metadata_system_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-        let (table_url, _store, engine) =
-            setup_domain_metadata_table(&tmp_dir_url, "test_dm_sys").await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_sys").await?;
+        let table_path_str = table_url.as_str();
 
         // with_domain_metadata succeeds (validation is lazy), but commit should fail
         let txn = ok_or_panic(unsafe {
@@ -1656,12 +1643,8 @@ mod tests {
     #[tokio::test]
     async fn test_domain_metadata_duplicate_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-        let (table_url, _store, engine) =
-            setup_domain_metadata_table(&tmp_dir_url, "test_dm_dup").await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_dup").await?;
+        let table_path_str = table_url.as_str();
 
         // Adding the same domain twice should cause commit to fail
         let txn = ok_or_panic(unsafe {
@@ -2972,7 +2955,6 @@ mod tests {
 
     /// End-to-end FFI round trip for connector-authored deletion vector updates.
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_dv_update_round_trip_via_ffi() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel::actions::deletion_vector_writer::{
             KernelDeletionVector, StreamingDeletionVectorWriter,
@@ -2983,16 +2965,13 @@ mod tests {
             dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
             transaction_update_deletion_vectors, KernelDvStorageType,
         };
-        use test_utils::{create_default_engine, record_batch_to_bytes};
-
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        use test_utils::record_batch_to_bytes;
 
         // Build a DV-enabled table; create_table sets delta.enableDeletionVectors for the
         // writer feature.
         let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
         let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup("test_dv_ffi", Some(&tmp_dir_url));
+            test_utils::engine_store_setup("test_dv_ffi", None);
         let table_url = test_utils::create_table(
             store.clone(),
             table_location.clone(),
@@ -3021,7 +3000,11 @@ mod tests {
             .await?;
 
         // Add the file via a kernel transaction so the table has something to scan.
-        let kernel_engine: Arc<dyn delta_kernel::Engine> = create_default_engine(&table_url)?;
+        // Build the kernel engine over the seeded store: `create_default_engine` resolves a fresh
+        // store from the URL, which for `memory://` would not see this table.
+        let kernel_engine: Arc<dyn delta_kernel::Engine> = Arc::new(
+            delta_kernel_default_engine::DefaultEngineBuilder::new(Arc::clone(&store)).build(),
+        );
         let snapshot = delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
             .build(kernel_engine.as_ref())?;
         let mut add_txn = snapshot
@@ -3053,9 +3036,8 @@ mod tests {
             .await?;
 
         // === FFI surface under test ===
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
-        let engine = get_default_engine(table_path_str);
+        let table_path_str = table_url.as_str();
+        let engine = engine_handle_for_store(Arc::clone(&store));
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
