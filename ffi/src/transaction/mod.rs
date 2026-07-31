@@ -968,7 +968,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    // Keeps local storage: `canonicalize` on the FFI-returned write path has no in-memory
+    // equivalent.
+    #[cfg_attr(
+        miri,
+        ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
+    )]
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(StructType::try_new(vec![
             StructField::nullable("number", DataType::INTEGER),
@@ -1143,7 +1148,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    // Keeps local storage: the test creates the Hive partition directory on disk, which an object
+    // store does not have.
+    #[cfg_attr(
+        miri,
+        ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
+    )]
     async fn test_partitioned_append() -> Result<(), Box<dyn std::error::Error>> {
         // Partition column `part` is listed last in the schema; the physical write schema must
         // exclude it (CM=none, partition columns are not materialized).
