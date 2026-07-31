@@ -45,7 +45,9 @@ rest of the UC integration.
 ```rust,ignore
 use unity_catalog_delta_client_default::{ClientConfig, UCClient};
 
-let config = ClientConfig::build(&endpoint, &token, "MyEngine/1.0").build()?;
+let config = ClientConfig::build(&endpoint, &token)
+    .with_additional_user_agent([("MyConnector", "1.0")])
+    .build()?;
 let uc_client = UCClient::new(config)?;
 ```
 
@@ -189,7 +191,7 @@ use unity_catalog_delta_client_default::{ClientConfig, UCClient};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Build the UC client
-    let config = ClientConfig::build(&endpoint, &token, "MyEngine/1.0").build()?;
+    let config = ClientConfig::build(&endpoint, &token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
     let uc_client = UCClient::new(config)?;
 
     // 2. Load the table (metadata + inline log tail)

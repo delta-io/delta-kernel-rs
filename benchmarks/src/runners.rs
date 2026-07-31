@@ -23,7 +23,7 @@ use delta_kernel_workloads::models::{
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_client_default::{default_engine_user_agent, ClientConfig, UCClient};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient};
 use url::Url;
 
 use crate::registry::{ParallelScan, ReadConfig};
@@ -131,7 +131,7 @@ fn resolve_snapshot_strategy(
 
     let endpoint = std::env::var("UC_WORKSPACE").map_err(|_| "UC_WORKSPACE required")?;
     let token = std::env::var("UC_TOKEN").map_err(|_| "UC_TOKEN required")?;
-    let config = ClientConfig::build(&endpoint, &token, default_engine_user_agent()).build()?;
+    let config = ClientConfig::build(&endpoint, &token).build()?;
     let client = Box::new(UCClient::new(config)?);
 
     let (catalog, schema, table) = parse_three_part_name(&cm.table_name)?;

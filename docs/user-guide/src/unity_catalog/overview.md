@@ -205,6 +205,32 @@ The `unity-catalog-delta-client-api` crate has one feature flag:
 > transitively. Add it to your `[dev-dependencies]` to get the in-memory
 > client for tests.
 
+## Identifying your client (User-Agent)
+
+Some catalogs allowlist requests by `User-Agent` and reject callers they don't
+recognize. The client always identifies itself as
+`Unity-Catalog-Delta-Client-Default/<version>`. Use `with_additional_user_agent`
+to add the other versions relevant to your setup. Providing them is voluntary,
+and which ones apply depends on the caller.
+
+Versions worth including, when they apply to your setup:
+
+- **compute engine**: the external query system, if any (e.g. Spark, Flink).
+- **connector**: your code integrating an engine with Delta and UC.
+- **client**: `Unity-Catalog-Delta-Client-Default`, added for you.
+- **kernel**: `Delta-Kernel-Rust`, if your connector uses Kernel.
+
+```rust,ignore
+let config = ClientConfig::build(&endpoint, &token)
+    .with_additional_user_agent([
+        ("MyEngine", "1.0.0"),
+        ("MyConnector", "1.0.0"),
+        ("Delta-Kernel-Rust", "0.14.0"),
+    ])
+    .build()?;
+// User-Agent: Unity-Catalog-Delta-Client-Default/<v> MyEngine/1.0.0 MyConnector/1.0.0 Delta-Kernel-Rust/0.14.0
+```
+
 ## Client configuration and retries
 
 `ClientConfigBuilder` exposes the following tuning knobs. The defaults are
@@ -222,7 +248,7 @@ often benefit from raising timeouts or the retry budget.
 use std::time::Duration;
 use unity_catalog_delta_client_default::ClientConfig;
 
-let config = ClientConfig::build(&endpoint, &token, "MyEngine/1.0")
+let config = ClientConfig::build(&endpoint, &token)
     .with_timeout(Duration::from_secs(60))
     .with_max_retries(5)
     .with_retry_delays(Duration::from_millis(200), Duration::from_secs(5))

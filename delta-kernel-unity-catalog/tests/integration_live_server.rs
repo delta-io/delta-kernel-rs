@@ -41,9 +41,7 @@ use unity_catalog_delta_client_api::{
     CreateStagingTableRequest, CreateStagingTableResponse, LoadTableResponse, TableIdentifier,
 };
 use unity_catalog_delta_client_default::http::build_http_client;
-use unity_catalog_delta_client_default::{
-    default_engine_user_agent, ClientConfig, UCClient, UCUpdateTableRestClient,
-};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 use url::Url;
 
 /// Returns `(server_url, token)` from the environment, or `None` to signal the caller to skip.
@@ -54,13 +52,8 @@ fn server_env() -> Option<(String, String)> {
     Some((url, token))
 }
 
-/// Engine identity for the `User-Agent`, overridable via `UC_USER_AGENT`.
-fn engine_user_agent() -> String {
-    std::env::var("UC_USER_AGENT").unwrap_or_else(|_| default_engine_user_agent())
-}
-
 fn client_config(url: &str, token: &str) -> ClientConfig {
-    ClientConfig::build(url, token, engine_user_agent())
+    ClientConfig::build(url, token)
         .build()
         .expect("failed to build ClientConfig")
 }
@@ -74,7 +67,7 @@ fn client(url: &str, token: &str) -> UCClient {
 ///
 /// TODO(remove): fold into UCClient once it exposes a typed staging-tables method.
 fn raw_delta_rest_client(url: &str, token: &str) -> (Url, reqwest::Client) {
-    let config = ClientConfig::build(url, token, engine_user_agent())
+    let config = ClientConfig::build(url, token)
         .build()
         .expect("failed to build ClientConfig");
     let base = config
