@@ -31,6 +31,7 @@ delta_kernel_default_engine = { path = "../default-engine", default-features = f
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.26.0" }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
+peak_alloc = { version = "0.3.0", optional = true }
 
 [build-dependencies]
 cbindgen = "0.29.2"
@@ -80,4 +81,4 @@ geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
 # `*_native_bytes` FFI getters. Off by default. Only enable when building the cdylib:
 # this crate is also an rlib, so `#[global_allocator]` applies to any Rust binary that
 # links it and conflicts with a binary that installs its own (jemalloc, dhat, ...).
-alloc-tracking = []
+alloc-tracking = ["dep:peak_alloc"]
