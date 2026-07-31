@@ -136,12 +136,13 @@ impl Scan {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_schema.as_ref();
         let physical_partitions = self.state_info.physical_partition_schema.as_ref();
-        let source_physical_stats = shape.parsed_stats_schema.as_ref();
+        let source_physical_stats =
+            physical_stats.and_then(|schema| shape.compatible_stats_parsed_schema(schema));
         let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats, None)?;
+                let schema = parquet_read_schema(source_physical_stats.as_ref(), None)?;
                 PlanBuilder::scan_parquet(parts, &[VERSION], schema)
             }
             (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
@@ -152,7 +153,7 @@ impl Scan {
                 )
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats, None)?;
+                let schema = parquet_read_schema(source_physical_stats.as_ref(), None)?;
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
                     Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                     // Without a complete hint, load the sidecars referenced by the manifest.
@@ -661,9 +662,12 @@ mod tests {
     }
 
     fn shape(checkpoint_type: CheckpointType, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
+        let leaf_checkpoint_schema = parsed_stats
+            .as_ref()
+            .map(|stats| parquet_read_schema(Some(stats), None).unwrap());
         CheckpointShape {
             checkpoint_type,
-            parsed_stats_schema: parsed_stats,
+            leaf_checkpoint_schema,
         }
     }
 
