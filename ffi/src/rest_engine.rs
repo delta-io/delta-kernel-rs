@@ -330,8 +330,6 @@ pub(crate) fn build_rest_object_store(
             })
             .transpose()?,
     };
-    let client = build_rest_client(&tls)?;
-
     let max_retries = options
         .get(REST_BUILDER_OPTION_RETRY_MAX_RETRIES)
         .map(|s| {
@@ -348,6 +346,10 @@ pub(crate) fn build_rest_object_store(
         REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS,
         options.get(REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS),
     )?;
+
+    // Validate every option before building the client: constructing the reqwest/rustls client
+    // initializes a crypto provider, which is minutes of work under the Miri interpreter.
+    let client = build_rest_client(&tls)?;
 
     Ok(Arc::new(
         RestObjectStore::new(base_url.to_string(), client, auth, Arc::new(config))
@@ -580,14 +582,15 @@ mod tests {
     //
     //   3a. Rejected cheaply, before rustls crypto init. Kept under Miri.
     //
-    //   3b. Client built fully (success cases, plus errors parsed after the build). Marked
-    //       `#[cfg_attr(miri, ignore)]`: skipping drops no coverage (groups 1-2 already cover
-    //       their `unsafe`). They still run under `cargo test` / nextest.
+    //   3b. Client built fully (the success cases). Marked `#[cfg_attr(miri, ignore)]`: skipping
+    //       drops no coverage (groups 1-2 already cover their `unsafe`). They still run under
+    //       `cargo test` / nextest.
 
-    // --- 3a: rejected before rustls crypto init (cheap; run under Miri) ---
+    // === 3a: rejected before rustls crypto init (cheap; run under Miri) ===
     //
-    // Invalid timeout and header value reject inside `build_rest_object_store`; partial mTLS
-    // rejects inside `build_rest_client` but before `builder.build()`, so no crypto stack is built.
+    // `build_rest_object_store` validates every option before building the client, so a bad option
+    // rejects without paying crypto init. Partial mTLS rejects inside `build_rest_client` itself,
+    // but before `builder.build()`, so no crypto stack is built either.
 
     #[test]
     fn build_rejects_invalid_timeout() {
@@ -625,11 +628,34 @@ mod tests {
         );
     }
 
-    // --- 3b: build the reqwest/rustls client (~minutes under Miri, so skipped) ---
+    #[test]
+    fn build_rejects_invalid_max_retries() {
+        let mut options = HashMap::new();
+        options.insert(REST_BUILDER_OPTION_RETRY_MAX_RETRIES.into(), "nope".into());
+        assert!(
+            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn build_rejects_invalid_verify_on_ambiguous() {
+        let mut options = HashMap::new();
+        options.insert(
+            REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS.into(),
+            "nope".into(),
+        );
+        assert!(
+            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
+                .is_err()
+        );
+    }
+
+    // === 3b: build the reqwest/rustls client (~minutes under Miri, so skipped) ===
     //
-    // Every test below is `#[cfg_attr(miri, ignore)]` because it reaches `build_rest_client` and
-    // pays the full rustls crypto-init cost under the interpreter. Their `unsafe` is already run
-    // under Miri by groups 1-2, so skipping drops no coverage. See the group-3 banner above.
+    // Every test below is `#[cfg_attr(miri, ignore)]` because it builds the client and pays the
+    // full rustls crypto-init cost under the interpreter. Their `unsafe` is already run under Miri
+    // by groups 1-2, so skipping drops no coverage. See the group-3 banner above.
 
     #[test]
     #[cfg_attr(
@@ -686,36 +712,5 @@ mod tests {
             "true".into(),
         );
         assert!(build_rest_object_store(&test_base_url(), &options, &rest).is_ok());
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "builds reqwest/rustls client (no unsafe); crypto init is minutes under Miri"
-    )]
-    fn build_rejects_invalid_max_retries() {
-        let mut options = HashMap::new();
-        options.insert(REST_BUILDER_OPTION_RETRY_MAX_RETRIES.into(), "nope".into());
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
-                .is_err()
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "builds reqwest/rustls client (no unsafe); crypto init is minutes under Miri"
-    )]
-    fn build_rejects_invalid_verify_on_ambiguous() {
-        let mut options = HashMap::new();
-        options.insert(
-            REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS.into(),
-            "nope".into(),
-        );
-        assert!(
-            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
-                .is_err()
-        );
     }
 }
