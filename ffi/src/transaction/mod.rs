@@ -1356,7 +1356,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_visit_partition_values_surfaces_null() -> Result<(), Box<dyn std::error::Error>> {
         // A null partition value must surface across the visitor as `is_null = true` with an
         // empty value slice (the documented C contract).
@@ -1364,15 +1363,13 @@ mod tests {
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("part", DataType::INTEGER),
         ])?);
-        let (_tmp_test_dir, tables) =
-            setup_local_test_tables(schema, &["part"], "test_null_partition").await?;
+        let tables = setup_test_tables(schema, &["part"], None, "test_null_partition").await?;
 
-        for (table_url, _engine, _store, _table_name) in tables {
-            let table_path = table_url.to_file_path().unwrap();
-            let table_path_str = table_path.to_str().unwrap();
-            let engine = get_default_engine(table_path_str);
+        for (table_url, _engine, store, _table_name) in tables {
+            let table_url_str = table_url.as_str();
+            let engine = engine_handle_for_store(store);
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
 
             let partition_values = partition_value_map_new();
@@ -1389,7 +1386,11 @@ mod tests {
                 )
             });
             let write_context = ok_or_panic(unsafe {
-                get_partitioned_write_context(txn, partition_values, engine.shallow_copy())
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
@@ -1402,6 +1403,7 @@ mod tests {
             assert_eq!(collected, vec![("part".to_string(), String::new(), true)]);
 
             unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
             unsafe { free_engine(engine) };
         }
 
@@ -1409,7 +1411,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_visit_partition_values_is_sorted_by_key() -> Result<(), Box<dyn std::error::Error>>
     {
         // Multiple partition columns must be visited in deterministic (sorted) key order,
@@ -1419,15 +1420,14 @@ mod tests {
             StructField::nullable("region", DataType::STRING),
             StructField::nullable("year", DataType::INTEGER),
         ])?);
-        let (_tmp_test_dir, tables) =
-            setup_local_test_tables(schema, &["year", "region"], "test_multi_partition").await?;
+        let tables =
+            setup_test_tables(schema, &["year", "region"], None, "test_multi_partition").await?;
 
-        for (table_url, _engine, _store, _table_name) in tables {
-            let table_path = table_url.to_file_path().unwrap();
-            let table_path_str = table_path.to_str().unwrap();
-            let engine = get_default_engine(table_path_str);
+        for (table_url, _engine, store, _table_name) in tables {
+            let table_url_str = table_url.as_str();
+            let engine = engine_handle_for_store(store);
             let txn = ok_or_panic(unsafe {
-                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
             });
 
             let partition_values = partition_value_map_new();
@@ -1452,7 +1452,11 @@ mod tests {
                 )
             });
             let write_context = ok_or_panic(unsafe {
-                get_partitioned_write_context(txn, partition_values, engine.shallow_copy())
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
             });
 
             let mut collected: Vec<(String, String, bool)> = Vec::new();
@@ -1466,6 +1470,7 @@ mod tests {
             assert_eq!(keys, vec!["region", "year"]);
 
             unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
             unsafe { free_engine(engine) };
         }
 
@@ -2077,15 +2082,16 @@ mod tests {
     /// fields. Returns `(table_path, engine_handle, builder_handle)`. The caller is responsible
     /// for freeing/consuming the engine and builder handles.
     fn create_table_builder(
-        tmp_dir: &tempfile::TempDir,
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
         fields: Vec<StructField>,
     ) -> (
         String,
         Handle<SharedExternEngine>,
         Handle<ExclusiveCreateTableBuilder>,
     ) {
-        let table_path = tmp_dir.path().to_str().unwrap().to_string();
-        let engine = get_default_engine(&table_path);
+        let table_path = table_url.to_string();
+        let engine = engine_handle_for_store(Arc::clone(store));
         let engine_info = "test-engine/1.0";
         let schema_arg = EngineSchema {
             schema: &fields as *const Vec<StructField> as *mut c_void,
@@ -2117,11 +2123,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_basic() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("name", DataType::STRING),
@@ -2151,20 +2158,28 @@ mod tests {
     }
 
     /// Reads the v0 commit file (`_delta_log/00..00.json`) of a freshly created table.
-    fn read_v0_commit(tmp_dir: &tempfile::TempDir) -> String {
-        let path = tmp_dir
-            .path()
-            .join("_delta_log")
-            .join("00000000000000000000.json");
-        std::fs::read_to_string(path).expect("v0 commit file should exist")
+    async fn read_v0_commit(store: &Arc<DynObjectStore>, table_url: &Url) -> String {
+        let path = table_url
+            .join("_delta_log/00000000000000000000.json")
+            .expect("valid commit url");
+        let path = Path::from_url_path(path.path()).expect("valid object store path");
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("v0 commit file should exist")
+            .bytes()
+            .await
+            .expect("v0 commit body");
+        String::from_utf8(bytes.to_vec()).expect("v0 commit is utf-8")
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_with_clustering_columns() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("name", DataType::STRING),
@@ -2186,7 +2201,7 @@ mod tests {
         // A clustered create records the `delta.clustering` domain metadata (listing the
         // clustering columns, JSON-escaped inside the configuration string) and adds the
         // `clustering` writer feature to the protocol.
-        let log = read_v0_commit(&tmp_dir);
+        let log = read_v0_commit(&store, &table_url).await;
         assert!(
             log.contains("delta.clustering"),
             "missing clustering domain metadata: {log}"
@@ -2205,13 +2220,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_with_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         // Partitioning requires at least one non-partition column, so partition on `date`
         // while keeping `id` as data.
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("date", DataType::STRING),
@@ -2231,7 +2247,7 @@ mod tests {
         build_and_commit(builder, &engine);
 
         // A partitioned create records the partition columns in the table metadata.
-        let log = read_v0_commit(&tmp_dir);
+        let log = read_v0_commit(&store, &table_url).await;
         assert!(
             log.contains(r#""partitionColumns":["date"]"#),
             "missing partitionColumns in metadata: {log}"
@@ -2242,12 +2258,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_with_multiple_clustering_columns(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("name", DataType::STRING),
@@ -2268,7 +2285,7 @@ mod tests {
         });
         build_and_commit(builder, &engine);
 
-        let log = read_v0_commit(&tmp_dir);
+        let log = read_v0_commit(&store, &table_url).await;
         assert!(
             log.contains(r#"[[\"id\"],[\"name\"]]"#),
             "clustering column order not preserved: {log}"
@@ -2279,12 +2296,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_data_layout_last_call_wins() -> Result<(), Box<dyn std::error::Error>>
     {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("date", DataType::STRING),
@@ -2315,7 +2333,7 @@ mod tests {
         });
         build_and_commit(builder, &engine);
 
-        let log = read_v0_commit(&tmp_dir);
+        let log = read_v0_commit(&store, &table_url).await;
         assert!(
             log.contains(r#""partitionColumns":["date"]"#),
             "partition layout should win: {log}"
@@ -2340,9 +2358,11 @@ mod tests {
     fn test_with_data_layout_impl_propagates_column_error() {
         // A column-collection error must short-circuit the shared lowering and drop the consumed
         // builder, never producing a layout or a dangling handle.
-        let tmp_dir = tempdir().unwrap();
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (_table_path, engine, builder_handle) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let builder = unsafe { *builder_handle.into_inner() };
@@ -2355,11 +2375,12 @@ mod tests {
     /// CREATE TABLE: the committed transaction must expose a post-commit snapshot at version 0
     /// without re-listing the log.
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_post_commit_snapshot_create_table() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
 
@@ -2441,11 +2462,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_create_table_with_properties() {
-        let tmp_dir = tempdir().unwrap();
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
 
@@ -2501,7 +2523,8 @@ mod tests {
     /// Builds a create-table transaction and its unpartitioned write context, optionally
     /// enabling column mapping. Returns handles the caller must free.
     fn cm_table_write_context(
-        tmp_dir: &tempfile::TempDir,
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
         cm_mode: Option<&str>,
     ) -> (
         Handle<SharedExternEngine>,
@@ -2509,7 +2532,8 @@ mod tests {
         Handle<SharedWriteContext>,
     ) {
         let (_table_path, engine, mut builder) = create_table_builder(
-            tmp_dir,
+            store,
+            table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("name", DataType::STRING),
@@ -2539,8 +2563,9 @@ mod tests {
     #[case::name_mode(Some("name"))]
     #[case::id_mode(Some("id"))]
     fn test_write_context_accessors(#[case] cm_mode: Option<&str>) {
-        let tmp_dir = tempdir().unwrap();
-        let (engine, txn, write_context) = cm_table_write_context(&tmp_dir, cm_mode);
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
+        let (engine, txn, write_context) = cm_table_write_context(&store, &table_url, cm_mode);
 
         let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
         let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
@@ -2605,20 +2630,22 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_already_exists() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
 
         // Create the table first time -- should succeed
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         build_and_commit(builder, &engine);
 
         // Try to create the same table again -- build should error (table already exists)
         let (_, engine2, builder2) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let result = unsafe { create_table_builder_build(builder2, engine2.shallow_copy()) };
@@ -2656,10 +2683,11 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_build_with_empty_schema_succeeds(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         // CREATE TABLE with no columns is permitted by the Delta protocol; users may
         // populate the schema later via ALTER TABLE ADD COLUMN.
-        let (_table_path, engine, builder) = create_table_builder(&tmp_dir, vec![]);
+        let (_table_path, engine, builder) = create_table_builder(&store, &table_url, vec![]);
 
         let txn =
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
@@ -2670,11 +2698,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_with_custom_committer() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let table_path_str = table_path.as_str();
