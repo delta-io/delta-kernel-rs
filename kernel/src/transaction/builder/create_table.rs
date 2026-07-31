@@ -453,9 +453,11 @@ fn maybe_set_materialized_row_tracking_column_name_properties(
     );
 }
 
-/// Ensures that `inCommitTimestamp` is enabled when `catalogManaged` is present. Adds the ICT
-/// feature to the protocol and sets the enablement property if not already present.
-fn maybe_enable_ict_for_catalog_managed(
+/// Ensures the features that `catalogManaged` depends on are enabled. Per the Delta protocol,
+/// `catalogManaged` requires `inCommitTimestamp` to be enabled and `vacuumProtocolCheck` to be
+/// supported, so when `catalogManaged` is present this adds both features to the protocol and
+/// sets the ICT enablement property if not already present.
+fn maybe_enable_catalog_managed_dependencies(
     validated: &mut ValidatedTableProperties,
 ) -> DeltaResult<()> {
     let has_catalog_managed = validated
@@ -475,6 +477,11 @@ fn maybe_enable_ict_for_catalog_managed(
         }
         add_feature_to_lists(
             TableFeature::InCommitTimestamp,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+        add_feature_to_lists(
+            TableFeature::VacuumProtocolCheck,
             &mut validated.reader_features,
             &mut validated.writer_features,
         );
@@ -928,7 +935,7 @@ impl CreateTableTransactionBuilder {
         maybe_auto_enable_property_driven_features(&mut validated);
 
         // Auto-enable inCommitTimestamp for catalogManaged tables
-        maybe_enable_ict_for_catalog_managed(&mut validated)?;
+        maybe_enable_catalog_managed_dependencies(&mut validated)?;
 
         // Set materialized row tracking column names when row tracking is enabled.
         maybe_set_materialized_row_tracking_column_name_properties(&mut validated);
@@ -1687,20 +1694,26 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_managed_auto_enables_ict() {
+    fn test_catalog_managed_auto_enables_dependencies() {
         let properties = HashMap::from([(
             "delta.feature.catalogManaged".to_string(),
             "supported".to_string(),
         )]);
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
-        maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
+        maybe_enable_catalog_managed_dependencies(&mut validated).unwrap();
 
         assert!(
             validated
                 .writer_features
                 .contains(&TableFeature::InCommitTimestamp),
             "ICT should be auto-added to writer_features"
+        );
+        assert!(
+            validated
+                .writer_features
+                .contains(&TableFeature::VacuumProtocolCheck),
+            "vacuumProtocolCheck should be auto-added to writer_features"
         );
         assert_eq!(
             validated.properties.get(ENABLE_IN_COMMIT_TIMESTAMPS),
@@ -1723,7 +1736,7 @@ mod tests {
         ]);
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
-        maybe_enable_ict_for_catalog_managed(&mut validated).unwrap();
+        maybe_enable_catalog_managed_dependencies(&mut validated).unwrap();
 
         assert!(validated
             .writer_features
@@ -1786,7 +1799,7 @@ mod tests {
         ]);
         let mut validated = validate_extract_table_features_and_properties(properties).unwrap();
         maybe_auto_enable_property_driven_features(&mut validated);
-        let err = maybe_enable_ict_for_catalog_managed(&mut validated).unwrap_err();
+        let err = maybe_enable_catalog_managed_dependencies(&mut validated).unwrap_err();
         assert!(
             err.to_string().contains("enableInCommitTimestamps"),
             "expected ICT conflict error, got: {err}"

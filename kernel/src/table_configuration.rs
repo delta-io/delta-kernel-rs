@@ -1820,12 +1820,13 @@ mod test {
 
     #[test]
     fn test_catalog_managed_writes() {
-        // CatalogManaged requires ICT to be supported and enabled
+        // CatalogManaged requires ICT enabled and vacuumProtocolCheck supported
         let config = create_mock_table_config(
             &[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")],
             &[
                 TableFeature::CatalogManaged,
                 TableFeature::InCommitTimestamp,
+                TableFeature::VacuumProtocolCheck,
             ],
         );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
@@ -1835,26 +1836,36 @@ mod test {
             &[
                 TableFeature::CatalogOwnedPreview,
                 TableFeature::InCommitTimestamp,
+                TableFeature::VacuumProtocolCheck,
             ],
         );
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 
-    // A catalog-managed table requires inCommitTimestamp to be enabled.
+    // A catalog-managed table requires inCommitTimestamp to be enabled and vacuumProtocolCheck
+    // to be supported.
     #[rstest]
-    #[case::catalog_managed(
-        TableFeature::CatalogManaged,
+    #[case::catalog_managed_ict(
+        &[TableFeature::CatalogManaged],
         "Feature 'catalogManaged' requires 'inCommitTimestamp' to be enabled"
     )]
-    #[case::catalog_owned_preview(
-        TableFeature::CatalogOwnedPreview,
+    #[case::catalog_owned_preview_ict(
+        &[TableFeature::CatalogOwnedPreview],
         "Feature 'catalogOwned-preview' requires 'inCommitTimestamp' to be enabled"
     )]
-    fn test_catalog_managed_requires_in_commit_timestamp(
-        #[case] feature: TableFeature,
+    #[case::catalog_managed_vacuum(
+        &[TableFeature::CatalogManaged, TableFeature::InCommitTimestamp],
+        "Feature 'catalogManaged' requires 'vacuumProtocolCheck' to be supported"
+    )]
+    #[case::catalog_owned_preview_vacuum(
+        &[TableFeature::CatalogOwnedPreview, TableFeature::InCommitTimestamp],
+        "Feature 'catalogOwned-preview' requires 'vacuumProtocolCheck' to be supported"
+    )]
+    fn test_catalog_managed_feature_requirements(
+        #[case] features: &[TableFeature],
         #[case] expected_error: &str,
     ) {
-        let config = create_mock_table_config(&[], &[feature]);
+        let config = create_mock_table_config(&[(ENABLE_IN_COMMIT_TIMESTAMPS, "true")], features);
         let result = config.ensure_operation_supported(Operation::Write);
         assert_result_error_with_message(result, expected_error);
     }
