@@ -1,19 +1,31 @@
 //! Conversion from a kernel [`Expression`](KernelExpression) to a DataFusion [`Expr`](DFExpr).
 
-use datafusion::common::{Column as DFColumn, ScalarValue as DFScalarValue};
+use std::sync::Arc;
+
+use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
 use datafusion::functions::core::expr_fn::{
     coalesce, get_field, get_field_path, named_struct, nullif,
 };
 use datafusion::functions_nested::expr_fn::make_array;
-use datafusion::logical_expr::{binary_expr, cast, lit, Case, Expr as DFExpr, Operator};
+use datafusion::logical_expr::{
+    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
+    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
     Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, MapToStructExpression,
-    UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
+    ParseJsonExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructField, StructType};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::schema::{
+    DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
+    StructType,
+};
+use delta_kernel::{DeltaResult, EngineData, Error};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -55,10 +67,7 @@ pub fn to_df_expr(
             map_to_struct_to_df_expr(map_to_struct, input_schema, output_type)
         }
 
-        // TODO: wire up via a custom JSON-parsing UDF (DataFusion core has no stock JSON parser).
-        KernelExpression::ParseJson(_) => Err(Error::unsupported(
-            "converting a ParseJson expression requires a custom JSON-parsing UDF",
-        )),
+        KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
             UnaryExpressionOp::ToJson => Err(Error::unsupported(
@@ -383,6 +392,117 @@ fn map_to_struct_to_df_expr(
     }
 
     Ok(struct_null_when_not(map.is_not_null(), named_struct(args)))
+}
+
+/// Lowers a `ParseJson` (parse a JSON-string column into a struct) to a call of the
+/// [`ParseJsonUdf`] scalar UDF, which delegates to kernel's own JSON parser. Unlike the
+/// struct-shaped arms, `ParseJson` is self-typed -- it carries its target `output_schema` -- so it
+/// takes no `output_type` and lowers its string operand untyped.
+fn parse_json_to_df_expr(
+    parse: &ParseJsonExpression,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
+    let json = to_df_expr(&parse.json_expr, input_schema, None)?;
+    let udf = ScalarUDF::new_from_impl(ParseJsonUdf::try_new(parse.output_schema.clone())?);
+    Ok(udf.call(vec![json]))
+}
+
+/// A DataFusion scalar UDF that parses a JSON-string column into a struct, delegating to kernel's
+/// [`parse_json`] so the result is value-identical to the kernel evaluator by construction. Since a
+/// [`ParseJsonExpression`] carries its own target schema, the schema is baked into the UDF instance
+/// rather than passed as an argument.
+///
+/// The UDF reproduces the coarse malformed-JSON backstop the evaluator applies around
+/// `parse_json`: on a whole-batch parse error it returns an all-null struct rather than failing.
+/// (The finer per-cell null for failure-prone leaves -- Timestamp/Date/Decimal -- already lives
+/// inside `parse_json`.)
+///
+/// Identity (`Eq`/`Hash`, required by DataFusion for common-subexpression elimination) is keyed on
+/// `return_type`, which is derived from and uniquely determined by `output_schema`. Two ParseJson
+/// UDFs with different target schemas therefore never compare equal.
+#[derive(Debug)]
+struct ParseJsonUdf {
+    output_schema: KernelSchemaRef,
+    return_type: ArrowDataType,
+    signature: Signature,
+}
+
+impl PartialEq for ParseJsonUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.return_type == other.return_type
+    }
+}
+impl Eq for ParseJsonUdf {}
+impl std::hash::Hash for ParseJsonUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.return_type.hash(state);
+    }
+}
+
+impl ParseJsonUdf {
+    fn try_new(output_schema: KernelSchemaRef) -> DeltaResult<Self> {
+        let arrow_schema: ArrowSchema = output_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(Error::generic_err)?;
+        Ok(Self {
+            return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
+            // JSON lives in a string column; accept the three arrow string layouts, mirroring
+            // kernel's `parse_json_impl` (Utf8 / LargeUtf8 / Utf8View).
+            signature: Signature::uniform(
+                1,
+                vec![
+                    ArrowDataType::Utf8,
+                    ArrowDataType::LargeUtf8,
+                    ArrowDataType::Utf8View,
+                ],
+                Volatility::Immutable,
+            ),
+            output_schema,
+        })
+    }
+}
+
+impl ScalarUDFImpl for ParseJsonUdf {
+    fn name(&self) -> &str {
+        "kernel_parse_json"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let [json] = <[_; 1]>::try_from(args.args)
+            .map_err(|_| DataFusionError::Execution("kernel_parse_json expects one arg".into()))?;
+        let num_rows = args.number_rows;
+        let json = json.into_array(num_rows)?;
+
+        // `parse_json` reads column 0 of an `EngineData`-wrapped batch; wrap the input to match.
+        let batch = RecordBatch::try_from_iter([("json", json)])?;
+        let input: Box<dyn EngineData> = Box::new(ArrowEngineData::from(batch));
+
+        let parsed = match parse_json(input, self.output_schema.clone()) {
+            Ok(data) => {
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)
+                    .map_err(to_df_err)?
+                    .into();
+                Arc::new(StructArray::from(batch)) as ArrayRef
+            }
+            // Coarse malformed-JSON backstop, matching the evaluator's ParseJson arm.
+            Err(_) => new_null_array(&self.return_type, num_rows),
+        };
+        Ok(ColumnarValue::Array(parsed))
+    }
+}
+
+/// Wraps a kernel [`Error`] as a [`DataFusionError`] for surfacing out of UDF execution.
+fn to_df_err(err: Error) -> DataFusionError {
+    DataFusionError::External(Box::new(err))
 }
 
 #[cfg(test)]
@@ -932,5 +1052,103 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(expected_message), "{err}");
+    }
+
+    // === ParseJson ===
+
+    use datafusion::arrow::array::{Array, AsArray, StringArray};
+    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::common::DFSchema;
+    use datafusion::physical_expr::create_physical_expr;
+    use datafusion::physical_expr::execution_props::ExecutionProps;
+
+    /// Input schema for JSON tests: `{ j: string }`.
+    fn json_input_schema() -> StructType {
+        StructType::try_new([StructField::nullable("j", DataType::STRING)]).unwrap()
+    }
+
+    /// Target parse schema `{ n: long, s: string }`.
+    fn parse_target() -> KernelSchemaRef {
+        Arc::new(
+            StructType::try_new([
+                StructField::nullable("n", DataType::LONG),
+                StructField::nullable("s", DataType::STRING),
+            ])
+            .unwrap(),
+        )
+    }
+
+    /// Lowers `parse_json(col("j"), schema)`, builds a physical expr over a one-column string batch
+    /// carrying `rows`, evaluates it, and returns the resulting struct column.
+    fn eval_parse_json(schema: KernelSchemaRef, rows: Vec<Option<&str>>) -> StructArray {
+        let kernel = KernelExpr::parse_json(column_expr!("j"), schema);
+        // Self-typed: no output_type is threaded in, yet lowering still succeeds.
+        let logical = to_df_expr(&kernel, &json_input_schema(), None).unwrap();
+
+        let arrow_schema: ArrowSchema = (&json_input_schema()).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(rows)) as ArrayRef],
+        )
+        .unwrap();
+
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap()
+            .as_struct()
+            .clone()
+    }
+
+    #[test]
+    fn parse_json_lowers_to_udf_call() {
+        let kernel = KernelExpr::parse_json(column_expr!("j"), parse_target());
+        assert_eq!(
+            to_df_expr(&kernel, &json_input_schema(), None)
+                .unwrap()
+                .to_string(),
+            "kernel_parse_json(j)"
+        );
+    }
+
+    #[test]
+    fn parse_json_parses_fields_into_typed_struct() {
+        let out = eval_parse_json(
+            parse_target(),
+            vec![Some(r#"{"n": 1, "s": "a"}"#), Some(r#"{"n": 2, "s": "b"}"#)],
+        );
+        let n = out.column(0).as_primitive::<Int64Type>();
+        let s = out.column(1).as_string::<i32>();
+        assert_eq!(n.values(), &[1, 2]);
+        assert_eq!((s.value(0), s.value(1)), ("a", "b"));
+    }
+
+    /// A null input string decodes as `{}` (kernel's contract): the row stays present with all its
+    /// fields null, rather than nulling the whole struct row.
+    #[test]
+    fn parse_json_null_input_yields_present_row_with_null_fields() {
+        let out = eval_parse_json(parse_target(), vec![None]);
+        assert_eq!(out.len(), 1);
+        assert!(out.column(0).is_null(0) && out.column(1).is_null(0));
+    }
+
+    /// A field absent from the JSON object parses to null.
+    #[test]
+    fn parse_json_missing_field_is_null() {
+        let out = eval_parse_json(parse_target(), vec![Some(r#"{"s": "only"}"#)]);
+        assert!(out.column(0).is_null(0));
+        assert_eq!(out.column(1).as_string::<i32>().value(0), "only");
+    }
+
+    /// Genuinely malformed JSON hits the coarse backstop: the whole struct comes back all-null
+    /// (every field of every row null) rather than erroring the batch.
+    #[test]
+    fn parse_json_malformed_yields_all_null_struct() {
+        let out = eval_parse_json(parse_target(), vec![Some("{not json"), Some(r#"{"n": 5}"#)]);
+        assert_eq!(out.len(), 2);
+        assert!((0..2).all(|i| out.column(0).is_null(i) && out.column(1).is_null(i)));
     }
 }
