@@ -1736,7 +1736,6 @@ mod tests {
 
     #[cfg(feature = "delta-kernel-unity-catalog")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg_attr(miri, ignore)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel_ffi::{
             get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
@@ -1776,12 +1775,9 @@ mod tests {
             StructField::nullable("string", DataType::STRING),
         ]));
 
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-
         // Create a catalog-managed table so UCCommitter (a catalog committer) is allowed.
         let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup("test_uc_table", Some(&tmp_dir_local_url));
+            test_utils::engine_store_setup("test_uc_table", None);
         let table_url = test_utils::create_table(
             store.clone(),
             table_location,
@@ -1794,9 +1790,8 @@ mod tests {
         .await?;
 
         {
-            let table_path = table_url.to_file_path().unwrap();
-            let table_path_str = table_path.to_str().unwrap();
-            let engine = get_default_engine(table_path_str);
+            let table_path_str = table_url.as_str();
+            let engine = engine_handle_for_store(Arc::clone(&store));
 
             let snapshot = unsafe {
                 let mut ptr = ok_or_panic(get_snapshot_builder(
@@ -1826,7 +1821,11 @@ mod tests {
             };
 
             let txn = ok_or_panic(unsafe {
-                transaction_with_committer(snapshot, engine.shallow_copy(), uc_committer)
+                transaction_with_committer(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                    uc_committer,
+                )
             });
             unsafe { set_data_change(txn.shallow_copy(), false) };
 
@@ -1865,12 +1864,14 @@ mod tests {
                     .as_ref()
                     .add_files_schema()
             };
-            let file_info = write_parquet_file(
-                table_path_str,
+            let file_info = put_parquet_file(
+                &store,
+                &table_url,
                 "uc_test_file.parquet",
                 &batch,
                 parquet_schema.as_ref().try_into_arrow()?,
-            )?;
+            )
+            .await?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
@@ -1960,6 +1961,7 @@ mod tests {
             unsafe { free_snapshot(republished_snapshot) };
             unsafe { free_snapshot(published_snapshot) };
             unsafe { free_snapshot(post_commit_snapshot) };
+            unsafe { free_snapshot(snapshot) };
             unsafe { free_committed_transaction(committed) };
 
             let context = recover_test_context(context).unwrap();
