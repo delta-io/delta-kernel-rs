@@ -1581,7 +1581,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_system_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_test_dir = tempdir()?;
@@ -1620,7 +1619,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_duplicate_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_test_dir = tempdir()?;
@@ -1668,7 +1666,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_rejected_without_feature(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_test_dir = tempdir()?;
@@ -2541,7 +2538,6 @@ mod tests {
     #[case::no_column_mapping(None)]
     #[case::name_mode(Some("name"))]
     #[case::id_mode(Some("id"))]
-    #[cfg_attr(miri, ignore)]
     fn test_write_context_accessors(#[case] cm_mode: Option<&str>) {
         let tmp_dir = tempdir().unwrap();
         let (engine, txn, write_context) = cm_table_write_context(&tmp_dir, cm_mode);
@@ -2658,7 +2654,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_build_with_empty_schema_succeeds(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_dir = tempdir()?;
