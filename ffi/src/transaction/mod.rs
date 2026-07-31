@@ -937,6 +937,36 @@ mod tests {
         create_file_metadata(file_path, file_size_bytes, num_rows, metadata_schema)
     }
 
+    /// Write `batch` as parquet into `store` at `file_path` and return its Add-action metadata.
+    ///
+    /// The store-based counterpart to [`write_parquet_file`], for tests that must avoid
+    /// `std::fs` so they can run under Miri.
+    async fn put_parquet_file(
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
+        file_path: &str,
+        batch: &RecordBatch,
+        metadata_schema: ArrowSchema,
+    ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))?;
+        writer.write(batch)?;
+        let res = writer.close()?;
+
+        let file_size_bytes = buf.len() as u64;
+        let url = table_url.join(file_path)?;
+        let path = Path::from_url_path(url.path())?;
+        store.put(&path, buf.into()).await?;
+
+        create_file_metadata(
+            file_path,
+            file_size_bytes,
+            res.file_metadata().num_rows(),
+            metadata_schema,
+        )
+    }
+
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
@@ -2408,11 +2438,11 @@ mod tests {
     /// just-committed version. Also verifies that calling the accessor a second time yields an
     /// independent handle (Arc clone).
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_post_commit_snapshot_existing_table() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_post_commit_existing", None);
         // create_table_with_one_file commits v0 (create) and v1 (file add).
-        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
+        let (table_path, engine) = create_table_with_one_file(&store, &table_url).await?;
 
         // Blind no-op commit on top of v1 -> v2.
         let txn = ok_or_panic(unsafe {
@@ -2736,16 +2766,17 @@ mod tests {
 
     /// Helper: create a table, write one parquet file, and return (table_path, engine_handle).
     /// The caller is responsible for freeing the engine handle.
-    fn create_table_with_one_file(
-        tmp_dir: &tempfile::TempDir,
+    async fn create_table_with_one_file(
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
     ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
-        let table_path = tmp_dir.path().to_str().unwrap();
+        let table_path = table_url.as_str();
         let fields = vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ];
 
-        let engine = get_default_engine(table_path);
+        let engine = engine_handle_for_store(Arc::clone(store));
 
         // Create the table
         let engine_info = "test-engine/1.0";
@@ -2788,12 +2819,14 @@ mod tests {
         });
 
         let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
-        let file_info = write_parquet_file(
-            table_path,
+        let file_info = put_parquet_file(
+            store,
+            table_url,
             "file1.parquet",
             &batch,
             parquet_schema.as_ref().try_into_arrow()?,
-        )?;
+        )
+        .await?;
         let file_info_engine_data = ok_or_panic(unsafe {
             get_engine_data(
                 file_info.array,
@@ -2839,8 +2872,9 @@ mod tests {
     /// return the components needed for remove_files tests. Caller must free the engine handle
     /// (and txn if not committed).
     #[allow(clippy::type_complexity)]
-    fn setup_remove_files_test(
-        tmp_dir: &tempfile::TempDir,
+    async fn setup_remove_files_test(
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
     ) -> Result<
         (
             Box<dyn delta_kernel::EngineData>,
@@ -2852,7 +2886,7 @@ mod tests {
         ),
         Box<dyn std::error::Error>,
     > {
-        let (table_path, engine) = create_table_with_one_file(tmp_dir)?;
+        let (table_path, engine) = create_table_with_one_file(store, table_url).await?;
         let table_path_str = table_path.as_str();
 
         let kernel_engine = unsafe { engine.as_ref() }.engine();
@@ -2886,11 +2920,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_remove_files_with_null_sv_commits_and_removes_all(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (data, sv, txn, engine, kernel_engine, table_path) = setup_remove_files_test(&tmp_dir)?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_remove_files", None);
+        let (data, sv, txn, engine, kernel_engine, table_path) =
+            setup_remove_files_test(&store, &table_url).await?;
         let data_handle: Handle<ExclusiveEngineData> = data.into();
 
         // Pass the original SV as u8 values
@@ -3106,16 +3141,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts(
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
         // a non-null selection vector pointer with non-zero length. The null-SV test always
         // passes a null pointer because scan_metadata for a single-file table returns an
         // empty selection vector.
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_remove_files_sv", None);
         let (data, _sv, txn, engine, _kernel_engine, _table_path) =
-            setup_remove_files_test(&tmp_dir)?;
+            setup_remove_files_test(&store, &table_url).await?;
         let num_rows = data.len();
         assert!(num_rows > 0);
         let data_handle: Handle<ExclusiveEngineData> = data.into();
