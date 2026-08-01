@@ -2,7 +2,6 @@
 //! the metadata needed to generate the Change Data Feed.
 
 use std::collections::{HashMap, HashSet};
-use std::slice;
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
@@ -18,13 +17,18 @@ use crate::expressions::{column_name, ColumnName};
 use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
+use crate::schema::{
+    schema_ref, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef, StructType,
+};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
+use crate::{
+    DeltaResult, Engine, EngineData, Error, FileDataReadResultIterator, FileMeta, PredicateRef,
+    RowVisitor,
+};
 
 #[cfg(test)]
 mod tests;
@@ -95,21 +99,129 @@ pub(crate) fn table_changes_action_iter_with_mode(
         .map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
+    let commit_files = commit_files.into_iter().collect_vec();
+
+    // Submit all commits in each phase together so engines can overlap object-store reads. CDF
+    // validation still processes the regrouped batches in ascending commit order, and prepare
+    // batches remain unfiltered so deletion-vector resolution sees every add/remove pair.
+    let prepare_groups = read_commits_grouped(
+        engine.as_ref(),
+        &commit_files,
+        &PreparePhaseVisitor::schema(),
+        None,
+    )?;
+    let scan_groups = read_commits_grouped(
+        engine.as_ref(),
+        &commit_files,
+        &FileActionSelectionVisitor::schema(),
+        None,
+    )?;
+
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(
-                engine.as_ref(),
-                &mut current_configuration,
-                commit_file,
-                &table_schema,
-                mode,
-            )?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
-        }) //Iterator-Result-Iterator-Result
+        .zip(prepare_groups)
+        .zip(scan_groups)
+        .map(
+            move |((commit_file, prepare_actions), scan_actions)| -> DeltaResult<_> {
+                let scanner = LogReplayScanner::try_new(
+                    &mut current_configuration,
+                    commit_file,
+                    prepare_actions,
+                    &table_schema,
+                    mode,
+                )?;
+                scanner.into_scan_batches(engine.clone(), scan_actions, filter.clone())
+            },
+        ) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
         .map(|x| x?); // Iterator-Result
     Ok(result)
+}
+
+/// Reads the requested commits together and returns their batches grouped by commit.
+fn read_commits_grouped(
+    engine: &dyn Engine,
+    commit_files: &[ParsedLogPath],
+    schema: &StructType,
+    predicate: Option<PredicateRef>,
+) -> DeltaResult<Vec<Vec<Box<dyn EngineData>>>> {
+    let locations = commit_files
+        .iter()
+        .map(|commit_file| commit_file.location.clone())
+        .collect_vec();
+    let schema_with_file_path =
+        Arc::new(schema.add_metadata_column(FILE_PATH_COLUMN_NAME, MetadataColumnSpec::FilePath)?);
+    let batches =
+        engine
+            .json_handler()
+            .read_json_files(&locations, schema_with_file_path, predicate)?;
+
+    group_commit_batches(&locations, batches)
+}
+
+fn group_commit_batches(
+    locations: &[FileMeta],
+    batches: FileDataReadResultIterator,
+) -> DeltaResult<Vec<Vec<Box<dyn EngineData>>>> {
+    let file_indices: HashMap<_, _> = locations
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (file.location.to_string(), index))
+        .collect();
+    let mut groups: Vec<Vec<Box<dyn EngineData>>> = locations.iter().map(|_| Vec::new()).collect();
+    for batch in batches {
+        let batch = batch?;
+        if batch.is_empty() {
+            continue;
+        }
+
+        let mut visitor = FilePathVisitor::default();
+        visitor.visit_rows_of(batch.as_ref())?;
+        let path = visitor.file_path.ok_or_else(|| {
+            Error::internal_error("table_changes received a JSON batch without a file path")
+        })?;
+        let group_index = file_indices.get(&path).ok_or_else(|| {
+            Error::internal_error(format!(
+                "table_changes received a JSON batch for unrequested commit file {path}"
+            ))
+        })?;
+        groups[*group_index].push(batch);
+    }
+    Ok(groups)
+}
+
+const FILE_PATH_COLUMN_NAME: &str = "_file";
+
+/// Reads the file path that identifies a JSON batch's source commit.
+///
+/// The JSON handler does not merge file boundaries, so the first row identifies the batch.
+#[derive(Default)]
+struct FilePathVisitor {
+    file_path: Option<String>,
+}
+
+impl RowVisitor for FilePathVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| (vec![column_name!("_file")], vec![DataType::STRING]).into());
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::InternalError(format!(
+                "Wrong number of FilePathVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        if row_count > 0 {
+            self.file_path = getters[0]
+                .get_str(0, FILE_PATH_COLUMN_NAME)?
+                .map(ToString::to_string);
+        }
+        Ok(())
+    }
 }
 
 /// Processes a single commit file from the log to generate an iterator of
@@ -151,9 +263,8 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///     - Otherwise, select `add` and `remove` actions. Note that only `remove` actions that do not
 ///       share a path with an `add` action are selected.
 ///
-/// Note: As a consequence of the two phases, LogReplayScanner will iterate over each action in the
-/// commit twice. It also may use an unbounded amount of memory, proportional to the number of
-/// `add` + `remove` actions in the _single_ commit.
+/// Both phases materialize their JSON batches across the requested version range before commit
+/// processing, so peak memory grows with the actions in that range.
 struct LogReplayScanner {
     // True if a `cdc` action was found after running [`LogReplayScanner::try_new`]
     has_cdc_action: bool,
@@ -177,34 +288,14 @@ impl LogReplayScanner {
     ///
     /// For more details, see the documentation for [`LogReplayScanner`].
     fn try_new(
-        engine: &dyn Engine,
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
+        prepare_phase_actions: Vec<Box<dyn EngineData>>,
         table_schema: &SchemaRef,
         mode: CdfMode,
     ) -> DeltaResult<Self> {
-        let visitor_schema = PreparePhaseVisitor::schema();
-
-        // Note: We do not perform data skipping yet because we need to visit all add and
-        // remove actions for deletion vector resolution to be correct.
-        //
-        // Consider a scenario with a pair of add/remove actions with the same path. The add
-        // action has file statistics, while the remove action does not (stats is optional for
-        // remove). In this scenario we might skip the add action, while the remove action remains.
-        // As a result, we would read the file path for the remove action, which is unnecessary
-        // because all of the rows will be filtered by the predicate. Instead, we wait until
-        // deletion vectors are resolved so that we can skip both actions in the pair.
-        let mut action_iter = engine
-            .json_handler()
-            .read_json_files(
-                slice::from_ref(&commit_file.location),
-                visitor_schema,
-                None, // not safe to apply data skipping yet
-            )?
-            .peekable();
-
         let mut in_commit_timestamp_opt = None;
-        if let Some(Ok(actions)) = action_iter.peek() {
+        if let Some(actions) = prepare_phase_actions.first() {
             let mut visitor = InCommitTimestampVisitor::default();
             visitor.visit_rows_of(actions.as_ref())?;
             in_commit_timestamp_opt = visitor.in_commit_timestamp;
@@ -214,9 +305,7 @@ impl LogReplayScanner {
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
 
-        for actions in action_iter {
-            let actions = actions?;
-
+        for actions in prepare_phase_actions {
             let mut visitor = PreparePhaseVisitor {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
@@ -331,6 +420,7 @@ impl LogReplayScanner {
     fn into_scan_batches(
         self,
         engine: Arc<dyn Engine>,
+        scan_phase_actions: Vec<Box<dyn EngineData>>,
         filter: Option<Arc<DataSkippingFilter>>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
         let Self {
@@ -342,12 +432,7 @@ impl LogReplayScanner {
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
 
-        let schema = FileActionSelectionVisitor::schema();
-        let action_iter = engine.json_handler().read_json_files(
-            slice::from_ref(&commit_file.location),
-            schema,
-            None,
-        )?;
+        let action_iter = scan_phase_actions.into_iter();
         let commit_version = commit_file
             .version
             .try_into()
@@ -359,8 +444,6 @@ impl LogReplayScanner {
         )?;
 
         let result = action_iter.map(move |actions| -> DeltaResult<_> {
-            let actions = actions?;
-
             // Apply data skipping to get back a selection vector for actions that passed skipping.
             // We start our selection vector based on what was filtered. We will add to this vector
             // below if a file has been removed. Note: None implies all files passed data skipping.

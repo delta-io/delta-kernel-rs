@@ -7,17 +7,23 @@ use rstest::rstest;
 use test_utils::LoggingTest;
 
 use super::{
-    table_changes_action_iter, table_changes_action_iter_with_mode, TableChangesScanMetadata,
+    group_commit_batches, read_commits_grouped, table_changes_action_iter,
+    table_changes_action_iter_with_mode, LogReplayScanner, PreparePhaseVisitor,
+    TableChangesScanMetadata,
 };
 use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+use crate::arrow::array::{RecordBatch, StringArray};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
 use crate::log_segment::LogSegment;
+use crate::metrics::{MeteredDeltaEngine, MetricEvent};
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::table_changes::log_replay::LogReplayScanner;
+use crate::table_changes::scan_file::scan_metadata_to_scan_file;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
 };
@@ -25,8 +31,11 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::{ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED};
-use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
-use crate::{DeltaResult, Engine, Error, Predicate, Version};
+use crate::utils::test_utils::{
+    assert_result_error_with_message, install_thread_local_metrics_reporter, Action,
+    CapturingReporter, LocalMockTable,
+};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
     Arc::new(StructType::new_unchecked([
@@ -170,6 +179,166 @@ fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>
         .flatten_ok()
         .try_collect()
         .unwrap()
+}
+
+fn file_path_batch(path: &str, row_count: usize) -> Box<dyn EngineData> {
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "_file",
+        ArrowDataType::Utf8,
+        false,
+    )]));
+    let paths = Arc::new(StringArray::from(vec![path; row_count]));
+    let batch = RecordBatch::try_new(schema, vec![paths]).unwrap();
+    Box::new(ArrowEngineData::new(batch))
+}
+
+fn nullable_file_path_batch(path: Option<&str>) -> Box<dyn EngineData> {
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "_file",
+        ArrowDataType::Utf8,
+        true,
+    )]));
+    let paths = Arc::new(StringArray::from(vec![path]));
+    let batch = RecordBatch::try_new(schema, vec![paths]).unwrap();
+    Box::new(ArrowEngineData::new(batch))
+}
+
+fn prepare_actions_for_commit(
+    engine: &dyn Engine,
+    commit: &ParsedLogPath,
+) -> Vec<Box<dyn EngineData>> {
+    read_commits_grouped(
+        engine,
+        std::slice::from_ref(commit),
+        &PreparePhaseVisitor::schema(),
+        None,
+    )
+    .unwrap()
+    .pop()
+    .unwrap()
+}
+
+#[test]
+fn groups_multiple_batches_without_shifting_over_empty_commits() {
+    let locations = vec![
+        FileMeta::new(url::Url::parse("memory:///0.json").unwrap(), 0, 0),
+        FileMeta::new(url::Url::parse("memory:///1.json").unwrap(), 0, 0),
+        FileMeta::new(url::Url::parse("memory:///2.json").unwrap(), 0, 0),
+    ];
+    let batches = vec![
+        Ok::<_, Error>(file_path_batch("memory:///0.json", 1)),
+        Ok(file_path_batch("memory:///0.json", 1)),
+        Ok(file_path_batch("memory:///1.json", 0)),
+        Ok(file_path_batch("memory:///2.json", 1)),
+    ];
+
+    let groups = group_commit_batches(&locations, Box::new(batches.into_iter())).unwrap();
+
+    assert_eq!(groups.iter().map(Vec::len).collect_vec(), vec![2, 0, 1]);
+}
+
+#[rstest]
+#[case(None, "without a file path")]
+#[case(Some("memory:///unexpected.json"), "unrequested commit file")]
+fn rejects_batch_without_requested_file_path(
+    #[case] batch_path: Option<&str>,
+    #[case] expected_error: &str,
+) {
+    let locations = vec![FileMeta::new(
+        url::Url::parse("memory:///requested.json").unwrap(),
+        0,
+        0,
+    )];
+    let batches = vec![Ok::<_, Error>(nullable_file_path_batch(batch_path))];
+
+    let result = group_commit_batches(&locations, Box::new(batches.into_iter()));
+
+    assert_result_error_with_message(result, expected_error);
+}
+
+#[tokio::test]
+async fn batches_each_json_phase_across_the_commit_range() {
+    let reporter = Arc::new(CapturingReporter::default());
+    let _guard = install_thread_local_metrics_reporter(reporter.clone());
+    let engine: Arc<dyn Engine> = Arc::new(MeteredDeltaEngine::new(Arc::new(SyncEngine::new())));
+    let mut mock_table = LocalMockTable::new();
+    for version in 0..3 {
+        mock_table
+            .commit([Action::Add(Add {
+                path: format!("file_{version}.parquet"),
+                data_change: true,
+                ..Default::default()
+            })])
+            .await;
+    }
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let scan_metadata =
+        table_changes_action_iter(engine, &table_config, commits, get_schema(), None).unwrap();
+    let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
+        .map_ok(|scan_file| (scan_file.commit_version, scan_file.path))
+        .try_collect()
+        .unwrap();
+
+    assert_eq!(
+        scan_files,
+        vec![
+            (0, "file_0.parquet".to_string()),
+            (1, "file_1.parquet".to_string()),
+            (2, "file_2.parquet".to_string()),
+        ]
+    );
+    let json_read_file_counts = reporter
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            MetricEvent::JsonReadCompleted(event) => Some(event.num_files),
+            _ => None,
+        })
+        .collect_vec();
+    assert_eq!(json_read_file_counts, vec![3, 3]);
+}
+
+#[tokio::test]
+async fn empty_commit_does_not_shift_following_actions() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([Action::Add(Add {
+            path: "file_0.parquet".to_string(),
+            data_change: true,
+            ..Default::default()
+        })])
+        .await;
+    mock_table.commit(std::iter::empty()).await;
+    mock_table
+        .commit([Action::Add(Add {
+            path: "file_2.parquet".to_string(),
+            data_change: true,
+            ..Default::default()
+        })])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).unwrap();
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let scan_metadata =
+        table_changes_action_iter(engine, &table_config, commits, get_schema(), None).unwrap();
+    let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
+        .map_ok(|scan_file| (scan_file.commit_version, scan_file.path))
+        .try_collect()
+        .unwrap();
+
+    assert_eq!(
+        scan_files,
+        vec![
+            (0, "file_0.parquet".to_string()),
+            (2, "file_2.parquet".to_string()),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1218,10 +1387,11 @@ async fn file_meta_timestamp() {
     let file_meta_ts = commit.location.last_modified;
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit,
+        prepare_actions,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1506,10 +1676,11 @@ async fn test_timestamp_with_ict_enabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit,
+        prepare_actions,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1557,10 +1728,11 @@ async fn test_timestamp_with_ict_disabled() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
     let scanner = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit.clone(),
+        prepare_actions,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     )
@@ -1615,10 +1787,11 @@ async fn test_timestamp_with_commit_info_not_first() {
     let commit = commits.next().unwrap();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let mut table_config = get_default_table_config(&table_root_url);
+    let prepare_actions = prepare_actions_for_commit(engine.as_ref(), &commit);
     let result = LogReplayScanner::try_new(
-        engine.as_ref(),
         &mut table_config,
         commit,
+        prepare_actions,
         &get_schema(),
         CdfMode::ChangeDataFeed,
     );
