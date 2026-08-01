@@ -33,7 +33,8 @@ impl StagedDataValidator {
     }
 }
 
-/// Validates required fields for every staged add-file row.
+/// Validates required-field existence and that each row's `partitionValues` keys match the table's
+/// physical partition columns.
 ///
 /// Required fields: `path`, `partitionValues`, `size`, `modificationTime`, and `dataChange`.
 /// Optional fields: `stats`, `tags`, `deletionVector`, `baseRowId`,
