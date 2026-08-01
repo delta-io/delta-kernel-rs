@@ -148,21 +148,33 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
 #[internal_api]
 pub(crate) trait FoldWithOption: Sized {
     /// Applies an optional fold operation `f` to `self` if `opt` is [`Some`]; otherwise returns
-    /// `self`.
+    /// `self` unchanged.
     ///
     /// Similar to `opt.iter().fold(self, |acc, value| f(acc, value))`, but accepting `FnOnce`
     /// instead of requiring `FnMut`, and with the base value as receiver instead of the option.
-    fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self;
-}
-
-impl<T: Sized> FoldWithOption for T {
     fn fold_with<U>(self, opt: Option<U>, f: impl FnOnce(Self, U) -> Self) -> Self {
         match opt {
             Some(value) => f(self, value),
             None => self,
         }
     }
+
+    /// Fallible [`fold_with`](Self::fold_with): applies `Result`-returning `f` to `self` if `opt`
+    /// is [`Some`], otherwise returns `self` unchanged (wrapped in `Ok`).
+    fn try_fold_with<U, E>(
+        self,
+        opt: Option<U>,
+        f: impl FnOnce(Self, U) -> Result<Self, E>,
+    ) -> Result<Self, E> {
+        match opt {
+            Some(value) => f(self, value),
+            None => Ok(self),
+        }
+    }
 }
+
+// Blanket impl -- every type can fold_with an Option.
+impl<T: Sized> FoldWithOption for T {}
 
 /// Extension trait for adding completion callbacks to iterators.
 pub(crate) trait IteratorExt: Iterator + Sized {

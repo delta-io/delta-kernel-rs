@@ -19,15 +19,12 @@ use crate::{DeltaResult, Error, FileMeta};
 // Operator: enumerates every operator kind
 // ============================================================================
 
-/// Plan node operators.
+/// Plan node operators, grouped below by input arity. Each variant wraps a payload struct
+/// documenting that operator's semantics, invariants, and output shape.
 ///
-/// Output schemas are stored on the payload struct for operators whose caller
-/// declares them (`ScanParquet`, `ScanJson`, `Values`, `Load`, `Project`,
-/// `Aggregate`); the remaining operators pass an input's schema through
-/// unchanged:
-/// - `Filter` from its input.
-/// - `UnionAll` from its inputs' common schema.
-/// - `SemiJoin` from the probe input.
+/// An operator that reshapes its rows (a source, projection, aggregation, or file load) carries a
+/// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
+/// they inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display)]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
@@ -556,8 +553,8 @@ impl Aggregate {
         Self::group_by(input_schema, std::iter::empty::<ColumnName>())
     }
 
-    /// Starts building an [`Aggregate`] over `input_schema`, grouped by `keys`. Add aggregators
-    /// directly with [`aggregate`](AggregateBuilder::aggregate) or using named helpers
+    /// Starts building an [`Aggregate`] over `input_schema`, grouped by `grouping_keys`. Add
+    /// aggregators directly with [`aggregate`](AggregateBuilder::aggregate) or using named helpers
     /// (e.g. [`max`](AggregateBuilder::max)), and finalize the aggregate by calling
     /// [`build`](AggregateBuilder::build). Grouping keys are emitted first in the output schema,
     /// followed by aggregators in insertion order.
@@ -639,8 +636,21 @@ impl Agg {
     /// (no rows)        ->  NULL
     /// ```
     ///
-    /// Equivalent to SQL `max_by(value, key) FILTER (WHERE value IS NOT NULL)`: `max_by` already
-    /// ignores NULL keys, and the filter additionally drops NULL values.
+    /// A native `max_by` ignores NULL keys but keeps NULL values, so it needs help to drop the
+    /// latter. Both of the first two forms below do that, and are equivalent:
+    ///
+    /// ```sql
+    /// -- CORRECT: the filter drops NULL-value rows before aggregating
+    /// max_by(value, key) FILTER (WHERE value IS NOT NULL)
+    ///
+    /// -- CORRECT: nulls the key on NULL-value rows, which max_by then ignores anyway. Use this
+    /// -- where FILTER is unavailable, such as a DataFrame API with no filtered-aggregate form.
+    /// max_by(value, CASE WHEN value IS NOT NULL THEN key END)
+    ///
+    /// -- WRONG: keeps NULL values, so it returns NULL whenever the greatest-key row has one
+    /// -- instead of the next-greatest row that does not
+    /// max_by(value, key)
+    /// ```
     ///
     /// In systems without `max_by`, it can also be expressed using window functions:
     ///

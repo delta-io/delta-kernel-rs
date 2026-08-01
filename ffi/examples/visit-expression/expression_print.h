@@ -184,6 +184,12 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         case Date:
           printf("Date(%d)\n", lit->value.integer_data);
           break;
+        case IntervalYearMonth:
+          printf("IntervalYearMonth(%d)\n", lit->value.integer_data);
+          break;
+        case IntervalDayTime:
+          printf("IntervalDayTime(%lld)\n", (long long)lit->value.long_data);
+          break;
         case Binary: {
           printf("Binary(");
           for (size_t i = 0; i < lit->value.binary.len; i++) {
@@ -205,12 +211,14 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           static const char* null_type_names[] = {
             "Boolean", "Byte", "Short", "Integer", "Long", "Float",
             "Double", "String", "Binary", "Date", "Timestamp", "TimestampNtz",
+            "Decimal", "IntervalYearMonth", "IntervalDayTime",
           };
+          const size_t null_type_count = sizeof(null_type_names) / sizeof(null_type_names[0]);
           struct NullTypeInfo* nt = &lit->value.null_type;
-          if (nt->type_tag < 12) { // 12 == Decimal (has special precision/scale handling)
-            printf("Null(%s)\n", null_type_names[nt->type_tag]);
-          } else if (nt->type_tag == 12) {
+          if (nt->type_tag == 12) {
             printf("Null(Decimal(%d,%d))\n", nt->precision, nt->scale);
+          } else if (nt->type_tag < null_type_count) {
+            printf("Null(%s)\n", null_type_names[nt->type_tag]);
           } else {
             printf("Null(tag=%d)\n", nt->type_tag);
           }

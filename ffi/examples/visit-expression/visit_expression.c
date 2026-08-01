@@ -102,8 +102,8 @@ int main() {
       .description = 
         "This test validates expressions/predicates with full support.\n"
         "Supported types: primitives (int, long, float, double, bool, "
-        "string),\n  temporal (date, timestamp, timestamp_ntz), binary, "
-        "decimal, null,\n  binary operations (+, -, *, /), struct "
+        "string),\n  temporal (date, timestamp, timestamp_ntz), intervals, "
+        "binary, decimal, null,\n  binary operations (+, -, *, /), struct "
         "expressions, predicates (eq, ne, lt, le,\n  gt, ge, distinct, "
         "is_null, is_not_null, not, and, or)"
     }

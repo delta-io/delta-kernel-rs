@@ -34,7 +34,7 @@ use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
-    PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
+    PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
-    IntoEngineData, RowVisitor, Version,
+    IntoEngineData, Predicate, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -1551,14 +1551,23 @@ fn build_remove_struct_patch(
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
 ) -> DeltaResult<ExpressionStructPatch> {
+    // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
+    // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
+    let extended_file_metadata = Predicate::and_from([
+        col!(SIZE_NAME).is_not_null(),
+        col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
+    ]);
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
         .insert_after("path", lit(commit_timestamp))
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .insert_after("path", lit(true))
-        .insert_after("path", col!(FILE_CONSTANT_VALUES_NAME, "partitionValues"));
+        .insert_after("path", Expression::from(extended_file_metadata))
+        .insert_after(
+            "path",
+            col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
+        );
 
     if coalesce_stats_with_parsed {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
@@ -2016,6 +2025,30 @@ mod tests {
             schema.field("stats").unwrap().data_type(),
             &DataType::STRING
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_action_projection_sets_extended_metadata() -> DeltaResult<()> {
+        let patch = build_remove_struct_patch(
+            0,     /* commit_timestamp */
+            true,  /* data_change */
+            &[],   /* columns_to_drop */
+            false, /* coalesce_stats_with_parsed */
+        )?;
+        let path_patch = patch
+            .field_patches
+            .get("path")
+            .expect("path should have inserted fields");
+        let extended_file_metadata = path_patch
+            .insertions
+            .get(2)
+            .expect("extendedFileMetadata should follow deletionTimestamp and dataChange");
+        let expected = Expression::from_pred(Predicate::and_from([
+            col!(SIZE_NAME).is_not_null(),
+            col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
+        ]));
+        assert_eq!(extended_file_metadata.as_ref(), &expected);
         Ok(())
     }
 

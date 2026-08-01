@@ -842,6 +842,30 @@ impl LogSegment {
         Ok(Some((file_type, Self::version_tagged_scan_files(parts)?)))
     }
 
+    /// Returns sidecars from the applicable checkpoint hint, tagged with checkpoint version.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn checkpoint_hint_version_tagged_sidecar_scan_files(
+        &self,
+    ) -> DeltaResult<Option<Vec<ScanFile>>> {
+        let Some(sidecars) = self.checkpoint_hint_sidecars() else {
+            return Ok(None);
+        };
+        let version = self.checkpoint_version.ok_or_else(|| {
+            Error::generic("Checkpoint hint sidecars require a selected checkpoint version")
+        })?;
+        let version = crate::version_as_i64(version)?;
+        sidecars
+            .iter()
+            .map(|sidecar| {
+                Ok(ScanFile {
+                    meta: sidecar.to_filemeta(&self.log_root)?,
+                    file_constants: vec![Scalar::Long(version)],
+                })
+            })
+            .collect::<DeltaResult<Vec<_>>>()
+            .map(Some)
+    }
+
     /// Determines the file actions schema and extracts sidecar file references for checkpoints.
     ///
     /// This function analyzes the checkpoint to determine:
