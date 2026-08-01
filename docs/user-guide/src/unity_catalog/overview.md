@@ -209,7 +209,7 @@ The `unity-catalog-delta-client-api` crate has one feature flag:
 
 Some catalogs allowlist requests by `User-Agent` and reject callers they don't
 recognize. The client always identifies itself as
-`Unity-Catalog-Delta-Client-Default/<version>`. Use `with_additional_user_agent`
+`Unity-Catalog-Delta-Default-Rust-Client/<version>`. Use `with_additional_user_agent`
 to add the other versions relevant to your setup. Providing them is voluntary,
 and which ones apply depends on the caller.
 
@@ -217,7 +217,7 @@ Versions worth including, when they apply to your setup:
 
 - **compute engine**: the external query system, if any (e.g. Spark, Flink).
 - **connector**: your code integrating an engine with Delta and UC.
-- **client**: `Unity-Catalog-Delta-Client-Default`, added for you.
+- **client**: `Unity-Catalog-Delta-Default-Rust-Client`, added for you.
 - **kernel**: `Delta-Kernel-Rust`, if your connector uses Kernel.
 
 ```rust,ignore
@@ -225,10 +225,10 @@ let config = ClientConfig::build(&endpoint, &token)
     .with_additional_user_agent([
         ("MyEngine", "1.0.0"),
         ("MyConnector", "1.0.0"),
-        ("Delta-Kernel-Rust", "0.14.0"),
+        ("Delta-Kernel-Rust", "0.26.0"),
     ])
     .build()?;
-// User-Agent: Unity-Catalog-Delta-Client-Default/<v> MyEngine/1.0.0 MyConnector/1.0.0 Delta-Kernel-Rust/0.14.0
+// User-Agent: Unity-Catalog-Delta-Default-Rust-Client/<v> MyEngine/1.0.0 MyConnector/1.0.0 Delta-Kernel-Rust/0.26.0
 ```
 
 ## Client configuration and retries
