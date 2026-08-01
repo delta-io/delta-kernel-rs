@@ -75,6 +75,14 @@ where
     Err(Error::MaxRetriesExceeded)
 }
 
+pub async fn execute_without_retry<F, Fut>(f: F) -> Result<Response>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<Response, reqwest::Error>>,
+{
+    f().await.map_err(Error::from)
+}
+
 /// Handle HTTP response and deserialize.
 pub async fn handle_response<T>(response: Response) -> Result<T>
 where

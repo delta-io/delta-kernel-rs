@@ -4854,6 +4854,7 @@ dependencies = [
 name = "unity-catalog-delta-rest-client"
 version = "0.26.0"
 dependencies = [
+ "percent-encoding",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
