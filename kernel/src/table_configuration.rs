@@ -108,6 +108,8 @@ pub(crate) struct TableConfiguration {
     protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
     logical_schema: SchemaRef,
+    /// Whether any field in the logical schema declares a column default.
+    has_column_with_default: bool,
     /// The subset of the logical schema that remains after excluding partition columns.
     logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
@@ -203,8 +205,9 @@ impl TableConfiguration {
             Arc::new(StructType::new_unchecked(fields))
         };
 
-        let table_config = Self {
+        let mut table_config = Self {
             logical_schema,
+            has_column_with_default: false,
             logical_schema_without_partition_columns,
             physical_schema,
             physical_data_schema_without_partition_columns,
@@ -222,8 +225,10 @@ impl TableConfiguration {
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
-        // default on a Variant column).
-        validate_column_defaults_metadata(&table_config.logical_schema)?;
+        // default on a Variant column) and retain whether the validated schema declares any column
+        // defaults.
+        table_config.has_column_with_default =
+            validate_column_defaults_metadata(&table_config.logical_schema)?;
         // Reject tables with geo-typed columns that don't declare the `geospatial` feature.
         #[cfg(feature = "geo-type-in-dev")]
         validate_geospatial_feature_support(&table_config)?;
@@ -485,6 +490,13 @@ impl TableConfiguration {
     /// `&self`-bound borrows from the schema (e.g. `&DataType` of a field).
     pub(crate) fn logical_schema_ref(&self) -> &SchemaRef {
         &self.logical_schema
+    }
+
+    /// Whether any field in the logical schema declares a column default.
+    ///
+    /// This includes nested fields and is independent of the `allowColumnDefaults` feature.
+    pub(crate) fn has_column_with_default(&self) -> bool {
+        self.has_column_with_default
     }
 
     /// The physical schema ([`SchemaRef`]) of this table at this version.

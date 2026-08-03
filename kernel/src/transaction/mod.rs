@@ -241,6 +241,7 @@ pub struct Transaction<S = ExistingTable> {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // TODO(#2499): Replace this state when Engine responsibilities encode column-default handling.
     // Whether the connector acknowledged responsibility for applying column defaults.
     column_defaults_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
@@ -807,16 +808,17 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Rejects write-context creation when the connector has not acknowledged column-default
-    /// handling.
+    /// Rejects write-context creation when a table declares column defaults and the connector has
+    /// not acknowledged handling them.
     fn ensure_column_defaults_acknowledged(&self) -> DeltaResult<()> {
         require!(
             self.column_defaults_acknowledged
                 || !self
                     .effective_table_config
-                    .is_feature_enabled(&TableFeature::AllowColumnDefaults),
+                    .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+                || !self.effective_table_config.has_column_with_default(),
             Error::invalid_transaction_state(
-                "Writing data to a table with allowColumnDefaults requires calling \
+                "Writing data to a table with column defaults requires calling \
                  Transaction::ack_column_defaults() first",
             )
         );
@@ -919,9 +921,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Acknowledges that the connector applies column defaults before writing data files.
     ///
     /// Call this before requesting a write context for a table that enables the
-    /// `allowColumnDefaults` feature. The connector must materialize every omitted column's
-    /// default itself; this method records that responsibility but does not apply any defaults.
-    /// Without this acknowledgement, write-context creation fails with an error.
+    /// `allowColumnDefaults` feature and declares at least one column default. The connector must
+    /// materialize every omitted column's default itself; this method records that responsibility
+    /// but does not apply any defaults. Without this acknowledgement, write-context creation fails
+    /// with an error.
     pub fn ack_column_defaults(&mut self) {
         self.column_defaults_acknowledged = true;
     }
@@ -1024,6 +1027,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.effective_table_config.logical_partition_columns()
     }
 
+    // TODO(#2630): Expose nested column defaults through the transaction API.
     /// Returns the column default for every top-level column in this table's logical schema that
     /// declares one, keyed by logical column name.
     ///
@@ -1132,8 +1136,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Returns an error if the table is not partitioned (use
     /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead), or if the
-    /// table enables `allowColumnDefaults` and [`ack_column_defaults`](Self::ack_column_defaults)
-    /// has not been called.
+    /// table enables `allowColumnDefaults`, declares at least one column default, and
+    /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
     ///
     /// [`write_dir`]: WriteContext::write_dir
     /// [`logical_to_physical`]: WriteContext::logical_to_physical
@@ -1191,8 +1195,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Returns an error if the table has partition columns (use
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead), or if the table
-    /// enables `allowColumnDefaults` and [`ack_column_defaults`](Self::ack_column_defaults) has not
-    /// been called.
+    /// enables `allowColumnDefaults`, declares at least one column default, and
+    /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
         self.ensure_column_defaults_acknowledged()?;
