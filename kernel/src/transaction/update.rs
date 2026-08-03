@@ -231,8 +231,8 @@ impl Transaction {
     ///   new deletion vector descriptor for that file.
     /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata using
     ///   [`scan_row_schema`]. Selected rows must preserve the scan-file values and cover every path
-    ///   in `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
-    ///   accurate `stats.numRecords` value.
+    ///   in `new_dv_descriptors`. Files with deletion vectors must have an accurate
+    ///   `stats.numRecords` value.
     ///
     /// # Errors
     ///

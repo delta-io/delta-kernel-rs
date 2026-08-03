@@ -789,6 +789,14 @@ struct ScanFileModification {
 }
 
 #[rstest::rstest]
+#[case::missing_path(
+    ScanFileModification {
+        field_name: "path",
+        value: new_null_array(&ArrowDataType::Utf8, 1),
+        row_id: 0,
+    },
+    "Number of matched DV files does not match number of new DV descriptors"
+)]
 #[case::empty_path(
     ScanFileModification {
         field_name: "path",
@@ -849,7 +857,7 @@ struct ScanFileModification {
     "missing required field 'modificationTime'"
 )]
 #[tokio::test]
-async fn test_update_deletion_vectors_commit_rejects_corrupted_scan_files(
+async fn test_update_deletion_vectors_rejects_corrupted_scan_files(
     #[case] modification: ScanFileModification,
     #[case] expected_error: &str,
     #[values(0, 1, 2)] invalid_batch_index: usize,
@@ -875,15 +883,22 @@ async fn test_update_deletion_vectors_commit_rejects_corrupted_scan_files(
         .expect("table should contain one scan-file batch");
     let scan_files =
         make_scan_file_batches(scan_file, &modification, invalid_batch_index, BATCH_COUNT);
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     let mut descriptors = sequential_dv_descriptors(&file_paths);
     if modification.field_name == "path" {
+        if modification.value.is_null(0) {
+            assert_result_error_with_message(
+                txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok)),
+                expected_error,
+            );
+            return Ok(());
+        }
         let path = modification.value.as_string::<i32>().value(0);
         let descriptor = descriptors
             .remove(&file_paths[0])
-            .expect("descriptor for original path");
+            .expect("descriptor for the original path modified by this test");
         descriptors.insert(path.to_string(), descriptor);
     }
-    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
     txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
 
     assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);

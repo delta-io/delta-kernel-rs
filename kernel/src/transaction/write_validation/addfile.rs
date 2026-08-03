@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use super::utils::{validate_partition_keys, validate_required_field};
+use super::utils::{validate_partition_keys, validate_required_field_exist};
 use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
@@ -55,20 +55,23 @@ impl Validation for AddFileRequiredFields {
             return Err(Error::generic("AddFile path must not be empty"));
         }
 
-        let partition_values = validate_required_field(
+        let partition_values = validate_required_field_exist(
             getters[PARTITION_VALUES].get_map(row, "partitionValues")?,
             path,
             "partitionValues",
         )?;
         validate_partition_keys(path, partition_values, &self.physical_partition_columns)?;
-        let size =
-            validate_required_field::<i64>(getters[SIZE].get_opt(row, "size")?, path, "size")?;
+        let size = validate_required_field_exist::<i64>(
+            getters[SIZE].get_opt(row, "size")?,
+            path,
+            "size",
+        )?;
         if size < 0 {
             return Err(Error::generic(format!(
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
             )));
         }
-        validate_required_field::<i64>(
+        validate_required_field_exist::<i64>(
             getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
             path,
             "modificationTime",
