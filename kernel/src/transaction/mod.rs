@@ -241,8 +241,9 @@ pub struct Transaction<S = ExistingTable> {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
-    // TODO(#2499): Replace this state when Engine responsibilities encode column-default handling.
-    // Whether the connector acknowledged responsibility for applying column defaults.
+    // TODO(#2499): Replace this state when Conntector responsibilities encode column-default
+    // handling. Whether the connector acknowledged responsibility for applying column
+    // defaults.
     column_defaults_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
