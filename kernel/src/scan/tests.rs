@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ::test_utils::{get_column, load_test_data};
+use ::test_utils::{assert_result_error_with_message, get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
 use url::Url;
@@ -2136,6 +2136,40 @@ fn test_scan_metadata_with_specific_stats_columns(#[case] stats: StatsOptions) {
     }
 }
 
+#[rstest]
+fn scan_builder_validates_predicate_and_stats_columns(
+    #[values(
+        (column_pred!("missing_predicate"), false),
+        (column_pred!("id"), true)
+    )]
+    predicate: (Pred, bool),
+    #[values(
+        (StatsOptions::struct_columns(vec![column_name!("missing_stats")]), false),
+        (StatsOptions::struct_columns(vec![column_name!("id")]), true)
+    )]
+    stats: (StatsOptions, bool),
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (predicate, predicate_exists) = predicate;
+    let (stats, stats_columns_exist) = stats;
+    let result = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats(stats)
+        .build();
+
+    match (predicate_exists, stats_columns_exist) {
+        (true, true) => {
+            result.expect("valid predicate and stats columns");
+        }
+        (false, _) => assert_result_error_with_message(result, "missing_predicate"),
+        (true, false) => assert_result_error_with_message(result, "missing_stats"),
+    }
+}
+
 /// Test that [`StructStats::Columns`] with multiple specific columns returns stats for all of them.
 #[test]
 fn test_scan_metadata_with_multiple_stats_columns() {
@@ -2208,8 +2242,7 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that [`StructStats::Columns`] with a nonexistent column name produces empty stats for
-/// that column.
+/// Test that [`StructStats::Columns`] rejects nonexistent columns.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -2217,43 +2250,15 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let scan = snapshot
+    let result = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
         })
-        .build()
-        .unwrap();
+        .build();
 
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    assert!(
-        !scan_metadata_results.is_empty(),
-        "Should have scan metadata"
-    );
-
-    for scan_metadata in scan_metadata_results {
-        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-            .unwrap()
-            .into();
-        let filtered_batch =
-            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-
-        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-
-        // Should have numRecords but no minValues/maxValues/nullCount
-        // (or they exist but are empty structs)
-        assert!(
-            stats_parsed.column_by_name(NUM_RECORDS).is_some(),
-            "Should still have numRecords"
-        );
-    }
+    assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
