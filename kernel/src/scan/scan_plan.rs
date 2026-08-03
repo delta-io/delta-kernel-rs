@@ -438,7 +438,8 @@ fn add_field_with_parsed_stats_and_partitions(
     Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
 }
 
-/// Builds the output projection for requested stats and partition values.
+/// Builds the output projection for requested stats and partition values. The base of this
+/// transformation is constructed by [`add_field_with_parsed_stats_and_partitions`].
 ///
 /// The output schema is:
 /// ```text
