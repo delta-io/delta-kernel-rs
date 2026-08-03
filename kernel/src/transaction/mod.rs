@@ -777,6 +777,7 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    // Reject data-file removals / DV updates on appendOnly tables when `data_change` is true.
     fn validate_append_only_semantics(&self) -> DeltaResult<()> {
         if !self.data_change
             || !self
@@ -2873,7 +2874,7 @@ mod tests {
         &[true, true, true], /* selection_vector */
         true, /* expected_error */
     )]
-    fn validate_append_only_semantics(
+    fn append_only_rejects_data_removal_when_data_change(
         #[values(DataRemoval::RemoveFile, DataRemoval::DeletionVectorUpdate)] removal: DataRemoval,
         #[values(0, 1)] batch_index: usize,
         #[case] append_only: bool,
