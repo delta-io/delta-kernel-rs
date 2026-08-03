@@ -425,6 +425,7 @@ pub trait FilteredRowVisitor {
     {
         // column_names is 'static so this borrow ends immediately, before bridge borrows self
         let column_names = self.selected_column_names_and_types().0;
+        // TODO(#3028): Define callback cardinality; this bridge assumes one visit per EngineData.
         let mut bridge = FilteredVisitorBridge {
             visitor: self,
             selection_vector: data.selection_vector(),
