@@ -30,7 +30,7 @@ fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> Stri
             let uuid = uuid::Uuid::new_v4();
             format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
         }
-        LogPathFileType::SinglePartCheckpoint => {
+        LogPathFileType::ClassicCheckpoint => {
             format!("_delta_log/{version:020}.checkpoint.parquet")
         }
         LogPathFileType::MultiPartCheckpoint {
@@ -536,7 +536,7 @@ async fn test_listing_stops_at_last_checkpoint_marker() {
         (2, LogPathFileType::Commit, CommitSource::Filesystem),
         (
             2,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ),
         (2, LogPathFileType::Crc, CommitSource::Filesystem),
@@ -600,7 +600,7 @@ async fn test_non_commit_files_at_log_tail_versions_are_preserved() {
         (5, LogPathFileType::Commit, CommitSource::Filesystem),
         (
             7,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ),
         (8, LogPathFileType::Crc, CommitSource::Filesystem),
@@ -679,7 +679,7 @@ async fn backward_scan_single_checkpoint_cases(
     if let Some(cp) = checkpoint_version {
         log_files.push((
             cp,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ));
     }
@@ -724,7 +724,7 @@ fn files_incomplete_in_second_window_complete_in_third_window(
         .collect();
     log_files.push((
         500,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     log_files.push((
@@ -850,7 +850,7 @@ async fn backward_scan_with_log_tail_derives_lower_bound_from_checkpoint() {
         .collect();
     log_files.push((
         5,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     let (storage, log_root) = create_storage(log_files).await;
@@ -899,7 +899,7 @@ async fn backward_scan_with_log_tail_starting_before_checkpoint() {
         .collect();
     log_files.push((
         5,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     log_files.push((6, LogPathFileType::Crc, CommitSource::Filesystem));
@@ -1078,8 +1078,8 @@ async fn test_zero_byte_checkpoint_skipped_older_used(#[case] use_backward_scan:
         (8, LogPathFileType::Commit, false),
         (9, LogPathFileType::Commit, false),
         (10, LogPathFileType::Commit, false),
-        (5, LogPathFileType::SinglePartCheckpoint, false), // valid checkpoint
-        (10, LogPathFileType::SinglePartCheckpoint, true), // empty checkpoint
+        (5, LogPathFileType::ClassicCheckpoint, false), // valid checkpoint
+        (10, LogPathFileType::ClassicCheckpoint, true), // empty checkpoint
     ];
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
 
@@ -1130,8 +1130,8 @@ async fn test_zero_byte_checkpoint_backward_scan_crosses_windows() {
     let mut log_files: Vec<(Version, LogPathFileType, bool)> = (0u64..=1005)
         .map(|v| (v, LogPathFileType::Commit, false))
         .collect();
-    log_files.push((5, LogPathFileType::SinglePartCheckpoint, false));
-    log_files.push((1005, LogPathFileType::SinglePartCheckpoint, true));
+    log_files.push((5, LogPathFileType::ClassicCheckpoint, false));
+    log_files.push((1005, LogPathFileType::ClassicCheckpoint, true));
 
     let (storage, log_root) = create_storage_with_empty_files(log_files).await;
     let counter = CountingStorageHandler::new(storage);
@@ -1254,7 +1254,7 @@ async fn test_list_commits_keeps_commits_across_checkpoint() {
         .collect();
     files.push((
         3,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     let (storage, log_root) = create_storage(files).await;
@@ -1294,7 +1294,7 @@ fn incomplete_then_complete_files() -> Vec<ParsedLogPath> {
     ));
     files.push(make_parsed_log_path_with_source(
         10,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     files
@@ -1310,12 +1310,12 @@ fn two_complete_checkpoints_files() -> Vec<ParsedLogPath> {
         .collect();
     files.push(make_parsed_log_path_with_source(
         5,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     files.push(make_parsed_log_path_with_source(
         10,
-        LogPathFileType::SinglePartCheckpoint,
+        LogPathFileType::ClassicCheckpoint,
         CommitSource::Filesystem,
     ));
     files
@@ -1357,30 +1357,42 @@ fn multipart_checkpoint_name(version: Version, part_num: u32, num_parts: u32) ->
     format!("{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
 }
 
-/// Mirrors Delta-Spark's `CheckpointInstanceSuite`: a single-part checkpoint sorts below a
-/// multi-part one, more parts beats fewer, a V2 checkpoint outranks both, and single-file
-/// checkpoints break ties on file name.
+/// A v5 `_last_checkpoint` hint describing the uuid-named (V2) checkpoint `filename`.
+fn hint_naming_uuid(filename: &str) -> LastCheckpointHint {
+    LastCheckpointHint {
+        version: 5,
+        v2_checkpoint: Some(crate::last_checkpoint_hint::LastCheckpointV2 {
+            path: filename.to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Mirrors Delta-Spark's `CheckpointInstanceSuite`: a classic checkpoint sorts below a multi-part
+/// one, more parts beats fewer, a uuid (V2) checkpoint outranks both, and two uuid checkpoints at
+/// one version break the tie on file name.
 #[test]
 fn checkpoint_instance_orders_like_delta_spark() {
-    let classic = CheckpointInstance::single_file(
-        CheckpointFormatRank::Single,
-        "00000000000000000005.checkpoint.parquet".to_string(),
-    );
-    let uuid_a = CheckpointInstance::single_file(
-        CheckpointFormatRank::V2,
-        "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet".to_string(),
-    );
-    let uuid_b = CheckpointInstance::single_file(
-        CheckpointFormatRank::V2,
-        "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet".to_string(),
-    );
+    let classic = CheckpointInstance::Classic;
+    let uuid_a = CheckpointInstance::Uuid {
+        filename: "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+            .to_string(),
+    };
+    let uuid_b = CheckpointInstance::Uuid {
+        filename: "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet"
+            .to_string(),
+    };
 
-    assert!(classic < CheckpointInstance::multi_part(2));
-    assert!(CheckpointInstance::multi_part(2) < CheckpointInstance::multi_part(11));
-    assert!(classic < CheckpointInstance::multi_part(11));
-    assert!(uuid_a > CheckpointInstance::multi_part(11));
+    assert!(classic < CheckpointInstance::MultiPart { num_parts: 2 });
+    assert!(
+        CheckpointInstance::MultiPart { num_parts: 2 }
+            < CheckpointInstance::MultiPart { num_parts: 11 }
+    );
+    assert!(classic < CheckpointInstance::MultiPart { num_parts: 11 });
+    assert!(uuid_a > CheckpointInstance::MultiPart { num_parts: 11 });
     assert!(uuid_a > classic);
-    // Two V2 checkpoints at one version break the tie on file name.
+    // Two uuid checkpoints at one version break the tie on file name.
     assert!(uuid_a < uuid_b);
 }
 
@@ -1476,7 +1488,7 @@ async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (
             1,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ),
     ];
@@ -1503,7 +1515,7 @@ async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
 }
 
 /// A uuid-named (V2) checkpoint and a complete multi-part (V1) checkpoint at one version. The V2
-/// one wins, matching Delta-Spark's `Format.V2 > Format.WITH_PARTS`.
+/// one wins, matching Delta-Spark.
 #[tokio::test]
 async fn uuid_and_multipart_checkpoints_at_one_version_selects_uuid() {
     let (storage, log_root) = create_storage_with_raw_paths(
@@ -1552,14 +1564,80 @@ async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
     );
 }
 
-/// A uuid-named (V2) checkpoint beats a classic (V1) one at the same version, matching
-/// Delta-Spark's `Format.V2 > Format.SINGLE`.
+/// End-to-end through the real `_last_checkpoint`-hint listing path: a version holds a complete
+/// multi-part checkpoint plus two uuid-named checkpoints (uuid `bbbb...` > `aaaa...`), so listing
+/// deterministically selects the greater uuid. A hint is retained (`applies_to` is true) only when
+/// it names that selected checkpoint; a hint pointing at any of the losing candidates -- the loser
+/// uuid, the multi-part group, or a phantom classic checkpoint -- is ignored, so readers fall back
+/// to the checkpoint file's own fields. This drives the `Uuid` arm of `applies_to` against real
+/// listed `ParsedLogPath`s, which the hand-built `applies_to` unit test cannot.
+#[rstest]
+#[case::hint_names_winner_uuid(
+    hint_naming_uuid(
+        "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet"
+    ),
+    true
+)]
+#[case::hint_names_loser_uuid(
+    hint_naming_uuid(
+        "00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"
+    ),
+    false
+)]
+#[case::hint_names_losing_multipart(
+    LastCheckpointHint { version: 5, parts: Some(2), ..Default::default() },
+    false
+)]
+#[case::hint_names_phantom_classic(
+    LastCheckpointHint { version: 5, ..Default::default() },
+    false
+)]
+#[tokio::test]
+async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
+    #[case] hint: LastCheckpointHint,
+    #[case] expect_hint_applies: bool,
+) {
+    let winner = "00000000000000000005.checkpoint.bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.parquet";
+    let (storage, log_root) = create_storage_with_raw_paths(
+        vec![
+            (5, LogPathFileType::Commit, CommitSource::Filesystem),
+            (6, LogPathFileType::Commit, CommitSource::Filesystem),
+        ],
+        &[
+            &format!("_delta_log/{}", multipart_checkpoint_name(5, 1, 2)),
+            &format!("_delta_log/{}", multipart_checkpoint_name(5, 2, 2)),
+            "_delta_log/00000000000000000005.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet",
+            &format!("_delta_log/{winner}"),
+        ],
+    )
+    .await;
+
+    let listed = LogSegmentFiles::list_with_checkpoint_hint(
+        &hint,
+        storage.as_ref(),
+        &log_root,
+        vec![],
+        None,
+    )
+    .unwrap();
+
+    // Listing always selects the deterministic winner, regardless of what the hint names.
+    assert_eq!(listed.checkpoint_parts.len(), 1);
+    assert_eq!(listed.checkpoint_parts[0].filename, winner);
+    // The hint's fields are trusted only when it names that selected checkpoint.
+    assert_eq!(
+        hint.applies_to(&listed.checkpoint_parts),
+        expect_hint_applies
+    );
+}
+
+/// A uuid-named (V2) checkpoint beats a classic (V1) one at the same version, matching Delta-Spark.
 #[tokio::test]
 async fn uuid_checkpoint_beats_classic_checkpoint_at_one_version() {
     let (storage, log_root) = create_storage_with_raw_paths(
         vec![
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
-            (1, LogPathFileType::SinglePartCheckpoint, CommitSource::Filesystem),
+            (1, LogPathFileType::ClassicCheckpoint, CommitSource::Filesystem),
         ],
         &["_delta_log/00000000000000000001.checkpoint.aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.parquet"],
     )
@@ -1585,7 +1663,7 @@ async fn json_uuid_checkpoint_beats_v1_checkpoints_at_one_version() {
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (
                 1,
-                LogPathFileType::SinglePartCheckpoint,
+                LogPathFileType::ClassicCheckpoint,
                 CommitSource::Filesystem,
             ),
         ],
@@ -1607,16 +1685,15 @@ async fn json_uuid_checkpoint_beats_v1_checkpoints_at_one_version() {
     );
 }
 
-/// A 1-of-1 multi-part checkpoint outranks a classic one at the same version, following
-/// Delta-Spark's format ordinals. Both are complete single-file V1 checkpoints, so they replay to
-/// the same state.
+/// A 1-of-1 multi-part checkpoint outranks a classic one at the same version, matching Delta-Spark.
+/// Both are complete single-file V1 checkpoints, so they replay to the same state.
 #[tokio::test]
 async fn one_of_one_multipart_checkpoint_beats_classic_checkpoint() {
     let (storage, log_root) = create_storage(vec![
         (1, LogPathFileType::Commit, CommitSource::Filesystem),
         (
             1,
-            LogPathFileType::SinglePartCheckpoint,
+            LogPathFileType::ClassicCheckpoint,
             CommitSource::Filesystem,
         ),
         (

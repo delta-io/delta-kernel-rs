@@ -35,7 +35,15 @@ pub(crate) enum LogPathFileType {
     Commit,
     /// Staged commits are commits with UUID filenames, stored in _delta_log/_staged_commits dir.
     StagedCommit,
-    SinglePartCheckpoint,
+    /// A classic-named checkpoint, `<version>.checkpoint.parquet`. The name identifies the
+    /// file-naming scheme, not the checkpoint's spec version: this file may hold a V1 checkpoint
+    /// with its actions inline, or a V2 checkpoint that references sidecars. Only reading the file
+    /// distinguishes them, which is why `LogSegment::get_file_actions_schema_and_sidecars` probes
+    /// for a sidecar column.
+    ClassicCheckpoint,
+    /// A uuid-named checkpoint, `<version>.checkpoint.<uuid>.{parquet,json}`. Always a V2
+    /// checkpoint, since only the V2 spec writes this naming scheme. The uuid means several can
+    /// share a version -- each writer picks a fresh one.
     #[allow(unused)]
     UuidCheckpoint,
     // NOTE: Delta spec doesn't actually say, but checkpoint part numbers are effectively 31-bit
@@ -52,6 +60,64 @@ pub(crate) enum LogPathFileType {
     },
     Crc,
     Unknown,
+}
+
+/// Identifies one checkpoint among those at a single version and orders it against its siblings.
+///
+/// The variant is the checkpoint's naming scheme, read from the file name with no I/O. The naming
+/// scheme and the [checkpoint spec] are independent axes, and only two of the three schemes pin the
+/// spec:
+///
+/// | spec | classic | multi-part | uuid-named |
+/// |------|---------|------------|------------|
+/// | V1   | valid   | valid      | invalid    |
+/// | V2   | valid   | invalid    | valid      |
+///
+/// So a `Classic` checkpoint follows either spec and only its contents say which, which is why
+/// `LogSegment::get_file_actions_schema_and_sidecars` probes for a sidecar column.
+///
+/// Variant declaration order is the rank and each payload is that rank's tiebreaker, so the derived
+/// [`Ord`] is the entire comparison (`Uuid` > `MultiPart` > `Classic`, matching Delta-Spark for
+/// cross-engine parity). Reordering the variants changes which checkpoint kernel selects.
+///
+/// [checkpoint spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[internal_api]
+pub(crate) enum CheckpointInstance {
+    /// `<version>.checkpoint.parquet`. At most one per version, so nothing to break ties on.
+    Classic,
+    /// `<version>.checkpoint.<part_num>.<num_parts>.parquet`. More parts wins.
+    MultiPart { num_parts: u32 },
+    /// `<version>.checkpoint.<uuid>.{json,parquet}`. The greater file name wins.
+    Uuid { filename: String },
+}
+
+impl CheckpointInstance {
+    /// The instance a checkpoint part belongs to, or `None` for a non-checkpoint file.
+    pub(crate) fn of<Location: AsUrl>(part: &ParsedLogPath<Location>) -> Option<Self> {
+        match &part.file_type {
+            LogPathFileType::ClassicCheckpoint => Some(Self::Classic),
+            LogPathFileType::UuidCheckpoint => Some(Self::Uuid {
+                filename: part.filename.clone(),
+            }),
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } => Some(Self::MultiPart {
+                num_parts: *num_parts,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `part_files` holds every part this checkpoint needs.
+    pub(crate) fn is_complete<Location: AsUrl>(
+        &self,
+        part_files: &[ParsedLogPath<Location>],
+    ) -> bool {
+        let expected = match self {
+            Self::MultiPart { num_parts } => *num_parts as usize,
+            Self::Classic | Self::Uuid { .. } => 1,
+        };
+        expected == part_files.len()
+    }
 }
 
 /// A ParsedLogPath is a well-understood path to a file in the _delta_log directory.
@@ -207,7 +273,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
                 }
             }
             ["crc"] if in_delta_log_dir => LogPathFileType::Crc,
-            ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::SinglePartCheckpoint,
+            ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::ClassicCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] if in_delta_log_dir => {
                 let Some(_) = parse_path_part::<String>(uuid, UUID_PART_LEN) else {
                     return Ok(None);
@@ -268,7 +334,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     pub(crate) fn should_list(&self) -> bool {
         match self.file_type {
             LogPathFileType::Commit
-            | LogPathFileType::SinglePartCheckpoint
+            | LogPathFileType::ClassicCheckpoint
             | LogPathFileType::UuidCheckpoint
             | LogPathFileType::MultiPartCheckpoint { .. }
             | LogPathFileType::CompactedCommit { .. }
@@ -296,7 +362,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     pub(crate) fn is_checkpoint(&self) -> bool {
         matches!(
             self.file_type,
-            LogPathFileType::SinglePartCheckpoint
+            LogPathFileType::ClassicCheckpoint
                 | LogPathFileType::MultiPartCheckpoint { .. }
                 | LogPathFileType::UuidCheckpoint
         )
@@ -734,7 +800,7 @@ pub(crate) mod tests {
         assert_eq!(log_path.version, 2);
         assert!(matches!(
             log_path.file_type,
-            LogPathFileType::SinglePartCheckpoint
+            LogPathFileType::ClassicCheckpoint
         ));
         assert!(!log_path.is_commit());
         assert!(log_path.is_checkpoint());
@@ -1023,7 +1089,7 @@ pub(crate) mod tests {
         assert_eq!(log_path.extension, "parquet");
         assert!(matches!(
             log_path.file_type,
-            LogPathFileType::SinglePartCheckpoint
+            LogPathFileType::ClassicCheckpoint
         ));
         assert_eq!(log_path.filename, "00000000000000000010.checkpoint.parquet");
     }
@@ -1087,7 +1153,7 @@ pub(crate) mod tests {
         for (file_type, should_list) in [
             (LogPathFileType::Commit, true),
             (LogPathFileType::StagedCommit, false),
-            (LogPathFileType::SinglePartCheckpoint, true),
+            (LogPathFileType::ClassicCheckpoint, true),
             (LogPathFileType::UuidCheckpoint, true),
             (
                 LogPathFileType::MultiPartCheckpoint {

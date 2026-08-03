@@ -11,7 +11,7 @@ use url::Url;
 use crate::actions::{
     CheckpointMetadata, DomainMetadata, Metadata, Protocol, SetTransaction, Sidecar,
 };
-use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::path::{CheckpointInstance, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
 
@@ -107,45 +107,33 @@ pub(crate) enum HintAction {
 }
 
 impl LastCheckpointHint {
-    /// Whether this hint describes the checkpoint a log segment selected -- the `checkpoint_parts`
-    /// at `version`. Multiple checkpoints can share a version (e.g. concurrent writers), so a
-    /// matching version alone is not enough: the hint's own shape must agree with the selected
-    /// checkpoint's format, and within a format with its parts or file name.
+    /// Whether this hint describes the checkpoint a log segment selected -- its `checkpoint_parts`.
+    /// Multiple checkpoints can share a version (e.g. concurrent writers), so a matching version
+    /// alone is not enough: the hint's own identity must equal the selected checkpoint's.
     ///
     /// On a mismatch, callers read the checkpoint file itself instead of trusting the hint's
     /// fields.
-    pub(crate) fn applies_to(
-        &self,
-        version: Version,
-        checkpoint_parts: &[ParsedLogPath<FileMeta>],
-    ) -> bool {
+    pub(crate) fn applies_to(&self, checkpoint_parts: &[ParsedLogPath<FileMeta>]) -> bool {
         let Some(selected) = checkpoint_parts.first() else {
             return false;
         };
-        // A hint's format is implied by its fields, as in Delta-Spark's `getFormatEnum`: a
-        // `v2Checkpoint` object means V2, else `parts` means multi-part, else single-file. It must
-        // match the selected checkpoint's format, or the hint describes some other file at this
-        // version and its `checkpointSchema` would be read as that file's.
-        let format_matches = match (&self.v2_checkpoint, self.parts) {
-            // A V2 checkpoint's file name carries a UUID, so it must match the selected part -- the
-            // file the hint's fields describe.
-            (Some(v2), _) => selected.filename == v2.path,
-            // A multi-part checkpoint's names are fully determined by `(version, num_parts)`, so a
-            // matching part count pins the identity.
-            (None, Some(parts)) => {
-                matches!(
-                    selected.file_type,
-                    LogPathFileType::MultiPartCheckpoint { .. }
-                ) && parts == checkpoint_parts.len()
-            }
-            // A hint with neither field describes a single whole file, and a uuid-named one would
-            // have come with a `v2Checkpoint` object naming it.
-            (None, None) => {
-                matches!(selected.file_type, LogPathFileType::SinglePartCheckpoint)
-                    && checkpoint_parts.len() == 1
-            }
-        };
-        self.version == version && format_matches
+        self.version == selected.version
+            && CheckpointInstance::of(selected) == Some(self.implied_instance())
+    }
+
+    /// The checkpoint identity this hint's fields describe, mirroring Delta-Spark's
+    /// `getFormatEnum`: a `v2Checkpoint` object means uuid-named, else `parts` means
+    /// multi-part, else classic-named.
+    fn implied_instance(&self) -> CheckpointInstance {
+        match (&self.v2_checkpoint, self.parts) {
+            (Some(v2), _) => CheckpointInstance::Uuid {
+                filename: v2.path.clone(),
+            },
+            (None, Some(parts)) => CheckpointInstance::MultiPart {
+                num_parts: parts as u32,
+            },
+            (None, None) => CheckpointInstance::Classic,
+        }
     }
 
     /// Parses a hint from raw `_last_checkpoint` bytes, dropping oversized fields so the retained
@@ -364,11 +352,19 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(v2.applies_to(1, &[part(selected)]));
-        assert!(!v2.applies_to(2, &[part(selected)]), "wrong version");
-        assert!(!v2.applies_to(1, &[part(other)]), "wrong v2 path");
+        assert!(v2.applies_to(&[part(selected)]));
+        assert!(!v2.applies_to(&[part(other)]), "wrong v2 path");
+        // The hint's version must equal the selected part's version (read from the part).
+        let v2_wrong_version = LastCheckpointHint {
+            version: 2,
+            ..v2.clone()
+        };
+        assert!(
+            !v2_wrong_version.applies_to(&[part(selected)]),
+            "wrong version"
+        );
 
-        // V1 multi-part: keyed by (version, numParts); the file name is not consulted.
+        // V1 multi-part: keyed by (version, numParts) read from the selected part's file name.
         let mp1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
         let mp2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
         let v1_multi = LastCheckpointHint {
@@ -376,8 +372,10 @@ mod tests {
             parts: Some(2),
             ..Default::default()
         };
-        assert!(v1_multi.applies_to(1, &[part(mp1), part(mp2)]));
-        assert!(!v1_multi.applies_to(1, &[part(mp1)]), "wrong part count");
+        assert!(v1_multi.applies_to(&[part(mp1), part(mp2)]));
+        // A hint whose numParts disagrees with the selected checkpoint's declared numParts.
+        let mp1_of_3 = "00000000000000000001.checkpoint.0000000001.0000000003.parquet";
+        assert!(!v1_multi.applies_to(&[part(mp1_of_3)]), "wrong part count");
 
         // V1 single-part: an absent `parts` means one part.
         let v1_single = LastCheckpointHint {
@@ -385,17 +383,17 @@ mod tests {
             ..Default::default()
         };
         let classic = "00000000000000000001.checkpoint.parquet";
-        assert!(v1_single.applies_to(1, &[part(classic)]));
+        assert!(v1_single.applies_to(&[part(classic)]));
 
         // Format has to match, not just part count: a 1-of-1 multi-part checkpoint and a uuid-named
         // one each hold one part too.
         let one_of_one = "00000000000000000001.checkpoint.0000000001.0000000001.parquet";
         assert!(
-            !v1_single.applies_to(1, &[part(one_of_one)]),
+            !v1_single.applies_to(&[part(one_of_one)]),
             "single-file hint applied to a multi-part checkpoint"
         );
         assert!(
-            !v1_single.applies_to(1, &[part(selected)]),
+            !v1_single.applies_to(&[part(selected)]),
             "single-file hint applied to a uuid-named checkpoint"
         );
         // Nor can a multi-part hint describe a single whole file.
@@ -404,13 +402,13 @@ mod tests {
             parts: Some(1),
             ..Default::default()
         };
-        assert!(v1_one_part.applies_to(1, &[part(one_of_one)]));
+        assert!(v1_one_part.applies_to(&[part(one_of_one)]));
         assert!(
-            !v1_one_part.applies_to(1, &[part(classic)]),
+            !v1_one_part.applies_to(&[part(classic)]),
             "multi-part hint applied to a classic checkpoint"
         );
 
-        assert!(!v1_single.applies_to(1, &[]), "no checkpoint selected");
+        assert!(!v1_single.applies_to(&[]), "no checkpoint selected");
     }
 
     /// `sidecarFiles` / `nonFileActions` are dropped only when their count exceeds the threshold --
