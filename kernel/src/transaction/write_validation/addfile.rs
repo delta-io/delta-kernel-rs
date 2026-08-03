@@ -131,12 +131,14 @@ mod tests {
     use test_utils::{modify_add_file_partition_keys, AddFilePartitionKeyModify};
 
     use super::*;
-    use crate::arrow::array::{new_null_array, Array, ArrayRef, Int64Array, StringArray};
+    use crate::arrow::array::{new_null_array, Array, Int64Array, StringArray};
     use crate::arrow::compute::{concat, concat_batches};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::ColumnName;
-    use crate::unit_test_utils::{assert_result_error_with_message, create_valid_add_file_batch};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, create_valid_add_file_batch, replace_column,
+    };
     use crate::EngineData;
 
     /// Builds one valid add-file row with a fully nullable schema.
@@ -172,15 +174,6 @@ mod tests {
             .expect("failed to replace the selected add-file field with a null value");
         RecordBatch::try_new(schema, columns)
             .expect("failed to rebuild add-file batch after replacing a field value with null")
-    }
-
-    fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
-        let schema = batch.schema();
-        let index = schema.index_of(field).expect("field not found in schema");
-        let mut columns = batch.columns().to_vec();
-        columns[index] = column;
-        RecordBatch::try_new(schema, columns)
-            .expect("failed to rebuild add-file batch after replacing a column")
     }
 
     /// Returns nullable add-file rows with `partitionValues` replaced by the given values.

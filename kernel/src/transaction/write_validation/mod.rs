@@ -4,7 +4,6 @@
 
 // TODO(#2869): Add the remaining write-side validations:
 // - No missing partition columns in `txn.add_files_metadata`
-// - Required fields for `txn.remove_files_metadata`
 // - Required fields for `txn.dv_matched_files`
 // - No missing partition columns in `txn.dv_matched_files`
 // - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
@@ -12,8 +11,11 @@
 // - AppendOnly table can not have `removeFile` with dataChange = true
 
 mod addfile;
+mod removefile;
 
-use crate::engine_data::{GetData, RowVisitor};
+use crate::engine_data::{
+    FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
+};
 use crate::expressions::ColumnName;
 use crate::schema::{ColumnNamesAndTypes, DataType};
 use crate::{DeltaResult, EngineData};
@@ -48,7 +50,28 @@ impl StagedDataValidator {
     /// Run every validation against each batch. Returns the first validation error encountered.
     pub(crate) fn validate(mut self, batches: &[Box<dyn EngineData>]) -> DeltaResult<()> {
         for batch in batches {
-            self.visit_rows_of(batch.as_ref())?;
+            RowVisitor::visit_rows_of(&mut self, batch.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Run every validation against each selected row. Returns the first validation error.
+    pub(crate) fn validate_filtered(mut self, batches: &[FilteredEngineData]) -> DeltaResult<()> {
+        for batch in batches {
+            FilteredRowVisitor::visit_rows_of(&mut self, batch)?;
+        }
+        Ok(())
+    }
+
+    fn validate_rows<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = usize>,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<()> {
+        for row in rows {
+            for validation in &mut self.validations {
+                validation.validate_row(row, getters)?;
+            }
         }
         Ok(())
     }
@@ -60,11 +83,20 @@ impl RowVisitor for StagedDataValidator {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        for row in 0..row_count {
-            for validation in &mut self.validations {
-                validation.validate_row(row, getters)?;
-            }
-        }
-        Ok(())
+        self.validate_rows(0..row_count, getters)
+    }
+}
+
+impl FilteredRowVisitor for StagedDataValidator {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        self.columns_and_types.as_ref()
+    }
+
+    fn visit_filtered<'a>(
+        &mut self,
+        getters: &[&'a dyn GetData<'a>],
+        rows: RowIndexIterator<'_>,
+    ) -> DeltaResult<()> {
+        self.validate_rows(rows, getters)
     }
 }

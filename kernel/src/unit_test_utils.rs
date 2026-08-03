@@ -205,6 +205,14 @@ pub(crate) fn create_valid_add_file_batch(all_nullable: bool) -> RecordBatch {
     RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid add-file batch")
 }
 
+pub(crate) fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
+    let schema = batch.schema();
+    let index = schema.index_of(field).expect("field in schema");
+    let mut columns = batch.columns().to_vec();
+    columns[index] = column;
+    RecordBatch::try_new(schema, columns).expect("rebuild batch with replacement column")
+}
+
 pub(crate) fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
     let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
     let schema = Arc::new(ArrowSchema::new(vec![string_field]));
