@@ -740,7 +740,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
 #[case::no_updates_short_selection_vector(&[true, true], &[], false)]
 #[case::no_updates_empty_selection_vector(&[], &[], false)]
 #[tokio::test]
-async fn test_update_deletion_vectors_with_selection_vector(
+async fn test_update_deletion_vectors_respects_selection_vector(
     #[case] selection_vector: &[bool],
     #[case] target_indexes: &[usize],
     #[case] expect_mismatch: bool,
