@@ -14,6 +14,9 @@ version range (`incremental_scan`).
 
 ## Build & Test Commands
 
+> **`datafusion_executor` is a separate workspace,** so the `--workspace` commands below do NOT
+> touch it. Build/test it on its own -- see `datafusion-executor/CLAUDE.md`.
+
 ```bash
 # Build
 cargo build --workspace --all-features

@@ -14,6 +14,7 @@ use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
@@ -1070,28 +1071,6 @@ fn assert_declarative_metadata_matches_imperative(
     assert_metadata_eq(&actual, &expected, table.description())
 }
 
-// Forwards every handler to an inner [`SyncEngine`] but provides no [`PlanExecutor`], exercising
-// the `None` arm that `declarative_metadata_scan_plan` rejects.
-struct NoPlanEngine(Arc<SyncEngine>);
-
-impl Engine for NoPlanEngine {
-    fn evaluation_handler(&self) -> Arc<dyn crate::EvaluationHandler> {
-        self.0.evaluation_handler()
-    }
-    fn storage_handler(&self) -> Arc<dyn crate::StorageHandler> {
-        self.0.storage_handler()
-    }
-    fn json_handler(&self) -> Arc<dyn crate::JsonHandler> {
-        self.0.json_handler()
-    }
-    fn parquet_handler(&self) -> Arc<dyn crate::ParquetHandler> {
-        self.0.parquet_handler()
-    }
-    fn plan_executor(&self) -> Option<Arc<dyn crate::plans::PlanExecutor>> {
-        None
-    }
-}
-
 #[test]
 fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> DeltaResult<()> {
     let table = TestTableBuilder::new()
@@ -1102,7 +1081,7 @@ fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> Delt
     let snapshot = Snapshot::builder_for(table.table_root()).build(sync_engine.as_ref())?;
     let scan = snapshot.scan_builder().build()?;
 
-    let no_plan_engine = NoPlanEngine(sync_engine);
+    let no_plan_engine = DelegatingEngine::new(sync_engine).without_plan_executor();
     let err = scan
         .declarative_metadata_scan_plan(&no_plan_engine)
         .unwrap_err();

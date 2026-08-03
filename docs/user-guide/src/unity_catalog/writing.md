@@ -188,6 +188,51 @@ Publishing copies each staged commit from `_staged_commits/<version>.<uuid>.json
 to `_delta_log/<version>.json`. If a published file already exists (from a
 previous publish attempt), the copy is silently skipped.
 
+## Report commit metrics
+
+After a successful commit, report commit metrics to the catalog. For a
+catalog-managed table, the catalog owns table maintenance, not your connector.
+Unity Catalog uses the per-commit metrics you report to decide when to schedule
+OPTIMIZE and VACUUM.
+
+> [!NOTE]
+> Support for the metrics endpoint depends on the catalog. Some catalogs accept
+> reported metrics; others, including the open-source Unity Catalog server, do
+> not implement it yet and return a 404. Treat the report as best-effort: a
+> failure never affects commit correctness.
+
+You supply the counts the write engine observed. The row counts and the
+file-size histogram are only known to your engine. File and byte counts are
+derivable from the commit's add and remove actions.
+
+The catalog requires the commit version on every report, and reads it from
+`file_size_histogram.commit_version`. Set it to the version your commit
+produced. When you have no size distribution to report, send a histogram with
+empty bins that carries only the version.
+
+```rust,ignore
+use unity_catalog_delta_client_api::{CommitReport, FileSizeHistogram};
+
+let report = CommitReport {
+    num_files_added: 3,
+    num_bytes_added: 4096,
+    num_rows_inserted: Some(1000),
+    file_size_histogram: FileSizeHistogram {
+        commit_version,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+
+// table_id comes from the load_table response (metadata.table_uuid).
+if let Err(e) = uc_client
+    .report_metrics("my_catalog", "my_schema", "my_table", &table_id, report)
+    .await
+{
+    eprintln!("metrics report failed (non-fatal): {e}");
+}
+```
+
 ## Post-publish maintenance
 
 Once commits are published, you can checkpoint the table:
