@@ -207,6 +207,8 @@ pub struct ScanJson {
     pub files: Vec<ScanFile>,
     pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
+    /// Optional non-null LONG output column containing each JSON line's first-byte offset.
+    pub commit_action_position_column: Option<String>,
 }
 
 /// Inline literal rows. Each `rows[i]` carries one [`Scalar`] per **top-level** field

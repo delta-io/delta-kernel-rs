@@ -45,7 +45,7 @@ use super::ir::nodes::{
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::SchemaRef;
+use crate::schema::{DataType, SchemaRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
@@ -118,7 +118,13 @@ impl PlanBuilder {
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(FileType::Parquet, files, file_constant_columns, schema)
+        Self::scan_source(
+            FileType::Parquet,
+            files,
+            file_constant_columns,
+            schema,
+            None,
+        )
     }
 
     /// A newline-delimited JSON scan source over `files` producing rows matching `schema`. See
@@ -128,7 +134,23 @@ impl PlanBuilder {
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(FileType::Json, files, file_constant_columns, schema)
+        Self::scan_source(FileType::Json, files, file_constant_columns, schema, None)
+    }
+
+    /// A newline-delimited JSON scan that also emits the byte offset of each line's first byte.
+    pub fn scan_json_with_action_position(
+        files: impl IntoIterator<Item = impl Into<ScanFile>>,
+        file_constant_columns: &[&str],
+        schema: impl Into<SchemaRef>,
+        action_position_column: &str,
+    ) -> DeltaResult<Self> {
+        Self::scan_source(
+            FileType::Json,
+            files,
+            file_constant_columns,
+            schema,
+            Some(action_position_column),
+        )
     }
 
     /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Normalizes and validates the
@@ -139,6 +161,7 @@ impl PlanBuilder {
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
+        commit_action_position_column: Option<&str>,
     ) -> DeltaResult<Self> {
         let schema = schema.into();
         let files = Vec::from_iter(files.into_iter().map(Into::into));
@@ -155,6 +178,28 @@ impl PlanBuilder {
             }
         }
         check_file_constant_columns(&schema, &cols, "scan file_constant_columns")?;
+        if let Some(name) = commit_action_position_column {
+            if file_type != FileType::Json {
+                return Err(Error::generic(
+                    "commit action position is supported only by scan_json",
+                ));
+            }
+            let field = schema.field(name).ok_or_else(|| {
+                Error::generic(format!(
+                    "scan_json commit action position column '{name}' is absent from schema"
+                ))
+            })?;
+            if field.data_type() != &DataType::LONG || field.nullable {
+                return Err(Error::generic(format!(
+                    "scan_json commit action position column '{name}' must be non-null LONG"
+                )));
+            }
+            if cols.iter().any(|column| column == name) {
+                return Err(Error::generic(format!(
+                    "scan_json commit action position column '{name}' cannot be a file constant"
+                )));
+            }
+        }
         if files.is_empty() {
             return Ok(Self::absent(schema));
         }
@@ -169,6 +214,7 @@ impl PlanBuilder {
                 files,
                 file_constant_columns,
                 schema: Arc::clone(&schema),
+                commit_action_position_column: commit_action_position_column.map(str::to_string),
             }),
         };
         Ok(Self::present(schema, op, vec![]))
@@ -530,6 +576,7 @@ impl PlanBuilder {
         Ok(match &self.0 {
             PlanBuilderRoot::Present(root) => Self::build_plan(root),
             PlanBuilderRoot::Absent(schema) => Plan {
+                header: Default::default(),
                 nodes: vec![PlanNode::new(
                     Values::new(Arc::clone(schema), vec![]),
                     vec![],
@@ -570,7 +617,10 @@ impl PlanBuilder {
         }
         let mut nodes = Vec::new();
         emit(root, &mut nodes, &mut HashMap::new());
-        Plan { nodes }
+        Plan {
+            header: Default::default(),
+            nodes,
+        }
     }
 }
 

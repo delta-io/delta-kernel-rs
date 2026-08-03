@@ -132,6 +132,10 @@ pub enum StructStats {
     All,
     /// Emit only the specified stats columns.
     Columns(Vec<ColumnName>),
+    /// Emit the specified stats columns even when they are not part of Kernel's table-property
+    /// stats configuration. Engines use this for additional stats policies that Kernel does not
+    /// understand (for example, DBR workload-based stats columns).
+    RequiredColumns(Vec<ColumnName>),
 }
 
 impl Default for StatsOptions {
@@ -166,6 +170,18 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::Columns(cols),
+        }
+    }
+
+    /// Struct stats projected to caller-required columns without JSON synthesis.
+    ///
+    /// Unlike [`Self::struct_columns`], valid table columns are added to the expected checkpoint
+    /// stats schema even when Kernel's table properties do not mark them as indexed. The caller is
+    /// asserting that its external stats policy wrote these columns.
+    pub fn required_struct_columns(cols: Vec<ColumnName>) -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::RequiredColumns(cols),
         }
     }
 
@@ -1041,6 +1057,7 @@ impl Scan {
             plan_executor.as_ref(),
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
+            self.state_info.physical_partition_schema.as_ref(),
         )?;
         scan_plan::build_metadata_scan_plan(&self.state_info, log_segment, &shape)
     }

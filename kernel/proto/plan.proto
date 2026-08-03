@@ -40,6 +40,9 @@ message ScanJsonNode {
   repeated ScanFile files = 1;
   repeated string file_constant_columns = 2;
   delta.kernel.schema.StructType schema = 3;
+  // When set, the engine populates this non-null LONG output field with the byte offset of the
+  // JSON line's first byte. Plans using it require COMMIT_ACTION_POSITION_V1.
+  optional string commit_action_position_column = 4;
 }
 
 message ValuesRow {
@@ -100,7 +103,6 @@ message MaxNonNullByAgg {
   delta.kernel.expressions.ColumnName value = 1;
   delta.kernel.expressions.ColumnName key = 2;
 }
-
 message Agg {
   oneof func {
     MinAgg min = 1;
@@ -153,7 +155,14 @@ message PlanNode {
   repeated uint32 inputs = 2;
 }
 
+message PlanHeader {
+  int32 protocol_major = 1;
+  int32 protocol_minor = 2;
+  repeated string required_capabilities = 3;
+}
+
 // The plan's terminal node is its last entry; the engine streams that node's rows.
 message Plan {
   repeated PlanNode nodes = 1;
+  PlanHeader header = 2;
 }
