@@ -6,6 +6,7 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -23,7 +24,7 @@ use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, copy_directory, create_default_engine,
-    create_default_engine_mt_executor, insert_data, load_and_begin_transaction,
+    create_default_engine_mt_executor, insert_data, into_record_batch, load_and_begin_transaction,
     read_actions_from_commit, setup_test_tables, test_table_setup,
 };
 use url::Url;
@@ -762,8 +763,13 @@ async fn test_update_deletion_vectors_with_selection_vector(
     // the test will fail.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut setup_txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+    let initial_dvs = sequential_dv_descriptors(&file_paths);
+    let initial_dv_ids: HashMap<_, _> = initial_dvs
+        .iter()
+        .map(|(path, dv)| (path.clone(), dv.unique_id()))
+        .collect();
     setup_txn.update_deletion_vectors(
-        sequential_dv_descriptors(&file_paths),
+        initial_dvs,
         get_scan_files(snapshot, engine.as_ref())?
             .into_iter()
             .map(Ok),
@@ -795,16 +801,20 @@ async fn test_update_deletion_vectors_with_selection_vector(
             )
         })
         .collect();
+    let updated_dv_ids: HashMap<_, _> = dv_map
+        .iter()
+        .map(|(path, dv)| (path.clone(), dv.unique_id()))
+        .collect();
 
-    let mut scan_data: Vec<_> = get_scan_files(snapshot, engine.as_ref())?
+    let batches = get_scan_files(snapshot, engine.as_ref())?
         .into_iter()
-        .map(FilteredEngineData::apply_selection_vector)
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
         .collect::<Result<Vec<_>, _>>()?;
-    scan_data.retain(|data| data.len() > 0);
-    assert_eq!(scan_data.len(), 1, "expected one active scan batch");
-    let data = scan_data.pop().unwrap();
-    assert_eq!(data.len(), file_paths.len());
-    let scan_files = FilteredEngineData::try_new(data, selection_vector.to_vec())?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let scan_files = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(batch)),
+        selection_vector.to_vec(),
+    )?;
 
     let update_result = txn.update_deletion_vectors(dv_map, std::iter::once(Ok(scan_files)));
     if expect_mismatch {
@@ -818,6 +828,7 @@ async fn test_update_deletion_vectors_with_selection_vector(
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     let version = committed.commit_version();
 
+    // Read the commit directly from the (in-memory) store.
     let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
     let commit_content = store
         .get(&Path::from_url_path(commit_path.path())?)
@@ -859,6 +870,24 @@ async fn test_update_deletion_vectors_with_selection_vector(
         removed_paths, expected,
         "removed paths must be exactly the targeted files"
     );
+
+    let dv_id = |action: &serde_json::Value| {
+        let dv = &action["deletionVector"];
+        format!(
+            "{}{}@{}",
+            dv["storageType"].as_str().unwrap(),
+            dv["pathOrInlineDv"].as_str().unwrap(),
+            dv["offset"].as_i64().unwrap()
+        )
+    };
+    for add in &adds {
+        let path = add["path"].as_str().unwrap();
+        assert_eq!(dv_id(add), updated_dv_ids[path]);
+    }
+    for remove in &removes {
+        let path = remove["path"].as_str().unwrap();
+        assert_eq!(dv_id(remove), initial_dv_ids[path]);
+    }
 
     // Each new add carries its DV and widened tightBounds, with numRecords preserved.
     for add in &adds {
