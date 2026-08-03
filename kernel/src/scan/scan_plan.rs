@@ -1208,6 +1208,7 @@ mod tests {
         let engine = SyncEngine::new_with_store(store);
         let mut batches = engine
             .plan_executor()
+            .unwrap()
             .execute_op(PlanOperation::QueryPlan(plan))?
             .into_data()?;
         let batch = batches
