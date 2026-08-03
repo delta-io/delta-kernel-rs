@@ -1430,6 +1430,14 @@ mod tests {
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("filemod", DataType::LONG),
             StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
+            StructField::nullable("c", DataType::INTEGER),
+        ]))
+    }
+
+    fn sample_dynamic_scan_output_schema() -> SchemaRef {
+        Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("c", DataType::INTEGER),
         ]))
     }
 
@@ -1449,15 +1457,15 @@ mod tests {
         #[case] base_url: Url,
         #[case] expected_base_url: &str,
     ) -> DeltaResult<()> {
-        let node = DynamicScan::new(
+        let node = DynamicScan::try_new(
             &sample_dynamic_scan_input_schema(),
-            sample_schema(),
+            sample_dynamic_scan_output_schema(),
             file_type,
             base_url,
+            ["c"],
             sample_dynamic_scan_file_metadata_columns(),
             ColumnName::new(["dv"]),
-        )?
-        .with_file_constant_columns(["c"]);
+        )?;
         let proto = proto_plan::DynamicScanNode::from(&node);
         assert!(proto.schema.is_some());
         assert_eq!(

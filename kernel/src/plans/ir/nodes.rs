@@ -3,7 +3,7 @@
 //! [`Operator`] enumerates every operator. Each operator's payload struct is defined
 //! below.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use strum::Display;
 use url::Url;
@@ -348,23 +348,26 @@ pub struct DynamicScanFileMetadataColumns {
 }
 
 impl DynamicScanFileMetadataColumns {
-    /// The columns naming each file's path, size, and last-modified timestamp.
-    pub fn new(
+    /// Constructs validated column names for each file's path, size, and modification time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a named column is absent from `input_schema`, has an incompatible
+    /// type, or is nullable, including through a nullable parent struct.
+    pub fn try_new(
+        input_schema: &SchemaRef,
         path_column: ColumnName,
         file_size_column: ColumnName,
         last_modified_column: ColumnName,
-    ) -> Self {
-        Self {
+    ) -> DeltaResult<Self> {
+        Self::validate_column(input_schema, &path_column, &DataType::STRING)?;
+        Self::validate_column(input_schema, &file_size_column, &DataType::LONG)?;
+        Self::validate_column(input_schema, &last_modified_column, &DataType::LONG)?;
+        Ok(Self {
             path_column,
             file_size_column,
             last_modified_column,
-        }
-    }
-
-    pub(crate) fn validate_input_schema(&self, schema: &SchemaRef) -> DeltaResult<()> {
-        Self::validate_column(schema, &self.path_column, &DataType::STRING)?;
-        Self::validate_column(schema, &self.file_size_column, &DataType::LONG)?;
-        Self::validate_column(schema, &self.last_modified_column, &DataType::LONG)
+        })
     }
 
     fn validate_column(
@@ -465,61 +468,97 @@ pub struct DynamicScan {
 impl DynamicScan {
     /// Constructs a [`DynamicScan`] whose emitted rows match `output_schema`.
     ///
-    /// `input_schema` describes the upstream rows containing file metadata. Validation here
-    /// provides early diagnostics; plan attachment revalidates against the actual upstream schema.
-    /// The scan reads `file_type` files relative to `base_url` and initially has no file-constant
-    /// columns. Add those with [`Self::with_file_constant_columns`].
+    /// `input_schema` describes the upstream rows containing file metadata and validates the
+    /// deletion-vector column. Construct `file_meta` with
+    /// [`DynamicScanFileMetadataColumns::try_new`] against the same schema. Plan attachment
+    /// applies both constructor validations to the actual upstream schema. The scan reads
+    /// `file_type` files relative to `base_url`.
     ///
     /// # Errors
     ///
-    /// Returns an error when a file-metadata or deletion-vector column is absent from
-    /// `input_schema`, either kind of column has an incompatible type, or a required path, size, or
-    /// last-modified column is nullable.
-    pub fn new(
+    /// Returns an error when the deletion-vector column is absent from `input_schema` or has an
+    /// incompatible type, or when a file-constant column is absent from either schema, is a
+    /// metadata column, or has different input and output types or nullability.
+    pub fn try_new(
         input_schema: &SchemaRef,
         output_schema: impl Into<SchemaRef>,
         file_type: FileType,
         base_url: Url,
+        file_constant_columns: impl IntoIterator<Item = impl Into<String>>,
         file_meta: DynamicScanFileMetadataColumns,
         dv_column: ColumnName,
     ) -> DeltaResult<Self> {
-        let scan = Self {
-            schema: output_schema.into(),
-            file_type,
-            base_url,
-            file_constant_columns: Vec::new(),
-            file_meta,
-            dv_column,
-        };
-        scan.validate_input_schema(input_schema)?;
-        Ok(scan)
-    }
+        static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
+            LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
 
-    /// Set the output columns broadcast from the upstream row (see
-    /// [`Self::file_constant_columns`]).
-    pub fn with_file_constant_columns(
-        mut self,
-        columns: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.file_constant_columns = columns.into_iter().map(Into::into).collect();
-        self
-    }
+        let schema = output_schema.into();
+        let file_constant_columns = file_constant_columns
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        Self::validate_file_constant_columns(input_schema, &schema, &file_constant_columns)?;
 
-    pub(crate) fn validate_input_schema(&self, schema: &SchemaRef) -> DeltaResult<()> {
-        self.file_meta.validate_input_schema(schema)?;
-        let field = schema.field_at(&self.dv_column).map_err(|err| {
+        let field = input_schema.field_at(&dv_column).map_err(|err| {
             Error::generic(format!(
-                "dynamic scan: deletion-vector column `{}` is invalid: {err}",
-                self.dv_column
+                "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
             ))
         })?;
-        let expected = DataType::from(DeletionVectorDescriptor::to_schema());
-        if field.data_type() != &expected {
+        let expected = &*DELETION_VECTOR_DATA_TYPE;
+        if field.data_type() != expected {
             return Err(Error::generic(format!(
-                "dynamic scan: deletion-vector column `{}` must have type {expected:?}, found {:?}",
-                self.dv_column,
+                "dynamic scan: deletion-vector column `{dv_column}` must have type \
+                 {expected:?}, found {:?}",
                 field.data_type()
             )));
+        }
+
+        Ok(Self {
+            schema,
+            file_type,
+            base_url,
+            file_constant_columns,
+            file_meta,
+            dv_column,
+        })
+    }
+
+    fn validate_file_constant_columns(
+        input_schema: &SchemaRef,
+        output_schema: &SchemaRef,
+        file_constant_columns: &[String],
+    ) -> DeltaResult<()> {
+        for name in file_constant_columns {
+            let Some(input_field) = input_schema.field(name) else {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant source: column `{name}` not found; schema has \
+                     {:?}",
+                    Vec::from_iter(input_schema.fields().map(|field| field.name())),
+                )));
+            };
+            if input_field.is_metadata_column() {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant source: column `{name}` is a metadata column"
+                )));
+            }
+            let Some(output_field) = output_schema.field(name) else {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant: column `{name}` not found; schema has {:?}",
+                    Vec::from_iter(output_schema.fields().map(|field| field.name())),
+                )));
+            };
+            if output_field.is_metadata_column() {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant: column `{name}` is a metadata column"
+                )));
+            }
+            if input_field.data_type() != output_field.data_type()
+                || input_field.is_nullable() != output_field.is_nullable()
+            {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant: column `{name}` must have the same type and \
+                     nullability in input and output"
+                )));
+            }
         }
         Ok(())
     }

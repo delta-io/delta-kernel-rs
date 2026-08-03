@@ -280,19 +280,20 @@ fn sidecar_actions(
             SIDECAR_FILE_META_SCHEMA.clone(),
         )?;
 
-    let dynamic_scan = DynamicScan::new(
+    let dynamic_scan = DynamicScan::try_new(
         &SIDECAR_FILE_META_SCHEMA,
         action_schema,
         FileType::Parquet,
         log_root.join("_sidecars/")?,
-        DynamicScanFileMetadataColumns::new(
+        [VERSION],
+        DynamicScanFileMetadataColumns::try_new(
+            &SIDECAR_FILE_META_SCHEMA,
             ColumnName::new([FILE_PATH]),
             ColumnName::new([FILE_SIZE]),
             ColumnName::new([FILE_MOD]),
-        ),
+        )?,
         ColumnName::new([DV]),
-    )?
-    .with_file_constant_columns([VERSION]);
+    )?;
 
     sidecar_files.dynamic_scan(dynamic_scan)
 }
