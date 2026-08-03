@@ -4,7 +4,7 @@ use crate::engine_data::MapItem;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-pub(super) fn validate_required_field<T>(
+pub(super) fn validate_required_field_exist<T>(
     value: Option<T>,
     path: &str,
     field: &str,
