@@ -11,6 +11,7 @@ use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
@@ -80,6 +81,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
     };
     let batches = engine
         .plan_executor()
+        .unwrap()
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?;
 
@@ -302,6 +304,7 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Delta
         .expect("metadata plan");
     let batches = engine
         .plan_executor()
+        .unwrap()
         .execute_op(PlanOperation::QueryPlan(plan))?
         .into_data()?;
 
@@ -466,4 +469,23 @@ fn assert_declarative_metadata_matches_imperative(
     let actual = declarative_metadata(&scan, &engine)?;
 
     assert_metadata_eq(&actual, &expected, table.description())
+}
+
+#[test]
+fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
+        .build()
+        .expect("build checkpoint-plus-commits table");
+    let sync_engine = Arc::new(SyncEngine::new_with_store(table.store().clone()));
+    let snapshot = Snapshot::builder_for(table.table_root()).build(sync_engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+
+    let no_plan_engine = DelegatingEngine::new(sync_engine).without_plan_executor();
+    let err = scan
+        .declarative_metadata_scan_plan(&no_plan_engine)
+        .unwrap_err();
+
+    assert!(matches!(err, crate::Error::Unsupported(_)));
+    Ok(())
 }

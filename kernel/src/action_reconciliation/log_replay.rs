@@ -525,23 +525,27 @@ impl ActionReconciliationVisitor<'_> {
             return Ok(None); // Not a txn action, continue checking other types
         };
 
-        // Check retention if last_updated is present
+        // Replay is newest-to-oldest, so the first txn seen for an app_id is the winner. Record it
+        // before checking retention: an expired winner must still suppress older txns for the same
+        // app_id rather than let one of them survive.
+        if !self.seen_txns.insert(app_id.to_string()) {
+            return Ok(Some(false)); // superseded by a newer txn for this app_id
+        }
+
+        // Exclude the winner when retention has expired it. A txn without last_updated never
+        // expires (kept for backward compatibility).
         if let Some(retention_ts) = self.txn_expiration_timestamp {
             if let Some(last_updated) =
                 getters[Self::TXN_LAST_UPDATED.index].get_opt(i, Self::TXN_LAST_UPDATED.name)?
             {
                 let last_updated: i64 = last_updated;
                 if last_updated <= retention_ts {
-                    // Transaction is old, exclude it
                     return Ok(Some(false));
                 }
             }
-            // Note: transactions without last_updated are kept for backward compatibility
         }
 
-        // If the app ID already exists in the set, the insertion will return false,
-        // indicating that this is a duplicate.
-        Ok(Some(self.seen_txns.insert(app_id.to_string())))
+        Ok(Some(true))
     }
 
     /// Processes a potential domainMetadata action to determine if it should be included.
@@ -1106,14 +1110,51 @@ mod tests {
 
         visitor.visit_rows_of(batch.as_ref())?;
 
-        // app1 and app4 should be filtered out (too old)
-        // app2 and app3 should be kept
+        // app1 and app4 are excluded (expired); app2 and app3 are emitted. All four app_ids are
+        // recorded as seen, since recording precedes the retention check.
         let expected = vec![false, true, true, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 2);
-        assert_eq!(visitor.seen_txns.len(), 2);
-        assert!(visitor.seen_txns.contains("app2"));
-        assert!(visitor.seen_txns.contains("app3"));
+        assert_eq!(visitor.seen_txns.len(), 4);
+
+        Ok(())
+    }
+
+    // Replay is newest-to-oldest. When an app_id's newest txn is expired but an older one is not,
+    // the app_id must be dropped entirely: the expired newest suppresses the older duplicate, and
+    // neither reaches the checkpoint. Guards against resurrecting the older txn (a stale winner).
+    #[test]
+    fn test_action_reconciliation_expired_newest_txn_suppresses_older_txn_for_same_app(
+    ) -> DeltaResult<()> {
+        let json_strings: StringArray = vec![
+            // Newest for "app" (visited first), expired.
+            r#"{"txn":{"appId":"app","version":2,"lastUpdated":500}}"#,
+            // Older for "app", not expired. Must NOT survive.
+            r#"{"txn":{"appId":"app","version":1,"lastUpdated":2000}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut seen_file_keys = HashSet::new();
+        let mut seen_txns = HashSet::new();
+        let mut seen_domains = HashSet::new();
+        let mut visitor = ActionReconciliationVisitor::new(
+            &mut seen_file_keys,
+            true,
+            vec![true; 2],
+            0,
+            false,
+            false,
+            &mut seen_txns,
+            &mut seen_domains,
+            Some(1000),
+        );
+
+        visitor.visit_rows_of(batch.as_ref())?;
+
+        assert_eq!(visitor.selection_vector, vec![false, false]);
+        assert_eq!(visitor.actions_count, 0);
+        assert_eq!(visitor.seen_txns.len(), 1);
 
         Ok(())
     }

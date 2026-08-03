@@ -1,7 +1,7 @@
 # Writing to Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-rest-client -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-client-default -->
 
 To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`,
 pass it to a Kernel transaction, and then publish the staged commit to make it
@@ -9,51 +9,53 @@ visible in `_delta_log/`.
 
 Before reading this page, make sure you understand the generic
 [catalog-managed write lifecycle](../catalog_managed/writing.md) and the
-[Unity Catalog integration overview](./overview.md).
+[Unity Catalog Integration overview](./overview.md).
 
 > [!NOTE]
 > This page uses the `delta-kernel-unity-catalog` and
-> `unity-catalog-delta-rest-client` crates. All code examples use
+> `unity-catalog-delta-client-default` crates. All code examples use
 > `rust,ignore` because they require these external crates.
 
 ## Set up clients and resolve the table
 
-Use `UCClient` to resolve the table name and fetch read-write credentials, then
-build a `UCCommitsRestClient` for the commits API. Both clients share a
+Use `UCClient` to load the table and fetch read-write credentials, and build a
+`UCUpdateTableRestClient` for the commit path. Both clients share a
 `ClientConfig`.
 
 ```rust,ignore
 use std::sync::Arc;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCCommitsRestClient};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
 let uc_client = UCClient::new(config.clone())?;
-let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
+let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
-// Resolve table name to table ID and storage location
-let table_info = uc_client.get_table("my_catalog.my_schema.my_table").await?;
-let table_id = &table_info.table_id;
-let table_uri = &table_info.storage_location;
+// Load the table: metadata + inline log tail
+let resp = uc_client
+    .load_table("my_catalog", "my_schema", "my_table")
+    .await?;
+let table_uri = url::Url::parse(&resp.metadata.location)?;
 
 // Fetch read-write credentials for the table's cloud storage
-let creds = uc_client.get_credentials(table_id, Operation::ReadWrite).await?;
+let creds = uc_client
+    .get_table_credentials("my_catalog", "my_schema", "my_table", Operation::ReadWrite)
+    .await?;
 ```
 
-For the full details on resolving tables and building an engine with vended
-credentials, see [Reading UC Tables](./reading.md).
+For the full details on building an engine from vended credentials, see
+[Reading UC Tables](./reading.md).
 
-## Load a snapshot with the log tail
+## Load a snapshot from the load_table response
 
-Use `UCKernelClient` to load a snapshot. It fetches the catalog's log tail
-(staged commits) and passes them to Kernel's `Snapshot::builder_for` with
-`with_log_tail` and `with_max_catalog_version`.
+Build the Snapshot from the `load_table` response. Pass it to
+`snapshot_builder_from_load_table` to get a `SnapshotBuilder` with the log tail
+and max catalog version already applied, then call `build`.
 
 ```rust,ignore
-use delta_kernel_unity_catalog::UCKernelClient;
+use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 
-let catalog = UCKernelClient::new(commits_client.as_ref());
-let snapshot = catalog.load_snapshot(table_id, table_uri, &engine).await?;
+let snapshot = snapshot_builder_from_load_table(&resp)?.build(&engine)?;
 ```
 
 The returned `Snapshot` reflects all ratified commits the catalog knows about,
@@ -62,12 +64,20 @@ including those that haven't been published to `_delta_log/` yet.
 ## Create a transaction with `UCCommitter`
 
 `UCCommitter` implements Kernel's `Committer` trait. It stages the commit to
-`_staged_commits/`, then calls the UC commits API to ratify it.
+`_staged_commits/`, then submits it to the UC `update_table` API for Unity
+Catalog to ratify. Construct it with the commit client and the table's
+three-part name plus its table ID.
 
 ```rust,ignore
 use delta_kernel_unity_catalog::UCCommitter;
+use unity_catalog_delta_client_api::TableIdentifier;
 
-let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+let table_id = resp.metadata.table_uuid.clone();
+let committer = Box::new(UCCommitter::new(
+    update_client.clone(),
+    table_id.clone(),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
+));
 let mut txn = snapshot.clone().transaction(committer, &engine)?
     .with_operation("INSERT".to_string());
 ```
@@ -138,11 +148,12 @@ Under the hood, `UCCommitter::commit` does two things for versions >= 1:
 
 1. Writes the transaction's actions to
    `_delta_log/_staged_commits/<version>.<uuid>.json`
-2. Calls the UC commits API to ratify the staged commit
+2. Submits the staged commit to the UC `update_table` API, where Unity Catalog
+   ratifies it
 
-For version 0 (table creation), the committer writes directly to
-`_delta_log/00000000000000000000.json` instead and skips the UC commits API.
-See [Creating UC Tables](./creating_tables.md) for the full creation flow and
+Version 0 (table creation) takes a different path: `UCCommitter` writes
+`_delta_log/00000000000000000000.json` directly and skips the `update_table` API.
+See [Creating UC Tables](./creating_tables.md) for the creation flow and
 [the catalog-managed write lifecycle](../catalog_managed/writing.md) for the
 generic ratification flow.
 
@@ -160,10 +171,14 @@ readers can see the commit.
 
 ```rust,ignore
 use delta_kernel_unity_catalog::UCCommitter;
+use unity_catalog_delta_client_api::TableIdentifier;
 
-// Keep a reference to the committer for publishing
-let committer: Box<dyn delta_kernel::committer::Committer> =
-    Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+// Build a committer to drive publishing
+let committer: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
+    update_client.clone(),
+    table_id.clone(),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
+));
 
 let published_snapshot = post_commit_snapshot
     .publish(&engine, committer.as_ref())?;
@@ -173,12 +188,57 @@ Publishing copies each staged commit from `_staged_commits/<version>.<uuid>.json
 to `_delta_log/<version>.json`. If a published file already exists (from a
 previous publish attempt), the copy is silently skipped.
 
+## Report commit metrics
+
+After a successful commit, report commit metrics to the catalog. For a
+catalog-managed table, the catalog owns table maintenance, not your connector.
+Unity Catalog uses the per-commit metrics you report to decide when to schedule
+OPTIMIZE and VACUUM.
+
+> [!NOTE]
+> Support for the metrics endpoint depends on the catalog. Some catalogs accept
+> reported metrics; others, including the open-source Unity Catalog server, do
+> not implement it yet and return a 404. Treat the report as best-effort: a
+> failure never affects commit correctness.
+
+You supply the counts the write engine observed. The row counts and the
+file-size histogram are only known to your engine. File and byte counts are
+derivable from the commit's add and remove actions.
+
+The catalog requires the commit version on every report, and reads it from
+`file_size_histogram.commit_version`. Set it to the version your commit
+produced. When you have no size distribution to report, send a histogram with
+empty bins that carries only the version.
+
+```rust,ignore
+use unity_catalog_delta_client_api::{CommitReport, FileSizeHistogram};
+
+let report = CommitReport {
+    num_files_added: 3,
+    num_bytes_added: 4096,
+    num_rows_inserted: Some(1000),
+    file_size_histogram: FileSizeHistogram {
+        commit_version,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+
+// table_id comes from the load_table response (metadata.table_uuid).
+if let Err(e) = uc_client
+    .report_metrics("my_catalog", "my_schema", "my_table", &table_id, report)
+    .await
+{
+    eprintln!("metrics report failed (non-fatal): {e}");
+}
+```
+
 ## Post-publish maintenance
 
 Once commits are published, you can checkpoint the table:
 
 ```rust,ignore
-published_snapshot.checkpoint(&engine)?;
+published_snapshot.checkpoint(&engine, None)?;
 ```
 
 Checkpointing requires published commits. If you skip the publish step,
@@ -189,32 +249,39 @@ checkpointing fails because it can only operate on published versions.
 ```rust,ignore
 use std::sync::Arc;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel_unity_catalog::{UCCommitter, UCKernelClient};
-use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCCommitsRestClient};
+use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
+use unity_catalog_delta_client_api::{Operation, TableIdentifier};
+use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 // 1. Set up clients
 let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
 let uc_client = UCClient::new(config.clone())?;
-let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
+let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
-// 2. Resolve table and fetch credentials
-let table_info = uc_client.get_table("my_catalog.my_schema.my_table").await?;
-let table_id = &table_info.table_id;
-let table_uri = &table_info.storage_location;
-let creds = uc_client.get_credentials(table_id, Operation::ReadWrite).await?;
+// 2. Load the table and fetch read-write credentials
+let resp = uc_client
+    .load_table("my_catalog", "my_schema", "my_table")
+    .await?;
+let table_uri = url::Url::parse(&resp.metadata.location)?;
+let table_id = resp.metadata.table_uuid.clone();
+let creds = uc_client
+    .get_table_credentials("my_catalog", "my_schema", "my_table", Operation::ReadWrite)
+    .await?;
 
 // 3. Build engine with vended credentials. `build_engine_with_credentials` is
 //    a connector-owned helper, not part of the library. See Step 4 of
 //    [Reading UC Tables](./reading.md) for the full expansion.
-let engine = build_engine_with_credentials(table_uri, &creds)?;
+let engine = build_engine_with_credentials(&table_uri, &creds)?;
 
-// 4. Load snapshot via UC log tail
-let catalog = UCKernelClient::new(commits_client.as_ref());
-let snapshot = catalog.load_snapshot(table_id, table_uri, &engine).await?;
+// 4. Build a Snapshot from the load_table response
+let snapshot = snapshot_builder_from_load_table(&resp)?.build(&engine)?;
 
 // 5. Create transaction with UCCommitter
-let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+let committer = Box::new(UCCommitter::new(
+    update_client.clone(),
+    table_id.clone(),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
+));
 let mut txn = snapshot.clone().transaction(committer, &engine)?
     .with_operation("INSERT".to_string());
 
@@ -224,8 +291,11 @@ let write_context = txn.unpartitioned_write_context()?;
 txn.add_files(file_metadata);
 
 // 7. Commit, publish, and checkpoint
-let committer_for_publish: Box<dyn delta_kernel::committer::Committer> =
-    Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
+let committer_for_publish: Box<dyn delta_kernel::committer::Committer> = Box::new(UCCommitter::new(
+    update_client.clone(),
+    table_id.clone(),
+    TableIdentifier::new("my_catalog", "my_schema", "my_table"),
+));
 
 match txn.commit(&engine)? {
     CommitResult::CommittedTransaction(committed) => {
@@ -238,7 +308,7 @@ match txn.commit(&engine)? {
             .publish(&engine, committer_for_publish.as_ref())?;
 
         // Checkpoint the published snapshot
-        published_snapshot.checkpoint(&engine)?;
+        published_snapshot.checkpoint(&engine, None)?;
     }
     CommitResult::ConflictedTransaction(_) => { /* rebase and retry */ }
     CommitResult::RetryableTransaction(_) => { /* retry the commit */ }
