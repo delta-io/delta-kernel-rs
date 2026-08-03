@@ -5,9 +5,15 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
-use delta_kernel::arrow::array::{Int32Array, RecordBatch};
-use delta_kernel::arrow::compute::concat_batches;
-use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use delta_kernel::arrow::array::{
+    new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray,
+};
+use delta_kernel::arrow::compute::{concat, concat_batches};
+use delta_kernel::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -775,6 +781,244 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     Ok(())
 }
 
+#[derive(Clone)]
+struct ScanFileModification {
+    field_name: &'static str,
+    value: ArrayRef,
+    row_id: usize,
+}
+
+#[rstest::rstest]
+#[case::empty_path(
+    ScanFileModification {
+        field_name: "path",
+        value: string_array(""),
+        row_id: 0,
+    },
+    "path must not be empty"
+)]
+#[case::missing_partition_values(
+    ScanFileModification {
+        field_name: "partitionValues",
+        value: null_partition_values(),
+        row_id: 1,
+    },
+    "missing required field 'partitionValues'"
+)]
+#[case::extra_partition_key(
+    ScanFileModification {
+        field_name: "partitionValues",
+        value: string_map_array(&[("stray", Some("value"))]),
+        row_id: 2,
+    },
+    "partitionValues keys"
+)]
+#[case::duplicate_partition_key(
+    ScanFileModification {
+        field_name: "partitionValues",
+        value: string_map_array(&[
+            ("stray", Some("first")),
+            ("stray", Some("second")),
+        ]),
+        row_id: 0,
+    },
+    "duplicate partition column names"
+)]
+#[case::missing_size(
+    ScanFileModification {
+        field_name: "size",
+        value: new_null_array(&ArrowDataType::Int64, 1),
+        row_id: 1,
+    },
+    "missing required field 'size'"
+)]
+#[case::negative_size(
+    ScanFileModification {
+        field_name: "size",
+        value: int64_array(-1),
+        row_id: 2,
+    },
+    "size must be non-negative"
+)]
+#[case::missing_modification_time(
+    ScanFileModification {
+        field_name: "modificationTime",
+        value: new_null_array(&ArrowDataType::Int64, 1),
+        row_id: 0,
+    },
+    "missing required field 'modificationTime'"
+)]
+#[tokio::test]
+async fn test_update_deletion_vectors_commit_rejects_corrupted_scan_files(
+    #[case] modification: ScanFileModification,
+    #[case] expected_error: &str,
+    #[values(0, 1, 2)] invalid_batch_index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const BATCH_COUNT: usize = 3;
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("part", DataType::STRING),
+    ])?);
+    let (_store, engine, table_url, file_paths) = create_dv_table_with_files(
+        "test_table",
+        schema,
+        &[("part", Some("value"))],
+        &["file0.parquet", "file1.parquet", "file2.parquet"],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let scan_file = get_scan_files(snapshot.clone(), engine.as_ref())?
+        .into_iter()
+        .next()
+        .expect("table should contain one scan-file batch");
+    let scan_files =
+        make_scan_file_batches(scan_file, &modification, invalid_batch_index, BATCH_COUNT);
+    let mut descriptors = sequential_dv_descriptors(&file_paths);
+    if modification.field_name == "path" {
+        let path = modification.value.as_string::<i32>().value(0);
+        let descriptor = descriptors
+            .remove(&file_paths[0])
+            .expect("descriptor for original path");
+        descriptors.insert(path.to_string(), descriptor);
+    }
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    txn.update_deletion_vectors(descriptors, scan_files.into_iter().map(Ok))?;
+
+    assert_result_error_with_message(txn.commit(engine.as_ref()), expected_error);
+    Ok(())
+}
+
+fn make_scan_file_batches(
+    scan_file: FilteredEngineData,
+    modification: &ScanFileModification,
+    invalid_batch_index: usize,
+    batch_count: usize,
+) -> Vec<FilteredEngineData> {
+    let (data, selection_vector) = scan_file.into_parts();
+    let batch = into_record_batch(data);
+    (0..batch_count)
+        .map(|batch_index| {
+            let selection_vector = if batch_index == invalid_batch_index {
+                selection_vector.clone()
+            } else {
+                vec![false; batch.num_rows()]
+            };
+            let scan_file = FilteredEngineData::try_new(
+                Box::new(ArrowEngineData::new(batch.clone())),
+                selection_vector,
+            )
+            .expect("selection vector length should match scan-file row count");
+            if batch_index == invalid_batch_index {
+                modify_scan_file(scan_file, modification)
+            } else {
+                scan_file
+            }
+        })
+        .collect()
+}
+
+fn modify_scan_file(
+    scan_file: FilteredEngineData,
+    modification: &ScanFileModification,
+) -> FilteredEngineData {
+    let (data, selection_vector) = scan_file.into_parts();
+    let batch = into_record_batch(data);
+    let schema = batch.schema();
+    let mut columns = batch.columns().to_vec();
+    let row_index = (0..batch.num_rows())
+        .filter(|&row_index| selection_vector.get(row_index).copied().unwrap_or(true))
+        .nth(modification.row_id)
+        .expect("modified selected row must exist in scan-file batch");
+    assert!(row_index < batch.num_rows(), "modified row must exist");
+
+    if modification.field_name == "partitionValues" {
+        let constants_index = schema
+            .index_of("fileConstantValues")
+            .expect("fileConstantValues field in scan data");
+        let constants = columns[constants_index].as_struct();
+        let partition_values_index = constants
+            .fields()
+            .iter()
+            .position(|field| field.name() == "partitionValues")
+            .expect("partitionValues field in fileConstantValues");
+        let partition_values = constants.column(partition_values_index);
+        let mut constant_columns = constants.columns().to_vec();
+        constant_columns[partition_values_index] =
+            replace_array_row(partition_values, modification.value.clone(), row_index);
+        columns[constants_index] = Arc::new(StructArray::new(
+            constants.fields().clone(),
+            constant_columns,
+            constants.nulls().cloned(),
+        ));
+    } else {
+        let field_index = schema
+            .index_of(modification.field_name)
+            .expect("modified field in scan data");
+        columns[field_index] =
+            replace_array_row(&columns[field_index], modification.value.clone(), row_index);
+    }
+
+    let batch = RecordBatch::try_new(schema, columns)
+        .expect("modified scan-file schema and columns should form a valid batch");
+    FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection_vector)
+        .expect("selection vector length should match modified scan-file row count")
+}
+
+fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row_id: usize) -> ArrayRef {
+    assert_eq!(
+        replacement.len(),
+        1,
+        "replacement must contain exactly one row"
+    );
+    let slices = [
+        column.slice(0, row_id),
+        replacement,
+        column.slice(row_id + 1, column.len() - row_id - 1),
+    ];
+    let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
+    concat(&arrays).expect("replacement value must match the modified column type")
+}
+
+fn string_array(value: &str) -> ArrayRef {
+    Arc::new(StringArray::from(vec![value]))
+}
+
+fn int64_array(value: i64) -> ArrayRef {
+    Arc::new(Int64Array::from(vec![value]))
+}
+
+fn null_partition_values() -> ArrayRef {
+    let partition_values = string_map_array(&[]);
+    new_null_array(partition_values.data_type(), 1)
+}
+
+fn string_map_array(values: &[(&str, Option<&str>)]) -> ArrayRef {
+    let mut builder = MapBuilder::new(
+        Some(MapFieldNames {
+            entry: "key_value".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        }),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    )
+    .with_keys_field(ArrowField::new("key", ArrowDataType::Utf8, false))
+    .with_values_field(ArrowField::new("value", ArrowDataType::Utf8, true));
+    for (key, value) in values {
+        builder.keys().append_value(key);
+        match value {
+            Some(value) => builder.values().append_value(value),
+            None => builder.values().append_null(),
+        }
+    }
+    builder
+        .append(true)
+        .expect("partition-values row should be valid");
+    Arc::new(builder.finish())
+}
+
 #[tokio::test]
 async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that update_deletion_vectors can update multiple files
@@ -789,7 +1033,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     // Setup: Create table with 3 files
     let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
     let (store, engine, table_url, file_paths) =
-        create_dv_table_with_files("test_table", schema, file_names).await?;
+        create_dv_table_with_files("test_table", schema, &[], file_names).await?;
 
     // Create DV update transaction
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
@@ -925,7 +1169,7 @@ async fn test_update_deletion_vectors_respects_selection_vector(
         "file3.parquet",
     ];
     let (store, engine, table_url, file_paths) =
-        create_dv_table_with_files("test_table", schema, file_names).await?;
+        create_dv_table_with_files("test_table", schema, &[], file_names).await?;
 
     // Attach DV to all files first, if later DV updates incorrectly remove the existing DV,
     // the test will fail.

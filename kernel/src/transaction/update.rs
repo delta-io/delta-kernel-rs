@@ -229,10 +229,10 @@ impl Transaction {
     ///
     /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
     ///   new deletion vector descriptor for that file.
-    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
-    ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
-    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
+    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata using
+    ///   [`scan_row_schema`]. Selected rows must preserve the scan-file values and cover every path
+    ///   in `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
+    ///   accurate `stats.numRecords` value.
     ///
     /// # Errors
     ///
