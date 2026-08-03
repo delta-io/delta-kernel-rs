@@ -41,6 +41,8 @@ pub(crate) struct CheckpointShape {
     /// The requested partition schema when the checkpoint has a compatible
     /// `add.partitionValues_parsed` struct; `None` when it was not requested or is incompatible.
     pub(crate) parsed_partition_schema: Option<SchemaRef>,
+    /// Sidecar files resolved while classifying a manifest checkpoint.
+    pub(crate) resolved_sidecars: Option<Vec<FileMeta>>,
 }
 
 impl CheckpointShape {
@@ -63,6 +65,7 @@ impl CheckpointShape {
                     checkpoint_type: CheckpointType::None,
                     parsed_stats_schema: None,
                     parsed_partition_schema: None,
+                    resolved_sidecars: None,
                 })
             }
         };
@@ -97,26 +100,40 @@ impl CheckpointShape {
                 }
                 // The `sidecar` column may still be all-null (not a manifest), so scan it to
                 // confirm whether a sidecar is actually present.
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => {
-                        Self::try_new_manifest(exec, sidecar, stats_schema, partition_schema)
-                    }
-                    None => Ok(Self::try_new_leaf(
+                let sidecars =
+                    collect_sidecars(exec, root_checkpoint, file_type, &segment.log_root)?;
+                if sidecars.is_empty() {
+                    Ok(Self::try_new_leaf(
                         Some(cp_schema),
                         stats_schema,
                         partition_schema,
-                    )),
+                    ))
+                } else {
+                    Self::try_new_manifest(
+                        exec,
+                        sidecars,
+                        segment.checkpoint_hint_sidecar_schema(),
+                        stats_schema,
+                        partition_schema,
+                    )
                 }
             }
             // A JSON checkpoint has no footer schema to inspect, so try to collect a sidecar to
             // decide if it is a manifest or a leaf. A JSON leaf has no readable schema,
             // hence no parsed stats.
             FileType::Json => {
-                match collect_single_sidecar(exec, root_checkpoint, file_type, &segment.log_root)? {
-                    Some(sidecar) => {
-                        Self::try_new_manifest(exec, sidecar, stats_schema, partition_schema)
-                    }
-                    None => Ok(Self::try_new_leaf(None, stats_schema, partition_schema)),
+                let sidecars =
+                    collect_sidecars(exec, root_checkpoint, file_type, &segment.log_root)?;
+                if sidecars.is_empty() {
+                    Ok(Self::try_new_leaf(None, stats_schema, partition_schema))
+                } else {
+                    Self::try_new_manifest(
+                        exec,
+                        sidecars,
+                        segment.checkpoint_hint_sidecar_schema(),
+                        stats_schema,
+                        partition_schema,
+                    )
                 }
             }
         }
@@ -136,10 +153,18 @@ impl CheckpointShape {
         partition_schema: Option<&SchemaRef>,
     ) -> DeltaResult<Option<CheckpointShape>> {
         match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
-            Some([sidecar, ..]) => {
-                let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
-                let result =
-                    Self::try_new_manifest(exec, sidecar_meta, stats_schema, partition_schema)?;
+            Some(sidecars @ [_, ..]) => {
+                let sidecars = sidecars
+                    .iter()
+                    .map(|sidecar| sidecar.to_filemeta(&segment.log_root))
+                    .collect::<DeltaResult<Vec<_>>>()?;
+                let result = Self::try_new_manifest(
+                    exec,
+                    sidecars,
+                    segment.checkpoint_hint_sidecar_schema(),
+                    stats_schema,
+                    partition_schema,
+                )?;
                 Ok(Some(result))
             }
             Some([]) => {
@@ -169,12 +194,20 @@ impl CheckpointShape {
     /// sidecars of a checkpoint share one schema, so probing the first is sufficient.
     fn try_new_manifest(
         exec: &dyn PlanExecutor,
-        sidecar: FileMeta,
+        sidecars: Vec<FileMeta>,
+        hinted_sidecar_schema: Option<SchemaRef>,
         stats_schema: Option<&SchemaRef>,
         partition_schema: Option<&SchemaRef>,
     ) -> DeltaResult<CheckpointShape> {
+        let first_sidecar = sidecars
+            .first()
+            .expect("manifest checkpoint must have at least one sidecar")
+            .clone();
         let footer_schema = if stats_schema.is_some() || partition_schema.is_some() {
-            Some(exec.read_parquet_footer(sidecar)?.schema)
+            match hinted_sidecar_schema {
+                Some(schema) => Some(schema),
+                None => Some(exec.read_parquet_footer(first_sidecar)?.schema),
+            }
         } else {
             None
         };
@@ -195,6 +228,7 @@ impl CheckpointShape {
             checkpoint_type: CheckpointType::Manifest,
             parsed_stats_schema: parsed_stats_schema.cloned(),
             parsed_partition_schema: parsed_partition_schema.cloned(),
+            resolved_sidecars: Some(sidecars),
         })
     }
 
@@ -222,18 +256,19 @@ impl CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
             parsed_stats_schema: parsed_stats_schema.cloned(),
             parsed_partition_schema: parsed_partition_schema.cloned(),
+            resolved_sidecars: None,
         }
     }
 }
 
 /// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's
 /// [`FileMeta`] (enough to classify and probe; not a full enumeration).
-fn collect_single_sidecar(
+fn collect_sidecars(
     exec: &dyn PlanExecutor,
     file: &FileMeta,
     file_format: FileType,
     log_root: &Url,
-) -> DeltaResult<Option<FileMeta>> {
+) -> DeltaResult<Vec<FileMeta>> {
     let read_schema = LogSegment::sidecar_read_schema();
     // No file-constant columns: the sidecar column is read directly from each file.
     let plan = match file_format {
@@ -246,14 +281,12 @@ fn collect_single_sidecar(
     let mut visitor = SidecarVisitor::default();
     for batch in data {
         visitor.visit_rows_of(batch?.as_ref())?;
-        if !visitor.sidecars.is_empty() {
-            break;
-        }
     }
-    match visitor.sidecars.first() {
-        Some(sidecar) => Ok(Some(sidecar.to_filemeta(log_root)?)),
-        None => Ok(None),
-    }
+    visitor
+        .sidecars
+        .iter()
+        .map(|sidecar| sidecar.to_filemeta(log_root))
+        .collect()
 }
 
 #[cfg(test)]
@@ -419,6 +452,29 @@ mod tests {
             exec.footer_reads.load(Ordering::Relaxed),
             1,
             "fast path footer-reads exactly the hint's first sidecar"
+        );
+    }
+
+    /// A modern V2 hint carries `checkpointMetadata.tags.sidecarFileSchema`; use it instead of a
+    /// sidecar footer while preserving structured-stats compatibility checks.
+    #[rstest]
+    #[case::parquet("v2-parquet-sidecars-struct-stats-only")]
+    #[case::json("v2-json-sidecars-struct-stats-only")]
+    fn fast_path_uses_sidecar_schema_from_checkpoint_metadata_hint(#[case] table: &str) {
+        let (_engine, snapshot, _tempdir) = load_test_table(table).unwrap();
+        let exec = CountingExecutor::new();
+
+        let shape =
+            CheckpointShape::try_new(&exec, snapshot.as_ref(), Some(&probe_stats_schema()), None)
+                .unwrap();
+
+        assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
+        assert_eq!(shape.parsed_stats_schema, Some(probe_stats_schema()));
+        assert_eq!(exec.query_scans.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            exec.footer_reads.load(Ordering::Relaxed),
+            0,
+            "sidecarFileSchema hint must avoid the sidecar footer read"
         );
     }
 

@@ -6,7 +6,6 @@ use rstest::rstest;
 use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
-use crate::arrow::datatypes::DataType as ArrowDataType;
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
@@ -91,23 +90,18 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
         if batch.num_rows() == 0 {
             continue;
         }
-        let add = batch
-            .column_by_name(ADD_NAME)
-            .expect("add column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add struct");
-        let partitions = add
-            .column_by_name(PARTITION_VALUES)
-            .filter(|column| matches!(column.data_type(), ArrowDataType::Struct(_)))
-            .cloned();
+        let partitions = batch.column_by_name(PARTITION_VALUES_PARSED).cloned();
         projected.push(comparable_metadata_batch(
             |name| {
-                add.column_by_name(name)
-                    .unwrap_or_else(|| panic!("add.{name}"))
+                batch
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("metadata field {name}"))
                     .clone()
             },
-            add.column_by_name(STATS).expect("add.stats").clone(),
+            batch
+                .column_by_name(STATS_PARSED)
+                .expect("stats_parsed")
+                .clone(),
             partitions,
         )?);
     }
@@ -311,21 +305,19 @@ fn declarative_metadata_reconstructs_well_formed_stats_and_partitions() -> Delta
     let mut projected = vec![];
     for batch in batches {
         let batch = batch?.try_into_record_batch()?;
-        let add = batch
-            .column_by_name(ADD_NAME)
-            .expect("add column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add struct");
         projected.push(RecordBatch::try_from_iter([
             (
                 "stats",
-                add.column_by_name("stats").expect("add.stats").clone(),
+                batch
+                    .column_by_name(STATS_PARSED)
+                    .expect("stats_parsed")
+                    .clone(),
             ),
             (
                 "partitionValues",
-                add.column_by_name("partitionValues")
-                    .expect("add.partitionValues")
+                batch
+                    .column_by_name(PARTITION_VALUES_PARSED)
+                    .expect("partitionValues_parsed")
                     .clone(),
             ),
         ])?);

@@ -15,7 +15,7 @@ use crate::actions::{
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
@@ -268,6 +268,33 @@ impl LogSegment {
     /// otherwise -- the caller then reads the checkpoint footer instead.
     pub(crate) fn checkpoint_hint_schema(&self) -> Option<SchemaRef> {
         self.checkpoint_hint()?.checkpoint_schema.clone()
+    }
+
+    /// The sidecar file-action schema embedded in a matching V2 checkpoint hint's
+    /// `checkpointMetadata.tags.sidecarFileSchema`. Delta writers include this bounded hint so
+    /// readers can determine structured-stats compatibility without reading a sidecar footer.
+    pub(crate) fn checkpoint_hint_sidecar_schema(&self) -> Option<SchemaRef> {
+        let actions = self
+            .checkpoint_hint()?
+            .v2_checkpoint
+            .as_ref()?
+            .non_file_actions
+            .as_ref()?;
+        let schema_json = actions.iter().find_map(|action| match action {
+            HintAction::CheckpointMetadata(metadata) => metadata
+                .tags
+                .as_ref()?
+                .get("sidecarFileSchema")
+                .map(String::as_str),
+            _ => None,
+        })?;
+        match serde_json::from_str::<StructType>(schema_json) {
+            Ok(schema) => Some(Arc::new(schema)),
+            Err(error) => {
+                debug!(?error, "Ignoring invalid sidecarFileSchema checkpoint hint");
+                None
+            }
+        }
     }
 
     /// The hint's sidecar references, when it describes the selected checkpoint (see

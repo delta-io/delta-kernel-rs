@@ -17,19 +17,19 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, ColumnName, Expression as Expr, Predicate,
+    col, column_name, joined_column_expr, ColumnName, Expression as Expr, Predicate, Scalar,
 };
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
 use crate::plans::ir::plan::{Plan, COMMIT_ACTION_POSITION_V1};
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
-    StructField, ToSchema as _,
+    StructField, StructType, ToSchema as _,
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
 use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, PlanBuilder};
+use crate::{DeltaResult, Error, PlanBuilder};
 
 // === Internal column names ===
 
@@ -44,6 +44,7 @@ const IS_ADD: &str = "is_add";
 const ORDERING_KEY: &str = "ordering_key";
 const ACTION_POSITION: &str = "actionPosition";
 const VERSION: &str = "version";
+const FLAT_METADATA_ROWS_V1: &str = "FLAT_METADATA_ROWS_V1";
 
 /// Build the live-add metadata plan from checkpoint and commit actions.
 ///
@@ -63,10 +64,25 @@ pub(crate) fn build_metadata_scan_plan(
     let prune = stats_skipping_predicate(state);
     let prune = prune.as_ref();
 
-    // The output `add` after reparsing `stats`/`partitionValues`: shared by the commit arm's dedup
-    // carrier and both terminal `{ add }` projections, so every arm agrees on the union schema.
+    // The normalized `add` is retained while replay needs an action envelope. The terminal
+    // projection flattens it into the engine-facing metadata row so consumers do not need to
+    // expand and rename a nested struct before caching it.
     let add_field = add_field_with_parsed_stats_and_partitions(stats_schema, partition_schema)?;
-    let output_schema = schema_ref! { (&add_field) };
+    let (flat_output, output_schema) = flat_metadata_projection(&add_field)?;
+
+    // A checkpoint-only scan needs neither replay identity nor an action envelope. Emit the flat
+    // metadata row directly from the checkpoint so the engine does not execute two wide Projects
+    // merely to add and then discard replay-only columns.
+    if log_segment.listed.ascending_commit_files.is_empty() && prune.is_none() {
+        return checkpoint_only_arm(log_segment, shape, stats_schema, &add_field)?
+            .build_opt()
+            .map(|plan| {
+                plan.map(|plan| {
+                    plan.require_capability(COMMIT_ACTION_POSITION_V1)
+                        .require_capability(FLAT_METADATA_ROWS_V1)
+                })
+            });
+    }
 
     let commit_actions = commit_arm(log_segment, stats_schema, partition_schema)?.try_fold_with(
         prune,
@@ -112,16 +128,19 @@ pub(crate) fn build_metadata_scan_plan(
             [ColumnName::new([FILE_ACTION_KEY])],
             [ColumnName::new([FILE_ACTION_KEY])],
         )?
-        .project(Expr::struct_from([col!("add")]), output_schema.clone())?;
+        .project(flat_output.clone(), output_schema.clone())?;
 
     let commit_live_adds = deduped_commit
         .filter(col!("add").is_not_null())?
-        .project(Expr::struct_from([col!("add")]), output_schema)?;
+        .project(flat_output, output_schema)?;
 
     Ok(
         PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?
             .build_opt()?
-            .map(|plan| plan.require_capability(COMMIT_ACTION_POSITION_V1)),
+            .map(|plan| {
+                plan.require_capability(COMMIT_ACTION_POSITION_V1)
+                    .require_capability(FLAT_METADATA_ROWS_V1)
+            }),
     )
 }
 
@@ -145,41 +164,7 @@ fn checkpoint_arm(
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<&SchemaRef>,
 ) -> DeltaResult<PlanBuilder> {
-    let source_stats_schema = shape.parsed_stats_schema.as_ref();
-    let source_partition_schema = shape.parsed_partition_schema.as_ref();
-    let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
-
-    let actions = match (&shape.checkpoint_type, checkpoint) {
-        (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
-            PlanBuilder::scan_parquet(parts, &[VERSION], schema)
-        }
-        (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
-            PlanBuilder::scan_json(
-                parts,
-                &[VERSION],
-                json_read_schema(
-                    /* include_remove */ false, /* action_position */ false,
-                ),
-            )
-        }
-        (CheckpointType::Manifest, Some((file_type, parts))) => {
-            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
-            match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
-                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
-                // Without a complete hint, load the sidecars referenced by the manifest.
-                None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
-            }
-        }
-        (CheckpointType::None, _) | (_, None) => {
-            PlanBuilder::values(
-                json_read_schema(
-                    /* include_remove */ false, /* action_position */ false,
-                ),
-                vec![],
-            )
-        }
-    }?;
+    let actions = checkpoint_actions(log_segment, shape)?;
 
     actions
         .filter(col!("add.path").is_not_null())?
@@ -195,6 +180,91 @@ fn checkpoint_arm(
                     file_action_key_expr(|column| joined_column_expr!("add", column)),
                 )
         })
+}
+
+/// Build the checkpoint action source selected by the resolved checkpoint shape.
+fn checkpoint_actions(
+    log_segment: &LogSegment,
+    shape: &CheckpointShape,
+) -> DeltaResult<PlanBuilder> {
+    let source_stats_schema = shape.parsed_stats_schema.as_ref();
+    let source_partition_schema = shape.parsed_partition_schema.as_ref();
+    let checkpoint = log_segment.checkpoint_version_tagged_scan_files()?;
+    match (&shape.checkpoint_type, checkpoint) {
+        (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
+            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
+            PlanBuilder::scan_parquet(parts, &[VERSION], schema)
+        }
+        (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
+            PlanBuilder::scan_json(
+                parts,
+                &[VERSION],
+                json_read_schema(
+                    /* include_remove */ false, /* action_position */ false,
+                ),
+            )
+        }
+        (CheckpointType::Manifest, Some((file_type, parts))) => {
+            let schema = parquet_read_schema(source_stats_schema, source_partition_schema)?;
+            match resolved_sidecar_scan_files(log_segment, shape)?
+                .or(log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()?)
+            {
+                Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
+                // Without a complete hint, load the sidecars referenced by the manifest.
+                None => sidecar_actions(file_type, parts, schema, &log_segment.log_root),
+            }
+        }
+        (CheckpointType::None, _) | (_, None) => {
+            PlanBuilder::values(
+                json_read_schema(
+                    /* include_remove */ false, /* action_position */ false,
+                ),
+                vec![],
+            )
+        }
+    }
+}
+
+/// Tag sidecars resolved with the checkpoint shape so the engine can scan them directly.
+fn resolved_sidecar_scan_files(
+    log_segment: &LogSegment,
+    shape: &CheckpointShape,
+) -> DeltaResult<Option<Vec<ScanFile>>> {
+    let Some(sidecars) = shape.resolved_sidecars.as_ref() else {
+        return Ok(None);
+    };
+    let version = log_segment.checkpoint_version.ok_or_else(|| {
+        Error::generic("Resolved checkpoint sidecars require a checkpoint version")
+    })?;
+    let version = crate::version_as_i64(version)?;
+    Ok(Some(
+        sidecars
+            .iter()
+            .cloned()
+            .map(|meta| ScanFile {
+                meta,
+                file_constants: vec![Scalar::Long(version)],
+            })
+            .collect(),
+    ))
+}
+
+/// Build a checkpoint-only plan that normalizes and flattens in one terminal projection.
+fn checkpoint_only_arm(
+    log_segment: &LogSegment,
+    shape: &CheckpointShape,
+    stats_schema: Option<&SchemaRef>,
+    add_field: &StructField,
+) -> DeltaResult<PlanBuilder> {
+    let (projection, output_schema) = flat_checkpoint_metadata_projection(
+        add_field,
+        shape.parsed_stats_schema.is_some(),
+        shape.parsed_partition_schema.is_some(),
+        stats_schema,
+    )?;
+    checkpoint_actions(log_segment, shape)?
+        .filter(col!("add.path").is_not_null())?
+        .project(projection, output_schema)
 }
 
 /// Build the normalized commit JSON arm.
@@ -458,6 +528,104 @@ fn add_field_with_parsed_stats_and_partitions(
     Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
 }
 
+/// Flatten the normalized `add` envelope into the metadata row consumed by engines.
+///
+/// Structured stats and partition values use their public sibling names. Raw JSON stats and the
+/// string partition map remain present only when no typed representation was requested.
+fn flat_metadata_projection(add_field: &StructField) -> DeltaResult<(Expr, SchemaRef)> {
+    let DataType::Struct(add_schema) = &add_field.data_type else {
+        unreachable!("normalized add field must be a struct")
+    };
+    let mut expressions = Vec::with_capacity(add_schema.fields().len());
+    let mut fields = Vec::with_capacity(add_schema.fields().len());
+    let mut structured_metadata = Vec::with_capacity(2);
+    for field in add_schema.fields() {
+        let mut output_field = field.clone();
+        if field.name == STATS && matches!(field.data_type, DataType::Struct(_)) {
+            output_field.name = STATS_PARSED.to_string();
+            structured_metadata.push((field.name.as_str(), output_field));
+        } else if field.name == PARTITION_VALUES && matches!(field.data_type, DataType::Struct(_)) {
+            output_field.name = PARTITION_VALUES_PARSED.to_string();
+            structured_metadata.push((field.name.as_str(), output_field));
+        } else {
+            expressions.push(Expr::column([ADD_NAME, field.name.as_str()]));
+            fields.push(output_field);
+        }
+    }
+    // Match the DSRv2 compact-row layout: canonical AddFile fields first, then typed metadata.
+    // This lets engines cache and filter the row directly without a second normalization Project.
+    for (source_name, output_field) in structured_metadata {
+        expressions.push(Expr::column([ADD_NAME, source_name]));
+        fields.push(output_field);
+    }
+    let output_schema = Arc::new(StructType::try_new(fields)?);
+    Ok((Expr::struct_from(expressions), output_schema))
+}
+
+/// Flat checkpoint projection that also performs the stats/partition normalization normally done
+/// by the replay envelope Project.
+fn flat_checkpoint_metadata_projection(
+    add_field: &StructField,
+    has_source_stats_parsed: bool,
+    has_source_partition_values_parsed: bool,
+    stats_schema: Option<&SchemaRef>,
+) -> DeltaResult<(Expr, SchemaRef)> {
+    let DataType::Struct(add_schema) = &add_field.data_type else {
+        unreachable!("normalized add field must be a struct")
+    };
+    let mut regular = Vec::with_capacity(add_schema.fields().len());
+    let mut structured_metadata = Vec::with_capacity(2);
+    for field in add_schema.fields() {
+        let (expression, output_name, defer) = match (&*field.name, &field.data_type) {
+            (STATS, DataType::Struct(_)) => {
+                let expression = if has_source_stats_parsed {
+                    col!(ADD_NAME, STATS_PARSED)
+                } else {
+                    Expr::parse_json(
+                        col!(ADD_NAME, STATS),
+                        Arc::clone(stats_schema.expect("structured stats schema")),
+                    )
+                };
+                (expression, STATS_PARSED, true)
+            }
+            (STATS, _) if stats_schema.is_none() => {
+                (Expr::null_literal(DataType::STRING), STATS, false)
+            }
+            (PARTITION_VALUES, DataType::Struct(_)) => {
+                let expression = if has_source_partition_values_parsed {
+                    col!(ADD_NAME, PARTITION_VALUES_PARSED)
+                } else {
+                    Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES))
+                };
+                (expression, PARTITION_VALUES_PARSED, true)
+            }
+            (PARTITION_VALUES, _) => (
+                Expr::null_literal(partition_values_map_type()),
+                PARTITION_VALUES,
+                false,
+            ),
+            _ => (
+                Expr::column([ADD_NAME, field.name.as_str()]),
+                field.name.as_str(),
+                false,
+            ),
+        };
+        let mut output_field = field.clone();
+        output_field.name = output_name.to_string();
+        if defer {
+            structured_metadata.push((expression, output_field));
+        } else {
+            regular.push((expression, output_field));
+        }
+    }
+    regular.extend(structured_metadata);
+    let (expressions, fields): (Vec<_>, Vec<_>) = regular.into_iter().unzip();
+    Ok((
+        Expr::struct_from(expressions),
+        Arc::new(StructType::try_new(fields)?),
+    ))
+}
+
 /// Build the metadata pruning predicate, or `None` when no pruning is possible.
 fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
     /// Re-roots metadata columns under `add`.
@@ -605,6 +773,7 @@ mod tests {
             checkpoint_type,
             parsed_stats_schema: parsed_stats,
             parsed_partition_schema: None,
+            resolved_sidecars: None,
         }
     }
 
@@ -830,6 +999,7 @@ mod tests {
                 checkpoint_type: CheckpointType::Manifest,
                 parsed_stats_schema: None,
                 parsed_partition_schema: Some(parsed_partition_schema),
+                resolved_sidecars: None,
             },
         )?
         .expect("non-empty");
@@ -870,7 +1040,10 @@ mod tests {
         assert_eq!(tags(&plan), COMMIT_ARM_TAGS);
         assert_eq!(
             plan.header.required_capabilities,
-            [COMMIT_ACTION_POSITION_V1.to_string()]
+            [
+                COMMIT_ACTION_POSITION_V1.to_string(),
+                FLAT_METADATA_ROWS_V1.to_string(),
+            ]
         );
         let commit_scan = plan
             .nodes
@@ -889,9 +1062,9 @@ mod tests {
 
     #[rstest::rstest]
     #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "project"])]
+        vec!["scan_parquet", "filter", "project"])]
     #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "load", "filter", "project", "project"])]
+        vec!["scan_parquet", "filter", "project", "load", "filter", "project"])]
     fn metadata_plan_checkpoint_only(
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
@@ -997,15 +1170,9 @@ mod tests {
         assert!(batches.next().is_none());
         assert_eq!(batch.num_rows(), 1);
 
-        let add = batch
-            .column_by_name(ADD_NAME)
-            .expect("add column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add struct");
-        let paths = add
+        let paths = batch
             .column_by_name("path")
-            .expect("add.path")
+            .expect("path")
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("path string");
@@ -1047,15 +1214,9 @@ mod tests {
             .next()
             .expect("one batch")?
             .try_into_record_batch()?;
-        let add = batch
-            .column_by_name(ADD_NAME)
-            .expect("add column")
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("add struct");
-        let paths = add
+        let paths = batch
             .column_by_name("path")
-            .expect("add.path")
+            .expect("path")
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("path string");

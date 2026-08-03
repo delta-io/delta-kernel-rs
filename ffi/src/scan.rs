@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
 use delta_kernel::snapshot::SnapshotRef;
@@ -340,6 +341,38 @@ pub unsafe extern "C" fn scan_builder_with_stats(
 ) -> Handle<ExclusiveScanBuilder> {
     let builder = unsafe { builder.into_inner() };
     Box::new(builder.with_stats(options.into())).into()
+}
+
+/// Configure scan metadata to emit structured stats for a caller-selected list of columns.
+///
+/// `columns` is a comma-separated list in [`ColumnName`] syntax. Unlike
+/// [`scan_builder_with_stats`], this can fail when the list is malformed, so errors are returned
+/// through the engine. The column names are logical; Kernel resolves them through column mapping
+/// before constructing the physical checkpoint projection.
+///
+/// Consumes the `builder` handle on both success and error. On success, returns a replacement
+/// builder configured with [`StatsOptions::required_struct_columns`] (and therefore no JSON
+/// synthesis). The required semantics allow an engine's external stats policy to request columns
+/// that are not listed in Kernel's table properties.
+///
+/// # Safety
+///
+/// `builder` and `engine` must be valid handles. `columns` must point to `len` valid UTF-8 bytes
+/// for the duration of this call. The builder must not be used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn scan_builder_with_stats_columns(
+    builder: Handle<ExclusiveScanBuilder>,
+    engine: Handle<SharedExternEngine>,
+    columns: KernelStringSlice,
+) -> ExternResult<Handle<ExclusiveScanBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { builder.into_inner() };
+    let result = (|| {
+        let columns: &str = unsafe { TryFromStringSlice::try_from_slice(&columns) }?;
+        let columns = ColumnName::parse_column_name_list(columns)?;
+        Ok(Box::new(builder.with_stats(StatsOptions::required_struct_columns(columns))).into())
+    })();
+    result.into_extern_result(&engine)
 }
 
 /// Configure how partition values are included in the resulting scan metadata.
@@ -975,8 +1008,8 @@ mod scan_builder_tests {
 
     use super::{
         free_scan, free_scan_builder, scan_builder, scan_builder_build,
-        scan_builder_with_predicate, scan_builder_with_schema, scan_logical_schema,
-        EnginePredicate, EngineSchema,
+        scan_builder_with_predicate, scan_builder_with_schema, scan_builder_with_stats_columns,
+        scan_logical_schema, EnginePredicate, EngineSchema,
     };
     use crate::error::KernelError;
     use crate::expressions::kernel_visitor::{
@@ -1227,6 +1260,48 @@ mod scan_builder_tests {
         if let ExternResult::Err(e) = result {
             let err = unsafe { recover_error(e) };
             assert_eq!(err.etype, KernelError::SchemaError);
+        }
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_with_stats_columns() {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let columns = "id, val";
+        let builder = unsafe {
+            ok_or_panic(scan_builder_with_stats_columns(
+                builder,
+                engine.shallow_copy(),
+                kernel_string_slice!(columns),
+            ))
+        };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        unsafe { free_scan(scan) };
+        unsafe { free_snapshot(snapshot) };
+        unsafe { free_engine(engine) };
+    }
+
+    #[tokio::test]
+    async fn test_scan_builder_with_malformed_stats_columns() {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![TestAction::Metadata]))
+            .await
+            .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let columns = "`unterminated";
+        let result = unsafe {
+            scan_builder_with_stats_columns(
+                builder,
+                engine.shallow_copy(),
+                kernel_string_slice!(columns),
+            )
+        };
+        assert!(matches!(result, ExternResult::Err(_)));
+        if let ExternResult::Err(error) = result {
+            let _ = unsafe { recover_error(error) };
         }
         unsafe { free_snapshot(snapshot) };
         unsafe { free_engine(engine) };

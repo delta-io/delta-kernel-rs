@@ -205,6 +205,20 @@ fn build_data_skipping_schemas(
                     .physical,
             )
         }
+        // Caller-required columns can come from an external stats policy not represented in
+        // Kernel's table properties. Treat them as both required (so they are added to the
+        // expected schema) and requested (so unrelated configured columns stay projected out).
+        (StructStats::RequiredColumns(requested_columns), _) if !requested_columns.is_empty() => {
+            let requested_physical = union_to_physical(requested_columns);
+            with_data_cols(
+                table_configuration
+                    .build_expected_stats_schemas(
+                        Some(&requested_physical),
+                        Some(&requested_physical),
+                    )?
+                    .physical,
+            )
+        }
         // No explicit requested columns, but a predicate is present. Use just the predicate
         // refs so the stats schema is trimmed to what the rewritten predicate needs.
         (_, PhysicalPredicate::Some(_, _)) => {
@@ -1138,6 +1152,41 @@ pub(crate) mod tests {
             );
         } else {
             panic!("minValues should be a struct");
+        }
+    }
+
+    #[test]
+    fn required_stats_columns_extend_table_configuration() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("indexed", DataType::LONG),
+            StructField::nullable("external", DataType::LONG),
+        ]));
+        let properties = get_string_map(&[("delta.dataSkippingStatsColumns", "indexed")]);
+
+        let state_info = get_state_info_with_stats(
+            schema,
+            vec![],
+            None,
+            &[],
+            properties,
+            vec![],
+            StatsOptions::required_struct_columns(vec![column_name!("external")]),
+        )
+        .unwrap();
+
+        let stats_schema = state_info
+            .physical_stats_schema
+            .expect("required column should build a stats schema");
+        for stats_field in [MIN_VALUES, MAX_VALUES, NULL_COUNT] {
+            let DataType::Struct(inner) = stats_schema
+                .field(stats_field)
+                .unwrap_or_else(|| panic!("should have {stats_field}"))
+                .data_type()
+            else {
+                panic!("{stats_field} should be a struct");
+            };
+            assert!(inner.field("external").is_some());
+            assert!(inner.field("indexed").is_none());
         }
     }
 
