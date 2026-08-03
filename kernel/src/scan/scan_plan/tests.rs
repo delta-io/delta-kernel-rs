@@ -19,6 +19,7 @@ use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
+use crate::unit_test_utils::load_test_table;
 use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
 
 // Normalizes metadata for comparison: the imperative path splits fields between the data batch
@@ -297,7 +298,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     #[case] stats: StatsOptions,
     #[case] expected_stats_field_groups: &[&[&str]],
 ) -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table("parsed-stats")?;
+    let (engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
     let struct_stats = stats.struct_stats.clone();
     let no_stats = !stats.synthesize_json && matches!(&struct_stats, StructStats::None);
     let expected_stats = if no_stats {
@@ -519,9 +520,8 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 ) {
     (|| -> DeltaResult<()> {
         let json_requested = stats.synthesize_json;
-        let (engine, snapshot, _tempdir) = crate::utils::test_utils::load_test_table(
-            "v1-multi-part-partitioned-struct-stats-only",
-        )?;
+        let (engine, snapshot, _tempdir) =
+            load_test_table("v1-multi-part-partitioned-struct-stats-only")?;
         let scan = snapshot
             .scan_builder()
             .with_stats(stats)
@@ -574,8 +574,7 @@ fn declarative_metadata_has_exact_leaf_schema_across_output_options(
 
 #[test]
 fn declarative_metadata_projects_nested_column_mapped_stats() -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::utils::test_utils::load_test_table("stats-writing-all-types/delta")?;
+    let (engine, snapshot, _tempdir) = load_test_table("stats-writing-all-types/delta")?;
     let scan = snapshot
         .scan_builder()
         .with_stats(StatsOptions::struct_columns(vec![column_name!(
@@ -822,8 +821,7 @@ fn declarative_metadata_reconstructs_partition_values_for_pruning(
 
 #[test]
 fn declarative_metadata_partition_is_null_keeps_null_partition() -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::utils::test_utils::load_test_table("data-reader-timestamp_ntz")?;
+    let (engine, snapshot, _tempdir) = load_test_table("data-reader-timestamp_ntz")?;
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(column_expr!("tsNtzPartition").is_null()))
@@ -964,8 +962,7 @@ fn declarative_metadata_reconciles_checkpoint_with_later_commits() -> DeltaResul
 
 #[test]
 fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> DeltaResult<()> {
-    let (engine, snapshot, _tempdir) =
-        crate::utils::test_utils::load_test_table("with_checkpoint_no_last_checkpoint")?;
+    let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(column_expr!("int").gt(Expr::literal(0i64))))
