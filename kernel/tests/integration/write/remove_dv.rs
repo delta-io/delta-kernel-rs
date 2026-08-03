@@ -729,10 +729,20 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// A DV update over a batch where only some files are targeted: only the matched files get
-/// remove/add pairs.
+#[rstest::rstest]
+#[case::target_in_explicit_prefix(&[true, true], &[0], false)]
+#[case::target_in_implicit_tail(&[true, true], &[3], false)]
+#[case::multiple_targets(&[true, true], &[0, 3], false)]
+#[case::empty_selection_vector(&[], &[3], false)]
+#[case::unselected_rows_are_ignored(&[true, false, true, false], &[2], false)]
+#[case::unselected_target_is_rejected(&[true, false, true, false], &[2, 3], true)]
+#[case::no_updates_short_selection_vector(&[true, true], &[], false)]
+#[case::no_updates_empty_selection_vector(&[], &[], false)]
 #[tokio::test]
-async fn test_update_deletion_vectors_updates_only_matched_files(
+async fn test_update_deletion_vectors_with_selection_vector(
+    #[case] selection_vector: &[bool],
+    #[case] target_indexes: &[usize],
+    #[case] expect_mismatch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::INTEGER),
@@ -748,8 +758,22 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
     let (store, engine, table_url, file_paths) =
         create_dv_table_with_files("test_table", schema, file_names).await?;
 
-    // Target only files 1 and 3 for a DV update; files 0 and 2 must be left untouched.
-    let targeted = [file_paths[1].clone(), file_paths[3].clone()];
+    // Attach DV to all files first, if later DV updates incorrectly remove the existing DV,
+    // the test will fail.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut setup_txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+    setup_txn.update_deletion_vectors(
+        sequential_dv_descriptors(&file_paths),
+        get_scan_files(snapshot, engine.as_ref())?
+            .into_iter()
+            .map(Ok),
+    )?;
+    setup_txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let targeted: Vec<String> = target_indexes
+        .iter()
+        .map(|&index| file_paths[index].clone())
+        .collect();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
@@ -772,12 +796,28 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
         })
         .collect();
 
-    let scan_files = get_scan_files(snapshot, engine.as_ref())?;
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let mut scan_data: Vec<_> = get_scan_files(snapshot, engine.as_ref())?
+        .into_iter()
+        .map(FilteredEngineData::apply_selection_vector)
+        .collect::<Result<Vec<_>, _>>()?;
+    scan_data.retain(|data| data.len() > 0);
+    assert_eq!(scan_data.len(), 1, "expected one active scan batch");
+    let data = scan_data.pop().unwrap();
+    assert_eq!(data.len(), file_paths.len());
+    let scan_files = FilteredEngineData::try_new(data, selection_vector.to_vec())?;
+
+    let update_result = txn.update_deletion_vectors(dv_map, std::iter::once(Ok(scan_files)));
+    if expect_mismatch {
+        assert_result_error_with_message(
+            update_result,
+            "Number of matched DV files does not match number of new DV descriptors",
+        );
+    } else {
+        update_result?;
+    }
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     let version = committed.commit_version();
 
-    // Read the commit directly from the (in-memory) store.
     let commit_path = table_url.join(&format!("_delta_log/{version:020}.json"))?;
     let commit_content = store
         .get(&Path::from_url_path(commit_path.path())?)
@@ -790,21 +830,34 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
     let adds: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("add")).collect();
     let removes: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("remove")).collect();
 
-    // Only the two targeted files produce remove/add pairs.
-    assert_eq!(adds.len(), 2, "only the targeted files should be re-added");
-    assert_eq!(
-        removes.len(),
-        2,
-        "only the targeted files should be removed"
-    );
+    let expected_count = if expect_mismatch {
+        0
+    } else {
+        target_indexes.len()
+    };
+    assert_eq!(adds.len(), expected_count, "unexpected re-added files");
+    assert_eq!(removes.len(), expected_count, "unexpected removed files");
 
     let mut added_paths: Vec<&str> = adds.iter().map(|a| a["path"].as_str().unwrap()).collect();
     added_paths.sort();
-    let mut expected: Vec<&str> = targeted.iter().map(String::as_str).collect();
+    let mut removed_paths: Vec<&str> = removes
+        .iter()
+        .map(|a| a["path"].as_str().unwrap())
+        .collect();
+    removed_paths.sort();
+    let mut expected: Vec<&str> = if expect_mismatch {
+        Vec::new()
+    } else {
+        targeted.iter().map(String::as_str).collect()
+    };
     expected.sort();
     assert_eq!(
         added_paths, expected,
         "re-added paths must be exactly the targeted files"
+    );
+    assert_eq!(
+        removed_paths, expected,
+        "removed paths must be exactly the targeted files"
     );
 
     // Each new add carries its DV and widened tightBounds, with numRecords preserved.
