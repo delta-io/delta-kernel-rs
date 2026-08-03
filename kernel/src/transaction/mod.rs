@@ -423,6 +423,11 @@ impl<S> Transaction<S> {
         )
         .validate(&self.add_files_metadata)?;
 
+        write_validation::StagedDataValidator::staged_dv_matched_file(
+            self.effective_table_config.physical_partition_columns(),
+        )?
+        .validate_filtered(&self.dv_matched_files)?;
+
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions

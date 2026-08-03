@@ -228,10 +228,10 @@ impl Transaction {
     ///
     /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
     ///   new deletion vector descriptor for that file.
-    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
-    ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
-    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
+    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata using
+    ///   [`scan_row_schema`]. Selected rows must preserve the scan-file values and cover every path
+    ///   in `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
+    ///   accurate `stats.numRecords` value.
     ///
     /// # Errors
     ///
@@ -301,6 +301,8 @@ impl Transaction {
 
             // Update selection vector to keep only files that matched DV descriptors.
             // This ensures we only generate remove/add actions for files being updated.
+            // TODO(#3043): Expand short selection vectors to the data length before deselecting
+            // unmatched rows.
             let mut current_matched_index = 0;
             for (i, selected) in selection_vector.iter_mut().enumerate() {
                 if current_matched_index < visitor.matched_file_indexes.len() {

@@ -3,11 +3,11 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+use super::utils::{validate_partition_keys, validate_required_field};
 use super::{StagedDataValidator, Validation};
-use crate::engine_data::{GetData, MapItem, TypedGetData as _};
+use crate::engine_data::{GetData, TypedGetData as _};
 use crate::schema::ColumnNamesAndTypes;
 use crate::transaction::mandatory_add_file_schema;
-use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 /// Column indices, matching the order in [`MANDATORY_ADD_FILE_COLUMNS`].
@@ -46,48 +46,6 @@ pub(crate) struct AddFileRequiredFields {
     physical_partition_columns: HashSet<String>,
 }
 
-fn validate_required_add_file_field_exist<T>(
-    value: Option<T>,
-    path: &str,
-    field: &str,
-) -> DeltaResult<T> {
-    value.ok_or_else(|| {
-        Error::missing_data(format!(
-            "AddFile for '{path}' is missing required field '{field}'"
-        ))
-    })
-}
-
-fn validate_partition_keys(
-    path: &str,
-    actual_partition_values: MapItem<'_>,
-    expected_physical_partition_columns: &HashSet<String>,
-) -> DeltaResult<()> {
-    let actual_keys_vec: Vec<&str> = actual_partition_values.keys().collect();
-    let actual_keys_set: HashSet<&str> = actual_keys_vec.iter().copied().collect();
-    let keys_match = actual_keys_set.len() == expected_physical_partition_columns.len()
-        && actual_keys_set
-            .iter()
-            .all(|key| expected_physical_partition_columns.contains(*key));
-
-    require!(
-        actual_keys_vec.len() == actual_keys_set.len(),
-        Error::invalid_partition_values(format!(
-            "AddFile for '{path}' has duplicate partition column names in partitionValues: \
-             {actual_keys_vec:?}"
-        ))
-    );
-
-    require!(
-        keys_match,
-        Error::invalid_partition_values(format!(
-            "AddFile for '{path}' has partitionValues keys {actual_keys_vec:?}, but the table's \
-             physical partition columns are {expected_physical_partition_columns:?}"
-        ))
-    );
-    Ok(())
-}
-
 impl Validation for AddFileRequiredFields {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
@@ -97,23 +55,20 @@ impl Validation for AddFileRequiredFields {
             return Err(Error::generic("AddFile path must not be empty"));
         }
 
-        let partition_values = validate_required_add_file_field_exist(
+        let partition_values = validate_required_field(
             getters[PARTITION_VALUES].get_map(row, "partitionValues")?,
             path,
             "partitionValues",
         )?;
         validate_partition_keys(path, partition_values, &self.physical_partition_columns)?;
-        let size = validate_required_add_file_field_exist::<i64>(
-            getters[SIZE].get_opt(row, "size")?,
-            path,
-            "size",
-        )?;
+        let size =
+            validate_required_field::<i64>(getters[SIZE].get_opt(row, "size")?, path, "size")?;
         if size < 0 {
             return Err(Error::generic(format!(
                 "AddFile for '{path}' has negative size {size}; size must be non-negative"
             )));
         }
-        validate_required_add_file_field_exist::<i64>(
+        validate_required_field::<i64>(
             getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
             path,
             "modificationTime",
@@ -128,79 +83,17 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use test_utils::{modify_add_file_partition_keys, AddFilePartitionKeyModify};
 
     use super::*;
-    use crate::arrow::array::{new_null_array, Array, ArrayRef, Int64Array, StringArray};
-    use crate::arrow::compute::{concat, concat_batches};
+    use crate::arrow::array::{Int64Array, StringArray};
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::expressions::ColumnName;
-    use crate::unit_test_utils::{assert_result_error_with_message, create_valid_add_file_batch};
+    use crate::unit_test_utils::{
+        add_files_with_partition_values, assert_result_error_with_message, nullable_add_file,
+        nullable_add_files, replace_column, set_field_as_null,
+    };
     use crate::EngineData;
-
-    /// Builds one valid add-file row with a fully nullable schema.
-    ///
-    /// The nullable schema lets tests inject nulls to protocol-required fields.
-    fn nullable_add_file() -> RecordBatch {
-        create_valid_add_file_batch(true /* all_nullable */)
-    }
-
-    /// Builds `row_count` valid add-file rows with a fully nullable schema.
-    ///
-    /// The nullable schema lets tests inject nulls to protocol-required fields.
-    fn nullable_add_files(row_count: usize) -> RecordBatch {
-        let batch = nullable_add_file();
-        concat_batches(&batch.schema(), &vec![batch; row_count])
-            .expect("failed to concatenate rows into a multi-row add-file batch")
-    }
-
-    /// Return `batch` with `field` set to null at `row`.
-    fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
-        let schema = batch.schema();
-        let index = schema.index_of(field).expect("field in schema");
-        let mut columns = batch.columns().to_vec();
-        let column = &columns[index];
-        let null = new_null_array(schema.field(index).data_type(), 1);
-        let slices = [
-            column.slice(0, row),
-            null,
-            column.slice(row + 1, batch.num_rows() - row - 1),
-        ];
-        let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
-        columns[index] = concat(&arrays)
-            .expect("failed to replace the selected add-file field with a null value");
-        RecordBatch::try_new(schema, columns)
-            .expect("failed to rebuild add-file batch after replacing a field value with null")
-    }
-
-    fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
-        let schema = batch.schema();
-        let index = schema.index_of(field).expect("field not found in schema");
-        let mut columns = batch.columns().to_vec();
-        columns[index] = column;
-        RecordBatch::try_new(schema, columns)
-            .expect("failed to rebuild add-file batch after replacing a column")
-    }
-
-    /// Returns nullable add-file rows with `partitionValues` replaced by the given values.
-    /// A `None` value stores a present key with a null value.
-    fn add_files_with_partition_values(
-        partition_values: &[&[(&str, Option<&str>)]],
-    ) -> RecordBatch {
-        let batches: Vec<_> = partition_values
-            .iter()
-            .map(|entries| {
-                let modifications: Vec<_> = entries
-                    .iter()
-                    .map(|(key, value)| AddFilePartitionKeyModify::Insert { key, value: *value })
-                    .collect();
-                modify_add_file_partition_keys(nullable_add_file(), &modifications)
-            })
-            .collect();
-        concat_batches(&batches[0].schema(), &batches)
-            .expect("failed to concatenate add-file rows with partition values")
-    }
 
     fn add_file_validator(physical_partition_columns: &[&str]) -> StagedDataValidator {
         StagedDataValidator::staged_add_file(
