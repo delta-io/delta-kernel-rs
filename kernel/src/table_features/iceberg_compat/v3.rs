@@ -9,7 +9,7 @@ use super::{
 use crate::schema::PrimitiveType::*;
 use crate::schema::{try_collect_column_defaults, DataType};
 use crate::table_configuration::TableConfiguration;
-use crate::DeltaResult;
+use crate::{DeltaResult, Error};
 
 /// V3 invariants paired with the version constant. Fed to
 /// [`super::validate_iceberg_compat_if_needed`].
@@ -51,27 +51,30 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
     )
 }
 
-/// Validates IcebergCompatV3 column defaults and logs warnings kernel cannot verify.
+/// Validates that IcebergCompatV3 column defaults are literals.
 ///
-/// The IcebergCompatV3 spec requires column defaults to be literals. Kernel warns when its parser
-/// cannot verify that requirement. This warning can be a false positive when the expression is a
-/// literal that kernel's parser cannot parse.
-///
-/// This condition remains a warning because the table has already passed metadata validation and
-/// rejecting a DML transaction could block valid tables based on kernel parser limitations. The
-/// check provides defense in depth without treating an interoperability risk as definite
-/// corruption.
+/// The IcebergCompatV3 spec requires column defaults to be literals. Kernel rejects defaults its
+/// parser recognizes as non-literal expressions and warns when its parser cannot determine whether
+/// the SQL is a literal. The latter warning can be a false positive for a literal outside kernel's
+/// parser coverage.
 ///
 /// # Errors
 ///
-/// Propagates malformed column-default metadata errors from [`try_collect_column_defaults`].
+/// Returns [`Error::Unsupported`] when kernel recognizes a non-literal default. Propagates
+/// malformed column-default metadata errors from [`try_collect_column_defaults`].
 pub(crate) fn iceberg_compat_v3_column_defaults_validation(
     table_configuration: &TableConfiguration,
 ) -> DeltaResult<()> {
     for (path, column_default) in
         try_collect_column_defaults(table_configuration.logical_schema_ref())?
     {
-        if !column_default.is_kernel_parsable_literal() {
+        if column_default.is_kernel_parsable_non_literal() {
+            return Err(Error::unsupported(format!(
+                "icebergCompatV3 requires column defaults to be literals, but the default for \
+                 '{path}' is a non-literal expression: {}",
+                column_default.raw_sql()
+            )));
+        } else if !column_default.is_kernel_parsable_literal() {
             warn!(
                 "kernel could not verify that the icebergCompatV3 column default for '{path}' is a \
                  literal, got: {}",
@@ -193,15 +196,6 @@ mod column_default_tests {
         "a",
         None
     )]
-    #[case::non_literal_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            DataType::TIMESTAMP,
-            "current_timestamp()"
-        )]).unwrap(),
-        "a",
-        Some("could not verify")
-    )]
     #[case::null_on_non_primitive(
         StructType::try_new([field_with_default(
             "a",
@@ -218,18 +212,6 @@ mod column_default_tests {
             "ARRAY(1)"
         )]).unwrap(),
         "a",
-        Some("could not verify")
-    )]
-    #[case::nested_non_literal(
-        StructType::try_new([StructField::nullable(
-            "s",
-            DataType::try_struct_type([field_with_default(
-                "inner",
-                DataType::TIMESTAMP,
-                "current_timestamp()"
-            )]).unwrap(),
-        )]).unwrap(),
-        "s.inner",
         Some("could not verify")
     )]
     fn v3_column_default_validation(
@@ -252,5 +234,43 @@ mod column_default_tests {
                 assert!(logs.contains(needle), "logs: {logs}");
             }
         }
+    }
+
+    #[rstest]
+    #[case::top_level(
+        StructType::try_new([field_with_default(
+            "a",
+            DataType::TIMESTAMP,
+            "current_timestamp()"
+        )]).unwrap(),
+        "a"
+    )]
+    #[case::nested(
+        StructType::try_new([StructField::nullable(
+            "s",
+            DataType::try_struct_type([field_with_default(
+                "inner",
+                DataType::TIMESTAMP,
+                "current_timestamp()"
+            )]).unwrap(),
+        )]).unwrap(),
+        "s.inner"
+    )]
+    fn v3_column_default_validation_rejects_recognized_non_literal(
+        #[case] schema: StructType,
+        #[case] expected_path: &str,
+    ) {
+        let table_configuration = table_config_with_schema(schema);
+        let error = iceberg_compat_v3_column_defaults_validation(&table_configuration)
+            .expect_err("icebergCompatV3 must reject a recognized non-literal default");
+
+        assert!(matches!(&error, crate::Error::Unsupported(_)));
+        let message = error.to_string();
+        assert!(message.contains(expected_path), "got: {message}");
+        assert!(message.contains("current_timestamp()"), "got: {message}");
+        assert!(
+            message.contains("requires column defaults to be literals"),
+            "got: {message}"
+        );
     }
 }
