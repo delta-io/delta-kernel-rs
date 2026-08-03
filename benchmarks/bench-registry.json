@@ -4,5 +4,81 @@
       { "name": "serial",    "parallelScan": "disabled" },
       { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
     ]
+  },
+  "crc1Col200Commits1ChkptCrc150": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "freshIncrementalCrc",
+        "snapshotBuilder": "for",
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 50 } }
+      },
+      {
+        "name": "from199IncrementalCrc",
+        "snapshotBuilder": { "from": { "version": 199 } },
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 50 } }
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptCrc195": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "freshIncrementalCrc",
+        "snapshotBuilder": "for",
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 5 } }
+      },
+      {
+        "name": "from199IncrementalCrc",
+        "snapshotBuilder": { "from": { "version": 199 } },
+        "incrementalCrcReplay": { "upToCommits": { "numCommits": 5 } }
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptCrcLatest": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      }
+    ]
+  },
+  "crc1Col200Commits1ChkptNoCrc": {
+    "snapshotLatest": [
+      {
+        "name": "fresh",
+        "snapshotBuilder": "for",
+        "incrementalCrcReplay": "disabled"
+      },
+      {
+        "name": "from199",
+        "snapshotBuilder": { "from": { "version": 199 } },
+        "incrementalCrcReplay": "disabled"
+      }
+    ]
   }
 }
