@@ -21,7 +21,7 @@ use url::Url;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::{DeltaResult, Error, StorageHandler, Version};
+use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
 
 #[cfg(test)]
 mod tests;
@@ -70,8 +70,7 @@ pub(crate) fn list_delta_log_from_storage(
     end_version: Version,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_from = log_root.join(&format!("{start_version:020}"))?;
-    let files = storage
-        .list_from(&start_from)?
+    let files = debug_assert_direct_children(log_root, storage.list_from(&start_from)?)
         .map(|meta| ParsedLogPath::try_from(meta?))
         // NOTE: this filters out .crc files etc which start with "." - some engines
         // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
@@ -86,6 +85,30 @@ pub(crate) fn list_delta_log_from_storage(
             Err(_) => true,
         });
     Ok(files)
+}
+
+/// True if `child` is a direct child of the directory `dir`.
+fn is_single_directory_child(dir: &Url, child: &Url) -> bool {
+    dir.make_relative(child)
+        .is_none_or(|rel| !rel.contains('/'))
+}
+
+/// Debug-only guard catching a [`StorageHandler::list_from`] that recurses into subdirectories.
+fn debug_assert_direct_children(
+    dir: &Url,
+    iter: impl Iterator<Item = DeltaResult<FileMeta>>,
+) -> impl Iterator<Item = DeltaResult<FileMeta>> {
+    let dir = dir.clone();
+    iter.inspect(move |res| {
+        if let Ok(meta) = res {
+            debug_assert!(
+                is_single_directory_child(&dir, &meta.location),
+                "list_from returned '{}', not a direct child of '{}'",
+                meta.location,
+                dir,
+            );
+        }
+    })
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.

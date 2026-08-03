@@ -1331,3 +1331,52 @@ fn find_complete_checkpoint_version_cases(
 ) {
     assert_eq!(find_complete_checkpoint_version(&files), expected);
 }
+
+/// Recursing `list_from` will trip this guard.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "not a direct child")]
+fn list_delta_log_from_storage_rejects_recursive_listing() {
+    use crate::{FileSlice, StorageHandler};
+
+    struct RecursingStorage;
+    impl StorageHandler for RecursingStorage {
+        fn list_from(
+            &self,
+            _path: &Url,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+            let nested = FileMeta {
+                location: Url::parse(
+                    "memory:///_delta_log/_staged_commits/00000000000000000001.abc.json",
+                )
+                .unwrap(),
+                last_modified: 0,
+                size: 1,
+            };
+            Ok(Box::new(std::iter::once(Ok(nested))))
+        }
+        fn read_files(
+            &self,
+            _files: Vec<FileSlice>,
+        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+        fn copy_atomic(&self, _src: &Url, _dst: &Url) -> DeltaResult<()> {
+            Ok(())
+        }
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+            Ok(())
+        }
+        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+            unreachable!()
+        }
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    let log_root = Url::parse("memory:///_delta_log/").unwrap();
+    let iter = list_delta_log_from_storage(&RecursingStorage, &log_root, 0, Version::MAX).unwrap();
+    // The assert fires lazily as the item is pulled.
+    let _ = iter.collect::<Vec<_>>();
+}

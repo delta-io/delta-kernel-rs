@@ -933,12 +933,12 @@ fn get_default_engine_impl(
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel_default_engine::storage::{engine_store_from_url_opts, EngineStore};
+    use delta_kernel_default_engine::storage::EngineStore;
 
     let store =
         match object_store_backend {
-            ObjectStoreBackend::UrlScheme => engine_store_from_url_opts(&url, options)?,
-            ObjectStoreBackend::Rest(rest) => EngineStore::Plain(
+            ObjectStoreBackend::UrlScheme => EngineStore::from_url_opts(&url, options)?,
+            ObjectStoreBackend::Rest(rest) => EngineStore::plain(
                 rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?,
             ),
         };

@@ -13,7 +13,7 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::{DeltaResult, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel_default_engine::storage::{EngineStore, ListingStore};
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use url::Url;
 
@@ -134,17 +134,18 @@ pub fn get_engine(
         })?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
-        // Each concrete cloud store is a `ListingStore`, so wrap it in `EngineStore::Listing` to
-        // enable delimiter-pushdown listing.
-        macro_rules! listing_store {
+        // Each concrete cloud store supports delimiter-pushdown listing.
+        macro_rules! engine_store {
             ($builder:ty) => {
-                Arc::new(<$builder>::from_env().with_url(url_str).build()?) as Arc<dyn ListingStore>
+                EngineStore::with_paginated(Arc::new(
+                    <$builder>::from_env().with_url(url_str).build()?,
+                ))
             };
         }
-        let store: Arc<dyn ListingStore> = match scheme {
-            AmazonS3 => listing_store!(AmazonS3Builder),
-            GoogleCloudStorage => listing_store!(GoogleCloudStorageBuilder),
-            MicrosoftAzure => listing_store!(MicrosoftAzureBuilder),
+        let store = match scheme {
+            AmazonS3 => engine_store!(AmazonS3Builder),
+            GoogleCloudStorage => engine_store!(GoogleCloudStorageBuilder),
+            MicrosoftAzure => engine_store!(MicrosoftAzureBuilder),
             Local | Memory | Http => {
                 return Err(delta_kernel::Error::Generic(format!(
                     "Scheme {scheme:?} doesn't support getting credentials from environment"
@@ -157,7 +158,7 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngineBuilder::from_engine_store(EngineStore::Listing(store)).build())
+        Ok(DefaultEngineBuilder::from_engine_store(store).build())
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();

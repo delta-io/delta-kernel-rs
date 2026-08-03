@@ -29,7 +29,7 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
-use self::storage::{engine_store_from_url_opts, EngineStore};
+use self::storage::EngineStore;
 
 pub mod executor;
 pub mod file_stream;
@@ -223,7 +223,7 @@ pub struct DefaultEngineBuilder<E> {
 impl<E> std::fmt::Debug for DefaultEngineBuilder<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DefaultEngineBuilder")
-            .field("listing_capable", &self.store.paginated().is_some())
+            .field("listing_capable", &self.store.paginated.is_some())
             .field("io_config", &self.io_config)
             .finish_non_exhaustive()
     }
@@ -252,7 +252,7 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
     /// expose delimiter pushdown and falls back to a single `list_with_delimiter` request.
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self {
-            store: EngineStore::Plain(object_store),
+            store: EngineStore::plain(object_store),
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
         }
@@ -277,7 +277,7 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
         V: Into<String>,
     {
         Ok(Self {
-            store: engine_store_from_url_opts(url, options)?,
+            store: EngineStore::from_url_opts(url, options)?,
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
         })
@@ -347,10 +347,13 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 
 impl<E: TaskExecutor> DefaultEngine<E> {
     fn new_with_opts(store: EngineStore, task_executor: Arc<E>, io_config: ReadIoConfig) -> Self {
-        let object_store = store.object_store();
+        let EngineStore {
+            object_store,
+            paginated,
+        } = store;
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
-            store.paginated(),
+            paginated,
             task_executor.clone(),
         ));
 

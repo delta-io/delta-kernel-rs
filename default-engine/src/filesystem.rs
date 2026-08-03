@@ -53,6 +53,10 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 
 /// Returns the `(prefix, offset)` to list: a trailing-`/` `path` lists itself, otherwise its
 /// parent is listed after `path`.
+///
+/// - `s3://bucket/_delta_log/` -> (`_delta_log`, `_delta_log`)
+/// - `s3://bucket/_delta_log/00000000000000000005.json` -> (`_delta_log`,
+///   `_delta_log/00000000000000000005.json`)
 fn list_scope(path: &Url) -> DeltaResult<(Path, Path)> {
     let offset = Path::from_url_path(path.path())?;
     let prefix = if path.path().ends_with('/') {
@@ -1016,5 +1020,12 @@ mod tests {
             vec!["/00000000000000000000.json"],
             "only top-level files: {names:?}"
         );
+    }
+
+    #[test]
+    fn list_scope_rejects_authority_only_url() {
+        // No path segments and not directory-like, thus no parent to list after.
+        let url = Url::parse("s3://bucket").unwrap();
+        assert!(matches!(list_scope(&url), Err(Error::Generic(_))));
     }
 }
