@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use datafusion::common::utils::take_function_args;
 use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
 use datafusion::functions::core::expr_fn::{
     coalesce, get_field, get_field_path, named_struct, nullif,
@@ -66,7 +67,6 @@ pub fn to_df_expr(
         KernelExpression::MapToStruct(map_to_struct) => {
             map_to_struct_to_df_expr(map_to_struct, input_schema, output_type)
         }
-
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
@@ -416,26 +416,23 @@ fn parse_json_to_df_expr(
 /// `parse_json`: on a whole-batch parse error it returns an all-null struct rather than failing.
 /// (The finer per-cell null for failure-prone leaves -- Timestamp/Date/Decimal -- already lives
 /// inside `parse_json`.)
-///
-/// Identity (`Eq`/`Hash`, required by DataFusion for common-subexpression elimination) is keyed on
-/// `return_type`, which is derived from and uniquely determined by `output_schema`. Two ParseJson
-/// UDFs with different target schemas therefore never compare equal.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct ParseJsonUdf {
     output_schema: KernelSchemaRef,
     return_type: ArrowDataType,
     signature: Signature,
 }
 
-impl PartialEq for ParseJsonUdf {
-    fn eq(&self, other: &Self) -> bool {
-        self.return_type == other.return_type
-    }
-}
-impl Eq for ParseJsonUdf {}
+/// DataFusion requires scalar UDF implementations to support equality and hashing so UDF calls
+/// can participate in expression comparison and optimizations such as common-subexpression
+/// elimination. The output schema captures this UDF's schema-dependent behavior; its signature is
+/// otherwise identical for every instance.
 impl std::hash::Hash for ParseJsonUdf {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.return_type.hash(state);
+        for field in self.output_schema.fields() {
+            field.name().hash(state);
+            field.data_type().to_string().hash(state);
+        }
     }
 }
 
@@ -477,9 +474,8 @@ impl ScalarUDFImpl for ParseJsonUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
-        let [json] = <[_; 1]>::try_from(args.args)
-            .map_err(|_| DataFusionError::Execution("kernel_parse_json expects one arg".into()))?;
         let num_rows = args.number_rows;
+        let [json] = take_function_args(self.name(), args.args)?;
         let json = json.into_array(num_rows)?;
 
         // `parse_json` reads column 0 of an `EngineData`-wrapped batch; wrap the input to match.
@@ -489,7 +485,7 @@ impl ScalarUDFImpl for ParseJsonUdf {
         let parsed = match parse_json(input, self.output_schema.clone()) {
             Ok(data) => {
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)
-                    .map_err(to_df_err)?
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
                     .into();
                 Arc::new(StructArray::from(batch)) as ArrayRef
             }
@@ -500,13 +496,13 @@ impl ScalarUDFImpl for ParseJsonUdf {
     }
 }
 
-/// Wraps a kernel [`Error`] as a [`DataFusionError`] for surfacing out of UDF execution.
-fn to_df_err(err: Error) -> DataFusionError {
-    DataFusionError::External(Box::new(err))
-}
-
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::array::{Array, AsArray, StringArray};
+    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::common::DFSchema;
+    use datafusion::physical_expr::create_physical_expr;
+    use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
         col, lit, Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
     };
@@ -1054,13 +1050,7 @@ mod tests {
         assert!(err.contains(expected_message), "{err}");
     }
 
-    // === ParseJson ===
-
-    use datafusion::arrow::array::{Array, AsArray, StringArray};
-    use datafusion::arrow::datatypes::Int64Type;
-    use datafusion::common::DFSchema;
-    use datafusion::physical_expr::create_physical_expr;
-    use datafusion::physical_expr::execution_props::ExecutionProps;
+    // === ParseJson Shared Helpers ===
 
     /// Input schema for JSON tests: `{ j: string }`.
     fn json_input_schema() -> StructType {
@@ -1103,6 +1093,8 @@ mod tests {
             .clone()
     }
 
+    // === ParseJson Tests ===
+
     #[test]
     fn parse_json_lowers_to_udf_call() {
         let kernel = KernelExpr::parse_json(column_expr!("j"), parse_target());
@@ -1122,7 +1114,8 @@ mod tests {
         );
         let n = out.column(0).as_primitive::<Int64Type>();
         let s = out.column(1).as_string::<i32>();
-        assert_eq!(n.values(), &[1, 2]);
+        assert_eq!(n.null_count(), 0);
+        assert_eq!((n.value(0), n.value(1)), (1, 2));
         assert_eq!((s.value(0), s.value(1)), ("a", "b"));
     }
 
@@ -1150,5 +1143,29 @@ mod tests {
         let out = eval_parse_json(parse_target(), vec![Some("{not json"), Some(r#"{"n": 5}"#)]);
         assert_eq!(out.len(), 2);
         assert!((0..2).all(|i| out.column(0).is_null(i) && out.column(1).is_null(i)));
+    }
+
+    /// UDF identity must distinguish target schemas that share an arrow return type, or DataFusion
+    /// would treat the two calls as one common subexpression and parse both with one schema.
+    /// `integer` and `interval year to month` both map to arrow `Int32`.
+    #[rstest]
+    #[case(DataType::INTEGER, DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::LONG, DataType::INTERVAL_DAY_TIME)]
+    fn parse_json_udfs_with_same_return_type_but_different_schemas_are_not_equal(
+        #[case] left: DataType,
+        #[case] right: DataType,
+    ) {
+        let udf = |dt: DataType| {
+            ParseJsonUdf::try_new(Arc::new(
+                StructType::try_new([StructField::nullable("a", dt)]).unwrap(),
+            ))
+            .unwrap()
+        };
+        let (left, right) = (udf(left), udf(right));
+        assert_eq!(
+            left.return_type, right.return_type,
+            "precondition: arrow return types collide"
+        );
+        assert_ne!(left, right);
     }
 }
