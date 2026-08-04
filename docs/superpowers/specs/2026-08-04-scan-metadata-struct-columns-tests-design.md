@@ -45,6 +45,7 @@ For every emitted metadata batch, apply its selection vector before checking ret
 
 - the total selected-file count exactly matches the case;
 - every requested column exists under `minValues`, `maxValues`, and `nullCount`;
+- the no-predicate case returns exactly the requested stats columns;
 - each selected row has a non-null `stats_parsed` value and `numRecords == 100`;
 - the selected rows' sorted min/max pairs for the case's probe column exactly match expectations.
 

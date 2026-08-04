@@ -2113,6 +2113,7 @@ fn scan_metadata_struct_columns_returns_expected_stats(
     let url = Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let expect_exact_stats_projection = predicate.is_none();
     let predicate = predicate.map(|predicate| Arc::new(predicate) as PredicateRef);
     let scan = snapshot
         .scan_builder()
@@ -2131,6 +2132,11 @@ fn scan_metadata_struct_columns_returns_expected_stats(
         let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
         let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
         let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
+        if expect_exact_stats_projection {
+            assert_eq!(field_names(min_values), requested_names);
+            assert_eq!(field_names(max_values), requested_names);
+            assert_eq!(field_names(null_count), requested_names);
+        }
         for requested in requested_names {
             assert!(
                 min_values.column_by_name(requested).is_some(),
