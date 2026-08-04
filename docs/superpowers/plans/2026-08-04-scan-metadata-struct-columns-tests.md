@@ -15,6 +15,7 @@ six-file `parsed-stats` fixture.
 
 - Exercise only the imperative `Scan::scan_metadata` path.
 - Do not assert that predicate-only statistics are absent from scan metadata.
+- Assert the exact returned stats columns when no predicate requires internal columns.
 - Assert exact selected-file counts and sorted min/max values without depending on batch order.
 - Preserve at least one case whose predicate column is excluded from `struct_columns`.
 - Use the existing `parsed-stats` fixture.
