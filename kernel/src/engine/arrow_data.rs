@@ -416,6 +416,21 @@ impl ArrowEngineData {
                 .or_else(|| col.as_list_view_opt::<i32>().map(|a| a as _))
                 .or_else(|| col.as_list_view_opt::<i64>().map(|a| a as _))
         };
+        let col_as_struct_list = || -> Option<&'a dyn GetData<'a>> {
+            match col.data_type() {
+                ArrowDataType::List(f)
+                | ArrowDataType::LargeList(f)
+                | ArrowDataType::ListView(f)
+                | ArrowDataType::LargeListView(f)
+                    if matches!(f.data_type(), ArrowDataType::Struct(_)) => {}
+                _ => return None,
+            }
+            col.as_list_opt::<i32>()
+                .map(|a| a as _)
+                .or_else(|| col.as_list_opt::<i64>().map(|a| a as _))
+                .or_else(|| col.as_list_view_opt::<i32>().map(|a| a as _))
+                .or_else(|| col.as_list_view_opt::<i64>().map(|a| a as _))
+        };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
                 (is_string_type(array.key_type()) && is_string_type(array.value_type()))
@@ -503,6 +518,10 @@ impl ArrowEngineData {
                 col.as_primitive_opt::<Decimal128Type>()
                     .map(|a| a as _)
                     .ok_or("decimal")
+            }
+            DataType::Array(array) if matches!(array.element_type(), DataType::Struct(_)) => {
+                debug!("Pushing struct list for {}", ColumnName::new(path));
+                col_as_struct_list().ok_or("array<struct>")
             }
             DataType::Array(_) => {
                 debug!("Pushing list for {}", ColumnName::new(path));
@@ -1763,6 +1782,66 @@ mod tests {
                 vec!["c".to_string()]
             ]
         );
+        Ok(())
+    }
+
+    /// visit_rows must route an array-of-structs column through the struct-list branch of
+    /// extract_leaf_column, letting a nested RowVisitor visit each outer row's element structs.
+    #[test]
+    fn test_visit_rows_struct_list() -> DeltaResult<()> {
+        use crate::engine::struct_list_test_support::{struct_list_fixture, CollectNVisitor};
+
+        // Column `items: array<struct<n: int>>` with two outer rows: [[1, 2], [3]].
+        let list = struct_list_fixture(&[&[1, 2], &[3]]);
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "items",
+                list.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(list)],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        // Outer visitor collects each row's element `n`s via the struct-list getter.
+        #[derive(Default)]
+        struct OuterVisitor {
+            per_row: Vec<Vec<i32>>,
+        }
+        impl RowVisitor for OuterVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NT: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
+                    let element =
+                        StructType::new_unchecked([StructField::not_null("n", DataType::INTEGER)]);
+                    (
+                        vec![ColumnName::new(["items"])],
+                        vec![ArrayType::new(element, false).into()],
+                    )
+                });
+                (&NT.0, &NT.1)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let mut inner = CollectNVisitor::default();
+                    getters[0]
+                        .get_struct_list(i, "items")?
+                        .expect("non-null struct list")
+                        .visit_with(&mut inner)?;
+                    self.per_row.push(inner.values);
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = OuterVisitor::default();
+        arrow_data.visit_rows(&[ColumnName::new(["items"])], &mut visitor)?;
+        assert_eq!(visitor.per_row, vec![vec![1, 2], vec![3]]);
         Ok(())
     }
 

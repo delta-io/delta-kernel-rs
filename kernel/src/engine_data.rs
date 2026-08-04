@@ -209,6 +209,46 @@ impl<'a> MapItem<'a> {
     }
 }
 
+/// Read access to an array-of-structs column, abstracting over the various list encodings an
+/// engine may use. Implemented on the engine's list array itself, so that a row index selects an
+/// outer row -- matching every [`GetData`] accessor -- and backs [`StructList`].
+pub trait StructListAccessor {
+    /// Visit the element structs of outer row `row_index` with `visitor`, extracting the
+    /// element-struct leaves named by `column_names`.
+    ///
+    /// Implementations must reject, rather than skip, a null element struct.
+    fn visit_row_elements(
+        &self,
+        row_index: usize,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()>;
+}
+
+/// A handle to a single outer row's array of element structs. Unlike [`ListItem`], which
+/// materializes strings, the elements are structs visited in place by a nested [`RowVisitor`].
+pub struct StructList<'a> {
+    values: &'a dyn StructListAccessor,
+    row_index: usize,
+}
+
+impl<'a> StructList<'a> {
+    pub fn new(values: &'a dyn StructListAccessor, row_index: usize) -> StructList<'a> {
+        StructList { values, row_index }
+    }
+
+    /// Drive a nested [`RowVisitor`] over this row's element structs, one visited row per element.
+    /// The columns the visitor declares are resolved against the element struct's schema, not the
+    /// outer row's.
+    ///
+    /// Returns an error if any element struct in this row is null.
+    pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+        let column_names = visitor.selected_column_names_and_types().0;
+        self.values
+            .visit_row_elements(self.row_index, column_names, visitor)
+    }
+}
+
 macro_rules! impl_default_get {
     ( $(($name: ident, $typ: ty)), * ) => {
         $(
@@ -242,6 +282,20 @@ pub trait GetData<'a> {
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
+
+    /// Access an array-of-structs column as a [`StructList`], whose element structs a nested
+    /// [`RowVisitor`] can visit in place. Returns `Ok(None)` if the row's list is null, and an
+    /// error if this column is not an array of structs.
+    fn get_struct_list(
+        &'a self,
+        _row_index: usize,
+        field_name: &str,
+    ) -> DeltaResult<Option<StructList<'a>>> {
+        Err(
+            Error::UnexpectedColumnType(format!("{field_name} is not an array of structs"))
+                .with_backtrace(),
+        )
+    }
 }
 
 macro_rules! impl_null_get {
@@ -271,6 +325,14 @@ impl<'a> GetData<'a> for () {
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
+
+    fn get_struct_list(
+        &'a self,
+        _row_index: usize,
+        _field_name: &str,
+    ) -> DeltaResult<Option<StructList<'a>>> {
+        Ok(None)
+    }
 }
 
 /// This is a convenience wrapper over `GetData` to allow code like: `let name: Option<String> =
