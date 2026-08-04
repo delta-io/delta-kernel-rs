@@ -20,8 +20,6 @@
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use delta_kernel::expressions::{col, column_name, lit};
-use delta_kernel::scan::StatsOptions;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
 use tempfile::TempDir;
@@ -97,52 +95,5 @@ fn scan_metadata_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-fn scan_metadata_struct_columns_benchmark(c: &mut Criterion) {
-    let (_tempdir, url, engine) = setup();
-
-    let snapshot = Snapshot::builder_for(url)
-        .build(engine.as_ref())
-        .expect("Failed to create snapshot");
-    let predicate = Arc::new(col!("col_0").gt(lit(0i64)));
-    let mut group = c.benchmark_group("scan_metadata_struct_columns");
-    group.sample_size(SCAN_METADATA_BENCH_SAMPLE_SIZE);
-
-    for (id, stats) in [
-        (
-            "predicate_column_excluded",
-            StatsOptions::struct_columns(vec![column_name!("col_1")]),
-        ),
-        (
-            "predicate_column_included",
-            StatsOptions::struct_columns(vec![column_name!("col_0"), column_name!("col_1")]),
-        ),
-    ] {
-        group.bench_function(id, |b| {
-            b.iter(|| {
-                let scan = snapshot
-                    .clone()
-                    .scan_builder()
-                    .with_predicate(predicate.clone())
-                    .with_stats(stats.clone())
-                    .without_row_transforms()
-                    .build()
-                    .expect("Failed to build scan");
-                for result in scan
-                    .scan_metadata(engine.as_ref())
-                    .expect("Failed to get scan metadata")
-                {
-                    result.expect("Failed to process scan metadata");
-                }
-            })
-        });
-    }
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    create_snapshot_benchmark,
-    scan_metadata_benchmark,
-    scan_metadata_struct_columns_benchmark
-);
+criterion_group!(benches, create_snapshot_benchmark, scan_metadata_benchmark);
 criterion_main!(benches);

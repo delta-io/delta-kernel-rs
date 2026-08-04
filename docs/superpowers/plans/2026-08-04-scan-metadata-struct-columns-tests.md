@@ -4,24 +4,20 @@
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add exact imperative `scan_metadata` coverage for `StatsOptions::struct_columns`, then
-benchmark whether requesting a predicate column is faster than keeping it internal.
+**Goal:** Add exact imperative `scan_metadata` coverage for `StatsOptions::struct_columns`.
 
 **Architecture:** Consolidate three shallow unit tests into one named `rstest` over the existing
-six-file `parsed-stats` fixture. Extend the existing Criterion metadata benchmark with two otherwise
-identical 300k-file scans that differ only in whether the predicate column is requested in
-`stats_parsed`.
+six-file `parsed-stats` fixture.
 
-**Tech Stack:** Rust, rstest, Arrow arrays, Criterion, cargo-nextest.
+**Tech Stack:** Rust, rstest, Arrow arrays, cargo-nextest.
 
 ## Global Constraints
 
 - Exercise only the imperative `Scan::scan_metadata` path.
-- Add tests before changing the benchmark.
 - Do not assert that predicate-only statistics are absent from scan metadata.
 - Assert exact selected-file counts and sorted min/max values without depending on batch order.
 - Preserve at least one case whose predicate column is excluded from `struct_columns`.
-- Use the existing `parsed-stats` and `300k-add-files-100-col-partitioned` fixtures.
+- Use the existing `parsed-stats` fixture.
 - Preserve unrelated untracked files under `.isaac/` and `docs/superpowers/`.
 
 ---
@@ -214,129 +210,15 @@ git commit -m "test: strengthen scan metadata struct columns coverage"
 Expected: formatting is stable, all matrix cases pass, and only the test/catalog changes are in the
 commit.
 
-### Task 2: Predicate-column Criterion comparison
-
-**Files:**
-- Modify: `kernel/benches/metadata_bench.rs`
-
-**Interfaces:**
-- Consumes: `scan_metadata_benchmark` setup, `StatsOptions::struct_columns`, `col!`, and `lit`.
-- Produces: `scan_metadata_struct_columns_benchmark`, with benchmark IDs
-  `predicate_column_excluded` and `predicate_column_included`.
-
-- [ ] **Step 1: Add the focused benchmark group**
-
-Import `column_name`, `col`, and `lit` from `delta_kernel::expressions` and `StatsOptions` from
-`delta_kernel::scan`. Add:
-
-```rust
-fn scan_metadata_struct_columns_benchmark(c: &mut Criterion) {
-    let (_tempdir, url, engine) = setup();
-    let snapshot = Snapshot::builder_for(url)
-        .build(engine.as_ref())
-        .expect("Failed to create snapshot");
-    let predicate = Arc::new(col!("col_0").gt(lit(0i64)));
-    let mut group = c.benchmark_group("scan_metadata_struct_columns");
-    group.sample_size(SCAN_METADATA_BENCH_SAMPLE_SIZE);
-
-    for (id, stats) in [
-        (
-            "predicate_column_excluded",
-            StatsOptions::struct_columns(vec![column_name!("col_1")]),
-        ),
-        (
-            "predicate_column_included",
-            StatsOptions::struct_columns(vec![column_name!("col_0"), column_name!("col_1")]),
-        ),
-    ] {
-        group.bench_function(id, |b| {
-            b.iter(|| {
-                let scan = snapshot
-                    .clone()
-                    .scan_builder()
-                    .with_predicate(predicate.clone())
-                    .with_stats(stats.clone())
-                    .without_row_transforms()
-                    .build()
-                    .expect("Failed to build scan");
-                for result in scan
-                    .scan_metadata(engine.as_ref())
-                    .expect("Failed to get scan metadata")
-                {
-                    result.expect("Failed to process scan metadata");
-                }
-            })
-        });
-    }
-    group.finish();
-}
-```
-
-Add `scan_metadata_struct_columns_benchmark` to `criterion_group!`.
-
-- [ ] **Step 2: Compile the benchmark**
-
-Run:
-
-```bash
-cargo bench -p delta_kernel --bench metadata_bench --all-features --no-run
-```
-
-Expected: the optimized benchmark binary compiles without warnings.
-
-- [ ] **Step 3: Measure both variants**
-
-Run:
-
-```bash
-cargo bench -p delta_kernel --bench metadata_bench --all-features -- \
-  scan_metadata_struct_columns
-```
-
-Expected: Criterion reports timing confidence intervals for both IDs. Record both intervals and
-their ratio. Treat the included variant as faster only if its entire interval is below the excluded
-variant's interval; otherwise treat the result as indistinguishable or slower.
-
-- [ ] **Step 4: Apply the measured choice to cross-column cases**
-
-If inclusion is measurably faster, add the predicate column to `stats_columns` and
-`requested_names` for the salary predicate case. Keep `id_predicate_not_requested` unchanged so the
-matrix continues to cover internal predicate stats. If inclusion is not measurably faster, make no
-test-input change.
-
-Re-run:
-
-```bash
-cargo nextest run -p delta_kernel --lib --all-features \
-  scan_metadata_struct_columns_returns_expected_stats
-```
-
-Expected: all cases pass with the measured configuration.
-
-- [ ] **Step 5: Format and commit the benchmark**
-
-Run:
-
-```bash
-cargo +nightly fmt
-git diff --check
-git add kernel/benches/metadata_bench.rs kernel/src/scan/tests.rs
-git commit -m "perf: benchmark predicate columns in scan metadata stats"
-```
-
-Expected: the benchmark and any measurement-driven test-input adjustment are committed together.
-
-### Task 3: Final verification
+### Task 2: Final verification
 
 **Files:**
 - Verify: `kernel/src/scan/tests.rs`
-- Verify: `kernel/benches/metadata_bench.rs`
 - Verify: `kernel/tests/README.md`
 
 **Interfaces:**
-- Consumes: the matrix and Criterion comparison from Tasks 1 and 2.
-- Produces: a clean, formatted, linted, documented, and tested change set plus benchmark results for
-  the user.
+- Consumes: the matrix from Task 1.
+- Produces: a clean, formatted, linted, documented, and tested change set for the user.
 
 - [ ] **Step 1: Run the complete delta_kernel library suite**
 
@@ -370,6 +252,5 @@ git status --short
 git log -3 --oneline
 ```
 
-Expected: no tracked changes remain, the design/test/benchmark commits are present, and unrelated
-untracked files remain untouched. Report the exact selected-file cases and both Criterion intervals
-to the user.
+Expected: no tracked changes remain, the design and test commits are present, and unrelated
+untracked files remain untouched. Report the exact selected-file cases to the user.
