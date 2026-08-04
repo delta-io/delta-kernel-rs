@@ -9,10 +9,9 @@ statistics rather than only checking that `stats_parsed` exists.
 
 ## Scope
 
-This change covers the imperative `scan_metadata` path using the existing `parsed-stats` fixture
-and adds a Criterion comparison to the existing metadata benchmark. Declarative metadata plans,
-parallel scans, and production behavior are out of scope. Existing overlapping imperative tests
-may be consolidated into the new matrix.
+This change covers the imperative `scan_metadata` path using the existing `parsed-stats` fixture.
+Declarative metadata plans, parallel scans, and production behavior are out of scope. Existing
+overlapping imperative tests may be consolidated into the new matrix.
 
 The fixture has six files of 100 rows. Its `id` and `salary` statistics form non-overlapping ranges,
 which makes exact data-skipping outcomes deterministic. Assertions must not depend on scan output
@@ -40,25 +39,6 @@ The cross-column cases verify that Kernel reads the predicate's statistics even 
 not in `struct_columns`. Predicate-only statistics are allowed to appear in the returned struct;
 their presence or absence is not part of this test's contract.
 
-## Benchmark
-
-Extend `metadata_bench` with a focused `scan_metadata` comparison over its existing 300k-file,
-100-column fixture. Both variants use `col_0 > 0` and request statistics for `col_1`:
-
-- predicate column excluded: `struct_columns([col_1])`;
-- predicate column included: `struct_columns([col_0, col_1])`.
-
-Build and consume a fresh scan in each iteration, matching the existing benchmark's measurement
-boundary. Call `without_row_transforms()` in both variants to isolate statistics processing from
-partition transform construction. Both variants must otherwise use the same snapshot, engine, and
-predicate so the requested output schema is the only intentional difference.
-
-Run Criterion long enough to report confidence intervals. If including `col_0` is measurably
-faster, cross-column test cases should include their predicate columns in `struct_columns` where
-doing so does not undermine the behavior being tested. If the result is indistinguishable or
-slower, keep predicate columns excluded. Preserve at least one test case with the predicate column
-excluded, because that behavior is the primary correctness gap identified by the survey.
-
 ## Assertions
 
 For every emitted metadata batch, apply its selection vector before checking returned rows. Assert:
@@ -78,5 +58,5 @@ Replace the existing shallow predicate, single-column, and multiple-column tests
 subsumes their public-constructor coverage. Keep unrelated JSON-synthesis, validation, checkpoint,
 and all-struct tests intact.
 
-Run the focused matrix, the remaining scan-metadata stats tests, the Criterion comparison,
-formatting, and the `delta_kernel` library test suite with all features.
+Run the focused matrix, the remaining scan-metadata stats tests, formatting, and the `delta_kernel`
+library test suite with all features.
