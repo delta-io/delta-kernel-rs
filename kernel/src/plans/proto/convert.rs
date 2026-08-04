@@ -18,8 +18,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, DynamicScanFileMetadataColumns, FileType, Filter, Operator,
-    Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
+    ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -225,18 +225,10 @@ impl From<&DynamicScan> for proto_plan::DynamicScanNode {
             file_type: proto_plan::FileType::from(node.file_type) as i32,
             base_url: node.base_url.to_string(),
             file_constant_columns: node.file_constant_columns.clone(),
-            file_meta: Some((&node.file_meta).into()),
+            path_column: Some((&node.path_column).into()),
+            file_size_column: Some((&node.file_size_column).into()),
+            last_modified_column: Some((&node.last_modified_column).into()),
             dv_column: Some((&node.dv_column).into()),
-        }
-    }
-}
-
-impl From<&DynamicScanFileMetadataColumns> for proto_plan::DynamicScanFileMetadataColumns {
-    fn from(meta: &DynamicScanFileMetadataColumns) -> Self {
-        proto_plan::DynamicScanFileMetadataColumns {
-            path_column: Some((&meta.path_column).into()),
-            file_size_column: Some((&meta.file_size_column).into()),
-            last_modified_column: Some((&meta.last_modified_column).into()),
         }
     }
 }
@@ -987,8 +979,8 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, DynamicScanFileMetadataColumns, FileType, Filter, Operator,
-        Project, ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
+        ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1313,7 +1305,9 @@ mod tests {
             file_type: FileType::Parquet,
             base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            file_meta: sample_dynamic_scan_file_metadata_columns(),
+            path_column: ColumnName::new(["path"]),
+            file_size_column: ColumnName::new(["size"]),
+            last_modified_column: ColumnName::new(["filemod"]),
             dv_column: ColumnName::new(["dv"]),
         }),
         "dynamic_scan"
@@ -1416,14 +1410,6 @@ mod tests {
         assert!(proto.predicate.is_some());
     }
 
-    fn sample_dynamic_scan_file_metadata_columns() -> DynamicScanFileMetadataColumns {
-        DynamicScanFileMetadataColumns {
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            last_modified_column: ColumnName::new(["filemod"]),
-        }
-    }
-
     fn sample_dynamic_scan_input_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
             StructField::not_null("path", DataType::STRING),
@@ -1463,7 +1449,9 @@ mod tests {
             file_type,
             base_url,
             ["c"],
-            sample_dynamic_scan_file_metadata_columns(),
+            ColumnName::new(["path"]),
+            ColumnName::new(["size"]),
+            ColumnName::new(["filemod"]),
             ColumnName::new(["dv"]),
         )?;
         let proto = proto_plan::DynamicScanNode::from(&node);
@@ -1476,20 +1464,19 @@ mod tests {
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.dv_column.is_some());
 
-        let file_meta = proto.file_meta.expect("file_meta present");
         assert_eq!(
-            file_meta.path_column.expect("path column present").path,
+            proto.path_column.expect("path column present").path,
             ["path"]
         );
         assert_eq!(
-            file_meta
+            proto
                 .file_size_column
                 .expect("file size column present")
                 .path,
             ["size"]
         );
         assert_eq!(
-            file_meta
+            proto
                 .last_modified_column
                 .expect("last modified column present")
                 .path,

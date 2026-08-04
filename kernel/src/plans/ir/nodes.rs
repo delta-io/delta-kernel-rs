@@ -336,67 +336,10 @@ pub enum FileType {
     Json,
 }
 
-/// Names the columns carrying each file's path, size, and modification time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DynamicScanFileMetadataColumns {
-    /// Non-nullable column holding the per-row file path / URL fragment.
-    pub path_column: ColumnName,
-    /// Non-nullable column with the file's total size in bytes.
-    pub file_size_column: ColumnName,
-    /// Non-nullable column with the file's last-modified timestamp in milliseconds since epoch.
-    pub last_modified_column: ColumnName,
-}
-
-impl DynamicScanFileMetadataColumns {
-    /// Constructs validated column names for each file's path, size, and modification time.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a named column is absent from `input_schema`, has an incompatible
-    /// type, or is nullable, including through a nullable parent struct.
-    pub fn try_new(
-        input_schema: &SchemaRef,
-        path_column: ColumnName,
-        file_size_column: ColumnName,
-        last_modified_column: ColumnName,
-    ) -> DeltaResult<Self> {
-        Self::validate_column(input_schema, &path_column, &DataType::STRING)?;
-        Self::validate_column(input_schema, &file_size_column, &DataType::LONG)?;
-        Self::validate_column(input_schema, &last_modified_column, &DataType::LONG)?;
-        Ok(Self {
-            path_column,
-            file_size_column,
-            last_modified_column,
-        })
-    }
-
-    fn validate_column(
-        schema: &SchemaRef,
-        column: &ColumnName,
-        expected_type: &DataType,
-    ) -> DeltaResult<()> {
-        let fields = schema.fields_of_path(column)?;
-        let field = fields
-            .last()
-            .ok_or_else(|| Error::generic("dynamic scan: column path must not be empty"))?;
-        if field.data_type() != expected_type {
-            return Err(Error::generic(format!(
-                "dynamic scan: column `{column}` must have type {expected_type:?}, found {:?}",
-                field.data_type()
-            )));
-        }
-        if fields.iter().any(|field| field.is_nullable()) {
-            return Err(Error::generic(format!(
-                "dynamic scan: required column `{column}` is nullable"
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// Reads data files from an upstream stream of file-metadata tuples, one input row per file.
-/// For each row, `file_meta` locates and sizes the file, the engine resolves its path against
-/// `base_url` (see below), opens it as `file_type`, and reads columns matching `schema`.
+/// For each row, the path, size, and last-modified columns describe the file; the engine resolves
+/// its path against `base_url` (see below), opens it as `file_type`, and reads columns matching
+/// `schema`.
 ///
 /// `file_constant_columns` lists upstream columns whose per-file values are broadcast onto
 /// every emitted file row. This is file-constant metadata, the same concept as
@@ -435,11 +378,9 @@ impl DynamicScanFileMetadataColumns {
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
 ///     file_constant_columns: ["version"],
-///     file_meta: {
-///         path_column: "path",
-///         file_size_column: "size",
-///         last_modified_column: "filemod",
-///     },
+///     path_column: "path",
+///     file_size_column: "size",
+///     last_modified_column: "filemod",
 ///     dv_column: "dv",
 /// }
 /// ```
@@ -461,41 +402,58 @@ pub struct DynamicScan {
     pub file_type: FileType,
     pub base_url: Url,
     pub file_constant_columns: Vec<String>,
-    pub file_meta: DynamicScanFileMetadataColumns,
+    /// Non-nullable input column holding the per-row file path or URL fragment.
+    pub path_column: ColumnName,
+    /// Non-nullable input column with the file's total size in bytes.
+    pub file_size_column: ColumnName,
+    /// Non-nullable input column with the last-modified timestamp in milliseconds since epoch.
+    pub last_modified_column: ColumnName,
     pub dv_column: ColumnName,
 }
 
 impl DynamicScan {
     /// Constructs a [`DynamicScan`] whose emitted rows match `output_schema`.
     ///
-    /// `input_schema` describes the upstream rows containing file metadata and validates the
-    /// deletion-vector column. Construct `file_meta` with
-    /// [`DynamicScanFileMetadataColumns::try_new`] against the same schema. Plan attachment
-    /// applies both constructor validations to the actual upstream schema. The scan reads
+    /// `input_schema` describes the upstream rows containing file metadata. Plan attachment
+    /// applies the same constructor validation to the actual upstream schema. The scan reads
     /// `file_type` files relative to `base_url`.
     ///
     /// # Errors
     ///
-    /// Returns an error when the deletion-vector column is absent from `input_schema` or has an
-    /// incompatible type, or when a file-constant column is absent from either schema, is a
-    /// metadata column, or has different input and output types or nullability.
+    /// Returns an error when `base_url` cannot serve as a base URL; when a required metadata or
+    /// deletion-vector column is absent from `input_schema` or has an incompatible type; or when a
+    /// required metadata column or one of its ancestors is nullable. Also returns an error when a
+    /// file-constant column is absent from either schema, is a metadata column, or has different
+    /// input and output types or nullability.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         input_schema: &SchemaRef,
         output_schema: impl Into<SchemaRef>,
         file_type: FileType,
         base_url: Url,
         file_constant_columns: impl IntoIterator<Item = impl Into<String>>,
-        file_meta: DynamicScanFileMetadataColumns,
+        path_column: ColumnName,
+        file_size_column: ColumnName,
+        last_modified_column: ColumnName,
         dv_column: ColumnName,
     ) -> DeltaResult<Self> {
         static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
             LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
+
+        if base_url.cannot_be_a_base() {
+            return Err(Error::generic(format!(
+                "dynamic scan: URL `{base_url}` cannot be used as a base URL"
+            )));
+        }
 
         let schema = output_schema.into();
         let file_constant_columns = file_constant_columns
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
+        Self::validate_required_column(input_schema, &path_column, &DataType::STRING)?;
+        Self::validate_required_column(input_schema, &file_size_column, &DataType::LONG)?;
+        Self::validate_required_column(input_schema, &last_modified_column, &DataType::LONG)?;
         Self::validate_file_constant_columns(input_schema, &schema, &file_constant_columns)?;
 
         let field = input_schema.field_at(&dv_column).map_err(|err| {
@@ -517,9 +475,34 @@ impl DynamicScan {
             file_type,
             base_url,
             file_constant_columns,
-            file_meta,
+            path_column,
+            file_size_column,
+            last_modified_column,
             dv_column,
         })
+    }
+
+    fn validate_required_column(
+        schema: &SchemaRef,
+        column: &ColumnName,
+        expected_type: &DataType,
+    ) -> DeltaResult<()> {
+        let fields = schema.fields_of_path(column)?;
+        let field = fields
+            .last()
+            .ok_or_else(|| Error::generic("dynamic scan: column path must not be empty"))?;
+        if field.data_type() != expected_type {
+            return Err(Error::generic(format!(
+                "dynamic scan: column `{column}` must have type {expected_type:?}, found {:?}",
+                field.data_type()
+            )));
+        }
+        if fields.iter().any(|field| field.is_nullable()) {
+            return Err(Error::generic(format!(
+                "dynamic scan: required column `{column}` is nullable"
+            )));
+        }
+        Ok(())
     }
 
     fn validate_file_constant_columns(

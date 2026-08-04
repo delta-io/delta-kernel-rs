@@ -65,14 +65,6 @@ message FilterNode {
 
 message UnionAllNode {}
 
-message DynamicScanFileMetadataColumns {
-  // Required input columns: path is STRING; size and last-modified are LONG.
-  // Each column and every ancestor in its path must be non-nullable.
-  delta.kernel.expressions.ColumnName path_column = 1;
-  delta.kernel.expressions.ColumnName file_size_column = 2;
-  delta.kernel.expressions.ColumnName last_modified_column = 3;
-}
-
 enum FileType {
   FILE_TYPE_UNSPECIFIED = 0;
   FILE_TYPE_PARQUET = 1;
@@ -85,8 +77,12 @@ message DynamicScanNode {
   // Absolute, non-empty base URL used to resolve relative file paths.
   string base_url = 3;
   repeated string file_constant_columns = 4;
-  DynamicScanFileMetadataColumns file_meta = 5;
-  delta.kernel.expressions.ColumnName dv_column = 6;
+  // Required input columns: path is STRING; size and last-modified are LONG.
+  // Each column and every ancestor in its path must be non-nullable.
+  delta.kernel.expressions.ColumnName path_column = 5;
+  delta.kernel.expressions.ColumnName file_size_column = 6;
+  delta.kernel.expressions.ColumnName last_modified_column = 7;
+  delta.kernel.expressions.ColumnName dv_column = 8;
 }
 
 message MinAgg {

@@ -20,7 +20,7 @@ use crate::expressions::{
     col, column_name, joined_column_expr, ColumnName, Expression as Expr, Predicate,
 };
 use crate::log_segment::LogSegment;
-use crate::plans::ir::nodes::{DynamicScan, DynamicScanFileMetadataColumns, FileType, ScanFile};
+use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::schema::{
     lazy_schema_ref, schema, schema_ref, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
@@ -245,6 +245,7 @@ fn sidecar_actions(
     const FILE_MOD: &str = "filemod";
     const DV: &str = "dv";
     const SIDECAR_SIZE: &str = "sizeInBytes";
+    const SIDECAR_FILE_MOD: &str = "modificationTime";
 
     static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
         not_null (FILE_PATH): STRING,
@@ -265,15 +266,13 @@ fn sidecar_actions(
     };
     let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
         .filter(Predicate::and_from([
-            col!(SIDECAR_NAME).is_not_null(),
             col!(SIDECAR_NAME, FILE_PATH).is_not_null(),
-            col!(SIDECAR_NAME, SIDECAR_SIZE).is_not_null(),
         ]))?
         .project(
             Expr::struct_from([
                 col!(SIDECAR_NAME, FILE_PATH),
                 col!(SIDECAR_NAME, SIDECAR_SIZE),
-                Expr::literal(0_i64),
+                col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
                 Expr::null_literal(DeletionVectorDescriptor::to_schema().into()),
                 col!(VERSION),
             ]),
@@ -286,12 +285,9 @@ fn sidecar_actions(
         FileType::Parquet,
         log_root.join("_sidecars/")?,
         [VERSION],
-        DynamicScanFileMetadataColumns::try_new(
-            &SIDECAR_FILE_META_SCHEMA,
-            ColumnName::new([FILE_PATH]),
-            ColumnName::new([FILE_SIZE]),
-            ColumnName::new([FILE_MOD]),
-        )?,
+        ColumnName::new([FILE_PATH]),
+        ColumnName::new([FILE_SIZE]),
+        ColumnName::new([FILE_MOD]),
         ColumnName::new([DV]),
     )?;
 
