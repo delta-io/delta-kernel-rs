@@ -2306,17 +2306,29 @@ mod tests {
     /// predictable and the physical one must merely differ from it.
     #[rstest::rstest]
     #[case::no_clustering(None, None, None, false)]
-    #[case::clustered_no_column_mapping(Some(vec!["region"]), None, Some("region"), false)]
+    #[case::clustered_no_column_mapping(Some(vec![vec!["region"]]), None, Some(vec!["region"]), false)]
     #[case::clustered_with_column_mapping(
-        Some(vec!["region"]),
+        Some(vec![vec!["region"]]),
         Some("name"),
-        Some("region"),
+        Some(vec!["region"]),
+        true
+    )]
+    #[case::nested_no_column_mapping(
+        Some(vec![vec!["address", "city"]]),
+        None,
+        Some(vec!["address", "city"]),
+        false
+    )]
+    #[case::nested_with_column_mapping(
+        Some(vec![vec!["address", "city"]]),
+        Some("name"),
+        Some(vec!["address", "city"]),
         true
     )]
     fn test_get_clustering_column_infos(
-        #[case] clustering_cols: Option<Vec<&str>>,
+        #[case] clustering_cols: Option<Vec<Vec<&str>>>,
         #[case] column_mapping_mode: Option<&str>,
-        #[case] expected_logical: Option<&str>,
+        #[case] expected_logical: Option<Vec<&str>>,
         #[case] physical_differs: bool,
     ) {
         use crate::transaction::create_table::create_table;
@@ -2326,14 +2338,26 @@ mod tests {
         let engine = SyncEngine::new_with_store(storage);
         let schema = Arc::new(
             crate::schema::StructType::try_new(vec![
-                crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
-                crate::schema::StructField::new("region", crate::schema::DataType::STRING, true),
+                crate::schema::StructField::nullable("id", DataType::INTEGER),
+                crate::schema::StructField::nullable("region", DataType::STRING),
+                crate::schema::StructField::nullable(
+                    "address",
+                    crate::schema::StructType::try_new(vec![
+                        crate::schema::StructField::nullable("city", DataType::STRING),
+                        crate::schema::StructField::nullable("zip", DataType::INTEGER),
+                    ])
+                    .unwrap(),
+                ),
             ])
             .unwrap(),
         );
         let _ = create_table("memory:///", schema, "test")
             .fold_with(clustering_cols.as_ref(), |builder, cols| {
-                builder.with_data_layout(DataLayout::clustered(cols.clone()))
+                let columns = cols
+                    .iter()
+                    .map(|path| ColumnName::new(path.iter().copied()))
+                    .collect();
+                builder.with_data_layout(DataLayout::Clustered { columns })
             })
             .fold_with(column_mapping_mode, |builder, mode| {
                 builder.with_table_properties([("delta.columnMapping.mode", mode)])
@@ -2354,10 +2378,20 @@ mod tests {
                 let infos = result.expect("clustering infos should be present");
                 assert_eq!(infos.len(), 1);
                 let info = &infos[0];
-                assert_eq!(info.logical_column, ColumnName::new([logical]));
+                assert_eq!(
+                    info.logical_column,
+                    ColumnName::new(logical.iter().copied())
+                );
                 assert_eq!(info.data_type, DataType::STRING);
+                assert_eq!(info.physical_column.path().len(), logical.len());
                 if physical_differs {
                     assert_ne!(info.physical_column, info.logical_column);
+                    for part in info.physical_column.path() {
+                        assert!(
+                            part.starts_with("col-"),
+                            "physical path segment '{part}' should be a column-mapping id"
+                        );
+                    }
                 } else {
                     assert_eq!(info.physical_column, info.logical_column);
                 }
