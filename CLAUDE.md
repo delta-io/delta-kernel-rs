@@ -63,7 +63,7 @@ cargo +nightly fmt \
 | `feature_tests`                      | `feature-tests/`                      | Feature flag tests                                                       |
 | `delta-kernel-unity-catalog`         | `delta-kernel-unity-catalog/`         | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
 | `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Unity Catalog client traits and shared models                            |
-| `unity-catalog-delta-client-default` | `unity-catalog-delta-client-default/` | Default Unity Catalog REST/HTTP client implementation                    |
+| `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP implementation of the Unity Catalog client API                 |
 
 ### Feature Flags
 

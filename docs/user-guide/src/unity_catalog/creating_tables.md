@@ -1,7 +1,7 @@
 # Creating Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-default, unity-catalog-delta-client-api -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-rest-client, unity-catalog-delta-client-api -->
 
 To create a new Unity Catalog-managed Delta table, you register the table with
 your UC server to obtain a table ID and storage location, write a version 0
@@ -13,7 +13,7 @@ Before reading this page, make sure you understand
 [Unity Catalog Integration overview](./overview.md).
 
 > [!NOTE]
-> Steps 1 and 5 call UC endpoints that the Rust `unity-catalog-delta-client-default`
+> Steps 1 and 5 call UC endpoints that the Rust `unity-catalog-delta-rest-client`
 > crate does not yet expose. Route those through your connector's own UC client;
 > the request and response wire types live in `unity-catalog-delta-client-api`.
 
@@ -76,7 +76,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 let config = ClientConfig::build(&endpoint, &token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);

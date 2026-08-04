@@ -5,15 +5,15 @@
 //! normal `cargo test`. The dedicated CI workflow (`.github/workflows/unitycatalog_oss_test.yml`)
 //! builds + starts a UC server and runs them:
 //!
-//!   cargo nextest run -p unity-catalog-delta-client-default --features integration-test -E
+//!   cargo nextest run -p unity-catalog-delta-rest-client --features integration-test -E
 //! 'test(live_)'
 #![cfg(feature = "integration-test")]
 
 use unity_catalog_delta_client_api::{
     CreateStagingTableRequest, CreateStagingTableResponse, Operation,
 };
-use unity_catalog_delta_client_default::http::build_http_client;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::http::build_http_client;
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 use url::Url;
 
 /// Reads the server URL + token from the environment, or `None` to skip the test.

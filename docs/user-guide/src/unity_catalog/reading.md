@@ -1,7 +1,7 @@
 # Reading Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-default -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-rest-client -->
 
 To read a Unity Catalog-managed Delta table, you load the table through the UC
 Delta-Tables API, fetch temporary storage credentials, build a Snapshot from the
@@ -14,7 +14,7 @@ Before reading this page, make sure you understand
 
 > [!NOTE]
 > This example uses the `delta-kernel-unity-catalog` and
-> `unity-catalog-delta-client-default` crates, which are not part of the
+> `unity-catalog-delta-rest-client` crates, which are not part of the
 > `delta_kernel` crate itself. Add them as dependencies alongside `delta_kernel`.
 
 ## Dependencies
@@ -26,7 +26,7 @@ Add the following to your `Cargo.toml`:
 delta_kernel = "..."
 delta_kernel_default_engine = { version = "...", features = ["rustls"] }
 delta-kernel-unity-catalog = "..."
-unity-catalog-delta-client-default = "..."
+unity-catalog-delta-rest-client = "..."
 unity-catalog-delta-client-api = "..."
 url = "2"
 tokio = { version = "1", features = ["full"] }
@@ -43,7 +43,7 @@ the REST client crate does not re-export them.
 rest of the UC integration.
 
 ```rust,ignore
-use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 
 let config = ClientConfig::build(&endpoint, &token)
     .with_additional_user_agent([("MyConnector", "1.0")])
@@ -186,7 +186,7 @@ use delta_kernel::object_store;
 use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel_unity_catalog::snapshot_builder_from_load_table;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

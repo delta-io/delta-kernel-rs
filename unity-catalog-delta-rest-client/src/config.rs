@@ -8,7 +8,7 @@ use crate::error::Result;
 /// connector, and kernel versions via [`ClientConfigBuilder::with_additional_user_agent`].
 fn client_user_agent() -> String {
     format!(
-        "Unity-Catalog-Delta-Default-Rust-Client/{}",
+        "Unity-Catalog-Delta-Rest-Rust-Client/{}",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -173,7 +173,7 @@ mod tests {
 
     fn client_token() -> String {
         format!(
-            "Unity-Catalog-Delta-Default-Rust-Client/{}",
+            "Unity-Catalog-Delta-Rest-Rust-Client/{}",
             env!("CARGO_PKG_VERSION")
         )
     }

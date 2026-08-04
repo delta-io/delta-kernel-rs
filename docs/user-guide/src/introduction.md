@@ -107,7 +107,7 @@ without writing any Rust. See the [FFI overview](./ffi/overview.md) for details.
 | `acceptance` | Delta Acceptance Tests (DAT) validation suite |
 | `benchmarks` | Performance benchmarks for the core library |
 | `delta-kernel-unity-catalog` | Unity Catalog integration ([overview](./unity_catalog/overview.md)) |
-| `unity-catalog-delta-client-default` | REST client for the Unity Catalog API |
+| `unity-catalog-delta-rest-client` | REST client for the Unity Catalog API |
 
 ## Getting started
 

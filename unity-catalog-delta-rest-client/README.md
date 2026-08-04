@@ -1,4 +1,4 @@
-# unity-catalog-delta-client-default
+# unity-catalog-delta-rest-client
 
 An experimental/under-construction Rust client for the Unity Catalog Delta APIs. This crate is not
 intended for production use.
@@ -14,7 +14,7 @@ It provides two REST structs:
 
 ```rust,no_run
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

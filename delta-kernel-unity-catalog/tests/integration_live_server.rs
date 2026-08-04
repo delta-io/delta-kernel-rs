@@ -40,8 +40,8 @@ use test_utils::{insert_data_with, read_scan};
 use unity_catalog_delta_client_api::{
     CreateStagingTableRequest, CreateStagingTableResponse, LoadTableResponse, TableIdentifier,
 };
-use unity_catalog_delta_client_default::http::build_http_client;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::http::build_http_client;
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 use url::Url;
 
 /// Returns `(server_url, token)` from the environment, or `None` to signal the caller to skip.

@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+//! use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
