@@ -644,6 +644,74 @@ mod tests {
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
     }
 
+    fn dv_with_path(
+        storage_type: DeletionVectorStorageType,
+        path_or_inline_dv: &str,
+    ) -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv: path_or_inline_dv.to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        }
+    }
+
+    #[rstest::rstest]
+    // z85 UUID with a random prefix -> `<prefix>/deletion_vector_<uuid>.bin`.
+    #[case(
+        "ab^-aqEH.-t@S}K{vb[*k^",
+        "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    )]
+    // Bare 20-char z85 UUID, no prefix.
+    #[case(
+        "vBn[lx{q8@P<9BNH/isA",
+        "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+    )]
+    fn test_relative_path_decodes(#[case] encoded: &str, #[case] expected: &str) {
+        let dv = dv_with_path(DeletionVectorStorageType::PersistedRelative, encoded);
+        assert_eq!(dv.relative_path().unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    // Non-relative storage types are rejected by the guard.
+    #[case(
+        DeletionVectorStorageType::PersistedAbsolute,
+        "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin",
+        "only valid for PersistedRelative"
+    )]
+    #[case(
+        DeletionVectorStorageType::Inline,
+        "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
+        "only valid for PersistedRelative"
+    )]
+    // Path shorter than the 20-byte z85 UUID suffix.
+    #[case(
+        DeletionVectorStorageType::PersistedRelative,
+        "short",
+        "Invalid length"
+    )]
+    // A non-ASCII byte straddling the trailing-20-byte window must error, not panic. `é` is two
+    // bytes, so this 21-byte path leaves `prefix_len == 1` inside the multi-byte `é`; byte-slicing
+    // (vs the pre-fix char-slicing) errors cleanly instead of panicking.
+    #[case(
+        DeletionVectorStorageType::PersistedRelative,
+        "éaaaaaaaaaaaaaaaaaaa",
+        "Failed to decode DV uuid"
+    )]
+    fn test_relative_path_errors(
+        #[case] storage_type: DeletionVectorStorageType,
+        #[case] path_or_inline_dv: &str,
+        #[case] expected_error: &str,
+    ) {
+        let dv = dv_with_path(storage_type, path_or_inline_dv);
+        let err = dv.relative_path().unwrap_err().to_string();
+        assert!(
+            err.contains(expected_error),
+            "error {err:?} did not contain {expected_error:?}"
+        );
+    }
+
     #[test]
     fn test_magic_number_constants() {
         assert_eq!(ROARING_BITMAP_PORTABLE_MAGIC, 1681511377);
