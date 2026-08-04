@@ -266,7 +266,7 @@ fn sidecar_actions(
     };
     let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
         .filter(Predicate::and_from([
-            col!(SIDECAR_NAME, FILE_PATH).is_not_null(),
+            col!(SIDECAR_NAME, FILE_PATH).is_not_null()
         ]))?
         .project(
             Expr::struct_from([
