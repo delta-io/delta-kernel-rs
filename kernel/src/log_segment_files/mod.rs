@@ -106,11 +106,10 @@ pub(crate) fn list_delta_log_from_storage(
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
 ///
-/// Several _complete_ checkpoints can legitimately share a version: writers choose how many parts
-/// to split a checkpoint into independently, and a V2 writer embeds a fresh uuid in each file name.
-/// Each distinct checkpoint therefore gets its own [`CheckpointInstance`] key and they never
-/// overwrite one another, so the caller can pick a winner deterministically (see
-/// `ListingAccumulator::select_checkpoint_for_group`).
+/// Several _complete_ checkpoints can legitimately share a version -- e.g. two multi-part
+/// checkpoints with different part counts, or two uuid-named ones. Each gets its own
+/// [`CheckpointInstance`] key so they never overwrite one another, letting the caller pick a winner
+/// deterministically (see `ListingAccumulator::select_checkpoint_for_group`).
 ///
 /// `parts` must arrive in ascending file name order, which is what log listing produces: a
 /// multi-part checkpoint only accumulates while its parts arrive in order.
@@ -614,10 +613,11 @@ impl LogSegmentFiles {
         );
         } else if !checkpoint_metadata.applies_to(&listed_files.checkpoint_parts) {
             // The hint describes a checkpoint other than the one selected at this version (see
-            // `group_checkpoint_parts`) -- expected under concurrent writers. Readers fall back to
-            // the checkpoint file's own fields; `applies_to` also makes
-            // `LogSegment::checkpoint_hint` yield `None`, so this logs exactly when the
-            // hint's fields are dropped.
+            // `group_checkpoint_parts`) -- expected whenever a writer checkpoints a version another
+            // writer already checkpointed and leaves the hint alone, concurrently or not. Readers
+            // fall back to the checkpoint file's own fields; `applies_to` also makes
+            // `LogSegment::checkpoint_hint` yield `None`, so this logs exactly when the hint's
+            // fields are dropped.
             debug!(
                 version = checkpoint_metadata.version,
                 hint_parts = checkpoint_metadata.parts.unwrap_or(1),

@@ -1369,9 +1369,9 @@ fn hint_naming_uuid(filename: &str) -> LastCheckpointHint {
     }
 }
 
-/// Mirrors Delta-Spark's `CheckpointInstanceSuite`: a classic checkpoint sorts below a multi-part
-/// one, more parts beats fewer, a uuid (V2) checkpoint outranks both, and two uuid checkpoints at
-/// one version break the tie on file name.
+/// Mirrors Delta-Spark: a classic checkpoint sorts below a multi-part one, more parts beats fewer,
+/// a uuid (V2) checkpoint outranks both, and two uuid checkpoints at one version break the tie on
+/// file name.
 #[test]
 fn checkpoint_instance_orders_like_delta_spark() {
     let classic = CheckpointInstance::Classic;

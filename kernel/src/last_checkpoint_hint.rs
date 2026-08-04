@@ -108,8 +108,8 @@ pub(crate) enum HintAction {
 
 impl LastCheckpointHint {
     /// Whether this hint describes the checkpoint a log segment selected -- its `checkpoint_parts`.
-    /// Multiple checkpoints can share a version (e.g. concurrent writers), so a matching version
-    /// alone is not enough: the hint's own identity must equal the selected checkpoint's.
+    /// Multiple checkpoints can share a version, so a matching version alone is not enough: the
+    /// hint's own identity must equal the selected checkpoint's.
     ///
     /// On a mismatch, callers read the checkpoint file itself instead of trusting the hint's
     /// fields.

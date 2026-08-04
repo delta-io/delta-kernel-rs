@@ -37,9 +37,7 @@ pub(crate) enum LogPathFileType {
     StagedCommit,
     /// A classic-named checkpoint, `<version>.checkpoint.parquet`. The name identifies the
     /// file-naming scheme, not the checkpoint's spec version: this file may hold a V1 checkpoint
-    /// with its actions inline, or a V2 checkpoint that references sidecars. Only reading the file
-    /// distinguishes them, which is why `LogSegment::get_file_actions_schema_and_sidecars` probes
-    /// for a sidecar column.
+    /// with its actions inline, or a V2 checkpoint that references sidecars.
     ClassicCheckpoint,
     /// A uuid-named checkpoint, `<version>.checkpoint.<uuid>.{parquet,json}`. Always a V2
     /// checkpoint, since only the V2 spec writes this naming scheme. The uuid means several can
@@ -73,8 +71,7 @@ pub(crate) enum LogPathFileType {
 /// | V1   | valid   | valid      | invalid    |
 /// | V2   | valid   | invalid    | valid      |
 ///
-/// So a `Classic` checkpoint follows either spec and only its contents say which, which is why
-/// `LogSegment::get_file_actions_schema_and_sidecars` probes for a sidecar column.
+/// So a `Classic` checkpoint follows either spec and only its contents say which.
 ///
 /// Variant declaration order is the rank and each payload is that rank's tiebreaker, so the derived
 /// [`Ord`] is the entire comparison (`Uuid` > `MultiPart` > `Classic`, matching Delta-Spark for

@@ -1663,3 +1663,88 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
 
     Ok(snapshot)
 }
+
+/// A version holding two complete checkpoints must load from the uuid-named one, since it outranks
+/// the classic-named one, and the resulting snapshot must still read every row.
+///
+/// Kernel only ever writes classic-named checkpoints, so the competing uuid-named file is copied
+/// from the one kernel wrote -- byte-identical, and spec-valid under `v2Checkpoint`. The
+/// `_last_checkpoint` on disk names the classic file either way, so the winning uuid checkpoint is
+/// selected even though the hint points elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = schema_ref! { nullable "value": INTEGER };
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let result = insert_data(
+        snapshot0,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?;
+    let CommitResult::CommittedTransaction(committed) = result else {
+        panic!("Expected CommittedTransaction");
+    };
+    let snapshot = committed
+        .post_commit_snapshot()
+        .expect("expected post-commit snapshot");
+    let version = snapshot.version();
+
+    // Writes `<version>.checkpoint.parquet` plus a `_last_checkpoint` naming it.
+    snapshot.checkpoint(
+        engine.as_ref(),
+        Some(&CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+    )?;
+
+    // Add a second complete checkpoint at the same version under a uuid name, which outranks the
+    // classic one. Kernel's write path cannot produce this, so copy the file it did write.
+    let classic_path = load_existing_single_file_checkpoint_path(&table_path, version);
+    let uuid_name = format!("{version:020}.checkpoint.{}.parquet", uuid::Uuid::new_v4());
+    let uuid_path = std::path::Path::new(&table_path)
+        .join("_delta_log")
+        .join(&uuid_name);
+    std::fs::copy(&classic_path, &uuid_path).expect("copy classic checkpoint to a uuid name");
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), version);
+
+    // The uuid-named checkpoint wins, even though `_last_checkpoint` names the classic one.
+    let log_segment = snapshot.log_segment();
+    let selected: Vec<&str> = log_segment
+        .listed
+        .checkpoint_parts
+        .iter()
+        .map(|p| p.filename.as_str())
+        .collect();
+    assert_eq!(
+        selected,
+        vec![uuid_name.as_str()],
+        "expected the uuid-named checkpoint to outrank the classic one"
+    );
+    assert_eq!(log_segment.checkpoint_version, Some(version));
+
+    // The selected checkpoint is readable, so replay over it returns every row.
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?;
+    assert_batches_sorted_eq!(
+        vec![
+            "+-------+",
+            "| value |",
+            "+-------+",
+            "| 1     |",
+            "| 2     |",
+            "| 3     |",
+            "+-------+",
+        ],
+        &batches
+    );
+
+    Ok(())
+}
