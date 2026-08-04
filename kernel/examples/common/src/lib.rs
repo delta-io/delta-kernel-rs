@@ -8,12 +8,12 @@ use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::object_store::aws::AmazonS3Builder;
 use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
 use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
-use delta_kernel::object_store::{DynObjectStore, ObjectStoreScheme};
+use delta_kernel::object_store::ObjectStoreScheme;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::MetadataColumnSpec;
 use delta_kernel::{DeltaResult, SnapshotRef};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel_default_engine::storage::store_from_url_opts;
+use delta_kernel_default_engine::storage::EngineStore;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use url::Url;
 
@@ -134,18 +134,18 @@ pub fn get_engine(
         })?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
-        let store: Arc<DynObjectStore> = match scheme {
-            AmazonS3 => Arc::new(AmazonS3Builder::from_env().with_url(url_str).build()?),
-            GoogleCloudStorage => Arc::new(
-                GoogleCloudStorageBuilder::from_env()
-                    .with_url(url_str)
-                    .build()?,
-            ),
-            MicrosoftAzure => Arc::new(
-                MicrosoftAzureBuilder::from_env()
-                    .with_url(url_str)
-                    .build()?,
-            ),
+        // Each concrete cloud store supports delimiter-pushdown listing.
+        macro_rules! engine_store {
+            ($builder:ty) => {
+                EngineStore::with_paginated(Arc::new(
+                    <$builder>::from_env().with_url(url_str).build()?,
+                ))
+            };
+        }
+        let store = match scheme {
+            AmazonS3 => engine_store!(AmazonS3Builder),
+            GoogleCloudStorage => engine_store!(GoogleCloudStorageBuilder),
+            MicrosoftAzure => engine_store!(MicrosoftAzureBuilder),
             Local | Memory | Http => {
                 return Err(delta_kernel::Error::Generic(format!(
                     "Scheme {scheme:?} doesn't support getting credentials from environment"
@@ -158,13 +158,13 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngineBuilder::new(Arc::new(store)).build())
+        Ok(DefaultEngineBuilder::from_engine_store(store).build())
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
             (parts[0].to_ascii_lowercase(), parts[1])
         });
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, opts)?).build())
+        Ok(DefaultEngineBuilder::from_url_opts(url, opts)?.build())
     } else {
         let mut options = if let Some(ref region) = args.region {
             HashMap::from([("region", region.clone())])
@@ -174,7 +174,7 @@ pub fn get_engine(
         if args.public {
             options.insert("skip_signature", "true".to_string());
         }
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, options)?).build())
+        Ok(DefaultEngineBuilder::from_url_opts(url, options)?.build())
     }
 }
 
