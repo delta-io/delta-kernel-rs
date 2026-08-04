@@ -549,11 +549,11 @@ impl Snapshot {
                     &physical_col,
                     column_mapping_mode,
                 )?;
-                Ok(ClusteringColumnInfo::new(
-                    physical_col,
-                    logical_col,
+                Ok(ClusteringColumnInfo {
+                    physical_column: physical_col,
+                    logical_column: logical_col,
                     data_type,
-                ))
+                })
             })
             .collect::<DeltaResult<Vec<_>>>()?;
         Ok(Some(infos))
@@ -2354,12 +2354,12 @@ mod tests {
                 let infos = result.expect("clustering infos should be present");
                 assert_eq!(infos.len(), 1);
                 let info = &infos[0];
-                assert_eq!(info.logical_column(), &ColumnName::new([logical]));
-                assert_eq!(info.data_type(), &DataType::STRING);
+                assert_eq!(info.logical_column, ColumnName::new([logical]));
+                assert_eq!(info.data_type, DataType::STRING);
                 if physical_differs {
-                    assert_ne!(info.physical_column(), info.logical_column());
+                    assert_ne!(info.physical_column, info.logical_column);
                 } else {
-                    assert_eq!(info.physical_column(), info.logical_column());
+                    assert_eq!(info.physical_column, info.logical_column);
                 }
             }
         }

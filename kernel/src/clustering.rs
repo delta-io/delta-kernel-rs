@@ -47,48 +47,16 @@ pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
 /// nested-field clustering.
 ///
 /// Callers needing to correlate a clustering column with per-file statistics must use
-/// [`Self::physical_column`]: stats are keyed on physical names.
+/// [`physical_column`]: stats are keyed on physical names.
 #[derive(Debug, Clone, PartialEq)]
 #[internal_api]
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 pub(crate) struct ClusteringColumnInfo {
-    physical_column: ColumnName,
-    logical_column: ColumnName,
-    data_type: DataType,
-}
-
-#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-impl ClusteringColumnInfo {
-    #[internal_api]
-    pub(crate) fn new(
-        physical_column: ColumnName,
-        logical_column: ColumnName,
-        data_type: DataType,
-    ) -> Self {
-        Self {
-            physical_column,
-            logical_column,
-            data_type,
-        }
-    }
-
     /// The physical column reference as stored in the `delta.clustering` domain.
-    #[internal_api]
-    pub(crate) fn physical_column(&self) -> &ColumnName {
-        &self.physical_column
-    }
-
+    pub physical_column: ColumnName,
     /// The logical column reference, resolved against the snapshot's schema.
-    #[internal_api]
-    pub(crate) fn logical_column(&self) -> &ColumnName {
-        &self.logical_column
-    }
-
+    pub logical_column: ColumnName,
     /// The data type of the column at the resolved path.
-    #[internal_api]
-    pub(crate) fn data_type(&self) -> &DataType {
-        &self.data_type
-    }
+    pub data_type: DataType,
 }
 
 /// Validates clustering columns against the table schema.

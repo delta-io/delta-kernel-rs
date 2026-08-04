@@ -107,9 +107,9 @@ fn visit_clustering_columns_impl(
         return Ok(OptionalValue::None);
     };
     for info in &infos {
-        let logical = info.logical_column().to_string();
-        let physical = info.physical_column().to_string();
-        let (tag, precision, scale) = NullTypeTag::from_data_type(info.data_type());
+        let logical = info.logical_column.to_string();
+        let physical = info.physical_column.to_string();
+        let (tag, precision, scale) = NullTypeTag::from_data_type(&info.data_type);
         visitor(
             engine_context,
             kernel_string_slice!(logical),
