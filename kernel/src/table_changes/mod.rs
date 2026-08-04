@@ -571,7 +571,7 @@ mod tests {
         assert_result_error_with_message, test_schema_flat_with_column_mapping, Action,
         LocalMockTable,
     };
-    use crate::{Engine, Error};
+    use crate::Engine;
 
     fn listing_test_schema() -> Arc<StructType> {
         Arc::new(StructType::new_unchecked([
@@ -608,7 +608,9 @@ mod tests {
                 start_version,
                 end_version.into(),
             );
-            assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))))
+            assert!(res
+                .as_ref()
+                .is_err_and(|error| { error.legacy_error_kind() == Some("CdfUnsupported") }))
         }
     }
     #[test]
@@ -620,7 +622,9 @@ mod tests {
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
-        assert!(matches!(table_changes_res, Err(Error::Generic(msg)) if msg == expected_msg));
+        assert!(table_changes_res
+            .as_ref()
+            .is_err_and(|error| error.legacy_message() == Some(expected_msg)));
     }
 
     #[test]
@@ -659,7 +663,7 @@ mod tests {
         );
         let res = table_changes.scan_file_listing(engine, TableChangesListingMode::AllChanges);
         assert!(
-            matches!(res, Err(Error::Unsupported(_))),
+            res.as_ref().is_err_and(|error| error.is_unsupported()),
             "scan_file_listing on a cdc-file TableChanges must return an unsupported error"
         );
     }
@@ -700,7 +704,9 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let res = TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
         assert!(
-            matches!(&res, Err(Error::RowTrackingChangeFeedUnsupported(_))),
+            res.as_ref().is_err_and(|error| {
+                error.legacy_error_kind() == Some("RowTrackingCdfUnsupported")
+            }),
             "expected a row-tracking-disabled error, got {res:?}"
         );
     }
@@ -749,7 +755,8 @@ mod tests {
         let res =
             TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 1, Some(2));
         assert!(
-            matches!(&res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
+            res.as_ref()
+                .is_err_and(|error| { error.legacy_error_kind() == Some("CdfIncompatibleSchema") }),
             "expected an incompatible start schema to be rejected, got {res:?}"
         );
     }

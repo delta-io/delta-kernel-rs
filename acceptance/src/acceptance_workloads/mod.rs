@@ -47,9 +47,13 @@
 //! ```json
 //! {
 //!   "type": "read",
-//!   "error": { "errorCode": "TABLE_NOT_FOUND" }
+//!   "error": { "errorCode": "DELTA_VERSION_NOT_FOUND" }
 //! }
 //! ```
+//!
+//! Structured conditions implemented by Kernel are compared exactly. Workload conditions outside
+//! that catalog retain the legacy behavior of accepting any error. For a structured condition, an
+//! engine-originated error does not match. Optional message text is diagnostic and is not compared.
 //!
 //! ## Snapshot Construction Spec Format
 //!
@@ -71,7 +75,7 @@
 //! ```json
 //! {
 //!   "type": "snapshotConstruction",
-//!   "error": { "errorCode": "INVALID_TABLE" }
+//!   "error": { "errorCode": "DELTA_STATE_RECOVER_ERROR" }
 //! }
 //! ```
 

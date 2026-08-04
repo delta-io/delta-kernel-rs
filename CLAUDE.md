@@ -109,7 +109,12 @@ actions, enforces protocol compliance, delegates atomic commit to a `Committer`.
 
 **Engine trait:** five handlers (`StorageHandler`, `JsonHandler`, `ParquetHandler`,
 `EvaluationHandler`, optional `MetricsReporter`). `DefaultEngine` lives in
-`kernel/src/engine/default/`.
+the `default-engine/` crate.
+
+**Error boundary:** Engine handler and evaluator methods return `EngineResult`, while Kernel APIs
+return `DeltaResult`. Public `Error` values have exactly one origin: `Error::Delta` carries a
+structured Delta condition, and `Error::Engine` carries a typed engine failure. Preserve engine
+sources when adapting errors so retry detection and connector diagnostics retain their origin.
 
 **EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
 directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).
@@ -281,6 +286,9 @@ Keep this list updated when new protocol features are added to kernel.
 
 - **EngineData is opaque:** NEVER downcast to `ArrowEngineData` or any concrete type
   in production code (ok in tests). NEVER assume one batch per file -- ALWAYS iterate.
+- **Engine errors stay engine-originated:** Handler and evaluator implementations return
+  `EngineResult`, using the most specific `EngineError` kind and retaining the source. Convert to
+  the top-level `Error` only when crossing into a Kernel API that returns `DeltaResult`.
 - **Column mapping:** Physical column names can differ from logical names. ALWAYS use
   the schema from `Snapshot::schema()` for user data columns. Metadata/system schema
   column names (defined by the protocol) are not subject to column mapping.
@@ -319,8 +327,9 @@ Keep this list updated when new protocol features are added to kernel.
     binding/field, a `[DataType]`/`Vec<DataType>` element, or a `&DataType` argument),
     prefer `DataType::from(ArrayType::new(...))` over
     `DataType::Array(Box::new(ArrayType::new(...)))`.
-- Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
-  hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
+- Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` and
+  `EngineResultIterator<'a, T>` / `EngineResultIteratorStatic<T>` aliases over hand-rolled boxed
+  result iterators.
 - Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
   `Expression::literal(...)` when building expressions inline. `col!` has two forms: a single
   string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,

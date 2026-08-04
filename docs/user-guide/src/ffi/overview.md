@@ -115,7 +115,9 @@ authoritative list and signatures, consult the generated
 | Function | Purpose |
 |----------|---------|
 | `get_default_engine` | Create an engine from a table path with default options |
+| `get_default_engine_v2` | Create a default engine with structured outbound errors |
 | `get_engine_builder` / `set_builder_option` / `builder_build` | Create an engine with custom storage options |
+| `get_engine_builder_v2` | Create an engine builder with structured outbound errors |
 | `set_builder_with_multithreaded_executor` | Configure the builder to use a multi-threaded tokio executor |
 | `set_builder_with_io_concurrency` | Configure read-path I/O concurrency (buffer size and batch size) for the JSON and Parquet handlers |
 | `free_engine` | Release the engine handle |
@@ -400,15 +402,29 @@ typedef struct {
 } ExternResult;
 ```
 
-You provide an `allocate_error` callback when creating the engine. Kernel calls this
-callback to allocate error objects in your memory space whenever an operation fails.
-Because the engine allocates these errors, the engine is also responsible for freeing
-them. Kernel returns the error pointer immediately and does not retain it.
+The V1 entry points, `get_engine_builder` and `get_default_engine`, take an `allocate_error`
+callback. Kernel calls this callback to allocate error objects in your memory space whenever an
+operation fails. The `EngineError` struct contains a `KernelError` enum that classifies the error
+type, such as `GenericError`, `FileNotFoundError`, or `InvalidUrlError`. The message passed to the
+callback is valid only for the duration of the call, so copy it if you need to keep it.
 
-The `EngineError` struct contains a `KernelError` enum that classifies the error type
-(e.g., `GenericError`, `FileNotFoundError`, `InvalidUrlError`). The error message
-string passed to `allocate_error` is only valid for the duration of the callback, so
-you must copy it if you need to keep it.
+For structured errors, use `get_engine_builder_v2` or `get_default_engine_v2` with an
+`FfiErrorAllocatorV2`. Its callback receives a borrowed `FfiErrorDescriptorV1` containing the
+error origin, optional Delta condition and SQLSTATE, exact named parameters, user-facing display
+text, and diagnostic debug text. The descriptor, parameter array, and every string slice are valid
+only until the callback returns. Deep-copy any fields you retain. The callback may return a null
+error pointer and must not unwind across the FFI boundary.
+
+The V2 entry points support URL-scheme object stores only. `set_builder_rest_object_store()`
+rejects a V2 builder because REST callbacks still use the V1 allocator contract.
+
+The V2 allocator context remains caller-owned and must support concurrent invocation. Keep the
+callback and context valid for the lifetimes of the builder, the engine, and every derived handle
+or object that retains that engine. Calling `free_engine` releases only the caller's engine handle;
+it does not end this requirement while a derived object still retains the engine.
+
+Kernel returns each allocated error pointer immediately and does not retain it. Your engine owns
+the pointer and is responsible for freeing it.
 
 ## C examples
 

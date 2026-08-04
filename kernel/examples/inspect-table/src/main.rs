@@ -117,7 +117,7 @@ impl RowVisitor for LogVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let expected = NAMES_AND_TYPES.as_ref().0.len();
         if getters.len() != expected {
-            return Err(Error::InternalError(format!(
+            return Err(Error::generic(format!(
                 "Wrong number of LogVisitor getters: {}, expected {expected}",
                 getters.len()
             )));

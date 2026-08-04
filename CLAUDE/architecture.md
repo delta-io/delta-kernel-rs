@@ -89,7 +89,7 @@ and delegates the atomic commit to a `Committer`.
 
 ## Engine Trait System
 
-The kernel is built around the `Engine` trait (`kernel/src/lib.rs`), which provides four handlers:
+The kernel is built around the `Engine` trait (`kernel/src/lib.rs`), which provides five handlers:
 
 | Handler              | Purpose                          | Key Methods                                |
 |----------------------|----------------------------------|--------------------------------------------|
@@ -99,8 +99,13 @@ The kernel is built around the `Engine` trait (`kernel/src/lib.rs`), which provi
 | `EvaluationHandler`  | Expression/predicate evaluation  | `new_expression_evaluator`, etc.           |
 | `MetricsReporter`    | Optional observability           | `get_metrics_reporter` (default: None)     |
 
-A `DefaultEngine` (Arrow + `object_store` + Tokio) lives in `kernel/src/engine/default/`. Custom
+A `DefaultEngine` (Arrow + `object_store` + Tokio) lives in the `default-engine/` crate. Custom
 engines only need to replace specific handlers -- they can reuse defaults for the rest.
+
+Engine handler and evaluator methods return `EngineResult`, which carries a typed `EngineError`.
+Kernel-facing APIs return `DeltaResult`. At that boundary, the public `Error` distinguishes
+structured Delta conditions (`Error::Delta`) from connector-provided engine failures
+(`Error::Engine`) without discarding the underlying source.
 
 ## EngineData Trait
 

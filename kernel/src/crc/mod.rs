@@ -708,7 +708,7 @@ mod tests {
         };
         let err = CrcRaw::try_from(&crc).unwrap_err();
         assert!(
-            matches!(err, crate::Error::ChecksumWriteUnsupported(_)),
+            err.to_string().contains("Cannot serialize CRC"),
             "expected ChecksumWriteUnsupported, got: {err:?}"
         );
     }

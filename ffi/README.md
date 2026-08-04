@@ -2,6 +2,21 @@
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
 
+## Error allocators
+
+`get_engine_builder` and `get_default_engine` retain the V1 error callback ABI: the callback
+receives a fixed `KernelError` category and rendered message. Connectors that need structured
+Delta conditions can use `get_engine_builder_v2` or `get_default_engine_v2` with an
+`FfiErrorAllocatorV2`. Its callback receives a borrowed `FfiErrorDescriptorV1` with the error
+origin, optional condition and SQLSTATE, named parameters, and diagnostic strings.
+
+The V2 callback must deep-copy any descriptor data it retains. The descriptor and every nested
+pointer are valid only until the callback returns. The caller owns the callback context and must
+keep it valid and safe for concurrent use for the lifetimes of the builder, the engine, and every
+derived handle or object that retains that engine. Calling `free_engine` does not end this
+requirement while a derived object still retains the engine. V2 applies to URL-scheme default
+engines; REST callbacks and inbound execution errors use the V1 contract.
+
 ## Building
 
 ### Building Kernel and Headers

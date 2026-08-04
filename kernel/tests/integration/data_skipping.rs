@@ -855,10 +855,11 @@ async fn scan_with_replace_table_schema_change(
     }
     let error = surviving_paths(&table_path, engine, predicate, use_parallel)
         .expect_err("an active incompatible add file should fail the scan");
-    assert!(matches!(
-        error.downcast_ref::<Error>(),
-        Some(Error::ParseError(_, _))
-    ));
+    let error = error
+        .downcast_ref::<Error>()
+        .expect("scan failure should be a Delta Kernel error");
+    assert!(error.as_delta_error().is_some());
+    assert!(error.to_string().contains("Failed to parse value"));
     Ok(())
 }
 

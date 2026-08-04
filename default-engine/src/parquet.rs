@@ -30,8 +30,9 @@ use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObject
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
-    FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, EngineError,
+    EngineResult, Error, FileDataReadResultIterator, FileMeta, ParquetFooter, ParquetHandler,
+    PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -196,12 +197,14 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
         physical_schema: &StructType,
-    ) -> DeltaResult<DataFileMetadata> {
-        let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
+    ) -> EngineResult<DataFileMetadata> {
+        let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)
+            .map_err(|error| super::adapter_error("Parquet input conversion failed", error))?;
         let record_batch = batch.record_batch();
 
         // Collect statistics before writing (includes numRecords)
-        let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
+        let stats = collect_stats(record_batch, stats_columns, physical_schema)
+            .map_err(|error| super::adapter_error("Parquet statistics collection failed", error))?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new_with_options(
@@ -212,18 +215,19 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
-        let size: u64 = buffer
-            .len()
-            .try_into()
-            .map_err(|_| Error::generic("unable to convert usize to u64"))?;
+        let size: u64 = buffer.len().try_into().map_err(|error| {
+            EngineError::other("Unable to convert Parquet size to u64").with_source(error)
+        })?;
         let name: String = format!("{}.parquet", Uuid::new_v4());
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
-            return Err(Error::generic(format!(
+            return Err(EngineError::other(format!(
                 "Path must end with a trailing slash: {path}"
             )));
         }
-        let path = path.join(&name)?;
+        let path = path.join(&name).map_err(|error| {
+            EngineError::other("Unable to construct Parquet write URL").with_source(error)
+        })?;
 
         self.store
             .put(&Path::from_url_path(path.path())?, buffer.into())
@@ -232,7 +236,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         if size != metadata.size {
-            return Err(Error::generic(format!(
+            return Err(EngineError::other(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
                 size, metadata.size
             )));
@@ -255,14 +259,21 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         write_context: &WriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        let write_dir = write_context.write_dir();
+        if !write_dir.path().ends_with('/') {
+            return Err(Error::generic(format!(
+                "Path must end with a trailing slash: {write_dir}"
+            )));
+        }
         let file_metadata = self
             .write_parquet(
-                &write_context.write_dir(),
+                &write_dir,
                 data,
                 write_context.stats_columns(),
                 write_context.physical_schema().as_ref(),
             )
-            .await?;
+            .await
+            .map_err(Error::from)?;
         super::build_add_file_metadata(file_metadata, write_context)
     }
 }
@@ -326,7 +337,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         self.read_parquet_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
@@ -336,7 +347,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -365,47 +376,62 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] indicating success or failure.
+    /// An [`EngineResult`] indicating success or failure.
     fn write_parquet_file(
         &self,
         location: url::Url,
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> EngineResult<()> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
             let path = Path::from_url_path(location.path())?;
 
             // Get first batch to initialize writer with schema
-            let first_batch = data.next().ok_or_else(|| {
-                Error::generic("Cannot write parquet file with empty data iterator")
-            })??;
-            let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
+            let first_batch = data
+                .next()
+                .ok_or_else(|| EngineError::other("Cannot write an empty Parquet file"))?
+                .map_err(|error| super::adapter_error("Parquet input stream failed", error))?;
+            let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)
+                .map_err(|error| super::adapter_error("Parquet input conversion failed", error))?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
 
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = first_record_batch.schema();
             let mut writer =
-                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())?;
+                AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())
+                    .map_err(|error| {
+                        super::adapter_error("Parquet writer initialization failed", error.into())
+                    })?;
 
             // Write the first batch
-            writer.write(&first_record_batch).await?;
+            writer.write(&first_record_batch).await.map_err(|error| {
+                super::adapter_error("Parquet batch write failed", error.into())
+            })?;
 
             // Write remaining batches
             for result in data {
-                let engine_data = result?;
-                let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
+                let engine_data = result
+                    .map_err(|error| super::adapter_error("Parquet input stream failed", error))?;
+                let arrow_data =
+                    ArrowEngineData::try_from_engine_data(engine_data).map_err(|error| {
+                        super::adapter_error("Parquet input conversion failed", error)
+                    })?;
                 let batch: RecordBatch = (*arrow_data).into();
-                writer.write(&batch).await?;
+                writer.write(&batch).await.map_err(|error| {
+                    super::adapter_error("Parquet batch write failed", error.into())
+                })?;
             }
 
-            writer.finish().await?;
+            writer.finish().await.map_err(|error| {
+                super::adapter_error("Parquet writer finalization failed", error.into())
+            })?;
 
-            Ok(())
+            Ok::<(), EngineError>(())
         })
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> EngineResult<ParquetFooter> {
         self.read_parquet_footer_with_cancellation(file, None)
     }
 
@@ -413,7 +439,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         file: &FileMeta,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<ParquetFooter> {
+    ) -> EngineResult<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
@@ -421,14 +447,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         let footer_future = async move {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
-                let response =
-                    client.get(location.as_str()).send().await.map_err(|e| {
-                        Error::generic(format!("Failed to fetch presigned URL: {e}"))
-                    })?;
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {e}")))?;
+                let response = client.get(location.as_str()).send().await?;
+                let bytes = response.bytes().await?;
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
@@ -442,9 +462,17 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         // Race the footer read against cancellation so a cancelled request stops promptly.
         match cancellation_token {
-            Some(token) => super::block_on_or_cancelled(&self.task_executor, token, footer_future)
-                .unwrap_or(Err(Error::Cancelled)),
-            None => self.task_executor.block_on(footer_future),
+            Some(token) => {
+                match super::block_on_or_cancelled(&self.task_executor, token, footer_future) {
+                    Some(result) => result
+                        .map_err(|error| super::adapter_error("Parquet footer read failed", error)),
+                    None => Err(EngineError::cancelled()),
+                }
+            }
+            None => self
+                .task_executor
+                .block_on(footer_future)
+                .map_err(|error| super::adapter_error("Parquet footer read failed", error)),
         }
     }
 }
@@ -643,8 +671,7 @@ mod tests {
     };
     use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
-        assert_result_error_with_message, current_time_ms,
-        try_into_record_batch as into_record_batch,
+        current_time_ms, try_into_record_batch as into_record_batch,
     };
     use itertools::Itertools;
     use test_utils::engine_contract::{
@@ -886,7 +913,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|result| into_record_batch(result.map_err(Error::from)))
             .try_collect()
             .unwrap();
 
@@ -963,7 +990,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(slice::from_ref(&file_meta), footer.schema.clone(), None)
             .unwrap()
-            .map(into_record_batch)
+            .map(|result| into_record_batch(result.map_err(Error::from)))
             .try_collect()
             .unwrap();
 
@@ -1150,7 +1177,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|result| into_record_batch(result.map_err(Error::from)))
             .try_collect()
             .unwrap();
 
@@ -1173,16 +1200,19 @@ mod tests {
         ));
         let physical_schema = long_schema("a");
 
-        assert_result_error_with_message(
-            parquet_handler
-                .write_parquet(
-                    &Url::parse("memory:///data").unwrap(),
-                    data,
-                    &[],
-                    &physical_schema,
-                )
-                .await,
-            "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
+        let error = parquet_handler
+            .write_parquet(
+                &Url::parse("memory:///data").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), delta_kernel::EngineErrorKind::Other);
+        assert_eq!(
+            error.message(),
+            "Path must end with a trailing slash: memory:///data"
         );
     }
 
@@ -1241,7 +1271,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|result| into_record_batch(result.map_err(Error::from)))
             .try_collect()
             .unwrap();
 
@@ -1295,7 +1325,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|result| into_record_batch(result.map_err(Error::from)))
             .try_collect()
             .unwrap();
 
@@ -1443,7 +1473,7 @@ mod tests {
                 None,
             )
             .unwrap()
-            .map(into_record_batch)
+            .map(|result| into_record_batch(result.map_err(Error::from)))
             .try_collect()
             .unwrap();
 
@@ -1713,7 +1743,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(slice::from_ref(&file_meta), kernel_schema, None)
             .unwrap()
-            .map(into_record_batch)
+            .map(|result| into_record_batch(result.map_err(Error::from)))
             .try_collect()
             .unwrap();
 

@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_crc_from_version_zero_no_checkpoint_first_commit_nonzero_errors() {
+    async fn snapshot_segment_rejects_nonzero_first_commit_without_checkpoint() {
         let store = Arc::new(InMemory::new());
         let engine = SyncEngine::new_with_store(store.clone());
         let root = "memory:///t/";
@@ -1060,17 +1060,31 @@ mod tests {
         .await
         .unwrap();
         let log_root = url::Url::parse(root).unwrap().join("_delta_log/").unwrap();
-        let segment = LogSegment::for_snapshot_impl(
+        let error = LogSegment::for_snapshot_impl(
             engine.storage_handler().as_ref(),
             log_root,
             vec![],
             None,
             Some(1),
         )
-        .unwrap();
-        assert_result_error_with_message(
-            segment.build_crc_from_version_zero(&engine),
-            "log appears truncated without a checkpoint",
+        .unwrap_err();
+        let delta_error = error.as_delta_error().unwrap();
+        assert_eq!(
+            delta_error.code(),
+            crate::DeltaErrorCode::DeltaVersionsNotContiguous
+        );
+        assert_eq!(
+            delta_error
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.name(), parameter.value()))
+                .collect::<Vec<_>>(),
+            [
+                ("versionList", "1"),
+                ("startVersion", "1"),
+                ("endVersion", "1"),
+                ("versionToLoad", "1"),
+            ]
         );
     }
 }

@@ -738,7 +738,7 @@ impl PrimitiveType {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ParseError`] if `raw` is not a valid encoding of this type.
+    /// Returns an error if `raw` is not a valid encoding of this type.
     ///
     /// [partition value serialization]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
     pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, Error> {
@@ -1084,8 +1084,30 @@ mod tests {
 
     use super::*;
     use crate::expressions::{column_expr, BinaryPredicateOp};
-    use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
+
+    fn assert_schema_error<T>(result: DeltaResult<T>, expected_source_message: &str) {
+        let error = match result {
+            Ok(_) => panic!("schema validation must fail"),
+            Err(error) => error,
+        };
+        let delta = error
+            .as_delta_error()
+            .expect("schema validation failures must be Delta errors");
+        assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+        assert_eq!(delta.sql_state(), None);
+        assert!(delta.parameters().is_empty());
+        assert_eq!(error.legacy_error_kind(), Some("Schema"));
+        assert!(
+            std::error::Error::source(delta).is_some(),
+            "schema validation must retain its legacy source"
+        );
+        assert!(
+            delta.message().contains(expected_source_message),
+            "unexpected schema diagnostic: {}",
+            delta.message()
+        );
+    }
 
     #[rstest]
     #[case::truncates(Scalar::Integer(7), Scalar::Integer(2), Some(Scalar::Integer(3)))]
@@ -1123,10 +1145,7 @@ mod tests {
     )))]
     fn test_geo_parse_scalar_unsupported(#[case] ptype: PrimitiveType) {
         let err = ptype.parse_scalar("anything").unwrap_err();
-        assert!(
-            matches!(err, Error::Unsupported(_)),
-            "expected Unsupported, got: {err:?}"
-        );
+        assert!(err.is_unsupported(), "expected Unsupported, got: {err:?}");
     }
 
     #[test]
@@ -1250,10 +1269,10 @@ mod tests {
 
     fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
         let s = PrimitiveType::decimal(prec, scale).unwrap();
-        match s.parse_scalar(raw) {
-            Err(Error::ParseError(..)) => {}
-            other => panic!("expected ParseError for {raw:?}, got {other:?}"),
-        }
+        let error = s
+            .parse_scalar(raw)
+            .expect_err("invalid decimal should fail to parse");
+        assert!(error.is_parse_error(), "expected ParseError, got {error:?}");
     }
 
     #[test]
@@ -1311,30 +1330,33 @@ mod tests {
 
     #[test]
     fn test_invalid_array() {
-        assert_result_error_with_message(
+        assert_schema_error(
             ArrayData::try_new(
                 ArrayType::new(DataType::INTEGER, false),
                 [Scalar::Integer(1), Scalar::String("s".to_string())],
             ),
-            "Schema error: Array scalar type mismatch: expected integer, got string",
+            "Array scalar type mismatch: expected integer, got string",
         );
 
-        assert_result_error_with_message(
+        assert_schema_error(
             ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]),
-            "Schema error: Array element cannot be null for non-nullable array",
+            "Array element cannot be null for non-nullable array",
         );
     }
 
     #[test]
     fn test_invalid_map() {
         // incorrect schema
-        assert_result_error_with_message(MapData::try_new(
-            MapType::new(DataType::STRING, DataType::INTEGER, false),
-            [(Scalar::Integer(1), Scalar::String("s".to_string())),],
-        ), "Schema error: Map scalar type mismatch: expected key type string, got key type integer");
+        assert_schema_error(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::INTEGER, false),
+                [(Scalar::Integer(1), Scalar::String("s".to_string()))],
+            ),
+            "Map scalar type mismatch: expected key type string, got key type integer",
+        );
 
         // key must be non-null
-        assert_result_error_with_message(
+        assert_schema_error(
             MapData::try_new(
                 MapType::new(DataType::STRING, DataType::STRING, true),
                 [(
@@ -1342,11 +1364,11 @@ mod tests {
                     Scalar::String("s".to_string()), // val
                 )],
             ),
-            "Schema error: Map key cannot be null",
+            "Map key cannot be null",
         );
 
         // val must be non-null if we have value_contains_null = false
-        assert_result_error_with_message(
+        assert_schema_error(
             MapData::try_new(
                 MapType::new(DataType::STRING, DataType::STRING, false),
                 [(
@@ -1354,7 +1376,7 @@ mod tests {
                     Scalar::Null(DataType::STRING),  // val
                 )],
             ),
-            "Schema error: Null map value disallowed if map value_contains_null is false",
+            "Null map value disallowed if map value_contains_null is false",
         );
     }
 

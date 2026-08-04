@@ -44,10 +44,29 @@ use crate::unit_test_utils::{
     create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Expression, FileDataReadResultIterator,
-    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
-    StorageHandler,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, EngineResult, Expression,
+    FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate,
+    PredicateRef, RowVisitor, StorageHandler,
 };
+
+fn assert_delta_error(
+    error: &Error,
+    condition: &str,
+    sql_state: Option<&str>,
+    expected_parameters: &[(&str, &str)],
+) {
+    let delta = error
+        .as_delta_error()
+        .expect("expected a structured Delta error");
+    assert_eq!(delta.condition(), condition);
+    assert_eq!(delta.sql_state(), sql_state);
+    let parameters: Vec<_> = delta
+        .parameters()
+        .iter()
+        .map(|parameter| (parameter.name(), parameter.value()))
+        .collect();
+    assert_eq!(parameters, expected_parameters);
+}
 
 /// Processes sidecar files for the given checkpoint batch.
 ///
@@ -76,11 +95,11 @@ fn process_sidecars(
         .try_collect()?;
 
     // Read the sidecar files and return an iterator of sidecar file batches
-    Ok(Some(parquet_handler.read_parquet_files(
-        &sidecar_files,
-        checkpoint_read_schema,
-        meta_predicate,
-    )?))
+    Ok(Some(
+        parquet_handler
+            .read_parquet_files(&sidecar_files, checkpoint_read_schema, meta_predicate)?
+            .map(|result| result.map_err(Into::into)),
+    ))
 }
 
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
@@ -231,7 +250,7 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         self.0.read_parquet_files(files, physical_schema, None)
     }
 
@@ -239,11 +258,11 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> EngineResult<()> {
         self.0.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> EngineResult<ParquetFooter> {
         self.0.read_parquet_footer(file)
     }
 }
@@ -613,17 +632,20 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let error = LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-    );
-    assert_result_error_with_message(
-        log_segment,
-        "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
     )
+    .unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_MISSING_PART_FILES",
+        Some("42KD6"),
+        &[("version", "5")],
+    );
 }
 
 #[tokio::test]
@@ -659,18 +681,20 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
     )
     .await;
 
-    let log_segment = LogSegment::for_snapshot_impl(
+    let error = LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root,
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-    );
-    assert_result_error_with_message(
-        log_segment,
-        "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
-        it has 2",
     )
+    .unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_MISSING_PART_FILES",
+        Some("42KD6"),
+        &[("version", "5")],
+    );
 }
 
 #[tokio::test]
@@ -981,6 +1005,139 @@ async fn build_snapshot_time_travel_no_hint_checkpoint_at_end_version_included()
     assert_eq!(commit_files.len(), 0);
 }
 
+#[rstest]
+#[case::lone_time_travel(&[2], Some(2), "2", "2", "2", "2")]
+#[case::contiguous_latest(&[5, 6], None, "5, 6", "5", "6", "6")]
+#[tokio::test]
+async fn snapshot_without_reconstruction_anchor_reports_non_contiguous_versions(
+    #[case] versions: &[Version],
+    #[case] requested: Option<Version>,
+    #[case] version_list: &str,
+    #[case] start_version: &str,
+    #[case] end_version: &str,
+    #[case] version_to_load: &str,
+) {
+    let paths = versions
+        .iter()
+        .map(|version| delta_path_for_version(*version, "json"))
+        .collect::<Vec<_>>();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let error = LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, requested)
+        .unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_VERSIONS_NOT_CONTIGUOUS",
+        Some("KD00C"),
+        &[
+            ("versionList", version_list),
+            ("startVersion", start_version),
+            ("endVersion", end_version),
+            ("versionToLoad", version_to_load),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn snapshot_with_truncated_log_uses_checkpoint_as_reconstruction_anchor() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, None).unwrap();
+    assert_eq!(log_segment.end_version, 6);
+    assert_eq!(log_segment.checkpoint_version, Some(5));
+}
+
+#[rstest]
+#[case::below_earliest(4)]
+#[case::above_latest(9)]
+#[tokio::test]
+async fn unavailable_time_travel_version_reports_reconstructable_bounds(
+    #[case] requested: Version,
+) {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    )
+    .await;
+
+    let error =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(requested))
+            .unwrap_err();
+    let requested = requested.to_string();
+    assert_delta_error(
+        &error,
+        "DELTA_VERSION_NOT_FOUND",
+        Some("22003"),
+        &[
+            ("userVersion", requested.as_str()),
+            ("earliest", "5"),
+            ("latest", "7"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn unavailable_time_travel_version_includes_catalog_log_tail_in_bounds() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[delta_path_for_version(5, "checkpoint.parquet")],
+        None,
+    )
+    .await;
+
+    let error = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        staged_commit_log_paths(&[6, 7]),
+        None,
+        Some(9),
+    )
+    .unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_VERSION_NOT_FOUND",
+        Some("22003"),
+        &[("userVersion", "9"), ("earliest", "5"), ("latest", "7")],
+    );
+}
+
+#[tokio::test]
+async fn unavailable_version_between_reconstructable_anchors_reports_log_gap() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(7, "checkpoint.parquet"),
+        ],
+        None,
+    )
+    .await;
+
+    let error = LogSegment::for_snapshot_impl(storage.as_ref(), log_root, vec![], None, Some(6))
+        .unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_VERSIONS_NOT_CONTIGUOUS",
+        Some("KD00C"),
+        &[
+            ("versionList", "5, 7"),
+            ("startVersion", "5"),
+            ("endVersion", "7"),
+            ("versionToLoad", "6"),
+        ],
+    );
+}
+
 #[tokio::test]
 async fn build_table_changes_with_commit_versions() {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -1057,25 +1214,30 @@ async fn test_non_contiguous_log() {
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
-    // check the error message up to the timestamp
-    let expected_error_pattern = "Generic delta kernel error: Expected contiguous commit files, \
-        but found gap: ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
-        cannot_be_a_base: false, username: \"\", password: None, host: None, port: None, path: \
-        \"/_delta_log/00000000000000000000.json\", query: None, fragment: None }, last_modified:";
-    assert_result_error_with_message(log_segment_res, expected_error_pattern);
+    let error = log_segment_res.unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_VERSIONS_NOT_CONTIGUOUS",
+        Some("KD00C"),
+        &[
+            ("versionList", "0, 2"),
+            ("startVersion", "0"),
+            ("endVersion", "2"),
+            ("versionToLoad", "2"),
+        ],
+    );
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
     assert_result_error_with_message(
         log_segment_res,
-        "Generic delta kernel error: Expected the first commit to have version 1",
+        "Expected the first commit to have version 1",
     );
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
     assert_result_error_with_message(
         log_segment_res,
-        "Generic delta kernel error: LogSegment end version 0 not the same as the specified end \
-        version 1",
+        "LogSegment end version 0 not the same as the specified end version 1",
     );
 }
 
@@ -1091,7 +1253,10 @@ async fn table_changes_fails_with_larger_start_version_than_end() {
     )
     .await;
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
-    assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
+    assert_result_error_with_message(
+        log_segment_res,
+        "Failed to build LogSegment: start_version cannot be greater than end_version",
+    );
 }
 
 #[test_log::test(rstest::rstest)]
@@ -2818,7 +2983,7 @@ async fn for_timestamp_conversion_no_commit_files() {
 
     let res =
         LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None, vec![]);
-    assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
+    assert_result_error_with_message(res, "No files in log segment");
 }
 
 #[tokio::test]
@@ -3003,7 +3168,7 @@ fn test_log_segment_contiguous_commit_files() {
     .is_ok());
 
     // gaps are disallowed by LogSegment::try_new
-    let log_segment = LogSegment::try_new(
+    let error = LogSegment::try_new(
         LogSegmentFiles {
             ascending_commit_files: vec![
                 create_log_path("file:///_delta_log/00000000000000000001.json"),
@@ -3014,19 +3179,53 @@ fn test_log_segment_contiguous_commit_files() {
         log_root,
         None,
         None,
+    )
+    .unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_VERSIONS_NOT_CONTIGUOUS",
+        Some("KD00C"),
+        &[
+            ("versionList", "1, 3"),
+            ("startVersion", "1"),
+            ("endVersion", "3"),
+            ("versionToLoad", "3"),
+        ],
     );
-    assert_result_error_with_message(
-        log_segment,
-        "Generic delta kernel error: Expected contiguous commit files, but found gap: \
-        ParsedLogPath { location: FileMeta { location: Url { scheme: \
-        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/_delta_log/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
-        0, size: 0 }, filename: \"00000000000000000001.json\", extension: \"json\", version: 1, \
-        file_type: Commit } -> ParsedLogPath { location: FileMeta { location: Url { scheme: \
-        \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/_delta_log/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
-        0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
-        file_type: Commit }",
+}
+
+#[test]
+fn test_log_segment_rejects_checkpoint_commit_gap_with_structured_error() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    let error = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(
+                "file:///_delta_log/00000000000000000001.checkpoint.parquet",
+                1,
+            )],
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000003.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000003.json",
+            )),
+            ..Default::default()
+        },
+        log_root,
+        Some(3),
+        None,
+    )
+    .unwrap_err();
+    assert_delta_error(
+        &error,
+        "DELTA_VERSIONS_NOT_CONTIGUOUS",
+        Some("KD00C"),
+        &[
+            ("versionList", "1, 3"),
+            ("startVersion", "1"),
+            ("endVersion", "3"),
+            ("versionToLoad", "3"),
+        ],
     );
 }
 

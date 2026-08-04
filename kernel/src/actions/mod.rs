@@ -10,6 +10,7 @@ use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
+use crate::error::delta_errors;
 use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{
     is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef,
@@ -18,8 +19,8 @@ use crate::schema::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{schema, ArrayType};
 use crate::table_features::{
-    FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, KernelSupport, TableFeature, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
+    MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -435,9 +436,10 @@ impl Metadata {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth or
-    /// declares a type the kernel doesn't support, or [`Error::MalformedJson`] for other
-    /// JSON decoding failures.
+    /// Returns
+    /// [`DeltaErrorCode::DeltaKernelUnclassified`](crate::DeltaErrorCode::DeltaKernelUnclassified)
+    /// when the schema exceeds the supported decoding depth, declares an unsupported type, or is
+    /// malformed JSON. Malformed JSON retains the underlying `serde_json` error as its source.
     #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
@@ -747,6 +749,16 @@ impl Protocol {
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.protocol)
+    }
+
+    /// Reads a protocol action and reports validation failures with table context.
+    pub(crate) fn try_new_from_data_for_table(
+        data: &dyn EngineData,
+        table_name_or_path: impl Into<String>,
+    ) -> DeltaResult<Option<Protocol>> {
+        let mut visitor = ProtocolVisitor::for_table(table_name_or_path);
         visitor.visit_rows_of(data)?;
         Ok(visitor.protocol)
     }
@@ -1521,19 +1533,22 @@ mod tests {
 
         let result = metadata.parse_schema();
         if exceeds_limit {
-            assert_result_error_with_message(
-                result.as_ref(),
-                concat!(
-                    "Schema error: Table schema is too deeply nested: decoding ",
-                    "metaData.schemaString exceeded serde_json's ",
-                    "recursion limit: recursion limit exceeded"
-                ),
+            let error = result.as_ref().expect_err("excessive nesting must fail");
+            let delta = error
+                .as_delta_error()
+                .expect("schema validation is a Delta error");
+            assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+            assert_eq!(delta.sql_state(), None);
+            assert!(delta.parameters().is_empty());
+            assert_eq!(error.legacy_error_kind(), Some("Schema"));
+            assert!(
+                delta.message().contains(concat!(
+                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded ",
+                    "serde_json's recursion limit: recursion limit exceeded"
+                )),
+                "unexpected diagnostic: {}",
+                delta.message()
             );
-            let error = match result.unwrap_err() {
-                Error::Backtraced { source, .. } => *source,
-                error => error,
-            };
-            assert!(matches!(error, Error::Schema(_)));
         } else {
             result.unwrap();
         }
@@ -1583,21 +1598,9 @@ mod tests {
             schema_string: schema_string.to_string(),
             ..Default::default()
         };
-        // Error conversion captures a backtrace only when enabled, so normalize both forms before
-        // checking the underlying error.
-        let error = match metadata.parse_schema().unwrap_err() {
-            Error::Backtraced { source, .. } => *source,
-            error => error,
-        };
-        match expected_error {
-            "MalformedJson" => {
-                assert!(matches!(error, Error::MalformedJson(_)), "got: {error:?}")
-            }
-            "Schema" => {
-                assert!(matches!(error, Error::Schema(_)), "got: {error:?}")
-            }
-            other => panic!("unknown expected_error discriminant: {other}"),
-        }
+        let error = metadata.parse_schema().unwrap_err();
+        assert!(error.as_delta_error().is_some(), "got: {error:?}");
+        assert_eq!(error.legacy_error_kind(), Some(expected_error));
     }
 
     fn nested_schema(depth: usize) -> StructType {
@@ -1826,15 +1829,14 @@ mod tests {
             writer_features,
         } in invalid_protocols
         {
-            assert!(matches!(
-                Protocol::try_new(
-                    min_reader_version,
-                    min_writer_version,
-                    reader_features,
-                    writer_features
-                ),
-                Err(Error::InvalidProtocol(_)),
-            ));
+            assert!(Protocol::try_new(
+                min_reader_version,
+                min_writer_version,
+                reader_features,
+                writer_features
+            )
+            .unwrap_err()
+            .is_invalid_protocol());
         }
     }
 
@@ -1844,14 +1846,24 @@ mod tests {
     #[case(-1, 2)]
     #[case(1, -1)]
     fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
-        let expected = if rv < 1 {
-            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        let expected_message = if rv < 1 {
+            format!("min_reader_version must be >= 1, got {rv}")
         } else {
-            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+            format!("min_writer_version must be >= 1, got {wv}")
         };
-        assert_result_error_with_message(
-            Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
-            &expected,
+        let error = Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST)
+            .expect_err("protocol versions below one must fail");
+        let delta = error
+            .as_delta_error()
+            .expect("protocol validation is a Delta error");
+        assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+        assert_eq!(delta.sql_state(), None);
+        assert!(delta.parameters().is_empty());
+        assert_eq!(error.legacy_error_kind(), Some("InvalidProtocol"));
+        assert!(
+            delta.message().contains(&expected_message),
+            "unexpected diagnostic: {}",
+            delta.message()
         );
     }
 
@@ -1904,10 +1916,7 @@ mod tests {
             // The error message is enriched with the offending feature and the parsed
             // feature lists, so match on a prefix rather than the whole string.
             assert!(
-                matches!(
-                    &res,
-                    Err(Error::InvalidProtocol(error)) if error.to_string().contains(error_msg)
-                ),
+                res.as_ref().unwrap_err().to_string().contains(error_msg),
                 "Expected message containing:\t{error_msg}\nBut got:{res:?}\n"
             );
         }

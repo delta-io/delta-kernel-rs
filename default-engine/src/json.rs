@@ -20,8 +20,8 @@ use delta_kernel::object_store::{
 };
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, Error,
-    FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, EngineError, EngineResult,
+    Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
@@ -143,9 +143,13 @@ async fn write_json_file_impl(
 
     let path = Path::from_url_path(path.path())?;
     let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
-    result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
-        e => e.into(),
+    result.map_err(|error| match error {
+        error @ object_store::Error::AlreadyExists { .. } => {
+            EngineError::file_already_exists(path.to_string())
+                .with_source(error)
+                .into()
+        }
+        error => Error::from(error),
     })?;
     Ok(())
 }
@@ -155,8 +159,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> EngineResult<Box<dyn EngineData>> {
         arrow_parse_json(json_strings, output_schema)
+            .map_err(|error| super::adapter_error("JSON parsing failed", error))
     }
 
     fn read_json_files(
@@ -164,7 +169,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         self.read_json_files_with_cancellation(files, physical_schema, predicate, None)
     }
 
@@ -174,7 +179,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         cancellation_token: Option<CancellationTokenRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let future = read_json_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -196,13 +201,17 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
-        self.task_executor.block_on(write_json_file_impl(
-            self.store.clone(),
-            path.clone(),
-            to_json_bytes(data)?,
-            overwrite,
-        ))
+    ) -> EngineResult<()> {
+        let bytes = to_json_bytes(data)
+            .map_err(|error| super::adapter_error("JSON serialization failed", error))?;
+        self.task_executor
+            .block_on(write_json_file_impl(
+                self.store.clone(),
+                path.clone(),
+                bytes,
+                overwrite,
+            ))
+            .map_err(|error| super::adapter_error("JSON write failed", error))
     }
 }
 
@@ -905,12 +914,12 @@ mod tests {
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
-            match result {
-                Err(Error::FileAlreadyExists(err_path)) => {
-                    assert_eq!(err_path, object_path.to_string());
-                }
-                _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
-            }
+            let error = result.expect_err("second write must fail");
+            assert_eq!(
+                error.kind(),
+                delta_kernel::EngineErrorKind::FileAlreadyExists
+            );
+            assert_eq!(error.path(), Some(object_path.to_string().as_str()));
         }
 
         Ok(())

@@ -428,10 +428,7 @@ pub(crate) fn timestamp_to_version(
                 None,
                 HistoryCommitType::Recreatable,
             )
-            .map_err(|e| match e {
-                DeltaError::LogHistory(inner) => *inner,
-                _ => LogHistoryError::internal("failed to get earliest commit", e),
-            })?;
+            .map_err(|error| LogHistoryError::internal("failed to get earliest commit", error))?;
             let limit = snapshot
                 .version()
                 .checked_sub(earliest)
@@ -707,11 +704,12 @@ pub fn timestamp_range_to_versions(
 /// # Errors
 /// - Propagates any error from listing the log directory.
 /// - [`LogHistoryError::NoCommitsFound`] when the log directory contains no commits.
-/// - [`DeltaError::Generic`] when there is no publised file-system commit and the earliest ratified
-///   CCv2 commit is v0. For a catalog-managed table, v0 must be a published file-system commit
-///   before the catalog exposes the table. Otherwise a filesystem-only client could list an empty
-///   `_delta_log/` and "create" a table at the same location. An empty listing here therefore
-///   indicates a broken invariant rather than a normal missing version.
+/// - [`DeltaErrorCode::DeltaKernelUnclassified`](crate::DeltaErrorCode::DeltaKernelUnclassified)
+///   when there is no published file-system commit and the earliest ratified CCv2 commit is v0. For
+///   a catalog-managed table, v0 must be a published file-system commit before the catalog exposes
+///   the table. Otherwise a filesystem-only client could list an empty `_delta_log/` and "create" a
+///   table at the same location. An empty listing here therefore indicates a broken invariant
+///   rather than a normal missing version.
 #[tracing::instrument(skip(engine), ret, err)]
 fn get_earliest_published_commit_version(
     engine: &dyn Engine,
@@ -869,9 +867,10 @@ pub enum HistoryCommitType {
 /// - [`LogHistoryError::NoRecreatableCommit`] when `commit_type` is
 ///   [`HistoryCommitType::Recreatable`], commits exist, but neither `00...00.json` nor a checkpoint
 ///   anchoring the smallest commit is present.
-/// - [`DeltaError::Generic`] when the listing yields no commits and
-///   `earliest_ratified_commit_version` is `Some(0)`, flagging a broken catalog-managed invariant
-///   (ratified commit 0 with no published filesystem commit).
+/// - [`DeltaErrorCode::DeltaKernelUnclassified`](crate::DeltaErrorCode::DeltaKernelUnclassified)
+///   when the listing yields no commits and `earliest_ratified_commit_version` is `Some(0)`,
+///   flagging a broken catalog-managed invariant (ratified commit 0 with no published filesystem
+///   commit).
 #[tracing::instrument(skip(engine), err, ret)]
 pub fn get_earliest_commit(
     engine: &dyn Engine,
@@ -895,6 +894,7 @@ pub fn get_earliest_commit(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::error::Error as _;
     use std::fs::{remove_file, OpenOptions};
     use std::ops::RangeInclusive;
     use std::sync::Arc;
@@ -915,6 +915,27 @@ mod tests {
     use crate::unit_test_utils::{Action, LocalMockTable};
     use crate::utils::FoldWithOption as _;
     use crate::Version;
+
+    fn assert_unclassified_delta(error: &crate::Error) {
+        assert_eq!(
+            error.as_delta_error().map(|error| error.condition()),
+            Some("DELTA_KERNEL_UNCLASSIFIED")
+        );
+    }
+
+    fn log_history_source(error: &crate::Error) -> &LogHistoryError {
+        assert_unclassified_delta(error);
+
+        let mut source = error.as_delta_error().and_then(|error| error.source());
+        while let Some(current) = source {
+            if let Some(history_error) = current.downcast_ref::<LogHistoryError>() {
+                return history_error;
+            }
+            source = current.source();
+        }
+
+        panic!("expected a retained LogHistoryError source, got {error:?}");
+    }
 
     fn get_test_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1622,11 +1643,14 @@ mod tests {
         let snapshot = Snapshot::builder_for(path).build(&engine).unwrap();
 
         let res = timestamp_range_to_versions(&snapshot, &engine, 300, Some(100));
+        let error = res.as_ref().unwrap_err();
         assert!(
             matches!(
-                res,
-                Err(crate::Error::LogHistory(ref e))
-                    if matches!(**e, LogHistoryError::InvalidTimestampRange { .. })
+                log_history_source(error),
+                LogHistoryError::InvalidTimestampRange {
+                    start_timestamp: 300,
+                    end_timestamp: 100,
+                }
             ),
             "{res:?}"
         );
@@ -1649,11 +1673,15 @@ mod tests {
 
         // Timestamps 51-149 fall between v0 (ts=50) and v1 (ts=150)
         let res = timestamp_range_to_versions(&snapshot, &engine, 51, Some(149));
+        let error = res.as_ref().unwrap_err();
         assert!(
             matches!(
-                res,
-                Err(crate::Error::LogHistory(ref e))
-                    if matches!(**e, LogHistoryError::EmptyTimestampRange { between_version: 0, .. })
+                log_history_source(error),
+                LogHistoryError::EmptyTimestampRange {
+                    start_timestamp: 51,
+                    end_timestamp: 149,
+                    between_version: 0,
+                }
             ),
             "{res:?}"
         );
@@ -2191,16 +2219,30 @@ mod tests {
         let res = get_earliest_recreatable_commit(&engine, &log_root, ratified);
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
-            Expected::NoCommitsFound => assert!(
-                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
-                "expected NoCommitsFound error, got {res:?}"
-            ),
-            Expected::NoRecreatableCommit => assert!(
-                matches!(&res, Err(DeltaError::LogHistory(e)) if matches!(**e, LogHistoryError::NoRecreatableCommit { .. })),
-                "expected NoRecreatableCommit error, got {res:?}"
-            ),
+            Expected::NoCommitsFound => {
+                let error = res.as_ref().unwrap_err();
+                assert!(
+                    matches!(
+                        log_history_source(error),
+                        LogHistoryError::NoCommitsFound { log_root: actual }
+                            if actual == &log_root
+                    ),
+                    "expected NoCommitsFound error for {log_root}, got {res:?}"
+                );
+            }
+            Expected::NoRecreatableCommit => {
+                let error = res.as_ref().unwrap_err();
+                assert!(
+                    matches!(
+                        log_history_source(error),
+                        LogHistoryError::NoRecreatableCommit { log_root: actual }
+                            if actual == &log_root
+                    ),
+                    "expected NoRecreatableCommit error for {log_root}, got {res:?}"
+                );
+            }
             Expected::CCv2MissingV0FilesystemCommit => {
-                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+                assert_unclassified_delta(res.as_ref().unwrap_err());
             }
         }
     }
@@ -2266,12 +2308,19 @@ mod tests {
         );
         match expected {
             Expected::Version(v) => assert_eq!(res.unwrap(), v),
-            Expected::NoCommitsFound => assert!(
-                matches!(res, Err(DeltaError::LogHistory(ref e)) if matches!(**e, LogHistoryError::NoCommitsFound { .. })),
-                "{res:?}"
-            ),
+            Expected::NoCommitsFound => {
+                let error = res.as_ref().unwrap_err();
+                assert!(
+                    matches!(
+                        log_history_source(error),
+                        LogHistoryError::NoCommitsFound { log_root: actual }
+                            if actual == &log_root
+                    ),
+                    "expected NoCommitsFound error for {log_root}, got {res:?}"
+                );
+            }
             Expected::CCv2MissingV0FilesystemCommit => {
-                assert!(matches!(res, Err(DeltaError::Generic(_))), "{res:?}")
+                assert_unclassified_delta(res.as_ref().unwrap_err());
             }
             Expected::NoRecreatableCommit => {
                 unreachable!(

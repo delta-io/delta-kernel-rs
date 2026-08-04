@@ -17,7 +17,7 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler,
+    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, EngineResult, EvaluationHandler,
     FileDataReadResultIterator, FileMeta, FileStats, JsonHandler, ParquetFooter, ParquetHandler,
     PredicateRef, StorageHandler, Version,
 };
@@ -929,10 +929,10 @@ async fn test_write_checksum_from_checkpoint_ict_enabled_but_commit_unreadable_p
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh.crc_at_version().is_none());
     // The failure is the propagated ICT read error, not a laundered `ChecksumWriteUnsupported`.
-    assert!(matches!(
-        fresh.write_checksum(engine.as_ref()),
-        Err(e) if !matches!(e, delta_kernel::Error::ChecksumWriteUnsupported(_))
-    ));
+    let error = fresh
+        .write_checksum(engine.as_ref())
+        .expect_err("corrupt commit should fail checksum resolution");
+    assert!(!error.to_string().contains("Cannot resolve a CRC to write"));
 
     Ok(())
 }
@@ -963,10 +963,19 @@ async fn test_write_checksum_no_crc_with_non_incremental_tail_returns_unsupporte
 
     let fresh = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
     assert!(fresh.crc_at_version().is_none());
-    assert!(matches!(
-        fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
-    ));
+    let error = fresh
+        .write_checksum(engine.as_ref())
+        .expect_err("non-incremental tail should prevent checksum resolution");
+    let delta = error
+        .as_delta_error()
+        .expect("checksum resolution failure should be a Delta error");
+    assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+    assert_eq!(delta.sql_state(), None);
+    assert!(delta.parameters().is_empty());
+    assert_eq!(
+        delta.message(),
+        "Cannot resolve a CRC to write: commits after the checkpoint are not incremental-safe"
+    );
 
     Ok(())
 }
@@ -2319,10 +2328,19 @@ async fn test_stale_crc_fresh_build_non_incremental_op_trips_indeterminate() -> 
         .file_stats_state()
         .is_indeterminate());
     assert_eq!(fresh.get_file_stats_if_present(), None);
-    assert!(matches!(
-        fresh.write_checksum(engine.as_ref()),
-        Err(delta_kernel::Error::ChecksumWriteUnsupported(_))
-    ));
+    let error = fresh
+        .write_checksum(engine.as_ref())
+        .expect_err("indeterminate file stats should prevent writing a checksum");
+    let delta = error
+        .as_delta_error()
+        .expect("checksum write failure should be a Delta error");
+    assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+    assert_eq!(delta.sql_state(), None);
+    assert!(delta.parameters().is_empty());
+    assert_eq!(
+        delta.message(),
+        "Cannot write CRC file with Indeterminate file stats"
+    );
 
     Ok(())
 }
@@ -2379,7 +2397,7 @@ impl ParquetHandler for NoParquetReadsHandler {
         _files: &[FileMeta],
         _physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         panic!("read_parquet_files called: the checkpoint must not be read on the rooted path");
     }
 
@@ -2387,11 +2405,11 @@ impl ParquetHandler for NoParquetReadsHandler {
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> EngineResult<()> {
         self.inner.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> EngineResult<ParquetFooter> {
         self.inner.read_parquet_footer(file)
     }
 }

@@ -13,6 +13,7 @@
 //!
 //! [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
 
+use std::error::Error as StdError;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -29,6 +30,81 @@ use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler,
     PredicateRef, SchemaRef, StorageHandler,
 };
+
+fn adapter_error(context: &'static str, error: Error) -> crate::EngineError {
+    match error {
+        Error::Engine(error) => error,
+        error => classify_adapter_error(context, error),
+    }
+}
+
+fn classify_adapter_error(context: &'static str, error: Error) -> crate::EngineError {
+    let file_error =
+        find_source::<crate::object_store::Error>(&error).and_then(|source| match source {
+            crate::object_store::Error::NotFound { path, .. } => {
+                Some((crate::EngineErrorKind::FileNotFound, path.clone()))
+            }
+            crate::object_store::Error::AlreadyExists { path, .. } => {
+                Some((crate::EngineErrorKind::FileAlreadyExists, path.clone()))
+            }
+            _ => None,
+        });
+    if let Some((kind, path)) = file_error {
+        return match kind {
+            crate::EngineErrorKind::FileNotFound => {
+                crate::EngineError::file_not_found(path).with_source(error)
+            }
+            crate::EngineErrorKind::FileAlreadyExists => {
+                crate::EngineError::file_already_exists(path).with_source(error)
+            }
+            _ => crate::EngineError::other(context).with_source(error),
+        };
+    }
+
+    let io_file_error = find_source::<std::io::Error>(&error).and_then(|source| {
+        let kind = match source.kind() {
+            std::io::ErrorKind::NotFound => crate::EngineErrorKind::FileNotFound,
+            std::io::ErrorKind::AlreadyExists => crate::EngineErrorKind::FileAlreadyExists,
+            _ => return None,
+        };
+        Some((kind, source.to_string()))
+    });
+    if let Some((kind, path)) = io_file_error {
+        return match kind {
+            crate::EngineErrorKind::FileNotFound => {
+                crate::EngineError::file_not_found(path).with_source(error)
+            }
+            crate::EngineErrorKind::FileAlreadyExists => {
+                crate::EngineError::file_already_exists(path).with_source(error)
+            }
+            _ => crate::EngineError::other(context).with_source(error),
+        };
+    }
+
+    let is_corrupt_data = matches!(
+        error.legacy_error_kind(),
+        Some("MalformedJson" | "Utf8" | "Arrow" | "Parquet")
+    );
+    if is_corrupt_data {
+        crate::EngineError::corrupt_data(context).with_source(error)
+    } else {
+        crate::EngineError::other(context).with_source(error)
+    }
+}
+
+fn find_source<T>(error: &Error) -> Option<&T>
+where
+    T: StdError + 'static,
+{
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(source) = current {
+        if let Some(source) = source.downcast_ref::<T>() {
+            return Some(source);
+        }
+        current = source.source();
+    }
+    None
+}
 
 pub(crate) mod json;
 mod parquet;
@@ -177,7 +253,8 @@ pub(super) fn get_bytes(
 ///
 /// For `file://` URLs the parent directory is created if missing (matching the local FS
 /// behavior callers expect; `LocalFileSystem::put` itself does not create parents). When
-/// `overwrite` is false, an existing file at `location` produces [`Error::FileAlreadyExists`].
+/// `overwrite` is false, an existing file at `location` produces
+/// [`EngineError::FileAlreadyExists`](crate::EngineError::FileAlreadyExists).
 pub(super) fn put_bytes(
     default_store: Option<&Arc<DynObjectStore>>,
     location: &Url,
@@ -202,14 +279,16 @@ pub(super) fn put_bytes(
             ..Default::default()
         }
     };
-    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(|e| {
-        match e {
-            crate::object_store::Error::AlreadyExists { .. } => {
-                Error::FileAlreadyExists(location.to_string())
+    futures::executor::block_on(store.put_opts(&object_path, data.into(), opts)).map_err(
+        |error| match error {
+            error @ crate::object_store::Error::AlreadyExists { .. } => {
+                crate::EngineError::file_already_exists(location.to_string())
+                    .with_source(error)
+                    .into()
             }
-            other => Error::generic(other.to_string()),
-        }
-    })?;
+            error => Error::from(error),
+        },
+    )?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::{Error as KernelError, Snapshot};
+use delta_kernel::Snapshot;
 use itertools::Itertools;
 use serde_json::{json, Deserializer};
 use test_utils::{load_and_begin_transaction, set_json_value, setup_test_tables};
@@ -21,13 +21,14 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // can't have duplicate app_id in same transaction
-        assert!(matches!(
-            load_and_begin_transaction(table_url.clone(), &engine)?
-                .with_transaction_id("app_id1".to_string(), 0)
-                .with_transaction_id("app_id1".to_string(), 1)
-                .commit(&engine),
-            Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
-        ));
+        let error = load_and_begin_transaction(table_url.clone(), &engine)?
+            .with_transaction_id("app_id1".to_string(), 0)
+            .with_transaction_id("app_id1".to_string(), 1)
+            .commit(&engine)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("app_id app_id1 already exists in transaction"));
 
         let txn = load_and_begin_transaction(table_url.clone(), &engine)?
             .with_engine_info("default engine")

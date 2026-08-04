@@ -9,7 +9,7 @@ use tracing::instrument;
 
 use super::{IncrementalReplay, Snapshot};
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::LogSegmentFiles;
+use crate::log_segment_files::{list_available_version_range, LogSegmentFiles};
 use crate::metrics::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
     emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
@@ -240,6 +240,7 @@ impl Snapshot {
     ) -> DeltaResult<NewSegment> {
         let log_root = existing_log_segment.log_root.clone();
         let storage = engine.storage_handler();
+        let availability_log_tail = requested_version.map(|_| log_tail.clone());
 
         // Start listing just after the previous segment's checkpoint, if any.
         let listing_start = existing_log_segment.checkpoint_version.unwrap_or(0) + 1;
@@ -251,6 +252,33 @@ impl Snapshot {
             Some(listing_start),
             requested_version,
         )?;
+
+        if let (Some(requested), Some(availability_log_tail)) =
+            (requested_version, availability_log_tail)
+        {
+            let checkpoint_version = new_listed_files
+                .checkpoint_parts
+                .first()
+                .map(|checkpoint| checkpoint.version);
+            let effective_version = new_listed_files
+                .ascending_commit_files
+                .iter()
+                .rev()
+                .find(|commit| checkpoint_version.is_none_or(|version| commit.version > version))
+                .map(|commit| commit.version)
+                .or(checkpoint_version);
+            if effective_version != Some(requested) {
+                if let Some(error) = list_available_version_range(
+                    storage.as_ref(),
+                    &log_root,
+                    &availability_log_tail,
+                )?
+                .and_then(|range| range.error_for_missing_version(requested))
+                {
+                    return Err(error);
+                }
+            }
+        }
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
@@ -533,6 +561,25 @@ mod tests {
         })
     }
 
+    fn assert_delta_error(
+        error: &Error,
+        condition: &str,
+        sql_state: Option<&str>,
+        expected_parameters: &[(&str, &str)],
+    ) {
+        let delta = error
+            .as_delta_error()
+            .expect("expected a structured Delta error");
+        assert_eq!(delta.condition(), condition);
+        assert_eq!(delta.sql_state(), sql_state);
+        let parameters: Vec<_> = delta
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name(), parameter.value()))
+            .collect();
+        assert_eq!(parameters, expected_parameters);
+    }
+
     // Helper: create a minimal test table with commits 0..num_commits.
     async fn setup_test_table_with_commits(
         table_root: impl AsRef<str>,
@@ -792,10 +839,9 @@ mod tests {
             IncrementalReplay::Disabled,
             false, /* built_as_latest */
         );
-        assert!(matches!(
-            older_version,
-            Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")
-        ));
+        assert!(older_version.err().is_some_and(|error| error
+            .to_string()
+            .contains("older than snapshot hint version")));
 
         Ok(())
     }
@@ -1015,10 +1061,11 @@ mod tests {
         let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
             .at_version(0)
             .build(&engine);
-        assert!(matches!(
-            snapshot_res,
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
-        ));
+        assert!(snapshot_res.err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("Requested snapshot version 0 is older than snapshot hint version 1")
+        }));
 
         // 2. new version == existing version
         let snapshot = Snapshot::builder_from(old_snapshot.clone())
@@ -1099,10 +1146,16 @@ mod tests {
             .build(&engine)?;
         assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
-        assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
-            Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is not available: no new commits were found after existing snapshot version 0"
-        ));
+        let error = Snapshot::builder_from(base_snapshot.clone())
+            .at_version(1)
+            .build(&engine)
+            .expect_err("version above the log should fail");
+        assert_delta_error(
+            &error,
+            "DELTA_VERSION_NOT_FOUND",
+            Some("22003"),
+            &[("userVersion", "1"), ("earliest", "0"), ("latest", "0")],
+        );
 
         // b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
         let store_3a = store.fork();
@@ -1165,10 +1218,16 @@ mod tests {
         let base_snapshot = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(&engine)?;
-        assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
-            Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
-        ));
+        let error = Snapshot::builder_from(base_snapshot.clone())
+            .at_version(2)
+            .build(&engine)
+            .expect_err("version above the log should fail");
+        assert_delta_error(
+            &error,
+            "DELTA_VERSION_NOT_FOUND",
+            Some("22003"),
+            &[("userVersion", "2"), ("earliest", "0"), ("latest", "1")],
+        );
 
         // ii. commits have (new protocol, no metadata)
         let store_3c_ii = store.fork();
@@ -2069,23 +2128,44 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::metadata(vec![protocol_action(1, 2)], "metadata", "MissingMetadata")]
+    #[case::protocol(vec![metadata_action(json!({}))], "protocol", "MissingProtocol")]
+    #[case::metadata_and_protocol(
+        vec![add_action("f0.parquet")],
+        "protocol",
+        "MissingMetadataAndProtocol"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_fresh_build_missing_protocol_metadata_emits_failure() -> DeltaResult<()> {
+    async fn test_fresh_build_missing_table_state_emits_structured_failure(
+        #[case] actions: Vec<serde_json::Value>,
+        #[case] expected_operation: &str,
+        #[case] expected_legacy_kind: &str,
+    ) -> DeltaResult<()> {
         let ctx = setup_incremental_snapshot_test()?;
-        // A commit with only an add action: no protocol or metadata anywhere in the log.
-        commit(
-            ctx.url.as_str(),
-            &ctx.store,
-            0,
-            vec![add_action("f0.parquet")],
-        )
-        .await;
+        commit(ctx.url.as_str(), &ctx.store, 0, actions).await;
 
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
 
-        let result = Snapshot::builder_for(ctx.url.as_str()).build(ctx.engine.as_ref());
-        assert!(result.is_err());
+        let error = Snapshot::builder_for(ctx.url.as_str())
+            .build(ctx.engine.as_ref())
+            .expect_err("missing table state should fail snapshot construction");
+        assert_eq!(error.legacy_error_kind(), Some(expected_legacy_kind));
+        let delta = error
+            .as_delta_error()
+            .expect("missing table state should be a Delta error");
+        assert_eq!(delta.condition(), "DELTA_STATE_RECOVER_ERROR");
+        assert_eq!(delta.sql_state(), Some("XXKDS"));
+        let parameters: Vec<_> = delta
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name(), parameter.value()))
+            .collect();
+        assert_eq!(
+            parameters,
+            [("operation", expected_operation), ("version", "0")]
+        );
 
         let events = reporter.events();
         assert_eq!(
@@ -2200,7 +2280,13 @@ mod tests {
         let result = Snapshot::builder_from(base)
             .at_version(9)
             .build(ctx.engine.as_ref());
-        assert!(result.is_err());
+        let error = result.expect_err("version above the incremental log should fail");
+        assert_delta_error(
+            &error,
+            "DELTA_VERSION_NOT_FOUND",
+            Some("22003"),
+            &[("userVersion", "9"), ("earliest", "0"), ("latest", "3")],
+        );
 
         let events = reporter.events();
         let failure = events

@@ -338,7 +338,7 @@ overwrite existing checksum files.
 > [!NOTE]
 > `write_checksum()` requires in-memory CRC information, which is only available on
 > post-commit snapshots. Calling it on a snapshot loaded from disk (without a pre-computed
-> CRC) returns a `ChecksumWriteUnsupported` error.
+> CRC) returns a `DELTA_KERNEL_UNCLASSIFIED` Delta error.
 
 The post-commit snapshot is the entry point for maintenance operations that should happen
 after a successful write. See [Checkpointing](../maintenance/checkpointing.md) and

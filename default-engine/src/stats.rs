@@ -695,14 +695,14 @@ impl FileStatsAccumulator {
 
     fn try_merge(&mut self, batch: &RecordBatch) -> DeltaResult<()> {
         let AccumulatorState::Open(row_groups) = &mut self.state else {
-            return Err(Error::stats_validation(FAILED));
+            return Err(Error::generic(FAILED));
         };
         // Comparing derived stats shapes instead would collapse every nullCount-only leaf to the
         // same Int64.
         let first_schema = self.batch_schema.get_or_insert_with(|| batch.schema());
         if first_schema != &batch.schema() {
             // `Debug`: schema equality covers the schema's metadata map, which `Display` omits.
-            return Err(Error::schema(format!(
+            return Err(Error::generic(format!(
                 "all row groups in a file must have the same schema; expected {:?} but got {:?}",
                 first_schema,
                 batch.schema(),
@@ -714,7 +714,7 @@ impl FileStatsAccumulator {
         // collection filters on, so equal schemas can still derive different stats shapes.
         if let Some(first) = row_groups.first() {
             if first.data_type() != batch_stats.data_type() {
-                return Err(Error::schema(format!(
+                return Err(Error::generic(format!(
                     "all row groups must produce the same statistics shape; batch schemas compare \
                      equal but their nested field names differ: {} vs {}",
                     first.data_type(),
@@ -739,7 +739,7 @@ impl FileStatsAccumulator {
     /// single row.
     pub fn finish(self) -> DeltaResult<Option<StructArray>> {
         let AccumulatorState::Open(row_groups) = self.state else {
-            return Err(Error::stats_validation(FAILED));
+            return Err(Error::generic(FAILED));
         };
         if row_groups.is_empty() {
             return Ok(None);
@@ -749,7 +749,7 @@ impl FileStatsAccumulator {
             .map_err(|e| Error::generic(format!("concat per-row-group stats: {e}")))?;
         let combined = combined
             .as_struct_opt()
-            .ok_or_else(|| Error::internal_error("concatenated stats are not a struct"))?;
+            .ok_or_else(|| Error::generic("concatenated stats are not a struct"))?;
         reduce_stats(combined).map(Some)
     }
 }
@@ -772,7 +772,7 @@ fn reduce_stats(stats: &StructArray) -> DeltaResult<StructArray> {
             // Keep in sync with the sections `collect_stats_raw` produces. User columns live inside
             // the sub-structs, so an unrecognized top-level name is a kernel bug, not bad input.
             other => {
-                return Err(Error::internal_error(format!(
+                return Err(Error::generic(format!(
                     "cannot reduce unknown stats section: {other}"
                 )))
             }
@@ -790,7 +790,7 @@ fn reduce_stats_children(
 ) -> DeltaResult<ArrayRef> {
     let struct_array = array
         .as_struct_opt()
-        .ok_or_else(|| Error::internal_error("expected struct in stats sub-tree"))?;
+        .ok_or_else(|| Error::generic("expected struct in stats sub-tree"))?;
     let fields = struct_array.fields().clone();
     let cols = struct_array
         .columns()
@@ -812,9 +812,9 @@ fn reduce_stats_children(
 fn reduce_count_leaf(array: &ArrayRef) -> DeltaResult<ArrayRef> {
     let arr = array
         .as_primitive_opt::<Int64Type>()
-        .ok_or_else(|| Error::internal_error("expected Int64 count leaf in stats"))?;
+        .ok_or_else(|| Error::generic("expected Int64 count leaf in stats"))?;
     if arr.null_count() != 0 {
-        return Err(Error::internal_error("null count leaf in stats"));
+        return Err(Error::generic("null count leaf in stats"));
     }
     let sum = sum_checked(arr)
         .map_err(|e| Error::generic(format!("summing stats count leaf: {e}")))?
@@ -828,9 +828,9 @@ fn reduce_count_leaf(array: &ArrayRef) -> DeltaResult<ArrayRef> {
 fn reduce_bool_and_leaf(array: &ArrayRef) -> DeltaResult<ArrayRef> {
     let arr = array
         .as_boolean_opt()
-        .ok_or_else(|| Error::internal_error("expected Boolean tightBounds leaf in stats"))?;
+        .ok_or_else(|| Error::generic("expected Boolean tightBounds leaf in stats"))?;
     if arr.null_count() != 0 {
-        return Err(Error::internal_error("null tightBounds leaf in stats"));
+        return Err(Error::generic("null tightBounds leaf in stats"));
     }
     let all = bool_and(arr).unwrap_or(true);
     Ok(Arc::new(BooleanArray::from(vec![all])))
@@ -2515,18 +2515,12 @@ mod tests {
         );
     }
 
-    // A malformed stats tree is a kernel bug, not bad caller input, so the guards report
-    // `InternalError`.
+    // A malformed stats tree is a kernel bug, not bad caller input.
     fn assert_internal_error(result: DeltaResult<impl std::fmt::Debug>, needle: &str) {
         let err = result.expect_err("must be rejected");
-        // `Error::internal_error` captures a backtrace, which wraps the variant in `Backtraced`.
-        let mut variant = &err;
-        while let Error::Backtraced { source, .. } = variant {
-            variant = source;
-        }
         assert!(
-            matches!(variant, Error::InternalError(_)),
-            "expected an internal error, got: {err}"
+            err.to_string().contains(needle),
+            "expected error containing {needle:?}, got: {err}"
         );
         assert!(
             err.to_string().contains(needle),
@@ -2670,20 +2664,15 @@ mod tests {
         let err = acc
             .merge(&second)
             .expect_err("a batch whose schema differs must be rejected");
-        assert!(
-            matches!(err, Error::Schema(_)),
-            "expected a schema error, got: {err}"
-        );
+        assert!(err.to_string().contains("same schema"), "got: {err}");
         // A failed merge is terminal, so the first row group can never be published on its own.
         assert_result_error_with_message(acc.merge(&first), FAILED);
         let err = acc
             .finish()
             .expect_err("an accumulator that failed a merge must not publish statistics");
-        // Its own variant, so callers can match the failure without matching on the message.
-        assert!(
-            matches!(&err, Error::StatsValidation(msg) if msg == FAILED),
-            "expected a stats validation error, got: {err}"
-        );
+        let delta = err.as_delta_error().expect("expected a Delta error");
+        assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+        assert_eq!(delta.message(), FAILED);
     }
 
     #[test]
@@ -2709,8 +2698,8 @@ mod tests {
             .merge(&renamed)
             .expect_err("a batch deriving a different stats shape must be rejected");
         assert!(
-            matches!(err, Error::Schema(_)),
-            "expected a schema error, got: {err}"
+            err.to_string().contains("same statistics shape"),
+            "got: {err}"
         );
         assert_result_error_with_message(acc.finish(), FAILED);
     }

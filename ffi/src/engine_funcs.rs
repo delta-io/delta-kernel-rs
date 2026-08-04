@@ -30,7 +30,8 @@ pub struct FileReadResultIterator {
     // Item = Box<dyn EngineData>, see above, Vec<bool> -> can become a KernelBoolSlice
     data: FileDataReadResultIterator,
 
-    // Also keep a reference to the external engine for its error allocator.
+    // Also keep a reference to the external engine for its error allocator. A V2 allocator's
+    // caller-owned context must therefore remain valid until this iterator is freed.
     // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
     // terminates early if the last engine goes out of scope.
     engine: Arc<dyn ExternEngine>,
@@ -221,7 +222,7 @@ fn evaluate_expression_impl(
     batch: &dyn EngineData,
     evaluator: &dyn ExpressionEvaluator,
 ) -> DeltaResult<Handle<ExclusiveEngineData>> {
-    evaluator.evaluate(batch).map(Into::into)
+    Ok(evaluator.evaluate(batch)?.into())
 }
 
 #[cfg(test)]

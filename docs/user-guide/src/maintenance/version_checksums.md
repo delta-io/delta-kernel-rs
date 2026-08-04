@@ -54,8 +54,8 @@ publishing) so that downstream code sees the CRC file.
 > [!NOTE]
 > `write_checksum()` currently requires a post-commit snapshot with
 > pre-computed CRC information in memory. Calling it on a snapshot loaded from
-> disk (without a pre-computed CRC) returns an
-> `Error::ChecksumWriteUnsupported` error. In practice, this means you call
+> disk (without a pre-computed CRC) returns a `DELTA_KERNEL_UNCLASSIFIED` Delta
+> error. In practice, this means you call
 > `write_checksum()` on the snapshot returned by
 > `CommittedTransaction::post_commit_snapshot()`.
 

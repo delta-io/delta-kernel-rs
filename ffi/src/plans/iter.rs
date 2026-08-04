@@ -11,7 +11,7 @@
 //! Rust's `Option<Result<T>>`) into a caller-provided out pointer. The out pointer is
 //! pre-initialized to `Some(EngineExecResult::Uninit)`.
 //!
-//! This allows us to implement `DeltaResultIterator<T>` semantics:
+//! This allows us to implement `EngineResultIterator<T>` semantics:
 //!     - The outer Option represents whether iteration is complete (`None` = done)
 //!     - The inner [`EngineExecResult`] represents the item (`Success`) or an engine-side error
 //!       (`Failure`)
@@ -29,7 +29,8 @@
 //!
 //! 3. Errors - each [`EngineExecError`](crate::error::EngineExecError) carries a kernel-allocated
 //!    `ExclusiveRustString` message handle. Kernel takes ownership of the message and frees it when
-//!    converting the error into a kernel error (via `From<EngineExecError> for Error`).
+//!    converting it into an engine-originated error (`EngineError` directly, or `Error` at a mixed
+//!    kernel boundary).
 //!
 //! # Safety
 //! The engine is responsible for ensuring that all `state`, `next`, and `free` pointers
@@ -41,7 +42,7 @@ use delta_kernel::arrow::array::{
     self as arrow_array, Array, BinaryArray, Int64Array, StringArray, StructArray, UInt64Array,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
-use delta_kernel::{DeltaResult, EngineData, Error};
+use delta_kernel::{EngineData, EngineError, EngineResult};
 use url::Url;
 
 use crate::error::EngineExecResult;
@@ -117,14 +118,14 @@ pub struct CFileMetaIterator {
 
 /// Helper function for invokeing an engine iterator's `next` callback and normalizing its
 /// out-pointer result into the next raw item.
-fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<DeltaResult<T>> {
+fn next_item<T>(next: CIterNextFn<T>, state: NullableCvoid) -> Option<EngineResult<T>> {
     let mut out = OptionalValue::Some(EngineExecResult::Uninit);
     next(state, &mut out);
     match out {
         OptionalValue::None => None,
         OptionalValue::Some(EngineExecResult::Success(item)) => Some(Ok(item)),
         OptionalValue::Some(EngineExecResult::Failure(err)) => Some(Err(err.into())),
-        OptionalValue::Some(EngineExecResult::Uninit) => Some(Err(Error::internal_error(
+        OptionalValue::Some(EngineExecResult::Uninit) => Some(Err(EngineError::other(
             "FFI engine iterator returned from next upcall without writing an item",
         ))),
     }
@@ -174,7 +175,7 @@ impl FfiEngineDataIter {
 }
 
 impl Iterator for FfiEngineDataIter {
-    type Item = DeltaResult<Box<dyn EngineData>>;
+    type Item = EngineResult<Box<dyn EngineData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // into_inner transfers ownership of the EngineData to kernel, and kernel will free it when
@@ -203,25 +204,33 @@ impl FfiBytesIter {
         }
     }
 
-    fn arrow_array_to_bytes(array: FFI_ArrowArray) -> DeltaResult<Bytes> {
-        let schema = FFI_ArrowSchema::try_from(&ArrowDataType::Binary)?;
-        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
+    fn arrow_array_to_bytes(array: FFI_ArrowArray) -> EngineResult<Bytes> {
+        let schema = FFI_ArrowSchema::try_from(&ArrowDataType::Binary).map_err(|error| {
+            EngineError::corrupt_data("CBytesIterator returned invalid Arrow data")
+                .with_source(error)
+        })?;
+        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }.map_err(|error| {
+            EngineError::corrupt_data("CBytesIterator returned invalid Arrow data")
+                .with_source(error)
+        })?;
         let array = arrow_array::make_array(array_data);
 
         let Some(binary) = array.as_any().downcast_ref::<BinaryArray>() else {
-            return Err(Error::generic(format!(
+            return Err(EngineError::corrupt_data(format!(
                 "CBytesIterator must yield BinaryArray, got {:?}",
                 array.data_type()
             )));
         };
         if binary.len() != 1 {
-            return Err(Error::generic(format!(
+            return Err(EngineError::corrupt_data(format!(
                 "CBytesIterator array must contain exactly one row, got {}",
                 binary.len()
             )));
         }
         if binary.is_null(0) {
-            return Err(Error::generic("CBytesIterator array row must not be null"));
+            return Err(EngineError::corrupt_data(
+                "CBytesIterator array row must not be null",
+            ));
         }
 
         // TODO: this copies the payload bytes, but could be made zero-copy by
@@ -231,7 +240,7 @@ impl FfiBytesIter {
 }
 
 impl Iterator for FfiBytesIter {
-    type Item = DeltaResult<Bytes>;
+    type Item = EngineResult<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         next_item(self.next, self.cleanup.state())
@@ -270,31 +279,37 @@ impl FfiFileMetaIter {
 
     /// The fixed Arrow type expected by [`CFileMetaIterator`]: a non-null struct of
     /// `{location: Utf8, last_modified: Int64, size: UInt64}`, all non-null.
-    fn arrow_schema() -> DeltaResult<FFI_ArrowSchema> {
+    fn arrow_schema() -> EngineResult<FFI_ArrowSchema> {
         let schema = ArrowDataType::Struct(Fields::from(vec![
             ArrowField::new("location", ArrowDataType::Utf8, false),
             ArrowField::new("last_modified", ArrowDataType::Int64, false),
             ArrowField::new("size", ArrowDataType::UInt64, false),
         ]));
-        Ok(FFI_ArrowSchema::try_from(&schema)?)
+        FFI_ArrowSchema::try_from(&schema).map_err(|error| {
+            EngineError::other("Failed to construct the CFileMetaIterator Arrow schema")
+                .with_source(error)
+        })
     }
 
     /// Decodes a single engine batch into a `Vec<FileMeta>`.
     fn arrow_array_to_file_metas(
         array: FFI_ArrowArray,
-    ) -> DeltaResult<Vec<delta_kernel::FileMeta>> {
+    ) -> EngineResult<Vec<delta_kernel::FileMeta>> {
         let schema = Self::arrow_schema()?;
-        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }?;
+        let array_data = unsafe { arrow_ffi::from_ffi(array, &schema) }.map_err(|error| {
+            EngineError::corrupt_data("CFileMetaIterator returned invalid Arrow data")
+                .with_source(error)
+        })?;
         let array = arrow_array::make_array(array_data);
 
         let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() else {
-            return Err(Error::generic(format!(
+            return Err(EngineError::corrupt_data(format!(
                 "CFileMetaIterator must yield StructArray, got {:?}",
                 array.data_type()
             )));
         };
         if struct_array.is_empty() {
-            return Err(Error::generic(
+            return Err(EngineError::corrupt_data(
                 "CFileMetaIterator batch must contain at least one row",
             ));
         }
@@ -307,19 +322,23 @@ impl FfiFileMetaIter {
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::generic("CFileMetaIterator: location column is not Utf8"))?;
+            .ok_or_else(|| {
+                EngineError::corrupt_data("CFileMetaIterator: location column is not Utf8")
+            })?;
         let last_modified_col = struct_array
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| {
-                Error::generic("CFileMetaIterator: last_modified column is not Int64")
+                EngineError::corrupt_data("CFileMetaIterator: last_modified column is not Int64")
             })?;
         let size_col = struct_array
             .column(2)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::generic("CFileMetaIterator: size column is not UInt64"))?;
+            .ok_or_else(|| {
+                EngineError::corrupt_data("CFileMetaIterator: size column is not UInt64")
+            })?;
 
         // The fixed schema declares every column non-null; reject any batch that violates that
         // contract up front so the per-row decode below can safely call `value(i)`.
@@ -327,7 +346,7 @@ impl FfiFileMetaIter {
             || last_modified_col.null_count() != 0
             || size_col.null_count() != 0
         {
-            return Err(Error::generic(
+            return Err(EngineError::corrupt_data(
                 "CFileMetaIterator batch must not contain null fields",
             ));
         }
@@ -335,7 +354,13 @@ impl FfiFileMetaIter {
         (0..struct_array.len())
             .map(|i| {
                 Ok(delta_kernel::FileMeta {
-                    location: Url::parse(location_col.value(i))?,
+                    location: Url::parse(location_col.value(i)).map_err(|error| {
+                        EngineError::corrupt_data(format!(
+                            "CFileMetaIterator returned an invalid file URL: {}",
+                            location_col.value(i)
+                        ))
+                        .with_source(error)
+                    })?,
                     last_modified: last_modified_col.value(i),
                     size: size_col.value(i),
                 })
@@ -345,7 +370,7 @@ impl FfiFileMetaIter {
 }
 
 impl Iterator for FfiFileMetaIter {
-    type Item = DeltaResult<delta_kernel::FileMeta>;
+    type Item = EngineResult<delta_kernel::FileMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

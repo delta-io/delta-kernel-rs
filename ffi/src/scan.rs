@@ -484,8 +484,9 @@ pub struct ScanMetadataIterator {
     // Mutex -> Allow the iterator to be accessed safely by multiple threads.
     data: Mutex<ScanMetadataIter>,
 
-    // Also keep a reference to the external engine for its error allocator. The default Parquet
-    // and Json handlers don't hold any reference to the tokio reactor they rely on, so the
+    // Also keep a reference to the external engine for its error allocator. A V2 allocator's
+    // caller-owned context must therefore remain valid until this iterator is freed. The default
+    // Parquet and Json handlers don't hold any reference to the tokio reactor they rely on, so the
     // iterator terminates early if the last engine goes out of scope.
     engine: Arc<dyn ExternEngine>,
 }

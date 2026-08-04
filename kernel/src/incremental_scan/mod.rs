@@ -78,8 +78,8 @@ impl IncrementalScanBuilder {
     ///
     /// # Errors
     /// - `Err` if `base_version >= target_snapshot.version()` (caller error).
-    /// - [`Error::MissingColumn`] if a [`with_predicate`](Self::with_predicate) predicate
-    ///   references a column absent from the table schema.
+    /// - An error if a [`with_predicate`](Self::with_predicate) predicate references a column
+    ///   absent from the table schema.
     /// - `Err` if the target snapshot's protocol contains an unsupported reader feature.
     /// - `Err` if the engine fails to open the commit stream.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<Option<IncrementalScanStream>> {
@@ -246,7 +246,7 @@ impl Iterator for IncrementalScanStream {
             match self.actions.next()? {
                 Err(e) => {
                     self.errored = true;
-                    return Some(Err(e));
+                    return Some(Err(e.into()));
                 }
                 Ok(batch) => match process_batch(
                     batch,
@@ -273,15 +273,16 @@ impl IncrementalScanStream {
     /// data structure they prefer.
     ///
     /// # Errors
-    /// - [`Error::IOError`], [`Error::ObjectStore`], or [`Error::Reqwest`] on transient I/O while
-    ///   reading commit JSONs. Retryable by rebuilding the stream.
-    /// - [`Error::FileNotFound`] if a commit was vacuumed between [`IncrementalScanBuilder::build`]
-    ///   and stream consumption. Rebuilding will likely return `Ok(None)` (commits unavailable);
-    ///   fall back to [`crate::Snapshot::scan_builder`].
-    /// - [`Error::MalformedJson`] or [`Error::Arrow`] (default-engine) on commit JSON corruption.
+    /// - [`Error::Engine`] on transient I/O while reading commit JSONs. Retryable by rebuilding the
+    ///   stream.
+    /// - [`EngineError::FileNotFound`](crate::EngineError::FileNotFound) if a commit was vacuumed
+    ///   between [`IncrementalScanBuilder::build`] and stream consumption. Rebuilding will likely
+    ///   return `Ok(None)` (commits unavailable); fall back to [`crate::Snapshot::scan_builder`].
+    /// - [`EngineError::CorruptData`](crate::EngineError::CorruptData) on commit JSON corruption.
     ///   Not retryable.
-    /// - [`Error::Generic`] on malformed `deletionVector` fields in a commit row, or on "cannot
-    ///   finish a stream that previously errored" when a terminal method is called after a prior
+    /// - [`DeltaErrorCode::DeltaKernelUnclassified`](crate::DeltaErrorCode::DeltaKernelUnclassified)
+    ///   on malformed `deletionVector` fields in a commit row, or on "cannot finish a stream that
+    ///   previously errored" when a terminal method is called after a prior
     ///   `next()` returned `Err`. Rebuild to retry the latter; the former indicates table
     ///   corruption.
     pub fn into_summary(mut self) -> DeltaResult<IncrementalScanSummary> {

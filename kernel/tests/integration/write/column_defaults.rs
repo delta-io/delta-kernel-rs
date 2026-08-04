@@ -305,10 +305,7 @@ async fn write_context_acknowledgement_depends_on_column_defaults(
             txn.partitioned_write_context(partition_values.clone())
         }
         .expect_err("inspecting defaults must not implicitly acknowledge them");
-        assert!(matches!(
-            &error,
-            delta_kernel::Error::InvalidTransactionState(_)
-        ));
+        assert!(error.as_delta_error().is_some());
         assert!(error.to_string().contains("ack_column_defaults"));
 
         txn.ack_column_defaults();

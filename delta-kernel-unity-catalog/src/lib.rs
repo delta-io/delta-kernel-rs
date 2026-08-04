@@ -128,10 +128,11 @@ mod tests {
             .with_max_catalog_version(max_catalog_version)
             .build(&engine);
 
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Log tail versions 1 and 3 are not contiguous"));
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.as_delta_error().unwrap().code(),
+            delta_kernel::DeltaErrorCode::DeltaVersionsNotContiguous
+        );
     }
 
     /// Builds a `LoadTableResponse` with no commits at the given location and ratified version.

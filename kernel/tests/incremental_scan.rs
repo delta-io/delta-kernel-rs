@@ -446,7 +446,7 @@ async fn missing_commit_file_surfaces_error_during_iteration(
         Err(e) => e,
     };
     assert!(
-        matches!(err, delta_kernel::Error::FileNotFound(_)),
+        err.is_file_not_found(),
         "expected FileNotFound, got {err:?}"
     );
 
@@ -1619,9 +1619,7 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
         .with_predicate(predicate)
         .build(engine.as_ref());
 
-    // Fail-fast at build, surfacing the unresolved column. The concrete error is
-    // `Error::MissingColumn`, but a captured backtrace wraps it in `Error::Backtraced`, so match
-    // on the message rather than the variant.
+    // Fail fast at build and surface the unresolved column through the unclassified fallback.
     assert_result_error_with_message(result, "unknown column: nonexistent");
 
     Ok(())

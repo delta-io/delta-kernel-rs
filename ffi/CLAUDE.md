@@ -23,6 +23,20 @@ Fallible functions return `ExternResult` (tagged union of Ok/Err). The caller pr
 `allocate_error` callback when creating the engine; kernel calls this to allocate errors in
 the caller's memory space.
 
+The V1 entry points (`get_engine_builder`, `get_default_engine`) pass a fixed numeric `KernelError`
+and Display text to `AllocateErrorFn`. Their ABI remains stable. The additive V2 entry points
+(`get_engine_builder_v2`, `get_default_engine_v2`) accept `FfiErrorAllocatorV2` and pass a borrowed
+`FfiErrorDescriptorV1` containing the origin, legacy V1 category, optional Delta condition and
+SQLSTATE, lexically ordered named parameters, Display text, and diagnostic Debug text. Descriptor
+pointers and strings are valid only during the synchronous callback; callbacks must deep-copy
+retained data and may return null. The callback context remains caller-owned and must support
+concurrent invocation. It must outlive the builder, the engine, and every derived handle or object
+that retains that engine. Releasing the caller's engine handle does not end this requirement while
+a derived object still retains the engine.
+
+V2 supports the default URL-scheme object-store path. REST/custom callbacks, standalone helpers,
+and inbound `EngineExecError` remain on V1.
+
 ## Key Files
 
 - `src/lib.rs` -- main FFI entry points and type definitions

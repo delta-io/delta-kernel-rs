@@ -79,6 +79,16 @@ pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
 #[internal_api]
 pub(crate) struct ProtocolVisitor {
     pub(crate) protocol: Option<Protocol>,
+    table_name_or_path: Option<String>,
+}
+
+impl ProtocolVisitor {
+    pub(crate) fn for_table(table_name_or_path: impl Into<String>) -> Self {
+        Self {
+            protocol: None,
+            table_name_or_path: Some(table_name_or_path.into()),
+        }
+    }
 }
 
 impl RowVisitor for ProtocolVisitor {
@@ -87,7 +97,9 @@ impl RowVisitor for ProtocolVisitor {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            if let Some(protocol) = visit_protocol_at(i, getters)? {
+            if let Some(protocol) =
+                visit_protocol_at_for_table(i, getters, self.table_name_or_path.as_deref())?
+            {
                 self.protocol = Some(protocol);
                 break;
             }
@@ -598,6 +610,14 @@ pub(crate) fn visit_protocol_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<Protocol>> {
+    visit_protocol_at_for_table(row_index, getters, None)
+}
+
+fn visit_protocol_at_for_table<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+    table_name_or_path: Option<&str>,
+) -> DeltaResult<Option<Protocol>> {
     require!(
         getters.len() == 4,
         Error::InternalError(format!(
@@ -611,10 +631,41 @@ pub(crate) fn visit_protocol_at<'a>(
         return Ok(None);
     };
     let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
-    let reader_features: Option<Vec<_>> =
+    let reader_features: Option<Vec<String>> =
         getters[2].get_opt(row_index, "protocol.reader_features")?;
-    let writer_features: Option<Vec<_>> =
+    let writer_features: Option<Vec<String>> =
         getters[3].get_opt(row_index, "protocol.writer_features")?;
+
+    if let Some(table_name_or_path) = table_name_or_path {
+        let invalid_version = !(MIN_VALID_RW_VERSION..=MAX_VALID_READER_VERSION)
+            .contains(&min_reader_version)
+            || (min_reader_version == TABLE_FEATURES_MIN_READER_VERSION
+                && min_writer_version < TABLE_FEATURES_MIN_WRITER_VERSION);
+        if invalid_version {
+            return Err(invalid_protocol_version_error(
+                table_name_or_path,
+                min_reader_version,
+                min_writer_version,
+            ));
+        }
+
+        let mut unsupported = reader_features
+            .iter()
+            .flatten()
+            .map(|name| TableFeature::from(name.as_str()))
+            .filter(|feature| matches!(feature.info().kernel_support, KernelSupport::NotSupported))
+            .map(|feature| feature.to_string())
+            .collect::<Vec<_>>();
+        unsupported.sort_unstable();
+        unsupported.dedup();
+        if !unsupported.is_empty() {
+            return Err(delta_errors::unsupported_features_for_read(
+                table_name_or_path,
+                KERNEL_VERSION,
+                unsupported.join(", "),
+            ));
+        }
+    }
 
     let protocol = Protocol::try_new(
         min_reader_version,
@@ -623,6 +674,29 @@ pub(crate) fn visit_protocol_at<'a>(
         writer_features,
     )?;
     Ok(Some(protocol))
+}
+
+fn invalid_protocol_version_error(
+    table_name_or_path: &str,
+    min_reader_version: i32,
+    min_writer_version: i32,
+) -> Error {
+    let supported_readers = (MIN_VALID_RW_VERSION..=MAX_VALID_READER_VERSION)
+        .map(|version| version.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let supported_writers = (MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION)
+        .map(|version| version.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    delta_errors::invalid_protocol_version(
+        table_name_or_path,
+        min_reader_version,
+        min_writer_version,
+        KERNEL_VERSION,
+        supported_readers,
+        supported_writers,
+    )
 }
 
 /// This visitor extracts the in-commit timestamp (ICT) from a CommitInfo action in the log it is
