@@ -126,7 +126,7 @@ fn in_to_df_predicate_expr(
         .map(|scalar| Ok(lit(to_df_scalar(scalar)?)))
         .collect();
 
-    let value = to_df_expr(value, input_schema)?;
+    let value = to_df_expr(value, input_schema, None)?;
     let in_list = InList::new(Box::new(value.clone()), elements?, false);
     let is_member = DFExpr::InList(in_list).is_true();
 
