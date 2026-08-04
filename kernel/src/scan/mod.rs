@@ -687,6 +687,7 @@ impl HasSelectionVector for ScanMetadata {
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
+#[derive(Clone)]
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
@@ -1100,6 +1101,42 @@ impl Scan {
             &self.stats,
             &self.partition_values,
             self.physical_stats_output_schema.as_ref(),
+        )
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Builds a resumable state machine that produces the scan's live-add declarative plan.
+    ///
+    /// Unlike [`Self::declarative_metadata_scan_plan`], this method does not require a
+    /// [`PlanExecutor`](crate::plans::PlanExecutor) up front. The returned machine yields each
+    /// checkpoint-inspection operation to the caller and completes with the metadata plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state machine cannot be initialized. Plan construction and
+    /// executor failures are surfaced while the caller drives the machine.
+    pub fn build_metadata_scan(
+        &self,
+    ) -> DeltaResult<crate::plans::state_machines::CoroutineSM<Plan>> {
+        let scan = self.clone();
+        crate::plans::state_machines::CoroutineSM::new(
+            "scan_metadata",
+            move |mut engine, _id| async move {
+                let shape = CheckpointShape::try_new_state_machine(
+                    &mut engine,
+                    scan.snapshot.log_segment(),
+                    scan.state_info.physical_stats_schema.as_ref(),
+                )
+                .await?;
+                scan_plan::build_metadata_scan_plan_or_empty(
+                    &scan.state_info,
+                    scan.snapshot.log_segment(),
+                    &shape,
+                    &scan.stats,
+                    &scan.partition_values,
+                    scan.physical_stats_output_schema.as_ref(),
+                )
+            },
         )
     }
 

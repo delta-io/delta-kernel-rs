@@ -13,7 +13,7 @@ use crate::{FileMeta, FileSlice};
 /// [`PlanExecutor`](crate::plans::PlanExecutor) should perform.
 ///
 /// It can either be an IO operation or a declarative query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Operation {
     /// A singular I/O operation that returns concretely typed data such as bytes or file metadata.
     IoOperation(IoOperation),
@@ -35,7 +35,7 @@ impl Operation {
 ///
 /// Each variant describes an operation and its parameters. The shape of the result it produces
 /// is documented on the variant in terms of [`PlanResult`](crate::plans::PlanResult).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum IoOperation {
     /// Recursively list files at the given URL.
     ///

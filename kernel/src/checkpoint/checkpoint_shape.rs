@@ -13,6 +13,7 @@ use crate::actions::SIDECAR_NAME;
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
+use crate::plans::state_machines::CoroutineEngine;
 use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
@@ -40,6 +41,135 @@ pub(crate) struct CheckpointShape {
 }
 
 impl CheckpointShape {
+    /// Resolve a checkpoint shape by yielding each required operation to a state-machine driver.
+    pub(crate) async fn try_new_state_machine(
+        engine: &mut CoroutineEngine,
+        segment: &LogSegment,
+        stats_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<CheckpointShape> {
+        let (root_checkpoint, file_type) = match segment.listed.checkpoint_parts.first() {
+            Some(checkpoint) if checkpoint.is_json() => (&checkpoint.location, FileType::Json),
+            Some(checkpoint) => (&checkpoint.location, FileType::Parquet),
+            None => {
+                return Ok(CheckpointShape {
+                    checkpoint_type: CheckpointType::None,
+                    parsed_stats_schema: None,
+                })
+            }
+        };
+
+        if let Some(shape) = Self::from_v2_checkpoint_hint_state_machine(
+            engine,
+            segment,
+            root_checkpoint,
+            file_type,
+            stats_schema,
+        )
+        .await?
+        {
+            return Ok(shape);
+        }
+
+        match file_type {
+            FileType::Parquet => {
+                let cp_schema = match segment.checkpoint_hint_schema() {
+                    Some(schema) => schema,
+                    None => {
+                        read_footer_schema(engine, root_checkpoint.clone(), "checkpoint_schema")
+                            .await?
+                    }
+                };
+                if !cp_schema.contains(SIDECAR_NAME) {
+                    return Ok(Self::try_new_leaf(Some(cp_schema), stats_schema));
+                }
+                match collect_single_sidecar_state_machine(
+                    engine,
+                    root_checkpoint,
+                    file_type,
+                    &segment.log_root,
+                )
+                .await?
+                {
+                    Some(sidecar) => {
+                        Self::try_new_manifest_state_machine(engine, sidecar, stats_schema).await
+                    }
+                    None => Ok(Self::try_new_leaf(Some(cp_schema), stats_schema)),
+                }
+            }
+            FileType::Json => match collect_single_sidecar_state_machine(
+                engine,
+                root_checkpoint,
+                file_type,
+                &segment.log_root,
+            )
+            .await?
+            {
+                Some(sidecar) => {
+                    Self::try_new_manifest_state_machine(engine, sidecar, stats_schema).await
+                }
+                None => Ok(Self::try_new_leaf(None, stats_schema)),
+            },
+        }
+    }
+
+    async fn from_v2_checkpoint_hint_state_machine(
+        engine: &mut CoroutineEngine,
+        segment: &LogSegment,
+        root_checkpoint: &FileMeta,
+        file_type: FileType,
+        stats_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<Option<CheckpointShape>> {
+        match segment.checkpoint_hint_sidecars().map(Vec::as_slice) {
+            Some([sidecar, ..]) => {
+                let sidecar_meta = sidecar.to_filemeta(&segment.log_root)?;
+                let result =
+                    Self::try_new_manifest_state_machine(engine, sidecar_meta, stats_schema)
+                        .await?;
+                Ok(Some(result))
+            }
+            Some([]) => {
+                let leaf_schema = match file_type {
+                    FileType::Parquet if stats_schema.is_some() => {
+                        Some(match segment.checkpoint_hint_schema() {
+                            Some(schema) => schema,
+                            None => {
+                                read_footer_schema(
+                                    engine,
+                                    root_checkpoint.clone(),
+                                    "checkpoint_stats_schema",
+                                )
+                                .await?
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+                Ok(Some(Self::try_new_leaf(leaf_schema, stats_schema)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn try_new_manifest_state_machine(
+        engine: &mut CoroutineEngine,
+        sidecar: FileMeta,
+        stats_schema: Option<&SchemaRef>,
+    ) -> DeltaResult<CheckpointShape> {
+        let parsed_stats_schema = match stats_schema {
+            Some(stats_schema) => {
+                let footer_schema =
+                    read_footer_schema(engine, sidecar, "sidecar_stats_schema").await?;
+                LogSegment::schema_has_compatible_stats_parsed(footer_schema.as_ref(), stats_schema)
+                    .then(|| stats_schema.clone())
+            }
+            None => None,
+        };
+        Ok(CheckpointShape {
+            checkpoint_type: CheckpointType::Manifest,
+            parsed_stats_schema,
+        })
+    }
+
     /// Resolve `snapshot`'s checkpoint shape. Determines the checkpoint type and, when
     /// `stats_schema` is `Some`, whether the checkpoint contains parsed stats compatible with it.
     pub(crate) fn try_new(
@@ -171,6 +301,51 @@ impl CheckpointShape {
             checkpoint_type: CheckpointType::Leaf,
             parsed_stats_schema: parsed_stats_schema.cloned(),
         }
+    }
+}
+
+async fn read_footer_schema(
+    engine: &mut CoroutineEngine,
+    file: FileMeta,
+    step_name: &'static str,
+) -> DeltaResult<SchemaRef> {
+    engine
+        .execute(
+            Operation::IoOperation(crate::plans::IoOperation::parquet_footer(file)),
+            step_name,
+        )
+        .await?
+        .into_parquet_footer()
+        .map(|footer| footer.schema)
+}
+
+async fn collect_single_sidecar_state_machine(
+    engine: &mut CoroutineEngine,
+    file: &FileMeta,
+    file_format: FileType,
+    log_root: &Url,
+) -> DeltaResult<Option<FileMeta>> {
+    let read_schema = LogSegment::sidecar_read_schema();
+    let plan = match file_format {
+        FileType::Parquet => PlanBuilder::scan_parquet([file.clone()], &[], read_schema),
+        FileType::Json => PlanBuilder::scan_json([file.clone()], &[], read_schema),
+    }?
+    .build()?;
+    let data = engine
+        .execute(Operation::QueryPlan(plan), "inspect_checkpoint_sidecars")
+        .await?
+        .into_data()?;
+
+    let mut visitor = SidecarVisitor::default();
+    for batch in data {
+        visitor.visit_rows_of(batch?.as_ref())?;
+        if !visitor.sidecars.is_empty() {
+            break;
+        }
+    }
+    match visitor.sidecars.first() {
+        Some(sidecar) => Ok(Some(sidecar.to_filemeta(log_root)?)),
+        None => Ok(None),
     }
 }
 

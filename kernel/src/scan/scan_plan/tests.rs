@@ -17,6 +17,7 @@ use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
 use crate::plans::ir::nodes::Operator;
+use crate::plans::state_machines::{EngineRequest, EngineResponse, NextStep, StateMachine as _};
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
 use crate::unit_test_utils::load_test_table;
@@ -125,6 +126,23 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
         )?);
     }
     Ok(projected)
+}
+
+fn drive_metadata_state_machine(
+    scan: &Scan,
+    engine: &dyn Engine,
+) -> DeltaResult<crate::plans::ir::plan::Plan> {
+    let executor = engine.require_plan_executor()?;
+    let mut sm = scan.build_metadata_scan()?;
+    loop {
+        match sm.get_step()? {
+            NextStep::Execute(EngineRequest::Execute(operation)) => {
+                let response = EngineResponse::Plan(executor.execute_op(operation)?);
+                sm.submit(Ok(response))?;
+            }
+            NextStep::Done(plan) => return Ok(plan),
+        }
+    }
 }
 
 fn metadata_row_count(batches: &[RecordBatch]) -> usize {
@@ -278,6 +296,25 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
             .iter()
             .any(|file| file.meta.location.path().contains("/_sidecars/"))
     }));
+    Ok(())
+}
+
+#[rstest]
+#[case::no_checkpoint("basic_partitioned")]
+#[case::parquet_manifest("v2-checkpoints-parquet-with-sidecars")]
+#[case::json_leaf("v2-checkpoints-json-without-sidecars")]
+fn metadata_state_machine_matches_direct_plan(#[case] table: &str) -> DeltaResult<()> {
+    let (engine, snapshot, _tempdir) = load_test_table(table)?;
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .build()?;
+
+    let direct = scan
+        .declarative_metadata_scan_plan(engine.as_ref())?
+        .expect("metadata plan");
+    let state_machine = drive_metadata_state_machine(&scan, engine.as_ref())?;
+    assert_eq!(format!("{direct:?}"), format!("{state_machine:?}"));
     Ok(())
 }
 

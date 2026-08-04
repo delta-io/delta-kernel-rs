@@ -132,6 +132,43 @@ pub(crate) fn build_metadata_scan_plan(
     PlanBuilder::union_all([commit_live_adds, checkpoint_live_adds])?.build_opt()
 }
 
+/// Build an always-runnable live-add metadata plan.
+///
+/// Unlike [`build_metadata_scan_plan`], an empty result is represented by an empty `Values` node
+/// instead of `None`.
+pub(crate) fn build_metadata_scan_plan_or_empty(
+    state: &StateInfo,
+    log_segment: &LogSegment,
+    shape: &CheckpointShape,
+    stats: &StatsOptions,
+    partition_values: &PartitionValuesOptions,
+    physical_stats_output_schema: Option<&SchemaRef>,
+) -> DeltaResult<Plan> {
+    if let Some(plan) = build_metadata_scan_plan(
+        state,
+        log_segment,
+        shape,
+        stats,
+        partition_values,
+        physical_stats_output_schema,
+    )? {
+        return Ok(plan);
+    }
+
+    let add_field = add_field_with_parsed_stats_and_partitions(
+        state.physical_stats_schema.as_ref(),
+        state.physical_partition_schema.as_ref(),
+    )?;
+    let (_, output_schema) = metadata_output_projection(
+        &add_field,
+        stats,
+        partition_values,
+        state.physical_partition_schema.as_ref(),
+        physical_stats_output_schema,
+    )?;
+    PlanBuilder::values(output_schema, vec![])?.build()
+}
+
 /// Build normalized checkpoint adds. Returns an empty relation when no checkpoint exists.
 ///
 /// ## SQL equivalent:
@@ -997,6 +1034,20 @@ mod tests {
             state.physical_stats_schema.as_ref(),
         )?
         .is_none());
+
+        let plan = build_metadata_scan_plan_or_empty(
+            &state,
+            &segment,
+            &no_checkpoint(),
+            &stats,
+            &partition_values,
+            state.physical_stats_schema.as_ref(),
+        )?;
+        assert_eq!(plan.nodes.len(), 1);
+        let Operator::Values(values) = &plan.nodes[0].op else {
+            panic!("empty metadata plan must contain a Values node");
+        };
+        assert!(values.rows.is_empty());
         Ok(())
     }
 
