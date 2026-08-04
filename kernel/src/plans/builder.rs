@@ -623,12 +623,13 @@ fn check_file_constant_columns<'a>(
 
 #[cfg(test)]
 mod tests {
+    use test_utils::assert_result_error_with_message;
+
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{col, column_name, lit, Expression};
     use crate::plans::ir::nodes::FileType;
     use crate::schema::{DataType, MetadataColumnSpec, StructField, StructType, ToSchema as _};
-    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
