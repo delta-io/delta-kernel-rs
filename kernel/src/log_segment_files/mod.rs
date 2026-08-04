@@ -3,7 +3,7 @@
 //! 1. `list_commits`: Lists all commit files between the provided start and end versions.
 //! 2. `list`: Lists all commit and checkpoint files between the provided start and end versions.
 //! 3. `list_with_checkpoint_hint`: Lists all commit and checkpoint files after the provided
-//!    checkpoint hint.
+//!    checkpoint hint, or `None` if that hint turned out to be stale.
 //! 4. `list_with_backward_checkpoint_scan`: Scans backward from an end version in 1000-version
 //!    windows until a complete checkpoint is found or the log is exhausted.
 //!
@@ -588,7 +588,7 @@ impl LogSegmentFiles {
         log_root: &Url,
         log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<Option<Self>> {
         let listed_files = Self::list(
             storage,
             log_root,
@@ -598,11 +598,12 @@ impl LogSegmentFiles {
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-            // Kernel should not compensate for corrupt tables, so we fail if we can't find a
-            // checkpoint
-            return Err(Error::invalid_checkpoint(
-                "Had a _last_checkpoint hint but didn't find any checkpoints",
-            ));
+            info!(
+                hint_version = checkpoint_metadata.version,
+                "_last_checkpoint names a checkpoint that is missing or incomplete; treating the \
+                 hint as stale and listing without it"
+            );
+            return Ok(None);
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
             info!(
@@ -623,7 +624,7 @@ impl LogSegmentFiles {
                  this version; using the checkpoint file's own fields"
             );
         }
-        Ok(listed_files)
+        Ok(Some(listed_files))
     }
 
     /// Returns a [`LogSegmentFiles`] ending at `end_version`, rooted at the most recent complete
