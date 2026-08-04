@@ -9,7 +9,7 @@ use delta_kernel::expressions::{
     Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, UnaryExpressionOp,
     VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, StructType};
 use delta_kernel::{DeltaResult, Error};
 
 use crate::predicate::to_df_predicate_expr;
@@ -175,22 +175,6 @@ fn struct_null_when_not(guard: DFExpr, body: DFExpr) -> DFExpr {
     ))
 }
 
-/// Emits a computed field into `args`: consumes the next output slot for its name and target type,
-/// lowers `expr` against that type, and pushes the `[name, value]` pair.
-fn emit_new_field<'a>(
-    args: &mut Vec<DFExpr>,
-    output_fields: &mut impl Iterator<Item = &'a StructField>,
-    input_schema: &StructType,
-    expr: &KernelExpression,
-) -> DeltaResult<()> {
-    let field = output_fields
-        .next()
-        .ok_or_else(|| Error::generic("StructPatch produced more fields than the output schema"))?;
-    args.push(lit(field.name().to_string()));
-    args.push(to_df_expr(expr, input_schema, Some(field.data_type()))?);
-    Ok(())
-}
-
 /// Lowers a struct constructor to `named_struct(..)`, taking field names and per-child target types
 /// from `output_type`. An optional nullability predicate nulls the whole struct where it is not
 /// true.
@@ -208,6 +192,8 @@ fn struct_to_df_expr(
             target.num_fields()
         )));
     }
+    // `named_struct` takes one flat arg list of alternating names and values:
+    // `[name1, value1, name2, value2, ...]`, hence two args per field.
     let mut args = Vec::with_capacity(fields.len() * 2);
     for (child, field) in fields.iter().zip(target.fields()) {
         args.push(lit(field.name().to_string()));
@@ -236,6 +222,14 @@ fn struct_patch_to_df_expr(
     input_schema: &StructType,
     output_type: Option<&KernelDataType>,
 ) -> DeltaResult<DFExpr> {
+    /// What supplies one output field of a struct patch, before it is paired with its output field.
+    enum PatchValue<'a> {
+        /// An input field forwarded unchanged; already lowered, since it needs no target type.
+        KeepExisting(DFExpr),
+        /// A patch expression, lowered once its output field supplies the target type.
+        ComputeNew(&'a KernelExpression),
+    }
+
     let target = require_struct_output(output_type, "StructPatch")?;
 
     // `None` = operate on the top-level columns; otherwise the nested struct at `input_path`.
@@ -255,35 +249,36 @@ fn struct_patch_to_df_expr(
         }
     };
 
-    let mut output_fields = target.fields();
-    let mut args = Vec::with_capacity(target.num_fields() * 2);
-
-    for expr in &patch.prepended_fields {
-        emit_new_field(&mut args, &mut output_fields, input_schema, expr)?;
-    }
+    // Collect the output values in emission order. Passthroughs lower eagerly (they just forward an
+    // input array); computed fields stay as kernel expressions until they are paired with the
+    // output field that supplies their target type.
+    let mut values = Vec::with_capacity(target.num_fields());
+    values.extend(
+        patch
+            .prepended_fields
+            .iter()
+            .map(|e| PatchValue::ComputeNew(e)),
+    );
 
     let mut used_field_patches = 0usize;
     for input_field in source_struct.fields() {
         let name = input_field.name();
         let field_patch = patch.field_patches.get(name);
 
-        // Passthrough keeps the input array, so it consumes an output slot only for its name.
         if field_patch.is_none_or(|fp| fp.keep_input) {
-            let field = output_fields.next().ok_or_else(|| {
-                Error::generic("StructPatch produced more fields than the output schema")
-            })?;
-            let value = match &source_expr {
+            values.push(PatchValue::KeepExisting(match &source_expr {
                 Some(base) => get_field(base.clone(), name.to_string()),
                 None => DFExpr::Column(DFColumn::new_unqualified(name)),
-            };
-            args.push(lit(field.name().to_string()));
-            args.push(value);
+            }));
         }
 
         if let Some(field_patch) = field_patch {
-            for expr in &field_patch.insertions {
-                emit_new_field(&mut args, &mut output_fields, input_schema, expr)?;
-            }
+            values.extend(
+                field_patch
+                    .insertions
+                    .iter()
+                    .map(|e| PatchValue::ComputeNew(e)),
+            );
             used_field_patches += 1;
         }
     }
@@ -299,14 +294,30 @@ fn struct_patch_to_df_expr(
         ));
     }
 
-    for expr in &patch.appended_fields {
-        emit_new_field(&mut args, &mut output_fields, input_schema, expr)?;
+    values.extend(
+        patch
+            .appended_fields
+            .iter()
+            .map(|e| PatchValue::ComputeNew(e)),
+    );
+
+    if values.len() != target.num_fields() {
+        return Err(Error::generic(format!(
+            "StructPatch field count mismatch: patch produced {} fields but the output schema has {}",
+            values.len(),
+            target.num_fields()
+        )));
     }
 
-    if output_fields.next().is_some() {
-        return Err(Error::generic(
-            "StructPatch produced fewer fields than the output schema",
-        ));
+    let mut args = Vec::with_capacity(target.num_fields() * 2);
+    for (value, field) in values.into_iter().zip(target.fields()) {
+        args.push(lit(field.name().to_string()));
+        args.push(match value {
+            PatchValue::KeepExisting(expr) => expr,
+            PatchValue::ComputeNew(expr) => {
+                to_df_expr(expr, input_schema, Some(field.data_type()))?
+            }
+        });
     }
 
     let body = named_struct(args);

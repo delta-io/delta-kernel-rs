@@ -118,7 +118,7 @@ fn in_to_df_predicate_expr(
             "converting an IN predicate requires a literal left-hand side",
         ));
     };
-    let value = to_df_expr(value, input_schema)?;
+    let value = to_df_expr(value, input_schema, None)?;
     let membership =
         match list {
             KernelExpression::Literal(KernelScalar::Array(array)) => in_list_expr(value, array)?,
@@ -161,7 +161,7 @@ fn array_has_expr(
             "converting an IN predicate against a column requires an array-typed column",
         ));
     };
-    Ok(array_has(to_df_expr(column, input_schema)?, value))
+    Ok(array_has(to_df_expr(column, input_schema, None)?, value))
 }
 
 /// Lowers a junction (`And`/`Or`) by converting each child and combining them with DataFusion's
