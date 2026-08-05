@@ -1,11 +1,12 @@
 [package]
 name = "unity-catalog-delta-client-api"
+description = "Transport-agnostic client traits and wire models for the Unity Catalog Delta Tables API."
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 license.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 version.workspace = true
 

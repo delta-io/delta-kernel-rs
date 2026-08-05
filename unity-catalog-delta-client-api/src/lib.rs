@@ -2,25 +2,15 @@
 //! surface.
 //!
 //! This crate defines the transport-agnostic [`UpdateTableClient`] trait that
-//! kernel-uc's `UCCommitter` dispatches through, plus serde-friendly wire
-//! models for the connector-driven endpoints (`load_table`, credentials,
-//! `/config`). Concrete HTTP implementations live in
-//! `unity-catalog-delta-rest-client`.
+//! `delta-kernel-unity-catalog`'s `UCCommitter` dispatches through, plus
+//! serde-friendly wire models for the connector-driven endpoints
+//! (`load_table`, credentials, `/config`). Concrete HTTP implementations live
+//! in `unity-catalog-delta-rest-client`.
 //!
 //! Only `update_table` (the commit RPC) is behind a trait. Read and
 //! credential-vending flows are connector-driven: connectors call concrete
 //! REST methods (or bring their own HTTP plumbing) and hand the responses to
-//! kernel-uc helpers.
-//!
-//! # Testing
-//!
-//! Enable the `test-utils` feature for an in-memory `UpdateTableClient`
-//! implementation suitable for unit tests:
-//!
-//! ```toml
-//! [dev-dependencies]
-//! unity-catalog-delta-client-api = { version = "...", features = ["test-utils"] }
-//! ```
+//! `delta-kernel-unity-catalog` helpers.
 
 pub mod clients;
 pub mod credentials;

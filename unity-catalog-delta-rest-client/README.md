@@ -5,8 +5,8 @@ intended for production use.
 
 It provides two REST structs:
 
-- `UCClient`: concrete HTTP methods for the connector-driven read endpoints (`load_table`,
-  credential vending, `/config`).
+- `UCClient`: concrete HTTP methods for the connector-driven endpoints: `load_table`, credential
+  vending, `/config`, table and staging-table creation, and metrics reporting.
 - `UCUpdateTableRestClient`: an implementation of the `UpdateTableClient` trait (from
   `unity-catalog-delta-client-api`) against the `update_table` commit endpoint.
 
