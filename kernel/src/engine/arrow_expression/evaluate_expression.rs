@@ -2012,7 +2012,7 @@ mod tests {
 
         let operand = |v: Option<bool>| match v {
             Some(b) => Pred::literal(b),
-            None => Pred::null_literal(),
+            None => Pred::NULL,
         };
         let pred = Pred::junction(op, [operand(left), operand(right)]);
 

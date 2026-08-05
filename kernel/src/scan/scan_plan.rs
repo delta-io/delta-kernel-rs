@@ -1007,7 +1007,7 @@ mod tests {
         let state = state(
             data_schema(),
             vec![],
-            Some(Predicate::literal(false)),
+            Some(Predicate::FALSE),
             stats.clone(),
             partition_values.clone(),
         );
