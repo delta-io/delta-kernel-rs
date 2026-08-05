@@ -17,8 +17,8 @@ use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatc
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
-    ParquetFooter, ParquetHandler, PredicateRef,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, EngineResult, FileDataReadResultIterator,
+    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
 };
 
 pub(crate) struct SyncParquetHandler {
@@ -71,7 +71,7 @@ impl ParquetHandler for SyncParquetHandler {
         files: &[FileMeta],
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         let iter = read_files_arrow(
             self.store.as_ref(),
             files,
@@ -79,7 +79,10 @@ impl ParquetHandler for SyncParquetHandler {
             predicate,
             try_create_from_parquet,
         );
-        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
+        Ok(Box::new(iter.map(|data| {
+            data.map(|data| Box::new(data) as _)
+                .map_err(|error| super::adapter_error("Parquet read failed", error))
+        })))
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -95,11 +98,13 @@ impl ParquetHandler for SyncParquetHandler {
         &self,
         location: Url,
         mut data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
-        let first_batch = data.next().ok_or_else(|| {
-            crate::Error::generic("Cannot write parquet file with empty data iterator")
-        })??;
-        let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
+    ) -> EngineResult<()> {
+        let first_batch = data
+            .next()
+            .ok_or_else(|| crate::EngineError::other("Cannot write an empty Parquet file"))?
+            .map_err(|error| super::adapter_error("Parquet input stream failed", error))?;
+        let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)
+            .map_err(|error| super::adapter_error("Parquet input conversion failed", error))?;
         let first_record_batch: crate::arrow::array::RecordBatch = (*first_arrow).into();
 
         let mut buf = Vec::new();
@@ -110,18 +115,22 @@ impl ParquetHandler for SyncParquetHandler {
         )?;
         writer.write(&first_record_batch)?;
         for result in data {
-            let engine_data = result?;
-            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
+            let engine_data = result
+                .map_err(|error| super::adapter_error("Parquet input stream failed", error))?;
+            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)
+                .map_err(|error| super::adapter_error("Parquet input conversion failed", error))?;
             let batch: crate::arrow::array::RecordBatch = (*arrow_data).into();
             writer.write(&batch)?;
         }
         writer.close()?;
 
         put_bytes(self.store.as_ref(), &location, buf.into(), true)
+            .map_err(|error| super::adapter_error("Parquet write failed", error))
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> EngineResult<ParquetFooter> {
         parquet_footer(self.store.as_ref(), file)
+            .map_err(|error| super::adapter_error("Parquet footer read failed", error))
     }
 }
 

@@ -12,6 +12,7 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
+use crate::error::{delta_errors, DeltaErrorCode};
 #[cfg(feature = "declarative-plans")]
 use crate::expressions::ColumnName;
 use crate::log_replay::ActionsBatch;
@@ -23,7 +24,7 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
 use crate::schema::schema_ref;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine, EngineErrorKind, Error};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -39,9 +40,21 @@ impl LogSegment {
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
-            (None, Some(_), _) => Err(Error::MissingMetadata),
-            (Some(_), None, _) => Err(Error::MissingProtocol),
-            (None, None, _) => Err(Error::MissingMetadataAndProtocol),
+            (None, Some(_), _) => Err(delta_errors::state_recover_error(
+                "metadata",
+                self.end_version,
+                Error::missing_metadata(),
+            )),
+            (Some(_), None, _) => Err(delta_errors::state_recover_error(
+                "protocol",
+                self.end_version,
+                Error::missing_protocol(),
+            )),
+            (None, None, _) => Err(delta_errors::state_recover_error(
+                "protocol",
+                self.end_version,
+                Error::missing_metadata_and_protocol(),
+            )),
         }
     }
 
@@ -125,7 +138,9 @@ impl LogSegment {
         // Providing a plan executor opts the engine into declarative P&M replay.
         #[cfg(feature = "declarative-plans")]
         let actions_batches = match engine.plan_executor() {
-            Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
+            Some(executor) => self
+                .read_pm_batches_via_plan(executor.as_ref())
+                .map_err(|error| self.prefer_protocol_error(engine, error))?,
             None => Box::new(self.read_pm_batches(engine)?) as _,
         };
 
@@ -135,18 +150,66 @@ impl LogSegment {
         let mut metadata_opt = None;
         let mut protocol_opt = None;
         for actions_batch in actions_batches {
-            let actions = actions_batch?.actions;
+            let actions = match actions_batch {
+                Ok(actions_batch) => actions_batch.actions,
+                Err(error) => return Err(self.prefer_protocol_error(engine, error)),
+            };
+            if protocol_opt.is_none() {
+                protocol_opt = Protocol::try_new_from_data_for_table(
+                    actions.as_ref(),
+                    self.log_root.join("../")?.to_string(),
+                )?;
+            }
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
-            }
-            if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 break;
             }
         }
         Ok((metadata_opt, protocol_opt))
+    }
+
+    fn prefer_protocol_error(&self, engine: &dyn Engine, error: Error) -> Error {
+        if error
+            .as_engine_error()
+            .is_some_and(|error| error.kind() == EngineErrorKind::CorruptData)
+        {
+            match self.protocol_error_precedence(engine) {
+                Some(protocol_error) => protocol_error.with_delta_source(error),
+                None => error,
+            }
+        } else {
+            error
+        }
+    }
+
+    /// Replays only protocol actions after combined P&M decoding failed. This preserves protocol
+    /// validation precedence without replacing an unrelated engine failure.
+    fn protocol_error_precedence(&self, engine: &dyn Engine) -> Option<Error> {
+        let schema = schema_ref! { (&PROTOCOL_FIELD) };
+        let actions_batches = self.read_actions(engine, schema).ok()?;
+        let table_name_or_path = self.log_root.join("../").ok()?.to_string();
+        for actions_batch in actions_batches {
+            let actions = actions_batch.ok()?.actions;
+            match Protocol::try_new_from_data_for_table(actions.as_ref(), &table_name_or_path) {
+                Ok(Some(_)) => return None,
+                Ok(None) => {}
+                Err(error)
+                    if error.as_delta_error().is_some_and(|error| {
+                        matches!(
+                            error.code(),
+                            DeltaErrorCode::DeltaInvalidProtocolVersion
+                                | DeltaErrorCode::DeltaUnsupportedFeaturesForRead
+                        )
+                    }) =>
+                {
+                    return Some(error);
+                }
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -206,20 +269,21 @@ impl LogSegment {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    #[cfg(feature = "declarative-plans")]
     use std::sync::Arc;
 
     use itertools::Itertools;
-    use test_log::test;
+    use rstest::rstest;
+    use test_utils::add_commit;
 
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
     use crate::engine::test_delegating::DelegatingEngine;
+    use crate::object_store::memory::InMemory;
     #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
-    use crate::Snapshot;
+    use crate::{DeltaErrorCode, EngineErrorKind, Error, Snapshot};
     #[cfg(feature = "declarative-plans")]
-    use crate::{DeltaResult, Error};
+    use crate::{EngineError, EngineResult};
 
     // A [`PlanExecutor`] whose every operation fails, used to prove that a plan-path failure
     // surfaces from P&M replay rather than falling back to legacy replay.
@@ -228,9 +292,77 @@ mod tests {
 
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
-        fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-            Err(Error::generic("plan executor deliberately failed"))
+        fn execute_op(&self, _op: Operation) -> EngineResult<PlanResult> {
+            Err(EngineError::other("plan executor deliberately failed"))
         }
+    }
+
+    #[rstest]
+    #[case(
+        r#"{"minReaderVersion":2147483647,"minWriterVersion":2147483647,"readerFeatures":[],"writerFeatures":[]}"#,
+        DeltaErrorCode::DeltaInvalidProtocolVersion
+    )]
+    #[case(
+        r#"{"minReaderVersion":3,"minWriterVersion":6}"#,
+        DeltaErrorCode::DeltaInvalidProtocolVersion
+    )]
+    #[case(
+        r#"{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["unknownReaderFeature"],"writerFeatures":[]}"#,
+        DeltaErrorCode::DeltaUnsupportedFeaturesForRead
+    )]
+    fn protocol_validation_precedes_malformed_metadata(
+        #[case] protocol: &str,
+        #[case] expected: DeltaErrorCode,
+    ) {
+        let table_root = "memory:///";
+        let store = Arc::new(InMemory::new());
+        let commit = format!(
+            r#"{{"metaData":{{"id":"id","format":{{"provider":"parquet","options":{{}}}},"partitionColumns":[],"configuration":{{}}}}}}
+{{"protocol":{protocol}}}"#
+        );
+        futures::executor::block_on(add_commit(table_root, store.as_ref(), 0, commit)).unwrap();
+        let engine = SyncEngine::new_with_store(store);
+
+        let error = Snapshot::builder_for(table_root)
+            .build(&engine)
+            .unwrap_err();
+
+        let delta_error = error
+            .as_delta_error()
+            .unwrap_or_else(|| panic!("expected Delta error, got {error:?}"));
+        assert_eq!(delta_error.code(), expected);
+        let source = std::error::Error::source(delta_error)
+            .and_then(|source| source.downcast_ref::<Error>())
+            .and_then(Error::as_engine_error)
+            .expect("structured protocol error should retain the engine failure");
+        assert_eq!(source.kind(), EngineErrorKind::CorruptData);
+    }
+
+    #[rstest]
+    #[case(r#"{"minReaderVersion":3,"minWriterVersion":7,"writerFeatures":[]}"#)]
+    #[case(r#"{"minReaderVersion":1,"minWriterVersion":2,"readerFeatures":[]}"#)]
+    #[case(
+        r#"{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":[]}"#
+    )]
+    fn malformed_protocol_shapes_remain_unclassified(#[case] protocol: &str) {
+        let table_root = "memory:///";
+        let store = Arc::new(InMemory::new());
+        let commit = format!(
+            r#"{{"metaData":{{"id":"id","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[]}}","partitionColumns":[],"configuration":{{}}}}}}
+{{"protocol":{protocol}}}"#
+        );
+        futures::executor::block_on(add_commit(table_root, store.as_ref(), 0, commit)).unwrap();
+        let engine = SyncEngine::new_with_store(store);
+
+        let error = Snapshot::builder_for(table_root)
+            .build(&engine)
+            .unwrap_err();
+
+        let delta_error = error
+            .as_delta_error()
+            .unwrap_or_else(|| panic!("expected Delta error, got {error:?}"));
+        assert_eq!(delta_error.code(), DeltaErrorCode::DeltaKernelUnclassified);
+        assert_eq!(error.legacy_error_kind(), Some("InvalidProtocol"));
     }
 
     // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
@@ -243,7 +375,7 @@ mod tests {
     //              type    nulls  min / max
     // txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
     // txn.version  INT64   0      "4390" / "4390"
-    #[test]
+    #[test_log::test]
     fn test_replay_for_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
@@ -285,7 +417,7 @@ mod tests {
     // produces a file kernel must translate on read. Spark and kernel both write `key_value`,
     // covered by
     // `scan_plan::execution_tests::declarative_metadata_reconciles_checkpoint_with_later_commits`.
-    #[test]
+    #[test_log::test]
     fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_entries_named_maps() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
@@ -302,7 +434,7 @@ mod tests {
     // fields `item` where kernel expects `element`, so it covers the other half of the naming
     // disagreement. `metaData.partitionColumns` is the array in question, and it is present in
     // every `metaData` action, so its element name is checked on every P&M replay.
-    #[test]
+    #[test_log::test]
     fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_item_named_arrays() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -315,7 +447,7 @@ mod tests {
     }
 
     #[cfg(feature = "declarative-plans")]
-    #[test]
+    #[test_log::test]
     fn test_snapshot_build_via_failing_plan_executor_surfaces_error_without_fallback() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();

@@ -1,0 +1,47 @@
+{
+  "source": {
+    "repository": "delta-io/delta",
+    "commit": "8ba5e37b9a21aba2859cdd09063d561928f7c641"
+  },
+  "conditions": {
+    "DELTA_INVALID_PROTOCOL_VERSION": {
+      "sqlState": "KD004",
+      "parameterNames": [
+        "tableNameOrPath",
+        "readerRequired",
+        "writerRequired",
+        "deltaVersion",
+        "supportedReaders",
+        "supportedWriters"
+      ]
+    },
+    "DELTA_LOG_ALREADY_EXISTS": {
+      "sqlState": "42K04",
+      "parameterNames": ["path"]
+    },
+    "DELTA_MISSING_PART_FILES": {
+      "sqlState": "42KD6",
+      "parameterNames": ["version"]
+    },
+    "DELTA_STATE_RECOVER_ERROR": {
+      "sqlState": "XXKDS",
+      "parameterNames": ["operation", "version"]
+    },
+    "DELTA_UNSUPPORTED_FEATURES_FOR_READ": {
+      "sqlState": "56038",
+      "parameterNames": ["tableNameOrPath", "deltaVersion", "unsupported"]
+    },
+    "DELTA_UNSUPPORTED_FEATURES_FOR_WRITE": {
+      "sqlState": "56038",
+      "parameterNames": ["tableNameOrPath", "deltaVersion", "unsupported"]
+    },
+    "DELTA_VERSIONS_NOT_CONTIGUOUS": {
+      "sqlState": "KD00C",
+      "parameterNames": ["versionList", "startVersion", "endVersion", "versionToLoad"]
+    },
+    "DELTA_VERSION_NOT_FOUND": {
+      "sqlState": "22003",
+      "parameterNames": ["userVersion", "earliest", "latest"]
+    }
+  }
+}

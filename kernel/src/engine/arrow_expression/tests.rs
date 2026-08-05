@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::ops::{Add, Div, Mul, Sub};
 
 use rstest::rstest;
@@ -31,7 +32,63 @@ use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField,
 use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::unit_test_utils::{geography_type, geometry_type};
-use crate::EvaluationHandlerExtension as _;
+use crate::{EngineErrorKind, EvaluationHandlerExtension as _};
+
+fn expect_error<T, E>(result: Result<T, E>, message: &str) -> E {
+    match result {
+        Ok(_) => panic!("{message}"),
+        Err(error) => error,
+    }
+}
+
+fn source_chain_contains_message(mut source: &(dyn StdError + 'static), expected: &str) -> bool {
+    loop {
+        if source.to_string().contains(expected) {
+            return true;
+        }
+        let Some(next) = source.source() else {
+            return false;
+        };
+        source = next;
+    }
+}
+
+fn assert_unclassified_delta_error(
+    error: &Error,
+    expected_legacy_kind: &str,
+    expected_source_message: &str,
+) {
+    let delta = error
+        .as_delta_error()
+        .expect("expected an unclassified Delta error");
+    assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+    assert_eq!(delta.sql_state(), None);
+    assert!(delta.parameters().is_empty());
+    assert_eq!(error.legacy_error_kind(), Some(expected_legacy_kind));
+    let source = delta.source().expect("expected a retained Delta source");
+    assert!(
+        source_chain_contains_message(source, expected_source_message),
+        "source chain does not contain {expected_source_message:?}: {error:?}"
+    );
+}
+
+fn assert_engine_error(
+    error: &EngineError,
+    expected_kind: EngineErrorKind,
+    expected_message: &str,
+    expected_source_message: &str,
+) {
+    assert_eq!(error.kind(), expected_kind);
+    assert!(
+        error.message().contains(expected_message),
+        "unexpected engine diagnostic: {error}"
+    );
+    let source = error.source().expect("expected a retained engine source");
+    assert!(
+        source_chain_contains_message(source, expected_source_message),
+        "source chain does not contain {expected_source_message:?}: {error:?}"
+    );
+}
 
 #[test]
 fn test_array_column() {
@@ -86,11 +143,14 @@ fn test_bad_right_type_array() {
         column_expr!("item"),
     ));
 
-    let in_result = evaluate_predicate(&in_op, &batch, false);
-
-    assert_result_error_with_message(
-        in_result,
-        "Invalid expression evaluation: Cannot cast to list array: Int32",
+    let error = expect_error(
+        evaluate_predicate(&in_op, &batch, false),
+        "a scalar right operand must not be accepted as a list array",
+    );
+    assert_unclassified_delta_error(
+        &error,
+        "InvalidExpression",
+        "Cannot cast to list array: Int32",
     );
 }
 
@@ -409,9 +469,15 @@ fn test_invalid_array_sides() {
         column_expr!("item"),
     ));
 
-    let in_result = evaluate_predicate(&in_op, &batch, false);
-
-    assert_result_error_with_message(in_result, "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)");
+    let error = expect_error(
+        evaluate_predicate(&in_op, &batch, false),
+        "two column operands must not be accepted for an IN comparison",
+    );
+    assert_unclassified_delta_error(
+        &error,
+        "InvalidExpression",
+        "Invalid right value for (NOT) IN comparison",
+    );
 }
 
 #[test]
@@ -835,9 +901,15 @@ fn test_null_row_err() {
         KernelDataType::STRING,
     )]));
     let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
+    let error = expect_error(
         handler.null_row(not_null_schema),
-        "Invalid argument error: Column 'a' is declared as non-nullable but contains null values",
+        "a null row must not satisfy a non-null field",
+    );
+    assert_engine_error(
+        &error,
+        EngineErrorKind::CorruptData,
+        "Arrow operation failed",
+        "Column 'a' is declared as non-nullable but contains null values",
     );
 }
 
@@ -990,8 +1062,17 @@ fn test_create_one_not_null_struct() {
         ]),
     )]));
     let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
+    let error = expect_error(
         handler.create_one(schema, values),
+        "a null struct must not satisfy a non-null field",
+    );
+    let engine = error
+        .as_engine_error()
+        .expect("Arrow evaluation failures must retain engine origin");
+    assert_engine_error(
+        engine,
+        EngineErrorKind::Other,
+        "Failed to apply output schema",
         "Column 'a' is declared as non-nullable but contains null values",
     );
 }
@@ -1007,8 +1088,17 @@ fn test_create_one_top_level_null() {
         "col_1",
         KernelDataType::INTEGER,
     )]));
-    assert_result_error_with_message(
+    let error = expect_error(
         handler.create_one(schema, values),
+        "a null scalar must not satisfy a non-null field",
+    );
+    let engine = error
+        .as_engine_error()
+        .expect("Arrow evaluation failures must retain engine origin");
+    assert_engine_error(
+        engine,
+        EngineErrorKind::Other,
+        "Failed to apply output schema",
         "Column 'col_1' is declared as non-nullable but contains null values",
     );
 }
@@ -1398,9 +1488,15 @@ fn test_create_many_wrong_field_type_returns_error() {
     let good_row: &[Scalar] = &[1.into(), "x".into()];
     let bad_row: &[Scalar] = &[1i64.into(), "y".into()];
     let handler = ArrowEvaluationHandler;
-    assert_result_error_with_message(
+    let error = expect_error(
         handler.create_many(schema, &[good_row, bad_row]),
-        "Row 1, field 'a' (expected type integer, got long): Invalid expression evaluation: Invalid builder for long",
+        "a long scalar must not be appended to an integer field",
+    );
+    assert_engine_error(
+        &error,
+        EngineErrorKind::Other,
+        "Row 1, field 'a' (expected type integer, got long)",
+        "Invalid builder for long",
     );
 }
 
@@ -1517,8 +1613,5 @@ fn test_geo_append_null_unsupported(#[case] dt: KernelDataType) {
     let mut builder: Box<dyn crate::arrow::array::ArrayBuilder> =
         Box::new(crate::arrow::array::BinaryBuilder::new());
     let err = Scalar::append_null(builder.as_mut(), &dt, 1).unwrap_err();
-    assert!(
-        matches!(err, Error::Unsupported(_)),
-        "expected Unsupported, got: {err:?}"
-    );
+    assert!(err.is_unsupported(), "expected Unsupported, got: {err:?}");
 }

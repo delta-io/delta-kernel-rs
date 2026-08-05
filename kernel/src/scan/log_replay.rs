@@ -139,9 +139,9 @@ pub struct SerializableScanState {
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique
 ///   file (identified by its path and deletion vector unique ID), only the latest valid Add action
 ///   is processed.
-/// - Parse-error fallback: If transformation and data skipping return [`Error::ParseError`],
-///   deduplicates the raw batch first, then retries transformation and data skipping on the
-///   surviving actions.
+/// - Parse-error fallback: If transformation and data skipping return an error for which
+///   [`Error::is_parse_error`] is true, deduplicates the raw batch first, then retries
+///   transformation and data skipping on the surviving actions.
 /// - Row StructPatch passthrough: Any user-provided row-level transformation expressions (e.g.
 ///   those derived from projection or filters) are preserved and passed through to the engine,
 ///   which applies them as part of its scan execution logic.
@@ -942,7 +942,7 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err) if err.is_parse_error() => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }
@@ -1038,7 +1038,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
                 Ok((transformed_actions, pre_dedup_selection)) => {
                     (Ok(transformed_actions), pre_dedup_selection)
                 }
-                Err(err @ Error::ParseError(_, _)) => {
+                Err(err) if err.is_parse_error() => {
                     should_retry_transform_and_data_skip = true;
                     (Err(err), vec![true; actions.len()])
                 }

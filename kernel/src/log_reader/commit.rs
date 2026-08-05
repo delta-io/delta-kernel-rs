@@ -36,6 +36,7 @@ impl CommitReader {
                 None,
                 cancellation_token.cloned(),
             )?
+            .map(|result| result.map_err(crate::Error::from))
             .map_ok(|batch| ActionsBatch::new(batch, true));
 
         Ok(Self {

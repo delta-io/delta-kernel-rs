@@ -352,7 +352,7 @@ impl ParsedLogPath<FileMeta> {
                     .in_commit_timestamp
                     .ok_or_else(|| Error::generic("In-Commit Timestamp not found in commit file"))
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(err.into()),
             None => Err(Error::generic("Commit file contains no actions")),
         }
     }

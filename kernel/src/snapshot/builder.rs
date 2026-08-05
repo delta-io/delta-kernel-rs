@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+use itertools::Itertools;
 use tracing::{info, instrument};
 
+use crate::error::delta_errors;
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::SNAPSHOT_COMPLETED_SPAN;
@@ -329,14 +331,28 @@ impl SnapshotBuilder {
         log_tail: &[crate::path::ParsedLogPath],
     ) -> DeltaResult<()> {
         // Log tail must be sorted ascending and contiguous (no gaps or duplicates)
+        let version_list = log_tail
+            .iter()
+            .map(|entry| entry.version)
+            .collect::<Vec<_>>();
         for pair in log_tail.windows(2) {
-            require!(
-                pair[0].version + 1 == pair[1].version,
-                Error::LogTailVersionsNotContiguous {
-                    first_version: pair[0].version,
-                    second_version: pair[1].version,
-                }
-            );
+            if pair[0].version + 1 != pair[1].version {
+                let version_to_load = version.or(max_catalog_version).unwrap_or_else(|| {
+                    version_list
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(pair[1].version)
+                });
+                let start_version = version_list.first().copied().unwrap_or(pair[0].version);
+                let end_version = version_list.last().copied().unwrap_or(pair[1].version);
+                return Err(delta_errors::versions_not_contiguous(
+                    version_list.iter().join(", "),
+                    start_version,
+                    end_version,
+                    version_to_load,
+                ));
+            }
         }
 
         // TODO: If inline commits (or any other catalog commits) are ever supported, change this
@@ -473,7 +489,9 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, install_thread_local_metrics_reporter, CapturingReporter,
+    };
     use crate::utils::FoldWithOption as _;
 
     fn setup_test() -> (Arc<SyncEngine>, Arc<DynObjectStore>, String) {
@@ -885,7 +903,10 @@ mod tests {
                 .with_log_tail(log_tail)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert_result_error_with_message(
+                result,
+                "Max catalog version is required when providing staged commits",
+            );
 
             Ok(())
         }
@@ -900,7 +921,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert_result_error_with_message(
+                result,
+                "Requested version 5 exceeds max catalog version 3",
+            );
 
             Ok(())
         }
@@ -925,7 +949,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert_result_error_with_message(
+                result,
+                "Log tail version 2 does not match max catalog version 3",
+            );
 
             Ok(())
         }
@@ -937,7 +964,10 @@ mod tests {
 
             let result = SnapshotBuilder::new_for(table_root).build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert_result_error_with_message(
+                result,
+                "Max catalog version is required when loading a catalog-managed table",
+            );
 
             Ok(())
         }
@@ -954,7 +984,10 @@ mod tests {
                 .with_max_catalog_version(0)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert_result_error_with_message(
+                result,
+                "Max catalog version 0 must not be set for a non-catalog-managed table",
+            );
 
             Ok(())
         }
@@ -978,7 +1011,10 @@ mod tests {
                 .with_max_catalog_version(3)
                 .build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert_result_error_with_message(
+                result,
+                "Log tail version 1 is less than requested version 2",
+            );
 
             Ok(())
         }
@@ -1032,7 +1068,10 @@ mod tests {
             // Incremental update without mcv should fail
             let result = SnapshotBuilder::new_from(initial).build(engine.as_ref());
 
-            assert!(matches!(result, Err(Error::MaxCatalogVersion(_))));
+            assert_result_error_with_message(
+                result,
+                "Max catalog version is required when loading a catalog-managed table",
+            );
 
             Ok(())
         }
@@ -1065,10 +1104,30 @@ mod tests {
                 .with_max_catalog_version(mcv)
                 .build(engine.as_ref());
 
-            assert!(matches!(
-                result,
-                Err(Error::LogTailVersionsNotContiguous { .. })
-            ));
+            let error = result.expect_err("non-contiguous log tail should fail");
+            let delta = error
+                .as_delta_error()
+                .expect("non-contiguous log tail should be a Delta error");
+            assert_eq!(delta.condition(), "DELTA_VERSIONS_NOT_CONTIGUOUS");
+            assert_eq!(delta.sql_state(), Some("KD00C"));
+            let parameters: Vec<_> = delta
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.name(), parameter.value()))
+                .collect();
+            let expected_version_list = log_tail_versions.iter().join(", ");
+            let expected_start = log_tail_versions[0].to_string();
+            let expected_end = log_tail_versions[log_tail_versions.len() - 1].to_string();
+            let expected_version_to_load = mcv.to_string();
+            assert_eq!(
+                parameters,
+                [
+                    ("versionList", expected_version_list.as_str()),
+                    ("startVersion", expected_start.as_str()),
+                    ("endVersion", expected_end.as_str()),
+                    ("versionToLoad", expected_version_to_load.as_str()),
+                ]
+            );
 
             Ok(())
         }

@@ -567,8 +567,7 @@ pub trait EngineData: AsAny {
     ///
     /// The selection vector may be shorter than the data; rows beyond its end are selected and
     /// must be retained (see [`FilteredEngineData`]). An empty selection vector selects all rows.
-    /// A selection vector longer than the data is invalid and must be rejected, e.g. with
-    /// [`Error::InvalidSelectionVector`].
+    /// A selection vector longer than the data is invalid and must be rejected with an error.
     fn apply_selection_vector(
         self: Box<Self>,
         selection_vector: Vec<bool>,

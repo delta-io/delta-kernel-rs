@@ -6,6 +6,7 @@
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
 //! the [executor] module.
 
+use std::error::Error as StdError;
 use std::future::Future;
 use std::num::NonZero;
 use std::sync::Arc;
@@ -18,8 +19,8 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
-    ParquetHandler, StorageHandler,
+    CancellationTokenRef, DeltaResult, Engine, EngineData, EngineError, EngineResult, Error,
+    EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -51,37 +52,49 @@ pub mod storage;
 ///
 /// This is an internal utility for bridging object_store's async API to
 /// Delta Kernel's synchronous handler traits.
-pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
+pub(crate) fn stream_future_to_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
-) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
+    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, DeltaResult<U>>>>
+        + Send
+        + 'static,
+) -> EngineResult<Box<dyn Iterator<Item = EngineResult<U>> + Send>> {
+    let stream = task_executor
+        .block_on(stream_future)
+        .map_err(|error| adapter_error("Engine stream initialization failed", error))?
+        .map(|result| result.map_err(|error| adapter_error("Engine stream failed", error)))
+        .boxed();
     Ok(Box::new(BlockingStreamIterator {
-        stream: Some(task_executor.block_on(stream_future)?),
+        stream: Some(stream),
         task_executor,
     }))
 }
 
 /// Like [`stream_future_to_iter`], but each blocking poll is raced against the cancellation
-/// token. When the token fires, the iterator yields a single `Err(Error::Cancelled)` and then
+/// token. When the token fires, the iterator yields one cancellation error and then
 /// ends, abandoning the in-flight read (dropping the stream releases its buffered work).
 ///
-/// Restricted to `DeltaResult` streams so cancellation can be surfaced as an item. With a `None`
-/// token, behavior is identical to [`stream_future_to_iter`].
+/// The source stream may contain mixed kernel errors; this engine adapter converts them at the
+/// boundary. With a `None` token, behavior is identical to [`stream_future_to_iter`].
 pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
     stream_future: impl Future<Output = DeltaResult<BoxStream<'static, DeltaResult<U>>>>
         + Send
         + 'static,
     cancellation_token: Option<CancellationTokenRef>,
-) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<U>> + Send>> {
+) -> EngineResult<Box<dyn Iterator<Item = EngineResult<U>> + Send>> {
     let Some(token) = cancellation_token else {
         return stream_future_to_iter(task_executor, stream_future);
     };
     // Race even the initial stream-producing future against cancellation.
     let stream = match block_on_or_cancelled(&task_executor, token.clone(), stream_future) {
-        Some(result) => result?,
-        None => return Err(Error::Cancelled),
+        Some(result) => {
+            result.map_err(|error| adapter_error("Engine stream initialization failed", error))?
+        }
+        None => return Err(EngineError::cancelled()),
     };
+    let stream = stream
+        .map(|result| result.map_err(|error| adapter_error("Engine stream failed", error)))
+        .boxed();
     Ok(Box::new(CancellableStreamIterator {
         stream: Some(stream),
         task_executor,
@@ -138,15 +151,15 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
 
 /// Cancellation-aware counterpart to [`BlockingStreamIterator`]: each `next()` races the blocking
 /// `stream.next()` against the token and, once cancelled, drops the stream and yields exactly one
-/// terminal `Err(Error::Cancelled)`.
+/// terminal cancellation error.
 struct CancellableStreamIterator<U: Send + 'static, E: executor::TaskExecutor> {
-    stream: Option<BoxStream<'static, DeltaResult<U>>>,
+    stream: Option<BoxStream<'static, EngineResult<U>>>,
     task_executor: Arc<E>,
     token: CancellationTokenRef,
 }
 
 impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStreamIterator<U, E> {
-    type Item = DeltaResult<U>;
+    type Item = EngineResult<U>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut stream = self.stream.take()?;
@@ -163,9 +176,85 @@ impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStrea
             }
             // Cancelled: `stream` was moved into the (now-dropped) future, releasing buffered
             // work. Emit one terminal error; the taken `self.stream` stays `None`, fusing us.
-            None => Some(Err(Error::Cancelled)),
+            None => Some(Err(EngineError::cancelled())),
         }
     }
+}
+
+fn adapter_error(context: &'static str, error: Error) -> EngineError {
+    match error {
+        Error::Engine(error) => error,
+        error => classify_adapter_error(context, error),
+    }
+}
+
+fn classify_adapter_error(context: &'static str, error: Error) -> EngineError {
+    let file_error =
+        find_source::<delta_kernel::object_store::Error>(&error).and_then(|source| match source {
+            delta_kernel::object_store::Error::NotFound { path, .. } => {
+                Some((delta_kernel::EngineErrorKind::FileNotFound, path.clone()))
+            }
+            delta_kernel::object_store::Error::AlreadyExists { path, .. } => Some((
+                delta_kernel::EngineErrorKind::FileAlreadyExists,
+                path.clone(),
+            )),
+            _ => None,
+        });
+    if let Some((kind, path)) = file_error {
+        return match kind {
+            delta_kernel::EngineErrorKind::FileNotFound => {
+                EngineError::file_not_found(path).with_source(error)
+            }
+            delta_kernel::EngineErrorKind::FileAlreadyExists => {
+                EngineError::file_already_exists(path).with_source(error)
+            }
+            _ => EngineError::other(context).with_source(error),
+        };
+    }
+
+    let io_file_error = find_source::<std::io::Error>(&error).and_then(|source| {
+        let kind = match source.kind() {
+            std::io::ErrorKind::NotFound => delta_kernel::EngineErrorKind::FileNotFound,
+            std::io::ErrorKind::AlreadyExists => delta_kernel::EngineErrorKind::FileAlreadyExists,
+            _ => return None,
+        };
+        Some((kind, source.to_string()))
+    });
+    if let Some((kind, path)) = io_file_error {
+        return match kind {
+            delta_kernel::EngineErrorKind::FileNotFound => {
+                EngineError::file_not_found(path).with_source(error)
+            }
+            delta_kernel::EngineErrorKind::FileAlreadyExists => {
+                EngineError::file_already_exists(path).with_source(error)
+            }
+            _ => EngineError::other(context).with_source(error),
+        };
+    }
+
+    let is_corrupt_data = matches!(
+        error.legacy_error_kind(),
+        Some("MalformedJson" | "Utf8" | "Arrow" | "Parquet")
+    );
+    if is_corrupt_data {
+        EngineError::corrupt_data(context).with_source(error)
+    } else {
+        EngineError::other(context).with_source(error)
+    }
+}
+
+fn find_source<T>(error: &Error) -> Option<&T>
+where
+    T: StdError + 'static,
+{
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(source) = current {
+        if let Some(source) = source.downcast_ref::<T>() {
+            return Some(source);
+        }
+        current = source.source();
+    }
+    None
 }
 
 const DEFAULT_BUFFER_SIZE: usize = 1000;
@@ -608,7 +697,10 @@ mod tests {
             firing.cancel();
         });
 
-        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(error)) if error.kind() == delta_kernel::EngineErrorKind::Cancelled
+        ));
         assert!(
             iter.next().is_none(),
             "iterator must fuse after cancellation"

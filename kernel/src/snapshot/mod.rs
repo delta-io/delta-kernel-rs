@@ -110,8 +110,8 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
-/// Build a [`Error::ChecksumWriteUnsupported`] for a resolution root that could not yield a
-/// writable CRC. `reason` completes the sentence "Cannot resolve a CRC to write: ...".
+/// Build an unclassified Delta error for a resolution root that could not yield a writable CRC.
+/// `reason` completes the sentence "Cannot resolve a CRC to write: ...".
 fn unresolved_crc(reason: &str) -> Error {
     Error::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
 }
@@ -954,11 +954,11 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// - [`Error::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if the
-    ///   resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
-    ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
-    ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
-    ///   `inCommitTimestampOpt` is absent.
+    /// - An error if no CRC can be resolved for this version, if the resolved CRC's
+    ///   `file_stats_state` is `Indeterminate` (a non-incremental operation like ANALYZE STATS, or
+    ///   a file action with a missing size; recoverable with a full state reconstruction in the
+    ///   future), or if `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is
+    ///   absent.
     /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
     ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
@@ -998,7 +998,7 @@ impl Snapshot {
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
-            Err(Error::FileAlreadyExists(_)) => {
+            Err(error) if error.is_file_already_exists() => {
                 info!(
                     "Another writer beat us to writing CRC file at {}",
                     crc_path.location
@@ -1019,9 +1019,8 @@ impl Snapshot {
     /// 3. A checkpoint, advanced over the tail commits via reverse replay.
     /// 4. A full reverse replay of the commit history.
     ///
-    /// Returns [`Error::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
-    /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
-    /// stats).
+    /// Returns an unclassified Delta error when a root is reached but cannot yield a writable CRC
+    /// (missing protocol or metadata, or a non-incremental tail that dooms file stats).
     ///
     /// The `root` span field records which root resolved the CRC.
     #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
@@ -1185,7 +1184,7 @@ impl Snapshot {
 
         let info = match write_result {
             Ok(info) => info,
-            Err(Error::FileAlreadyExists(_)) => {
+            Err(error) if error.is_file_already_exists() => {
                 // NOTE: Per write_parquet_file's documentation, it should silently overwrite
                 // existing files, so we log a warning but still return the correct result.
                 warn!(
@@ -1743,8 +1742,10 @@ mod tests {
         let err = snapshot
             .get_domain_metadata("delta.domain3", &engine)
             .unwrap_err();
-        assert!(matches!(err, Error::Generic(msg) if
-                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        assert_eq!(
+            err.legacy_message(),
+            Some("User DomainMetadata are not allowed to use system-controlled 'delta.*' domain")
+        );
 
         // Test get_domain_metadata_internal
         assert_eq!(

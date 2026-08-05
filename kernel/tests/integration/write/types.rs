@@ -28,6 +28,8 @@ use test_utils::{
 };
 use url::Url;
 
+use crate::common::error_source_chain_contains;
+
 #[tokio::test]
 async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -215,13 +217,13 @@ async fn test_append_variant(
 
     let fields = match variant_arrow {
         ArrowDataType::Struct(fields) => Ok(fields),
-        _ => Err(KernelError::Generic(
+        _ => Err(KernelError::generic(
             "Variant arrow data type is not struct.".to_string(),
         )),
     }?;
     let fields_flipped = match variant_arrow_flipped {
         ArrowDataType::Struct(fields) => Ok(fields),
-        _ => Err(KernelError::Generic(
+        _ => Err(KernelError::generic(
             "Variant arrow data type is not struct.".to_string(),
         )),
     }?;
@@ -405,7 +407,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     let fields = match variant_arrow {
         ArrowDataType::Struct(fields) => Ok(fields),
-        _ => Err(KernelError::Generic(
+        _ => Err(KernelError::generic(
             "Variant arrow data type is not struct.".to_string(),
         )),
     }?;
@@ -457,8 +459,15 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     assert!(parsed_commits[1].get("add").is_some());
 
     let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
-    assert!(matches!(res,
-        Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+    assert!(matches!(
+        res,
+        Err(error)
+            if error.as_engine_error().is_some()
+                && error_source_chain_contains(
+                    &error,
+                    "The default engine does not support shredded reads"
+                )
+    ));
 
     Ok(())
 }

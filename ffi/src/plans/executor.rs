@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::plans::proto::schema as proto_schema;
 use delta_kernel::schema::StructType;
-use delta_kernel::{DeltaResult, Error, Operation, ParquetFooter, PlanExecutor, PlanResult};
+use delta_kernel::{EngineError, EngineResult, Operation, ParquetFooter, PlanExecutor, PlanResult};
 use delta_kernel_ffi_macros::handle_descriptor;
 use prost::Message as _;
 
@@ -57,7 +57,7 @@ unsafe impl Send for FfiPlanExecutor {}
 unsafe impl Sync for FfiPlanExecutor {}
 
 impl PlanExecutor for FfiPlanExecutor {
-    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+    fn execute_op(&self, op: Operation) -> EngineResult<PlanResult> {
         let plan_proto_bytes = op.to_proto_bytes();
         let plan_proto_slice = kernel_bytes_slice!(plan_proto_bytes);
 
@@ -67,7 +67,7 @@ impl PlanExecutor for FfiPlanExecutor {
             match out {
                 EngineExecResult::Success(plan) => plan,
                 EngineExecResult::Failure(err) => return Err(err.into()),
-                EngineExecResult::Uninit => return Err(Error::internal_error(
+                EngineExecResult::Uninit => return Err(EngineError::other(
                     "FFI engine returned from execute_op upcall without writing the plan result",
                 )),
             };
@@ -90,12 +90,18 @@ impl PlanExecutor for FfiPlanExecutor {
 /// Consumes the embedded [`ExclusiveRustBytes`](crate::ExclusiveRustBytes) handle carrying
 /// the proto-serialized schema, returning an error if the bytes are not a valid schema proto
 /// message.
-fn decode_parquet_footer(footer: CParquetFooter) -> DeltaResult<ParquetFooter> {
+fn decode_parquet_footer(footer: CParquetFooter) -> EngineResult<ParquetFooter> {
     let CParquetFooter { schema_proto } = footer;
     // SAFETY: ExclusiveRustBytes should only have a single owner, so consuming here is safe.
     let bytes = *unsafe { schema_proto.into_inner() };
-    let proto = proto_schema::StructType::decode(bytes.as_slice()).map_err(Error::generic_err)?;
-    let schema = Arc::new(StructType::try_from(proto)?);
+    let proto = proto_schema::StructType::decode(bytes.as_slice()).map_err(|error| {
+        EngineError::corrupt_data("FFI engine returned an invalid Parquet footer schema")
+            .with_source(error)
+    })?;
+    let schema = Arc::new(StructType::try_from(proto).map_err(|error| {
+        EngineError::corrupt_data("FFI engine returned an invalid Parquet footer schema")
+            .with_source(error)
+    })?);
     Ok(ParquetFooter { schema })
 }
 
@@ -108,7 +114,7 @@ mod tests {
     use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
     use delta_kernel::plans::proto::{operation as proto, schema as proto_schema};
     use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
-    use delta_kernel::Error;
+    use delta_kernel::{EngineErrorKind, EngineResult};
     use prost::Message;
     use url::Url;
 
@@ -143,7 +149,7 @@ mod tests {
 
     /// Executes a dummy plan operation against a `PlanExecutor` whose callback returns the given
     /// `expected_plan_result`, returning the raw result of `execute_op`.
-    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> DeltaResult<PlanResult> {
+    fn try_execute_dummy_op(expected_plan_result: CPlanResult) -> EngineResult<PlanResult> {
         let cell: Mutex<Option<CPlanResult>> = Mutex::new(Some(expected_plan_result));
         let context = NonNull::new(&cell as *const Mutex<Option<CPlanResult>> as *mut c_void);
         let executor = unsafe { get_plan_executor(context, mock_execute_op) };
@@ -196,9 +202,10 @@ mod tests {
         let Err(err) = plan_executor.execute_op(op) else {
             panic!("execute_op should surface the engine failure");
         };
+        assert_eq!(err.kind(), EngineErrorKind::Other);
         assert!(
-            matches!(err, Error::Unsupported(ref msg) if msg == "kaboom"),
-            "expected Error::Unsupported(\"kaboom\"), got {err:?}"
+            err.to_string().contains("kaboom"),
+            "unexpected error: {err}"
         );
     }
 
@@ -316,8 +323,10 @@ mod tests {
         let Err(err) = try_execute_dummy_op(CPlanResult::ParquetFooter(footer)) else {
             panic!("invalid schema proto bytes should fail to decode");
         };
+        assert_eq!(err.kind(), EngineErrorKind::CorruptData);
         assert!(
-            matches!(err, Error::GenericError { .. }),
+            err.to_string()
+                .contains("FFI engine returned an invalid Parquet footer schema"),
             "expected a proto decode error, got {err:?}"
         );
     }

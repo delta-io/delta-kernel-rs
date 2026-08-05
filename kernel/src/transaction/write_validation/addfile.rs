@@ -392,9 +392,9 @@ mod tests {
         let error = add_file_validator(physical_partition_columns)
             .validate(&adds)
             .expect_err("invalid partition values should be rejected");
-        let Error::InvalidPartitionValues(message) = error else {
-            panic!("expected InvalidPartitionValues, got {error:?}");
-        };
+        let message = error
+            .legacy_message()
+            .expect("invalid partition values should preserve their legacy message");
         assert!(
             message.contains(expected_error),
             "expected error message to contain {expected_error:?}, got {message:?}"

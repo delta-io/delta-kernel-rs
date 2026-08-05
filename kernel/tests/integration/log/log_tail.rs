@@ -461,10 +461,21 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
         .with_log_tail(log_tail)
         .build(engine.as_ref());
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("LogSegment end version 3 not the same as the specified end version 4"));
+    let error = result.expect_err("a log tail ending before the requested version should fail");
+    let delta = error
+        .as_delta_error()
+        .expect("unavailable requested version should be a Delta error");
+    assert_eq!(delta.condition(), "DELTA_VERSION_NOT_FOUND");
+    assert_eq!(delta.sql_state(), Some("22003"));
+    let parameters: Vec<_> = delta
+        .parameters()
+        .iter()
+        .map(|parameter| (parameter.name(), parameter.value()))
+        .collect();
+    assert_eq!(
+        parameters,
+        [("userVersion", "4"), ("earliest", "0"), ("latest", "3"),]
+    );
 
     Ok(())
 }

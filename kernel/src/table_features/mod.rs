@@ -249,7 +249,7 @@ pub(crate) enum KernelSupport {
     /// Custom logic to determine support based on operation type and table properties.
     /// For example: Column Mapping may support Scan but not CDF, or CDF writes may only
     /// be supported when AppendOnly is true.
-    Custom(fn(&Protocol, &TableProperties, Operation) -> DeltaResult<()>),
+    Custom(fn(&Protocol, &TableProperties, Operation) -> bool),
 }
 
 /// Types of requirements for feature dependencies
@@ -361,9 +361,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan | Operation::Write | Operation::Cdf => Ok(()),
-    }),
+    kernel_support: KernelSupport::Custom(|_protocol, _properties, _operation| true),
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
     }),
@@ -509,12 +507,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Write => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
-            "Feature 'catalogManaged' is not supported for CDF",
-        )),
-    }),
+    kernel_support: KernelSupport::Custom(|_, _, op| op != Operation::Cdf),
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -522,12 +515,7 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[FeatureRequirement::Enabled(TableFeature::InCommitTimestamp)],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Write => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
-            "Feature 'catalogOwned-preview' is not supported for CDF",
-        )),
-    }),
+    kernel_support: KernelSupport::Custom(|_, _, op| op != Operation::Cdf),
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -570,12 +558,7 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'typeWidening' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Custom(|_, _, op| op != Operation::Write),
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
@@ -586,12 +569,7 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     min_legacy_version: None,
     feature_requirements: &[],
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'typeWidening-preview' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Custom(|_, _, op| op != Operation::Write),
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
@@ -678,12 +656,7 @@ static GEOSPATIAL_TYPE_INFO: FeatureInfo = FeatureInfo {
     min_legacy_version: None,
     feature_requirements: &[],
     #[cfg(feature = "geo-type-in-dev")]
-    kernel_support: KernelSupport::Custom(|_, _, op| match op {
-        Operation::Scan | Operation::Cdf => Ok(()),
-        Operation::Write => Err(Error::unsupported(
-            "Feature 'geospatial' is not supported for writes",
-        )),
-    }),
+    kernel_support: KernelSupport::Custom(|_, _, op| op != Operation::Write),
     #[cfg(not(feature = "geo-type-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
@@ -904,7 +877,8 @@ pub(crate) fn auto_enable_property_driven_features(
 
 /// Enforce that `protocol.min_reader_version()` lies within
 /// [`MIN_VALID_RW_VERSION`]..=[`MAX_VALID_READER_VERSION`]. Below the minimum yields
-/// [`Error::InvalidProtocol`]; above the maximum yields [`Error::Unsupported`].
+/// an error for which [`Error::is_invalid_protocol`] is true; above the maximum yields an error for
+/// which [`Error::is_unsupported`] is true.
 pub(crate) fn check_reader_version_range(protocol: &Protocol) -> DeltaResult<()> {
     require!(
         protocol.min_reader_version() >= MIN_VALID_RW_VERSION,
@@ -1060,11 +1034,13 @@ mod tests {
         match expected {
             ExpectRead::Ok => result.expect("protocol must be readable"),
             ExpectRead::InvalidProtocol => assert!(
-                matches!(result, Err(Error::InvalidProtocol(_))),
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.is_invalid_protocol()),
                 "expected InvalidProtocol, got: {result:?}"
             ),
             ExpectRead::Unsupported => assert!(
-                matches!(result, Err(Error::Unsupported(_))),
+                result.as_ref().is_err_and(|error| error.is_unsupported()),
                 "expected Unsupported, got: {result:?}"
             ),
         }

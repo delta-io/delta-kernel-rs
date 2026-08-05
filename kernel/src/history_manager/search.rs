@@ -260,7 +260,10 @@ mod tests {
             binary_search_by_key_with_bounds(&values, 7, failing_key_fn, Bound::LeastUpper);
         assert!(matches!(
             result,
-            Err(SearchError::KeyFunctionError(crate::Error::Generic(msg))) if msg.contains("Error extracting key")
+            Err(SearchError::KeyFunctionError(error))
+                if error
+                    .legacy_message()
+                    .is_some_and(|message| message.contains("Error extracting key"))
         ));
     }
 }

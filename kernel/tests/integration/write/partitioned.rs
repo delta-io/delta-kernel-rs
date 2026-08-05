@@ -26,6 +26,7 @@ use test_utils::{
 };
 use url::Url;
 
+use crate::common::error_source_chain_contains;
 use crate::common::read_utils::read_parquet_file;
 
 // ==============================================================================
@@ -1285,8 +1286,7 @@ async fn test_input_data_with_partition_column_errors(
         .write_parquet(&data, &write_context)
         .await
         .err()
-        .expect("writing data that includes the partition column must fail")
-        .to_string();
+        .expect("writing data that includes the partition column must fail");
     // The two cases fail at different layers. When materialized, the non-empty transform injects
     // the partition literal and overflows the output schema. When not, the transform is empty,
     // error comes when applying the physical schema to the transformed data.
@@ -1296,7 +1296,7 @@ async fn test_input_data_with_partition_column_errors(
         "Passed struct had 2 columns, but transformed column has 1"
     };
     assert!(
-        err.contains(needle),
+        error_source_chain_contains(&err, needle),
         "expected error containing {needle:?} (materialized={materialized}), got: {err}"
     );
 

@@ -167,11 +167,12 @@ shape:
 
 Map your catalog's "another writer won this version" error to
 `CommitResponse::Conflict { version: commit_metadata.version() }` rather than
-propagating it as an `Err`. Return other errors as `Err(...)`. Kernel classifies
-only `Error::IOError` as retryable (surfaced as
-`CommitResult::RetryableTransaction`); return `IOError` for transient storage
-failures and other variants for everything else. Do not disguise non-I/O errors
-as `IOError` to opt into retry semantics.
+propagating it as an `Err`. Return other errors as `Err(...)`. Kernel classifies an
+engine-originated error whose source chain contains a `std::io::Error` as retryable (surfaced as
+`CommitResult::RetryableTransaction`). For a transient I/O failure, preserve the `std::io::Error`
+in the source chain with `EngineError::with_source()` and convert the resulting `EngineError` into
+`Error`. Return other errors without an I/O source. Do not attach an I/O source to opt a non-I/O
+error into retry semantics.
 
 ### Step 3: Mark as catalog committer
 
@@ -193,8 +194,6 @@ Kernel passes the commits to publish as a contiguous ascending batch via
   already copied some entries.
 
 ```rust,ignore
-use delta_kernel::Error;
-
 fn publish(
     &self,
     engine: &dyn Engine,
@@ -204,8 +203,9 @@ fn publish(
         let src = catalog_commit.location();            // _staged_commits/<v>.<uuid>.json
         let dest = catalog_commit.published_location(); // _delta_log/<v>.json
         match engine.storage_handler().copy_atomic(src, dest) {
-            Ok(()) | Err(Error::FileAlreadyExists(_)) => (), // already published
-            Err(e) => return Err(e),
+            Ok(()) => (),
+            Err(e) if e.is_file_already_exists() => (), // already published
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
@@ -221,7 +221,7 @@ catalog's client type and fill in the ratification logic:
 // Imports elided for brevity. In addition to the ones below, you will need
 // Committer, CommitMetadata, CommitResponse, PublishMetadata, DeltaResult,
 // FilteredEngineData, and Engine from delta_kernel.
-use delta_kernel::{Error, FileMeta};
+use delta_kernel::FileMeta;
 
 pub struct MyCatalogCommitter {
     catalog_client: Arc<MyCatalogClient>,
@@ -275,8 +275,9 @@ impl Committer for MyCatalogCommitter {
             let src = catalog_commit.location();
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
-                Ok(()) | Err(Error::FileAlreadyExists(_)) => (),
-                Err(e) => return Err(e),
+                Ok(()) => (),
+                Err(e) if e.is_file_already_exists() => (),
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(())

@@ -217,6 +217,7 @@ mod tests {
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{DataType, StructField, StructType};
     use crate::unit_test_utils::load_test_table;
+    use crate::EngineResult;
 
     /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
     /// performs.
@@ -237,7 +238,7 @@ mod tests {
     }
 
     impl PlanExecutor for CountingExecutor {
-        fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+        fn execute_op(&self, op: Operation) -> EngineResult<PlanResult> {
             match &op {
                 Operation::QueryPlan(_) => _ = self.query_scans.fetch_add(1, Ordering::Relaxed),
                 Operation::IoOperation(IoOperation::ParquetFooter { .. }) => {

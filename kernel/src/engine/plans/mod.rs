@@ -21,7 +21,16 @@ use parquet::PlanBasedParquetHandler;
 use storage::PlanBasedStorageHandler;
 
 use crate::plans::PlanExecutor;
-use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+use crate::{
+    Engine, EngineError, Error, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+};
+
+fn adapter_error(context: &'static str, error: Error) -> EngineError {
+    match error {
+        Error::Engine(error) => error,
+        Error::Delta(error) => EngineError::other(context).with_source(error),
+    }
+}
 
 /// An [`Engine`] that routes operations through a [`PlanExecutor`].
 ///

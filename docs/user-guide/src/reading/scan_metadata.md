@@ -308,7 +308,7 @@ let scan = snapshot
     .build()?;
 
 for metadata in scan.scan_metadata(engine)? {
-    let metadata = metadata?; // yields Err(Error::Cancelled) once the token fires
+    let metadata = metadata?; // yields an error for which `is_cancelled()` is true
     // ... process the batch ...
 }
 ```
@@ -322,9 +322,9 @@ mistaken for a complete one:
   variants](../connector/implementing_engine.md#cancellation-aware-reads), an I/O already in flight
   can be interrupted rather than running to completion — this is what lets a scan stuck on one slow
   file read stop promptly.
-- Either way, the outcome surfaces as `Error::Cancelled`: either returned directly from
-  `scan_metadata()` (when the token is already cancelled before replay begins) or as the terminal
-  item of its iterator. It is never a short or empty result.
+- Either way, the outcome surfaces as an `Error` for which `is_cancelled()` returns `true`: either
+  returned directly from `scan_metadata()` (when the token is already cancelled before replay
+  begins) or as the terminal item of its iterator. It is never a short or empty result.
 
 Without a token, the scan is not cancellable and runs to completion as usual. Cancellation applies
 to the lazy `scan_metadata()` path; [`parallel_scan_metadata()`](./parallel_scan_metadata.md) does

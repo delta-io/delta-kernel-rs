@@ -99,7 +99,7 @@ struct MatchedParquetField<'p, 'k> {
     kernel_field_info: Option<KernelFieldInfo<'k>>,
 }
 
-/// Create an [`Error::Arrow`] with a backtrace from the given message.
+/// Create a corrupt-data engine [`Error`] from the given Arrow error message.
 #[internal_api]
 pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
     Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
@@ -1678,14 +1678,27 @@ mod tests {
 
     #[test]
     fn test_json_parsing() {
-        static EXPECTED_JSON_ERR_STR: &str = "Generic delta kernel error: Malformed JSON: Multiple, partial, or 0 JSON objects on row";
-        fn check_parse_fails(input: Vec<Option<&str>>, schema: SchemaRef, expected_start: &str) {
+        static EXPECTED_JSON_ERR_STR: &str =
+            "Malformed JSON: Multiple, partial, or 0 JSON objects on row";
+        fn check_parse_fails(
+            input: Vec<Option<&str>>,
+            schema: SchemaRef,
+            expected_legacy_kind: &str,
+            expected_start: &str,
+        ) {
             let result = parse_json_impl(&StringArray::from(input), schema);
             let err = result.expect_err("Expected an error");
-            let msg = err.to_string();
+            let delta = err
+                .as_delta_error()
+                .expect("JSON decoding failures must be Delta errors");
+            assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+            assert_eq!(delta.sql_state(), None);
+            assert!(delta.parameters().is_empty());
+            assert_eq!(err.legacy_error_kind(), Some(expected_legacy_kind));
             assert!(
-                msg.starts_with(expected_start),
-                "Error message was not what was expected"
+                delta.message().starts_with(expected_start),
+                "unexpected JSON diagnostic: {}",
+                delta.message()
             );
         }
 
@@ -1710,13 +1723,19 @@ mod tests {
             vec![Some(r#"{} { "a": 1"#), Some("}")],
             vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)],
         ] {
-            check_parse_fails(input, requested_schema.clone(), EXPECTED_JSON_ERR_STR);
+            check_parse_fails(
+                input,
+                requested_schema.clone(),
+                "Generic",
+                EXPECTED_JSON_ERR_STR,
+            );
         }
 
         // this one is an error from within the tape decoder, so has a different format
         check_parse_fails(
             vec![Some(r#""a""#)],
             requested_schema.clone(),
+            "Arrow",
             "Json error: expected { got \"a\"",
         );
 

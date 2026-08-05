@@ -3,7 +3,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, DynObjectStore, ObjectStoreExt as _, PutMode};
-use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{
+    DeltaResult, EngineError, EngineResult, EngineResultIteratorStatic, Error, FileMeta, FileSlice,
+    StorageHandler,
+};
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use url::Url;
@@ -55,7 +58,7 @@ async fn list_from_impl(
     } else {
         let mut parts = offset.parts().collect_vec();
         if parts.pop().is_none() {
-            return Err(Error::Generic(format!(
+            return Err(Error::generic(format!(
                 "Offset path must not be a root directory. Got: '{path}'",
             )));
         }
@@ -105,9 +108,9 @@ async fn read_files_impl(
             let path = if url.scheme() == "file" {
                 let file_path = url
                     .to_file_path()
-                    .map_err(|_| Error::InvalidTableLocation(format!("Invalid file URL: {url}")))?;
+                    .map_err(|_| EngineError::other(format!("Invalid file URL: {url}")))?;
                 Path::from_absolute_path(file_path)
-                    .map_err(|e| Error::InvalidTableLocation(format!("Invalid file path: {e}")))?
+                    .map_err(|error| EngineError::other("Invalid file path").with_source(error))?
             } else {
                 Path::from(url.path())
             };
@@ -141,9 +144,13 @@ async fn copy_atomic_impl(
     store
         .put_opts(&dest_path, data.into(), PutMode::Create.into())
         .await
-        .map_err(|e| match e {
-            object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
-            e => e.into(),
+        .map_err(|error| match error {
+            error @ object_store::Error::AlreadyExists { .. } => {
+                EngineError::file_already_exists(dest_path.to_string())
+                    .with_source(error)
+                    .into()
+            }
+            error => Error::from(error),
         })?;
     Ok(())
 }
@@ -161,9 +168,13 @@ async fn put_impl(
         PutMode::Create
     };
     let result = store.put_opts(&path, data.into(), put_mode.into()).await;
-    result.map_err(|e| match e {
-        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.into()),
-        e => e.into(),
+    result.map_err(|error| match error {
+        error @ object_store::Error::AlreadyExists { .. } => {
+            EngineError::file_already_exists(path.to_string())
+                .with_source(error)
+                .into()
+        }
+        error => Error::from(error),
     })?;
     Ok(())
 }
@@ -188,10 +199,7 @@ async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &Url) -> EngineResult<EngineResultIteratorStatic<FileMeta>> {
         let future = list_from_impl(self.inner.clone(), path.clone());
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
@@ -203,37 +211,40 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     ///
     /// Multiple reads may occur in parallel, depending on the configured readahead.
     /// See [`Self::with_readahead`].
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> EngineResult<EngineResultIteratorStatic<Bytes>> {
         let future = read_files_impl(self.inner.clone(), files, self.readahead);
         let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> EngineResult<()> {
         let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(put_impl(self.inner.clone(), path, data, overwrite))
+            .map_err(|error| super::adapter_error("Object-store write failed", error))
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> EngineResult<()> {
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
         let future = copy_atomic_impl(self.inner.clone(), src_path, dest_path);
-        self.task_executor.block_on(future)
+        self.task_executor
+            .block_on(future)
+            .map_err(|error| super::adapter_error("Atomic copy failed", error))
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> EngineResult<FileMeta> {
         let future = head_impl(self.inner.clone(), path.clone());
-        self.task_executor.block_on(future)
+        self.task_executor
+            .block_on(future)
+            .map_err(|error| super::adapter_error("Object-store HEAD failed", error))
     }
 
-    fn delete(&self, path: &Url) -> DeltaResult<()> {
+    fn delete(&self, path: &Url) -> EngineResult<()> {
         let path = Path::from_url_path(path.path())?;
         self.task_executor
             .block_on(delete_impl(self.inner.clone(), path))
+            .map_err(|error| super::adapter_error("Object-store delete failed", error))
     }
 }
 
@@ -438,10 +449,10 @@ mod tests {
         );
 
         // copy to existing fails
-        assert!(matches!(
-            handler.copy_atomic(&src_url, &dest_url),
-            Err(Error::FileAlreadyExists(_))
-        ));
+        assert_eq!(
+            handler.copy_atomic(&src_url, &dest_url).unwrap_err().kind(),
+            delta_kernel::EngineErrorKind::FileAlreadyExists
+        );
 
         // copy from non-existing fails
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
@@ -481,7 +492,10 @@ mod tests {
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         let result = handler.head(&missing_url);
 
-        assert!(matches!(result, Err(Error::FileNotFound(_))));
+        assert_eq!(
+            result.unwrap_err().kind(),
+            delta_kernel::EngineErrorKind::FileNotFound
+        );
     }
 
     #[test]
@@ -512,10 +526,13 @@ mod tests {
 
         // Second put with overwrite=false should fail
         let new_data = Bytes::from("updated");
-        assert!(matches!(
-            handler.put(&file_url, new_data.clone(), false),
-            Err(Error::FileAlreadyExists(_))
-        ));
+        assert_eq!(
+            handler
+                .put(&file_url, new_data.clone(), false)
+                .unwrap_err()
+                .kind(),
+            delta_kernel::EngineErrorKind::FileAlreadyExists
+        );
 
         // Put with overwrite=true should succeed
         handler.put(&file_url, new_data.clone(), true).unwrap();
@@ -540,10 +557,10 @@ mod tests {
 
         handler.delete(&file_url).unwrap();
 
-        assert!(matches!(
-            handler.head(&file_url),
-            Err(Error::FileNotFound(_))
-        ));
+        assert_eq!(
+            handler.head(&file_url).unwrap_err().kind(),
+            delta_kernel::EngineErrorKind::FileNotFound
+        );
     }
 
     #[test]
@@ -551,10 +568,10 @@ mod tests {
         let (tmp, _store, handler) = setup_test();
 
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
-        assert!(matches!(
-            handler.head(&missing_url),
-            Err(Error::FileNotFound(_))
-        ));
+        assert_eq!(
+            handler.head(&missing_url).unwrap_err().kind(),
+            delta_kernel::EngineErrorKind::FileNotFound
+        );
         handler.delete(&missing_url).unwrap();
     }
 }

@@ -173,6 +173,10 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Checkpoint directory is an absent checkpoint file under object-store semantics",
+        &["cp_err_missing_metadata/specs/cp_err_missing_metadata_error"],
+    ),
+    (
         "Cannot cast list to non-list data types during type widening",
         &[
             "tw_array_element/specs/tw_array_element_read_",
@@ -201,10 +205,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "ct_missing_delta_log/specs/ct_missing_delta_log_snapshot",
             "dseReadNonDeltaPath/specs/dseReadNonDeltaPath_snapshot",
         ],
-    ),
-    (
-        "Accepts truncated log when initial commits are missing but CRC files exist",
-        &["prod_truncated_log/"],
     ),
     (
         "Accepts checkpoint-only tables (no commits)",
@@ -264,14 +264,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
             "err_schema_empty/specs/err_schema_empty_error",
             "err_schema_invalid_json_error",
         ],
-    ),
-    (
-        "Does not require version 0 to exist",
-        &["err_missing_version_0/specs/err_missing_version_0_error"],
-    ),
-    (
-        "Does not reject unknown reader features",
-        &["ev_unknown_reader_feature/specs/ev_unknown_reader_feature_error"],
     ),
     (
         "Does not enforce time travel safety",

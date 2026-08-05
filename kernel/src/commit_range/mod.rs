@@ -62,7 +62,7 @@ use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaErrorCode, DeltaResult, Engine, Error, Version};
 
 /// A contiguous range of Delta commits, holding resolved `[start_version, end_version]` bounds
 /// plus the materialized commit-file pointers in `commit_files`.
@@ -228,15 +228,25 @@ impl CommitActionsIterator {
     }
 }
 
-/// Prepend `commit v={version}` context to `err`, preserving the original variant for the two
-/// kernel error kinds that protocol validation surfaces ([`Error::Unsupported`] and
-/// [`Error::InvalidProtocol`]). Other variants fall back to [`Error::generic`].
+/// Prepend `commit v={version}` context to unclassified Delta errors while preserving named
+/// conditions and legacy classifications.
 fn with_version_context(version: Version, err: Error) -> Error {
-    match err {
-        Error::Unsupported(msg) => Error::Unsupported(format!("commit v={version}: {msg}")),
-        Error::InvalidProtocol(msg) => Error::InvalidProtocol(format!("commit v={version}: {msg}")),
-        other => Error::generic(format!("commit v={version}: {other}")),
+    if err.as_engine_error().is_some() {
+        return err;
     }
+
+    if err
+        .as_delta_error()
+        .is_some_and(|delta| delta.code() != DeltaErrorCode::DeltaKernelUnclassified)
+    {
+        return err;
+    }
+
+    let message = err
+        .legacy_message()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| err.to_string());
+    err.with_unclassified_context(format!("commit v={version}: {message}"))
 }
 
 impl Iterator for CommitActionsIterator {
@@ -388,6 +398,80 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn version_context_preserves_engine_origin_and_source() {
+        let error = Error::from(
+            crate::EngineError::other("commit read failed")
+                .with_source(std::io::Error::other("storage detail")),
+        );
+
+        let error = with_version_context(12, error);
+
+        let engine_error = error.as_engine_error().expect("expected an engine error");
+        assert_eq!(engine_error.kind(), crate::EngineErrorKind::Other);
+        assert_eq!(engine_error.message(), "commit read failed");
+        assert_eq!(
+            std::error::Error::source(engine_error)
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("storage detail")
+        );
+    }
+
+    #[test]
+    fn version_context_preserves_unclassified_delta_category_and_source_chain() {
+        let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let error = with_version_context(12, Error::from(json_error));
+
+        assert_eq!(error.legacy_error_kind(), Some("MalformedJson"));
+        let delta_error = error.as_delta_error().expect("expected a Delta error");
+        assert_eq!(delta_error.code(), DeltaErrorCode::DeltaKernelUnclassified);
+        assert!(delta_error.message().starts_with("commit v=12: "));
+
+        let mut source = std::error::Error::source(delta_error);
+        let mut found_json_error = false;
+        while let Some(error) = source {
+            found_json_error |= error.is::<serde_json::Error>();
+            source = error.source();
+        }
+        assert!(found_json_error, "expected serde_json::Error source");
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_version_context_preserves_json_source() {
+        let malformed_metadata = serde_json::json!({
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1000,
+            }
+        });
+        let commit = format!("{VALID_PROTOCOL_LINE}\n{malformed_metadata}");
+        let (engine, table_root) = engine_with_commits(&[(0, &commit)]).await;
+        let range = CommitRange::builder_for(table_root, 0)
+            .build(engine.as_ref())
+            .expect("commit range should build before reading metadata");
+
+        let error = drain_commits(&range, engine, None, &[DeltaAction::Add])
+            .expect_err("malformed schemaString should fail");
+        assert_eq!(error.legacy_error_kind(), Some("MalformedJson"));
+        let delta_error = error.as_delta_error().expect("expected a Delta error");
+        assert_eq!(delta_error.code(), DeltaErrorCode::DeltaKernelUnclassified);
+        assert!(delta_error.message().starts_with("commit v=0: "));
+
+        let mut source = std::error::Error::source(delta_error);
+        let mut found_json_error = false;
+        while let Some(error) = source {
+            found_json_error |= error.is::<serde_json::Error>();
+            source = error.source();
+        }
+        assert!(found_json_error, "expected serde_json::Error source");
+    }
+
     const VALID_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":1}}"#;
     const UNSUPPORTED_PROTOCOL_LINE: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["futureFeature"],"writerFeatures":["futureFeature"]}}"#;
     const VALID_METADATA_LINE: &str = r#"{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1000}}"#;
@@ -398,11 +482,11 @@ mod tests {
     #[rstest::rstest]
     #[case::too_high_reader_version(
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":99}}"#,
-        |err: &Error| matches!(err, Error::Unsupported(_)),
+        |err: &Error| err.as_delta_error().is_some_and(|delta| delta.condition() == "DELTA_INVALID_PROTOCOL_VERSION"),
     )]
     #[case::too_low_reader_version(
         r#"{"protocol":{"minReaderVersion":0,"minWriterVersion":1}}"#,
-        |err: &Error| matches!(err, Error::InvalidProtocol(_)),
+        |err: &Error| err.is_invalid_protocol(),
     )]
     #[tokio::test]
     async fn test_commits_errors_on_unsupported_reader_version(
@@ -608,31 +692,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_error_on_start_snapshot_unsupported_for_scan() {
+    async fn test_snapshot_build_rejects_unsupported_reader_feature() {
         let v0 = format!("{}\n{}", UNSUPPORTED_PROTOCOL_LINE, VALID_METADATA_LINE,);
         let (engine, table_root) = engine_with_commits(&[(0, &v0)]).await;
 
-        let snapshot = Snapshot::builder_for(table_root)
+        let err = Snapshot::builder_for(table_root)
             .at_version(0)
             .build(engine.as_ref())
-            .expect("snapshot with unknown feature should still build");
-
-        let range = CommitRange::builder_for(table_root, 0)
-            .with_end_version(0)
-            .build(engine.as_ref())
-            .unwrap();
-
-        let actions = [DeltaAction::Add];
-        let err = range
-            .commits(engine, Some(snapshot), &actions)
-            .err()
-            .expect(
-                "commits must reject snapshot with unsupported feature before iteration begins",
-            );
-        match err {
-            Error::Unsupported(msg) => assert!(msg.contains("futureFeature"), "got: {msg}"),
-            other => panic!("expected Error::Unsupported, got: {other:?}"),
-        }
+            .expect_err("snapshot construction must reject an unsupported reader feature");
+        assert_eq!(
+            err.as_delta_error().map(|delta| delta.condition()),
+            Some("DELTA_UNSUPPORTED_FEATURES_FOR_READ")
+        );
+        assert!(err.to_string().contains("futureFeature"), "got: {err}");
     }
 
     #[rstest::rstest]
@@ -675,9 +747,26 @@ mod tests {
         let result = drain_commits(&range, engine, None, actions);
         if expects_unsupported {
             let err = result.expect_err("commit-driven validation must reject");
-            assert!(
-                matches!(err, Error::Unsupported(_)),
-                "expected Error::Unsupported, got: {err:?}",
+            let delta = err
+                .as_delta_error()
+                .expect("unsupported protocol must be a Delta error");
+            assert_eq!(delta.condition(), "DELTA_INVALID_PROTOCOL_VERSION");
+            assert_eq!(delta.sql_state(), Some("KD004"));
+            let parameters: Vec<_> = delta
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.name(), parameter.value()))
+                .collect();
+            assert_eq!(
+                parameters,
+                [
+                    ("tableNameOrPath", "memory:///"),
+                    ("readerRequired", "99"),
+                    ("writerRequired", "99"),
+                    ("deltaVersion", env!("CARGO_PKG_VERSION")),
+                    ("supportedReaders", "1, 2, 3"),
+                    ("supportedWriters", "1, 2, 3, 4, 5, 6, 7"),
+                ]
             );
         } else {
             result.expect("snapshot-less range must drain cleanly");
@@ -705,10 +794,7 @@ mod tests {
         let v0_result = iter.next().expect("v=0 commit yield slot");
         match v0_result {
             Ok(_) => panic!("v=0 must reject during iter.next()"),
-            Err(Error::Unsupported(msg)) => {
-                assert!(msg.contains("futureFeature"), "got: {msg}")
-            }
-            Err(other) => panic!("expected Error::Unsupported, got: {other:?}"),
+            Err(error) => assert!(error.to_string().contains("futureFeature"), "got: {error}"),
         }
     }
 

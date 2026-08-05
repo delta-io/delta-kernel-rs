@@ -14,10 +14,12 @@ use crate::actions::{
 };
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
+use crate::error::delta_errors;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
+use crate::log_segment_files::list_available_version_range;
 #[internal_api]
 use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::{
@@ -209,7 +211,7 @@ impl LogSegment {
         validate_compaction_files(&listed_files.ascending_compaction_files)?;
         validate_checkpoint_parts(&listed_files.checkpoint_parts)?;
         validate_commit_file_types(&listed_files.ascending_commit_files)?;
-        validate_commit_files_contiguous(&listed_files.ascending_commit_files)?;
+        validate_commit_files_contiguous(&listed_files.ascending_commit_files, end_version)?;
 
         // Filter commits before/at checkpoint version
         let checkpoint_version =
@@ -223,7 +225,11 @@ impl LogSegment {
                 None
             };
 
-        validate_checkpoint_commit_gap(checkpoint_version, &listed_files.ascending_commit_files)?;
+        validate_checkpoint_commit_gap(
+            checkpoint_version,
+            &listed_files.ascending_commit_files,
+            end_version,
+        )?;
         let effective_version = validate_end_version(
             &listed_files.ascending_commit_files,
             &listed_files.checkpoint_parts,
@@ -368,6 +374,7 @@ impl LogSegment {
         // TODO: When max catalog version is implemented, we would use that as end_version if
         // time_travel_version is not present
         let end_version = time_travel_version;
+        let availability_log_tail = end_version.map(|_| log_tail.clone());
 
         // Keep the hint only if it points at or before end_version, or if there is no end_version
         // bound
@@ -402,6 +409,31 @@ impl LogSegment {
             // Case 4
             (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
         };
+
+        validate_snapshot_reconstruction_anchor(&listed_files, end_version)?;
+
+        if let (Some(requested), Some(availability_log_tail)) = (end_version, availability_log_tail)
+        {
+            let checkpoint_version = listed_files
+                .checkpoint_parts
+                .first()
+                .map(|checkpoint| checkpoint.version);
+            let effective_version = listed_files
+                .ascending_commit_files
+                .iter()
+                .rev()
+                .find(|commit| checkpoint_version.is_none_or(|version| commit.version > version))
+                .map(|commit| commit.version)
+                .or(checkpoint_version);
+            if effective_version != Some(requested) {
+                if let Some(error) =
+                    list_available_version_range(storage, &log_root, &availability_log_tail)?
+                        .and_then(|range| range.error_for_missing_version(requested))
+                {
+                    return Err(error);
+                }
+            }
+        }
 
         LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
     }
@@ -1144,8 +1176,13 @@ impl LogSegment {
         // The boolean flag indicates whether the batch originated from a commit file
         // (true) or a checkpoint file (false).
         let actions_iter = actions
+            .map(|result| result.map_err(Error::from))
             .map_ok(|batch| ActionsBatch::new(batch, false))
-            .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
+            .chain(
+                sidecar_batches
+                    .map(|result| result.map_err(Error::from))
+                    .map_ok(|batch| ActionsBatch::new(batch, false)),
+            );
 
         let checkpoint_info = CheckpointReadInfo {
             has_stats_parsed,
@@ -1192,7 +1229,7 @@ impl LogSegment {
         // Extract sidecar file references
         let mut visitor = SidecarVisitor::default();
         for batch_result in batches {
-            let batch = batch_result?;
+            let batch = batch_result.map_err(Error::from)?;
             visitor.visit_rows_of(batch.as_ref())?;
         }
 
@@ -1540,13 +1577,59 @@ fn validate_commit_file_types(commits: &[ParsedLogPath]) -> DeltaResult<()> {
     Ok(())
 }
 
-fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()> {
+fn validate_snapshot_reconstruction_anchor(
+    listed_files: &LogSegmentFiles,
+    version_to_load: Option<Version>,
+) -> DeltaResult<()> {
+    if !listed_files.checkpoint_parts.is_empty() {
+        return Ok(());
+    }
+    let Some(first_commit) = listed_files.ascending_commit_files.first() else {
+        return Ok(());
+    };
+    if first_commit.version == 0 {
+        return Ok(());
+    }
+
+    let version_list = listed_files
+        .ascending_commit_files
+        .iter()
+        .map(|commit| commit.version)
+        .collect::<Vec<_>>();
+    let start_version = first_commit.version;
+    let end_version = version_list.last().copied().unwrap_or(start_version);
+    Err(delta_errors::versions_not_contiguous(
+        version_list.iter().join(", "),
+        start_version,
+        end_version,
+        version_to_load.unwrap_or(end_version),
+    ))
+}
+
+fn validate_commit_files_contiguous(
+    commits: &[ParsedLogPath],
+    version_to_load: Option<Version>,
+) -> DeltaResult<()> {
+    let version_list = commits
+        .iter()
+        .map(|commit| commit.version)
+        .collect::<Vec<_>>();
     for pair in commits.windows(2) {
         if pair[0].version + 1 != pair[1].version {
-            return Err(Error::generic(format!(
-                "Expected contiguous commit files, but found gap: {:?} -> {:?}",
-                pair[0], pair[1]
-            )));
+            let version_to_load = version_to_load.unwrap_or_else(|| {
+                commits
+                    .last()
+                    .map(|commit| commit.version)
+                    .unwrap_or(pair[1].version)
+            });
+            let start_version = version_list.first().copied().unwrap_or(pair[0].version);
+            let end_version = version_list.last().copied().unwrap_or(pair[1].version);
+            return Err(delta_errors::versions_not_contiguous(
+                version_list.iter().join(", "),
+                start_version,
+                end_version,
+                version_to_load,
+            ));
         }
     }
     Ok(())
@@ -1560,15 +1643,28 @@ fn validate_commit_files_contiguous(commits: &[ParsedLogPath]) -> DeltaResult<()
 fn validate_checkpoint_commit_gap(
     checkpoint_version: Option<Version>,
     commits: &[ParsedLogPath],
+    version_to_load: Option<Version>,
 ) -> DeltaResult<()> {
     if let (Some(checkpoint_version), Some(first_commit)) = (checkpoint_version, commits.first()) {
-        require!(
-            checkpoint_version + 1 == first_commit.version,
-            Error::InvalidCheckpoint(format!(
-                "Gap between checkpoint version {checkpoint_version} and next commit {}",
-                first_commit.version
-            ))
-        );
+        if checkpoint_version + 1 != first_commit.version {
+            let version_list = std::iter::once(checkpoint_version)
+                .chain(commits.iter().map(|commit| commit.version))
+                .collect::<Vec<_>>();
+            let version_to_load = version_to_load.unwrap_or_else(|| {
+                commits
+                    .last()
+                    .map(|commit| commit.version)
+                    .unwrap_or(first_commit.version)
+            });
+            let start_version = version_list.first().copied().unwrap_or(checkpoint_version);
+            let end_version = version_list.last().copied().unwrap_or(first_commit.version);
+            return Err(delta_errors::versions_not_contiguous(
+                version_list.iter().join(", "),
+                start_version,
+                end_version,
+                version_to_load,
+            ));
+        }
     }
     Ok(())
 }

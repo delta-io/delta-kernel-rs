@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
+use crate::error::delta_errors;
 use crate::expressions::ColumnName;
 use crate::schema::validation::{validate_interval_type_write_support, validate_schema};
 use crate::schema::variant_utils::schema_contains_variant_type;
@@ -152,20 +153,19 @@ fn ensure_table_does_not_exist(
             // - Some(Err(other)) means real error -> propagate
             // - None means empty iterator -> OK for new table
             match files.next() {
-                Some(Ok(_)) => Err(Error::generic(format!(
-                    "Table already exists at path: {table_path}"
-                ))),
-                Some(Err(Error::FileNotFound(_))) | None => {
+                Some(Ok(_)) => Err(delta_errors::log_already_exists(table_path)),
+                Some(Err(error)) if error.is_file_not_found() => {
                     // Path doesn't exist or empty - OK for new table
                     Ok(())
                 }
+                None => Ok(()),
                 Some(Err(e)) => {
                     // Real error (permissions, network, etc.) - propagate
-                    Err(e)
+                    Err(e.into())
                 }
             }
         }
-        Err(Error::FileNotFound(_)) => {
+        Err(error) if error.is_file_not_found() => {
             // Directory doesn't exist - this is expected for a new table.
             // The storage layer will create the full path (including _delta_log/)
             // when the commit writes the first log file via write_json_file().
@@ -173,7 +173,7 @@ fn ensure_table_does_not_exist(
         }
         Err(e) => {
             // Real error - propagate
-            Err(e)
+            Err(e.into())
         }
     }
 }

@@ -9,7 +9,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
-use crate::{Engine as _, FileMeta};
+use crate::{Engine as _, EngineResult, EngineResultIteratorStatic, FileMeta};
 
 // size markers used to identify commit sources in tests
 const FILESYSTEM_SIZE_MARKER: u64 = 10;
@@ -132,6 +132,58 @@ fn assert_source(commit: &ParsedLogPath, expected_source: CommitSource) {
     );
 }
 
+fn assert_delta_error(
+    error: &Error,
+    condition: &str,
+    sql_state: Option<&str>,
+    expected_parameters: &[(&str, &str)],
+) {
+    let delta = error
+        .as_delta_error()
+        .expect("expected a structured Delta error");
+    assert_eq!(delta.condition(), condition);
+    assert_eq!(delta.sql_state(), sql_state);
+    let parameters: Vec<_> = delta
+        .parameters()
+        .iter()
+        .map(|parameter| (parameter.name(), parameter.value()))
+        .collect();
+    assert_eq!(parameters, expected_parameters);
+}
+
+#[tokio::test]
+async fn availability_rejects_observed_commit_stranded_across_gap() {
+    let (storage, log_root) = create_storage(vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (3, LogPathFileType::Commit, CommitSource::Filesystem),
+        (
+            5,
+            LogPathFileType::SinglePartCheckpoint,
+            CommitSource::Filesystem,
+        ),
+    ])
+    .await;
+
+    let range = list_available_version_range(storage.as_ref(), &log_root, &[])
+        .unwrap()
+        .expect("checkpoint and commit zero should provide reconstruction anchors");
+    let error = range
+        .error_for_missing_version(3)
+        .expect("an observed commit after a gap is not reconstructable");
+    assert_delta_error(
+        &error,
+        "DELTA_VERSIONS_NOT_CONTIGUOUS",
+        Some("KD00C"),
+        &[
+            ("versionList", "0, 1, 3, 5"),
+            ("startVersion", "0"),
+            ("endVersion", "5"),
+            ("versionToLoad", "3"),
+        ],
+    );
+}
+
 /// A [`StorageHandler`] wrapper that counts the number of `list_from` calls and the number of
 /// items consumed from the returned iterators. Used to verify that
 /// `list_with_backward_checkpoint_scan` issues the expected number of storage listing requests,
@@ -161,10 +213,7 @@ impl CountingStorageHandler {
 }
 
 impl StorageHandler for CountingStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &Url) -> EngineResult<EngineResultIteratorStatic<FileMeta>> {
         self.list_from_count.fetch_add(1, Ordering::Relaxed);
         let items_listed = self.items_listed.clone();
         let iter = self.inner.list_from(path)?;
@@ -176,23 +225,23 @@ impl StorageHandler for CountingStorageHandler {
     fn read_files(
         &self,
         _files: Vec<crate::FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+    ) -> EngineResult<EngineResultIteratorStatic<bytes::Bytes>> {
         panic!("read_files should not be called during listing");
     }
 
-    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> EngineResult<()> {
         panic!("put should not be called during listing");
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> EngineResult<()> {
         panic!("copy_atomic should not be called during listing");
     }
 
-    fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+    fn head(&self, _path: &Url) -> EngineResult<crate::FileMeta> {
         panic!("head should not be called during listing");
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> EngineResult<()> {
         panic!("delete should not be called during listing");
     }
 }
@@ -355,28 +404,25 @@ fn test_log_tail_covers_entire_range_empty_filesystem() {
     // have nothing — e.g. a purely catalog-managed table.
     struct EmptyStorageHandler;
     impl StorageHandler for EmptyStorageHandler {
-        fn list_from(
-            &self,
-            _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        fn list_from(&self, _path: &Url) -> EngineResult<EngineResultIteratorStatic<FileMeta>> {
             Ok(Box::new(std::iter::empty()))
         }
         fn read_files(
             &self,
             _files: Vec<crate::FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+        ) -> EngineResult<EngineResultIteratorStatic<bytes::Bytes>> {
             panic!("read_files should not be called during listing");
         }
-        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> DeltaResult<()> {
+        fn put(&self, _path: &Url, _data: bytes::Bytes, _overwrite: bool) -> EngineResult<()> {
             panic!("put should not be called during listing");
         }
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> EngineResult<()> {
             panic!("copy_atomic should not be called during listing");
         }
-        fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+        fn head(&self, _path: &Url) -> EngineResult<crate::FileMeta> {
             panic!("head should not be called during listing");
         }
-        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        fn delete(&self, _path: &Url) -> EngineResult<()> {
             panic!("delete should not be called during listing");
         }
     }

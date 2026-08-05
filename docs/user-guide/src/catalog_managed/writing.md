@@ -135,9 +135,9 @@ match commit_result {
     CommitResult::RetryableTransaction(retryable) => {
         // Transient I/O error. `retryable.error` gives the underlying cause;
         // `retryable.transaction` is the original transaction you can retry
-        // without rebasing. Kernel reaches this arm only for `Error::IOError`
-        // variants; return other error kinds as-is rather than disguising
-        // them as IOError to force retry.
+        // without rebasing. Kernel reaches this arm only for an engine-originated
+        // error whose source chain contains a std::io::Error. Return other errors
+        // as-is instead of attaching an I/O source to force retry.
     }
 }
 ```

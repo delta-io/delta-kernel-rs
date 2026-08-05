@@ -8,7 +8,7 @@ use url::Url;
 use crate::plans::{IoOperation, Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
+    DeltaResultIteratorStatic, EngineData, EngineResult, FileDataReadResultIterator, FileMeta,
     ParquetFooter, ParquetHandler, PredicateRef,
 };
 
@@ -37,25 +37,31 @@ impl ParquetHandler for PlanBasedParquetHandler {
         files: &[FileMeta],
         physical_schema: SchemaRef,
         _predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> EngineResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)?.build()?;
-        self.executor
+        let query = PlanBuilder::scan_parquet(files.to_vec(), &[], physical_schema)
+            .and_then(|builder| builder.build())
+            .map_err(|error| {
+                super::adapter_error("Parquet scan plan construction failed", error)
+            })?;
+        let data = self
+            .executor
             .execute_op(Operation::QueryPlan(query))?
-            .into_data()
+            .into_data()?;
+        Ok(data)
     }
 
     fn write_parquet_file(
         &self,
         location: Url,
         data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
-    ) -> DeltaResult<()> {
+    ) -> EngineResult<()> {
         debug!(%location, "PlanBasedParquetHandler delegating write_parquet_file to fallback handler");
         self.fallback.write_parquet_file(location, data)
     }
 
-    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> EngineResult<ParquetFooter> {
         let op = IoOperation::parquet_footer(file.clone());
         self.executor
             .execute_op(Operation::IoOperation(op))?

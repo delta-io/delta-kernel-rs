@@ -13,7 +13,7 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::metrics::events::STORAGE_SPAN;
-use crate::{DeltaResult, FileMeta};
+use crate::FileMeta;
 
 /// Counts items observed and emits a `"storage"` span on drop. The type parameter
 /// `T` selects whether bytes are counted: `Bytes` counts bytes, `FileMeta` does not.
@@ -80,9 +80,9 @@ pub(crate) fn emit_storage_span(
     );
 }
 
-impl<I> Iterator for MetricsIterator<I, FileMeta>
+impl<I, E> Iterator for MetricsIterator<I, FileMeta>
 where
-    I: Iterator<Item = DeltaResult<FileMeta>>,
+    I: Iterator<Item = Result<FileMeta, E>>,
 {
     type Item = I::Item;
 
@@ -95,9 +95,9 @@ where
     }
 }
 
-impl<I> Iterator for MetricsIterator<I, Bytes>
+impl<I, E> Iterator for MetricsIterator<I, Bytes>
 where
-    I: Iterator<Item = DeltaResult<Bytes>>,
+    I: Iterator<Item = Result<Bytes, E>>,
 {
     type Item = I::Item;
 

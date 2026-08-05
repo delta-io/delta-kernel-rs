@@ -553,7 +553,7 @@ mod tests {
         }];
         let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, None)
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidProtocol(_)));
+        assert!(err.is_invalid_protocol());
         assert!(err.to_string().contains("maxColumnId"));
     }
 

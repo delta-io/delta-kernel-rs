@@ -107,7 +107,7 @@ mod test {
         let filename = "00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
         let err =
             LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
-        assert!(matches!(err, Error::InvalidTableLocation(_)));
+        assert!(err.to_string().contains("s3://my-bucket/my-table"));
 
         // filename with path separators
         let table_root = Url::from_str("s3://my-bucket/my-table/").unwrap();

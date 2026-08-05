@@ -56,6 +56,7 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         let leaf_checkpoint_reader = engine
             .parquet_handler()
             .read_parquet_files(&leaf_files, read_schema, None)?
+            .map(|result| result.map_err(crate::Error::from))
             .map_ok(|batch| ActionsBatch::new(batch, false));
         Ok(Self {
             processor,

@@ -481,7 +481,6 @@ pub(crate) mod tests {
     use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
     use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
-    use crate::unit_test_utils::assert_result_error_with_message;
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
@@ -937,7 +936,12 @@ pub(crate) mod tests {
             HashMap::new(),
             vec![("row_id", MetadataColumnSpec::RowId)],
         );
-        assert_result_error_with_message(res, "Unsupported: Row ids are not enabled on this table");
+        let error = res.unwrap_err();
+        assert_eq!(
+            error.as_delta_error().unwrap().code(),
+            crate::DeltaErrorCode::DeltaKernelUnclassified
+        );
+        assert_eq!(error.legacy_error_kind(), Some("Unsupported"));
 
         // Row tracking enabled but missing materializedRowIdColumnName → error
         let res = get_state_info(
@@ -948,10 +952,12 @@ pub(crate) mod tests {
             get_string_map(&[("delta.enableRowTracking", "true")]),
             vec![("row_id", MetadataColumnSpec::RowId)],
         );
-        assert_result_error_with_message(
-            res,
-            "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
+        let error = res.unwrap_err();
+        assert_eq!(
+            error.as_delta_error().unwrap().code(),
+            crate::DeltaErrorCode::DeltaKernelUnclassified
         );
+        assert_eq!(error.legacy_error_kind(), Some("Generic"));
     }
 
     #[test]
@@ -992,10 +998,12 @@ pub(crate) mod tests {
             &PartitionValuesOptions::default(),
             (),
         );
-        assert_result_error_with_message(
-            res,
-            "Schema error: Metadata column names must not match partition columns: part_col",
+        let error = res.unwrap_err();
+        assert_eq!(
+            error.as_delta_error().unwrap().code(),
+            crate::DeltaErrorCode::DeltaKernelUnclassified
         );
+        assert_eq!(error.legacy_error_kind(), Some("Schema"));
     }
 
     #[test]
@@ -1009,10 +1017,12 @@ pub(crate) mod tests {
             get_string_map(&[("delta.columnMapping.mode", "name")]),
             vec![("other", MetadataColumnSpec::RowIndex)],
         );
-        assert_result_error_with_message(
-            res,
-            "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'"
+        let error = res.unwrap_err();
+        assert_eq!(
+            error.as_delta_error().unwrap().code(),
+            crate::DeltaErrorCode::DeltaKernelUnclassified
         );
+        assert_eq!(error.legacy_error_kind(), Some("Schema"));
     }
 
     #[test]

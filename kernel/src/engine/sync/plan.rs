@@ -41,7 +41,9 @@ use crate::plans::ir::nodes::{
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
 use crate::schema::{ArrayType, DataType, SchemaRef, StructType};
-use crate::{DeltaResult, Error, EvaluationHandler as _, FileMeta, StorageHandler as _};
+use crate::{
+    DeltaResult, EngineResult, Error, EvaluationHandler as _, FileMeta, StorageHandler as _,
+};
 
 /// A synchronous, test-only [`PlanExecutor`].
 ///
@@ -77,11 +79,12 @@ impl Default for SyncPlanExecutor {
 }
 
 impl PlanExecutor for SyncPlanExecutor {
-    fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
-        match op {
+    fn execute_op(&self, op: Operation) -> EngineResult<PlanResult> {
+        let result = match op {
             Operation::IoOperation(io_op) => self.execute_io(io_op),
             Operation::QueryPlan(query) => self.execute_query(query),
-        }
+        };
+        result.map_err(|error| super::adapter_error("Declarative plan execution failed", error))
     }
 }
 
@@ -92,14 +95,14 @@ impl SyncPlanExecutor {
                 // `StorageHandler::list_from` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let metas: Vec<DeltaResult<FileMeta>> = self.storage.list_from(&url)?.collect();
+                let metas: Vec<EngineResult<FileMeta>> = self.storage.list_from(&url)?.collect();
                 Ok(PlanResult::FileMeta(Box::new(metas.into_iter())))
             }
             IoOperation::ReadBytes { files } => {
                 // `StorageHandler::read_files` returns a non-`Send` iterator, so we collect into
                 // a `Vec` first to convert into a `Send` iterator.
                 // TODO(#2619): Evaluate whether StorageHandler should just return `Send` iterators
-                let bytes: Vec<DeltaResult<Bytes>> = self.storage.read_files(files)?.collect();
+                let bytes: Vec<EngineResult<Bytes>> = self.storage.read_files(files)?.collect();
                 Ok(PlanResult::Bytes(Box::new(bytes.into_iter())))
             }
             IoOperation::WriteBytes {

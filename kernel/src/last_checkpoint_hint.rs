@@ -13,7 +13,7 @@ use crate::actions::{
 };
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, FileMeta, StorageHandler, Version};
+use crate::{DeltaResult, FileMeta, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
@@ -201,11 +201,11 @@ impl LastCheckpointHint {
                 info!(hint = result.as_ref().map(|h| h.summary()));
                 Ok(result)
             }
-            Some(Err(Error::FileNotFound(_))) => {
+            Some(Err(error)) if error.is_file_not_found() => {
                 info!("_last_checkpoint file not found");
                 Ok(None)
             }
-            Some(Err(err)) => Err(err),
+            Some(Err(err)) => Err(err.into()),
             None => {
                 warn!("empty _last_checkpoint file");
                 Ok(None)

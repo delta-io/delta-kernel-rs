@@ -19,7 +19,7 @@ use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::Transaction;
-use delta_kernel::{DeltaResult, Error as KernelError, Snapshot};
+use delta_kernel::{DeltaResult, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
 use serde_json::{json, Deserializer};
@@ -29,6 +29,7 @@ use test_utils::{
     AddFilePartitionKeyModify,
 };
 
+use crate::common::find_error_source;
 use crate::common::write_utils::{
     check_action_timestamps, get_and_check_all_parquet_sizes, get_simple_int_schema,
     validate_txn_id, write_data_and_check_result_and_stats, ZERO_UUID,
@@ -369,15 +370,13 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         });
 
         let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        assert!(add_files_metadata.all(|res| match res {
-            Err(KernelError::Arrow(ArrowError::InvalidArgumentError(_))) => true,
-            Err(KernelError::Backtraced { source, .. })
-                if matches!(
-                    &*source,
-                    KernelError::Arrow(ArrowError::InvalidArgumentError(_))
-                ) =>
-                true,
-            _ => false,
+        assert!(add_files_metadata.all(|res| {
+            res.is_err_and(|error| {
+                error.as_engine_error().is_some()
+                    && find_error_source::<ArrowError>(&error).is_some_and(|arrow_error| {
+                        matches!(arrow_error, ArrowError::InvalidArgumentError(_))
+                    })
+            })
         }));
     }
     Ok(())

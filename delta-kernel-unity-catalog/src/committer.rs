@@ -159,11 +159,11 @@ impl<C: UpdateTableClient> UCCommitter<C> {
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
-            Err(DeltaError::FileAlreadyExists(_)) => {
+            Err(error) if error.is_file_already_exists() => {
                 info!("version 0 commit conflict: commit file already exists");
                 Ok(CommitResponse::Conflict { version: 0 })
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -247,7 +247,7 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             }),
             // TODO(#2970): classify version conflicts as CommitResponse::Conflict so the
             // transaction layer can rebase/retry, instead of collapsing every error to Generic.
-            Err(e) => Err(DeltaError::Generic(format!("UC update_table error: {e}"))),
+            Err(e) => Err(DeltaError::generic(format!("UC update_table error: {e}"))),
         }
     }
 }
@@ -285,8 +285,8 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
                 Ok(_) => (),
-                Err(DeltaError::FileAlreadyExists(_)) => (),
-                Err(e) => return Err(e),
+                Err(error) if error.is_file_already_exists() => (),
+                Err(error) => return Err(error.into()),
             }
         }
 

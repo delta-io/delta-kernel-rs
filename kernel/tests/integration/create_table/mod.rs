@@ -176,7 +176,15 @@ async fn test_create_table_already_exists() -> DeltaResult<()> {
     let result = create_table(&table_path, schema.clone(), "UserManagementService/1.2.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
 
-    assert_result_error_with_message(result, "already exists");
+    let error = result.expect_err("creating an existing table should fail");
+    let delta = error
+        .as_delta_error()
+        .expect("existing Delta log should be a Delta error");
+    assert_eq!(delta.condition(), "DELTA_LOG_ALREADY_EXISTS");
+    assert_eq!(delta.sql_state(), Some("42K04"));
+    assert_eq!(delta.parameters().len(), 1);
+    assert_eq!(delta.parameters()[0].name(), "path");
+    assert_eq!(delta.parameters()[0].value(), table_path);
 
     Ok(())
 }

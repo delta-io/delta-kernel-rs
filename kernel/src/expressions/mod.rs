@@ -638,7 +638,7 @@ impl ParseJsonExpression {
 /// this operator; [`ParseJsonExpression`] does not share it.
 ///
 /// - Missing keys produce null values
-/// - A value that cannot be parsed as its target field type returns [`Error::ParseError`]
+/// - A value that cannot be parsed as its target field type returns an error
 /// - Duplicate map keys are resolved by taking the rightmost entry
 ///
 /// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar

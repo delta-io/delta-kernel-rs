@@ -11,13 +11,14 @@
 //!
 //! [`LogSegment`]: crate::log_segment::LogSegment
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
+use crate::error::delta_errors;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::LogPathFileType::*;
 use crate::path::{may_begin_listable_log_path, LogPathFileType, ParsedLogPath};
@@ -50,6 +51,52 @@ pub(crate) struct LogSegmentFiles {
     pub latest_crc_file: Option<ParsedLogPath>,
     pub latest_commit_file: Option<ParsedLogPath>,
     pub max_published_version: Option<Version>,
+}
+
+/// The inclusive bounds of table versions that can be reconstructed from the full log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AvailableVersionRange {
+    earliest: Version,
+    latest: Version,
+    observed_versions: Vec<Version>,
+    reconstructable_ranges: Vec<(Version, Version)>,
+}
+
+impl AvailableVersionRange {
+    /// Returns a structured error when `requested` is provably unavailable.
+    ///
+    /// A request outside the reconstructable bounds is a missing version. A missing version
+    /// between those bounds is instead a gap in the log. `None` means the requested version is
+    /// reconstructable, so the caller should preserve the original validation result.
+    pub(crate) fn error_for_missing_version(&self, requested: Version) -> Option<Error> {
+        if requested < self.earliest || requested > self.latest {
+            return Some(delta_errors::version_not_found(
+                requested,
+                self.earliest,
+                self.latest,
+            ));
+        }
+
+        let range_index = self
+            .reconstructable_ranges
+            .partition_point(|(_, end)| *end < requested);
+        if self
+            .reconstructable_ranges
+            .get(range_index)
+            .is_some_and(|(start, end)| (*start..=*end).contains(&requested))
+        {
+            return None;
+        }
+
+        let start_version = *self.observed_versions.first()?;
+        let end_version = *self.observed_versions.last()?;
+        Some(delta_errors::versions_not_contiguous(
+            self.observed_versions.iter().join(", "),
+            start_version,
+            end_version,
+            requested,
+        ))
+    }
 }
 
 /// Returns a lazy iterator of [`ParsedLogPath`]s from the filesystem over versions
@@ -101,6 +148,78 @@ pub(crate) fn list_delta_log_from_storage(
     Ok(files)
 }
 
+/// Discovers the reconstructable version bounds from an uncapped log listing.
+///
+/// Filesystem commits covered by `log_tail` are replaced by the catalog-provided entries. A
+/// version is a reconstruction anchor when it is version 0's commit or a complete checkpoint;
+/// commits contiguous after any anchor extend the latest reconstructable version.
+///
+/// Returns `None` when the listing contains no reconstruction anchor. Listing and parsing errors
+/// are propagated to the caller rather than manufacturing availability bounds.
+pub(crate) fn list_available_version_range(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    log_tail: &[ParsedLogPath],
+) -> DeltaResult<Option<AvailableVersionRange>> {
+    debug_assert!(
+        log_tail.iter().all(|entry| entry.is_commit()),
+        "log_tail should only contain commits"
+    );
+
+    let filesystem_files: Vec<_> =
+        list_delta_log_from_storage(storage, log_root, 0, Version::MAX)?.try_collect()?;
+    let checkpoint_versions: BTreeSet<_> = find_complete_checkpoint_versions(&filesystem_files)
+        .into_iter()
+        .collect();
+
+    let log_tail_start = log_tail.first().map(|entry| entry.version);
+    let mut commit_versions: BTreeSet<_> = filesystem_files
+        .iter()
+        .filter(|file| file.file_type == Commit)
+        .filter(|file| log_tail_start.is_none_or(|tail_start| file.version < tail_start))
+        .map(|file| file.version)
+        .collect();
+    commit_versions.extend(log_tail.iter().map(|entry| entry.version));
+
+    let observed_versions: Vec<_> = commit_versions
+        .union(&checkpoint_versions)
+        .copied()
+        .collect();
+    let mut reconstructable_ranges: Vec<(Version, Version)> = Vec::new();
+    for &version in &observed_versions {
+        let is_anchor = checkpoint_versions.contains(&version)
+            || (version == 0 && commit_versions.contains(&version));
+        let extends_last_range = reconstructable_ranges
+            .last()
+            .is_some_and(|(_, end)| end.checked_add(1) == Some(version));
+
+        if !is_anchor && (!extends_last_range || !commit_versions.contains(&version)) {
+            continue;
+        }
+        if extends_last_range {
+            if let Some((_, end)) = reconstructable_ranges.last_mut() {
+                *end = version;
+            }
+        } else {
+            reconstructable_ranges.push((version, version));
+        }
+    }
+
+    let Some(&(earliest, _)) = reconstructable_ranges.first() else {
+        return Ok(None);
+    };
+    let latest = reconstructable_ranges
+        .last()
+        .map(|(_, end)| *end)
+        .unwrap_or(earliest);
+    Ok(Some(AvailableVersionRange {
+        earliest,
+        latest,
+        observed_versions,
+        reconstructable_ranges,
+    }))
+}
+
 /// Groups all checkpoint parts according to the checkpoint they belong to.
 ///
 /// NOTE: There could be a single-part and/or any number of uuid-based checkpoints. They
@@ -147,9 +266,8 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
     checkpoints
 }
 
-/// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
-/// checkpoint exists. Skips 0-byte checkpoint files so they don't count toward completeness.
-fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
+/// Returns every complete checkpoint version in `files`, skipping 0-byte checkpoint files.
+fn find_complete_checkpoint_versions(ascending_files: &[ParsedLogPath]) -> Vec<Version> {
     ascending_files
         .iter()
         .filter(|f| f.is_checkpoint() && should_process_log_file(f))
@@ -162,6 +280,14 @@ fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option
                 .any(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
                 .then_some(version)
         })
+        .collect()
+}
+
+/// Returns the version of the latest complete checkpoint in `files`, or `None` if no complete
+/// checkpoint exists. Skips 0-byte checkpoint files so they don't count toward completeness.
+fn find_complete_checkpoint_version(ascending_files: &[ParsedLogPath]) -> Option<Version> {
+    find_complete_checkpoint_versions(ascending_files)
+        .into_iter()
         .last()
 }
 
@@ -577,8 +703,12 @@ impl LogSegmentFiles {
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
             // Kernel should not compensate for corrupt tables, so we fail if we can't find a
             // checkpoint
-            return Err(Error::invalid_checkpoint(
+            let source = Error::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
+            );
+            return Err(delta_errors::missing_part_files(
+                checkpoint_metadata.version,
+                source,
             ));
         };
         if latest_checkpoint.version != checkpoint_metadata.version {
@@ -588,11 +718,15 @@ impl LogSegmentFiles {
             latest_checkpoint.version
         );
         } else if listed_files.checkpoint_parts.len() != checkpoint_metadata.parts.unwrap_or(1) {
-            return Err(Error::InvalidCheckpoint(format!(
+            let source = Error::InvalidCheckpoint(format!(
                 "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
                 checkpoint_metadata.parts.unwrap_or(1),
                 listed_files.checkpoint_parts.len()
-            )));
+            ));
+            return Err(delta_errors::missing_part_files(
+                checkpoint_metadata.version,
+                source,
+            ));
         }
         Ok(listed_files)
     }

@@ -138,7 +138,7 @@ fn commit_result_to_committed_handle<S>(
             "commit failed: retryable transaction not supported in FFI (yet)",
         )),
         CommitResult::ConflictedTransaction(conflicted) => {
-            Err(delta_kernel::Error::Generic(format!(
+            Err(delta_kernel::Error::generic(format!(
                 "commit conflict at version {}",
                 conflicted.conflict_version()
             )))
@@ -1610,7 +1610,10 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             KernelError::GenericError,
-            Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
+            Some(concat!(
+                "[DELTA_KERNEL_UNCLASSIFIED] Cannot modify domains that start with 'delta.' ",
+                "as those are system controlled"
+            )),
         );
 
         unsafe { free_engine(engine) };
@@ -1658,7 +1661,10 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             KernelError::GenericError,
-            Some("Generic delta kernel error: Metadata for domain dup already specified in this transaction"),
+            Some(concat!(
+                "[DELTA_KERNEL_UNCLASSIFIED] Metadata for domain dup already specified in ",
+                "this transaction"
+            )),
         );
 
         unsafe { free_engine(engine) };
@@ -1710,7 +1716,10 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             KernelError::UnsupportedError,
-            Some("Unsupported: Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"),
+            Some(concat!(
+                "[DELTA_KERNEL_UNCLASSIFIED] Domain metadata operations require writer version ",
+                "7 and the 'domainMetadata' writer feature"
+            )),
         );
 
         unsafe { free_engine(engine) };

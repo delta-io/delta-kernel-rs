@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::metrics::events::{StorageCopyCompleted, StorageListCompleted, StorageReadCompleted};
 use crate::metrics::{emit_storage_span, MetricsIterator};
-use crate::{DeltaResult, FileMeta, FileSlice, StorageHandler};
+use crate::{EngineResult, EngineResultIteratorStatic, FileMeta, FileSlice, StorageHandler};
 
 /// Decorator over an engine-provided `Arc<dyn StorageHandler>` that emits the kernel's
 /// standard `"storage"` spans on operations that produce metrics. `put`, `head`, and `delete`
@@ -42,10 +42,7 @@ impl std::fmt::Debug for MeteredStorageHandler {
 }
 
 impl StorageHandler for MeteredStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &Url) -> EngineResult<EngineResultIteratorStatic<FileMeta>> {
         let start = Instant::now();
         let inner = self.inner.list_from(path)?;
         Ok(Box::new(MetricsIterator::<_, FileMeta>::new(
@@ -55,10 +52,7 @@ impl StorageHandler for MeteredStorageHandler {
         )))
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> EngineResult<EngineResultIteratorStatic<Bytes>> {
         let start = Instant::now();
         let inner = self.inner.read_files(files)?;
         Ok(Box::new(MetricsIterator::<_, Bytes>::new(
@@ -68,22 +62,22 @@ impl StorageHandler for MeteredStorageHandler {
         )))
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> EngineResult<()> {
         let start = Instant::now();
         let result = self.inner.copy_atomic(src, dest);
         emit_storage_span(StorageCopyCompleted::NAME, start.elapsed(), 0, 0);
         result
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> EngineResult<()> {
         self.inner.put(path, data, overwrite)
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> EngineResult<FileMeta> {
         self.inner.head(path)
     }
 
-    fn delete(&self, path: &Url) -> DeltaResult<()> {
+    fn delete(&self, path: &Url) -> EngineResult<()> {
         self.inner.delete(path)
     }
 }
@@ -104,10 +98,7 @@ mod tests {
     }
 
     impl StorageHandler for StubStorageHandler {
-        fn list_from(
-            &self,
-            _path: &Url,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        fn list_from(&self, _path: &Url) -> EngineResult<EngineResultIteratorStatic<FileMeta>> {
             let results: Vec<_> = self.list_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
@@ -115,24 +106,24 @@ mod tests {
         fn read_files(
             &self,
             _files: Vec<FileSlice>,
-        ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        ) -> EngineResult<EngineResultIteratorStatic<Bytes>> {
             let results: Vec<_> = self.read_results.iter().cloned().map(Ok).collect();
             Ok(Box::new(results.into_iter()))
         }
 
-        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> EngineResult<()> {
             Ok(())
         }
 
-        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaResult<()> {
+        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> EngineResult<()> {
             Ok(())
         }
 
-        fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        fn head(&self, _path: &Url) -> EngineResult<FileMeta> {
             unreachable!("not exercised in these tests")
         }
 
-        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+        fn delete(&self, _path: &Url) -> EngineResult<()> {
             Ok(())
         }
     }

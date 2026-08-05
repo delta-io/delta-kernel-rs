@@ -70,7 +70,7 @@
 //!
 //! // Build the [`LastCheckpointHintStats`] from the exhausted iterator state
 //! let state = std::sync::Arc::into_inner(state)
-//!     .ok_or(Error::internal_error("checkpoint state Arc still has other references"))?;
+//!     .ok_or_else(|| Error::generic("checkpoint state Arc still has other references"))?;
 //! let last_checkpoint_stats =
 //!     delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(
 //!         state,

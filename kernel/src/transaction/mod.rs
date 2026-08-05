@@ -317,7 +317,9 @@ where
             adds_expr.clone(),
             as_log_add_schema(output_schema.clone()).into(),
         )?;
-        adds_evaluator.evaluate(add_files_batch?.deref())
+        adds_evaluator
+            .evaluate(add_files_batch?.deref())
+            .map_err(Error::from)
     }))
 }
 
@@ -546,7 +548,7 @@ impl<S> Transaction<S> {
             }
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
-            Err(e @ Error::IOError(_)) => {
+            Err(e) if e.is_io_error() => {
                 // Flips the metric event from success -> failure.
                 tracing::Span::current()
                     .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
@@ -1546,11 +1548,11 @@ impl<S> Transaction<S> {
                 coalesce_stats_with_parsed,
             )?;
             let expr = Arc::new(Expression::struct_from([Expression::struct_patch(patch)?]));
-            evaluation_handler.new_expression_evaluator(
+            Ok(evaluation_handler.new_expression_evaluator(
                 input_schema.clone(),
                 expr,
                 target_schema.clone().into(),
-            )
+            )?)
         };
 
         // Build two evaluators: one for the common case where scan files do not include a
@@ -1823,7 +1825,7 @@ mod tests {
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map, CapturingReporter,
     };
-    use crate::{DeltaResultIterator, EvaluationHandler, Snapshot};
+    use crate::{DeltaResultIterator, EngineError, EvaluationHandler, Snapshot};
 
     impl Transaction {
         /// Set clustering columns for testing purposes without needing a table
@@ -1834,7 +1836,7 @@ mod tests {
         }
     }
 
-    /// A mock committer that always returns an IOError, used to test the retryable error path.
+    /// A mock committer that always returns an engine error with an I/O source.
     struct IoErrorCommitter;
 
     impl Committer for IoErrorCommitter {
@@ -1844,7 +1846,7 @@ mod tests {
             _actions: DeltaResultIterator<'_, FilteredEngineData>,
             _commit_metadata: CommitMetadata,
         ) -> DeltaResult<CommitResponse> {
-            Err(Error::IOError(std::io::Error::other("simulated IO error")))
+            Err(EngineError::from(std::io::Error::other("simulated IO error")).into())
         }
         fn is_catalog_committer(&self) -> bool {
             false
@@ -2601,10 +2603,7 @@ mod tests {
             .update_deletion_vectors(HashMap::new(), std::iter::empty())
             .expect_err("DV updates should require delta.enableDeletionVectors=true");
 
-        assert!(
-            matches!(err, Error::Unsupported(_)),
-            "unexpected error: {err}"
-        );
+        assert!(err.is_unsupported(), "unexpected error: {err}");
         assert!(
             err.to_string().contains("delta.enableDeletionVectors"),
             "error should mention the enablement property, got: {err}"
@@ -2779,7 +2778,10 @@ mod tests {
         let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
         txn = txn.with_blind_append();
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Blind append requires at least one added data file"));
         Ok(())
     }
 
@@ -2790,7 +2792,10 @@ mod tests {
         txn.set_data_change(false);
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Blind append requires data_change to be true"));
         Ok(())
     }
 
@@ -2804,7 +2809,10 @@ mod tests {
         ));
         txn.remove_files(remove_data);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Blind append cannot remove files"));
         Ok(())
     }
 
@@ -2818,7 +2826,10 @@ mod tests {
         ));
         txn.dv_matched_files.push(dv_data);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Blind append cannot update deletion vectors"));
         Ok(())
     }
 
@@ -2838,7 +2849,10 @@ mod tests {
         txn.is_blind_append = true;
         add_dummy_file(&mut txn);
         let result = txn.validate_blind_append_semantics();
-        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Blind append is not supported for create-table transactions"));
         Ok(())
     }
 
@@ -2880,7 +2894,7 @@ mod tests {
         // If it fails, it should NOT be an InvalidTransactionState error
         if let Err(e) = result {
             assert!(
-                !matches!(e, Error::InvalidTransactionState(_)),
+                !e.to_string().contains("Blind append"),
                 "Blind append validation should have passed, got: {e}"
             );
         }
@@ -2987,7 +3001,9 @@ mod tests {
                 Scalar::Array(ArrayData::try_new(score_type, [30i32])?),
             ],
         )?);
-        ArrowEvaluationHandler.create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
+        ArrowEvaluationHandler
+            .create_many(schema, &[&[1i64.into(), info1], &[2i64.into(), info2]])
+            .map_err(Into::into)
     }
 
     /// Validates that [`WriteContext::logical_to_physical`] correctly renames fields at all nesting
@@ -3179,16 +3195,14 @@ mod tests {
         // Directly test the validation method instead of committing
         let result = txn.validate_add_files_stats(&[add_files]);
 
-        assert!(
-            result.is_err(),
-            "Expected validation to fail when stats are missing for clustering columns"
+        let error = result.expect_err(
+            "Expected validation to fail when stats are missing for clustering columns",
         );
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Stats validation error") || err_msg.contains("no stats"),
-            "Expected stats validation error, got: {err_msg}"
+        assert_eq!(
+            error.as_delta_error().unwrap().code(),
+            crate::DeltaErrorCode::DeltaKernelUnclassified
         );
+        assert_eq!(error.legacy_error_kind(), Some("Other"));
     }
 
     #[test]
@@ -3261,9 +3275,8 @@ mod tests {
             .unwrap()
             .commit(&engine)
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+        assert!(err.to_string().contains(
+            "This table is path-based and cannot be committed to with a catalog committer"
         ));
     }
 
@@ -3282,9 +3295,8 @@ mod tests {
             .unwrap()
             .commit(&engine)
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Generic(e) if e.contains("This table is path-based and cannot be committed to with a catalog committer")
+        assert!(err.to_string().contains(
+            "This table is path-based and cannot be committed to with a catalog committer"
         ));
     }
 

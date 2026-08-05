@@ -357,6 +357,25 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
 
+    fn assert_generic_unclassified(
+        result: DeltaResult<DataTypeCompat>,
+        expected_source_message: &str,
+    ) {
+        let error = result.expect_err("type validation must fail");
+        let delta = error
+            .as_delta_error()
+            .expect("type validation failures must be Delta errors");
+        assert_eq!(delta.condition(), "DELTA_KERNEL_UNCLASSIFIED");
+        assert_eq!(delta.sql_state(), None);
+        assert!(delta.parameters().is_empty());
+        assert_eq!(error.legacy_error_kind(), Some("Generic"));
+        assert!(
+            delta.message().contains(expected_source_message),
+            "unexpected type-validation diagnostic: {}",
+            delta.message()
+        );
+    }
+
     #[test]
     fn accepts_safe_decimal_casts() {
         use ArrowDataType::*;
@@ -585,13 +604,13 @@ mod tests {
         )
         .is_ok());
 
-        assert_result_error_with_message(
+        assert_generic_unclassified(
             ensure_data_types(
                 &DataType::from(MapType::new(DataType::LONG, DataType::STRING, false)),
                 arrow_field.data_type(),
                 ValidationMode::Full,
             ),
-            "Generic delta kernel error: Map has nullability false in kernel and true in arrow",
+            "Map has nullability false in kernel and true in arrow",
         );
         assert_result_error_with_message(
             ensure_data_types(
@@ -625,13 +644,13 @@ mod tests {
             ),
             "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
         );
-        assert_result_error_with_message(
+        assert_generic_unclassified(
             ensure_data_types(
                 &DataType::from(ArrayType::new(DataType::LONG, true)),
                 &ArrowDataType::new_list(ArrowDataType::Int64, false),
                 ValidationMode::Full,
             ),
-            "Generic delta kernel error: List has nullability true in kernel and false in arrow",
+            "List has nullability true in kernel and false in arrow",
         );
     }
 
@@ -703,13 +722,13 @@ mod tests {
             ]),
             true,
         );
-        assert_result_error_with_message(
+        assert_generic_unclassified(
             ensure_data_types(
                 &kernel_simple,
                 arrow_nullable_mismatch_simple.data_type(),
                 ValidationMode::Full,
             ),
-            "Generic delta kernel error: w has nullability true in kernel and false in arrow",
+            "w has nullability true in kernel and false in arrow",
         );
     }
 

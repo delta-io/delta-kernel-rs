@@ -10,14 +10,16 @@ use crate::{DeltaResult, Engine, Error};
 /// Serialize and write a CRC file to storage.
 ///
 /// Serializes the [`Crc`] to JSON via serde and writes the raw bytes using the storage
-/// handler. Returns [`Error::ChecksumWriteUnsupported`] if:
+/// handler. Returns an
+/// [`DeltaErrorCode::DeltaKernelUnclassified`](crate::DeltaErrorCode::DeltaKernelUnclassified)
+/// error if:
 /// - `file_stats_state` is not `Complete` (only `Complete` CRCs have a well-defined on-disk
 ///   representation); or
 /// - `delta.enableInCommitTimestamps` is `true` but `inCommitTimestampOpt` is absent.
 ///
 /// Per the Delta protocol, writers MUST NOT overwrite existing CRC files, so this always
 /// writes with `overwrite = false`. If the file already exists, returns
-/// `Err(Error::FileAlreadyExists)`.
+/// [`EngineError::FileAlreadyExists`](crate::EngineError::FileAlreadyExists).
 pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> DeltaResult<()> {
     require!(
         crc.file_stats_state.is_complete(),
@@ -41,9 +43,9 @@ pub(crate) fn try_write_crc_file(engine: &dyn Engine, path: &Url, crc: &Crc) -> 
         )
     );
     let data = serde_json::to_vec(crc)?;
-    engine
+    Ok(engine
         .storage_handler()
-        .put(path, data.into(), false /* overwrite */)
+        .put(path, data.into(), false /* overwrite */)?)
 }
 
 #[cfg(test)]
@@ -233,7 +235,7 @@ mod tests {
 
         // Second write should fail (never overwrites)
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
-        assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
+        assert!(result.unwrap_err().is_file_already_exists());
     }
 
     #[test]
@@ -242,7 +244,10 @@ mod tests {
         let mut crc = test_crc(/* ict_supported */ true, /* ict_enabled */ true);
         crc.file_stats_state = FileStatsState::Indeterminate;
         let result = try_write_crc_file(&engine, crc_path.location.as_url(), &crc);
-        assert!(matches!(result, Err(Error::ChecksumWriteUnsupported(_))));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot write CRC file"));
     }
 
     #[rstest]
@@ -269,7 +274,7 @@ mod tests {
         } else {
             let err = result.unwrap_err();
             assert!(
-                matches!(err, Error::ChecksumWriteUnsupported(_)),
+                err.to_string().contains("Cannot write CRC file"),
                 "expected ChecksumWriteUnsupported, got: {err:?}"
             );
         }

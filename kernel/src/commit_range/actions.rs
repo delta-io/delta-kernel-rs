@@ -7,10 +7,14 @@ use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::actions::{Metadata, Protocol, COMMIT_INFO_FIELD, METADATA_FIELD, PROTOCOL_FIELD};
 use crate::commit_range::with_version_context;
 use crate::engine_data::RowVisitor as _;
+use crate::error::delta_errors;
 use crate::path::ParsedLogPath;
 use crate::schema::{lazy_schema_ref, SchemaRef};
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{ensure_table_can_be_read, Operation};
+use crate::table_features::{
+    ensure_table_can_be_read, Operation, MAX_VALID_READER_VERSION, MAX_VALID_WRITER_VERSION,
+    MIN_VALID_RW_VERSION,
+};
 use crate::{DeltaResult, Engine, Error, FileDataReadResultIterator, Version};
 
 /// A Delta log action kind.
@@ -207,9 +211,31 @@ impl CommitAction {
     fn protocol_validation(&self, table_config: &Option<TableConfiguration>) -> DeltaResult<()> {
         match (table_config, &self.protocol) {
             (Some(table_config), _) => table_config.ensure_operation_supported(Operation::Scan),
+            (None, Some(protocol)) if protocol.min_reader_version() > MAX_VALID_READER_VERSION => {
+                Err(self.invalid_protocol_version_error(protocol))
+            }
             (None, Some(protocol)) => ensure_table_can_be_read(protocol),
             (None, None) => Ok(()),
         }
+    }
+
+    fn invalid_protocol_version_error(&self, protocol: &Protocol) -> Error {
+        let supported_readers = (MIN_VALID_RW_VERSION..=MAX_VALID_READER_VERSION)
+            .map(|version| version.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let supported_writers = (MIN_VALID_RW_VERSION..=MAX_VALID_WRITER_VERSION)
+            .map(|version| version.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        delta_errors::invalid_protocol_version(
+            self.table_root.as_str(),
+            protocol.min_reader_version(),
+            protocol.min_writer_version(),
+            env!("CARGO_PKG_VERSION"),
+            supported_readers,
+            supported_writers,
+        )
     }
 
     /// Return an iterator over the commit's action batches projected to the
@@ -218,10 +244,10 @@ impl CommitAction {
     /// Batches contain raw actions exactly as recorded in the commit JSON; no column-mapping
     /// translation is applied.
     pub fn get_actions(&self, engine: &dyn Engine) -> DeltaResult<FileDataReadResultIterator> {
-        engine.json_handler().read_json_files(
+        Ok(engine.json_handler().read_json_files(
             slice::from_ref(&self.log_path.location),
             self.read_schema.clone(),
             None,
-        )
+        )?)
     }
 }

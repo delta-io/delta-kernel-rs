@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{self, Error, ObjectStore};
-use delta_kernel::Error as DeltaError;
+use delta_kernel::{EngineError, Error as DeltaError};
 use url::Url;
 
 /// Alias for convenience
@@ -97,12 +97,12 @@ where
                 .into_iter()
                 .map(|(k, v)| (k.as_ref().to_string(), v.into()))
                 .collect();
-            handler(url, options)?
+            handler(url, options).map_err(EngineError::from)?
         } else {
-            object_store::parse_url_opts(url, options)?
+            object_store::parse_url_opts(url, options).map_err(EngineError::from)?
         }
     } else {
-        object_store::parse_url_opts(url, options)?
+        object_store::parse_url_opts(url, options).map_err(EngineError::from)?
     };
 
     Ok(Arc::new(store))
@@ -162,17 +162,15 @@ mod tests {
         // Currently constructing an [HdfsObjectStore] won't work if there isn't an actual HDFS
         // to connect to, so the only way to really verify that we got the object store we
         // expected is to inspect the `store` on the error v_v
-        match store_from_url_opts(&url, options) {
-            Err(delta_kernel::Error::ObjectStore(object_store::Error::Generic {
-                store,
-                source: _,
-            })) => {
-                assert_eq!(store, "HdfsObjectStore");
-            }
-            Err(unexpected) => panic!("Unexpected error happened: {unexpected:?}"),
-            Ok(_) => {
-                panic!("Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS");
-            }
-        }
+        let error = store_from_url_opts(&url, options)
+            .expect_err("HdfsObjectStore construction must fail without an available HDFS service");
+        let source = error
+            .as_engine_error()
+            .and_then(std::error::Error::source)
+            .and_then(|source| source.downcast_ref::<object_store::Error>());
+        assert!(
+            matches!(source, Some(object_store::Error::Generic { store, .. }) if *store == "HdfsObjectStore"),
+            "unexpected error: {error:?}"
+        );
     }
 }

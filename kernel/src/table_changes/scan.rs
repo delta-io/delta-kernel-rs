@@ -294,7 +294,7 @@ fn read_scan_file(
         let batch = batch?;
         // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
-            eval.evaluate(batch.as_ref())
+            eval.evaluate(batch.as_ref()).map_err(Error::from)
         } else {
             // No transformation needed - pass through the batch as-is
             Ok(batch)

@@ -7,7 +7,9 @@ use itertools::Itertools as _;
 use url::Url;
 
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{
+    EngineError, EngineResult, EngineResultIteratorStatic, FileMeta, FileSlice, StorageHandler,
+};
 
 /// A [`StorageHandler`] that delegates to a [`PlanExecutor`].
 pub struct PlanBasedStorageHandler {
@@ -19,52 +21,50 @@ impl PlanBasedStorageHandler {
         Self { executor }
     }
 
-    fn execute_io(&self, op: IoOperation) -> DeltaResult<PlanResult> {
+    fn execute_io(&self, op: IoOperation) -> EngineResult<PlanResult> {
         self.executor.execute_op(Operation::IoOperation(op))
     }
 }
 
 impl StorageHandler for PlanBasedStorageHandler {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        Ok(self
+    fn list_from(&self, path: &Url) -> EngineResult<EngineResultIteratorStatic<FileMeta>> {
+        let files = self
             .execute_io(IoOperation::file_listing(path.clone()))?
-            .into_file_meta()?)
+            .into_file_meta()?;
+        Ok(files)
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        Ok(self
+    fn read_files(&self, files: Vec<FileSlice>) -> EngineResult<EngineResultIteratorStatic<Bytes>> {
+        let bytes = self
             .execute_io(IoOperation::read_bytes(files))?
-            .into_bytes()?)
+            .into_bytes()?;
+        Ok(bytes)
     }
 
-    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> EngineResult<()> {
         self.execute_io(IoOperation::atomic_copy(src.clone(), dest.clone()))?
             .into_unit()
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> EngineResult<()> {
         self.execute_io(IoOperation::write_bytes(path.clone(), data, overwrite))?
             .into_unit()
     }
 
-    fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, path: &Url) -> EngineResult<FileMeta> {
         self.execute_io(IoOperation::head_file(path.clone()))?
             .into_file_meta()?
             .exactly_one()
-            .map_err(|e| Error::generic(format!("Expected exactly one file meta: {e}")))?
+            .map_err(|error| {
+                EngineError::other(format!("Expected exactly one file meta: {error}"))
+            })?
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> EngineResult<()> {
         // TODO(#2820): implement here once supported as IoOperation.
         // Intentionally do not use a fallback because we expect this SHOULD be implemented via
         // plan-execution.
-        Err(Error::unsupported(
+        Err(EngineError::other(
             "PlanBasedStorageHandler does not yet implement delete",
         ))
     }
@@ -84,7 +84,7 @@ mod tests {
 
     use super::PlanBasedStorageHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
-    use crate::{Error, StorageHandler as _};
+    use crate::{EngineErrorKind, StorageHandler as _};
 
     fn make_handler() -> PlanBasedStorageHandler {
         PlanBasedStorageHandler::new(Arc::new(SyncPlanExecutor::default()))
@@ -147,7 +147,7 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from_static(b"second"), false)
             .unwrap_err();
-        assert!(matches!(err, Error::FileAlreadyExists(_)));
+        assert_eq!(err.kind(), EngineErrorKind::FileAlreadyExists);
 
         // With `overwrite = true`, the second write succeeds.
         storage
@@ -169,6 +169,6 @@ mod tests {
         // Errors on missing file
         let url = Url::from_file_path(tmp.path().join("missing.json")).unwrap();
         let err = make_handler().head(&url).unwrap_err();
-        assert!(matches!(err, Error::FileNotFound(_)));
+        assert_eq!(err.kind(), EngineErrorKind::FileNotFound);
     }
 }

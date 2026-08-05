@@ -130,7 +130,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
             vec![],
             &delta_kernel::arrow::array::RecordBatchOptions::new().with_row_count(Some(n_rows)),
         )
-        .map_err(|e| Error::Generic(format!("zero-arg opaque eval batch construction: {e}")));
+        .map_err(|e| Error::generic(format!("zero-arg opaque eval batch construction: {e}")));
     }
 
     let arrays: Vec<ArrayRef> = args
@@ -149,7 +149,7 @@ fn evaluate_args(args: &[Expression], batch: &RecordBatch) -> DeltaResult<Record
     let schema = Arc::new(Schema::new(fields));
 
     RecordBatch::try_new(schema, arrays)
-        .map_err(|e| Error::Generic(format!("opaque eval batch construction: {e}")))
+        .map_err(|e| Error::generic(format!("opaque eval batch construction: {e}")))
 }
 
 /// Lift a column type hint from the first `Literal` arg (kernel-native lifts the same way from
@@ -214,7 +214,7 @@ fn evaluate_struct_arg(fields: &[ExpressionRef], batch: &RecordBatch) -> DeltaRe
         .collect();
     StructArray::try_new(arrow_fields, arrays, None)
         .map(|sa| Arc::new(sa) as ArrayRef)
-        .map_err(|e| Error::Generic(format!("struct arg construction: {e}")))
+        .map_err(|e| Error::generic(format!("struct arg construction: {e}")))
 }
 
 /// Import an engine-produced `ArrowFFIData` into an `ArrayRef`, consuming the Arrow C Data
@@ -224,8 +224,8 @@ fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
     // slot. This check is load-bearing: `from_ffi` asserts on the empty structs' null pointers,
     // and kernel must never panic -- so reject the unpopulated case with an error up front.
     if ffi.array.is_released() {
-        return Err(Error::Generic(
-            "engine callback returned success but no result array".into(),
+        return Err(Error::generic(
+            "engine callback returned success but no result array",
         ));
     }
 
@@ -234,13 +234,13 @@ fn import_ffi_array(ffi: ArrowFFIData) -> DeltaResult<ArrayRef> {
     // SAFETY: the engine promised these structs are valid Arrow C Data
     // Interface payloads it produced and handed to us.
     let array_data = unsafe { from_ffi(array, &schema) }
-        .map_err(|e| Error::Generic(format!("from_ffi: {e}")))?;
+        .map_err(|e| Error::generic(format!("from_ffi: {e}")))?;
     Ok(make_array(array_data))
 }
 
 fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<BooleanArray> {
     if arr.len() != expected_rows {
-        return Err(Error::Generic(format!(
+        return Err(Error::generic(format!(
             "opaque predicate eval_pred returned {} rows, expected {expected_rows}",
             arr.len()
         )));
@@ -249,7 +249,7 @@ fn require_boolean_array(arr: ArrayRef, expected_rows: usize) -> DeltaResult<Boo
         .downcast_ref::<BooleanArray>()
         .cloned()
         .ok_or_else(|| {
-            Error::Generic(format!(
+            Error::generic(format!(
                 "opaque predicate eval_pred returned non-boolean array of type {:?}",
                 arr.data_type()
             ))
@@ -286,7 +286,7 @@ fn call_eval_pred(
         EngineExecResult::Success(result_ffi) => result_ffi,
         EngineExecResult::Failure(err) => return Err(err.into()),
         EngineExecResult::Uninit => {
-            return Err(Error::Generic(format!(
+            return Err(Error::generic(format!(
                 "engine opaque-eval callback for `{op_name}` returned without writing a result"
             )))
         }

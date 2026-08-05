@@ -12,13 +12,53 @@ use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaErrorCode, DeltaResult};
 use delta_kernel_workloads::models::{ReadExpected, SnapshotExpected};
 use itertools::Itertools;
 use tracing::debug;
 
 use super::workload::{ReadResult, SnapshotResult};
 use crate::data::assert_data_matches;
+
+const STRUCTURED_ERROR_CODES: &[DeltaErrorCode] = &[
+    DeltaErrorCode::DeltaLogAlreadyExists,
+    DeltaErrorCode::DeltaVersionNotFound,
+    DeltaErrorCode::DeltaMissingPartFiles,
+    DeltaErrorCode::DeltaStateRecoverError,
+    DeltaErrorCode::DeltaInvalidProtocolVersion,
+    DeltaErrorCode::DeltaUnsupportedFeaturesForRead,
+    DeltaErrorCode::DeltaUnsupportedFeaturesForWrite,
+    DeltaErrorCode::DeltaVersionsNotContiguous,
+    DeltaErrorCode::DeltaKernelUnclassified,
+];
+
+fn validate_error_condition(
+    actual: Option<&str>,
+    expected: &str,
+    rendered_error: &str,
+) -> Result<(), String> {
+    if !is_structured_condition(expected) {
+        return Ok(());
+    }
+
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(format!(
+            "Error condition mismatch: expected '{expected}', got '{actual}'. Error: \
+             {rendered_error}"
+        )),
+        None => Err(format!(
+            "Expected Delta error condition '{expected}', but got an engine-originated error: \
+             {rendered_error}"
+        )),
+    }
+}
+
+fn is_structured_condition(condition: &str) -> bool {
+    STRUCTURED_ERROR_CODES
+        .iter()
+        .any(|code| code.condition() == condition)
+}
 
 /// Read expected data from parquet files in expected_dir/expected_data/.
 fn read_expected_data(expected_dir: &Path) -> Result<RecordBatch, String> {
@@ -111,6 +151,13 @@ pub fn validate_read_result(
             Ok(())
         }
         (Err(kernel_err), ReadExpected::Error { error }) => {
+            validate_error_condition(
+                kernel_err
+                    .as_delta_error()
+                    .map(|delta_error| delta_error.condition()),
+                &error.error_code,
+                &kernel_err.to_string(),
+            )?;
             debug!(
                 "Got expected error '{}' with message: {:?}\nKernel error: {}",
                 error.error_code, error.error_message, kernel_err
@@ -149,6 +196,13 @@ pub fn validate_snapshot(
             Ok(())
         }
         (Err(kernel_err), SnapshotExpected::Error { error }) => {
+            validate_error_condition(
+                kernel_err
+                    .as_delta_error()
+                    .map(|delta_error| delta_error.condition()),
+                &error.error_code,
+                &kernel_err.to_string(),
+            )?;
             debug!(
                 "Got expected error '{}' with message: {:?}\nKernel error: {}",
                 error.error_code, error.error_message, kernel_err
@@ -162,5 +216,72 @@ pub fn validate_snapshot(
         (Err(e), SnapshotExpected::Success { .. }) => {
             Err(format!("Expected success but got error: {}", e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_error_condition, STRUCTURED_ERROR_CODES};
+
+    #[test]
+    fn matching_error_condition_is_accepted() {
+        assert_eq!(
+            validate_error_condition(
+                Some("DELTA_VERSION_NOT_FOUND"),
+                "DELTA_VERSION_NOT_FOUND",
+                "error"
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn mismatched_error_condition_reports_expected_and_actual() {
+        let error = validate_error_condition(
+            Some("DELTA_STATE_RECOVER_ERROR"),
+            "DELTA_VERSION_NOT_FOUND",
+            "rendered error",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("expected 'DELTA_VERSION_NOT_FOUND'"));
+        assert!(error.contains("got 'DELTA_STATE_RECOVER_ERROR'"));
+    }
+
+    #[test]
+    fn every_structured_condition_is_compared_exactly() {
+        for code in STRUCTURED_ERROR_CODES {
+            let expected = code.condition();
+            let error =
+                validate_error_condition(Some("OTHER_CONDITION"), expected, "error").unwrap_err();
+
+            assert!(error.contains(&format!("expected '{expected}'")));
+            assert!(error.contains("got 'OTHER_CONDITION'"));
+        }
+    }
+
+    #[test]
+    fn engine_error_cannot_satisfy_expected_delta_condition() {
+        let error = validate_error_condition(None, "DELTA_VERSION_NOT_FOUND", "storage failed")
+            .unwrap_err();
+
+        assert!(error.contains("engine-originated error"));
+        assert!(error.contains("DELTA_VERSION_NOT_FOUND"));
+    }
+
+    #[test]
+    fn unimplemented_expected_condition_accepts_any_error() {
+        assert_eq!(
+            validate_error_condition(
+                Some("DELTA_KERNEL_UNCLASSIFIED"),
+                "DELTA_TABLE_NOT_FOUND",
+                "rendered error"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_error_condition(None, "UNRESOLVED_COLUMN", "storage failed"),
+            Ok(())
+        );
     }
 }

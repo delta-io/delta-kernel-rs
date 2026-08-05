@@ -7,7 +7,9 @@ use url::Url;
 use super::{put_bytes, resolve_scope};
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::{
+    EngineError, EngineResult, EngineResultIteratorStatic, FileMeta, FileSlice, StorageHandler,
+};
 
 pub(crate) struct SyncStorageHandler {
     store: Option<Arc<DynObjectStore>>,
@@ -28,11 +30,9 @@ impl SyncStorageHandler {
 }
 
 impl StorageHandler for SyncStorageHandler {
-    fn list_from(
-        &self,
-        url_path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)?;
+    fn list_from(&self, url_path: &Url) -> EngineResult<EngineResultIteratorStatic<FileMeta>> {
+        let (store, base_url, offset) = resolve_scope(self.store.as_ref(), url_path)
+            .map_err(|error| super::adapter_error("Storage URL resolution failed", error))?;
 
         // For directory URLs, prefix == offset and the offset acts as a lower bound that still
         // includes everything underneath (since `dir/a` > `dir` lexicographically). For file
@@ -57,9 +57,9 @@ impl StorageHandler for SyncStorageHandler {
         metas.sort_unstable_by(|a, b| a.location.cmp(&b.location));
 
         let iter = metas.into_iter().map(move |meta| {
-            let location = base_url
-                .join(meta.location.as_ref())
-                .map_err(|e| Error::generic(format!("Failed to construct URL: {e}")))?;
+            let location = base_url.join(meta.location.as_ref()).map_err(|error| {
+                EngineError::other("Failed to construct URL").with_source(error)
+            })?;
             Ok(FileMeta {
                 location,
                 last_modified: meta.last_modified.timestamp_millis(),
@@ -69,15 +69,14 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(iter))
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+    fn read_files(&self, files: Vec<FileSlice>) -> EngineResult<EngineResultIteratorStatic<Bytes>> {
         let store = self.store.clone();
-        let results: Vec<DeltaResult<Bytes>> = files
+        let results: Vec<EngineResult<Bytes>> = files
             .into_iter()
             .map(|(url, _range_opt)| {
-                let (s, _, path) = resolve_scope(store.as_ref(), &url)?;
+                let (s, _, path) = resolve_scope(store.as_ref(), &url).map_err(|error| {
+                    super::adapter_error("Storage URL resolution failed", error)
+                })?;
                 let get_result = futures::executor::block_on(s.get(&path))?;
                 Ok(futures::executor::block_on(get_result.bytes())?)
             })
@@ -85,16 +84,20 @@ impl StorageHandler for SyncStorageHandler {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> EngineResult<()> {
         put_bytes(self.store.as_ref(), path, data, overwrite)
+            .map_err(|error| super::adapter_error("Storage write failed", error))
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
-        unimplemented!("SyncStorageHandler does not implement copy");
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> EngineResult<()> {
+        Err(EngineError::other(
+            "SyncStorageHandler does not implement copy",
+        ))
     }
 
-    fn head(&self, url: &Url) -> DeltaResult<FileMeta> {
-        let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
+    fn head(&self, url: &Url) -> EngineResult<FileMeta> {
+        let (store, _, path) = resolve_scope(self.store.as_ref(), url)
+            .map_err(|error| super::adapter_error("Storage URL resolution failed", error))?;
         let meta = futures::executor::block_on(store.head(&path))?;
         Ok(FileMeta {
             location: url.clone(),
@@ -103,8 +106,9 @@ impl StorageHandler for SyncStorageHandler {
         })
     }
 
-    fn delete(&self, url: &Url) -> DeltaResult<()> {
-        let (store, _, path) = resolve_scope(self.store.as_ref(), url)?;
+    fn delete(&self, url: &Url) -> EngineResult<()> {
+        let (store, _, path) = resolve_scope(self.store.as_ref(), url)
+            .map_err(|error| super::adapter_error("Storage URL resolution failed", error))?;
         match futures::executor::block_on(store.delete(&path)) {
             Ok(()) => Ok(()),
             Err(crate::object_store::Error::NotFound { .. }) => Ok(()),
@@ -115,6 +119,7 @@ impl StorageHandler for SyncStorageHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::fs::File;
     use std::io::Write;
     use std::time::Duration;
@@ -127,7 +132,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::ObjectStoreExt as _;
     use crate::utils::current_time_duration;
-    use crate::{Error, StorageHandler};
+    use crate::{EngineErrorKind, StorageHandler};
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
@@ -256,6 +261,32 @@ mod tests {
         assert_eq!(names, vec!["/a/file1.json", "/a/sub/file2.json"]);
     }
 
+    #[tokio::test]
+    async fn list_from_preserves_url_parse_error_source() {
+        let store = std::sync::Arc::new(InMemory::new());
+        store
+            .put(
+                &crate::object_store::path::Path::from("opaque/file"),
+                bytes::Bytes::from("x").into(),
+            )
+            .await
+            .unwrap();
+
+        let storage = SyncStorageHandler::new(Some(store));
+        let url = Url::parse("memory:opaque").unwrap();
+        let error = storage
+            .list_from(&url)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(error.kind(), EngineErrorKind::Other);
+        assert!(error
+            .source()
+            .is_some_and(|source| source.is::<url::ParseError>()));
+    }
+
     #[test]
     fn head_local_returns_metadata() {
         let storage = SyncStorageHandler::new(None);
@@ -274,10 +305,7 @@ mod tests {
         let storage = SyncStorageHandler::new(None);
         let tmp_dir = tempfile::tempdir().unwrap();
         let url = Url::from_file_path(tmp_dir.path().join("missing.json")).unwrap();
-        assert!(matches!(
-            storage.head(&url).unwrap_err(),
-            Error::FileNotFound(_)
-        ));
+        assert!(storage.head(&url).unwrap_err().is_file_not_found());
     }
 
     #[tokio::test]
@@ -315,7 +343,7 @@ mod tests {
         let err = storage
             .put(&url, bytes::Bytes::from("second"), false)
             .unwrap_err();
-        assert!(matches!(err, Error::FileAlreadyExists(_)));
+        assert!(err.is_file_already_exists());
 
         // With overwrite, it should succeed.
         storage
@@ -339,10 +367,7 @@ mod tests {
             .unwrap();
         storage.delete(&url).unwrap();
 
-        assert!(matches!(
-            storage.head(&url).unwrap_err(),
-            Error::FileNotFound(_)
-        ));
+        assert!(storage.head(&url).unwrap_err().is_file_not_found());
     }
 
     #[tokio::test]
@@ -351,10 +376,7 @@ mod tests {
         let storage = SyncStorageHandler::new(Some(store));
         let url = Url::parse("memory:///missing.json").unwrap();
 
-        assert!(matches!(
-            storage.head(&url).unwrap_err(),
-            Error::FileNotFound(_)
-        ));
+        assert!(storage.head(&url).unwrap_err().is_file_not_found());
         storage.delete(&url).unwrap();
     }
 }

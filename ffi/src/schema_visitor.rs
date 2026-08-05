@@ -1363,7 +1363,7 @@ mod tests {
             };
             assert_eq!(
                 msg,
-                "Generic delta kernel error: Delta Map keys may not be nullable"
+                "[DELTA_KERNEL_UNCLASSIFIED] Delta Map keys may not be nullable"
             );
             std::ptr::null_mut()
         }

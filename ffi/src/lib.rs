@@ -60,6 +60,8 @@ pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
+#[cfg(feature = "default-engine-base")]
+use error::{ErrorAllocator, FfiErrorAllocatorV2};
 #[cfg(feature = "delta-kernel-unity-catalog")]
 pub mod delta_kernel_unity_catalog;
 pub mod expressions;
@@ -595,7 +597,7 @@ pub struct SharedExternEngine;
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
-    allocate_error: AllocateErrorFn,
+    error_allocator: ErrorAllocator,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -630,7 +632,7 @@ impl ExternEngine for ExternEngineVtable {
         self.engine.clone()
     }
     fn error_allocator(&self) -> &dyn AllocateError {
-        &self.allocate_error
+        &self.error_allocator
     }
 }
 
@@ -662,7 +664,7 @@ pub(crate) enum ObjectStoreBackend {
 #[cfg(feature = "default-engine-base")]
 pub struct EngineBuilder {
     url: Url,
-    allocate_fn: AllocateErrorFn,
+    error_allocator: ErrorAllocator,
     options: HashMap<String, String>,
     object_store_backend: ObjectStoreBackend,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
@@ -712,17 +714,41 @@ pub unsafe extern "C" fn get_engine_builder(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<*mut EngineBuilder> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_engine_builder_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let error_allocator = ErrorAllocator::from(allocate_error);
+    get_engine_builder_impl(url, error_allocator).into_extern_result(&error_allocator)
+}
+
+/// Get a builder that reports outbound errors through a structured V2 allocator.
+///
+/// The returned builder supports URL-scheme object stores. Configuring a REST object store on it
+/// returns a structured error because REST callbacks still use the V1 allocator contract.
+///
+/// # Safety
+///
+/// `path` must be a valid UTF-8 string slice. The allocator callback and its caller-owned context
+/// must remain valid, support concurrent calls, and not unwind for the lifetimes of the returned
+/// builder, the resulting engine, and every derived handle or object that retains that engine.
+/// Releasing the caller's engine handle does not end this requirement while a derived object still
+/// retains the engine.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn get_engine_builder_v2(
+    path: KernelStringSlice,
+    error_allocator: FfiErrorAllocatorV2,
+) -> ExternResult<*mut EngineBuilder> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let error_allocator = ErrorAllocator::from(error_allocator);
+    get_engine_builder_impl(url, error_allocator).into_extern_result(&error_allocator)
 }
 
 #[cfg(feature = "default-engine-base")]
 fn get_engine_builder_impl(
     url: DeltaResult<Url>,
-    allocate_fn: AllocateErrorFn,
+    error_allocator: ErrorAllocator,
 ) -> DeltaResult<*mut EngineBuilder> {
     let builder = Box::new(EngineBuilder {
         url: url?,
-        allocate_fn,
+        error_allocator,
         options: HashMap::default(),
         object_store_backend: ObjectStoreBackend::default(),
         multithreaded_executor_config: None,
@@ -743,7 +769,7 @@ pub unsafe extern "C" fn set_builder_option(
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) -> ExternResult<bool> {
-    set_builder_option_impl(builder, key, value).into_extern_result(&builder.allocate_fn)
+    set_builder_option_impl(builder, key, value).into_extern_result(&builder.error_allocator)
 }
 #[cfg(feature = "default-engine-base")]
 fn set_builder_option_impl(
@@ -830,7 +856,7 @@ pub unsafe extern "C" fn set_builder_rest_object_store(
     context: NullableCvoid,
 ) -> ExternResult<bool> {
     set_builder_rest_object_store_impl(builder, endpoint_config, callback, context)
-        .into_extern_result(&builder.allocate_fn)
+        .into_extern_result(&builder.error_allocator)
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -840,6 +866,11 @@ fn set_builder_rest_object_store_impl(
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
 ) -> DeltaResult<bool> {
+    let Some(allocate_error) = builder.error_allocator.v1() else {
+        return Err(delta_kernel::Error::generic(
+            "REST object stores do not yet support the V2 error allocator",
+        ));
+    };
     // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
     let endpoint_config = unsafe { endpoint_config.as_ref() }
         .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
@@ -848,7 +879,7 @@ fn set_builder_rest_object_store_impl(
             endpoint_config,
             callback,
             context,
-            builder.allocate_fn,
+            allocate_error,
         )?));
     Ok(true)
 }
@@ -873,9 +904,9 @@ pub unsafe extern "C" fn builder_build(
         builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
         builder_box.io_config,
-        builder_box.allocate_fn,
+        builder_box.error_allocator,
     )
-    .into_extern_result(&builder_box.allocate_fn)
+    .into_extern_result(&builder_box.error_allocator)
 }
 
 /// # Safety
@@ -888,14 +919,34 @@ pub unsafe extern "C" fn get_default_engine(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    get_default_default_engine_impl(url, allocate_error).into_extern_result(&allocate_error)
+    let error_allocator = ErrorAllocator::from(allocate_error);
+    get_default_default_engine_impl(url, error_allocator).into_extern_result(&error_allocator)
+}
+
+/// Construct a URL-scheme default engine that reports errors through a structured V2 allocator.
+///
+/// # Safety
+///
+/// `path` must be a valid UTF-8 string slice. The allocator callback and its caller-owned context
+/// must remain valid, support concurrent calls, and not unwind for the lifetimes of the returned
+/// engine and every derived handle or object that retains it. Releasing the caller's engine handle
+/// does not end this requirement while a derived object still retains the engine.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn get_default_engine_v2(
+    path: KernelStringSlice,
+    error_allocator: FfiErrorAllocatorV2,
+) -> ExternResult<Handle<SharedExternEngine>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let error_allocator = ErrorAllocator::from(error_allocator);
+    get_default_default_engine_impl(url, error_allocator).into_extern_result(&error_allocator)
 }
 
 // get the default version of the default engine :)
 #[cfg(feature = "default-engine-base")]
 fn get_default_default_engine_impl(
     url: DeltaResult<Url>,
-    allocate_error: AllocateErrorFn,
+    error_allocator: ErrorAllocator,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     get_default_engine_impl(
         url?,
@@ -903,21 +954,32 @@ fn get_default_default_engine_impl(
         ObjectStoreBackend::default(),
         None,
         IoConcurrencyConfig::default(),
-        allocate_error,
+        error_allocator,
     )
 }
 
 /// Safety
 ///
 /// Caller must free this handle to prevent memory leaks
-#[cfg(feature = "default-engine-base")]
+#[cfg(all(
+    feature = "default-engine-base",
+    any(test, feature = "declarative-plans")
+))]
 fn engine_to_handle(
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
 ) -> Handle<SharedExternEngine> {
+    engine_to_handle_with_allocator(engine, allocate_error.into())
+}
+
+#[cfg(feature = "default-engine-base")]
+fn engine_to_handle_with_allocator(
+    engine: Arc<dyn Engine>,
+    error_allocator: ErrorAllocator,
+) -> Handle<SharedExternEngine> {
     let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
         engine,
-        allocate_error,
+        error_allocator,
     });
     engine.into()
 }
@@ -933,7 +995,7 @@ fn get_default_engine_impl(
     object_store_backend: ObjectStoreBackend,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
+    error_allocator: ErrorAllocator,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
@@ -943,17 +1005,17 @@ fn get_default_engine_impl(
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }
     };
-    build_engine_from_store(store, executor_config, io_config, allocate_error)
+    build_engine_from_store_with_allocator(store, executor_config, io_config, error_allocator)
 }
 
 /// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
 /// tuning. Shared by the URL-scheme and REST engine builder paths.
 #[cfg(feature = "default-engine-base")]
-pub(crate) fn build_engine_from_store(
+fn build_engine_from_store_with_allocator(
     store: Arc<dyn ObjectStore>,
     executor_config: Option<MultithreadedExecutorConfig>,
     io_config: IoConcurrencyConfig,
-    allocate_error: AllocateErrorFn,
+    error_allocator: ErrorAllocator,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
 
@@ -985,9 +1047,14 @@ pub(crate) fn build_engine_from_store(
         Arc::new(builder.build())
     };
 
-    Ok(engine_to_handle(engine, allocate_error))
+    Ok(engine_to_handle_with_allocator(engine, error_allocator))
 }
 
+/// Release the caller's engine handle.
+///
+/// Derived handles or objects may retain the engine. For a V2 error allocator, its callback and
+/// caller-owned context must remain valid until those derived values are also released.
+///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
@@ -1899,6 +1966,8 @@ impl<T> Default for ReferenceSet<T> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
@@ -1917,7 +1986,10 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::error::{EngineError, KernelError};
+    use crate::error::{
+        EngineError, FfiErrorAllocatorV2, FfiErrorDescriptorV1, KernelError,
+        FFI_ERROR_ORIGIN_KERNEL, FFI_ERROR_ORIGIN_UNKNOWN,
+    };
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
         ok_or_panic, recover_string, setup_snapshot,
@@ -1926,6 +1998,90 @@ mod tests {
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
         std::ptr::null_mut()
+    }
+
+    #[derive(Default)]
+    struct V2CallbackState {
+        calls: AtomicUsize,
+        descriptor_version: AtomicU32,
+        origin: AtomicU32,
+        captured: Mutex<Option<CapturedV2Descriptor>>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CapturedV2Descriptor {
+        condition: Option<String>,
+        sql_state: Option<String>,
+        parameters: Vec<(String, String)>,
+    }
+
+    unsafe fn copy_v2_string(value: &KernelStringSlice) -> String {
+        if value.len == 0 {
+            return String::new();
+        }
+        // SAFETY: V2 descriptor strings are valid for the duration of the allocator callback.
+        let bytes = unsafe { std::slice::from_raw_parts(value.ptr.cast(), value.len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    unsafe fn copy_v2_optional(value: &OptionalValue<KernelStringSlice>) -> Option<String> {
+        match value {
+            // SAFETY: The descriptor owns this borrowed slice for the callback duration.
+            OptionalValue::Some(value) => Some(unsafe { copy_v2_string(value) }),
+            OptionalValue::None => None,
+        }
+    }
+
+    extern "C" fn capture_v2_error(
+        context: NullableCvoid,
+        descriptor: *const FfiErrorDescriptorV1,
+    ) -> *mut EngineError {
+        let (Some(context), Some(descriptor)) = (context, unsafe { descriptor.as_ref() }) else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: The test keeps this state alive until after the engine is freed.
+        let state = unsafe { &*context.as_ptr().cast::<V2CallbackState>() };
+        state.calls.fetch_add(1, Ordering::Relaxed);
+        state
+            .descriptor_version
+            .store(descriptor.descriptor_version, Ordering::Relaxed);
+        state.origin.store(descriptor.origin, Ordering::Relaxed);
+        let parameter_refs = if descriptor.parameter_count == 0 {
+            &[]
+        } else {
+            // SAFETY: The descriptor contract guarantees `parameter_count` valid entries.
+            unsafe { std::slice::from_raw_parts(descriptor.parameters, descriptor.parameter_count) }
+        };
+        let parameters = parameter_refs
+            .iter()
+            .map(|parameter| {
+                // SAFETY: Parameter strings share the descriptor callback lifetime.
+                unsafe {
+                    (
+                        copy_v2_string(&parameter.name),
+                        copy_v2_string(&parameter.value),
+                    )
+                }
+            })
+            .collect();
+        let captured = CapturedV2Descriptor {
+            // SAFETY: Optional descriptor strings share the descriptor callback lifetime.
+            condition: unsafe { copy_v2_optional(&descriptor.condition) },
+            // SAFETY: See `condition`.
+            sql_state: unsafe { copy_v2_optional(&descriptor.sql_state) },
+            parameters,
+        };
+        if let Ok(mut slot) = state.captured.lock() {
+            *slot = Some(captured);
+        }
+        std::ptr::null_mut()
+    }
+
+    fn v2_allocator(state: &mut V2CallbackState) -> FfiErrorAllocatorV2 {
+        FfiErrorAllocatorV2 {
+            context: Some(NonNull::from(state).cast()),
+            allocate: capture_v2_error,
+        }
     }
 
     #[test]
@@ -2039,6 +2195,175 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v2_derived_builder_retains_allocator_after_engine_handle_is_freed() {
+        let mut state = V2CallbackState::default();
+        let path = "memory:///doesntmatter/foo";
+        let builder = unsafe {
+            match get_engine_builder_v2(kernel_string_slice!(path), v2_allocator(&mut state)) {
+                ExternResult::Ok(builder) => builder,
+                ExternResult::Err(_) => panic!("V2 engine builder creation failed"),
+            }
+        };
+        let engine = unsafe {
+            match builder_build(builder) {
+                ExternResult::Ok(engine) => engine,
+                ExternResult::Err(_) => panic!("V2 engine build failed"),
+            }
+        };
+
+        let snapshot_builder = unsafe {
+            ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+            ))
+        };
+        unsafe { free_engine(engine) };
+        let result = unsafe { snapshot_builder_build(snapshot_builder) };
+        assert!(matches!(result, ExternResult::Err(error) if error.is_null()));
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.descriptor_version.load(Ordering::Relaxed), 1);
+        assert_ne!(
+            state.origin.load(Ordering::Relaxed),
+            FFI_ERROR_ORIGIN_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn get_default_engine_v2_builds_url_scheme_engine() {
+        let mut state = V2CallbackState::default();
+        let path = "memory:///doesntmatter/foo";
+        let engine = unsafe {
+            match get_default_engine_v2(kernel_string_slice!(path), v2_allocator(&mut state)) {
+                ExternResult::Ok(engine) => engine,
+                ExternResult::Err(_) => panic!("V2 default engine creation failed"),
+            }
+        };
+
+        unsafe { free_engine(engine) };
+        assert_eq!(state.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case::metadata("memory:///v1_missing_metadata/", 1, KernelError::MissingMetadataError)]
+    #[case::protocol("memory:///v1_missing_protocol/", 2, KernelError::MissingProtocolError)]
+    #[case::both(
+        "memory:///v1_missing_metadata_and_protocol/",
+        0,
+        KernelError::MissingMetadataAndProtocolError
+    )]
+    #[tokio::test]
+    async fn v1_state_recovery_categories_remain_distinct(
+        #[case] table_root: &str,
+        #[case] retained_line: usize,
+        #[case] expected: KernelError,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        let commit = METADATA
+            .lines()
+            .nth(retained_line)
+            .expect("test metadata must contain commit info, protocol, and metadata");
+        add_commit(table_root, storage.as_ref(), 0, commit.to_string()).await?;
+        let engine = engine_to_handle(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            allocate_err,
+        );
+
+        let result = unsafe {
+            let builder = ok_or_panic(get_snapshot_builder(
+                kernel_string_slice!(table_root),
+                engine.shallow_copy(),
+            ));
+            snapshot_builder_build(builder)
+        };
+        assert_extern_result_error_with_message(result, expected, None);
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_engine_reports_named_delta_condition() -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = V2CallbackState::default();
+        let table_root = "memory:///v2_named_error/";
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            table_root,
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = engine_to_handle_with_allocator(
+            Arc::new(DefaultEngineBuilder::new(storage).build()),
+            v2_allocator(&mut state).into(),
+        );
+
+        let mut builder = unsafe {
+            match get_snapshot_builder(kernel_string_slice!(table_root), engine.shallow_copy()) {
+                ExternResult::Ok(builder) => builder,
+                ExternResult::Err(_) => panic!("V2 snapshot builder creation failed"),
+            }
+        };
+        unsafe { snapshot_builder_set_version(&mut builder, 1) };
+        let result = unsafe { snapshot_builder_build(builder) };
+        assert!(matches!(result, ExternResult::Err(error) if error.is_null()));
+
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.origin.load(Ordering::Relaxed),
+            FFI_ERROR_ORIGIN_KERNEL
+        );
+        let captured = state.captured.lock().unwrap();
+        let captured = captured
+            .as_ref()
+            .expect("V2 callback captured a descriptor");
+        assert_eq!(
+            captured.condition.as_deref(),
+            Some("DELTA_VERSION_NOT_FOUND")
+        );
+        assert_eq!(captured.sql_state.as_deref(), Some("22003"));
+        assert_eq!(
+            captured.parameters,
+            [
+                ("earliest".to_string(), "0".to_string()),
+                ("latest".to_string(), "0".to_string()),
+                ("userVersion".to_string(), "1".to_string()),
+            ]
+        );
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[test]
+    fn v2_engine_builder_rejects_rest_configuration_with_structured_error() {
+        let mut state = V2CallbackState::default();
+        let path = "memory:///doesntmatter/foo";
+        let builder = unsafe {
+            match get_engine_builder_v2(kernel_string_slice!(path), v2_allocator(&mut state)) {
+                ExternResult::Ok(builder) => builder,
+                ExternResult::Err(_) => panic!("V2 engine builder creation failed"),
+            }
+        };
+
+        let result = unsafe {
+            set_builder_rest_object_store(builder.as_mut().unwrap(), std::ptr::null(), None, None)
+        };
+        assert!(matches!(result, ExternResult::Err(error) if error.is_null()));
+        assert_eq!(state.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.origin.load(Ordering::Relaxed),
+            FFI_ERROR_ORIGIN_KERNEL
+        );
+
+        let engine = unsafe {
+            match builder_build(builder) {
+                ExternResult::Ok(engine) => engine,
+                ExternResult::Err(_) => panic!("V2 engine build failed after REST rejection"),
+            }
+        };
+        unsafe { free_engine(engine) };
+    }
+
     #[tokio::test]
     async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         let table_root = "memory:///test_table/";
@@ -2069,7 +2394,14 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 1);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, Some("Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1"));
+        assert_extern_result_error_with_message(
+            snapshot_at_non_existent_version,
+            KernelError::MissingVersionError,
+            Some(concat!(
+                "[DELTA_VERSION_NOT_FOUND] Cannot time travel Delta table to version 1. ",
+                "Available versions: [0, 0].\nSQLSTATE: 22003"
+            )),
+        );
 
         let snapshot_table_root_str =
             unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
@@ -2652,7 +2984,9 @@ mod tests {
         assert_extern_result_error_with_message(
             extern_result,
             KernelError::CheckpointWriteError,
-            Some("Error writing checkpoint: file_actions_per_sidecar_hint must be greater than 0"),
+            Some(
+                "[DELTA_KERNEL_UNCLASSIFIED] file_actions_per_sidecar_hint must be greater than 0",
+            ),
         );
 
         unsafe { free_snapshot(snapshot) }
@@ -2673,7 +3007,10 @@ mod tests {
         assert_extern_result_error_with_message(
             extern_result,
             KernelError::CheckpointWriteError,
-            Some("Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported"),
+            Some(concat!(
+                "[DELTA_KERNEL_UNCLASSIFIED] CheckpointSpec::V2 requires the v2Checkpoint ",
+                "table feature to be supported"
+            )),
         );
 
         unsafe { free_snapshot(snapshot) }
@@ -3027,7 +3364,7 @@ mod tests {
             invalid_snapshot,
             KernelError::GenericError,
             Some(concat!(
-                "Max catalog version error: Max catalog version is required when providing ",
+                "[DELTA_KERNEL_UNCLASSIFIED] Max catalog version is required when providing ",
                 "staged commits in the log tail. ",
                 "Use with_max_catalog_version()."
             )),
@@ -3144,7 +3481,10 @@ mod tests {
         assert_extern_result_error_with_message(
             result,
             KernelError::GenericError,
-            Some("Generic delta kernel error: Requested snapshot version 1 is older than snapshot hint version 2"),
+            Some(concat!(
+                "[DELTA_KERNEL_UNCLASSIFIED] Requested snapshot version 1 is older than ",
+                "snapshot hint version 2"
+            )),
         );
 
         unsafe { free_snapshot(snapshot_at_v2) }
@@ -3463,7 +3803,7 @@ mod tests {
             snapshot_builder_set_version(&mut ptr, 99);
             snapshot_builder_build(ptr)
         };
-        assert_extern_result_error_with_message(result, KernelError::GenericError, None);
+        assert_extern_result_error_with_message(result, KernelError::MissingVersionError, None);
 
         unsafe { free_engine(engine) }
         Ok(())
