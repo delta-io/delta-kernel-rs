@@ -257,6 +257,14 @@ impl DeletionVectorDescriptor {
     /// Decodes a `PersistedRelative` path to its relative-path form
     /// (`<prefix>/deletion_vector_<uuid>.bin`).
     ///
+    /// The encoded path is an optional random prefix followed by a fixed-length 20-character z85
+    /// UUID; the prefix becomes a directory component, and is omitted entirely when absent:
+    ///
+    /// ```text
+    /// "ab^-aqEH.-t@S}K{vb[*k^" -> "ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin"
+    /// "vBn[lx{q8@P<9BNH/isA"   -> "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
+    /// ```
+    ///
     /// Errors if called on a non-`PersistedRelative` descriptor, if the encoded path is shorter
     /// than the 20-character z85 UUID suffix, or if that suffix fails to decode into a UUID.
     pub(crate) fn relative_path(&self) -> DeltaResult<String> {

@@ -41,9 +41,9 @@ pub(crate) fn extract_deletion_vector_content(
             ));
         }
     };
-    // Add 8 bytes to convert from Delta's size (bitmap only) to Iceberg's size (full blob):
-    // - 4 bytes: size prefix
-    // - 4 bytes: CRC checksum
+    // Add 8 bytes to convert from Delta's size to Iceberg's size (full blob): Delta's
+    // `sizeInBytes` counts the 4-byte magic + bitmap; Iceberg's full-blob size adds the 4-byte
+    // length prefix and the 4-byte trailing CRC.
     Ok(DeletionVectorInfo {
         location,
         // Absent offset defaults to 1: a persisted DV file opens with a 1-byte version header, so
@@ -74,8 +74,11 @@ static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// Visits rows in one pass, accumulating decoded DV columns.
 ///
 /// For rows with a DV: decodes path (base85 UUID -> relative path), widens offset/sizeInBytes
-/// to LONG, adds 8 to sizeInBytes (Delta -> Iceberg framing), stores cardinality.
-/// For rows without a DV: pushes Null scalars for all 4 columns.
+/// to LONG, adds 8 to sizeInBytes (Delta -> Iceberg framing), stores cardinality. Rows without a
+/// DV push a null in every column.
+///
+/// Columns accumulate directly in their final [`Scalar`] form so they can be moved into
+/// [`ArrayData`] without a second pass to translate them.
 ///
 /// One batch per visitor: the accumulated columns are appended to a single [`EngineData`] via
 /// [`Self::append_decoded_dv_columns`], so visit exactly the batch you pass there. Reusing one
@@ -98,6 +101,30 @@ impl DecodedDvVisitor {
             decoded_cardinalities: Vec::with_capacity(n),
             is_log_batch,
         }
+    }
+
+    /// Appends one row to every column, so the columns can only advance in lockstep. Both arms
+    /// build the same tuple shape, which is what ties a new column to a compile error in each arm
+    /// rather than to a silently short column.
+    fn push_row(&mut self, decoded: Option<DeletionVectorInfo>) {
+        let (location, offset, size_in_bytes, cardinality) = match decoded {
+            Some(dv) => (
+                Scalar::String(dv.location),
+                Scalar::Long(dv.offset),
+                Scalar::Long(dv.size_in_bytes),
+                Scalar::Long(dv.cardinality),
+            ),
+            None => (
+                Scalar::Null(DataType::STRING),
+                Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::LONG),
+                Scalar::Null(DataType::LONG),
+            ),
+        };
+        self.decoded_paths.push(location);
+        self.decoded_offsets.push(offset);
+        self.decoded_sizes.push(size_in_bytes);
+        self.decoded_cardinalities.push(cardinality);
     }
 
     /// Visitor for scan-transform rows, where DV fields are projected at `deletionVector.*`.
@@ -182,36 +209,20 @@ impl RowVisitor for DecodedDvVisitor {
             // Labels are the bare leaf field names so error messages are correct for both the
             // scan-row (`deletionVector.*`) and log-batch (`add.deletionVector.*`) shapes.
             let storage_type_opt: Option<String> = getters[0].get_opt(i, "storageType")?;
-            if let Some(storage_type_str) = storage_type_opt {
-                let storage_type: DeletionVectorStorageType = storage_type_str.parse()?;
-                let path_or_inline_dv: String = getters[1].get(i, "pathOrInlineDv")?;
-                let offset: Option<i32> = getters[2].get_opt(i, "offset")?;
-                let size_in_bytes: i32 = getters[3].get(i, "sizeInBytes")?;
-                let cardinality: i64 = getters[4].get(i, "cardinality")?;
-
-                let dv = DeletionVectorDescriptor {
-                    storage_type,
-                    path_or_inline_dv,
-                    offset,
-                    size_in_bytes,
-                    cardinality,
-                };
-                let deletion_vector = extract_deletion_vector_content(&dv)?;
-                self.decoded_paths
-                    .push(Scalar::String(deletion_vector.location));
-                self.decoded_offsets
-                    .push(Scalar::Long(deletion_vector.offset));
-                self.decoded_sizes
-                    .push(Scalar::Long(deletion_vector.size_in_bytes));
-                self.decoded_cardinalities
-                    .push(Scalar::Long(deletion_vector.cardinality));
-            } else {
-                self.decoded_paths.push(Scalar::Null(DataType::STRING));
-                self.decoded_offsets.push(Scalar::Null(DataType::LONG));
-                self.decoded_sizes.push(Scalar::Null(DataType::LONG));
-                self.decoded_cardinalities
-                    .push(Scalar::Null(DataType::LONG));
-            }
+            let decoded = match storage_type_opt {
+                Some(storage_type_str) => {
+                    let dv = DeletionVectorDescriptor {
+                        storage_type: storage_type_str.parse()?,
+                        path_or_inline_dv: getters[1].get(i, "pathOrInlineDv")?,
+                        offset: getters[2].get_opt(i, "offset")?,
+                        size_in_bytes: getters[3].get(i, "sizeInBytes")?,
+                        cardinality: getters[4].get(i, "cardinality")?,
+                    };
+                    Some(extract_deletion_vector_content(&dv)?)
+                }
+                None => None,
+            };
+            self.push_row(decoded);
         }
         Ok(())
     }
@@ -220,6 +231,7 @@ impl RowVisitor for DecodedDvVisitor {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
@@ -285,6 +297,21 @@ mod tests {
         }
     }
 
+    /// The absolute path an [`absolute_dv`] descriptor must pass through verbatim.
+    const ABSOLUTE_DV_PATH: &str =
+        "s3://another-bucket/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin";
+
+    /// A `PersistedAbsolute` DV, whose path is used as-is rather than z85-decoded.
+    fn absolute_dv() -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
+            path_or_inline_dv: ABSOLUTE_DV_PATH.to_string(),
+            offset: Some(9),
+            size_in_bytes: 12,
+            cardinality: 3,
+        }
+    }
+
     /// Builds the DV descriptor struct scalar, with leaves ordered to match
     /// [`DeletionVectorDescriptor::to_schema`].
     fn dv_scalar(dv: &DeletionVectorDescriptor) -> Scalar {
@@ -319,10 +346,9 @@ mod tests {
     }
 
     impl DvColumnShape {
-        /// Schema projecting the DV struct at this shape's location.
-        fn schema(self) -> SchemaRef {
-            let dv_field =
-                StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema());
+        /// Schema projecting `dv_schema` at this shape's location.
+        fn schema(self, dv_schema: StructType) -> SchemaRef {
+            let dv_field = StructField::nullable("deletionVector", dv_schema);
             let root = match self {
                 DvColumnShape::ScanRow => StructType::new_unchecked([dv_field]),
                 DvColumnShape::LogBatch => StructType::new_unchecked([StructField::nullable(
@@ -334,16 +360,13 @@ mod tests {
         }
 
         /// Wraps a DV struct scalar (or a null placeholder) at this shape's root field, matching
-        /// [`Self::schema`].
-        fn root_scalar(self, dv: Scalar) -> Scalar {
+        /// [`Self::schema`] for the same `dv_schema`.
+        fn root_scalar(self, dv_schema: StructType, dv: Scalar) -> Scalar {
             match self {
                 DvColumnShape::ScanRow => dv,
                 DvColumnShape::LogBatch => Scalar::Struct(
                     StructData::try_new(
-                        vec![StructField::nullable(
-                            "deletionVector",
-                            DeletionVectorDescriptor::to_schema(),
-                        )],
+                        vec![StructField::nullable("deletionVector", dv_schema)],
                         vec![dv],
                     )
                     .unwrap(),
@@ -351,10 +374,21 @@ mod tests {
             }
         }
 
+        /// Builds a single-row `EngineData` holding `dv` under this shape's `deletionVector` field,
+        /// typed as `dv_schema`.
+        fn engine_data_for(self, dv_schema: StructType, dv: Scalar) -> Box<dyn EngineData> {
+            let row = vec![self.root_scalar(dv_schema.clone(), dv)];
+            SyncEngine::new()
+                .evaluation_handler()
+                .create_many(self.schema(dv_schema), &[row.as_slice()])
+                .unwrap()
+        }
+
         /// Builds an `EngineData` with one row per entry in `dvs`; `None` yields a row whose DV
         /// field is null, `Some(dv)` embeds the given descriptor.
         fn engine_data(self, dvs: &[Option<DeletionVectorDescriptor>]) -> Box<dyn EngineData> {
-            let dv_type = DataType::from(DeletionVectorDescriptor::to_schema());
+            let dv_schema = DeletionVectorDescriptor::to_schema();
+            let dv_type = DataType::from(dv_schema.clone());
             let rows: Vec<Vec<Scalar>> = dvs
                 .iter()
                 .map(|dv| {
@@ -362,13 +396,13 @@ mod tests {
                         Some(dv) => dv_scalar(dv),
                         None => Scalar::Null(dv_type.clone()),
                     };
-                    vec![self.root_scalar(scalar)]
+                    vec![self.root_scalar(dv_schema.clone(), scalar)]
                 })
                 .collect();
             let row_refs: Vec<&[Scalar]> = rows.iter().map(Vec::as_slice).collect();
             SyncEngine::new()
                 .evaluation_handler()
-                .create_many(self.schema(), &row_refs)
+                .create_many(self.schema(dv_schema), &row_refs)
                 .unwrap()
         }
 
@@ -432,18 +466,20 @@ mod tests {
     fn test_visitor_mixed_rows(
         #[values(DvColumnShape::ScanRow, DvColumnShape::LogBatch)] shape: DvColumnShape,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Two rows: one with a DV, one without, in a single batch.
-        let columns = decode(shape, &[Some(sample_dv()), None])?;
+        // One batch mixing all three row kinds: a relative DV (z85-decoded), an absolute DV (path
+        // verbatim), and a row with no DV at all.
+        let columns = decode(shape, &[Some(sample_dv()), Some(absolute_dv()), None])?;
         assert_eq!(
             columns.locations,
             vec![
                 Some("ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string()),
+                Some(ABSOLUTE_DV_PATH.to_string()),
                 None,
             ]
         );
-        assert_eq!(columns.offsets, vec![Some(4), None]);
-        assert_eq!(columns.sizes, vec![Some(48), None]);
-        assert_eq!(columns.cardinalities, vec![Some(6), None]);
+        assert_eq!(columns.offsets, vec![Some(4), Some(9), None]);
+        assert_eq!(columns.sizes, vec![Some(48), Some(20), None]);
+        assert_eq!(columns.cardinalities, vec![Some(6), Some(3), None]);
         Ok(())
     }
 
@@ -464,6 +500,38 @@ mod tests {
         decoder.visit_rows_of(data.as_ref())?;
         assert_eq!(decoder.has_any_dv(), expected);
         Ok(())
+    }
+
+    /// A row whose `storageType` is set but whose required `pathOrInlineDv` leaf is null must
+    /// error, not be silently treated as a DV-less row. `ensure_data_types` deliberately skips
+    /// nullability, so a malformed log can present this even though the derived schema marks the
+    /// leaf non-null -- hence the all-nullable schema variant here.
+    #[rstest]
+    fn test_visitor_storage_type_present_with_null_required_leaf_errors(
+        #[values(DvColumnShape::ScanRow, DvColumnShape::LogBatch)] shape: DvColumnShape,
+    ) {
+        let nullable_dv_schema = StructType::new_unchecked(
+            DeletionVectorDescriptor::to_schema()
+                .fields()
+                .map(|f| StructField::nullable(f.name(), f.data_type().clone())),
+        );
+        let partial_dv = Scalar::Struct(
+            StructData::try_new(
+                nullable_dv_schema.fields().cloned().collect(),
+                vec![
+                    Scalar::String(DeletionVectorStorageType::PersistedRelative.to_string()),
+                    Scalar::Null(DataType::STRING), // pathOrInlineDv missing
+                    Scalar::Integer(4),
+                    Scalar::Integer(40),
+                    Scalar::Long(6),
+                ],
+            )
+            .unwrap(),
+        );
+        let data = shape.engine_data_for(nullable_dv_schema, partial_dv);
+
+        let mut decoder = shape.visitor(1);
+        assert_result_error_with_message(decoder.visit_rows_of(data.as_ref()), "pathOrInlineDv");
     }
 
     #[rstest]
