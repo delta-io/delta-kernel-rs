@@ -9,7 +9,7 @@ use delta_kernel::expressions::{
     Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, UnaryExpressionOp,
     VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::schema::{DataType as KernelDataType, StructType};
+use delta_kernel::schema::{DataType as KernelDataType, StructField, StructType};
 use delta_kernel::{DeltaResult, Error};
 
 use crate::predicate::to_df_predicate_expr;
@@ -200,15 +200,11 @@ fn struct_to_df_expr(
         args.push(to_df_expr(child, input_schema, Some(field.data_type()))?);
     }
     let body = named_struct(args);
-    match nullability {
-        None => Ok(body),
-        // The guard is a value `Expression` (not a `Predicate`), lowered untyped: no arm consumes a
-        // scalar target type, and DataFusion coerces the CASE `WHEN` to boolean itself.
-        Some(pred) => {
-            let guard = to_df_expr(pred, input_schema, None)?;
-            Ok(struct_null_when_not(guard, body))
-        }
-    }
+    let Some(pred) = nullability else {
+        return Ok(body);
+    };
+    let guard = to_df_expr(pred, input_schema, None)?;
+    Ok(struct_null_when_not(guard, body))
 }
 
 /// Lowers a struct patch (a sparse edit of an input struct) to a `named_struct(..)` rebuild,
@@ -222,43 +218,60 @@ fn struct_patch_to_df_expr(
     input_schema: &StructType,
     output_type: Option<&KernelDataType>,
 ) -> DeltaResult<DFExpr> {
-    /// What supplies one output field of a struct patch, before it is paired with its output field.
-    enum PatchValue<'a> {
-        /// An input field forwarded unchanged; already lowered, since it needs no target type.
-        KeepExisting(DFExpr),
-        /// A patch expression, lowered once its output field supplies the target type.
-        ComputeNew(&'a KernelExpression),
-    }
-
     let target = require_struct_output(output_type, "StructPatch")?;
 
-    // `None` = operate on the top-level columns; otherwise the nested struct at `input_path`.
-    let (source_struct, source_expr) = match patch.input_path() {
-        None => (input_schema, None),
-        Some(path) => {
-            let field = input_schema.field_at(path)?;
-            let KernelDataType::Struct(source_struct) = field.data_type() else {
-                return Err(Error::generic(format!(
-                    "StructPatch input_path '{path}' does not resolve to a struct"
-                )));
-            };
-            (
-                source_struct.as_ref(),
-                Some(column_to_df_expr(path, input_schema)?),
-            )
-        }
+    // A patch targets either the whole input struct (`input_path` is `None`), whose fields are the
+    // top-level columns, or the nested struct at that path, whose fields are reached through it.
+    let (mut source_struct, mut source_expr) = (input_schema, None);
+    if let Some(path) = patch.input_path() {
+        let KernelDataType::Struct(nested) = input_schema.field_at(path)?.data_type() else {
+            return Err(Error::generic(format!(
+                "StructPatch input_path '{path}' does not resolve to a struct"
+            )));
+        };
+        let source = column_to_df_expr(path, input_schema)?;
+        (source_struct, source_expr) = (nested.as_ref(), Some(source));
+    }
+
+    // Append `[name, value]` pairs in the evaluator's emission order, consuming one output field per
+    // appended value so each value is lowered against the type it lands in.
+    let mut output_fields = target.fields();
+    let mut args = Vec::with_capacity(target.num_fields() * 2);
+
+    // Both closures need the shared `output_fields` cursor, so it is threaded as a parameter rather
+    // than captured.
+    let append_field_with_converted_expr =
+        |args: &mut Vec<DFExpr>,
+         output_fields: &mut dyn Iterator<Item = &StructField>,
+         expr: &KernelExpression|
+         -> DeltaResult<()> {
+            let field = output_fields.next().ok_or_else(|| {
+                Error::generic("StructPatch produced more fields than the output schema has")
+            })?;
+            let value = to_df_expr(expr, input_schema, Some(field.data_type()))?;
+            args.push(lit(field.name().to_string()));
+            args.push(value);
+            Ok(())
+        };
+    let append_field_with_existing_col = |args: &mut Vec<DFExpr>,
+                                          output_fields: &mut dyn Iterator<Item = &StructField>,
+                                          name: &str|
+     -> DeltaResult<()> {
+        let field = output_fields.next().ok_or_else(|| {
+            Error::generic("StructPatch produced more fields than the output schema has")
+        })?;
+        let value = match &source_expr {
+            Some(base) => get_field(base.clone(), name.to_string()),
+            None => DFExpr::Column(DFColumn::new_unqualified(name)),
+        };
+        args.push(lit(field.name().to_string()));
+        args.push(value);
+        Ok(())
     };
 
-    // Collect the output values in emission order. Passthroughs lower eagerly (they just forward an
-    // input array); computed fields stay as kernel expressions until they are paired with the
-    // output field that supplies their target type.
-    let mut values = Vec::with_capacity(target.num_fields());
-    values.extend(
-        patch
-            .prepended_fields
-            .iter()
-            .map(|e| PatchValue::ComputeNew(e)),
-    );
+    for expr in &patch.prepended_fields {
+        append_field_with_converted_expr(&mut args, &mut output_fields, expr)?;
+    }
 
     let mut used_field_patches = 0usize;
     for input_field in source_struct.fields() {
@@ -266,21 +279,16 @@ fn struct_patch_to_df_expr(
         let field_patch = patch.field_patches.get(name);
 
         if field_patch.is_none_or(|fp| fp.keep_input) {
-            values.push(PatchValue::KeepExisting(match &source_expr {
-                Some(base) => get_field(base.clone(), name.to_string()),
-                None => DFExpr::Column(DFColumn::new_unqualified(name)),
-            }));
+            append_field_with_existing_col(&mut args, &mut output_fields, name)?;
         }
 
-        if let Some(field_patch) = field_patch {
-            values.extend(
-                field_patch
-                    .insertions
-                    .iter()
-                    .map(|e| PatchValue::ComputeNew(e)),
-            );
-            used_field_patches += 1;
+        let Some(field_patch) = field_patch else {
+            continue;
+        };
+        for expr in &field_patch.insertions {
+            append_field_with_converted_expr(&mut args, &mut output_fields, expr)?;
         }
+        used_field_patches += 1;
     }
 
     let required = patch
@@ -294,37 +302,21 @@ fn struct_patch_to_df_expr(
         ));
     }
 
-    values.extend(
-        patch
-            .appended_fields
-            .iter()
-            .map(|e| PatchValue::ComputeNew(e)),
-    );
-
-    if values.len() != target.num_fields() {
-        return Err(Error::generic(format!(
-            "StructPatch field count mismatch: patch produced {} fields but the output schema has {}",
-            values.len(),
-            target.num_fields()
-        )));
+    for expr in &patch.appended_fields {
+        append_field_with_converted_expr(&mut args, &mut output_fields, expr)?;
     }
 
-    let mut args = Vec::with_capacity(target.num_fields() * 2);
-    for (value, field) in values.into_iter().zip(target.fields()) {
-        args.push(lit(field.name().to_string()));
-        args.push(match value {
-            PatchValue::KeepExisting(expr) => expr,
-            PatchValue::ComputeNew(expr) => {
-                to_df_expr(expr, input_schema, Some(field.data_type()))?
-            }
-        });
+    if output_fields.next().is_some() {
+        return Err(Error::generic(
+            "StructPatch produced fewer fields than the output schema has",
+        ));
     }
 
     let body = named_struct(args);
-    Ok(match source_expr {
-        None => body,
-        Some(base) => struct_null_when_not(base.is_not_null(), body),
-    })
+    let Some(base) = source_expr else {
+        return Ok(body);
+    };
+    Ok(struct_null_when_not(base.is_not_null(), body))
 }
 
 #[cfg(test)]
