@@ -7,13 +7,14 @@ use crate::arrow::array::types::{
 };
 use crate::arrow::array::{
     Array, BinaryViewArray, BooleanArray, GenericByteArray, GenericListArray, GenericListViewArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RunArray, StringViewArray, StructArray,
 };
 use crate::engine::arrow_data::{as_string_accessor, ArrowEngineData};
 use crate::engine_data::{
-    EngineData, GetData, ListItem, MapItem, RowVisitor, StructList, StructListAccessor,
+    EngineData, GetData, ListItem, MapItem, RowVisitor, StructArrayAccessor, StructList,
 };
 use crate::schema::ColumnName;
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 // actual impls (todo: could macro these)
@@ -156,26 +157,20 @@ fn get_list_item<'a>(
     Ok(Some(ListItem::new(values, list.row_offsets(row_index))))
 }
 
-impl<T: ListLikeArray> StructListAccessor for T {
-    fn visit_row_elements(
+impl StructArrayAccessor for StructArray {
+    fn visit_slice(
         &self,
-        row_index: usize,
+        offsets: Range<usize>,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
     ) -> DeltaResult<()> {
-        let values = self.list_values().as_struct_opt().ok_or_else(|| {
-            Error::unexpected_column_type("struct list values are not structs".to_string())
-        })?;
-        // Slice to this row's elements and reuse the standard visit machinery.
-        let offsets = self.row_offsets(row_index);
-        let sliced = values.slice(offsets.start, offsets.len());
+        let sliced = self.slice(offsets.start, offsets.len());
         // A RecordBatch cannot represent a null struct row, so `ArrowEngineData::from` would panic
         // on one; reject nulls here instead.
-        if sliced.null_count() > 0 {
-            return Err(Error::unexpected_column_type(
-                "struct-list elements contain nulls; cannot visit".to_string(),
-            ));
-        }
+        require!(
+            sliced.null_count() == 0,
+            Error::invalid_struct_data("struct-list elements contain nulls; cannot visit")
+        );
         ArrowEngineData::from(sliced).visit_rows(column_names, visitor)
     }
 }
@@ -186,17 +181,15 @@ fn get_struct_list_item<'a>(
     row_index: usize,
     field_name: &str,
 ) -> DeltaResult<Option<StructList<'a>>> {
-    // Check the element type before the null check: a non-struct list is a type error for every
-    // row, even a null one. `visit_with` would also catch it, but too late to name `field_name`.
-    if list.list_values().as_struct_opt().is_none() {
-        return Err(Error::unexpected_column_type(format!(
-            "{field_name}: list values are not structs"
-        )));
-    }
+    // Resolve the element type before the null check: a non-struct list is a type error for every
+    // row, even a null one.
+    let values = list.list_values().as_struct_opt().ok_or_else(|| {
+        Error::unexpected_column_type(format!("{field_name}: list values are not structs"))
+    })?;
     if !list.is_valid(row_index) {
         return Ok(None);
     }
-    Ok(Some(StructList::new(list, row_index)))
+    Ok(Some(StructList::new(values, list.row_offsets(row_index))))
 }
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListArray<OffsetSize> {
@@ -349,19 +342,16 @@ impl<'a> GetData<'a> for RunArray<Int64Type> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use rstest::rstest;
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        Int8Array, LargeBinaryArray, LargeStringArray, ListArray, ListBuilder, PrimitiveArray,
-        StringBuilder, StructArray,
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        LargeBinaryArray, LargeStringArray, ListArray, ListBuilder, PrimitiveArray, StringBuilder,
     };
-    use crate::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
-    use crate::engine::struct_list_test_support::{struct_list_fixture, CollectNVisitor};
+    use crate::engine::test_utils::{
+        struct_list_fixture, struct_list_fixture_opt, CollectNVisitor,
+    };
     use crate::engine_data::GetData;
 
     // =========================================================================
@@ -519,25 +509,19 @@ mod tests {
     }
 
     // =========================================================================
-    // Wrong-type error tests: calling the wrong getter returns an error
-    // =========================================================================
-
-    // =========================================================================
     // Array-of-structs: get_struct_list drives a nested RowVisitor
     // =========================================================================
 
     #[test]
     fn test_get_struct_list_visits_element_structs() {
-        // Two outer rows: row 0 has elements [10, 20], row 1 has [30].
         let list = struct_list_fixture(&[&[10, 20], &[30]]);
 
         let mut row0 = CollectNVisitor::default();
-        list.get_struct_list(0, "arr")
-            .unwrap()
-            .unwrap()
-            .visit_with(&mut row0)
-            .unwrap();
-        assert_eq!(row0.values, vec![10, 20]);
+        let elements = list.get_struct_list(0, "arr").unwrap().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert!(!elements.is_empty());
+        elements.visit_with(&mut row0).unwrap();
+        assert_eq!(row0.values, vec![Some(10), Some(20)]);
 
         let mut row1 = CollectNVisitor::default();
         list.get_struct_list(1, "arr")
@@ -545,13 +529,22 @@ mod tests {
             .unwrap()
             .visit_with(&mut row1)
             .unwrap();
-        assert_eq!(row1.values, vec![30]);
+        assert_eq!(row1.values, vec![Some(30)]);
+    }
+
+    /// `StructList` has no `Debug`, so unwrap the error by pattern rather than `expect_err`.
+    fn unwrap_err(result: DeltaResult<Option<StructList<'_>>>) -> Error {
+        match result {
+            Err(err) => err,
+            Ok(_) => panic!("expected an error"),
+        }
     }
 
     #[test]
-    fn test_get_struct_list_on_string_list_errors() {
+    fn test_get_struct_list_on_non_list_errors() {
         let array = LargeStringArray::from(vec![Some("hello")]);
-        assert!(array.get_struct_list(0, "f").is_err());
+        let err = unwrap_err(array.get_struct_list(0, "f"));
+        assert!(matches!(err, Error::UnexpectedColumnType(_)));
     }
 
     /// A non-struct element type is a type error for every row, including a null one -- the
@@ -566,67 +559,44 @@ mod tests {
         builder.append_value([Some("a")]);
         let list: ListArray = builder.finish();
 
-        assert!(list.get_struct_list(row, "arr").is_err());
+        let err = unwrap_err(list.get_struct_list(row, "arr"));
+        assert!(matches!(err, Error::UnexpectedColumnType(_)));
     }
 
     #[test]
     fn test_get_struct_list_null_element_struct_errors_not_panics() {
-        // Element structs [present, null] in a single outer row [0..2].
-        let n = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
-        let element_fields: Fields = vec![ArrowField::new("n", ArrowDataType::Int32, false)].into();
-        let elements = StructArray::new(
-            element_fields.clone(),
-            vec![n],
-            Some(NullBuffer::from(vec![true, false])),
-        );
-        let item_field = Arc::new(ArrowField::new(
-            "item",
-            ArrowDataType::Struct(element_fields),
-            true,
-        ));
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2]));
-        let list = GenericListArray::<i32>::new(item_field, offsets, Arc::new(elements), None);
+        // A single outer row whose element structs are [present, null].
+        let list = struct_list_fixture_opt(&[Some(vec![Some(1), None])]);
 
         let mut visitor = CollectNVisitor::default();
-        let result = list
+        let err = list
             .get_struct_list(0, "arr")
             .unwrap()
             .unwrap()
-            .visit_with(&mut visitor);
-        assert!(result.is_err());
+            .visit_with(&mut visitor)
+            .expect_err("a null element struct cannot be visited");
+        assert!(matches!(err, Error::InvalidStructData(_)));
     }
 
     #[test]
-    fn test_get_struct_list_null_outer_row_is_none_and_empty_slice_visits_nothing() {
-        // Two outer rows: row 0 null, row 1 present but empty (offsets [0, 0, 0]).
-        let n = Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef;
-        let element_fields: Fields = vec![ArrowField::new("n", ArrowDataType::Int32, false)].into();
-        let elements = StructArray::new(element_fields.clone(), vec![n], None);
-        let item_field = Arc::new(ArrowField::new(
-            "item",
-            ArrowDataType::Struct(element_fields),
-            false,
-        ));
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0, 0]));
-        let list = GenericListArray::<i32>::new(
-            item_field,
-            offsets,
-            Arc::new(elements),
-            Some(NullBuffer::from(vec![false, true])),
-        );
+    fn test_get_struct_list_null_outer_row_is_none_and_empty_row_visits_nothing() {
+        let list = struct_list_fixture_opt(&[None, Some(vec![])]);
 
         // Null outer row -> Ok(None).
         assert!(list.get_struct_list(0, "arr").unwrap().is_none());
 
         // Present-but-empty row -> visits zero rows.
+        let elements = list.get_struct_list(1, "arr").unwrap().unwrap();
+        assert_eq!(elements.len(), 0);
+        assert!(elements.is_empty());
         let mut visitor = CollectNVisitor::default();
-        list.get_struct_list(1, "arr")
-            .unwrap()
-            .unwrap()
-            .visit_with(&mut visitor)
-            .unwrap();
+        elements.visit_with(&mut visitor).unwrap();
         assert!(visitor.values.is_empty());
     }
+
+    // =========================================================================
+    // Wrong-type error tests: calling the wrong getter returns an error
+    // =========================================================================
 
     #[test]
     fn test_wrong_type_returns_error() {
