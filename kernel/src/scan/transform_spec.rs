@@ -10,9 +10,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{
-    col, lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar,
-};
+use crate::expressions::{lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
@@ -144,8 +142,8 @@ pub(crate) fn get_transform_expr(
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
                 let expr = Arc::new(Expression::coalesce([
-                    col!(field_name),
-                    lit(base_row_id) + col!(row_index_field_name),
+                    Expression::column([field_name]),
+                    lit(base_row_id) + Expression::column([row_index_field_name]),
                 ]));
                 patch.replace(field_name.clone(), expr)
             }
@@ -176,7 +174,7 @@ pub(crate) fn get_transform_expr(
                     apply_insert_after(
                         patch.drop(physical_name),
                         insert_after,
-                        Arc::new(col!(physical_name)),
+                        Arc::new(Expression::column([physical_name])),
                     )
                 } else {
                     // Column doesn't exist physically - treat as partition column

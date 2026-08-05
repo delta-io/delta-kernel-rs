@@ -1083,9 +1083,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{column_expr, BinaryPredicateOp};
+    use crate::expressions::{col, lit, BinaryPredicateOp};
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{Expression as Expr, Predicate as Pred};
+    use crate::Predicate as Pred;
 
     #[rstest]
     #[case::truncates(Scalar::Integer(7), Scalar::Integer(2), Some(Scalar::Integer(3)))]
@@ -1290,19 +1290,11 @@ mod tests {
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
         });
 
-        let column = column_expr!("item");
-        let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
-        let array_not_op = Pred::not(Pred::binary(
-            BinaryPredicateOp::In,
-            Expr::literal(10),
-            array,
-        ));
-        let column_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(PI), column.clone());
-        let column_not_op = Pred::not(Pred::binary(
-            BinaryPredicateOp::In,
-            Expr::literal("Cool"),
-            column,
-        ));
+        let column = col!("item");
+        let array_op = Pred::binary(BinaryPredicateOp::In, lit(10), array.clone());
+        let array_not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(10), array));
+        let column_op = Pred::binary(BinaryPredicateOp::In, lit(PI), column.clone());
+        let column_not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit("Cool"), column));
         assert_eq!(&format!("{array_op}"), "10 IN (1, 2, 3)");
         assert_eq!(&format!("{array_not_op}"), "NOT(10 IN (1, 2, 3))");
         assert_eq!(&format!("{column_op}"), "3.1415927 IN Column(item)");
