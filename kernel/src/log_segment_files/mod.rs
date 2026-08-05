@@ -106,13 +106,13 @@ pub(crate) fn list_delta_log_from_storage(
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
 ///
-/// Several _complete_ checkpoints can legitimately share a version -- e.g. two multi-part
-/// checkpoints with different part counts, or two uuid-named ones. Each gets its own
-/// [`CheckpointInstance`] key so they never overwrite one another, letting the caller pick a winner
-/// deterministically (see `ListingAccumulator::select_checkpoint_for_group`).
+/// Several _complete_ checkpoints can legitimately share a version, say two multi-part checkpoints
+/// with different part counts, or two uuid-named ones. Each gets its own [`CheckpointInstance`]
+/// key, so the caller can pick a winner deterministically (see
+/// `ListingAccumulator::select_checkpoint_for_group`).
 ///
-/// `parts` must arrive in ascending file name order, which is what log listing produces: a
-/// multi-part checkpoint only accumulates while its parts arrive in order.
+/// `parts` must arrive in ascending file name order, which log listing provides: a multi-part
+/// checkpoint only accumulates while its parts arrive in order.
 #[internal_api]
 fn group_checkpoint_parts(
     parts: Vec<ParsedLogPath>,
@@ -124,9 +124,8 @@ fn group_checkpoint_parts(
     let mut checkpoints: HashMap<CheckpointInstance, Vec<ParsedLogPath>> = HashMap::new();
     for part_file in parts {
         match &part_file.file_type {
-            // A single-file checkpoint is complete on its own. Keying on file name keeps distinct
-            // same-version checkpoints separate -- notably uuid-named ones, since each writer picks
-            // a fresh uuid.
+            // A single-file checkpoint is complete on its own. Keying uuid-named ones on file name
+            // keeps two of them at the same version separate.
             ClassicCheckpoint | UuidCheckpoint => {
                 if let Some(instance) = CheckpointInstance::of(&part_file) {
                     checkpoints.insert(instance, vec![part_file]);
@@ -612,12 +611,9 @@ impl LogSegmentFiles {
             latest_checkpoint.version
         );
         } else if !checkpoint_metadata.applies_to(&listed_files.checkpoint_parts) {
-            // The hint describes a checkpoint other than the one selected at this version (see
-            // `group_checkpoint_parts`) -- expected whenever a writer checkpoints a version another
-            // writer already checkpointed and leaves the hint alone, concurrently or not. Readers
-            // fall back to the checkpoint file's own fields; `applies_to` also makes
-            // `LogSegment::checkpoint_hint` yield `None`, so this logs exactly when the hint's
-            // fields are dropped.
+            // Expected whenever a writer checkpoints a version another writer already checkpointed
+            // and leaves the hint alone. `applies_to` also makes `LogSegment::checkpoint_hint`
+            // yield `None`, so this logs exactly when the hint's fields get dropped.
             debug!(
                 version = checkpoint_metadata.version,
                 hint_parts = checkpoint_metadata.parts.unwrap_or(1),

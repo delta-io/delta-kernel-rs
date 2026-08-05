@@ -35,13 +35,13 @@ pub(crate) enum LogPathFileType {
     Commit,
     /// Staged commits are commits with UUID filenames, stored in _delta_log/_staged_commits dir.
     StagedCommit,
-    /// A classic-named checkpoint, `<version>.checkpoint.parquet`. The name identifies the
-    /// file-naming scheme, not the checkpoint's spec version: this file may hold a V1 checkpoint
-    /// with its actions inline, or a V2 checkpoint that references sidecars.
+    /// A classic-named checkpoint, `<version>.checkpoint.parquet`. The name is the file-naming
+    /// scheme, not the spec version: this file may hold a V1 checkpoint with its actions inline,
+    /// or a V2 checkpoint that references sidecars.
     ClassicCheckpoint,
-    /// A uuid-named checkpoint, `<version>.checkpoint.<uuid>.{parquet,json}`. Always a V2
-    /// checkpoint, since only the V2 spec writes this naming scheme. The uuid means several can
-    /// share a version -- each writer picks a fresh one.
+    /// A uuid-named checkpoint, `<version>.checkpoint.<uuid>.{parquet,json}`. Always V2, since
+    /// only the V2 spec writes this naming scheme. Each writer picks a fresh uuid, so several
+    /// can share a version.
     #[allow(unused)]
     UuidCheckpoint,
     // NOTE: Delta spec doesn't actually say, but checkpoint part numbers are effectively 31-bit
@@ -62,20 +62,13 @@ pub(crate) enum LogPathFileType {
 
 /// Identifies one checkpoint among those at a single version and orders it against its siblings.
 ///
-/// The variant is the checkpoint's naming scheme, read from the file name with no I/O. The naming
-/// scheme and the [checkpoint spec] are independent axes, and only two of the three schemes pin the
-/// spec:
+/// The variant is the naming scheme, read from the file name with no I/O. Naming scheme and
+/// [checkpoint spec] are independent: only multi-part (always V1) and uuid (always V2) pin the
+/// spec, so a `Classic` checkpoint follows either one and only its contents say which.
 ///
-/// | spec | classic | multi-part | uuid-named |
-/// |------|---------|------------|------------|
-/// | V1   | valid   | valid      | invalid    |
-/// | V2   | valid   | invalid    | valid      |
-///
-/// So a `Classic` checkpoint follows either spec and only its contents say which.
-///
-/// Variant declaration order is the rank and each payload is that rank's tiebreaker, so the derived
-/// [`Ord`] is the entire comparison (`Uuid` > `MultiPart` > `Classic`, matching Delta-Spark for
-/// cross-engine parity). Reordering the variants changes which checkpoint kernel selects.
+/// Variant order is the rank and each payload breaks ties within a rank, so the derived [`Ord`] is
+/// the whole comparison: `Uuid` > `MultiPart` > `Classic`, matching Delta-Spark. Reordering these
+/// changes which checkpoint kernel selects.
 ///
 /// [checkpoint spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -104,16 +97,20 @@ impl CheckpointInstance {
         }
     }
 
+    /// How many files this checkpoint spans.
+    pub(crate) fn num_parts(&self) -> usize {
+        match self {
+            Self::MultiPart { num_parts } => *num_parts as usize,
+            Self::Classic | Self::Uuid { .. } => 1,
+        }
+    }
+
     /// Whether `part_files` holds every part this checkpoint needs.
     pub(crate) fn is_complete<Location: AsUrl>(
         &self,
         part_files: &[ParsedLogPath<Location>],
     ) -> bool {
-        let expected = match self {
-            Self::MultiPart { num_parts } => *num_parts as usize,
-            Self::Classic | Self::Uuid { .. } => 1,
-        };
-        expected == part_files.len()
+        self.num_parts() == part_files.len()
     }
 }
 
@@ -357,12 +354,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 
     #[internal_api]
     pub(crate) fn is_checkpoint(&self) -> bool {
-        matches!(
-            self.file_type,
-            LogPathFileType::ClassicCheckpoint
-                | LogPathFileType::MultiPartCheckpoint { .. }
-                | LogPathFileType::UuidCheckpoint
-        )
+        CheckpointInstance::of(self).is_some()
     }
 
     #[internal_api]
@@ -589,6 +581,30 @@ pub(crate) mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
     use crate::utils::test_utils::assert_result_error_with_message;
+
+    /// Builds a `ParsedLogPath` by parsing a real log file name, so `filename`, `extension` and
+    /// `file_type` agree. `size` is a parameter because listing tests use it to mark where a file
+    /// came from.
+    pub(crate) fn parse_log_path(filename: &str, size: u64) -> ParsedLogPath {
+        let url = Url::parse(&format!("memory:///_delta_log/{filename}")).unwrap();
+        ParsedLogPath::try_from(FileMeta {
+            location: url,
+            last_modified: 0,
+            size,
+        })
+        .unwrap_or_else(|e| panic!("{filename} is not a log path: {e}"))
+        .unwrap_or_else(|| panic!("{filename} is not a log path"))
+    }
+
+    /// One part of a multi-part checkpoint. Kernel never writes these, so there's no production
+    /// constructor to reuse.
+    pub(crate) fn multipart_checkpoint_name(
+        version: Version,
+        part_num: u32,
+        num_parts: u32,
+    ) -> String {
+        format!("{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+    }
 
     impl ParsedLogPath<FileMeta> {
         pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {

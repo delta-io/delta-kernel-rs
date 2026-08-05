@@ -9,6 +9,7 @@ use crate::engine::sync::SyncEngine;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path as ObjectPath;
 use crate::object_store::ObjectStoreExt as _;
+use crate::path::tests::multipart_checkpoint_name;
 use crate::{Engine as _, FileMeta};
 
 // size markers used to identify commit sources in tests
@@ -37,7 +38,8 @@ fn log_path_for_file_type(version: Version, file_type: &LogPathFileType) -> Stri
             part_num,
             num_parts,
         } => {
-            format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+            let name = multipart_checkpoint_name(version, *part_num, *num_parts);
+            format!("_delta_log/{name}")
         }
         LogPathFileType::Crc => {
             format!("_delta_log/{version:020}.crc")
@@ -1338,23 +1340,11 @@ fn find_complete_checkpoint_version_cases(
     assert_eq!(find_complete_checkpoint_version(&files), expected);
 }
 
-/// Builds a `ParsedLogPath` by parsing a real log file name, so `filename`, `extension` and
-/// `file_type` agree. Unlike [`make_parsed_log_path_with_source`], whose url is always
-/// `<version>.json`, this works for checkpoint paths -- whose file name takes part in checkpoint
-/// selection.
+/// [`crate::path::tests::parse_log_path`] stamped with this module's filesystem size marker. Unlike
+/// [`make_parsed_log_path_with_source`], whose url is always `<version>.json`, this works for
+/// checkpoint paths, whose file name takes part in checkpoint selection.
 fn parse_log_path(filename: &str) -> ParsedLogPath {
-    let url = Url::parse(&format!("memory:///_delta_log/{filename}")).unwrap();
-    ParsedLogPath::try_from(FileMeta {
-        location: url,
-        last_modified: 0,
-        size: FILESYSTEM_SIZE_MARKER,
-    })
-    .unwrap_or_else(|e| panic!("{filename} is not a log path: {e}"))
-    .unwrap_or_else(|| panic!("{filename} is not a log path"))
-}
-
-fn multipart_checkpoint_name(version: Version, part_num: u32, num_parts: u32) -> String {
-    format!("{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+    crate::path::tests::parse_log_path(filename, FILESYSTEM_SIZE_MARKER)
 }
 
 /// A v5 `_last_checkpoint` hint describing the uuid-named (V2) checkpoint `filename`.
@@ -1369,9 +1359,6 @@ fn hint_naming_uuid(filename: &str) -> LastCheckpointHint {
     }
 }
 
-/// Mirrors Delta-Spark: a classic checkpoint sorts below a multi-part one, more parts beats fewer,
-/// a uuid (V2) checkpoint outranks both, and two uuid checkpoints at one version break the tie on
-/// file name.
 #[test]
 fn checkpoint_instance_orders_like_delta_spark() {
     let classic = CheckpointInstance::Classic;
@@ -1396,8 +1383,7 @@ fn checkpoint_instance_orders_like_delta_spark() {
     assert!(uuid_a < uuid_b);
 }
 
-/// Two writers checkpointed the same version with different part counts, and both checkpoints are
-/// complete. The one with more parts wins.
+/// The reported failure: two writers checkpointed one version with different part counts.
 #[tokio::test]
 async fn two_complete_checkpoints_at_one_version_selects_more_parts() {
     let mut log_files: Vec<_> = (0..=6)
@@ -1437,8 +1423,7 @@ async fn two_complete_checkpoints_at_one_version_selects_more_parts() {
     assert_eq!(commit_versions, vec![5, 6]);
 }
 
-/// A torn checkpoint loses to a complete one even though it outranks it: rank orders the
-/// candidates, but only complete ones are candidates at all.
+/// Rank orders the candidates, but only complete checkpoints are candidates at all.
 #[tokio::test]
 async fn torn_higher_ranked_checkpoint_loses_to_complete_lower_ranked() {
     let mut log_files: Vec<_> = (0..=6)
@@ -1454,8 +1439,7 @@ async fn torn_higher_ranked_checkpoint_loses_to_complete_lower_ranked() {
             CommitSource::Filesystem,
         ));
     }
-    // A writer got 3 of its 11 parts out before dying, so this group outranks the 2-part one but is
-    // unusable.
+    // A writer got 3 of its 11 parts out before dying: outranks the 2-part group, unusable.
     for part_num in 1..=3 {
         log_files.push((
             4,
@@ -1480,8 +1464,7 @@ async fn torn_higher_ranked_checkpoint_loses_to_complete_lower_ranked() {
     assert_eq!(commit_versions, vec![5, 6]);
 }
 
-/// The same rank-versus-completeness rule when the surviving candidate is a single-file checkpoint:
-/// a torn multi-part group outranks the classic checkpoint but still loses to it.
+/// Same rule as above, but the surviving candidate is a single-file checkpoint.
 #[tokio::test]
 async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
     let mut log_files = vec![
@@ -1514,8 +1497,6 @@ async fn torn_multipart_checkpoint_loses_to_classic_checkpoint() {
     );
 }
 
-/// A uuid-named (V2) checkpoint and a complete multi-part (V1) checkpoint at one version. The V2
-/// one wins, matching Delta-Spark.
 #[tokio::test]
 async fn uuid_and_multipart_checkpoints_at_one_version_selects_uuid() {
     let (storage, log_root) = create_storage_with_raw_paths(
@@ -1541,8 +1522,8 @@ async fn uuid_and_multipart_checkpoints_at_one_version_selects_uuid() {
     );
 }
 
-/// Two uuid-named checkpoints at one version each stand alone -- each writer picks a fresh uuid, so
-/// they are distinct checkpoints, not parts of one -- and the greater file name wins.
+/// Two uuid-named checkpoints at one version are distinct checkpoints, not parts of one, since each
+/// writer picked its own uuid.
 #[tokio::test]
 async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
     let (storage, log_root) = create_storage_with_raw_paths(
@@ -1564,13 +1545,9 @@ async fn two_uuid_checkpoints_at_one_version_select_greater_filename() {
     );
 }
 
-/// End-to-end through the real `_last_checkpoint`-hint listing path: a version holds a complete
-/// multi-part checkpoint plus two uuid-named checkpoints (uuid `bbbb...` > `aaaa...`), so listing
-/// deterministically selects the greater uuid. A hint is retained (`applies_to` is true) only when
-/// it names that selected checkpoint; a hint pointing at any of the losing candidates -- the loser
-/// uuid, the multi-part group, or a phantom classic checkpoint -- is ignored, so readers fall back
-/// to the checkpoint file's own fields. This drives the `Uuid` arm of `applies_to` against real
-/// listed `ParsedLogPath`s, which the hand-built `applies_to` unit test cannot.
+/// v5 holds a complete 2-part checkpoint and two uuid-named ones, so listing selects uuid `bbbb`.
+/// Each case points the hint at a different candidate; only the one naming `bbbb` applies. Runs
+/// `applies_to` against listed paths rather than hand-built ones.
 #[rstest]
 #[case::hint_names_winner_uuid(
     hint_naming_uuid(
@@ -1621,17 +1598,15 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
     )
     .unwrap();
 
-    // Listing always selects the deterministic winner, regardless of what the hint names.
+    // The winner is the same no matter what the hint names.
     assert_eq!(listed.checkpoint_parts.len(), 1);
     assert_eq!(listed.checkpoint_parts[0].filename, winner);
-    // The hint's fields are trusted only when it names that selected checkpoint.
     assert_eq!(
         hint.applies_to(&listed.checkpoint_parts),
         expect_hint_applies
     );
 }
 
-/// A uuid-named (V2) checkpoint beats a classic (V1) one at the same version, matching Delta-Spark.
 #[tokio::test]
 async fn uuid_checkpoint_beats_classic_checkpoint_at_one_version() {
     let (storage, log_root) = create_storage_with_raw_paths(
@@ -1653,7 +1628,6 @@ async fn uuid_checkpoint_beats_classic_checkpoint_at_one_version() {
     );
 }
 
-/// A json V2 checkpoint outranks the V1 checkpoints at its version just like a parquet one does.
 /// A json checkpoint has no parquet footer, so selecting it routes schema discovery through the
 /// sidecar path rather than a footer read (see `LogSegment::get_file_actions_schema_and_sidecars`).
 #[tokio::test]
@@ -1685,8 +1659,7 @@ async fn json_uuid_checkpoint_beats_v1_checkpoints_at_one_version() {
     );
 }
 
-/// A 1-of-1 multi-part checkpoint outranks a classic one at the same version, matching Delta-Spark.
-/// Both are complete single-file V1 checkpoints, so they replay to the same state.
+/// Both are complete single-file V1 checkpoints, so they replay to the same state either way.
 #[tokio::test]
 async fn one_of_one_multipart_checkpoint_beats_classic_checkpoint() {
     let (storage, log_root) = create_storage(vec![
@@ -1718,8 +1691,7 @@ async fn one_of_one_multipart_checkpoint_beats_classic_checkpoint() {
 }
 
 #[rstest]
-// A classic checkpoint and a 1-of-1 multi-part checkpoint at one version: each is complete on its
-// own, and they occupy separate groups.
+// A classic and a 1-of-1 multi-part checkpoint at one version each fill their own group.
 #[case::single_and_one_of_one_same_version(
         vec![
             parse_log_path(&multipart_checkpoint_name(5, 1, 1)),
@@ -1735,8 +1707,7 @@ async fn one_of_one_multipart_checkpoint_beats_classic_checkpoint() {
             .collect(),
         Some(10)
     )]
-// A torn 11-part group beside a complete 2-part one at the same version: the version still counts
-// as checkpointed, on the strength of the complete group alone.
+// A torn 11-part group beside a complete 2-part one: still checkpointed, on the complete group.
 #[case::torn_beside_complete_same_version(
         (1..=2).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 2)))
             .chain((1..=3).map(|p| parse_log_path(&multipart_checkpoint_name(10, p, 11))))

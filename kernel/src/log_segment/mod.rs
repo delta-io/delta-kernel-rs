@@ -255,8 +255,9 @@ impl LogSegment {
     }
 
     /// The retained `_last_checkpoint` hint, but only when it describes the checkpoint this segment
-    /// selected (see [`LastCheckpointHint::applies_to`]) -- so the caller may trust its fields.
-    fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
+    /// selected (see `LastCheckpointHint::applies_to`), so the caller may trust its fields.
+    #[internal_api]
+    pub(crate) fn checkpoint_hint(&self) -> Option<&LastCheckpointHint> {
         self.checkpoint_version?;
         self.last_checkpoint_metadata
             .as_ref()
