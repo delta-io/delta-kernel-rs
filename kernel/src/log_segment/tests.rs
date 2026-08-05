@@ -517,6 +517,8 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         None,
     )
     .unwrap();
+    assert_eq!(log_segment.last_checkpoint_version(), Some(3));
+
     let commit_files = log_segment.listed.ascending_commit_files;
     let checkpoint_parts = log_segment.listed.checkpoint_parts;
 
@@ -581,12 +583,6 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
 
 #[tokio::test]
 async fn build_snapshot_with_missing_checkpoint_part_from_hint_falls_back() {
-    // The hinted checkpoint at version 5 declares 3 parts but only 2 are present, so it is not a
-    // usable checkpoint. The hint is advisory, and the table still reconstructs from the complete
-    // checkpoint at version 3 plus commits 4-7, so the load succeeds from there rather than
-    // failing. Delta Spark (`getLogSegmentWithMaxExclusiveCheckpointVersion`) and the Java kernel
-    // (`findFallbackCheckpointVersion`) behave the same way: neither distinguishes a checkpoint
-    // that was deleted from one whose parts are incomplete.
     let checkpoint_metadata = LastCheckpointHint {
         v2_checkpoint: None,
         version: 5,
@@ -632,6 +628,10 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_falls_back() {
     assert_eq!(log_segment.checkpoint_version, Some(3));
     assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
     assert_eq!(log_segment.listed.checkpoint_parts[0].version, 3);
+
+    // The disproved hint must be dropped, or `CheckpointWriter::finalize` keeps skipping the
+    // `_last_checkpoint` write and the table can never heal.
+    assert_eq!(log_segment.last_checkpoint_version(), None);
 
     let versions = log_segment
         .listed
@@ -730,20 +730,10 @@ async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkp
 
 #[tokio::test]
 async fn build_snapshot_with_deleted_checkpoint_from_hint_falls_back_to_commits() {
-    // The `_last_checkpoint` hint points at version 3, but every checkpoint file has been deleted
-    // (log cleanup, or a partial delete that spared `_last_checkpoint`, whose name does not match
-    // the checkpoint pattern). The commits are all intact, so the table is fully reconstructible
-    // from the JSON log: the stale hint must be ignored rather than reported as corruption.
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 3,
         size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -770,6 +760,7 @@ async fn build_snapshot_with_deleted_checkpoint_from_hint_falls_back_to_commits(
     assert_eq!(log_segment.checkpoint_version, None);
     assert!(log_segment.listed.checkpoint_parts.is_empty());
 
+    assert_eq!(log_segment.last_checkpoint_version(), None);
     let versions = log_segment
         .listed
         .ascending_commit_files
@@ -781,19 +772,10 @@ async fn build_snapshot_with_deleted_checkpoint_from_hint_falls_back_to_commits(
 
 #[tokio::test]
 async fn build_snapshot_with_deleted_checkpoint_from_hint_falls_back_to_earlier_checkpoint() {
-    // The hinted checkpoint at version 5 is gone, but an earlier complete checkpoint at version 3
-    // survives. Falling back to a listing from version 0 must root the segment at that earlier
-    // checkpoint rather than replaying every commit.
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
         version: 5,
         size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -827,6 +809,7 @@ async fn build_snapshot_with_deleted_checkpoint_from_hint_falls_back_to_earlier_
     assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
     assert_eq!(log_segment.listed.checkpoint_parts[0].version, 3);
 
+    assert_eq!(log_segment.last_checkpoint_version(), None);
     let versions = log_segment
         .listed
         .ascending_commit_files
@@ -837,27 +820,64 @@ async fn build_snapshot_with_deleted_checkpoint_from_hint_falls_back_to_earlier_
 }
 
 #[tokio::test]
-async fn build_snapshot_with_deleted_checkpoint_from_hint_and_truncated_log_fails() {
-    // Log cleanup deleted commits 0-98 because the checkpoint at version 99 covered them, and that
-    // checkpoint was then lost while `_last_checkpoint` survived. The surviving commits cannot
-    // reconstruct the table on their own, so the stale hint must NOT be treated as recoverable --
-    // falling back here would return a snapshot silently missing every file added before v99.
+async fn build_snapshot_with_deleted_checkpoint_from_hint_and_time_travel_falls_back() {
     let checkpoint_metadata = LastCheckpointHint {
-        v2_checkpoint: None,
-        version: 99,
+        version: 5,
         size: 10,
-        parts: None,
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-        tags: None,
+        ..Default::default()
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
-            // The checkpoint at version 99 named by the hint has been deleted, and commits 0-98
-            // were already cleaned up under it.
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+            // The checkpoint at version 5 named by the hint has been deleted.
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        Some(&checkpoint_metadata),
+    )
+    .await;
+
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![], // log_tail
+        Some(checkpoint_metadata),
+        Some(6),
+    )
+    .unwrap();
+
+    assert_eq!(log_segment.end_version, 6);
+    assert_eq!(log_segment.checkpoint_version, Some(3));
+    assert_eq!(log_segment.listed.checkpoint_parts.len(), 1);
+    assert_eq!(log_segment.listed.checkpoint_parts[0].version, 3);
+    assert_eq!(log_segment.last_checkpoint_version(), None);
+
+    let versions = log_segment
+        .listed
+        .ascending_commit_files
+        .into_iter()
+        .map(|f| f.version)
+        .collect_vec();
+    assert_eq!(versions, vec![4, 5, 6]);
+}
+
+#[tokio::test]
+async fn build_snapshot_with_deleted_checkpoint_from_hint_and_truncated_log_fails() {
+    let checkpoint_metadata = LastCheckpointHint {
+        version: 99,
+        size: 10,
+        ..Default::default()
+    };
+
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
             delta_path_for_version(99, "json"),
             delta_path_for_version(100, "json"),
             delta_path_for_version(101, "json"),

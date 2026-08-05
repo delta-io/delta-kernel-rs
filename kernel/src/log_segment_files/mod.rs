@@ -598,7 +598,7 @@ impl LogSegmentFiles {
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-            info!(
+            warn!(
                 hint_version = checkpoint_metadata.version,
                 "_last_checkpoint names a checkpoint that is missing or incomplete; treating the \
                  hint as stale and listing without it"
