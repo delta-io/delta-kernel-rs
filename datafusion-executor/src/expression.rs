@@ -233,8 +233,8 @@ fn struct_patch_to_df_expr(
         (source_struct, source_expr) = (nested.as_ref(), Some(source));
     }
 
-    // Append `[name, value]` pairs in the evaluator's emission order, consuming one output field per
-    // appended value so each value is lowered against the type it lands in.
+    // Append `[name, value]` pairs in the evaluator's emission order, consuming one output field
+    // per appended value so each value is lowered against the type it lands in.
     let mut output_fields = target.fields();
     let mut args = Vec::with_capacity(target.num_fields() * 2);
 
