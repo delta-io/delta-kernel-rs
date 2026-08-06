@@ -66,10 +66,34 @@ pub unsafe extern "C" fn get_plan_based_engine(
     engine_to_handle(engine, allocate_error)
 }
 
+/// Construct a [`PlanBasedEngine`] backed by `plan_executor` with no fallback engine.
+///
+/// Operations the plan-execution path does not implement return an unsupported error, rather than
+/// being delegated. Use this when a fallback cannot be constructed: an FFI-backed fallback resolves
+/// the table path itself, which fails for a path only the caller's filesystem can resolve -- a log
+/// served from process memory, for instance. Prefer [`get_plan_based_engine`] otherwise.
+///
+/// This method consumes the [`SharedPlanExecutor`] handle.
+///
+/// # Safety
+///
+/// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`] and a
+/// valid [`AllocateErrorFn`].
+#[no_mangle]
+pub unsafe extern "C" fn get_plan_based_engine_without_fallback(
+    plan_executor: Handle<SharedPlanExecutor>,
+    allocate_error: AllocateErrorFn,
+) -> Handle<SharedExternEngine> {
+    let executor: Arc<dyn PlanExecutor> = unsafe { plan_executor.into_inner() };
+    let engine: Arc<dyn Engine> = Arc::new(PlanBasedEngine::new_without_fallback(executor));
+    engine_to_handle(engine, allocate_error)
+}
+
 #[cfg(test)]
 mod tests {
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel_default_engine::DefaultEngineBuilder;
+    use url::Url;
 
     use super::*;
     use crate::error::EngineExecResult;
@@ -113,5 +137,39 @@ mod tests {
         // The plan-based engine and the fallback are freed independently.
         unsafe { free_engine(engine_handle) };
         unsafe { free_engine(fallback_handle) };
+    }
+
+    #[test]
+    fn get_plan_based_engine_without_fallback_returns_plan_based_engine() {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+
+        let engine_handle =
+            unsafe { get_plan_based_engine_without_fallback(executor, allocate_err) };
+
+        assert_is_plan_based_engine(&engine_handle);
+
+        unsafe { free_engine(engine_handle) };
+    }
+
+    /// Without a fallback, an operation the plan-execution path does not implement reports that
+    /// rather than delegating.
+    #[test]
+    fn without_fallback_unimplemented_operations_are_unsupported() {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+        let engine_handle =
+            unsafe { get_plan_based_engine_without_fallback(executor, allocate_err) };
+
+        let engine = unsafe { engine_handle.as_ref() }.engine();
+        let location = Url::parse("memory:///table/_delta_log/00000000000000000001.json").unwrap();
+        let err = engine
+            .json_handler()
+            .write_json_file(&location, Box::new(std::iter::empty()), false)
+            .expect_err("write_json_file has no plan-execution path and no fallback");
+        assert!(
+            matches!(err, delta_kernel::Error::Unsupported(_)),
+            "expected an unsupported error, got: {err:?}",
+        );
+
+        unsafe { free_engine(engine_handle) };
     }
 }

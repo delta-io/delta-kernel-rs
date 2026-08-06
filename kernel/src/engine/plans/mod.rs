@@ -20,6 +20,7 @@ use json::PlanBasedJsonHandler;
 use parquet::PlanBasedParquetHandler;
 use storage::PlanBasedStorageHandler;
 
+use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::plans::PlanExecutor;
 use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
@@ -29,7 +30,10 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 /// [`Operation`](crate::plans::Operation)s and delegated to the plan executor.
 ///
 /// Operations not yet implemented on the plan-execution path (e.g. `write_json_file`,
-/// `write_parquet_file`) and evaluation are delegated to the required `fallback` [`Engine`].
+/// `write_parquet_file`) are delegated to `fallback` when one is configured, and otherwise return
+/// an unsupported error. A fallback is optional because a connector may be unable to construct one:
+/// an FFI-backed engine resolves table paths itself, which fails for a path only the connector can
+/// resolve.
 pub struct PlanBasedEngine {
     executor: Arc<dyn PlanExecutor>,
     evaluation: Arc<dyn EvaluationHandler>,
@@ -51,12 +55,29 @@ impl PlanBasedEngine {
             storage: Arc::new(PlanBasedStorageHandler::new(plan_executor.clone())),
             json: Arc::new(PlanBasedJsonHandler::new(
                 plan_executor.clone(),
-                fallback.json_handler(),
+                Some(fallback.json_handler()),
             )),
             parquet: Arc::new(PlanBasedParquetHandler::new(
                 plan_executor.clone(),
-                fallback.parquet_handler(),
+                Some(fallback.parquet_handler()),
             )),
+            executor: plan_executor,
+        }
+    }
+
+    /// Construct a `PlanBasedEngine` with no fallback [`Engine`], for a caller that cannot build
+    /// one -- an FFI-backed fallback resolves table paths itself, which fails for a path only the
+    /// connector's filesystem can resolve.
+    ///
+    /// Operations the plan-execution path does not implement return an unsupported error rather
+    /// than being delegated. Evaluation, which needs no path resolution, uses the Arrow
+    /// implementation.
+    pub fn new_without_fallback(plan_executor: Arc<dyn PlanExecutor>) -> Self {
+        Self {
+            evaluation: Arc::new(ArrowEvaluationHandler),
+            storage: Arc::new(PlanBasedStorageHandler::new(plan_executor.clone())),
+            json: Arc::new(PlanBasedJsonHandler::new(plan_executor.clone(), None)),
+            parquet: Arc::new(PlanBasedParquetHandler::new(plan_executor.clone(), None)),
             executor: plan_executor,
         }
     }
