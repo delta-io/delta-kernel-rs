@@ -1333,16 +1333,16 @@ mod tests {
             // Test all primitive scalar types that have proper PartialEq
             let cases: Vec<Expression> = vec![
                 // Numeric types
-                lit(42i32),         // Integer
-                lit(9999999999i64), // Long
-                lit(123i16),        // Short
-                lit(42i8),          // Byte
-                lit(1.12345677_32), // Float
-                lit(1.12345667_64), // Double
+                Expression::literal(42i32),         // Integer
+                Expression::literal(9999999999i64), // Long
+                Expression::literal(123i16),        // Short
+                Expression::literal(42i8),          // Byte
+                Expression::literal(1.12345677_32), // Float
+                Expression::literal(1.12345667_64), // Double
                 // String and Boolean
-                lit("hello world"),
-                lit(true),
-                lit(false),
+                Expression::literal("hello world"),
+                Expression::literal(true),
+                Expression::literal(false),
                 // Temporal types
                 Expression::Literal(Scalar::Timestamp(1234567890000000)),
                 Expression::Literal(Scalar::TimestampNtz(1234567890000000)),
@@ -1695,7 +1695,7 @@ mod tests {
 
         #[test]
         fn test_opaque_expression_serialize_fails() {
-            use crate::expressions::{lit, OpaqueExpressionOp, ScalarExpressionEvaluator};
+            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
             use crate::DeltaResult;
 
             #[derive(Debug, PartialEq)]
@@ -1714,14 +1714,14 @@ mod tests {
                 }
             }
 
-            let expr = Expression::opaque(TestOpaqueExprOp, [lit(1)]);
+            let expr = Expression::opaque(TestOpaqueExprOp, [Expression::literal(1)]);
             let result = serde_json::to_string(&expr);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Expression");
         }
 
         #[test]
         fn test_opaque_predicate_serialize_fails() {
-            use crate::expressions::{lit, OpaquePredicateOp, ScalarExpressionEvaluator};
+            use crate::expressions::{OpaquePredicateOp, ScalarExpressionEvaluator};
             use crate::kernel_predicates::{
                 DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
                 IndirectDataSkippingPredicateEvaluator,
@@ -1762,7 +1762,7 @@ mod tests {
                 }
             }
 
-            let pred = Predicate::opaque(TestOpaquePredOp, [lit(1)]);
+            let pred = Predicate::opaque(TestOpaquePredOp, [Expression::literal(1)]);
             let result = serde_json::to_string(&pred);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
         }

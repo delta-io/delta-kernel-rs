@@ -691,14 +691,14 @@ mod tests {
             }
 
             // Check that other expressions are unchanged
-            assert_eq!(result_expr.exprs[0], lit(1));
+            assert_eq!(result_expr.exprs[0], Expr::literal(1));
             if let Expr::Column(col) = &result_expr.exprs[2] {
                 assert_eq!(col.len(), 1);
                 assert_eq!(col[0], "unchanged_col");
             } else {
                 panic!("Expected column expression");
             }
-            assert_eq!(result_expr.exprs[3], lit("test"));
+            assert_eq!(result_expr.exprs[3], Expr::literal("test"));
         }
     }
 
@@ -822,7 +822,7 @@ mod tests {
                 panic!("Expected unchanged column");
             }
 
-            assert_eq!(result_expr.exprs[1], lit(10)); // 5 * 2
+            assert_eq!(result_expr.exprs[1], Expr::literal(10)); // 5 * 2
 
             if let Expr::Column(col) = &result_expr.exprs[2] {
                 assert_eq!(col.len(), 1);
@@ -831,7 +831,7 @@ mod tests {
                 panic!("Expected transformed column");
             }
 
-            assert_eq!(result_expr.exprs[3], lit("keep"));
+            assert_eq!(result_expr.exprs[3], Expr::literal("keep"));
         }
     }
 

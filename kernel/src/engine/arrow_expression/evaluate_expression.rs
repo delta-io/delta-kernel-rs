@@ -1829,11 +1829,11 @@ mod tests {
         let batch = create_test_batch();
 
         // Valid: literal matches expected type
-        let result = evaluate_expression(&lit(42), &batch, Some(&DataType::INTEGER));
+        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::INTEGER));
         assert!(result.is_ok());
 
         // Error: literal type mismatch
-        let result = evaluate_expression(&lit(42), &batch, Some(&DataType::STRING));
+        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::STRING));
         assert_result_error_with_message(result, "Incorrect datatype");
     }
 
@@ -3340,7 +3340,7 @@ mod tests {
     // the Arrow Debug formatter for `DataType` since that may change.
     #[case::input_type_mismatch(
         create_test_batch(),
-        Expr::array([lit(1_i32), lit(2_i32), lit("text")]),
+        Expr::array([Expr::literal(1_i32), Expr::literal(2_i32), Expr::literal("text")]),
         None,
         "input 2",
     )]

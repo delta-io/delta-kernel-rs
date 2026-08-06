@@ -1183,7 +1183,7 @@ fn test_interval_partition_columns_are_not_pruning_columns(
         column_expr_ref!("stats_parsed"),
         Some(&partition_schema),
         column_expr_ref!("partitionValues_parsed"),
-        Arc::new(lit(true)),
+        Arc::new(Expr::literal(true)),
     )
     .unwrap();
 

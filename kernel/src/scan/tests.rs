@@ -50,9 +50,9 @@ fn test_static_skipping() {
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
-        (false, Pred::lt(col!("a"), lit(10))),
-        (false, Pred::lt(lit(10), lit(100))),
-        (true, Pred::gt(lit(10), lit(100))),
+        (false, Pred::lt(col!("a"), Expr::literal(10))),
+        (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
+        (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
         (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {

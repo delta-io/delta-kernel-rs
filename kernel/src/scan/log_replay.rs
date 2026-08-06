@@ -1158,7 +1158,7 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        lit, BinaryExpressionOp, ColumnName, Expression, OpaquePredicateOp, Predicate, Scalar,
+        col, lit, BinaryExpressionOp, ColumnName, Expression, OpaquePredicateOp, Predicate, Scalar,
         ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
@@ -1424,7 +1424,7 @@ mod tests {
                     Expr::column(["row_id_col"]),
                     Expr::binary(
                         BinaryExpressionOp::Plus,
-                        lit(42i64),
+                        Expr::literal(42i64),
                         Expr::column(["row_indexes_for_row_id_0"]),
                     ),
                 ]));
@@ -1499,7 +1499,7 @@ mod tests {
         ]));
         let predicate = Arc::new(crate::expressions::Predicate::eq(
             Expr::column(["id"]),
-            lit(10i32),
+            Expr::literal(10i32),
         ));
         let state_info = Arc::new(
             get_state_info(
@@ -1898,7 +1898,7 @@ mod tests {
             StructField::new("value", DataType::INTEGER, true),
         ])),
         vec![],
-        Arc::new(Expression::column(["value"]).gt(lit(5i32))),
+        Arc::new(col!("value").gt(lit(5i32))),
         false, // use batch without partition column
     )]
     #[case::partition_predicate(
@@ -1907,7 +1907,7 @@ mod tests {
             StructField::new("date", DataType::DATE, true),
         ])),
         vec!["date".to_string()],
-        Arc::new(Expression::column(["date"]).eq(lit(Scalar::Date(17_510)))),
+        Arc::new(col!("date").eq(lit(Scalar::Date(17_510)))),
         true, // use batch with partition column
     )]
     #[case::mixed_stats_and_partition(
@@ -1917,8 +1917,8 @@ mod tests {
         ])),
         vec!["date".to_string()],
         Arc::new(Predicate::and(
-            Expression::column(["value"]).gt(lit(5i32)),
-            Expression::column(["date"]).eq(lit(Scalar::Date(17_510))),
+            col!("value").gt(lit(5i32)),
+            col!("date").eq(lit(Scalar::Date(17_510))),
         )),
         true, // use batch with partition column
     )]
