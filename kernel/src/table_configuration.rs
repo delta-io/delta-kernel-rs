@@ -30,9 +30,9 @@ use crate::schema::{
 use crate::table_features::validate_geospatial_feature_support;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
-    get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
-    validate_timestamp_ntz_feature_support, ColumnMappingMode, EnablementCheck, FeatureRequirement,
-    FeatureType, KernelSupport, Operation, TableFeature, LEGACY_WRITER_FEATURES,
+    extract_enabled_writer_features, get_any_level_column_physical_name,
+    validate_iceberg_compat_if_needed, validate_timestamp_ntz_feature_support, ColumnMappingMode,
+    EnablementCheck, FeatureRequirement, FeatureType, KernelSupport, Operation, TableFeature,
     MAX_VALID_WRITER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
     TABLE_FEATURES_MIN_WRITER_VERSION, V3_VALIDATOR,
 };
@@ -251,15 +251,29 @@ impl TableConfiguration {
             });
         }
 
-        // note that while we could pick apart the protocol/metadata updates and validate them
-        // individually, instead we just re-parse so that we can recycle the try_new validation
-        // (instead of duplicating it here).
-        Self::try_new(
+        // Note that while we could pick apart the protocol/metadata updates and validate them
+        // individually, instead we re-parse so that we can recycle the try_new validation.
+        let protocol_changed = new_protocol.is_some();
+        let evolved = Self::try_new(
             new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
             new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
             table_configuration.table_root.clone(),
             new_version,
-        )
+        )?;
+
+        if protocol_changed {
+            // Validate dependencies for newly explicit features against the evolved metadata.
+            // This intentionally does not run the broad write-support gate: ADD FEATURE may
+            // preserve unsupported existing capabilities, and supporting a feature need not
+            // enable its property.
+            for feature in evolved.get_enabled_writer_features() {
+                if !table_configuration.is_feature_supported(&feature) {
+                    evolved.validate_feature_requirements(&feature)?;
+                }
+            }
+        }
+
+        Ok(evolved)
     }
 
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
@@ -678,24 +692,7 @@ impl TableConfiguration {
     /// For table features protocol (v7), returns the explicit writer_features list.
     /// For legacy protocol (v1-6), infers features from the version number.
     fn get_enabled_writer_features(&self) -> Vec<TableFeature> {
-        match self.protocol.min_writer_version() {
-            TABLE_FEATURES_MIN_WRITER_VERSION => {
-                // Table features writer: use explicit writer_features list
-                self.protocol
-                    .writer_features()
-                    .map(|f| f.to_vec())
-                    .unwrap_or_default()
-            }
-            v if (1..=6).contains(&v) => {
-                // Legacy writer: infer features from version
-                LEGACY_WRITER_FEATURES
-                    .iter()
-                    .filter(|f| f.is_valid_for_legacy_writer(v))
-                    .cloned()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
+        extract_enabled_writer_features(&self.protocol)
     }
 
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that

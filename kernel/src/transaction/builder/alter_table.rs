@@ -1,4 +1,4 @@
-//! Builder for ALTER TABLE (schema evolution) transactions.
+//! Builder for ALTER TABLE transactions.
 //!
 //! This module contains [`AlterTableTransactionBuilder`], which uses a type-state pattern to
 //! enforce valid operation chaining at compile time.
@@ -7,13 +7,13 @@
 //!
 //! - [`Ready`]: Initial state. Operations are available, but `build()` is not (at least one
 //!   operation is required).
-//! - [`Modifying`]: After any chainable schema operation. More ops can be chained, and `build()` is
+//! - [`Modifying`]: After any chainable operation. More ops can be chained, and `build()` is
 //!   available. See [`AlterTableTransactionBuilder<Modifying>`] for ops.
 //!
 //! # Transitions
 //!
 //! Each `impl` block below is gated by a state bound and documents which operations that
-//! state enables. Chainable schema operations live on `impl<S: Chainable>` and transition
+//! state enables. Chainable operations live on `impl<S: Chainable>` and transition
 //! the builder to a chainable state; `build()` lives on states that are buildable.
 //!
 //! ```ignore
@@ -27,14 +27,16 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata, ColumnMappingMode,
-    Operation, TableFeature,
+    protocol_with_added_features, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, ColumnMappingMode, Operation, TableFeature,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
@@ -67,7 +69,7 @@ mod sealed {
     impl Sealed for super::Modifying {}
 }
 
-/// Builder for constructing an [`AlterTableTransaction`] with schema evolution operations.
+/// Builder for constructing an [`AlterTableTransaction`] with protocol or schema operations.
 ///
 /// Uses a type-state pattern (`S`) to enforce at compile time:
 /// - At least one schema operation must be queued before `build()` is callable.
@@ -76,6 +78,8 @@ mod sealed {
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
+    table_features: Vec<TableFeature>,
+    allow_protocol_versions_increase: bool,
     correlation_id: Option<Arc<str>>,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
@@ -93,6 +97,8 @@ impl<S> AlterTableTransactionBuilder<S> {
         AlterTableTransactionBuilder {
             snapshot: self.snapshot,
             operations: self.operations,
+            table_features: self.table_features,
+            allow_protocol_versions_increase: self.allow_protocol_versions_increase,
             correlation_id: self.correlation_id,
             _state: PhantomData,
         }
@@ -104,6 +110,14 @@ impl<S> AlterTableTransactionBuilder<S> {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
+
+    /// Allow adding table features to increase the writer protocol to 7 and, when required by a
+    /// requested reader-writer feature, the reader protocol to 3.
+    #[internal_api]
+    pub(crate) fn with_allow_protocol_versions_increase(mut self, allow: bool) -> Self {
+        self.allow_protocol_versions_increase = allow;
+        self
+    }
 }
 
 impl AlterTableTransactionBuilder<Ready> {
@@ -112,6 +126,8 @@ impl AlterTableTransactionBuilder<Ready> {
         AlterTableTransactionBuilder {
             snapshot,
             operations: Vec::new(),
+            table_features: Vec::new(),
+            allow_protocol_versions_increase: false,
             correlation_id: None,
             _state: PhantomData,
         }
@@ -119,6 +135,16 @@ impl AlterTableTransactionBuilder<Ready> {
 }
 
 impl<S: Chainable> AlterTableTransactionBuilder<S> {
+    /// Add a supported table feature while conservatively preserving current capabilities.
+    #[internal_api]
+    pub(crate) fn add_table_feature(
+        mut self,
+        feature: TableFeature,
+    ) -> AlterTableTransactionBuilder<Modifying> {
+        self.table_features.push(feature);
+        self.transition()
+    }
+
     /// Add a new top-level column to the table schema.
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
@@ -144,14 +170,15 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
 }
 
 impl AlterTableTransactionBuilder<Modifying> {
-    /// Validate and apply schema operations, then build the [`AlterTableTransaction`].
+    /// Validate and apply protocol or schema operations, then build the
+    /// [`AlterTableTransaction`].
     ///
     /// This method:
-    /// 1. Validates the table supports writes
-    /// 2. Applies each operation sequentially against the evolving schema
-    /// 3. Constructs new Metadata action with evolved schema
-    /// 4. Builds the evolved table configuration
-    /// 5. Creates the transaction
+    /// 1. Validates schema changes against the table's write capabilities
+    /// 2. Applies schema operations sequentially when present
+    /// 3. Conservatively evolves and extends the table-feature Protocol when features are requested
+    /// 4. Validates the evolved table configuration
+    /// 5. Creates the transaction with explicit Protocol and Metadata emission flags
     ///
     /// # Errors
     ///
@@ -167,74 +194,103 @@ impl AlterTableTransactionBuilder<Modifying> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
-        // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
-        // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
-        if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
-                "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
-            ));
-        }
-        // TODO(#2630): Support ALTER TABLE on tables with column defaults.
-        if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-            return Err(Error::unsupported(
-                "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
-            ));
-        }
-        // Rejects writes to tables kernel can't safely commit to: writer version out of
-        // kernel's supported range, unsupported writer features, or schemas with SQL-expression
-        // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the
-        // protocol must also re-check this on the evolved `TableConfiguration`.
-        table_config.ensure_operation_supported(Operation::Write)?;
+        let has_schema_operations = !self.operations.is_empty();
+        let has_feature_operations = !self.table_features.is_empty();
 
-        let schema = Arc::unwrap_or_clone(table_config.logical_schema());
-        let column_mapping_mode = table_config.column_mapping_mode();
-        let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
-        // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
-        // strip below needs from it. Captured as a bool (not a clone) before
-        // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
-        // `None` mode, where no strip fires.
-        let current_has_cm = column_mapping_mode == ColumnMappingMode::None
-            && schema_has_column_mapping_metadata(&schema);
-        let SchemaEvolutionResult {
-            schema: evolved_schema,
-            new_max_column_id,
-        } = apply_schema_operations(
-            schema,
-            self.operations,
-            column_mapping_mode,
-            current_max_column_id,
-        )?;
+        let evolved_metadata = if has_schema_operations {
+            // Schema ALTER behavior retains the broad write gate and feature restrictions.
+            if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+                return Err(Error::unsupported(
+                    "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
+                ));
+            }
+            // TODO(#2630): Support ALTER TABLE on tables with column defaults.
+            if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
+                return Err(Error::unsupported(
+                    "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
+                ));
+            }
+            table_config.ensure_operation_supported(Operation::Write)?;
 
-        // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
-        // that was clean before it, strip them; residual annotations already present on the
-        // table are left in place (see `strip_stray_column_mapping_metadata`).
-        let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
-            strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
-                .map_or(evolved_schema, Arc::new)
+            let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+            let column_mapping_mode = table_config.column_mapping_mode();
+            let current_max_column_id =
+                table_config.table_properties().column_mapping_max_column_id;
+            let current_has_cm = column_mapping_mode == ColumnMappingMode::None
+                && schema_has_column_mapping_metadata(&schema);
+            let SchemaEvolutionResult {
+                schema: evolved_schema,
+                new_max_column_id,
+            } = apply_schema_operations(
+                schema,
+                self.operations,
+                column_mapping_mode,
+                current_max_column_id,
+            )?;
+
+            let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+                strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
+                    .map_or(evolved_schema, Arc::new)
+            } else {
+                evolved_schema
+            };
+
+            let metadata = table_config
+                .metadata()
+                .clone()
+                .with_schema(evolved_schema.clone())?
+                .fold_with(new_max_column_id, |evolved_metadata, id| {
+                    evolved_metadata
+                        .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+                });
+            Some((metadata, evolved_schema))
         } else {
-            evolved_schema
+            None
         };
 
-        let evolved_metadata = table_config
-            .metadata()
-            .clone()
-            .with_schema(evolved_schema.clone())?
-            .fold_with(new_max_column_id, |evolved_metadata, id| {
-                evolved_metadata
-                    .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
-            });
+        let evolved_protocol = has_feature_operations
+            .then(|| {
+                protocol_with_added_features(
+                    table_config.protocol(),
+                    self.table_features,
+                    self.allow_protocol_versions_increase,
+                )
+            })
+            .transpose()?;
 
-        // Validates the evolved metadata against the protocol.
-        let evolved_table_config = TableConfiguration::try_new_with_schema(
-            table_config,
-            evolved_metadata,
-            evolved_schema,
-        )?;
+        // Preserve the existing schema-only construction path. When Protocol also changes,
+        // re-parse the combined target configuration before publication.
+        let evolved_table_config = match (evolved_metadata.as_ref(), evolved_protocol.clone()) {
+            (Some((metadata, _)), Some(protocol)) => TableConfiguration::try_new_from(
+                table_config,
+                Some(metadata.clone()),
+                Some(protocol),
+                table_config.version(),
+            )?,
+            (Some((metadata, schema)), None) => TableConfiguration::try_new_with_schema(
+                table_config,
+                metadata.clone(),
+                schema.clone(),
+            )?,
+            (None, protocol) => TableConfiguration::try_new_from(
+                table_config,
+                None,
+                protocol,
+                table_config.version(),
+            )?,
+        };
 
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
             evolved_table_config,
             committer,
+            evolved_protocol.is_some(),
+            has_schema_operations,
+            if has_feature_operations {
+                "ADD FEATURE"
+            } else {
+                "ALTER TABLE"
+            },
             self.correlation_id,
         )
     }

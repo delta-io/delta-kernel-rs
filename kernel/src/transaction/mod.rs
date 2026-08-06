@@ -162,10 +162,11 @@ pub struct ExistingTable;
 #[derive(Debug)]
 pub struct CreateTable;
 
-/// Marker type for alter-table (schema evolution) transactions.
+/// Marker type for alter-table transactions.
 ///
-/// Transactions in this state perform metadata-only commits. Data file operations are not
-/// available at compile time because `AlterTable` does not implement [`SupportsDataFiles`].
+/// Transactions in this state perform protocol and/or metadata-only commits. Data file operations
+/// are not available at compile time because `AlterTable` does not implement
+/// [`SupportsDataFiles`].
 #[derive(Debug)]
 pub struct AlterTable;
 
@@ -173,7 +174,7 @@ pub struct AlterTable;
 ///
 /// Only transaction types that implement this trait can access methods for adding, removing, or
 /// updating data files. This prevents compile-time misuse by states like `AlterTable` that
-/// only perform metadata-only commits.
+/// only perform protocol and/or metadata-only commits.
 pub trait SupportsDataFiles {}
 impl SupportsDataFiles for ExistingTable {}
 impl SupportsDataFiles for CreateTable {}
@@ -211,9 +212,9 @@ pub struct Transaction<S = ExistingTable> {
     // config, this is cloned from the read snapshot; when the config changes (e.g. schema
     // evolution), it is constructed separately with the new schema/protocol.
     effective_table_config: TableConfiguration,
-    // Whether to emit a Protocol action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether to emit a Protocol action. True for CREATE TABLE and protocol-changing ALTER TABLE.
     should_emit_protocol: bool,
-    // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether to emit a Metadata action. True for CREATE TABLE and metadata-changing ALTER TABLE.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: Option<String>,
@@ -482,10 +483,8 @@ impl<S> Transaction<S> {
         let remove_actions =
             self.generate_remove_actions(engine, self.remove_files_metadata.iter(), &[])?;
 
-        // Build the action chain
-        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata
-        // -> removes For existing table: CommitInfo -> adds -> txns -> domain_metadata ->
-        // removes
+        // Build the action chain: CommitInfo -> optional Protocol -> optional Metadata -> adds ->
+        // txns -> domain_metadata -> removes.
         let actions = iter::once(commit_info_action)
             .chain(protocol_action.map(Ok))
             .chain(metadata_action.map(Ok))

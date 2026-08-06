@@ -852,6 +852,23 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
     }
 }
 
+/// Extract the writer features enabled for `protocol`. For `min_writer_version == 7` returns the
+/// explicit `writer_features` list; for `1..=6` returns the legacy-inferred features.
+pub(crate) fn extract_enabled_writer_features(protocol: &Protocol) -> Vec<TableFeature> {
+    match protocol.min_writer_version() {
+        TABLE_FEATURES_MIN_WRITER_VERSION => protocol
+            .writer_features()
+            .map(|f| f.to_vec())
+            .unwrap_or_default(),
+        v if (1..=6).contains(&v) => LEGACY_WRITER_FEATURES
+            .iter()
+            .filter(|f| f.is_valid_for_legacy_writer(v))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
 pub(crate) fn add_feature_to_lists(
     feature: TableFeature,
@@ -873,6 +890,113 @@ pub(crate) fn add_feature_to_lists(
             }
         }
     }
+}
+
+/// Construct a table-feature protocol that preserves all current explicit or legacy-implied
+/// features and adds the requested features.
+pub(crate) fn protocol_with_added_features(
+    protocol: &Protocol,
+    requested_features: impl IntoIterator<Item = TableFeature>,
+    allow_protocol_versions_increase: bool,
+) -> DeltaResult<Protocol> {
+    let requested_features: Vec<_> = requested_features.into_iter().collect();
+    require!(
+        !requested_features.is_empty(),
+        Error::invalid_protocol("At least one table feature must be requested")
+    );
+    require!(
+        requested_features
+            .iter()
+            .all(|feature| feature.feature_type() != FeatureType::Unknown),
+        Error::invalid_protocol(
+            "Unknown table features cannot be added because their reader/writer type is unknown"
+        )
+    );
+    require!(
+        protocol.min_reader_version() <= TABLE_FEATURES_MIN_READER_VERSION
+            && protocol.min_writer_version() <= TABLE_FEATURES_MIN_WRITER_VERSION,
+        Error::invalid_protocol(
+            "Adding table features must not lower the current protocol versions"
+        )
+    );
+
+    let target_reader_version =
+        requested_features
+            .iter()
+            .fold(
+                protocol.min_reader_version(),
+                |target, feature| match feature.feature_type() {
+                    FeatureType::ReaderWriter
+                        if protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION
+                            && feature
+                                .is_valid_for_legacy_reader(protocol.min_reader_version()) =>
+                    {
+                        target
+                    }
+                    FeatureType::ReaderWriter => TABLE_FEATURES_MIN_READER_VERSION,
+                    FeatureType::WriterOnly | FeatureType::Unknown => target,
+                },
+            );
+    let versions_must_increase = target_reader_version > protocol.min_reader_version()
+        || TABLE_FEATURES_MIN_WRITER_VERSION > protocol.min_writer_version();
+    require!(
+        allow_protocol_versions_increase || !versions_must_increase,
+        Error::invalid_protocol(
+            "Adding table features requires increasing the protocol versions; set allow_protocol_versions_increase to true"
+        )
+    );
+
+    // Preserve explicit feature lists exactly, then append only capabilities that must become
+    // explicit as part of the transition to writer version 7 (and, when needed, reader version 3).
+    let mut reader_features = protocol.reader_features().unwrap_or_default().to_vec();
+    let mut writer_features = protocol.writer_features().unwrap_or_default().to_vec();
+
+    if protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION {
+        for feature in extract_enabled_writer_features(protocol) {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature);
+            }
+        }
+    }
+
+    if protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION {
+        for feature in extract_enabled_reader_features(protocol) {
+            if !writer_features.contains(&feature) {
+                writer_features.push(feature.clone());
+            }
+            if target_reader_version == TABLE_FEATURES_MIN_READER_VERSION
+                && !reader_features.contains(&feature)
+            {
+                reader_features.push(feature);
+            }
+        }
+    } else {
+        // Explicit reader features, including unknown payloads, are necessarily writer features.
+        for feature in &reader_features {
+            if !writer_features.contains(feature) {
+                writer_features.push(feature.clone());
+            }
+        }
+    }
+
+    for feature in requested_features {
+        if !writer_features.contains(&feature) {
+            writer_features.push(feature.clone());
+        }
+        if feature.feature_type() == FeatureType::ReaderWriter
+            && target_reader_version == TABLE_FEATURES_MIN_READER_VERSION
+            && !reader_features.contains(&feature)
+        {
+            reader_features.push(feature);
+        }
+    }
+
+    Protocol::try_new(
+        target_reader_version,
+        TABLE_FEATURES_MIN_WRITER_VERSION,
+        (target_reader_version == TABLE_FEATURES_MIN_READER_VERSION).then_some(reader_features),
+        Some(writer_features),
+    )
 }
 
 /// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
@@ -949,6 +1073,221 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    fn assert_feature_protocol(
+        protocol: &Protocol,
+        expected_reader_version: i32,
+        expected_reader: Option<&[TableFeature]>,
+        expected_writer: &[TableFeature],
+    ) {
+        assert_eq!(protocol.min_reader_version(), expected_reader_version);
+        assert_eq!(
+            protocol.min_writer_version(),
+            TABLE_FEATURES_MIN_WRITER_VERSION
+        );
+        assert_eq!(protocol.reader_features(), expected_reader);
+        assert_eq!(protocol.writer_features().unwrap(), expected_writer);
+    }
+
+    #[test]
+    fn adding_writer_only_feature_to_versions_1_1_targets_1_7() {
+        let protocol = Protocol::try_new_legacy(1, 1).unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::DomainMetadata], true).unwrap();
+
+        assert_feature_protocol(&evolved, 1, None, &[TableFeature::DomainMetadata]);
+    }
+
+    #[test]
+    fn adding_writer_only_feature_preserves_reader_2_and_all_legacy_capabilities() {
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::DomainMetadata], true).unwrap();
+
+        assert_feature_protocol(
+            &evolved,
+            2,
+            None,
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::Invariants,
+                TableFeature::CheckConstraints,
+                TableFeature::ChangeDataFeed,
+                TableFeature::GeneratedColumns,
+                TableFeature::ColumnMapping,
+                TableFeature::DomainMetadata,
+            ],
+        );
+    }
+
+    #[test]
+    fn adding_reader_writer_feature_to_legacy_protocol_targets_3_7() {
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::DeletionVectors], true).unwrap();
+
+        assert_feature_protocol(
+            &evolved,
+            3,
+            Some(&[TableFeature::DeletionVectors]),
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::Invariants,
+                TableFeature::DeletionVectors,
+            ],
+        );
+    }
+
+    #[test]
+    fn adding_column_mapping_keeps_legacy_reader_2() {
+        let protocol = Protocol::try_new_legacy(2, 5).unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::ColumnMapping], true).unwrap();
+
+        assert_feature_protocol(
+            &evolved,
+            2,
+            None,
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::Invariants,
+                TableFeature::CheckConstraints,
+                TableFeature::ChangeDataFeed,
+                TableFeature::GeneratedColumns,
+                TableFeature::ColumnMapping,
+            ],
+        );
+    }
+
+    #[test]
+    fn adding_writer_only_feature_extends_existing_1_7_without_permission() {
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            None::<Vec<TableFeature>>,
+            Some([TableFeature::AppendOnly]),
+        )
+        .unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::DomainMetadata], false).unwrap();
+
+        assert_feature_protocol(
+            &evolved,
+            1,
+            None,
+            &[TableFeature::AppendOnly, TableFeature::DomainMetadata],
+        );
+    }
+
+    #[test]
+    fn adding_features_preserves_explicit_lists_and_unknown_payloads() {
+        let unknown_reader = TableFeature::unknown("futureReaderWriter");
+        let unknown_writer = TableFeature::unknown("futureWriterOnly");
+        let protocol = Protocol::try_new_modern(
+            [
+                TableFeature::DeletionVectors,
+                unknown_reader.clone(),
+                TableFeature::V2Checkpoint,
+            ],
+            [
+                TableFeature::DeletionVectors,
+                unknown_reader.clone(),
+                TableFeature::AppendOnly,
+                unknown_writer.clone(),
+                TableFeature::V2Checkpoint,
+            ],
+        )
+        .unwrap();
+
+        let evolved = protocol_with_added_features(
+            &protocol,
+            [TableFeature::DomainMetadata, TableFeature::DomainMetadata],
+            false,
+        )
+        .unwrap();
+
+        assert_feature_protocol(
+            &evolved,
+            3,
+            Some(&[
+                TableFeature::DeletionVectors,
+                unknown_reader.clone(),
+                TableFeature::V2Checkpoint,
+            ]),
+            &[
+                TableFeature::DeletionVectors,
+                unknown_reader,
+                TableFeature::AppendOnly,
+                unknown_writer,
+                TableFeature::V2Checkpoint,
+                TableFeature::DomainMetadata,
+            ],
+        );
+    }
+
+    #[rstest]
+    #[case::writer_only(1, 1, TableFeature::DomainMetadata)]
+    #[case::reader_writer(1, 2, TableFeature::DeletionVectors)]
+    fn adding_feature_rejects_required_version_increase_without_permission(
+        #[case] reader_version: i32,
+        #[case] writer_version: i32,
+        #[case] feature: TableFeature,
+    ) {
+        let protocol = Protocol::try_new_legacy(reader_version, writer_version).unwrap();
+        let result = protocol_with_added_features(&protocol, [feature], false);
+
+        assert!(
+            matches!(result, Err(Error::InvalidProtocol(message)) if message.contains("allow_protocol_versions_increase"))
+        );
+    }
+
+    #[test]
+    fn adding_features_rejects_empty_and_unknown_requests() {
+        let protocol =
+            Protocol::try_new_modern(Vec::<TableFeature>::new(), Vec::<TableFeature>::new())
+                .unwrap();
+
+        let empty = protocol_with_added_features(&protocol, [], false);
+        assert!(matches!(empty, Err(Error::InvalidProtocol(_))));
+
+        let unknown = protocol_with_added_features(
+            &protocol,
+            [TableFeature::unknown("futureFeature")],
+            false,
+        );
+        assert!(
+            matches!(unknown, Err(Error::InvalidProtocol(message)) if message.contains("reader/writer type"))
+        );
+    }
+
+    #[rstest]
+    #[case::reader_above_table_feature_version(4, 7)]
+    #[case::writer_above_table_feature_version(1, 8)]
+    fn adding_features_rejects_protocol_version_downgrade(
+        #[case] reader_version: i32,
+        #[case] writer_version: i32,
+    ) {
+        let protocol = Protocol::try_new(
+            reader_version,
+            writer_version,
+            if reader_version == 3 {
+                Some(Vec::<TableFeature>::new())
+            } else {
+                None
+            },
+            if writer_version == 7 {
+                Some(Vec::<TableFeature>::new())
+            } else {
+                None
+            },
+        )
+        .unwrap();
+        let result = protocol_with_added_features(&protocol, [TableFeature::DomainMetadata], true);
+
+        assert!(
+            matches!(result, Err(Error::InvalidProtocol(message)) if message.contains("must not lower"))
+        );
+    }
 
     #[test]
     fn test_unknown_features() {
