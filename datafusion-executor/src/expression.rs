@@ -362,6 +362,8 @@ fn map_to_struct_to_df_expr(
         };
         let raw = get_field(map.clone(), field.name().to_string());
         let value = match prim {
+            // An empty string is a value for these two (the empty string / empty bytes) and null
+            // for every other type based on kernel.
             PrimitiveType::String | PrimitiveType::Binary => raw,
             _ => nullif(raw, lit("")),
         };
