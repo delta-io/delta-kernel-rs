@@ -853,9 +853,13 @@ mod tests {
     async fn read_json_file(
         store: &Arc<InMemory>,
         path: &Path,
-    ) -> DeltaResult<Vec<serde_json::Value>> {
+    ) -> DeltaResult<(Vec<serde_json::Value>, u64)> {
         let content = store.get(path).await?;
         let file_bytes = content.bytes().await?;
+        let file_size = file_bytes
+            .len()
+            .try_into()
+            .map_err(|_| Error::generic("JSON file size exceeds u64::MAX"))?;
         let file_string =
             String::from_utf8(file_bytes.to_vec()).map_err(|e| object_store::Error::Generic {
                 store: "memory",
@@ -865,7 +869,7 @@ mod tests {
             .into_iter::<serde_json::Value>()
             .flatten()
             .collect();
-        Ok(json)
+        Ok((json, file_size))
     }
 
     #[tokio::test]
@@ -886,7 +890,7 @@ mod tests {
         let object_path = Path::from("/test/data/00000000000000000001.json");
 
         // First write with no existing file
-        let data = create_test_data(vec!["remi", "wilson"])?;
+        let data = create_test_data(vec!["rémi", "ウィルソン"])?;
         let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
         let result =
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
@@ -897,8 +901,12 @@ mod tests {
             write_result.size,
             Some(store.head(&object_path).await?.size)
         );
-        let json = read_json_file(&store, &object_path).await?;
-        assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
+        let (json, stored_body_size) = read_json_file(&store, &object_path).await?;
+        assert_eq!(write_result.size, Some(stored_body_size));
+        assert_eq!(
+            json,
+            vec![json!({"dog": "rémi"}), json!({"dog": "ウィルソン"})]
+        );
 
         // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
@@ -913,7 +921,8 @@ mod tests {
                 write_result.size,
                 Some(store.head(&object_path).await?.size)
             );
-            let json = read_json_file(&store, &object_path).await?;
+            let (json, stored_body_size) = read_json_file(&store, &object_path).await?;
+            assert_eq!(write_result.size, Some(stored_body_size));
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
@@ -925,6 +934,24 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_json_file_reports_zero_size() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let handler =
+            DefaultJsonHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let path = Url::parse("memory:///test/data/empty.json")?;
+        let object_path = Path::from("/test/data/empty.json");
+
+        let write_result = handler.write_json_file(&path, Box::new(std::iter::empty()), false)?;
+        let stored_meta = store.head(&object_path).await?;
+        let stored_bytes = store.get(&object_path).await?.bytes().await?;
+
+        assert_eq!(write_result.size, Some(0));
+        assert_eq!(stored_meta.size, 0);
+        assert!(stored_bytes.is_empty());
         Ok(())
     }
 
