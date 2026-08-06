@@ -1207,12 +1207,6 @@ impl From<Predicate> for Expression {
     }
 }
 
-impl From<Predicate> for Option<PredicateRef> {
-    fn from(value: Predicate) -> Self {
-        Some(Arc::new(value))
-    }
-}
-
 impl From<ColumnName> for Predicate {
     fn from(value: ColumnName) -> Self {
         Self::from_expr(value)

@@ -232,6 +232,111 @@ impl Scan {
                     )
             })
     }
+
+    fn normalized_add_field(&self) -> DeltaResult<StructField> {
+        let physical_stats_schema = self.state_info.physical_stats_schema.as_ref();
+        let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
+        let patch = SchemaStructPatchBuilder::new()
+            .fold_with(physical_stats_schema, |patch, schema| {
+                patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
+            })
+            .fold_with(physical_partition_schema, |patch, schema| {
+                patch.append(StructField::nullable(
+                    PARTITION_VALUES_PARSED,
+                    schema.as_ref().clone(),
+                ))
+            });
+        Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
+    }
+
+    /// Builds the output projection for requested stats and partition values. The base of this
+    /// transformation is constructed by [`Self::normalized_add_field`].
+    ///
+    /// The output schema is:
+    /// ```text
+    /// add: struct<
+    ///   path: string,
+    ///   partitionValues: map<string, string>,
+    ///   size: long,
+    ///   modificationTime: long,
+    ///   dataChange: boolean,
+    ///   stats: string,                         // when JSON stats are requested
+    ///   tags: map<string, string>,
+    ///   deletionVector: struct<...>,
+    ///   baseRowId: long,
+    ///   defaultRowCommitVersion: long,
+    ///   clusteringProvider: string,
+    ///   stats_parsed: struct<...>,             // when parsed stats are requested
+    ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
+    /// >
+    /// ```
+    /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
+    /// partition values are selected independently and omitted for unpartitioned tables. Fields
+    /// needed only for pruning are omitted.
+    fn metadata_output_projection(
+        &self,
+        add_field: &StructField,
+    ) -> DeltaResult<(ExpressionRef, SchemaRef)> {
+        let input_schema = schema_ref! { (add_field.clone()) };
+        let has_stats_parsed = input_schema.contains_col([ADD_NAME, STATS_PARSED_NAME]);
+        let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, [ADD_NAME]);
+
+        // JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither.
+        let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
+        let projection = match (self.stats.synthesize_json, has_json_stats) {
+            (true, true) | (false, false) => projection,
+            (true, false) => {
+                return Err(Error::internal_error(
+                    "JSON stats were requested, but add.stats is missing from the metadata schema",
+                ));
+            }
+            (false, true) => projection.drop(STATS),
+        };
+
+        // Parsed stats output.
+        let projection = match (self.physical_stats_output_schema.as_ref(), has_stats_parsed) {
+            (Some(stats_schema), _) => projection.replace(
+                STATS_PARSED,
+                StructField::nullable(STATS_PARSED, stats_schema.as_ref().clone()),
+                project_nested_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], stats_schema),
+            ),
+            (None, true) => projection.drop(STATS_PARSED),
+            (None, false) => projection,
+        };
+
+        // Parsed partition-values output.
+        let has_partition_values_parsed =
+            input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
+        let partition_output_schema = self
+            .partition_values
+            .parsed_struct
+            .then_some(self.state_info.physical_partition_schema.as_ref())
+            .flatten();
+        let projection = match (partition_output_schema, has_partition_values_parsed) {
+            (Some(partition_schema), true) => projection.replace(
+                PARTITION_VALUES_PARSED,
+                StructField::nullable(PARTITION_VALUES_PARSED, partition_schema.as_ref().clone()),
+                project_nested_struct_to_schema(
+                    [ADD_NAME, PARTITION_VALUES_PARSED_NAME],
+                    partition_schema,
+                ),
+            ),
+            (Some(_), false) => {
+                return Err(Error::internal_error(
+                    "parsed partition values were requested, but add.partitionValues_parsed is \
+                     missing",
+                ));
+            }
+            (None, true) => projection.drop(PARTITION_VALUES_PARSED),
+            (None, false) => projection,
+        };
+
+        let (add_schema, add_expr) = projection.build()?;
+        let schema = schema_ref! {
+            (StructField::nullable(ADD_NAME, add_schema.as_ref().clone()))
+        };
+        Ok((Arc::new(Expr::struct_from([add_expr])), schema))
+    }
 }
 
 /// Read actions from V2 checkpoint sidecars.
@@ -404,113 +509,6 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             }
             None => self,
         }
-    }
-}
-
-impl Scan {
-    fn normalized_add_field(&self) -> DeltaResult<StructField> {
-        let physical_stats_schema = self.state_info.physical_stats_schema.as_ref();
-        let physical_partition_schema = self.state_info.physical_partition_schema.as_ref();
-        let patch = SchemaStructPatchBuilder::new()
-            .fold_with(physical_stats_schema, |patch, schema| {
-                patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
-            })
-            .fold_with(physical_partition_schema, |patch, schema| {
-                patch.append(StructField::nullable(
-                    PARTITION_VALUES_PARSED,
-                    schema.as_ref().clone(),
-                ))
-            });
-        Ok(StructField::nullable(ADD_NAME, patch.build(&ADD_SCHEMA)?))
-    }
-
-    /// Builds the output projection for requested stats and partition values. The base of this
-    /// transformation is constructed by [`Self::normalized_add_field`].
-    ///
-    /// The output schema is:
-    /// ```text
-    /// add: struct<
-    ///   path: string,
-    ///   partitionValues: map<string, string>,
-    ///   size: long,
-    ///   modificationTime: long,
-    ///   dataChange: boolean,
-    ///   stats: string,                         // when JSON stats are requested
-    ///   tags: map<string, string>,
-    ///   deletionVector: struct<...>,
-    ///   baseRowId: long,
-    ///   defaultRowCommitVersion: long,
-    ///   clusteringProvider: string,
-    ///   stats_parsed: struct<...>,             // when parsed stats are requested
-    ///   partitionValues_parsed: struct<...>,   // when parsed partition values are requested
-    /// >
-    /// ```
-    /// Stats output may contain neither representation, JSON only, parsed only, or both. Parsed
-    /// partition values are selected independently and omitted for unpartitioned tables. Fields
-    /// needed only for pruning are omitted.
-    fn metadata_output_projection(
-        &self,
-        add_field: &StructField,
-    ) -> DeltaResult<(ExpressionRef, SchemaRef)> {
-        let input_schema = schema_ref! { (add_field.clone()) };
-        let has_stats_parsed = input_schema.contains_col([ADD_NAME, STATS_PARSED_NAME]);
-        let projection = ProjectionStructPatchBuilder::new_nested(&input_schema, [ADD_NAME]);
-
-        // JSON stats output. `StatsOptions` allows JSON only, parsed only, both, or neither.
-        let has_json_stats = input_schema.contains_col([ADD_NAME, STATS]);
-        let projection = match (self.stats.synthesize_json, has_json_stats) {
-            (true, true) | (false, false) => projection,
-            (true, false) => {
-                return Err(Error::internal_error(
-                    "JSON stats were requested, but add.stats is missing from the metadata schema",
-                ));
-            }
-            (false, true) => projection.drop(STATS),
-        };
-
-        // Parsed stats output.
-        let projection = match (self.physical_stats_output_schema.as_ref(), has_stats_parsed) {
-            (Some(stats_schema), _) => projection.replace(
-                STATS_PARSED,
-                StructField::nullable(STATS_PARSED, stats_schema.as_ref().clone()),
-                project_nested_struct_to_schema([ADD_NAME, STATS_PARSED_NAME], stats_schema),
-            ),
-            (None, true) => projection.drop(STATS_PARSED),
-            (None, false) => projection,
-        };
-
-        // Parsed partition-values output.
-        let has_partition_values_parsed =
-            input_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
-        let partition_output_schema = self
-            .partition_values
-            .parsed_struct
-            .then_some(self.state_info.physical_partition_schema.as_ref())
-            .flatten();
-        let projection = match (partition_output_schema, has_partition_values_parsed) {
-            (Some(partition_schema), true) => projection.replace(
-                PARTITION_VALUES_PARSED,
-                StructField::nullable(PARTITION_VALUES_PARSED, partition_schema.as_ref().clone()),
-                project_nested_struct_to_schema(
-                    [ADD_NAME, PARTITION_VALUES_PARSED_NAME],
-                    partition_schema,
-                ),
-            ),
-            (Some(_), false) => {
-                return Err(Error::internal_error(
-                    "parsed partition values were requested, but add.partitionValues_parsed is \
-                     missing",
-                ));
-            }
-            (None, true) => projection.drop(PARTITION_VALUES_PARSED),
-            (None, false) => projection,
-        };
-
-        let (add_schema, add_expr) = projection.build()?;
-        let schema = schema_ref! {
-            (StructField::nullable(ADD_NAME, add_schema.as_ref().clone()))
-        };
-        Ok((Arc::new(Expr::struct_from([add_expr])), schema))
     }
 }
 
@@ -769,7 +767,7 @@ mod tests {
         mock_snapshot(segment)
             .unwrap()
             .scan_builder()
-            .with_predicate(col!("x").gt(lit(5i64)))
+            .with_predicate(Arc::new(col!("x").gt(lit(5i64))))
             .with_stats(StatsOptions::all())
             .build()
             .unwrap()
@@ -905,7 +903,7 @@ mod tests {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?
             .scan_builder()
-            .with_predicate(Predicate::literal(false))
+            .with_predicate(Arc::new(Predicate::literal(false)))
             .build()?;
         assert_eq!(
             scan.state_info.physical_predicate,
@@ -1003,7 +1001,7 @@ mod tests {
         let scan = mock_snapshot(segment)?
             .scan_builder()
             .with_stats(StatsOptions::all())
-            .with_predicate(col!("x").gt(lit(lower_bound)))
+            .with_predicate(Arc::new(col!("x").gt(lit(lower_bound))))
             .build()?;
         let plan = scan
             // Leaf with no compatible parsed stats -> parse add.stats instead.
