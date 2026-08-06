@@ -329,7 +329,7 @@ fn struct_patch_to_df_expr(
 /// the cast, so an empty string becomes null (kernel's `empty_string_partition_cast`) while an
 /// unparseable value fails the cast (kernel's hard parse error). String and Binary keep the raw
 /// value (empty is a valid empty string / empty bytes). A missing key or null value is already null
-/// via `get_field`. The whole struct is nulled where the input map row is null, via `<map> IS NOT
+/// via [`get_field`]. The whole struct is nulled where the input map row is null, via `<map> IS NOT
 /// NULL`.
 ///
 /// KNOWN DIVERGENCES from the kernel parser, all confined to malformed or non-spec-compliant input
@@ -892,18 +892,24 @@ mod tests {
         assert_eq!(lower_map_to_struct(target), expected);
     }
 
-    #[test]
-    fn map_to_struct_without_target_is_unsupported() {
+    /// The target must be a struct of primitive fields: an absent one leaves the rebuild without
+    /// field names, and a non-primitive field has no string-to-value cast.
+    #[rstest]
+    #[case::no_target(None, "MapToStruct expression requires a struct output type")]
+    #[case::non_primitive_field(
+        Some(DataType::from(
+            StructType::try_new([StructField::nullable("nested", pq_struct())]).unwrap()
+        )),
+        "MapToStruct only supports primitive target types, but field 'nested' is"
+    )]
+    fn map_to_struct_with_unsupported_target_is_an_error(
+        #[case] output_type: Option<DataType>,
+        #[case] expected_message: &str,
+    ) {
         let kernel = KernelExpr::map_to_struct(column_expr!("pv"));
-        to_df_expr(&kernel, &pv_map_schema(), None).unwrap_err();
-    }
-
-    #[test]
-    fn map_to_struct_non_primitive_field_is_unsupported() {
-        let target: DataType = StructType::try_new([StructField::nullable("nested", pq_struct())])
-            .unwrap()
-            .into();
-        let kernel = KernelExpr::map_to_struct(column_expr!("pv"));
-        to_df_expr(&kernel, &pv_map_schema(), Some(&target)).unwrap_err();
+        let err = to_df_expr(&kernel, &pv_map_schema(), output_type.as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected_message), "{err}");
     }
 }
