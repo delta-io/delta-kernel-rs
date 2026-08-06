@@ -283,34 +283,11 @@ impl PlanBuilder {
     /// Read data files named by `self`'s rows. Output schema is `dynamic_scan.schema`. See
     /// [`DynamicScan`].
     ///
-    /// Produces an error when a `file_meta`/deletion-vector column is absent from the input schema;
-    /// when a file-metadata column has an incompatible type; when the path, size, or last-modified
-    /// column is nullable; or when a `file_constant_columns` entry is absent from the input or
-    /// output schema, names a metadata column in either schema, or has different input/output type
-    /// or nullability.
+    /// Applies [`DynamicScan::validate_input`]'s validation against `self`'s schema.
     pub fn dynamic_scan(self, dynamic_scan: DynamicScan) -> DeltaResult<Self> {
-        let DynamicScan {
-            schema,
-            file_type,
-            base_url,
-            file_constant_columns,
-            path_column,
-            file_size_column,
-            last_modified_column,
-            dv_column,
-        } = dynamic_scan;
-        let dynamic_scan = DynamicScan::try_new(
-            self.schema(),
-            schema,
-            file_type,
-            base_url,
-            file_constant_columns,
-            path_column,
-            file_size_column,
-            last_modified_column,
-            dv_column,
-        )?;
-        Ok(self.unary_op_or_absent(Arc::clone(&dynamic_scan.schema), dynamic_scan))
+        dynamic_scan.validate_input(self.schema())?;
+        let schema = Arc::clone(&dynamic_scan.schema);
+        Ok(self.unary_op_or_absent(schema, dynamic_scan))
     }
 
     /// Aggregate `self` into `aggregate` (build one with [`Aggregate::group_by`]). The output
@@ -676,31 +653,16 @@ mod tests {
         absent_over(id_schema())
     }
 
-    /// A discriminant tag for asserting a node's operator without matching its payload.
-    fn op_tag(op: &Operator) -> &'static str {
-        match op {
-            Operator::ScanParquet(_) => "scan_parquet",
-            Operator::ScanJson(_) => "scan_json",
-            Operator::Values(_) => "values",
-            Operator::Filter(_) => "filter",
-            Operator::Project(_) => "project",
-            Operator::DynamicScan(_) => "dynamic_scan",
-            Operator::Aggregate(_) => "aggregate",
-            Operator::SemiJoin(_) => "semi_join",
-            Operator::UnionAll(_) => "union_all",
-        }
-    }
-
     /// Build `builder` and assert its nodes match `expected` one-for-one in order, each described
     /// by its `(inputs, op)`: the indices of the nodes it references and its operator
-    /// [tag](op_tag). A node is identified by its index in `nodes`. Returns the built [`Plan`]
-    /// for further inspection.
+    /// tag. A node is identified by its index in `nodes`. Returns the built [`Plan`] for further
+    /// inspection.
     fn assert_plan(builder: PlanBuilder, expected: &[(&[usize], &str)]) -> Plan {
         let plan = builder.build().unwrap();
         assert_eq!(plan.nodes.len(), expected.len(), "node count");
         for (i, (node, &(inputs, op))) in plan.nodes.iter().zip(expected).enumerate() {
             assert_eq!(node.inputs.as_slice(), inputs, "node {i} inputs");
-            assert_eq!(op_tag(&node.op), op, "node {i} op");
+            assert_eq!(node.op.to_string(), op, "node {i} op");
         }
         plan
     }
@@ -1171,8 +1133,12 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::path("path", 0)]
+    #[case::size("size", 1)]
+    #[case::filemod("filemod", 2)]
     fn dynamic_scan_validates_nested_metadata(
-        #[values("path", "size", "filemod")] column: &str,
+        #[case] column: &str,
+        #[case] index: usize,
         #[values(false, true)] parent_nullable: bool,
     ) {
         let base_schema = dynamic_scan_input_schema();
@@ -1188,21 +1154,13 @@ mod tests {
         let input = Arc::new(StructType::new_unchecked(
             base_schema.fields().cloned().chain([metadata]),
         ));
-        let nested_column = || ColumnName::new(["metadata", column]);
-        let (path_column, file_size_column, last_modified_column) = match column {
-            "path" => (
-                nested_column(),
-                column_name!("size"),
-                column_name!("filemod"),
-            ),
-            "size" => (
-                column_name!("path"),
-                nested_column(),
-                column_name!("filemod"),
-            ),
-            "filemod" => (column_name!("path"), column_name!("size"), nested_column()),
-            _ => panic!("unsupported nested metadata column: {column}"),
-        };
+        let mut columns = [
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+        ];
+        columns[index] = ColumnName::new(["metadata", column]);
+        let [path_column, file_size_column, last_modified_column] = columns;
         let result = DynamicScan::try_new(
             &input,
             dynamic_scan_output_schema(),
@@ -1219,8 +1177,40 @@ mod tests {
         if parent_nullable {
             assert_result_error_with_message(result, &format!("`metadata.{column}` is nullable"));
         } else {
-            let _ = result.unwrap();
+            let plan = result.unwrap();
+            assert_eq!(plan.schema(), &dynamic_scan_output_schema());
         }
+    }
+
+    #[rstest::rstest]
+    fn dynamic_scan_accepts_dv_with_nullable_ancestor(
+        #[values(false, true)] parent_nullable: bool,
+    ) {
+        let metadata = StructField::new(
+            "metadata",
+            StructType::new_unchecked([StructField::nullable(
+                "dv",
+                DeletionVectorDescriptor::to_schema(),
+            )]),
+            parent_nullable,
+        );
+        let base_schema = dynamic_scan_input_schema();
+        let input = Arc::new(StructType::new_unchecked(
+            base_schema.fields().cloned().chain([metadata]),
+        ));
+
+        DynamicScan::try_new(
+            &input,
+            dynamic_scan_output_schema(),
+            FileType::Parquet,
+            url::Url::parse("memory:///").unwrap(),
+            ["version"],
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            ColumnName::new(["metadata", "dv"]),
+        )
+        .unwrap();
     }
 
     /// Every validating method surfaces its malformed input as an error at the call site, with a
@@ -1255,58 +1245,65 @@ mod tests {
         || vals(id_schema()).anti_join(vals(x_schema()), [column_name!("id")], [column_name!("nope")]))]
     #[case::join_key_arity("must match",
         || vals(id_schema()).semi_join(vals(x_schema()), [column_name!("id")], [column_name!("x"), column_name!("x")]))]
+    // dynamic scan file constants
+    #[case::dynamic_scan_missing_source("`version`", || build_dynamic_scan_with_schemas(
+        dynamic_scan_input_missing("version"),
+        dynamic_scan_output_schema(),
+    ))]
+    #[case::dynamic_scan_absent_from_output("`version`", || {
+        let input = dynamic_scan_input_schema();
+        let dynamic_scan = dynamic_scan_node(&input, id_schema())?;
+        vals(input).dynamic_scan(dynamic_scan)
+    })]
+    #[case::dynamic_scan_type_mismatch("same type and nullability", || {
+        let output = schema_with_field(
+            dynamic_scan_output_schema(),
+            StructField::nullable("version", DataType::STRING),
+        );
+        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
+    })]
+    #[case::dynamic_scan_input_nullable("same type and nullability", || {
+        let output = schema_with_field(
+            dynamic_scan_output_schema(),
+            StructField::not_null("version", DataType::LONG),
+        );
+        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
+    })]
+    #[case::dynamic_scan_output_nullable("same type and nullability", || {
+        let input = dynamic_scan_input_with(StructField::not_null("version", DataType::LONG));
+        build_dynamic_scan_with_schemas(input, dynamic_scan_output_schema())
+    })]
+    #[case::dynamic_scan_metadata_source("metadata column", || {
+        let input = dynamic_scan_input_with(
+            StructField::create_metadata_column("version", MetadataColumnSpec::RowIndex),
+        );
+        build_dynamic_scan_with_schemas(input, dynamic_scan_output_schema())
+    })]
+    #[case::dynamic_scan_metadata_output("metadata column", || {
+        let output = schema_with_field(
+            dynamic_scan_output_schema(),
+            StructField::create_metadata_column("version", MetadataColumnSpec::RowIndex),
+        );
+        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
+    })]
     fn rejects(#[case] needle: &str, #[case] make: impl Fn() -> DeltaResult<PlanBuilder>) {
-        let err = make().unwrap_err();
-        assert!(err.to_string().contains(needle), "got: {err}");
+        assert_result_error_with_message(make(), needle);
     }
 
     #[rstest::rstest]
-    fn dynamic_scan_constructor_rejects_missing_file_metadata_column(
-        #[values("path", "size", "filemod")] column: &str,
-    ) {
-        assert_result_error_with_message(
-            construct_dynamic_scan(dynamic_scan_input_missing(column)),
-            column,
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::path("path", DataType::STRING)]
-    #[case::size("size", DataType::LONG)]
-    #[case::filemod("filemod", DataType::LONG)]
-    fn dynamic_scan_constructor_rejects_nullable_file_metadata_column(
-        #[case] column: &str,
-        #[case] data_type: DataType,
-    ) {
-        assert_result_error_with_message(
-            construct_dynamic_scan(dynamic_scan_input_with(StructField::nullable(
-                column, data_type,
-            ))),
-            &format!("required column `{column}` is nullable"),
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::path("path", DataType::BOOLEAN, "Primitive(String)")]
-    #[case::size("size", DataType::STRING, "Primitive(Long)")]
-    #[case::filemod("filemod", DataType::STRING, "Primitive(Long)")]
-    fn dynamic_scan_constructor_rejects_wrong_file_metadata_type(
-        #[case] column: &str,
-        #[case] data_type: DataType,
-        #[case] expected_type: &str,
-    ) {
-        assert_result_error_with_message(
-            construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null(
-                column, data_type,
-            ))),
-            &format!("must have type {expected_type}"),
-        );
-    }
-
-    #[rstest::rstest]
+    #[case::missing_path("path", || construct_dynamic_scan(dynamic_scan_input_missing("path")))]
+    #[case::missing_size("size", || construct_dynamic_scan(dynamic_scan_input_missing("size")))]
+    #[case::missing_filemod("filemod", || construct_dynamic_scan(dynamic_scan_input_missing("filemod")))]
+    #[case::nullable_path("required column `path` is nullable", || construct_dynamic_scan(dynamic_scan_input_with(StructField::nullable("path", DataType::STRING))))]
+    #[case::nullable_size("required column `size` is nullable", || construct_dynamic_scan(dynamic_scan_input_with(StructField::nullable("size", DataType::LONG))))]
+    #[case::nullable_filemod("required column `filemod` is nullable", || construct_dynamic_scan(dynamic_scan_input_with(StructField::nullable("filemod", DataType::LONG))))]
+    #[case::wrong_path_type("must have type string", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("path", DataType::BOOLEAN))))]
+    #[case::wrong_size_type("must have type long", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("size", DataType::STRING))))]
+    #[case::wrong_filemod_type("must have type long", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("filemod", DataType::STRING))))]
     #[case::missing_dv("`dv`", || construct_dynamic_scan(dynamic_scan_input_missing("dv")))]
     #[case::wrong_dv_type("deletion-vector column `dv` must have type", || construct_dynamic_scan(dynamic_scan_input_with(StructField::nullable("dv", DataType::STRING))))]
-    #[case::non_base_url("cannot be used as a base URL", || {
+    #[case::non_nullable_dv("deletion-vector column `dv` must be nullable", || construct_dynamic_scan(dynamic_scan_input_with(StructField::not_null("dv", DeletionVectorDescriptor::to_schema()))))]
+    #[case::opaque_base_url("must be hierarchical and end in `/`", || {
         let input = dynamic_scan_input_schema();
         DynamicScan::try_new(
             &input,
@@ -1320,12 +1317,25 @@ mod tests {
             column_name!("dv"),
         )
     })]
+    #[case::base_url_without_trailing_slash("must be hierarchical and end in `/`", || {
+        let input = dynamic_scan_input_schema();
+        DynamicScan::try_new(
+            &input,
+            dynamic_scan_output_schema(),
+            FileType::Parquet,
+            url::Url::parse("s3://bucket/table/data").unwrap(),
+            ["version"],
+            column_name!("path"),
+            column_name!("size"),
+            column_name!("filemod"),
+            column_name!("dv"),
+        )
+    })]
     fn dynamic_scan_constructor_rejects_invalid_configuration(
         #[case] needle: &str,
         #[case] make: impl Fn() -> DeltaResult<DynamicScan>,
     ) {
-        let err = make().unwrap_err();
-        assert!(err.to_string().contains(needle), "got: {err}");
+        assert_result_error_with_message(make(), needle);
     }
 
     #[test]
@@ -1339,52 +1349,15 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    #[case::missing_source("`version`", || build_dynamic_scan_with_schemas(
-        dynamic_scan_input_missing("version"),
-        dynamic_scan_output_schema(),
-    ))]
-    #[case::absent_from_output("`version`", || {
+    #[test]
+    fn dynamic_scan_attachment_revalidates_base_url() {
         let input = dynamic_scan_input_schema();
-        let dynamic_scan = dynamic_scan_node(&input, id_schema())?;
-        vals(input).dynamic_scan(dynamic_scan)
-    })]
-    #[case::type_mismatch("same type and nullability", || {
-        let output = schema_with_field(
-            dynamic_scan_output_schema(),
-            StructField::nullable("version", DataType::STRING),
+        let mut dynamic_scan = dynamic_scan_node(&input, dynamic_scan_output_schema()).unwrap();
+        dynamic_scan.base_url = url::Url::parse("s3://bucket/table/data").unwrap();
+
+        assert_result_error_with_message(
+            vals(input).dynamic_scan(dynamic_scan),
+            "must be hierarchical and end in `/`",
         );
-        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
-    })]
-    #[case::input_nullable("same type and nullability", || {
-        let output = schema_with_field(
-            dynamic_scan_output_schema(),
-            StructField::not_null("version", DataType::LONG),
-        );
-        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
-    })]
-    #[case::output_nullable("same type and nullability", || {
-        let input = dynamic_scan_input_with(StructField::not_null("version", DataType::LONG));
-        build_dynamic_scan_with_schemas(input, dynamic_scan_output_schema())
-    })]
-    #[case::metadata_source("metadata column", || {
-        let input = dynamic_scan_input_with(
-            StructField::create_metadata_column("version", MetadataColumnSpec::RowIndex),
-        );
-        build_dynamic_scan_with_schemas(input, dynamic_scan_output_schema())
-    })]
-    #[case::metadata_output("metadata column", || {
-        let output = schema_with_field(
-            dynamic_scan_output_schema(),
-            StructField::create_metadata_column("version", MetadataColumnSpec::RowIndex),
-        );
-        build_dynamic_scan_with_schemas(dynamic_scan_input_schema(), output)
-    })]
-    fn dynamic_scan_rejects_invalid_file_constant(
-        #[case] needle: &str,
-        #[case] make: impl Fn() -> DeltaResult<PlanBuilder>,
-    ) {
-        let err = make().unwrap_err();
-        assert!(err.to_string().contains(needle), "got: {err}");
     }
 }

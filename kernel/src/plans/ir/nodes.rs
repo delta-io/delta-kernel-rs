@@ -27,6 +27,7 @@ use crate::{DeltaResult, Error, FileMeta};
 /// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
 /// they inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display)]
+#[strum(serialize_all = "snake_case")]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
     ScanParquet(ScanParquet),
@@ -353,9 +354,9 @@ pub enum FileType {
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
-/// Each path column value is treated as a path relative to `base_url` and resolved via
-/// [`Url::join`]. Paths that are themselves absolute URLs (any scheme prefix) bypass the join and
-/// are used as-is.
+/// Each path value is resolved against `base_url` via [`Url::join`]. URL-reference resolution need
+/// not stay under `base_url`: a different-scheme absolute URL replaces the base, while a value
+/// starting with `/` or `//` replaces its path or authority.
 ///
 /// Output row order is unspecified: the engine is free to read files in any order, in
 /// parallel, and to interleave rows from different files. The relative order of upstream
@@ -400,6 +401,7 @@ pub enum FileType {
 pub struct DynamicScan {
     pub schema: SchemaRef,
     pub file_type: FileType,
+    /// Hierarchical base URL ending in `/` against which per-row path values resolve.
     pub base_url: Url,
     pub file_constant_columns: Vec<String>,
     /// Non-nullable input column holding the per-row file path or URL fragment.
@@ -415,17 +417,15 @@ pub struct DynamicScan {
 impl DynamicScan {
     /// Constructs a [`DynamicScan`] whose emitted rows match `output_schema`.
     ///
-    /// `input_schema` describes the upstream rows containing file metadata. Plan attachment
-    /// applies the same constructor validation to the actual upstream schema. The scan reads
+    /// `input_schema` describes the upstream rows containing file metadata. The scan reads
     /// `file_type` files relative to `base_url`.
     ///
     /// # Errors
     ///
-    /// Returns an error when `base_url` cannot serve as a base URL; when a required metadata or
-    /// deletion-vector column is absent from `input_schema` or has an incompatible type; or when a
-    /// required metadata column or one of its ancestors is nullable. Also returns an error when a
-    /// file-constant column is absent from either schema, is a metadata column, or has different
-    /// input and output types or nullability.
+    /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
+    /// metadata or deletion-vector column is absent from `input_schema`, has an incompatible type,
+    /// or has invalid nullability; or when a file-constant column is absent from either schema, is
+    /// a metadata column, or has different input and output types or nullability.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         input_schema: &SchemaRef,
@@ -438,40 +438,12 @@ impl DynamicScan {
         last_modified_column: ColumnName,
         dv_column: ColumnName,
     ) -> DeltaResult<Self> {
-        static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
-            LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
-
-        if base_url.cannot_be_a_base() {
-            return Err(Error::generic(format!(
-                "dynamic scan: URL `{base_url}` cannot be used as a base URL"
-            )));
-        }
-
         let schema = output_schema.into();
         let file_constant_columns = file_constant_columns
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
-        Self::validate_required_column(input_schema, &path_column, &DataType::STRING)?;
-        Self::validate_required_column(input_schema, &file_size_column, &DataType::LONG)?;
-        Self::validate_required_column(input_schema, &last_modified_column, &DataType::LONG)?;
-        Self::validate_file_constant_columns(input_schema, &schema, &file_constant_columns)?;
-
-        let field = input_schema.field_at(&dv_column).map_err(|err| {
-            Error::generic(format!(
-                "dynamic scan: deletion-vector column `{dv_column}` is invalid: {err}"
-            ))
-        })?;
-        let expected = &*DELETION_VECTOR_DATA_TYPE;
-        if field.data_type() != expected {
-            return Err(Error::generic(format!(
-                "dynamic scan: deletion-vector column `{dv_column}` must have type \
-                 {expected:?}, found {:?}",
-                field.data_type()
-            )));
-        }
-
-        Ok(Self {
+        let dynamic_scan = Self {
             schema,
             file_type,
             base_url,
@@ -480,7 +452,69 @@ impl DynamicScan {
             file_size_column,
             last_modified_column,
             dv_column,
-        })
+        };
+        dynamic_scan.validate_input(input_schema)?;
+        Ok(dynamic_scan)
+    }
+
+    /// Validates the columns consumed by this scan against an upstream `input_schema`.
+    ///
+    /// Returns `Ok(())` when the base URL is valid and every configured column resolves with the
+    /// required type and nullability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
+    /// metadata or deletion-vector column is absent, has an incompatible type, or has invalid
+    /// nullability; or when a file-constant column is absent from either schema, is a metadata
+    /// column, or has different input and output types or nullability.
+    pub fn validate_input(&self, input_schema: &SchemaRef) -> DeltaResult<()> {
+        static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
+            LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
+
+        if self.base_url.cannot_be_a_base() || !self.base_url.path().ends_with('/') {
+            return Err(Error::generic(format!(
+                "dynamic scan: base URL `{}` must be hierarchical and end in `/`",
+                self.base_url
+            )));
+        }
+
+        Self::validate_required_column(input_schema, &self.path_column, &DataType::STRING)?;
+        Self::validate_required_column(input_schema, &self.file_size_column, &DataType::LONG)?;
+        Self::validate_required_column(input_schema, &self.last_modified_column, &DataType::LONG)?;
+        Self::validate_file_constant_columns(
+            input_schema,
+            &self.schema,
+            &self.file_constant_columns,
+        )?;
+
+        let fields = input_schema
+            .fields_of_path(&self.dv_column)
+            .map_err(|err| {
+                Error::generic(format!(
+                    "dynamic scan: deletion-vector column `{}` is invalid: {err}",
+                    self.dv_column
+                ))
+            })?;
+        let Some((field, _ancestors)) = fields.split_last() else {
+            return Err(Error::internal_error("fields_of_path returned no fields"));
+        };
+        let expected = &*DELETION_VECTOR_DATA_TYPE;
+        if field.data_type() != expected {
+            return Err(Error::generic(format!(
+                "dynamic scan: deletion-vector column `{}` must have type {expected}, found {}",
+                self.dv_column,
+                field.data_type()
+            )));
+        }
+        if !field.is_nullable() {
+            return Err(Error::generic(format!(
+                "dynamic scan: deletion-vector column `{}` must be nullable",
+                self.dv_column
+            )));
+        }
+
+        Ok(())
     }
 
     fn validate_required_column(
@@ -489,16 +523,16 @@ impl DynamicScan {
         expected_type: &DataType,
     ) -> DeltaResult<()> {
         let fields = schema.fields_of_path(column)?;
-        let field = fields
-            .last()
-            .ok_or_else(|| Error::generic("dynamic scan: column path must not be empty"))?;
+        let Some((field, ancestors)) = fields.split_last() else {
+            return Err(Error::internal_error("fields_of_path returned no fields"));
+        };
         if field.data_type() != expected_type {
             return Err(Error::generic(format!(
-                "dynamic scan: column `{column}` must have type {expected_type:?}, found {:?}",
+                "dynamic scan: column `{column}` must have type {expected_type}, found {}",
                 field.data_type()
             )));
         }
-        if fields.iter().any(|field| field.is_nullable()) {
+        if field.is_nullable() || ancestors.iter().any(|field| field.is_nullable()) {
             return Err(Error::generic(format!(
                 "dynamic scan: required column `{column}` is nullable"
             )));

@@ -74,7 +74,7 @@ enum FileType {
 message DynamicScanNode {
   delta.kernel.schema.StructType schema = 1;
   FileType file_type = 2;
-  // Absolute, non-empty base URL used to resolve relative file paths.
+  // Hierarchical base URL ending in `/` that relative file paths resolve against.
   string base_url = 3;
   repeated string file_constant_columns = 4;
   // Required input columns: path is STRING; size and last-modified are LONG.

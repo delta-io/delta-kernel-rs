@@ -265,9 +265,7 @@ fn sidecar_actions(
         FileType::Parquet => PlanBuilder::scan_parquet,
     };
     let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
-        .filter(Predicate::and_from([
-            col!(SIDECAR_NAME, FILE_PATH).is_not_null()
-        ]))?
+        .filter(col!(SIDECAR_NAME, FILE_PATH).is_not_null())?
         .project(
             Expr::struct_from([
                 col!(SIDECAR_NAME, FILE_PATH),
@@ -593,22 +591,8 @@ mod tests {
         shape(CheckpointType::None, None)
     }
 
-    fn op_tag(op: &Operator) -> &'static str {
-        match op {
-            Operator::ScanParquet(_) => "scan_parquet",
-            Operator::ScanJson(_) => "scan_json",
-            Operator::Values(_) => "values",
-            Operator::Filter(_) => "filter",
-            Operator::Project(_) => "project",
-            Operator::DynamicScan(_) => "dynamic_scan",
-            Operator::Aggregate(_) => "aggregate",
-            Operator::SemiJoin(_) => "semi_join",
-            Operator::UnionAll(_) => "union_all",
-        }
-    }
-
-    fn tags(plan: &Plan) -> Vec<&'static str> {
-        plan.nodes.iter().map(|n| op_tag(&n.op)).collect()
+    fn tags(plan: &Plan) -> Vec<String> {
+        plan.nodes.iter().map(|node| node.op.to_string()).collect()
     }
 
     fn add_struct(schema: &SchemaRef) -> &StructType {
