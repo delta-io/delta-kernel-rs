@@ -136,7 +136,7 @@ impl CheckpointShape {
                     }
                     _ => None,
                 };
-                // JSON leaves have no footer, but always use the full canonical action schema.
+                // JSON leaves have no footer, so we assume it has the widest checkpoint schema.
                 let leaf_schema = leaf_schema.or_else(|| {
                     (needs_leaf_schema && file_type == FileType::Json)
                         .then(|| LEAF_CHECKPOINT_ACTIONS_SCHEMA.clone())
