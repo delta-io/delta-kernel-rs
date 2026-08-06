@@ -646,16 +646,16 @@ mod tests {
         )
     }
 
-    fn dynamic_scan_error(size: Scalar, last_modified: Scalar, dv: Scalar) -> Error {
+    fn dynamic_scan_error(path: Scalar, size: Scalar, last_modified: Scalar, dv: Scalar) -> Error {
         let input_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
+            StructField::nullable("path", DataType::STRING),
             StructField::nullable("size", DataType::LONG),
             StructField::nullable("filemod", DataType::LONG),
             StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
         ]));
         let input = values_to_record_batch(Values::new(
             input_schema,
-            vec![vec![Scalar::from("file.parquet"), size, last_modified, dv]],
+            vec![vec![path, size, last_modified, dv]],
         ))
         .unwrap();
         let dynamic_scan = DynamicScan {
@@ -676,26 +676,64 @@ mod tests {
 
     #[test]
     fn dynamic_scan_executor_rejects_non_null_deletion_vector() {
-        let err = dynamic_scan_error(1_i64.into(), 0_i64.into(), present_dv());
+        let err = dynamic_scan_error(
+            "file.parquet".into(),
+            1_i64.into(),
+            0_i64.into(),
+            present_dv(),
+        );
         assert!(err.to_string().contains("with deletion vectors"), "{err}");
     }
 
-    #[test]
-    fn dynamic_scan_executor_rejects_null_last_modified() {
-        let err = dynamic_scan_error(1_i64.into(), Scalar::Null(DataType::LONG), null_dv());
-        assert!(
-            err.to_string()
-                .contains("last-modified time must not be null"),
-            "{err}"
-        );
+    #[rstest]
+    #[case::path(
+        Scalar::Null(DataType::STRING),
+        1_i64.into(),
+        0_i64.into(),
+        "path must not be null"
+    )]
+    #[case::size(
+        "file.parquet".into(),
+        Scalar::Null(DataType::LONG),
+        0_i64.into(),
+        "file size must not be null"
+    )]
+    #[case::last_modified(
+        "file.parquet".into(),
+        1_i64.into(),
+        Scalar::Null(DataType::LONG),
+        "last-modified time must not be null"
+    )]
+    fn dynamic_scan_executor_rejects_null_required_field(
+        #[case] path: Scalar,
+        #[case] size: Scalar,
+        #[case] last_modified: Scalar,
+        #[case] needle: &str,
+    ) {
+        let err = dynamic_scan_error(path, size, last_modified, null_dv());
+        assert!(err.to_string().contains(needle), "{err}");
     }
 
     #[rstest]
-    #[case::null(Scalar::Null(DataType::LONG), "file size must not be null")]
     #[case::zero(0_i64.into(), "file size must be positive")]
     #[case::negative((-1_i64).into(), "file size must be positive")]
     fn dynamic_scan_executor_rejects_invalid_size(#[case] size: Scalar, #[case] needle: &str) {
-        let err = dynamic_scan_error(size, 0_i64.into(), null_dv());
+        let err = dynamic_scan_error("file.parquet".into(), size, 0_i64.into(), null_dv());
         assert!(err.to_string().contains(needle), "{err}");
+    }
+
+    #[test]
+    fn dynamic_scan_executor_accepts_i64_max_file_size() {
+        let err = dynamic_scan_error(
+            "file.parquet".into(),
+            i64::MAX.into(),
+            Scalar::Null(DataType::LONG),
+            null_dv(),
+        );
+        assert!(
+            err.to_string()
+                .contains("last-modified time must not be null"),
+            "got a size validation error before last-modified validation: {err}"
+        );
     }
 }

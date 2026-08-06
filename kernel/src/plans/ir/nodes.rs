@@ -408,6 +408,7 @@ pub struct DynamicScan {
     pub file_size_column: ColumnName,
     /// Non-nullable input column with the last-modified timestamp in milliseconds since epoch.
     pub last_modified_column: ColumnName,
+    /// Nullable input column with the schema of [`DeletionVectorDescriptor`].
     pub dv_column: ColumnName,
 }
 
