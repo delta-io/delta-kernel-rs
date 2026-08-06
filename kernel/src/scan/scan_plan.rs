@@ -142,7 +142,7 @@ impl Scan {
 
         let actions = match (&shape.checkpoint_type, checkpoint) {
             (CheckpointType::Leaf, Some((FileType::Parquet, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats.as_ref(), None)?;
+                let schema = parquet_read_schema(source_physical_stats, None)?;
                 PlanBuilder::scan_parquet(parts, &[VERSION], schema)
             }
             (CheckpointType::Leaf, Some((FileType::Json, parts))) => {
@@ -153,7 +153,7 @@ impl Scan {
                 )
             }
             (CheckpointType::Manifest, Some((file_type, parts))) => {
-                let schema = parquet_read_schema(source_physical_stats.as_ref(), None)?;
+                let schema = parquet_read_schema(source_physical_stats, None)?;
                 match log_segment.checkpoint_hint_version_tagged_sidecar_scan_files()? {
                     Some(sidecars) => PlanBuilder::scan_parquet(sidecars, &[VERSION], schema),
                     // Without a complete hint, load the sidecars referenced by the manifest.
