@@ -9,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, column_name, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
+    col, column_name, lit, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
     JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
@@ -148,7 +148,7 @@ impl DataSkippingFilter {
         metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
-            LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
+            LazyLock::new(|| Arc::new(col!("output").distinct(lit(false))));
         static FILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             Arc::new(StructType::new_unchecked([StructField::nullable(
                 "output",
@@ -272,11 +272,11 @@ impl DataSkippingFilter {
         // from the raw `add.partitionValues` string map, and identify Add rows by
         // `add.path IS NOT NULL` (raw batches keep the nested layout).
         let stats_expr = Arc::new(Expr::parse_json(
-            column_expr!("add.stats"),
+            col!("add.stats"),
             physical_stats_schema.clone(),
         ));
-        let partition_expr = Arc::new(Expr::map_to_struct(column_expr!("add.partitionValues")));
-        let is_add_expr = Arc::new(Pred::is_not_null(column_expr!("add.path")).into());
+        let partition_expr = Arc::new(Expr::map_to_struct(col!("add.partitionValues")));
+        let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
         Self::new(
             engine,
             Some(physical_predicate),
@@ -601,7 +601,7 @@ impl DataSkippingColumns<'_> {
     }
 
     fn rowcount_stat(&self) -> Expr {
-        column_expr!("stats_parsed", NUM_RECORDS)
+        col!("stats_parsed", NUM_RECORDS)
     }
 }
 
@@ -714,7 +714,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         } else {
             let safe_to_skip = match inverted {
                 true => self.get_rowcount_stat()?, // all-null
-                false => Expr::literal(0i64),      // no-null
+                false => lit(0i64),                // no-null
             };
             Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
         }
@@ -894,7 +894,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
             return None; // IS NOT NULL: column vs column, can't prune (#1873)
         }
         let nullcount = self.get_nullcount_stat(col)?;
-        let comparison = Pred::ne(nullcount.clone(), Expr::literal(0i64));
+        let comparison = Pred::ne(nullcount.clone(), lit(0i64));
         Some(Pred::or(Pred::is_null(nullcount), comparison))
     }
 

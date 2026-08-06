@@ -10,7 +10,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::expressions::{column_expr, lit, ExpressionStructPatchBuilder, MapData, Scalar};
+use delta_kernel::expressions::{col, lit, ExpressionStructPatchBuilder, MapData, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, StatsOptions};
@@ -1181,10 +1181,8 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             .scan_builder()
             .with_stats(StatsOptions::all());
         if use_predicate {
-            scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
-                column_expr!("number"),
-                Expr::literal(0_i32),
-            )));
+            scan_builder =
+                scan_builder.with_predicate(Arc::new(Pred::gt(col!("number"), lit(0_i32))));
         }
         let scan = scan_builder.build()?;
 
@@ -1246,11 +1244,11 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
 #[rstest::rstest]
 #[case::no_predicate(None, &["usa", "japan"])]
 #[case::data_predicate(
-    Some(Pred::gt(column_expr!("id"), Expr::literal(0_i32))),
+    Some(Pred::gt(col!("id"), lit(0_i32))),
     &["usa", "japan"]
 )]
 #[case::partition_predicate(
-    Some(Pred::eq(column_expr!("country"), Expr::literal("usa".to_string()))),
+    Some(Pred::eq(col!("country"), lit("usa".to_string()))),
     &["usa"]
 )]
 #[tokio::test]

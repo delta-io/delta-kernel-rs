@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::expressions::{
-    column_expr, column_name, column_pred, ArrayData, Expression as Expr, OpaqueExpressionOp,
+    col, column_name, column_pred, lit, ArrayData, Expression as Expr, OpaqueExpressionOp,
     OpaquePredicateOp, Predicate as Pred, ScalarExpressionEvaluator, StructData,
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
@@ -265,22 +265,22 @@ fn test_default_scalar_arithmetic() {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     for ((l, r), (add, sub, mul, div)) in left.iter().zip(right).zip(expected) {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) + Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) + lit(r.clone()))),
             Some(add),
             "add({l:?}, {r:?})"
         );
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) - Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) - lit(r.clone()))),
             Some(sub),
             "sub({l:?}, {r:?})"
         );
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) * Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) * lit(r.clone()))),
             Some(mul),
             "mul({l:?}, {r:?})"
         );
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) / Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) / lit(r.clone()))),
             Some(div),
             "div({l:?}, {r:?})"
         );
@@ -288,27 +288,27 @@ fn test_default_scalar_arithmetic() {
 
     // Invalid type combinations
     expect_eq!(
-        filter.eval_expr(&(Expr::literal("hi") + Expr::literal("ho"))),
+        filter.eval_expr(&(lit("hi") + lit("ho"))),
         None,
         "add(string, string)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) + Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) + lit(1i64))),
         None,
         "add(byte, long)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) - Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) - lit(1i64))),
         None,
         "sub(byte, long)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) * Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) * lit(1i64))),
         None,
         "mul(byte, long)"
     );
     expect_eq!(
-        filter.eval_expr(&(Expr::literal(1i8) / Expr::literal(1i64))),
+        filter.eval_expr(&(lit(1i8) / lit(1i64))),
         None,
         "div(byte, long)"
     );
@@ -322,7 +322,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for (l, r) in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) + Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) + lit(r.clone()))),
             None,
             "add({l:?}, {r:?})"
         );
@@ -337,7 +337,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for (l, r) in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) - Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) - lit(r.clone()))),
             None,
             "sub({l:?}, {r:?})"
         );
@@ -352,7 +352,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for arg in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(arg.clone()) * Expr::literal(arg.clone()))),
+            filter.eval_expr(&(lit(arg.clone()) * lit(arg.clone()))),
             None,
             "mul({arg:?}, {arg:?})"
         );
@@ -367,7 +367,7 @@ fn test_default_scalar_arithmetic() {
     ];
     for (l, r) in args {
         expect_eq!(
-            filter.eval_expr(&(Expr::literal(l.clone()) / Expr::literal(r.clone()))),
+            filter.eval_expr(&(lit(l.clone()) / lit(r.clone()))),
             None,
             "div({l:?}, {r:?})"
         );
@@ -426,8 +426,8 @@ fn test_eval_binary_columns() {
         (column_name!("y"), Scalar::from(10)),
     ]);
     let filter = DefaultKernelPredicateEvaluator::from(columns);
-    let x = column_expr!("x");
-    let y = column_expr!("y");
+    let x = col!("x");
+    let y = col!("y");
     for inverted in [true, false] {
         assert_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &y, inverted),
@@ -530,7 +530,7 @@ fn test_eval_not(
 #[test]
 fn test_eval_is_null() {
     use crate::expressions::UnaryPredicateOp::IsNull;
-    let expr = column_expr!("x");
+    let expr = col!("x");
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     expect_eq!(
         filter.eval_pred_unary(IsNull, &expr, true),
@@ -543,7 +543,7 @@ fn test_eval_is_null() {
         "x IS NULL"
     );
 
-    let expr = Expr::literal(1);
+    let expr = lit(1);
     expect_eq!(
         filter.eval_pred_unary(IsNull, &expr, true),
         Some(true),
@@ -643,8 +643,8 @@ fn test_default_evaluator_resolves_column_then_casts_and_compares() {
 fn eval_binary() {
     use crate::expressions::BinaryPredicateOp;
 
-    let col = column_expr!("x");
-    let val = Expr::literal(10);
+    let col = col!("x");
+    let val = lit(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
     for inverted in [true, false] {
@@ -700,8 +700,8 @@ fn test_eval_binary_commutes_literal_and_cast_column(
     #[case] expected: bool,
     #[values(false, true)] inverted: bool,
 ) {
-    let val = Expr::literal(10);
-    let cast_col = Expr::cast(column_expr!("x"), DataType::INTEGER);
+    let val = lit(10);
+    let cast_col = Expr::cast(col!("x"), DataType::INTEGER);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
 
     assert_eq!(
@@ -820,8 +820,8 @@ impl ParquetStatsProvider for MinStatsValue {
 
 #[test]
 fn test_eval_opaque_simple() {
-    let expr = Expr::opaque(OpaqueLessThanOp, vec![column_expr!("x"), Expr::literal(10)]);
-    let pred = Pred::opaque(OpaqueLessThanOp, vec![column_expr!("x"), Expr::literal(10)]);
+    let expr = Expr::opaque(OpaqueLessThanOp, vec![col!("x"), lit(10)]);
+    let pred = Pred::opaque(OpaqueLessThanOp, vec![col!("x"), lit(10)]);
     let skipping_pred = as_data_skipping_predicate(&pred).unwrap();
 
     assert_eq!(expr, expr);
@@ -857,7 +857,7 @@ fn test_eval_opaque_simple() {
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     let pred = Pred::from_expr(Expr::from(Pred::opaque(
         OpaqueLessThanOp,
-        vec![column_expr!("x"), Expr::literal(10)],
+        vec![col!("x"), lit(10)],
     )));
     assert_eq!(filter.eval(&pred), Some(true), "pred(expr(x < 10))");
 }
@@ -933,7 +933,7 @@ impl ParquetStatsProvider for OneStatsValue {
 
 #[test]
 fn test_eval_opaque_predicate() {
-    let pred = Pred::opaque(OpaqueAndOp, vec![column_expr!("x"), Expr::literal(true)]);
+    let pred = Pred::opaque(OpaqueAndOp, vec![col!("x"), lit(true)]);
     let skipping_pred = as_data_skipping_predicate(&pred).unwrap();
 
     // Direct evaluation works for any column type.
@@ -987,12 +987,12 @@ fn test_eval_opaque_predicate() {
 fn test_eval_opaque_complex() {
     // A contrived example that uses an opaque predicate that references an opaque expression
     let complex_pred = Pred::and(
-        Pred::lt(column_expr!("x"), Scalar::from(true)),
+        Pred::lt(col!("x"), lit(true)),
         Pred::opaque(
             OpaqueLessThanOp,
             vec![
-                column_expr!("x"),
-                Expr::opaque(OpaqueLessThanOp, vec![Expr::literal(2), Expr::literal(5)]),
+                col!("x"),
+                Expr::opaque(OpaqueLessThanOp, vec![lit(2), lit(5)]),
             ],
         ),
     );
@@ -1046,7 +1046,7 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 
 #[test]
 fn test_sql_where() {
-    let col = &column_expr!("x");
+    let col = &col!("x");
     let col_pred = &column_pred!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
     const NULL: Pred = Pred::null_literal();
