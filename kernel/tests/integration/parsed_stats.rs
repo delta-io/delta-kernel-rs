@@ -7,7 +7,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
-use delta_kernel::arrow::util::display::array_value_to_string;
+use delta_kernel::arrow::util::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -91,8 +91,17 @@ fn assert_stats_struct_matches_json(
                 }
             }
             serde_json::Value::String(s) => {
-                let actual = array_value_to_string(col.as_ref(), row_idx)
-                    .unwrap_or_else(|e| panic!("{path}: cannot format parsed value: {e}"));
+                // JSON stats render timestamps with exactly three fractional digits, since Delta
+                // truncates timestamp stats down to milliseconds. Format the parsed side the same
+                // way so the two are directly comparable -- the default formatter would elide an
+                // all-zero fraction and spuriously differ on whole-second values.
+                let format_options = FormatOptions::default()
+                    .with_display_error(true)
+                    .with_timestamp_format(Some("%Y-%m-%dT%H:%M:%S%.3f"))
+                    .with_timestamp_tz_format(Some("%Y-%m-%dT%H:%M:%S%.3f%:z"));
+                let formatter = ArrayFormatter::try_new(col.as_ref(), &format_options)
+                    .unwrap_or_else(|e| panic!("{path}: cannot build formatter: {e}"));
+                let actual = formatter.value(row_idx).to_string();
                 assert_eq!(&actual, s, "{path} mismatch at row {row_idx}");
             }
             serde_json::Value::Object(sub_obj) => {

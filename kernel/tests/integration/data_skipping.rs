@@ -592,6 +592,93 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     Ok(())
 }
 
+/// Which side of the file's timestamp range a test predicate bounds.
+#[derive(Debug, Clone, Copy)]
+enum Bound {
+    Upper,
+    Lower,
+}
+
+/// Millisecond-truncated timestamp stats must not over-prune files whose real values live in the
+/// dropped sub-millisecond tail. This is the read-side half of the write-side truncation the
+/// protocol mandates (PROTOCOL.md, Per-file Statistics: timestamps are truncated down to
+/// milliseconds); `adjust_scalar_for_max_stat_truncation` is what makes it safe.
+///
+/// The file holds timestamps in [.298677, .307735], so its truncated stats are [.298, .307]. Every
+/// predicate below selects a real row in the file, so pruning it would drop committed data.
+///
+/// The lower-bound cases are the ones that exercise `adjust_scalar_for_max_stat_truncation`: a
+/// `>=` bound between the stored (truncated) max `.307000` and the real max `.307735` compares
+/// against the max stat, and without the 999us widening the file is wrongly pruned.
+#[rstest]
+// Upper bound inside the truncated range.
+#[case::upper_bound_within_range(Bound::Upper, 1_783_007_755_299_000, 1)]
+// Upper bound in the tail below the real max but above the truncated min.
+#[case::upper_bound_in_truncated_tail(Bound::Upper, 1_783_007_755_298_900, 1)]
+// Upper bound below the file's truncated min: nothing in the file can match, prune is correct.
+#[case::upper_bound_below_min(Bound::Upper, 1_783_007_754_000_000, 0)]
+// Lower bound inside the sub-millisecond tail dropped from the max stat. The file really does
+// hold `.307735`, so it must survive despite the stat claiming `.307000`.
+#[case::lower_bound_in_truncated_tail(Bound::Lower, 1_783_007_755_307_500, 1)]
+// Lower bound at the real max: still inside the tail, still must survive.
+#[case::lower_bound_at_real_max(Bound::Lower, 1_783_007_755_307_735, 1)]
+// Lower bound far past the tail (beyond stored max + 999us): pruning is correct here.
+#[case::lower_bound_past_tail(Bound::Lower, 1_783_007_755_400_000, 0)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn millisecond_truncated_timestamp_stats_dont_overprune(
+    #[case] bound: Bound,
+    #[case] bound_us: i64,
+    #[case] expected_survivors: usize,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let _ = create_table_and_load_snapshot(
+        &table_path,
+        timestamp_stats_schema(),
+        engine.as_ref(),
+        &[],
+    )?;
+
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+
+    // Real values span [.298677, .307735]; a protocol-conforming writer floors the stats to
+    // [.298, .307].
+    add_commit(
+        &table_url.to_string(),
+        store.as_ref(),
+        1,
+        commit_with_adds(
+            1,
+            &[(
+                "file_streaming.parquet",
+                stats_json(
+                    10,
+                    "2026-07-02T15:55:55.298Z",
+                    "2026-07-02T15:55:55.307Z",
+                    1,
+                    100,
+                ),
+            )],
+        ),
+    )
+    .await?;
+
+    let column = column_expr!("EventTime");
+    let literal = Expr::literal(Scalar::Timestamp(bound_us));
+    let predicate = Arc::new(match bound {
+        Bound::Upper => Pred::le(column, literal),
+        Bound::Lower => Pred::ge(column, literal),
+    });
+
+    assert_eq!(
+        surviving_files(&table_path, engine, predicate, use_parallel)?,
+        expected_survivors,
+    );
+    Ok(())
+}
+
 /// Replace table may change partition and data column types. A scan after replacement should
 /// remain compatible with the old addFiles.
 #[rstest]
