@@ -39,7 +39,12 @@ pub(crate) struct CheckpointShape {
 }
 
 impl CheckpointShape {
-    /// Resolve `snapshot`'s checkpoint shape and optionally retain its leaf-action schema.
+    /// Resolves `snapshot`'s checkpoint topology. When `needs_leaf_schema` is true, also loads and
+    /// retains the schema of the files containing leaf actions. Schema retention does not affect
+    /// checkpoint classification.
+    ///
+    /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
+    /// read.
     pub(crate) fn try_new(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
@@ -169,16 +174,16 @@ impl CheckpointShape {
     }
 
     /// Return `stats_schema` when the checkpoint has compatible parsed stats.
-    pub(crate) fn compatible_stats_parsed_schema(
+    pub(crate) fn compatible_stats_parsed_schema<'a>(
         &self,
-        stats_schema: &SchemaRef,
-    ) -> Option<SchemaRef> {
+        stats_schema: &'a SchemaRef,
+    ) -> Option<&'a SchemaRef> {
         self.leaf_checkpoint_schema
             .as_ref()
-            .filter(|checkpoint_schema| {
+            .is_some_and(|checkpoint_schema| {
                 LogSegment::schema_has_compatible_stats_parsed(checkpoint_schema, stats_schema)
             })
-            .map(|_| stats_schema.clone())
+            .then_some(stats_schema)
     }
 }
 
@@ -222,9 +227,10 @@ mod tests {
     use super::*;
     use crate::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
     use crate::engine::sync::plan::SyncPlanExecutor;
+    use crate::engine::sync::SyncEngine;
     use crate::plans::{IoOperation, PlanResult};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::unit_test_utils::load_test_table;
+    use crate::unit_test_utils::{copy_test_table, load_test_table};
 
     /// Counts ops by kind and delegates to `SyncPlanExecutor`, to assert which I/O the fast path
     /// performs.
@@ -328,7 +334,7 @@ mod tests {
             ),
             // Requested with compatible parsed stats: the requested schema is echoed back.
             Some(true) => assert_eq!(
-                parsed_stats_schema.as_ref(),
+                parsed_stats_schema,
                 stats_schema.as_ref(),
                 "{table}: parsed stats available, schema echoed"
             ),
@@ -337,6 +343,17 @@ mod tests {
                 parsed_stats_schema.is_none(),
                 "{table}: no compatible stats"
             ),
+        }
+
+        let needs_leaf_schema = stats_schema.is_some();
+        assert_eq!(
+            shape.leaf_checkpoint_schema.is_some(),
+            needs_leaf_schema && expected_checkpoint != CheckpointType::None,
+            "{table}: retained leaf schema"
+        );
+        if let Some(schema) = &shape.leaf_checkpoint_schema {
+            assert!(schema.contains("add"), "{table}: retained add action");
+            assert!(schema.contains("remove"), "{table}: retained remove action");
         }
     }
 
@@ -356,15 +373,40 @@ mod tests {
         ]))
     }
 
+    #[test]
+    fn incompatible_parsed_stats_schema_is_rejected() {
+        let (_engine, snapshot, _tempdir) =
+            load_test_table("v2-classic-parquet-struct-stats-only").unwrap();
+        let columns =
+            || StructType::new_unchecked([StructField::nullable("value", DataType::LONG)]);
+        let incompatible = Arc::new(StructType::new_unchecked([
+            StructField::nullable(NUM_RECORDS, DataType::LONG),
+            StructField::nullable(MIN_VALUES, columns()),
+            StructField::nullable(MAX_VALUES, columns()),
+        ]));
+
+        let shape = CheckpointShape::try_new(&SyncPlanExecutor::default(), snapshot.as_ref(), true)
+            .unwrap();
+
+        assert!(shape
+            .compatible_stats_parsed_schema(&incompatible)
+            .is_none());
+    }
+
     /// Fast path on a manifest hint: one sidecar footer read, no drain (`query_scans == 0`). Guards
     /// against the optimization silently not firing (result-only checks pass via the drain too).
-    #[test]
-    fn fast_path_skips_checkpoint_drain_when_hint_lists_sidecars() {
+    #[rstest]
+    #[case::without_leaf_schema(false, 0)]
+    #[case::with_leaf_schema(true, 1)]
+    fn fast_path_skips_checkpoint_drain_when_hint_lists_sidecars(
+        #[case] needs_leaf_schema: bool,
+        #[case] expected_footer_reads: usize,
+    ) {
         let (_engine, snapshot, _tempdir) =
             load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
         let exec = CountingExecutor::new();
 
-        let shape = CheckpointShape::try_new(&exec, snapshot.as_ref(), true).unwrap();
+        let shape = CheckpointShape::try_new(&exec, snapshot.as_ref(), needs_leaf_schema).unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert_eq!(
@@ -374,16 +416,25 @@ mod tests {
         );
         assert_eq!(
             exec.footer_reads.load(Ordering::Relaxed),
-            1,
-            "fast path footer-reads exactly the hint's first sidecar"
+            expected_footer_reads,
+            "fast path reads the sidecar footer only when its schema is needed"
         );
+        assert_eq!(shape.leaf_checkpoint_schema.is_some(), needs_leaf_schema);
     }
 
-    /// With the hint removed, a JSON manifest must drain the `sidecar` column (`query_scans >= 1`).
-    #[test]
-    fn resolve_json_manifest_via_drain_without_hint() {
-        let (engine, snapshot, _tempdir) =
-            load_test_table("v2-checkpoints-json-with-sidecars").unwrap();
+    /// Without a hint, a manifest must drain the `sidecar` column (`query_scans >= 1`).
+    #[rstest]
+    #[case::json("v2-checkpoints-json-with-sidecars", false)]
+    #[case::parquet("v2-parquet-sidecars-struct-stats-only", true)]
+    fn resolve_manifest_via_drain_without_hint(
+        #[case] table: &str,
+        #[case] expect_parsed_stats: bool,
+    ) {
+        let (table_root, _tempdir) = copy_test_table(table).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(table_root)
+            .build(engine.as_ref())
+            .unwrap();
         // Remove the hint so resolve must drain.
         let hint = snapshot
             .log_segment()
@@ -407,6 +458,12 @@ mod tests {
         assert!(
             exec.query_scans.load(Ordering::Relaxed) >= 1,
             "must drain, not fast-path"
+        );
+        assert_eq!(
+            shape
+                .compatible_stats_parsed_schema(&probe_stats_schema())
+                .is_some(),
+            expect_parsed_stats
         );
     }
 
@@ -452,13 +509,13 @@ mod tests {
     /// requested. `None` here means the hint short-circuited (a fall-through would return `Some`).
     #[rstest]
     // JSON leaf: use the canonical schema without I/O.
-    #[case::json_no_stats("json", false, None, 0)]
-    #[case::json_with_stats("json", true, None, 0)]
-    // Parquet leaf: no stats requested -> no schema read, no parsed stats.
-    #[case::parquet_no_stats("parquet", false, None, 0)]
+    #[case::json_without_leaf_schema("json", false, None, 0)]
+    #[case::json_with_leaf_schema("json", true, None, 0)]
+    // Parquet leaf: schema not retained -> no footer read or parsed stats.
+    #[case::parquet_without_leaf_schema("parquet", false, None, 0)]
     fn empty_sidecars_hint_classifies_leaf_without_drain(
         #[case] extension: &str,
-        #[case] request_stats: bool,
+        #[case] needs_leaf_schema: bool,
         #[case] expect_parsed: Option<bool>,
         #[case] expected_footer_reads: usize,
     ) {
@@ -468,7 +525,7 @@ mod tests {
             "json" => FileType::Json,
             _ => FileType::Parquet,
         };
-        let stats_schema = request_stats.then(probe_stats_schema);
+        let stats_schema = needs_leaf_schema.then(probe_stats_schema);
         let exec = CountingExecutor::new();
 
         let shape = CheckpointShape::from_v2_checkpoint_hint(
@@ -476,13 +533,13 @@ mod tests {
             &segment,
             root,
             file_type,
-            request_stats,
+            needs_leaf_schema,
         )
         .unwrap()
         .expect("an empty-sidecars hint must classify without falling through");
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Leaf);
-        if file_type == FileType::Json && request_stats {
+        if file_type == FileType::Json && needs_leaf_schema {
             assert_eq!(
                 shape.leaf_checkpoint_schema.as_ref(),
                 Some(&*LEAF_CHECKPOINT_ACTIONS_SCHEMA)
