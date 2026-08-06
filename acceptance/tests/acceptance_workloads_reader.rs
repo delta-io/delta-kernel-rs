@@ -165,14 +165,6 @@ const EXPECTED_KERNEL_FAILURES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Cannot fall back to log replay when checkpoint files are missing or incomplete",
-        &[
-            "corrupt_incomplete_multipart_checkpoint/",
-            "ckp_incomplete_multipart/",
-            "ckp_missing_checkpoint_file/",
-        ],
-    ),
-    (
         "Cannot cast list to non-list data types during type widening",
         &[
             "tw_array_element/specs/tw_array_element_read_",

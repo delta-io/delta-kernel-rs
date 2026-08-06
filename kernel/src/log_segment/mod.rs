@@ -386,25 +386,45 @@ impl LogSegment {
         //    end_version, list from that checkpoint TO end_version (falls back to v0 if no
         //    checkpoint found)
         // 4. no usable_hint,      end_version is None  --> list from v0 unbounded
+        //
+        // A stale hint (cases 1 and 2 returning `None`) degrades to cases 3 and 4. Both retry paths
+        // only ever select a *complete* checkpoint, so neither can rediscover the unusable one the
+        // hint named. The retry's result is then checked below to be self-contained, so a log
+        // truncated behind the vanished checkpoint fails rather than silently reconstructing
+        // partial state.
 
-        let listed_files = match (usable_hint, end_version) {
+        let hinted_files = match usable_hint {
             // Cases 1 and 2
-            (Some(cp), end_version) => LogSegmentFiles::list_with_checkpoint_hint(
+            Some(cp) => LogSegmentFiles::list_with_checkpoint_hint(
                 cp,
                 storage,
                 &log_root,
-                log_tail,
+                log_tail.clone(),
                 end_version,
             )?,
-            // Case 3
-            (None, Some(end)) => LogSegmentFiles::list_with_backward_checkpoint_scan(
-                storage, &log_root, log_tail, end,
-            )?,
-            // Case 4
-            (None, None) => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            None => None,
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version, checkpoint_hint)
+        let hint_was_stale = usable_hint.is_some() && hinted_files.is_none();
+
+        let listed_files = match hinted_files {
+            // The listing found a usable checkpoint at or after the hint's version
+            Some(listed) => listed,
+            // Cases 3 and 4, also reached when a hint turned out stale.
+            None => match end_version {
+                Some(end) => LogSegmentFiles::list_with_backward_checkpoint_scan(
+                    storage, &log_root, log_tail, end,
+                )?,
+                None => LogSegmentFiles::list(storage, &log_root, log_tail, None, None)?,
+            },
+        };
+
+        if hint_was_stale {
+            validate_stale_hint_fallback(&listed_files)?;
+        }
+
+        let retained_hint = checkpoint_hint.filter(|_| !hint_was_stale);
+        LogSegment::try_new(listed_files, log_root, time_travel_version, retained_hint)
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between
@@ -1571,6 +1591,26 @@ fn validate_checkpoint_commit_gap(
             ))
         );
     }
+    Ok(())
+}
+
+/// Validates that a segment built after discarding a stale `_last_checkpoint` hint can reconstruct
+/// the table on its own: a checkpoint-less segment starting above version 0 means the commits below
+/// it were cleaned up under the checkpoint the hint named, so replaying what survived would
+/// silently omit every file added before it.
+fn validate_stale_hint_fallback(listed: &LogSegmentFiles) -> DeltaResult<()> {
+    let Some(first_commit) = listed.ascending_commit_files.first() else {
+        return Ok(()); // an empty segment is rejected by `validate_end_version`
+    };
+    require!(
+        !listed.checkpoint_parts.is_empty() || first_commit.version == 0,
+        Error::invalid_checkpoint(format!(
+            "_last_checkpoint named a checkpoint that is missing, and the remaining log has no \
+             checkpoint and starts at version {} (expected 0); the log appears truncated without \
+             a checkpoint",
+            first_commit.version
+        ))
+    );
     Ok(())
 }
 

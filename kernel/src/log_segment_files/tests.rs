@@ -1596,6 +1596,7 @@ async fn last_checkpoint_hint_applies_iff_it_names_the_selected_checkpoint(
         vec![],
         None,
     )
+    .unwrap()
     .unwrap();
 
     // The winner is the same no matter what the hint names.
