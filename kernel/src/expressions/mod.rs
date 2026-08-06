@@ -103,7 +103,8 @@ pub enum BinaryPredicateOp {
 pub enum UnaryExpressionOp {
     /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
     /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
-    /// than `"null"`. This is the inverse of [`ParseJsonExpression`].
+    /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
+    /// timestamps, whose sub-millisecond precision this operator discards (see below).
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
     /// hex rather than base64, two digits per byte in the order the bytes appear, so
@@ -112,6 +113,15 @@ pub enum UnaryExpressionOp {
     /// ```text
     /// {"b":"abcd","l":[1,2],"n":{"z":7}}
     /// ```
+    ///
+    /// Timestamps must encode with exactly three fractional digits, truncated toward negative
+    /// infinity, because kernel writes `add.stats` with this operator and [Per-file Statistics]
+    /// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
+    /// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
+    /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
+    /// prune files that hold matching rows.
+    ///
+    /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
 }
 
@@ -319,7 +329,8 @@ pub struct VariadicExpression {
 }
 
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
-/// inverse of [`UnaryExpressionOp::ToJson`].
+/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
+/// that operator discards.
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
@@ -837,7 +848,9 @@ impl Expression {
     }
 
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
-    /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
+    /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
+    /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
+    /// `ToJson` truncates it.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
