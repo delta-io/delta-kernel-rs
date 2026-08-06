@@ -44,7 +44,7 @@ pub struct TableChangesScan {
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;
-/// # use delta_kernel::expressions::{column_expr, Scalar};
+/// # use delta_kernel::expressions::{col, lit};
 /// # use delta_kernel::Predicate;
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
@@ -56,7 +56,7 @@ pub struct TableChangesScan {
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
 ///     .unwrap();
-/// let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
+/// let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
 /// let scan = table_changes
 ///     .into_scan_builder()
 ///     .with_schema(schema)

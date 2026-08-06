@@ -1290,11 +1290,14 @@ mod tests {
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
         });
 
-        let column = col!("item");
         let array_op = Pred::binary(BinaryPredicateOp::In, lit(10), array.clone());
         let array_not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(10), array));
-        let column_op = Pred::binary(BinaryPredicateOp::In, lit(PI), column.clone());
-        let column_not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit("Cool"), column));
+        let column_op = Pred::binary(BinaryPredicateOp::In, lit(PI), col!("item"));
+        let column_not_op = Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
+            lit("Cool"),
+            col!("item"),
+        ));
         assert_eq!(&format!("{array_op}"), "10 IN (1, 2, 3)");
         assert_eq!(&format!("{array_not_op}"), "NOT(10 IN (1, 2, 3))");
         assert_eq!(&format!("{column_op}"), "3.1415927 IN Column(item)");
