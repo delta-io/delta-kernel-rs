@@ -476,8 +476,8 @@ macro_rules! __joined_column_name {
 #[doc(inline)]
 pub use __joined_column_name as joined_column_name;
 
-/// Convenience macro that builds an [`Expression`] column reference by forwarding all args to
-/// [`column_name!`]:
+/// Convenience macro that builds an [`Expression`](crate::expressions::Expression) column reference
+/// by forwarding all args to [`column_name!`]:
 ///
 /// ```
 /// # use delta_kernel::expressions::{col, ColumnName, Expression};
