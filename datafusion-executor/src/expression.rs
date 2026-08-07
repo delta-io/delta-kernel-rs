@@ -444,17 +444,8 @@ impl ParseJsonUdf {
             .map_err(Error::generic_err)?;
         Ok(Self {
             return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
-            // JSON lives in a string column; accept the three arrow string layouts, mirroring
-            // kernel's `parse_json_impl` (Utf8 / LargeUtf8 / Utf8View).
-            signature: Signature::uniform(
-                1,
-                vec![
-                    ArrowDataType::Utf8,
-                    ArrowDataType::LargeUtf8,
-                    ArrowDataType::Utf8View,
-                ],
-                Volatility::Immutable,
-            ),
+            // Coerces Utf8 / LargeUtf8 / Utf8View, mirroring kernel's `parse_json_impl`.
+            signature: Signature::string(1, Volatility::Immutable),
             output_schema,
         })
     }
@@ -499,7 +490,7 @@ impl ScalarUDFImpl for ParseJsonUdf {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{Array, AsArray, StringArray};
-    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
@@ -1093,6 +1084,19 @@ mod tests {
             .clone()
     }
 
+    /// [`eval_parse_json`] with the struct flattened to one column per parsed field. Panics on a
+    /// struct with a top-level null, so the malformed-backstop case must use [`eval_parse_json`].
+    fn eval_parse_json_batch(schema: KernelSchemaRef, rows: Vec<Option<&str>>) -> RecordBatch {
+        RecordBatch::from(eval_parse_json(schema, rows))
+    }
+
+    /// Asserts the result fields equal `target`'s arrow projection: the parse is typed to the
+    /// target schema, not merely compatible with it.
+    fn assert_matches_target(batch: &RecordBatch, target: &KernelSchemaRef) {
+        let target: ArrowSchema = target.as_ref().try_into_arrow().unwrap();
+        assert_eq!(batch.schema().fields(), target.fields());
+    }
+
     // === ParseJson Tests ===
 
     #[test]
@@ -1108,32 +1112,108 @@ mod tests {
 
     #[test]
     fn parse_json_parses_fields_into_typed_struct() {
-        let out = eval_parse_json(
+        let batch = eval_parse_json_batch(
             parse_target(),
             vec![Some(r#"{"n": 1, "s": "a"}"#), Some(r#"{"n": 2, "s": "b"}"#)],
         );
-        let n = out.column(0).as_primitive::<Int64Type>();
-        let s = out.column(1).as_string::<i32>();
-        assert_eq!(n.null_count(), 0);
-        assert_eq!((n.value(0), n.value(1)), (1, 2));
-        assert_eq!((s.value(0), s.value(1)), ("a", "b"));
+        assert_matches_target(&batch, &parse_target());
+        assert_batches_eq!(
+            [
+                "+---+---+",
+                "| n | s |",
+                "+---+---+",
+                "| 1 | a |",
+                "| 2 | b |",
+                "+---+---+",
+            ],
+            &[batch]
+        );
+    }
+
+    /// Every primitive `parse_json` can decode, in one struct: the integer/float/boolean families
+    /// decode directly, while the failure-prone leaves (date, both timestamps, decimal) route
+    /// through kernel's stringify-then-safe-cast path. Asserts they all land typed to the target.
+    #[test]
+    fn parse_json_decodes_all_supported_primitive_types() {
+        let target: KernelSchemaRef = Arc::new(
+            StructType::try_new([
+                StructField::nullable("str", DataType::STRING),
+                StructField::nullable("long", DataType::LONG),
+                StructField::nullable("int", DataType::INTEGER),
+                StructField::nullable("short", DataType::SHORT),
+                StructField::nullable("byte", DataType::BYTE),
+                StructField::nullable("float", DataType::FLOAT),
+                StructField::nullable("double", DataType::DOUBLE),
+                StructField::nullable("bool", DataType::BOOLEAN),
+                StructField::nullable("date", DataType::DATE),
+                StructField::nullable("ts", DataType::TIMESTAMP),
+                StructField::nullable("ts_ntz", DataType::TIMESTAMP_NTZ),
+                StructField::nullable("dec", DataType::decimal(10, 2).unwrap()),
+            ])
+            .unwrap(),
+        );
+        let row = r#"{
+            "str": "a", "long": 1, "int": 2, "short": 3, "byte": 4,
+            "float": 1.5, "double": 2.5, "bool": true, "date": "2024-01-02",
+            "ts": "2024-01-02T03:04:05Z", "ts_ntz": "2024-01-02T03:04:05", "dec": "12.34"
+        }"#;
+        let batch = eval_parse_json_batch(target.clone(), vec![Some(row)]);
+        assert_matches_target(&batch, &target);
+        assert_batches_eq!(
+            [
+                "+-----+------+-----+-------+------+-------+--------+------+------------+----------------------+---------------------+-------+",
+                "| str | long | int | short | byte | float | double | bool | date       | ts                   | ts_ntz              | dec   |",
+                "+-----+------+-----+-------+------+-------+--------+------+------------+----------------------+---------------------+-------+",
+                "| a   | 1    | 2   | 3     | 4    | 1.5   | 2.5    | true | 2024-01-02 | 2024-01-02T03:04:05Z | 2024-01-02T03:04:05 | 12.34 |",
+                "+-----+------+-----+-------+------+-------+--------+------+------------+----------------------+---------------------+-------+",
+            ],
+            &[batch]
+        );
+    }
+
+    /// `Binary` has no JSON decoder in arrow-json, so any row hits kernel's whole-batch parse error
+    /// and the coarse backstop nulls the struct. Documents that a `Binary` leaf is effectively
+    /// unsupported through this path rather than silently mis-decoding.
+    #[test]
+    fn parse_json_binary_leaf_is_unsupported_and_yields_all_null_struct() {
+        let target: KernelSchemaRef =
+            Arc::new(StructType::try_new([StructField::nullable("b", DataType::BINARY)]).unwrap());
+        let out = eval_parse_json(target, vec![Some(r#"{"b": "aGk="}"#)]);
+        assert_eq!(out.len(), 1);
+        assert!(out.column(0).is_null(0));
     }
 
     /// A null input string decodes as `{}` (kernel's contract): the row stays present with all its
     /// fields null, rather than nulling the whole struct row.
     #[test]
     fn parse_json_null_input_yields_present_row_with_null_fields() {
-        let out = eval_parse_json(parse_target(), vec![None]);
-        assert_eq!(out.len(), 1);
-        assert!(out.column(0).is_null(0) && out.column(1).is_null(0));
+        let batch = eval_parse_json_batch(parse_target(), vec![None]);
+        assert_batches_eq!(
+            [
+                "+---+---+",
+                "| n | s |",
+                "+---+---+",
+                "|   |   |",
+                "+---+---+",
+            ],
+            &[batch]
+        );
     }
 
     /// A field absent from the JSON object parses to null.
     #[test]
     fn parse_json_missing_field_is_null() {
-        let out = eval_parse_json(parse_target(), vec![Some(r#"{"s": "only"}"#)]);
-        assert!(out.column(0).is_null(0));
-        assert_eq!(out.column(1).as_string::<i32>().value(0), "only");
+        let batch = eval_parse_json_batch(parse_target(), vec![Some(r#"{"s": "only"}"#)]);
+        assert_batches_eq!(
+            [
+                "+---+------+",
+                "| n | s    |",
+                "+---+------+",
+                "|   | only |",
+                "+---+------+",
+            ],
+            &[batch]
+        );
     }
 
     /// Genuinely malformed JSON hits the coarse backstop: the whole struct comes back all-null
