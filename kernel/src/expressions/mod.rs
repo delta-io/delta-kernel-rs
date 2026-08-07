@@ -8,10 +8,10 @@ use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 #[doc(hidden)]
-pub use self::column_names::__require_valid_simple_column_segment;
+pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
-    col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
-    joined_column_name, ColumnName,
+    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
+    ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -1257,7 +1257,7 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{column_expr, column_pred, DataType, Expression as Expr, Predicate as Pred};
+    use super::{col, column_pred, lit, DataType, Expression as Expr, Predicate as Pred};
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1269,21 +1269,21 @@ mod tests {
     #[test]
     fn test_expression_format() {
         let cases = [
-            (column_expr!("x"), "Column(x)"),
+            (col!("x"), "Column(x)"),
             (
-                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                (col!("x") + lit(4)) / lit(10) * lit(42),
                 "Column(x) + 4 / 10 * 42",
             ),
             (
-                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                Expr::struct_from([col!("x"), lit(2), lit(10)]),
                 "Struct(Column(x), 2, 10)",
             ),
             (
-                Expr::array([column_expr!("x"), column_expr!("y"), Expr::literal(0)]),
+                Expr::array([col!("x"), col!("y"), lit(0)]),
                 "ARRAY(Column(x), Column(y), 0)",
             ),
             (
-                Expr::cast(column_expr!("x"), DataType::DATE),
+                Expr::cast(col!("x"), DataType::DATE),
                 "CAST(Column(x) AS date)",
             ),
         ];
@@ -1298,37 +1298,25 @@ mod tests {
     fn test_predicate_format() {
         let cases = [
             (column_pred!("x"), "Column(x)"),
-            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (col!("x").eq(lit(2)), "Column(x) = 2"),
+            ((col!("x") - lit(4)).lt(lit(10)), "Column(x) - 4 < 10"),
             (
-                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
-                "Column(x) - 4 < 10",
-            ),
-            (
-                Pred::and(
-                    column_expr!("x").ge(Expr::literal(2)),
-                    column_expr!("x").le(Expr::literal(10)),
-                ),
+                Pred::and(col!("x").ge(lit(2)), col!("x").le(lit(10))),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
             ),
             (
                 Pred::and_from([
-                    column_expr!("x").ge(Expr::literal(2)),
-                    column_expr!("x").le(Expr::literal(10)),
-                    column_expr!("x").le(Expr::literal(100)),
+                    col!("x").ge(lit(2)),
+                    col!("x").le(lit(10)),
+                    col!("x").le(lit(100)),
                 ]),
                 "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
             ),
             (
-                Pred::or(
-                    column_expr!("x").gt(Expr::literal(2)),
-                    column_expr!("x").lt(Expr::literal(10)),
-                ),
+                Pred::or(col!("x").gt(lit(2)), col!("x").lt(lit(10))),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (
-                column_expr!("x").eq(Expr::literal("foo")),
-                "Column(x) = 'foo'",
-            ),
+            (col!("x").eq(lit("foo")), "Column(x) = 'foo'"),
         ];
 
         for (pred, expected) in cases {
@@ -1345,8 +1333,8 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            col, column_expr, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
-            Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
+            col, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+            ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1435,7 +1423,7 @@ mod tests {
         #[test]
         fn test_column_expressions_roundtrip() {
             let cases: Vec<Expression> = vec![
-                column_expr!("my_column"),
+                col!("my_column"),
                 Expression::column(["parent", "child"]),
                 Expression::column(["a", "b", "c", "d"]),
             ];
@@ -1462,7 +1450,7 @@ mod tests {
 
         #[test]
         fn test_unary_expression_roundtrip() {
-            let expr = Expression::unary(UnaryExpressionOp::ToJson, column_expr!("data"));
+            let expr = Expression::unary(UnaryExpressionOp::ToJson, col!("data"));
             assert_roundtrip(&expr);
         }
 
@@ -1476,26 +1464,22 @@ mod tests {
             ];
 
             for op in ops {
-                let expr = Expression::binary(op, column_expr!("a"), Expression::literal(10));
+                let expr = Expression::binary(op, col!("a"), lit(10));
                 assert_roundtrip(&expr);
             }
         }
 
         #[test]
         fn test_variadic_expression_roundtrip() {
-            let expr = Expression::coalesce([
-                column_expr!("a"),
-                column_expr!("b"),
-                Expression::literal("default"),
-            ]);
+            let expr = Expression::coalesce([col!("a"), col!("b"), lit("default")]);
             assert_roundtrip(&expr);
         }
 
         #[rstest::rstest]
-        #[case::column(Expression::cast(column_expr!("part"), DataType::DATE))]
-        #[case::literal(Expression::cast(Expression::literal("2025-01-01"), DataType::DATE))]
+        #[case::column(Expression::cast(col!("part"), DataType::DATE))]
+        #[case::literal(Expression::cast(lit("2025-01-01"), DataType::DATE))]
         #[case::nested(Expression::cast(
-            Expression::cast(column_expr!("part"), DataType::STRING),
+            Expression::cast(col!("part"), DataType::STRING),
             DataType::INTEGER,
         ))]
         fn test_cast_expression_roundtrip(#[case] expr: Expression) {
@@ -1503,11 +1487,11 @@ mod tests {
         }
 
         #[rstest::rstest]
-        #[case::array_single(Expression::array([Expression::literal(7i32)]))]
+        #[case::array_single(Expression::array([lit(7i32)]))]
         #[case::array_mixed(Expression::array([
-            column_expr!("a"),
-            column_expr!("b"),
-            Expression::literal(42i64),
+            col!("a"),
+            col!("b"),
+            lit(42i64),
         ]))]
         fn test_array_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
@@ -1516,18 +1500,10 @@ mod tests {
         #[test]
         fn test_nested_arithmetic_expression_roundtrip() {
             // (a + b) * (c - d) / 2
-            let left = Expression::binary(
-                BinaryExpressionOp::Plus,
-                column_expr!("a"),
-                column_expr!("b"),
-            );
-            let right = Expression::binary(
-                BinaryExpressionOp::Minus,
-                column_expr!("c"),
-                column_expr!("d"),
-            );
+            let left = Expression::binary(BinaryExpressionOp::Plus, col!("a"), col!("b"));
+            let right = Expression::binary(BinaryExpressionOp::Minus, col!("c"), col!("d"));
             let mul = Expression::binary(BinaryExpressionOp::Multiply, left, right);
-            let expr = Expression::binary(BinaryExpressionOp::Divide, mul, Expression::literal(2));
+            let expr = Expression::binary(BinaryExpressionOp::Divide, mul, lit(2));
             assert_roundtrip(&expr);
         }
 
@@ -1536,9 +1512,9 @@ mod tests {
         #[test]
         fn test_struct_expression_roundtrip() {
             let expr = Expression::struct_from([
-                Arc::new(column_expr!("x")),
-                Arc::new(Expression::literal(42)),
-                Arc::new(Expression::literal("hello")),
+                Arc::new(col!("x")),
+                Arc::new(lit(42)),
+                Arc::new(lit("hello")),
             ]);
             assert_roundtrip(&expr);
         }
@@ -1578,7 +1554,7 @@ mod tests {
 
         #[test]
         fn test_expression_wrapping_predicate_roundtrip() {
-            let pred = Predicate::eq(column_expr!("x"), Expression::literal(10));
+            let pred = Predicate::eq(col!("x"), lit(10));
             let expr = Expression::from_pred(pred);
             assert_roundtrip(&expr);
         }
@@ -1592,8 +1568,8 @@ mod tests {
         #[test]
         fn test_map_to_struct_expression_roundtrip() {
             let cases: Vec<Expression> = vec![
-                Expression::map_to_struct(column_expr!("pv")),
-                Expression::map_to_struct(Expression::literal("ignored")),
+                Expression::map_to_struct(col!("pv")),
+                Expression::map_to_struct(lit("ignored")),
             ];
 
             for expr in &cases {
@@ -1607,22 +1583,19 @@ mod tests {
         fn test_predicate_basics_roundtrip() {
             let cases: Vec<Predicate> = vec![
                 // Boolean expression
-                Predicate::from_expr(column_expr!("is_active")),
+                Predicate::from_expr(col!("is_active")),
                 // Literals
                 Predicate::literal(true),
                 Predicate::literal(false),
                 // NOT
-                Predicate::not(Predicate::from_expr(column_expr!("x"))),
+                Predicate::not(Predicate::from_expr(col!("x"))),
                 // Nested NOT
-                Predicate::not(Predicate::not(Predicate::gt(
-                    column_expr!("x"),
-                    Expression::literal(5),
-                ))),
+                Predicate::not(Predicate::not(Predicate::gt(col!("x"), lit(5)))),
                 // Unknown
                 Predicate::unknown("some_unknown_predicate()"),
                 // Unary predicates
-                Predicate::is_null(column_expr!("nullable_col")),
-                Predicate::is_not_null(column_expr!("nullable_col")),
+                Predicate::is_null(col!("nullable_col")),
+                Predicate::is_not_null(col!("nullable_col")),
             ];
 
             for pred in &cases {
@@ -1639,13 +1612,13 @@ mod tests {
         #[test]
         fn test_predicate_comparisons_roundtrip() {
             let cases: Vec<Predicate> = vec![
-                Predicate::eq(column_expr!("x"), Expression::literal(42)),
-                Predicate::ne(column_expr!("status"), Expression::literal("active")),
-                Predicate::lt(column_expr!("age"), Expression::literal(18)),
-                Predicate::le(column_expr!("price"), Expression::literal(100)),
-                Predicate::gt(column_expr!("score"), Expression::literal(90)),
-                Predicate::ge(column_expr!("quantity"), Expression::literal(1)),
-                Predicate::distinct(column_expr!("a"), column_expr!("b")),
+                Predicate::eq(col!("x"), lit(42)),
+                Predicate::ne(col!("status"), lit("active")),
+                Predicate::lt(col!("age"), lit(18)),
+                Predicate::le(col!("price"), lit(100)),
+                Predicate::gt(col!("score"), lit(90)),
+                Predicate::ge(col!("quantity"), lit(1)),
+                Predicate::distinct(col!("a"), col!("b")),
             ];
 
             for pred in &cases {
@@ -1662,7 +1635,7 @@ mod tests {
             .unwrap();
             let pred = Predicate::binary(
                 BinaryPredicateOp::In,
-                column_expr!("x"),
+                col!("x"),
                 Expression::Literal(Scalar::Array(array_data)),
             );
             assert_roundtrip(&pred);
@@ -1673,33 +1646,33 @@ mod tests {
             let cases: Vec<Predicate> = vec![
                 // Simple AND
                 Predicate::and(
-                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
-                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
+                    Predicate::gt(col!("x"), lit(0)),
+                    Predicate::lt(col!("x"), lit(100)),
                 ),
                 // Simple OR
                 Predicate::or(
-                    Predicate::eq(column_expr!("status"), Expression::literal("active")),
-                    Predicate::eq(column_expr!("status"), Expression::literal("pending")),
+                    Predicate::eq(col!("status"), lit("active")),
+                    Predicate::eq(col!("status"), lit("pending")),
                 ),
                 // Multiple AND
                 Predicate::and_from([
-                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
-                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
-                    Predicate::is_not_null(column_expr!("x")),
+                    Predicate::gt(col!("x"), lit(0)),
+                    Predicate::lt(col!("x"), lit(100)),
+                    Predicate::is_not_null(col!("x")),
                 ]),
                 // Multiple OR
                 Predicate::or_from([
-                    Predicate::eq(column_expr!("type"), Expression::literal("A")),
-                    Predicate::eq(column_expr!("type"), Expression::literal("B")),
-                    Predicate::eq(column_expr!("type"), Expression::literal("C")),
+                    Predicate::eq(col!("type"), lit("A")),
+                    Predicate::eq(col!("type"), lit("B")),
+                    Predicate::eq(col!("type"), lit("C")),
                 ]),
                 // Nested: (a > 0 AND b < 100) OR (c = 'special')
                 Predicate::or(
                     Predicate::and(
-                        Predicate::gt(column_expr!("a"), Expression::literal(0)),
-                        Predicate::lt(column_expr!("b"), Expression::literal(100)),
+                        Predicate::gt(col!("a"), lit(0)),
+                        Predicate::lt(col!("b"), lit(100)),
                     ),
-                    Predicate::eq(column_expr!("c"), Expression::literal("special")),
+                    Predicate::eq(col!("c"), lit("special")),
                 ),
             ];
 
@@ -1713,30 +1686,18 @@ mod tests {
         #[test]
         fn test_deeply_nested_structures_roundtrip() {
             // COALESCE(a + b, c * d, 0) > 100
-            let add = Expression::binary(
-                BinaryExpressionOp::Plus,
-                column_expr!("a"),
-                column_expr!("b"),
-            );
-            let mul = Expression::binary(
-                BinaryExpressionOp::Multiply,
-                column_expr!("c"),
-                column_expr!("d"),
-            );
-            let coalesce = Expression::coalesce([add, mul, Expression::literal(0)]);
-            let pred = Predicate::gt(coalesce, Expression::literal(100));
+            let add = Expression::binary(BinaryExpressionOp::Plus, col!("a"), col!("b"));
+            let mul = Expression::binary(BinaryExpressionOp::Multiply, col!("c"), col!("d"));
+            let coalesce = Expression::coalesce([add, mul, lit(0)]);
+            let pred = Predicate::gt(coalesce, lit(100));
             assert_roundtrip(&pred);
 
             // Expression wrapping a predicate that references expressions
             let inner_pred = Predicate::and(
-                Predicate::eq(column_expr!("x"), Expression::literal(1)),
+                Predicate::eq(col!("x"), lit(1)),
                 Predicate::gt(
-                    Expression::binary(
-                        BinaryExpressionOp::Plus,
-                        column_expr!("y"),
-                        column_expr!("z"),
-                    ),
-                    Expression::literal(10),
+                    Expression::binary(BinaryExpressionOp::Plus, col!("y"), col!("z")),
+                    lit(10),
                 ),
             );
             let expr = Expression::from_pred(inner_pred);
@@ -1822,22 +1783,22 @@ mod tests {
 
     #[test]
     fn single_element_and_from_returns_unwrapped_predicate() {
-        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let inner = Pred::gt(col!("x"), lit(0));
         let result = Pred::and_from([inner.clone()]);
         assert_eq!(result, inner);
     }
 
     #[test]
     fn single_element_or_from_returns_unwrapped_predicate() {
-        let inner = Pred::gt(column_expr!("x"), Expr::literal(0));
+        let inner = Pred::gt(col!("x"), lit(0));
         let result = Pred::or_from([inner.clone()]);
         assert_eq!(result, inner);
     }
 
     #[test]
     fn multi_element_and_from_returns_junction() {
-        let p1 = Pred::gt(column_expr!("x"), Expr::literal(0));
-        let p2 = Pred::lt(column_expr!("x"), Expr::literal(100));
+        let p1 = Pred::gt(col!("x"), lit(0));
+        let p2 = Pred::lt(col!("x"), lit(100));
         let result = Pred::and_from([p1.clone(), p2.clone()]);
         assert!(matches!(result, Pred::Junction(ref j) if j.preds.len() == 2));
         assert_eq!(result, Pred::and(p1, p2));

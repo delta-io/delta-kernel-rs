@@ -11,7 +11,7 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred, PredicateRef};
+use delta_kernel::expressions::{col, lit, Predicate as Pred, PredicateRef};
 use delta_kernel::incremental_scan::{
     IncrementalListing, IncrementalListingAgainstBase, IncrementalScanStream,
     IncrementalScanSummary,
@@ -1280,7 +1280,7 @@ fn add_with_dv_and_id_stats(
 // vector agrees with `live_adds` (no summary/stream drift).
 #[rstest]
 #[case::pushdown(
-    Some(Arc::new(column_expr!("id").gt(Expr::literal(25i32))) as PredicateRef),
+    Some(Arc::new(col!("id").gt(lit(25i32))) as PredicateRef),
     vec!["high.parquet"],
 )]
 #[case::no_predicate(None, vec!["low.parquet", "mid.parquet", "high.parquet"])]
@@ -1356,7 +1356,7 @@ async fn added_file_without_stats_is_always_kept() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1408,7 +1408,7 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
         .at_version(2)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1435,8 +1435,8 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
 // stream, but Removes are still reported. A tautology (`id > 25 OR TRUE`) is useless for
 // skipping and behaves like no predicate.
 #[rstest]
-#[case::static_skip_all(Pred::and(column_expr!("id").gt(Expr::literal(25i32)), Pred::literal(false)), 0)]
-#[case::tautology(Pred::or(column_expr!("id").gt(Expr::literal(25i32)), Pred::literal(true)), 2)]
+#[case::static_skip_all(Pred::and(col!("id").gt(lit(25i32)), Pred::literal(false)), 0)]
+#[case::tautology(Pred::or(col!("id").gt(lit(25i32)), Pred::literal(true)), 2)]
 #[tokio::test]
 async fn static_skip_all_and_tautology(
     #[case] predicate: Pred,
@@ -1513,7 +1513,7 @@ async fn against_base_classification_composes_with_predicate(
     // Both files are in the consumer's base. Only the predicate-surviving one should classify
     // as a duplicate; the dropped file was pruned before base intersection.
     let base_keys = [key("matches.parquet"), key("dropped.parquet")];
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
     let stream = target
         .incremental_scan_builder(0)
         .with_predicate(predicate)
@@ -1570,7 +1570,7 @@ async fn pruned_newest_add_suppresses_older_matching_duplicate(
         .at_version(2)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1613,7 +1613,7 @@ async fn unknown_column_predicate_fails_at_build() -> Result<(), Box<dyn std::er
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(column_expr!("nonexistent").gt(Expr::literal(1i32)));
+    let predicate: PredicateRef = Arc::new(col!("nonexistent").gt(lit(1i32)));
     let result = target
         .incremental_scan_builder(0)
         .with_predicate(predicate)
@@ -1654,7 +1654,7 @@ async fn partition_column_predicate_prunes_added_files() -> Result<(), Box<dyn s
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(column_expr!("val").eq(Expr::literal("x")));
+    let predicate: PredicateRef = Arc::new(col!("val").eq(lit("x")));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1702,8 +1702,8 @@ async fn mixed_data_and_partition_predicate_prunes_on_both(
         .build(engine.as_ref())?;
 
     let predicate: PredicateRef = Arc::new(Pred::and(
-        column_expr!("id").gt(Expr::literal(25i32)),
-        column_expr!("val").eq(Expr::literal("x")),
+        col!("id").gt(lit(25i32)),
+        col!("val").eq(lit("x")),
     ));
     let listing = unwrap_listing(
         target
@@ -1750,7 +1750,7 @@ async fn pushdown_resolves_column_mapping_physical_names() -> Result<(), Box<dyn
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1793,7 +1793,7 @@ async fn pushdown_prunes_dv_bearing_adds_keyed_by_dv() -> Result<(), Box<dyn std
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(25i32)));
+    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(25i32)));
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)
@@ -1943,7 +1943,7 @@ async fn predicate_pushdown_reconciled_with_base_matches_full_scan_across_checkp
     }
     let target_version = snapshot.version();
 
-    let predicate: PredicateRef = Arc::new(column_expr!("id").gt(Expr::literal(20i32)));
+    let predicate: PredicateRef = Arc::new(col!("id").gt(lit(20i32)));
 
     // Base full scan (reads the checkpoint's `stats_parsed`) and target full scan, both loaded
     // fresh off disk so they replay through the checkpoint.

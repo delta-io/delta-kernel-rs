@@ -19,7 +19,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    column_expr, column_name, column_pred, Expression as Expr, Predicate as Pred,
+    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred,
 };
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -50,7 +50,7 @@ fn test_static_skipping() {
         (true, Pred::and(column_pred!("a"), Pred::literal(false))),
         (false, Pred::or(column_pred!("a"), Pred::literal(true))),
         (false, Pred::or(column_pred!("a"), Pred::literal(false))),
-        (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
+        (false, Pred::lt(col!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
         (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
@@ -225,14 +225,14 @@ fn test_physical_predicate() {
         StructField::nullable("Value", DataType::LONG),
     ]),
     Pred::and(
-        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
-        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+        Pred::gt(col!("createdat"), lit(500i64)),
+        Pred::lt(col!("value"), lit(100i64)),
     ),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
         Arc::new(Pred::and(
-            Pred::gt(column_expr!("createdAt"), Expr::literal(500i64)),
-            Pred::lt(column_expr!("Value"), Expr::literal(100i64)),
+            Pred::gt(col!("createdAt"), lit(500i64)),
+            Pred::lt(col!("Value"), lit(100i64)),
         )),
         StructType::new_unchecked(vec![
             StructField::nullable("createdAt", DataType::LONG),
@@ -253,14 +253,14 @@ fn test_physical_predicate() {
         )]),
     ]),
     Pred::and(
-        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
-        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+        Pred::gt(col!("createdat"), lit(500i64)),
+        Pred::lt(col!("value"), lit(100i64)),
     ),
     ColumnMappingMode::Name,
     PhysicalPredicate::Some(
         Arc::new(Pred::and(
-            Pred::gt(column_expr!("phys_created"), Expr::literal(500i64)),
-            Pred::lt(column_expr!("phys_value"), Expr::literal(100i64)),
+            Pred::gt(col!("phys_created"), lit(500i64)),
+            Pred::lt(col!("phys_value"), lit(100i64)),
         )),
         StructType::new_unchecked(vec![
             StructField::nullable("phys_created", DataType::LONG).with_metadata([(
@@ -280,14 +280,14 @@ fn test_physical_predicate() {
         StructField::nullable("Value", DataType::LONG),
     ]),
     Pred::and(
-        Pred::gt(column_expr!("value"), Expr::literal(5i64)),
-        Pred::lt(column_expr!("VALUE"), Expr::literal(10i64)),
+        Pred::gt(col!("value"), lit(5i64)),
+        Pred::lt(col!("VALUE"), lit(10i64)),
     ),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
         Arc::new(Pred::and(
-            Pred::gt(column_expr!("Value"), Expr::literal(5i64)),
-            Pred::lt(column_expr!("Value"), Expr::literal(10i64)),
+            Pred::gt(col!("Value"), lit(5i64)),
+            Pred::lt(col!("Value"), lit(10i64)),
         )),
         StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)])
             .into(),
@@ -357,7 +357,7 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         .unwrap();
 
     let projection = snapshot.schema().project(&["a_float"]).unwrap();
-    let predicate = Arc::new(column_expr!("number").gt(Expr::literal(5_i64)));
+    let predicate = Arc::new(col!("number").gt(lit(5_i64)));
 
     let scan = snapshot
         .scan_builder()
@@ -395,7 +395,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
             .add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)
             .unwrap(),
     );
-    let predicate = Arc::new(column_expr!("my_row_index").gt(Expr::literal(5_i64)));
+    let predicate = Arc::new(col!("my_row_index").gt(lit(5_i64)));
 
     let err = snapshot
         .scan_builder()
@@ -808,8 +808,8 @@ fn test_data_row_group_skipping() {
     assert_eq!(data.len(), 1);
 
     // Ineffective predicate pushdown attempted, so the one data file should be returned.
-    let int_col = column_expr!("numeric.ints.int32");
-    let value = Expr::literal(1000i32);
+    let int_col = col!("numeric.ints.int32");
+    let value = lit(1000i32);
     let predicate = Arc::new(int_col.clone().gt(value.clone()));
     let scan = snapshot
         .clone()
@@ -848,7 +848,7 @@ fn test_missing_column_row_group_skipping() {
     //
     // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
     // optimization is currently disabled, so the one data file is still returned.
-    let predicate = Arc::new(column_expr!("missing").lt(Expr::literal(1000i64)));
+    let predicate = Arc::new(col!("missing").lt(lit(1000i64)));
     let scan = snapshot
         .clone()
         .scan_builder()
@@ -859,7 +859,7 @@ fn test_missing_column_row_group_skipping() {
     assert_eq!(data.len(), 1);
 
     // Predicate over a logically missing column fails the scan
-    let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(Expr::literal(1000)));
+    let predicate = Arc::new(col!("numeric.ints.invalid").lt(lit(1000)));
     snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1034,7 +1034,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
     // Build scan with both a predicate and stats_columns
-    let predicate = Arc::new(column_expr!("id").gt(Expr::literal(0i64)));
+    let predicate = Arc::new(col!("id").gt(lit(0i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1104,7 +1104,7 @@ fn test_build_actions_meta_predicate_with_predicate() {
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
     // Build a scan with a predicate eligible for data skipping
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1173,16 +1173,16 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 // Partition-only scans have no stats schema, so the partition schema must enable the rewrite.
 #[rstest]
 #[case::equality(Pred::eq(
-    column_expr!("modified"),
-    Expr::literal("2021-02-01"),
+    col!("modified"),
+    lit("2021-02-01"),
 ), None)]
 #[case::date_cast_range(Pred::and(
     Pred::ge(
-        Expr::cast(column_expr!("modified"), DataType::DATE),
+        Expr::cast(col!("modified"), DataType::DATE),
         Scalar::Date(20_641),
     ),
     Pred::lt(
-        Expr::cast(column_expr!("modified"), DataType::DATE),
+        Expr::cast(col!("modified"), DataType::DATE),
         Scalar::Date(20_644),
     ),
 ), Some("CAST(Column(add.partitionValues_parsed.modified) AS date)"))]
@@ -1240,11 +1240,11 @@ fn test_build_actions_meta_predicate_partition_column_mapping(
 
     let predicate = if casted {
         Pred::eq(
-            Expr::cast(column_expr!("category"), DataType::DATE),
+            Expr::cast(col!("category"), DataType::DATE),
             Scalar::Date(20_641),
         )
     } else {
-        Pred::eq(column_expr!("category"), Expr::literal("a"))
+        Pred::eq(col!("category"), lit("a"))
     };
     let scan = snapshot
         .scan_builder()
@@ -1526,17 +1526,17 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 /// | id IS NOT NULL | no predicate (col vs col, #1873)                                                       | 6     |
 #[rstest]
 #[case::comparison(
-    Pred::gt(column_expr!("id"), Expr::literal(200i64)),
+    Pred::gt(col!("id"), lit(200i64)),
     Some(3),
     "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
 )]
 #[case::is_null(
-    Pred::is_null(column_expr!("id")),
+    Pred::is_null(col!("id")),
     Some(5),
     "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
 )]
 #[case::is_not_null(
-    Pred::not(Pred::is_null(column_expr!("id"))),
+    Pred::not(Pred::is_null(col!("id"))),
     None,
     "IS NOT NULL produces no skipping predicate (column vs column, #1873)"
 )]
@@ -1649,18 +1649,18 @@ fn standard_multi_rg() -> Bytes {
 }
 
 #[rstest]
-#[case::stats_gt(Pred::gt(column_expr!("x"), Expr::literal(150i64)), vec![3, 4])]
-#[case::stats_le(Pred::le(column_expr!("x"), Expr::literal(110i64)), vec![1, 2])]
+#[case::stats_gt(Pred::gt(col!("x"), lit(150i64)), vec![3, 4])]
+#[case::stats_le(Pred::le(col!("x"), lit(110i64)), vec![1, 2])]
 #[case::stats_all_kept(
-    Pred::ge(column_expr!("x"), Expr::literal(0i64)),
+    Pred::ge(col!("x"), lit(0i64)),
     vec![1, 2, 3, 4]
 )]
-#[case::partition_eq(Pred::eq(column_expr!("part"), Expr::literal("a")), vec![1, 3])]
-#[case::partition_lt(Pred::lt(column_expr!("part"), Expr::literal("b")), vec![1, 3])]
-#[case::partition_all_pruned(Pred::eq(column_expr!("part"), Expr::literal("z")), vec![])]
+#[case::partition_eq(Pred::eq(col!("part"), lit("a")), vec![1, 3])]
+#[case::partition_lt(Pred::lt(col!("part"), lit("b")), vec![1, 3])]
+#[case::partition_all_pruned(Pred::eq(col!("part"), lit("z")), vec![])]
 #[case::partition_cast_kept(
     Pred::eq(
-        Expr::cast(column_expr!("part"), DataType::DATE),
+        Expr::cast(col!("part"), DataType::DATE),
         Scalar::Date(18_628),
     ),
     vec![1, 2, 3, 4]
@@ -1668,30 +1668,30 @@ fn standard_multi_rg() -> Bytes {
 #[case::partition_cast_and_stats(
     Pred::and(
         Pred::eq(
-            Expr::cast(column_expr!("part"), DataType::DATE),
+            Expr::cast(col!("part"), DataType::DATE),
             Scalar::Date(18_628),
         ),
-        Pred::gt(column_expr!("x"), Expr::literal(150i64)),
+        Pred::gt(col!("x"), lit(150i64)),
     ),
     vec![3, 4]
 )]
 #[case::and_stats_and_partition(
     Pred::and(
-        Pred::eq(column_expr!("part"), Expr::literal("a")),
-        Pred::gt(column_expr!("x"), Expr::literal(150i64)),
+        Pred::eq(col!("part"), lit("a")),
+        Pred::gt(col!("x"), lit(150i64)),
     ),
     vec![3]
 )]
 #[case::or_stats_or_partition(
     Pred::or(
-        Pred::eq(column_expr!("part"), Expr::literal("c")),
-        Pred::gt(column_expr!("x"), Expr::literal(150i64)),
+        Pred::eq(col!("part"), lit("c")),
+        Pred::gt(col!("x"), lit(150i64)),
     ),
     vec![3, 4]
 )]
-#[case::partition_is_null(Pred::is_null(column_expr!("part")), vec![])]
+#[case::partition_is_null(Pred::is_null(col!("part")), vec![])]
 #[case::partition_is_not_null(
-    Pred::is_not_null(column_expr!("part")),
+    Pred::is_not_null(col!("part")),
     vec![1, 2, 3, 4]
 )]
 fn test_checkpoint_reader_skips_expected_row_groups(
@@ -1708,33 +1708,33 @@ fn test_checkpoint_reader_skips_expected_row_groups(
 #[rstest]
 #[case::is_null_keeps_only_null_group(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None)], &[rg(3, 200, 210, Some("c"))]],
-    Pred::is_null(column_expr!("part")),
+    Pred::is_null(col!("part")),
     vec![2],
 )]
 // Footer min/max ignore the null-valued Add, so the non-matching range prunes the group.
 #[case::mixed_group_with_null_partition_pruned(
     &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, None)] as &[RgSpec]],
-    Pred::eq(column_expr!("part"), Expr::literal("z")),
+    Pred::eq(col!("part"), lit("z")),
     vec![],
 )]
 #[case::partition_range_contains_target(
     &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, Some("c"))] as &[RgSpec]],
-    Pred::eq(column_expr!("part"), Expr::literal("b")),
+    Pred::eq(col!("part"), lit("b")),
     vec![1, 2],
 )]
 #[case::all_null_group_pruned_under_eq(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
-    Pred::eq(column_expr!("part"), Expr::literal("z")),
+    Pred::eq(col!("part"), lit("z")),
     vec![],
 )]
 #[case::all_null_group_pruned_under_gt(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
-    Pred::gt(column_expr!("part"), Expr::literal("m")),
+    Pred::gt(col!("part"), lit("m")),
     vec![],
 )]
 #[case::all_null_group_pruned_under_is_not_null(
     &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
-    Pred::is_not_null(column_expr!("part")),
+    Pred::is_not_null(col!("part")),
     vec![1],
 )]
 fn test_checkpoint_reader_handles_partition_groups(
@@ -1748,8 +1748,8 @@ fn test_checkpoint_reader_handles_partition_groups(
 
 /// A checkpoint may omit `partitionValues_parsed`; the absent leaf remains non-pruning.
 #[rstest]
-#[case::comparison(Pred::eq(column_expr!("part"), Expr::literal("z")))]
-#[case::is_not_null(Pred::is_not_null(column_expr!("part")))]
+#[case::comparison(Pred::eq(col!("part"), lit("z")))]
+#[case::is_not_null(Pred::is_not_null(col!("part")))]
 fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
     let parquet_bytes = write_checkpoint(&[&[rg(1, 0, 10, Some("a"))] as &[RgSpec]], false);
     assert_eq!(surviving_ids(parquet_bytes, &pred), vec![1]);
@@ -1838,8 +1838,8 @@ fn test_checkpoint_stats_projection_matches_requested_output(
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
     recorder.take_reads();
 
-    let predicate: Option<PredicateRef> = skip_stats
-        .then(|| Arc::new(Pred::gt(column_expr!("id"), Expr::literal(0i64))) as PredicateRef);
+    let predicate: Option<PredicateRef> =
+        skip_stats.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1936,13 +1936,13 @@ fn test_all_struct_parses_json_commit_stats() {
 #[rstest]
 #[case::v1_partition(
     "v1-multi-part-partitioned-struct-stats-only",
-    Pred::eq(column_expr!("part"), Expr::literal(1i32)),
+    Pred::eq(col!("part"), lit(1i32)),
     column_name!("add.partitionValues_parsed.part"),
     ".checkpoint.",
 )]
 #[case::v2_sidecar(
     "v2-parquet-sidecars-struct-stats-only",
-    Pred::gt(column_expr!("id"), Expr::literal(2i64)),
+    Pred::gt(col!("id"), lit(2i64)),
     column_name!("add.stats_parsed.maxValues.id"),
     "_sidecars/",
 )]
@@ -1991,7 +1991,7 @@ fn test_skip_stats_disables_data_skipping() {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -2345,7 +2345,7 @@ mod scan_metadata_completed_tests {
 
     use super::ScanBuilder;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+    use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
     use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
@@ -2411,7 +2411,7 @@ mod scan_metadata_completed_tests {
     )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
-        Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
+        Some(Arc::new(Expr::eq(col!("letter"), lit("a")))),
         2, 2, 1502, 0, 4
     )]
     fn test_scan_metrics(
