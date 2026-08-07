@@ -853,13 +853,9 @@ mod tests {
     async fn read_json_file(
         store: &Arc<InMemory>,
         path: &Path,
-    ) -> DeltaResult<(Vec<serde_json::Value>, u64)> {
+    ) -> DeltaResult<Vec<serde_json::Value>> {
         let content = store.get(path).await?;
         let file_bytes = content.bytes().await?;
-        let file_size = file_bytes
-            .len()
-            .try_into()
-            .map_err(|_| Error::generic("JSON file size exceeds u64::MAX"))?;
         let file_string =
             String::from_utf8(file_bytes.to_vec()).map_err(|e| object_store::Error::Generic {
                 store: "memory",
@@ -869,7 +865,7 @@ mod tests {
             .into_iter::<serde_json::Value>()
             .flatten()
             .collect();
-        Ok((json, file_size))
+        Ok(json)
     }
 
     #[tokio::test]
@@ -901,8 +897,12 @@ mod tests {
             write_result.size,
             Some(store.head(&object_path).await?.size)
         );
-        let (json, stored_body_size) = read_json_file(&store, &object_path).await?;
-        assert_eq!(write_result.size, Some(stored_body_size));
+        let stored_bytes = store.get(&object_path).await?.bytes().await?;
+        assert_eq!(
+            write_result.size,
+            Some(u64::try_from(stored_bytes.len()).unwrap())
+        );
+        let json = read_json_file(&store, &object_path).await?;
         assert_eq!(
             json,
             vec![json!({"dog": "rémi"}), json!({"dog": "ウィルソン"})]
@@ -921,8 +921,12 @@ mod tests {
                 write_result.size,
                 Some(store.head(&object_path).await?.size)
             );
-            let (json, stored_body_size) = read_json_file(&store, &object_path).await?;
-            assert_eq!(write_result.size, Some(stored_body_size));
+            let stored_bytes = store.get(&object_path).await?.bytes().await?;
+            assert_eq!(
+                write_result.size,
+                Some(u64::try_from(stored_bytes.len()).unwrap())
+            );
+            let json = read_json_file(&store, &object_path).await?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
             // Verify the second write fails with FileAlreadyExists error
