@@ -565,26 +565,35 @@ fn test_checkpoint_skipping_partition_range_ops(
 #[case::float(Scalar::Float(1.0))]
 #[case::double(Scalar::Double(1.0))]
 #[case::integer_literal(Scalar::from(1))]
-fn test_checkpoint_skipping_floating_partition_comparison_is_disabled(#[case] value: Scalar) {
+fn test_checkpoint_skipping_floating_partition_comparisons_keep_all(#[case] value: Scalar) {
     let partition_columns = HashSet::from([column_name!("part_col")]);
-    let pred = Pred::ne(column_expr!("part_col"), value.clone());
-    let skipping_pred = as_checkpoint_skipping_predicate(
-        &pred,
-        &partition_columns,
-        &partition_columns,
-        &HashSet::new(),
-    )
-    .unwrap();
-    let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
-        column_name!("partitionValues_parsed.part_col"),
-        value,
-    )]));
+    let col = column_expr!("part_col");
+    let predicates = [
+        Pred::eq(col.clone(), value.clone()),
+        Pred::ne(col.clone(), value.clone()),
+        Pred::distinct(col.clone(), value.clone()),
+        Pred::not(Pred::distinct(col, value.clone())),
+    ];
 
-    expect_eq!(
-        resolver.eval(&skipping_pred),
-        NULL,
-        "parquet footer min/max exclude NaN partition values"
-    );
+    for pred in predicates {
+        let skipping_pred = as_checkpoint_skipping_predicate(
+            &pred,
+            &partition_columns,
+            &partition_columns,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let resolver = DefaultKernelPredicateEvaluator::from(HashMap::from_iter([(
+            column_name!("partitionValues_parsed.part_col"),
+            value.clone(),
+        )]));
+
+        expect_eq!(
+            resolver.eval(&skipping_pred),
+            TRUE,
+            "parquet footer min/max exclude NaN partition values for {pred}"
+        );
+    }
 }
 
 #[test]
@@ -1650,12 +1659,10 @@ fn multiple_partition_columns_rewrite_and_evaluation() {
     );
 }
 
-// Without normalization, `AND([unknown])` would become `AND([NULL])` via
-// `collect_junction_preds`, which evaluates to `Some(false)` under `eval_sql_where` and
-// incorrectly prunes all row groups. The junction constructor normalizes `AND([unknown])`
-// to just `unknown`, which correctly returns `None` (no pushdown).
+// The junction constructor normalizes `AND([unknown])` to `unknown` before rewriting. With no
+// parent junction to insert a conservative TRUE fallback, the unsupported leaf remains `None`.
 #[test]
-fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
+fn normalized_single_unsupported_pred_disables_checkpoint_pushdown() {
     let pred = Pred::and_from([Pred::unknown("unsupported")]);
     let stats = all_referenced_columns(&pred);
     let skipping_pred =
@@ -1663,6 +1670,18 @@ fn single_unsupported_pred_in_junction_disables_checkpoint_pushdown() {
     assert!(
         skipping_pred.is_none(),
         "Single unsupported predicate in a junction should disable pushdown, got: {skipping_pred:?}"
+    );
+}
+
+#[test]
+fn negated_unsupported_pred_disables_checkpoint_pushdown() {
+    let pred = Pred::not(Pred::unknown("unsupported"));
+    let stats = all_referenced_columns(&pred);
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats);
+    assert!(
+        skipping_pred.is_none(),
+        "Negated unsupported predicate should disable pushdown, got: {skipping_pred:?}"
     );
 }
 
@@ -2050,11 +2069,8 @@ fn mixed_and_non_stat_arm_still_prunes_via_stat_arm() {
     );
 }
 
-/// Same scenario as `stat_and_non_stat_folds_non_stat` but through the checkpoint
-/// creator, which adds an `IS NULL` guard on each stat ref for safe parquet
-/// row-group filtering. The non-stat arm still folds to NULL.
 #[test]
-fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
+fn checkpoint_pushdown_non_stat_arm_folds_to_true_literal() {
     let pred = Pred::and(
         Pred::gt(column_expr!("stat"), Scalar::from(100)),
         Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
@@ -2065,6 +2081,99 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
     assert_eq!(
         result.to_string(),
         "AND(OR(Column(stats_parsed.maxValues.stat) IS NULL, \
-         Column(stats_parsed.maxValues.stat) > 100), null)"
+         Column(stats_parsed.maxValues.stat) > 100), true)"
+    );
+}
+
+#[rstest]
+#[case::and_supported_true(
+    Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(150i32),
+    TRUE,
+)]
+#[case::or_supported_false(
+    Pred::or(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(50i32),
+    TRUE,
+)]
+#[case::not_and_supported_false(
+    Pred::not(Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    )),
+    column_name!("stats_parsed.minValues.stat"),
+    Scalar::from(150i32),
+    TRUE,
+)]
+#[case::not_or_supported_false(
+    Pred::not(Pred::or(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::gt(column_expr!("non_stat"), Scalar::from(50)),
+    )),
+    column_name!("stats_parsed.minValues.stat"),
+    Scalar::from(150i32),
+    FALSE,
+)]
+#[case::and_logical_null(
+    Pred::and(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::null_literal(),
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(50i32),
+    FALSE,
+)]
+#[case::or_logical_null(
+    Pred::or(
+        Pred::gt(column_expr!("stat"), Scalar::from(100)),
+        Pred::null_literal(),
+    ),
+    column_name!("stats_parsed.maxValues.stat"),
+    Scalar::from(50i32),
+    TRUE,
+)]
+fn checkpoint_pushdown_true_fallback_semantics(
+    #[case] pred: Pred,
+    #[case] stat_column: ColumnName,
+    #[case] stat_value: Scalar,
+    #[case] expected: Option<bool>,
+) {
+    let stats = stats_cols(&["stat"]);
+    let result =
+        as_checkpoint_skipping_predicate(&pred, &HashSet::new(), &HashSet::new(), &stats).unwrap();
+    let resolver = HashMap::from_iter([(stat_column, stat_value)]);
+    let filter = DefaultKernelPredicateEvaluator::from(resolver);
+    expect_eq!(
+        filter.eval(&result),
+        expected,
+        "TRUE fallback semantics for {pred}"
+    );
+}
+
+#[rstest]
+fn checkpoint_true_fold_preserves_row_group_skip_decision(
+    #[values(JunctionPredicateOp::And, JunctionPredicateOp::Or)] op: JunctionPredicateOp,
+    #[values(TRUE, FALSE, NULL)] supported: Option<bool>,
+) {
+    let supported = supported.map_or_else(Pred::null_literal, Pred::literal);
+    let null_fold = Pred::junction(op, [supported.clone(), Pred::null_literal()]);
+    let true_fold = Pred::junction(op, [supported, Pred::literal(true)]);
+    let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
+
+    let null_fold_result = filter.eval_sql_where(&null_fold);
+    let true_fold_result = filter.eval_sql_where(&true_fold);
+    assert_eq!(
+        null_fold_result == FALSE,
+        true_fold_result == FALSE,
+        "{op:?} changed its row-group skip decision: NULL fold {null_fold_result:?}, \
+         TRUE fold {true_fold_result:?}"
     );
 }

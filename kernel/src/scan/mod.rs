@@ -1140,10 +1140,10 @@ impl Scan {
     /// guards.
     ///
     /// Returns `None` if the scan has no predicate, if neither a data-column stats schema nor a
-    /// partition schema is available, or if the predicate is a bare unsupported expression (e.g.
-    /// column-column comparison). Junctions represent unsupported arms with a NULL literal,
-    /// preserving three-valued logic while allowing independently decisive supported arms to
-    /// prune.
+    /// partition schema is available, or if the predicate is a structurally unsupported leaf (e.g.
+    /// a column-column comparison). Within a junction, children that produce no usable checkpoint
+    /// condition become TRUE, preserving supported pruning through AND without allowing an
+    /// unavailable child to exclude an Add.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;

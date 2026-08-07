@@ -431,13 +431,13 @@ impl DataSkippingFilter {
 /// IS NULL guarded `stats_parsed.{minValues,maxValues,nullCount}.<col>` comparisons; eligible
 /// partition references become exact, unguarded `partitionValues_parsed.<col>` values. Checkpoint
 /// Removes are irrelevant to scan replay, so partition predicates may prune their null add-side
-/// values. A bare unsupported predicate returns `None`; unsupported junction arms become NULL
-/// literals to preserve three-valued logic.
+/// values. A structurally unsupported leaf returns `None`. When a junction child produces no
+/// usable checkpoint condition, the creator substitutes TRUE so the child cannot exclude an Add.
 ///
 /// `physical_partition_columns` may be narrowed to the predicate's references; pass an empty set
 /// for unpartitioned tables. `physical_floating_partition_columns` identifies FLOAT and DOUBLE
 /// partitions whose parquet min/max may omit NaNs. `physical_stats_columns` is the table-level
-/// stats membership set; references outside it fold to NULL (keeping the file).
+/// stats membership set; references outside it cannot produce data-stat conditions.
 pub(crate) fn as_checkpoint_skipping_predicate(
     pred: &Pred,
     physical_partition_columns: &HashSet<ColumnName>,
@@ -921,19 +921,23 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
         None
     }
 
-    /// Combines sub-predicates with AND/OR. `col_a > 100 AND col_b < 50` becomes
-    /// ```text
-    /// AND(
-    ///   OR(stats_parsed.maxValues.col_a IS NULL, stats_parsed.maxValues.col_a > 100),
-    ///   OR(stats_parsed.minValues.col_b IS NULL, stats_parsed.minValues.col_b < 50)
-    /// )
-    /// ```
+    /// Replaces each child that produced no usable checkpoint condition with TRUE, the conservative
+    /// may-match value required by the Parquet pushdown contract. This preserves supported pruning
+    /// under AND and disables pruning under OR, where the missing child may match. Kernel's
+    /// `eval_pred_sql_where` keeps NULL as unknown, but consumers that apply ordinary SQL filtering
+    /// discard NULL, so a NULL literal is not a portable fallback.
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionPredicateOp,
+        mut op: JunctionPredicateOp,
         preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
-        Some(collect_junction_preds(op, preds, inverted))
+        if inverted {
+            op = op.invert();
+        }
+        Some(Pred::junction(
+            op,
+            preds.map(|pred| pred.unwrap_or_else(|| Pred::literal(true))),
+        ))
     }
 }
