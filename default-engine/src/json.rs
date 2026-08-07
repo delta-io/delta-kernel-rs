@@ -893,14 +893,11 @@ mod tests {
 
         // Verify the first write is successful and reports the stored size.
         let write_result = result?;
-        assert_eq!(
-            write_result.size,
-            Some(store.head(&object_path).await?.size)
-        );
+        assert_eq!(write_result.size, store.head(&object_path).await?.size);
         let stored_bytes = store.get(&object_path).await?.bytes().await?;
         assert_eq!(
             write_result.size,
-            Some(u64::try_from(stored_bytes.len()).unwrap())
+            u64::try_from(stored_bytes.len()).unwrap()
         );
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
@@ -914,14 +911,11 @@ mod tests {
         if overwrite {
             // Verify the second write is successful and reports the replaced size.
             let write_result = result?;
-            assert_eq!(
-                write_result.size,
-                Some(store.head(&object_path).await?.size)
-            );
+            assert_eq!(write_result.size, store.head(&object_path).await?.size);
             let stored_bytes = store.get(&object_path).await?.bytes().await?;
             assert_eq!(
                 write_result.size,
-                Some(u64::try_from(stored_bytes.len()).unwrap())
+                u64::try_from(stored_bytes.len()).unwrap()
             );
             let json = read_json_file(&store, &object_path).await?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
@@ -950,7 +944,7 @@ mod tests {
         let stored_meta = store.head(&object_path).await?;
         let stored_bytes = store.get(&object_path).await?.bytes().await?;
 
-        assert_eq!(write_result.size, Some(0));
+        assert_eq!(write_result.size, 0);
         assert_eq!(stored_meta.size, 0);
         assert!(stored_bytes.is_empty());
         Ok(())

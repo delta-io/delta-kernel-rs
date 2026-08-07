@@ -7,7 +7,7 @@ use delta_kernel::committer::{
 use delta_kernel::{
     DeltaResult, DeltaResultIterator, Engine, Error as DeltaError, FileMeta, FilteredEngineData,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use unity_catalog_delta_client_api::{
     Commit, DeltaTableRequirement, DeltaTableUpdate, TableIdentifier, UpdateTableClient,
     UpdateTableRequest,
@@ -152,14 +152,10 @@ impl<C: UpdateTableClient> UCCommitter<C> {
         ) {
             Ok(write_result) => {
                 info!("wrote version 0 commit file for UC table creation");
-                let size = write_result.size.unwrap_or_else(|| {
-                    warn!("JSON handler did not report the committed file size; using zero");
-                    0
-                });
                 let file_meta = FileMeta::new(
                     published_commit_path,
                     commit_metadata.in_commit_timestamp(),
-                    size,
+                    write_result.size,
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }

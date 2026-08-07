@@ -297,12 +297,11 @@ impl FileMeta {
 }
 
 /// Metadata produced by a successful JSON file write.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct JsonWriteResult {
-    /// The number of bytes written to the JSON file, when known without a separate storage
-    /// metadata request.
-    pub size: Option<FileSize>,
+    /// The exact number of bytes written to the JSON file.
+    pub size: FileSize,
 }
 
 impl JsonWriteResult {
@@ -316,16 +315,7 @@ impl JsonWriteResult {
     ///
     /// A write result containing `size`.
     pub fn new(size: FileSize) -> Self {
-        Self { size: Some(size) }
-    }
-
-    /// Create a JSON write result without a known serialized file size.
-    ///
-    /// # Returns
-    ///
-    /// A write result with no file size.
-    pub fn without_size() -> Self {
-        Self { size: None }
+        Self { size }
     }
 }
 
@@ -787,8 +777,7 @@ pub trait JsonHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// Metadata about the completed write. Implementations should return the exact serialized file
-    /// size when it is available without a separate storage metadata request.
+    /// Metadata about the completed write, including the exact serialized file size.
     ///
     /// # Errors
     ///

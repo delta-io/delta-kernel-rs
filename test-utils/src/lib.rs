@@ -1068,7 +1068,7 @@ impl Committer for TestCatalogCommitter {
             file_meta: FileMeta::new(
                 path,
                 commit_metadata.in_commit_timestamp(),
-                write_result.size.unwrap_or_default(),
+                write_result.size,
             ),
         })
     }
