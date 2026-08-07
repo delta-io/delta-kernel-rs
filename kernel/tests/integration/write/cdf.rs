@@ -224,18 +224,41 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 }
 
 #[rstest]
-#[case::data_change(true, Some("Cannot add and remove data in the same transaction"))]
-#[case::no_data_change(false, None)]
+#[case::cdf_disabled_no_data_change(
+    false, /* cdf_enabled */
+    false, /* data_change */
+    None
+)]
+#[case::cdf_disabled_data_change(
+    false, /* cdf_enabled */
+    true,  /* data_change */
+    None
+)]
+#[case::cdf_enabled_no_data_change(
+    true,  /* cdf_enabled */
+    false, /* data_change */
+    None
+)]
+#[case::cdf_enabled_data_change(
+    true, /* cdf_enabled */
+    true, /* data_change */
+    Some("Cannot add and remove data in the same transaction")
+)]
 #[tokio::test]
-async fn test_cdf_add_and_dv_update_requires_no_data_change(
+async fn test_add_and_dv_update_respects_cdf_and_data_change(
+    #[case] cdf_enabled: bool,
     #[case] data_change: bool,
     #[case] expected_error: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = get_simple_int_schema();
     let (store, engine, table_location) = engine_store_setup(
-        &format!("test_cdf_add_and_dv_update_{data_change}"),
+        &format!("test_add_and_dv_update_{cdf_enabled}_{data_change}"),
         None, /* local_directory */
     );
+    let mut writer_features = vec!["deletionVectors"];
+    if cdf_enabled {
+        writer_features.push("changeDataFeed");
+    }
     let table_url = create_table(
         store,
         table_location,
@@ -243,7 +266,7 @@ async fn test_cdf_add_and_dv_update_requires_no_data_change(
         &[],  /* partition_columns */
         true, /* use_37_protocol */
         vec!["deletionVectors"],
-        vec!["changeDataFeed", "deletionVectors"],
+        writer_features,
     )
     .await?;
 

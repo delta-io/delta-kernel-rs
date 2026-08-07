@@ -389,10 +389,9 @@ impl<S> Transaction<S> {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
 
-        // CDF check only applies to existing tables (not create table)
-        // When a data changing transaction adds files and also stages removes or DV updates, Kernel cannot tell
-        // whether it represents an UPDATE that requires CDC files(which kernel doesn't support yet).
-        // We block that as a conservative choice.
+        // If a data-changing transaction has add files together with remove files or DV updates,
+        // block it when CDF is enabled. Kernel cannot discern DML operations. DML operations that
+        // update rows require a `cdc` file, but Kernel does not support writing CDC files.
         if !self.is_create_table()
             && !self.add_files_metadata.is_empty()
             && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
