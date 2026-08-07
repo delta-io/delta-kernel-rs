@@ -14,6 +14,8 @@ use datafusion::execution::context::SessionContext;
 use delta_kernel::StorageHandler;
 
 mod expression;
+mod operator;
+mod plan;
 mod predicate;
 mod scalar;
 
