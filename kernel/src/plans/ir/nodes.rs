@@ -3,14 +3,15 @@
 //! [`Operator`] enumerates every operator. Each operator's payload struct is defined
 //! below.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use strum::Display;
 use url::Url;
 
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
 use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::transforms::SchemaTransform as _;
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error, FileMeta};
@@ -22,10 +23,11 @@ use crate::{DeltaResult, Error, FileMeta};
 /// Plan node operators, grouped below by input arity. Each variant wraps a payload struct
 /// documenting that operator's semantics, invariants, and output shape.
 ///
-/// An operator that reshapes its rows (a source, projection, aggregation, or file load) carries a
+/// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
 /// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
 /// they inherit an input's schema; each payload's docs name which input.
 #[derive(Debug, Clone, Display)]
+#[strum(serialize_all = "snake_case")]
 pub enum Operator {
     // === Source operators (0 inputs) =========================================
     ScanParquet(ScanParquet),
@@ -35,7 +37,7 @@ pub enum Operator {
     // === Unary operators (1 input) ===========================================
     Project(Project),
     Filter(Filter),
-    Load(Load),
+    DynamicScan(DynamicScan),
     Aggregate(Aggregate),
 
     // === Binary operators (2 inputs) =========================================
@@ -63,7 +65,7 @@ impl_from_payload_for_operator!(
     Values,
     Project,
     Filter,
-    Load,
+    DynamicScan,
     Aggregate,
     SemiJoin,
     UnionAll,
@@ -169,7 +171,8 @@ impl From<FileMeta> for ScanFile {
 /// literals in the same order as `file_constant_columns`.
 ///
 /// File-constant columns are distinct from [metadata columns], which are engine-generated
-/// (such as row index). [`Load::file_constant_columns`] is the same concept for the [`Load`] node.
+/// (such as row index). [`DynamicScan::file_constant_columns`] is the same concept for the
+/// [`DynamicScan`] node.
 ///
 /// # Invariants
 ///
@@ -327,47 +330,22 @@ pub struct Filter {
     pub predicate: PredicateRef,
 }
 
-/// File formats supported by [`Load`].
+/// File formats supported by [`DynamicScan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Parquet,
     Json,
 }
 
-/// Names the columns a [`Load`] reads from each upstream row to locate and size each file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadColumnFileMeta {
-    /// Non-nullable column holding the per-row file path / URL fragment.
-    pub path_column: ColumnName,
-    /// Nullable column with the file's total size in bytes. Engines use non-NULL size and
-    /// row-count values as split-sizing / pruning hints.
-    pub file_size_column: ColumnName,
-    /// Nullable column with the file's row-count.
-    pub num_records_column: ColumnName,
-}
-
-impl LoadColumnFileMeta {
-    /// The columns naming each file's path, size, and row-count.
-    pub fn new(
-        path_column: ColumnName,
-        file_size_column: ColumnName,
-        num_records_column: ColumnName,
-    ) -> Self {
-        Self {
-            path_column,
-            file_size_column,
-            num_records_column,
-        }
-    }
-}
-
 /// Reads data files from an upstream stream of file-metadata tuples, one input row per file.
-/// For each row, `file_meta` locates and sizes the file, the engine resolves its path against
-/// `base_url` (see below), opens it as `file_type`, and reads columns matching `schema`.
+/// For each row, the path, size, and last-modified columns describe the file; the engine resolves
+/// its path against `base_url` (see below), opens it as `file_type`, and reads columns matching
+/// `schema`.
 ///
 /// `file_constant_columns` lists upstream columns whose per-file values are broadcast onto
 /// every emitted file row. This is file-constant metadata, the same concept as
-/// [`ScanParquet::file_constant_columns`]. See the example below.
+/// [`ScanParquet::file_constant_columns`]. Each named input field must have the same type and
+/// nullability as its output field. See the example below.
 ///
 /// `dv_column` names a nullable column on the upstream row holding a Delta
 /// [`DeletionVectorDescriptor`] struct. The engine resolves it into a roaring bitmap
@@ -376,13 +354,9 @@ impl LoadColumnFileMeta {
 ///
 /// [`DeletionVectorDescriptor`]: crate::actions::deletion_vector::DeletionVectorDescriptor
 ///
-/// Each upstream path is resolved against `base_url`:
-///
-/// - **`Some(base)`**: each path column value is treated as a path relative to `base` and resolved
-///   via [`Url::join`]. Paths that are themselves absolute URLs (any scheme prefix) bypass the join
-///   and are used as-is.
-/// - **`None`**: every path column value must already be an absolute URL; the engine errors on
-///   relative paths.
+/// Each path value is resolved against `base_url` via [`Url::join`]. URL-reference resolution need
+/// not stay under `base_url`: a different-scheme absolute URL replaces the base, while a value
+/// starting with `/` or `//` replaces its path or authority.
 ///
 /// Output row order is unspecified: the engine is free to read files in any order, in
 /// parallel, and to interleave rows from different files. The relative order of upstream
@@ -390,26 +364,24 @@ impl LoadColumnFileMeta {
 ///
 /// # Example
 ///
-/// Given an upstream metadata stream and a `Load` configuration:
+/// Given an upstream metadata stream and a `DynamicScan` configuration:
 ///
 /// ```text
 /// upstream (metadata)
-///     path             | size | num_records | version | dv
-///     -----------------+------+-------------+---------+------
-///     part-0.parquet   | 1024 |        NULL |       7 | NULL
-///     part-1.parquet   | 2048 |        NULL |       8 | NULL
+///     path             | size | filemod | version | dv
+///     -----------------+------+---------+---------+------
+///     part-0.parquet   | 1024 |  100000 |       7 | NULL
+///     part-1.parquet   | 2048 |  200000 |       8 | NULL
 /// ```
 /// ```text
-/// Load {
+/// DynamicScan {
 ///     schema: { id: int, name: string, version: long },
 ///     file_type: Parquet,
 ///     base_url: "s3://table/",
 ///     file_constant_columns: ["version"],
-///     file_meta: {
-///         path_column: "path",
-///         file_size_column: "size",
-///         num_records_column: "num_records",
-///     },
+///     path_column: "path",
+///     file_size_column: "size",
+///     last_modified_column: "filemod",
 ///     dv_column: "dv",
 /// }
 /// ```
@@ -426,48 +398,187 @@ impl LoadColumnFileMeta {
 ///     |  1 |  a   |       7
 /// ```
 #[derive(Debug, Clone)]
-pub struct Load {
+pub struct DynamicScan {
     pub schema: SchemaRef,
     pub file_type: FileType,
-    pub base_url: Option<Url>,
+    /// Hierarchical base URL ending in `/` against which per-row path values resolve.
+    pub base_url: Url,
     pub file_constant_columns: Vec<String>,
-    pub file_meta: LoadColumnFileMeta,
+    /// Non-nullable input column holding the per-row file path or URL fragment.
+    pub path_column: ColumnName,
+    /// Non-nullable input column with the file's total size in bytes.
+    pub file_size_column: ColumnName,
+    /// Non-nullable input column with the last-modified timestamp in milliseconds since epoch.
+    pub last_modified_column: ColumnName,
+    /// Nullable input column with the schema of [`DeletionVectorDescriptor`].
     pub dv_column: ColumnName,
 }
 
-impl Load {
-    /// A [`Load`] over `schema` reading `file_type` files, with no base URL and no file-constant
-    /// columns. Add those with [`Self::with_base_url`] / [`Self::with_file_constant_columns`].
-    pub fn new(
-        schema: impl Into<SchemaRef>,
+impl DynamicScan {
+    /// Constructs a [`DynamicScan`] whose emitted rows match `output_schema`.
+    ///
+    /// `input_schema` describes the upstream rows containing file metadata. The scan reads
+    /// `file_type` files relative to `base_url`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
+    /// metadata or deletion-vector column is absent from `input_schema`, has an incompatible type,
+    /// or has invalid nullability; or when a file-constant column is absent from either schema, is
+    /// a metadata column, or has different input and output types or nullability.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        input_schema: &SchemaRef,
+        output_schema: impl Into<SchemaRef>,
         file_type: FileType,
-        file_meta: LoadColumnFileMeta,
+        base_url: Url,
+        file_constant_columns: impl IntoIterator<Item = impl Into<String>>,
+        path_column: ColumnName,
+        file_size_column: ColumnName,
+        last_modified_column: ColumnName,
         dv_column: ColumnName,
-    ) -> Self {
-        Self {
-            schema: schema.into(),
+    ) -> DeltaResult<Self> {
+        let schema = output_schema.into();
+        let file_constant_columns = file_constant_columns
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        let dynamic_scan = Self {
+            schema,
             file_type,
-            base_url: None,
-            file_constant_columns: Vec::new(),
-            file_meta,
+            base_url,
+            file_constant_columns,
+            path_column,
+            file_size_column,
+            last_modified_column,
             dv_column,
+        };
+        dynamic_scan.validate_input(input_schema)?;
+        Ok(dynamic_scan)
+    }
+
+    /// Validates the columns consumed by this scan against an upstream `input_schema`.
+    ///
+    /// Returns `Ok(())` when the base URL is valid and every configured column resolves with the
+    /// required type and nullability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base_url` is not hierarchical or does not end in `/`; when a required
+    /// metadata or deletion-vector column is absent, has an incompatible type, or has invalid
+    /// nullability; or when a file-constant column is absent from either schema, is a metadata
+    /// column, or has different input and output types or nullability.
+    pub fn validate_input(&self, input_schema: &SchemaRef) -> DeltaResult<()> {
+        static DELETION_VECTOR_DATA_TYPE: LazyLock<DataType> =
+            LazyLock::new(|| DataType::from(DeletionVectorDescriptor::to_schema()));
+
+        if self.base_url.cannot_be_a_base() || !self.base_url.path().ends_with('/') {
+            return Err(Error::generic(format!(
+                "dynamic scan: base URL `{}` must be hierarchical and end in `/`",
+                self.base_url
+            )));
         }
+
+        Self::validate_required_column(input_schema, &self.path_column, &DataType::STRING)?;
+        Self::validate_required_column(input_schema, &self.file_size_column, &DataType::LONG)?;
+        Self::validate_required_column(input_schema, &self.last_modified_column, &DataType::LONG)?;
+        Self::validate_file_constant_columns(
+            input_schema,
+            &self.schema,
+            &self.file_constant_columns,
+        )?;
+
+        let fields = input_schema
+            .fields_of_path(&self.dv_column)
+            .map_err(|err| {
+                Error::generic(format!(
+                    "dynamic scan: deletion-vector column `{}` is invalid: {err}",
+                    self.dv_column
+                ))
+            })?;
+        let Some((field, _ancestors)) = fields.split_last() else {
+            return Err(Error::internal_error("fields_of_path returned no fields"));
+        };
+        let expected = &*DELETION_VECTOR_DATA_TYPE;
+        if field.data_type() != expected {
+            return Err(Error::generic(format!(
+                "dynamic scan: deletion-vector column `{}` must have type {expected}, found {}",
+                self.dv_column,
+                field.data_type()
+            )));
+        }
+        if !field.is_nullable() {
+            return Err(Error::generic(format!(
+                "dynamic scan: deletion-vector column `{}` must be nullable",
+                self.dv_column
+            )));
+        }
+
+        Ok(())
     }
 
-    /// Set the base URL that per-row file paths resolve against.
-    pub fn with_base_url(mut self, base_url: Url) -> Self {
-        self.base_url = Some(base_url);
-        self
+    fn validate_required_column(
+        schema: &SchemaRef,
+        column: &ColumnName,
+        expected_type: &DataType,
+    ) -> DeltaResult<()> {
+        let fields = schema.fields_of_path(column)?;
+        let Some((field, ancestors)) = fields.split_last() else {
+            return Err(Error::internal_error("fields_of_path returned no fields"));
+        };
+        if field.data_type() != expected_type {
+            return Err(Error::generic(format!(
+                "dynamic scan: column `{column}` must have type {expected_type}, found {}",
+                field.data_type()
+            )));
+        }
+        if field.is_nullable() || ancestors.iter().any(|field| field.is_nullable()) {
+            return Err(Error::generic(format!(
+                "dynamic scan: required column `{column}` is nullable"
+            )));
+        }
+        Ok(())
     }
 
-    /// Set the output columns broadcast from the upstream row (see
-    /// [`Self::file_constant_columns`]).
-    pub fn with_file_constant_columns(
-        mut self,
-        columns: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.file_constant_columns = columns.into_iter().map(Into::into).collect();
-        self
+    fn validate_file_constant_columns(
+        input_schema: &SchemaRef,
+        output_schema: &SchemaRef,
+        file_constant_columns: &[String],
+    ) -> DeltaResult<()> {
+        for name in file_constant_columns {
+            let Some(input_field) = input_schema.field(name) else {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant source: column `{name}` not found; schema has \
+                     {:?}",
+                    Vec::from_iter(input_schema.fields().map(|field| field.name())),
+                )));
+            };
+            if input_field.is_metadata_column() {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant source: column `{name}` is a metadata column"
+                )));
+            }
+            let Some(output_field) = output_schema.field(name) else {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant: column `{name}` not found; schema has {:?}",
+                    Vec::from_iter(output_schema.fields().map(|field| field.name())),
+                )));
+            };
+            if output_field.is_metadata_column() {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant: column `{name}` is a metadata column"
+                )));
+            }
+            if input_field.data_type() != output_field.data_type()
+                || input_field.is_nullable() != output_field.is_nullable()
+            {
+                return Err(Error::generic(format!(
+                    "dynamic scan file_constant: column `{name}` must have the same type and \
+                     nullability in input and output"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

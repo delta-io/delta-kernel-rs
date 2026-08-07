@@ -20,7 +20,7 @@ use crate::expressions::{
     col, column_name, joined_column_expr, ColumnName, Expression as Expr, ExpressionRef, Predicate,
 };
 use crate::log_segment::LogSegment;
-use crate::plans::ir::nodes::{FileType, Load, LoadColumnFileMeta, ScanFile};
+use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME};
 use crate::schema::{
@@ -246,7 +246,7 @@ fn commit_arm(
         })
 }
 
-/// Load actions from V2 checkpoint sidecars.
+/// Read actions from V2 checkpoint sidecars.
 fn sidecar_actions(
     file_type: FileType,
     root_parts: Vec<ScanFile>,
@@ -255,14 +255,15 @@ fn sidecar_actions(
 ) -> DeltaResult<PlanBuilder> {
     const FILE_PATH: &str = "path";
     const FILE_SIZE: &str = "size";
-    const NUM_RECORDS: &str = "num_records";
+    const FILE_MOD: &str = "filemod";
     const DV: &str = "dv";
     const SIDECAR_SIZE: &str = "sizeInBytes";
+    const SIDECAR_FILE_MOD: &str = "modificationTime";
 
     static SIDECAR_FILE_META_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
-        nullable (FILE_PATH): STRING,
-        nullable (FILE_SIZE): LONG,
-        nullable (NUM_RECORDS): LONG,
+        not_null (FILE_PATH): STRING,
+        not_null (FILE_SIZE): LONG,
+        not_null (FILE_MOD): LONG,
         nullable (DV): (DeletionVectorDescriptor::to_schema()),
         nullable (VERSION): LONG,
     };
@@ -277,32 +278,31 @@ fn sidecar_actions(
         FileType::Parquet => PlanBuilder::scan_parquet,
     };
     let sidecar_files = scan(root_parts, &[VERSION], SIDECAR_READ_SCHEMA.clone())?
-        .filter(col!(SIDECAR_NAME).is_not_null())?
+        .filter(col!(SIDECAR_NAME, FILE_PATH).is_not_null())?
         .project(
             Expr::struct_from([
                 col!(SIDECAR_NAME, FILE_PATH),
                 col!(SIDECAR_NAME, SIDECAR_SIZE),
-                Expr::null_literal(DataType::LONG),
+                col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
                 Expr::null_literal(DeletionVectorDescriptor::to_schema().into()),
                 col!(VERSION),
             ]),
             SIDECAR_FILE_META_SCHEMA.clone(),
         )?;
 
-    let load = Load::new(
+    let dynamic_scan = DynamicScan::try_new(
+        &SIDECAR_FILE_META_SCHEMA,
         action_schema,
         FileType::Parquet,
-        LoadColumnFileMeta::new(
-            ColumnName::new([FILE_PATH]),
-            ColumnName::new([FILE_SIZE]),
-            ColumnName::new([NUM_RECORDS]),
-        ),
+        log_root.join("_sidecars/")?,
+        [VERSION],
+        ColumnName::new([FILE_PATH]),
+        ColumnName::new([FILE_SIZE]),
+        ColumnName::new([FILE_MOD]),
         ColumnName::new([DV]),
-    )
-    .with_base_url(log_root.join("_sidecars/")?)
-    .with_file_constant_columns([VERSION]);
+    )?;
 
-    sidecar_files.load(load)
+    sidecar_files.dynamic_scan(dynamic_scan)
 }
 
 // === Helpers ===
@@ -702,22 +702,8 @@ mod tests {
         shape(CheckpointType::None, None)
     }
 
-    fn op_tag(op: &Operator) -> &'static str {
-        match op {
-            Operator::ScanParquet(_) => "scan_parquet",
-            Operator::ScanJson(_) => "scan_json",
-            Operator::Values(_) => "values",
-            Operator::Filter(_) => "filter",
-            Operator::Project(_) => "project",
-            Operator::Load(_) => "load",
-            Operator::Aggregate(_) => "aggregate",
-            Operator::SemiJoin(_) => "semi_join",
-            Operator::UnionAll(_) => "union_all",
-        }
-    }
-
-    fn tags(plan: &Plan) -> Vec<&'static str> {
-        plan.nodes.iter().map(|n| op_tag(&n.op)).collect()
+    fn tags(plan: &Plan) -> Vec<String> {
+        plan.nodes.iter().map(|node| node.op.to_string()).collect()
     }
 
     fn add_struct(schema: &SchemaRef) -> &StructType {
@@ -829,7 +815,7 @@ mod tests {
     #[case::leaf_json(shape(CheckpointType::Leaf, None), FileType::Json,
         vec!["scan_json", "filter", "project", "semi_join", "project"])]
     #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "load", "filter", "project", "semi_join", "project"])]
+        vec!["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project", "semi_join", "project"])]
     fn metadata_plan_checkpoint_arm_shape(
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
@@ -869,7 +855,7 @@ mod tests {
     #[rstest::rstest]
     #[case::with_parsed_stats(Some(struct_stats_schema()), true)]
     #[case::without_parsed_stats(None, false)]
-    fn metadata_plan_manifest_sidecar_load_stats_columns(
+    fn metadata_plan_manifest_sidecar_dynamic_scan_stats_columns(
         #[case] parsed_stats: Option<SchemaRef>,
         #[case] expect_parsed_columns: bool,
     ) -> DeltaResult<()> {
@@ -893,20 +879,22 @@ mod tests {
         )?
         .expect("non-empty");
 
-        let load = plan
+        let dynamic_scan = plan
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Operator::Load(load) => Some(load),
+                Operator::DynamicScan(dynamic_scan) => Some(dynamic_scan),
                 _ => None,
             })
-            .expect("sidecar load");
+            .expect("sidecar dynamic scan");
         assert_eq!(
-            add_struct(&load.schema).field(STATS_PARSED).is_some(),
+            add_struct(&dynamic_scan.schema)
+                .field(STATS_PARSED)
+                .is_some(),
             expect_parsed_columns,
         );
         assert!(
-            add_struct(&load.schema)
+            add_struct(&dynamic_scan.schema)
                 .field(PARTITION_VALUES_PARSED)
                 .is_none(),
             "native parsed partition values are not requested yet"
@@ -947,7 +935,7 @@ mod tests {
     #[case::leaf_parquet(shape(CheckpointType::Leaf, None), FileType::Parquet,
         vec!["scan_parquet", "filter", "project", "project"])]
     #[case::manifest(shape(CheckpointType::Manifest, None), FileType::Parquet,
-        vec!["scan_parquet", "filter", "project", "load", "filter", "project", "project"])]
+        vec!["scan_parquet", "filter", "project", "dynamic_scan", "filter", "project", "project"])]
     fn metadata_plan_checkpoint_only(
         #[case] shape: CheckpointShape,
         #[case] file_type: FileType,
