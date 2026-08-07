@@ -1,7 +1,9 @@
 # unity-catalog-delta-client-api
 
-An experimental/under-construction crate defining the client API contract for the Unity Catalog
-Delta Tables API. This crate is not intended for production use.
+> [!WARNING]
+> This crate is experimental and under construction. It is not intended for production use.
+
+A crate defining the client API contract for the Unity Catalog Delta Tables API.
 
 It has no network dependencies, so any transport can implement it. The REST implementation lives in
 [`unity-catalog-delta-rest-client`], and [`delta-kernel-unity-catalog`] depends on this crate rather

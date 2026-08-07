@@ -1,7 +1,9 @@
 # unity-catalog-delta-rest-client
 
-An experimental/under-construction Rust client for the Unity Catalog Delta APIs. This crate is not
-intended for production use.
+> [!WARNING]
+> This crate is experimental and under construction. It is not intended for production use.
+
+A Rust client for the Unity Catalog Delta APIs.
 
 It provides two REST structs:
 

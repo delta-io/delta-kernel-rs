@@ -1,7 +1,9 @@
 # delta-kernel-unity-catalog
 
-An experimental/under-construction crate connecting [`delta_kernel`] to Unity Catalog for
-catalog-managed Delta tables. This crate is not intended for production use.
+> [!WARNING]
+> This crate is experimental and under construction. It is not intended for production use.
+
+A crate connecting [`delta_kernel`] to Unity Catalog for catalog-managed Delta tables.
 
 A table with the `catalogManaged` table feature cannot be read or written by accessing the
 transaction log on disk alone. This crate bridges UC's responses into kernel's APIs and implements
