@@ -58,6 +58,10 @@ const MAX_DATA_FIELD_ID: i32 = (MAX_DATA_STATS_FIELD_ID
     - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
     / NUM_SUPPORTED_STATS_PER_COLUMN;
 
+// These mirror the Iceberg reserved field-id space, part of which is also declared as `i64` in
+// [`crate::reserved_field_ids`] (e.g. `FILE_NAME`); kept as `i32` here to match the stats field-id
+// arithmetic. See that module for the canonical reserved-id definitions.
+
 /// Iceberg reserved field ID for `_last_updated_sequence_number` (`Integer.MAX_VALUE - 108`).
 const LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID: i32 = 2_147_483_539;
 
@@ -118,25 +122,17 @@ pub(crate) fn field_id_to_statistics_base(field_id: i32) -> Option<i32> {
     }
 }
 
-/// Creates a [`StructField`] with the given name, data type, nullability, and field ID.
-/// Also includes column mapping annotations (`delta.columnMapping.id` and
-/// `delta.columnMapping.physicalName`) which are required when the metadata tree feature
-/// is enabled (as it requires column mapping to be enabled).
+/// Creates a physical-schema [`StructField`] carrying the Iceberg/Parquet field ID.
+///
+/// The AMT `content_stats` schema is a physical schema projected by field ID, so it needs only
+/// [`ColumnMetadataKey::ParquetFieldId`] -- the same annotation the `#[field_id = N]` derive macro
+/// attaches to the other `content_tree` structs. It carries no `delta.columnMapping.*` logical
+/// annotations, which are consumed by (not produced from) logical->physical conversion.
 fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> StructField {
-    StructField::new(name, data_type, nullable).with_metadata([
-        (
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(field_id as i64),
-        ),
-        (
-            ColumnMetadataKey::ColumnMappingId.as_ref(),
-            MetadataValue::Number(field_id as i64),
-        ),
-        (
-            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-            MetadataValue::String(format!("col-{name}")),
-        ),
-    ])
+    StructField::new(name, data_type, nullable).with_metadata([(
+        ColumnMetadataKey::ParquetFieldId.as_ref(),
+        MetadataValue::Number(field_id as i64),
+    )])
 }
 
 /// Extracts the parquet field ID from a [`StructField`]'s metadata, or `None` if absent.
@@ -158,35 +154,25 @@ fn wrap_struct_or_variant(original: &DataType, inner: StructType) -> DataType {
     }
 }
 
-/// Builds the stats struct for a primitive or variant field.
-///
-/// The stats struct contains the following fields (with field IDs as offsets from the base):
-/// - offset 1: `lower_bound` (same type as the field)
-/// - offset 2: `upper_bound` (same type as the field)
-/// - offset 3: `tight_bounds` (boolean) - excluded for variant types
+/// Builds a single column's stats struct, with each stat sub-field's ID an offset from
+/// `base_field_id`:
+/// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
+/// - offset 3: `tight_bounds` (boolean) - excluded for variants
 /// - offset 4: `value_count` (long)
-/// - offset 5: `null_value_count` (long) - only if the field is nullable
-/// - offset 6: `nan_value_count` (long) - only for float/double types
-/// - offset 7: `avg_value_size_in_bytes` (int) - only for string/binary/variant types
+/// - offset 5: `null_value_count` (long) - only if `nullable`
+/// - offset 6: `nan_value_count` (long) - only for float/double `bounds_type`
+/// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
 ///
-/// `data_type` is the **column-level** type (may be `Variant`). For variant columns,
-/// `tight_bounds` is excluded and `avg_value_size_in_bytes` is always included. The
-/// bound types are derived from the primitive type for primitives, or from the inner
-/// value field for variants.
-fn build_primitive_stats_struct(
+/// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
+/// the variant's inner `value` type for variants. `is_variant` selects the variant rules (no
+/// `tight_bounds`, always a size stat).
+fn build_stats_struct(
     base_field_id: i32,
-    data_type: DataType,
+    bounds_type: &DataType,
     nullable: bool,
+    is_variant: bool,
 ) -> StructType {
-    let is_variant = matches!(&data_type, DataType::Variant(_));
-    let bounds_type = match &data_type {
-        DataType::Variant(inner) => inner
-            .field(VARIANT_VALUE_FIELD_NAME)
-            .map(|f| f.data_type().clone())
-            .unwrap_or(data_type.clone()),
-        _ => data_type.clone(),
-    };
-    let (has_nan_count, has_size_stats) = match &bounds_type {
+    let (has_nan_count, has_size_stats) = match bounds_type {
         DataType::Primitive(ptype) => (
             matches!(ptype, PrimitiveType::Float | PrimitiveType::Double),
             matches!(ptype, PrimitiveType::String | PrimitiveType::Binary),
@@ -194,33 +180,22 @@ fn build_primitive_stats_struct(
         _ => (false, false),
     };
     let has_size_stats = has_size_stats || is_variant;
-    let has_tight_bounds = !is_variant;
 
-    let capacity = 3
-        + usize::from(has_tight_bounds)
-        + usize::from(nullable)
-        + usize::from(has_nan_count)
-        + usize::from(has_size_stats);
-    let mut fields = Vec::with_capacity(capacity);
-
-    // lower_bound: same type as the field (inner value type for variants)
-    fields.push(field_with_id(
-        LOWER_BOUND,
-        bounds_type.clone(),
-        true,
-        base_field_id + STATS_OFFSET_LOWER_BOUND,
-    ));
-
-    // upper_bound: same type as the field (inner value type for variants)
-    fields.push(field_with_id(
-        UPPER_BOUND,
-        bounds_type,
-        true,
-        base_field_id + STATS_OFFSET_UPPER_BOUND,
-    ));
-
-    // tight_bounds: excluded for variant (and geometry/geography, not handled here)
-    if has_tight_bounds {
+    let mut fields = vec![
+        field_with_id(
+            LOWER_BOUND,
+            bounds_type.clone(),
+            true,
+            base_field_id + STATS_OFFSET_LOWER_BOUND,
+        ),
+        field_with_id(
+            UPPER_BOUND,
+            bounds_type.clone(),
+            true,
+            base_field_id + STATS_OFFSET_UPPER_BOUND,
+        ),
+    ];
+    if !is_variant {
         fields.push(field_with_id(
             TIGHT_BOUNDS,
             DataType::BOOLEAN,
@@ -228,16 +203,12 @@ fn build_primitive_stats_struct(
             base_field_id + STATS_OFFSET_TIGHT_BOUNDS,
         ));
     }
-
-    // value_count: always present
     fields.push(field_with_id(
         VALUE_COUNT,
         DataType::LONG,
         true,
         base_field_id + STATS_OFFSET_VALUE_COUNT,
     ));
-
-    // null_value_count: only if the field is nullable
     if nullable {
         fields.push(field_with_id(
             NULL_VALUE_COUNT,
@@ -246,8 +217,6 @@ fn build_primitive_stats_struct(
             base_field_id + STATS_OFFSET_NULL_VALUE_COUNT,
         ));
     }
-
-    // nan_value_count: only for float/double types
     if has_nan_count {
         fields.push(field_with_id(
             NAN_VALUE_COUNT,
@@ -256,8 +225,6 @@ fn build_primitive_stats_struct(
             base_field_id + STATS_OFFSET_NAN_VALUE_COUNT,
         ));
     }
-
-    // avg_value_size_in_bytes: for string, binary, and variant types
     if has_size_stats {
         fields.push(field_with_id(
             AVG_VALUE_SIZE_IN_BYTES,
@@ -272,10 +239,10 @@ fn build_primitive_stats_struct(
 
 /// A [`SchemaTransform`] that rewrites a table schema into its AMT stats schema.
 ///
-/// Each primitive/variant column becomes a nested stats struct (see
-/// [`build_primitive_stats_struct`]); struct columns recurse; array/map columns and columns whose
-/// stats struct would be empty are dropped. Uses a fallible filtering carrier so that a missing
-/// field ID aborts (error) while an out-of-range field ID or empty stats struct drops the column.
+/// Each primitive/variant column becomes a nested stats struct (see [`build_stats_struct`]);
+/// struct columns recurse; array/map columns and columns whose stats struct would be empty are
+/// dropped. Uses a fallible filtering carrier so that a missing field ID aborts (error) while an
+/// out-of-range field ID or empty stats struct drops the column.
 struct StatsSchemaTransform;
 
 impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
@@ -305,21 +272,25 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
 
         // Build the stats data type for this column; `None` means "drop this column".
         let stats_data_type = match field.data_type() {
-            DataType::Primitive(_) => {
-                Some(DataType::Struct(Box::new(build_primitive_stats_struct(
-                    base_stats_id,
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                ))))
-            }
+            DataType::Primitive(_) => Some(DataType::Struct(Box::new(build_stats_struct(
+                base_stats_id,
+                field.data_type(),
+                field.is_nullable(),
+                false,
+            )))),
             DataType::Variant(inner) => match inner.field(VARIANT_VALUE_FIELD_NAME) {
-                // Variant inner fields don't carry their own field IDs; the variant's base stats
-                // ID covers the whole variant and we only track stats for `value`.
+                // Variant inner fields carry no field IDs of their own, so we cannot recurse
+                // through `transform_struct` (which requires them). The variant's base stats ID
+                // covers the whole variant and we only track stats for the inner `value` field,
+                // built by hand here. `null_value_count` keys off the variant column's own
+                // nullability -- a NULL variant is a column-level SQL null, independent of the
+                // physical `value` encoding column's nullability.
                 Some(value_field) => {
-                    let value_stats = build_primitive_stats_struct(
+                    let value_stats = build_stats_struct(
                         base_stats_id,
-                        field.data_type().clone(),
-                        value_field.is_nullable(),
+                        value_field.data_type(),
+                        field.is_nullable(),
+                        true,
                     );
                     let variant_stats = StructType::new_unchecked([StructField::nullable(
                         value_field.name(),
@@ -344,9 +315,7 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
         // The stats group field uses the base stats field ID (e.g. 10_200 for field_id 1), not the
         // original column field ID. Remap the field-id metadata; preserve everything else.
         let metadata = field.metadata().iter().map(|(k, v)| {
-            let v = if k == ColumnMetadataKey::ParquetFieldId.as_ref()
-                || k == ColumnMetadataKey::ColumnMappingId.as_ref()
-            {
+            let v = if k == ColumnMetadataKey::ParquetFieldId.as_ref() {
                 MetadataValue::Number(base_stats_id as i64)
             } else {
                 v.clone()
@@ -362,19 +331,24 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
 
 /// Generates the AMT stats schema for the given table struct.
 ///
-/// Traverses the schema and produces a stats schema mirroring its structure. Each primitive field's
-/// stats struct contains `lower_bound`, `upper_bound`, `tight_bounds` (excluded for variants),
-/// `value_count`, `null_value_count` (only if nullable), `nan_value_count` (float/double only), and
-/// `avg_value_size_in_bytes` (string/binary/variant only). Field IDs in the stats schema are
-/// computed via [`field_id_to_statistics_base`] from each field's `parquet.field.id` metadata.
+/// Traverses the schema and produces a stats schema mirroring its structure: each primitive/variant
+/// column becomes a nested per-column stats struct (see [`build_stats_struct`] for its fields and
+/// field-id offsets), and struct columns recurse.
 ///
-/// Array/map columns and columns whose stats struct would be empty (e.g. a struct of only
-/// array/map fields) are omitted. Returns an error if any field is missing its field-id metadata.
+/// `table_struct` must be a physical schema carrying `parquet.field.id` metadata on each field (as
+/// produced by [`StructField::make_physical`]); logical schemas that annotate field IDs only under
+/// `delta.columnMapping.id` are not accepted.
+///
+/// A column is omitted when: it is an array/map column; its stats struct would be empty (e.g. a
+/// struct of only array/map fields, or a variant lacking a `value` field); or its field ID is
+/// outside the supported stats range (e.g. reserved metadata columns like `_file`/`_pos`, or data
+/// field IDs above the reserved range), which are skipped with a warning. Returns an error only if
+/// a field is missing its field-id metadata entirely.
 pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType> {
     // `Ok(None)` means every column was dropped, yielding an empty stats schema.
     match StatsSchemaTransform.transform_struct(table_struct)? {
         Some(stats) => Ok(stats.into_owned()),
-        None => Ok(StructType::new_unchecked(Vec::new())),
+        None => Ok(StructType::new_unchecked([])),
     }
 }
 
@@ -466,6 +440,15 @@ mod tests {
     #[case(DataType::DOUBLE, true, 5, 11_000, 6)] // nan count + null count
     #[case(DataType::FLOAT, false, 100, 30_000, 5)] // nan count, non-null
     #[case(DataType::LONG, true, 42, 18_400, 5)] // fixed-length + null count
+    #[case(DataType::BINARY, true, 3, 10_600, 6)] // size stats + null count
+    #[case(DataType::BINARY, false, 4, 10_800, 5)] // size stats, non-null
+    #[case(
+        DataType::INTEGER,
+        false,
+        MAX_DATA_FIELD_ID,
+        MAX_DATA_STATS_FIELD_ID,
+        4
+    )] // top of range
     fn stats_schema_primitive_field(
         #[case] data_type: DataType,
         #[case] nullable: bool,
@@ -678,6 +661,54 @@ mod tests {
         let record_struct = field_stats_struct_for(stats.field("record").unwrap(), &stats);
         assert!(record_struct.field("id").is_some());
         let _ = variant_value_stats(&record_struct, "data");
+    }
+
+    #[test]
+    fn stats_schema_nullable_variant_gets_null_value_count() {
+        // A nullable variant column must record null_value_count even though the inner `value`
+        // field of an unshredded variant is not_null -- null tracking follows the column.
+        let schema = StructType::new_unchecked([field_with_id(
+            "v",
+            DataType::unshredded_variant(),
+            true,
+            3,
+        )]);
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        let value_inner = variant_value_stats(&stats, "v");
+        assert!(value_inner.field(NULL_VALUE_COUNT).is_some());
+    }
+
+    #[test]
+    fn stats_schema_variant_without_value_field_is_omitted() {
+        // A variant whose inner struct has no `value` field yields an empty stats struct -> drop.
+        let variant = DataType::Variant(Box::new(StructType::new_unchecked([
+            StructField::not_null("metadata", DataType::BINARY),
+        ])));
+        let schema = StructType::new_unchecked([field_with_id("v", variant, false, 3)]);
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        assert!(stats.field("v").is_none());
+        assert_eq!(stats.fields().count(), 0);
+    }
+
+    #[test]
+    fn stats_schema_out_of_range_data_field_id_is_dropped() {
+        // A valid column at the top of the data range is kept; a data field ID just past the
+        // range is warn-dropped (not an error), unlike a missing field ID.
+        let ok = field_with_id("hi", DataType::INTEGER, false, MAX_DATA_FIELD_ID);
+        let over = field_with_id("over", DataType::INTEGER, false, MAX_DATA_FIELD_ID + 1);
+        let schema = StructType::new_unchecked([ok, over]);
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        assert_eq!(
+            get_field_id(stats.field("hi").unwrap()),
+            Some(MAX_DATA_STATS_FIELD_ID)
+        );
+        assert!(stats.field("over").is_none());
+    }
+
+    #[test]
+    fn stats_schema_empty_input_is_empty() {
+        let stats = stats_schema(&StructType::new_unchecked([])).expect("should succeed");
+        assert_eq!(stats.fields().count(), 0);
     }
 
     #[test]
