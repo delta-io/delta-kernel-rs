@@ -202,6 +202,18 @@ static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     ..(checkpoint_action_field()),
 };
 
+/// Schema for actions stored in a leaf checkpoint.
+#[internal_api]
+pub(crate) static LEAF_CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    ..(checkpoint_action_field()),
+};
+
 static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
     (&REMOVE_FIELD),
