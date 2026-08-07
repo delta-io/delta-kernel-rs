@@ -330,6 +330,10 @@ fn read_scan_file(
         // because the selection vector is `None`.
         let extend = Some(!is_dv_resolved_pair);
         let rest = split_vector(sv.as_mut(), len, extend);
+        let sv = match sv {
+            None if is_dv_resolved_pair => Some(vec![false; len]),
+            other => other,
+        };
         let result = logical.fold_with(sv, |logical, sv| {
             logical.and_then(|data| data.apply_selection_vector(sv))
         });
