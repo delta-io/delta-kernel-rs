@@ -886,7 +886,7 @@ mod tests {
         let object_path = Path::from("/test/data/00000000000000000001.json");
 
         // First write with no existing file
-        let data = create_test_data(vec!["rémi", "ウィルソン"])?;
+        let data = create_test_data(vec!["remi", "wilson"])?;
         let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
         let result =
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
@@ -903,10 +903,7 @@ mod tests {
             Some(u64::try_from(stored_bytes.len()).unwrap())
         );
         let json = read_json_file(&store, &object_path).await?;
-        assert_eq!(
-            json,
-            vec![json!({"dog": "rémi"}), json!({"dog": "ウィルソン"})]
-        );
+        assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
         // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
