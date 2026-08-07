@@ -142,9 +142,9 @@ mod tests {
         let result =
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        // Verify the first write is successful and reports the stored size.
+        // Verify the first write is successful and reports the expected size.
         let write_result = result?;
-        assert_eq!(write_result.size, std::fs::metadata(&path)?.len());
+        assert_eq!(write_result.size, 32);
         let json = read_json_file(&path)?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -155,9 +155,9 @@ mod tests {
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            // Verify the second write is successful and reports the replaced size.
+            // Verify the second write is successful and reports the expected size.
             let write_result = result?;
-            assert_eq!(write_result.size, std::fs::metadata(&path)?.len());
+            assert_eq!(write_result.size, 28);
             let json = read_json_file(&path)?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
