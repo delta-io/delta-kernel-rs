@@ -896,6 +896,7 @@ mod tests {
         // 10 JSON bytes = 8-byte `{"dog":"` prefix + 2-byte `"}` suffix.
         // 32 = (10 + 4 "remi" + 1 newline) + (10 + 6 "wilson" + 1 newline).
         assert_eq!(write_result.size, 32);
+        assert_eq!(write_result.size, store.head(&object_path).await?.size);
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -911,6 +912,7 @@ mod tests {
             // 10 JSON bytes = 8-byte `{"dog":"` prefix + 2-byte `"}` suffix.
             // 28 = 2 * (10 + 3 value + 1 newline).
             assert_eq!(write_result.size, 28);
+            assert_eq!(write_result.size, store.head(&object_path).await?.size);
             let json = read_json_file(&store, &object_path).await?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {

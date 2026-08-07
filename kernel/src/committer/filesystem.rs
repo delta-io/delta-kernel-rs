@@ -134,7 +134,7 @@ mod tests {
     async fn test_filesystem_committer_returns_valid_commit_response() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = SyncEngine::new_with_store(storage);
+        let engine = SyncEngine::new_with_store(storage.clone());
 
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
@@ -159,6 +159,11 @@ mod tests {
         )));
 
         let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+        let stored_size = storage
+            .head(&Path::from("_delta_log/00000000000000000001.json"))
+            .await
+            .unwrap()
+            .size;
 
         match result {
             CommitResponse::Committed { file_meta } => {
@@ -167,6 +172,7 @@ mod tests {
                 //     + 16 timestamp + 21 config.
                 // 214 = 177 fixed JSON + 36 UUID + 1 newline.
                 assert_eq!(file_meta.size, 214);
+                assert_eq!(file_meta.size, stored_size);
                 assert!(file_meta
                     .location
                     .as_str()
