@@ -216,6 +216,63 @@ impl<'a> MapItem<'a> {
     }
 }
 
+/// Read access to the element structs of an array-of-structs column, abstracting over the
+/// engine's struct representation. Backs [`StructList`], mirroring how [`StringArrayAccessor`]
+/// backs [`ListItem`].
+pub trait StructArrayAccessor {
+    /// Visit the element structs at `offsets` with `visitor`, one visited row per element,
+    /// extracting the element-struct leaves named by `column_names`.
+    ///
+    /// Implementations must reject, rather than skip, a null element struct: the nested visitor
+    /// sees one row per element and has no way to observe a skipped one, so silently dropping it
+    /// would misreport the row's element count.
+    fn visit_slice(
+        &self,
+        offsets: Range<usize>,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()>;
+}
+
+/// A pre-resolved view into a single row's array of element structs. Unlike [`ListItem`], which
+/// materializes strings, the elements are structs visited in place by a nested [`RowVisitor`].
+pub struct StructList<'a> {
+    values: &'a dyn StructArrayAccessor,
+    offsets: Range<usize>,
+}
+
+impl<'a> StructList<'a> {
+    /// Constructs a handle to the element structs at `offsets` within `values`.
+    pub(crate) fn new(
+        values: &'a dyn StructArrayAccessor,
+        offsets: Range<usize>,
+    ) -> StructList<'a> {
+        StructList { values, offsets }
+    }
+
+    /// The number of element structs in this row's list.
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Returns true if this row's list has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// Drive a nested [`RowVisitor`] over this row's element structs, one visited row per element.
+    /// The columns the visitor declares are resolved against the element struct's schema, not the
+    /// outer row's. Calls [`RowVisitor::visit`] exactly once, with `row_count == 0` for a
+    /// present-but-empty list.
+    ///
+    /// Returns an error if any element struct in this row is null.
+    pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+        let column_names = visitor.selected_column_names_and_types().0;
+        self.values
+            .visit_slice(self.offsets.clone(), column_names, visitor)
+    }
+}
+
 macro_rules! impl_default_get {
     ( $(($name: ident, $typ: ty)), * ) => {
         $(
@@ -232,6 +289,9 @@ macro_rules! impl_default_get {
 /// default all these methods will return an `Error` that an incorrect type has been asked
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
+///
+/// All methods return `Ok(None)` when the row's value is null. `get_struct_list` yields a
+/// [`StructList`], whose element structs a nested [`RowVisitor`] visits in place.
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
@@ -247,7 +307,8 @@ pub trait GetData<'a> {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 
@@ -276,7 +337,8 @@ impl<'a> GetData<'a> for () {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 

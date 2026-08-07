@@ -95,6 +95,7 @@ the appropriate typed method based on the column's data type:
 | `get_binary(row, name)` | `&[u8]` | BINARY |
 | `get_list(row, name)` | `ListItem` | ARRAY (of strings) |
 | `get_map(row, name)` | `MapItem` | MAP (string keys and values) |
+| `get_struct_list(row, name)` | `StructList` | ARRAY (of structs) |
 
 All methods return `DeltaResult<Option<T>>`. A `None` value means the field is null. By
 default, every method returns an "unexpected type" error, so you only need to implement the
@@ -106,6 +107,13 @@ single element, or `materialize()` to collect all elements into a `Vec<String>`.
 `MapItem` provides access to a row's string-to-string map. Call `get(key)` to look up a
 value by key, or `materialize()` to collect all entries into a `HashMap<String, String>`.
 If a value is null, `get` returns `None` and `materialize` drops that entry.
+
+`StructList` provides access to a row's array of structs. Rather than materializing the
+elements, call `visit_with(visitor)` to drive a nested `RowVisitor` over them, which sees one
+row per element. The nested visitor's columns resolve against the element struct's schema, not
+the outer row's, so a visitor selecting `n` reads the `n` field of each element. Call `len()`
+for the element count. Element structs cannot be null, so kernel rejects an `ARRAY` column
+whose element type is nullable.
 
 Not every possible data-type is covered (i.e. no `Map<Int, Int>`). The trait only covers the data
 types the kernel needs to fuction, and no more.
