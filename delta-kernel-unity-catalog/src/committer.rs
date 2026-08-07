@@ -150,12 +150,12 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             Box::new(actions),
             false,
         ) {
-            Ok(()) => {
+            Ok(write_result) => {
                 info!("wrote version 0 commit file for UC table creation");
                 let file_meta = FileMeta::new(
                     published_commit_path,
                     commit_metadata.in_commit_timestamp(),
-                    0,
+                    write_result.size,
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }

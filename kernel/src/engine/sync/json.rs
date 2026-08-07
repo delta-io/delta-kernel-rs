@@ -16,7 +16,7 @@ use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    JsonHandler, PredicateRef,
+    JsonHandler, JsonWriteResult, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler {
@@ -74,9 +74,14 @@ impl JsonHandler for SyncJsonHandler {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<JsonWriteResult> {
         let buf = to_json_bytes(data)?;
-        put_bytes(self.store.as_ref(), path, buf.into(), overwrite)
+        let size = buf
+            .len()
+            .try_into()
+            .map_err(|_| Error::generic("JSON file size exceeds u64::MAX"))?;
+        put_bytes(self.store.as_ref(), path, buf.into(), overwrite)?;
+        Ok(JsonWriteResult::new(size))
     }
 }
 
@@ -137,8 +142,12 @@ mod tests {
         let result =
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        // Verify the first write is successful
-        assert!(result.is_ok());
+        // Verify the first write is successful and reports the expected size.
+        let write_result = result?;
+        // 10 JSON bytes = 8-byte `{"dog":"` prefix + 2-byte `"}` suffix.
+        // 32 = (10 + 4 "remi" + 1 newline) + (10 + 6 "wilson" + 1 newline).
+        assert_eq!(write_result.size, 32);
+        assert_eq!(write_result.size, std::fs::metadata(&path)?.len());
         let json = read_json_file(&path)?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -149,8 +158,12 @@ mod tests {
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            // Verify the second write is successful
-            assert!(result.is_ok());
+            // Verify the second write is successful and reports the expected size.
+            let write_result = result?;
+            // 10 JSON bytes = 8-byte `{"dog":"` prefix + 2-byte `"}` suffix.
+            // 28 = 2 * (10 + 3 value + 1 newline).
+            assert_eq!(write_result.size, 28);
+            assert_eq!(write_result.size, std::fs::metadata(&path)?.len());
             let json = read_json_file(&path)?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {

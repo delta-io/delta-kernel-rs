@@ -10,7 +10,7 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, PredicateRef,
+    FilteredEngineData, JsonHandler, JsonWriteResult, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -60,7 +60,7 @@ impl JsonHandler for PlanBasedJsonHandler {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<JsonWriteResult> {
         debug!(%path, "PlanBasedJsonHandler delegating write_json_file to fallback handler");
         self.fallback.write_json_file(path, data, overwrite)
     }
