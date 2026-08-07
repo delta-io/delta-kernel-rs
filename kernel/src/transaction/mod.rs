@@ -71,7 +71,7 @@ pub(crate) mod alter_table;
 pub use alter_table::AlterTableTransaction;
 mod commit_info;
 mod domain_metadata;
-pub(crate) mod schema_evolution;
+pub mod schema_evolution;
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]

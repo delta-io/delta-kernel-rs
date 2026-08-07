@@ -36,7 +36,8 @@ use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
 };
-use crate::utils::current_time_ms;
+use crate::transaction::schema_evolution::{evolve_table_config, SchemaChange};
+use crate::utils::{current_time_ms, require};
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -131,6 +132,31 @@ impl Transaction {
     pub fn with_operation(mut self, operation: String) -> Self {
         self.operation = Some(operation);
         self
+    }
+
+    /// Applies schema operations to the transaction's effective table configuration.
+    ///
+    /// Operations are applied in order, with each operation observing changes made by preceding
+    /// operations. A successful call causes the transaction to emit updated table metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `changes` is empty, an operation is invalid, or the evolved schema is
+    /// incompatible with the table protocol.
+    pub fn with_schema_changes(mut self, changes: Vec<SchemaChange>) -> DeltaResult<Self> {
+        require!(
+            !changes.is_empty(),
+            Error::generic("with_schema_changes requires at least one schema operation")
+        );
+        require!(
+            !self.has_data_file_actions(),
+            Error::invalid_transaction_state(
+                "with_schema_changes must be called before staging data files"
+            )
+        );
+        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.should_emit_metadata = true;
+        Ok(self)
     }
 
     /// Remove domain metadata from the Delta log.

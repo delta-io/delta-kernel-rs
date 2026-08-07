@@ -31,18 +31,12 @@ use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
-use crate::table_configuration::TableConfiguration;
-use crate::table_features::{
-    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata, ColumnMappingMode,
-    Operation, TableFeature,
-};
-use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::table_features::Operation;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
-    apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
+    evolve_table_config, AddField, SchemaChange, SetNullable,
 };
-use crate::utils::FoldWithOption as _;
-use crate::{DeltaResult, Engine, Error};
+use crate::{DeltaResult, Engine};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
 /// See [`Chainable`] for the operations available on this state.
@@ -75,7 +69,7 @@ mod sealed {
 ///   chaining.
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
-    operations: Vec<SchemaOperation>,
+    operations: Vec<SchemaChange>,
     correlation_id: Option<Arc<str>>,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
@@ -128,7 +122,24 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations.push(SchemaOperation::AddColumn { field });
+        let column = ColumnName::new([field.name().clone()]);
+        self.operations.push(AddField::new(column, field).into());
+        self.transition()
+    }
+
+    /// Add a new column at `column` in the table schema.
+    ///
+    /// The final path component must match `field.name()`. Traversal through arrays uses their
+    /// element type, and traversal through maps uses their value type. Map keys cannot be evolved.
+    /// The field must be nullable and must not conflict with an existing sibling field.
+    ///
+    /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
+    pub fn add_column_at_path(
+        mut self,
+        column: ColumnName,
+        field: StructField,
+    ) -> AlterTableTransactionBuilder<Modifying> {
+        self.operations.push(AddField::new(column, field).into());
         self.transition()
     }
 
@@ -137,8 +148,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// Note: this matches Spark's behavior.
     pub fn set_nullable(mut self, column: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations
-            .push(SchemaOperation::SetNullable { column });
+        self.operations.push(SetNullable::new(column).into());
         self.transition()
     }
 }
@@ -155,8 +165,8 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///
     /// # Errors
     ///
-    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which ALTER TABLE does not
-    ///   yet support
+    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which schema evolution does
+    ///   not yet support
     /// - Any individual operation fails validation (see per-method errors above)
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
@@ -167,69 +177,13 @@ impl AlterTableTransactionBuilder<Modifying> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
-        // We don't support ALTER TABLE on tables with icebergCompatV3 enabled yet. See
-        // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
-        if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
-            return Err(Error::unsupported(
-                "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
-            ));
-        }
-        // TODO(#2630): Support ALTER TABLE on tables with column defaults.
-        if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
-            return Err(Error::unsupported(
-                "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
-            ));
-        }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression
         // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the
         // protocol must also re-check this on the evolved `TableConfiguration`.
         table_config.ensure_operation_supported(Operation::Write)?;
 
-        let schema = Arc::unwrap_or_clone(table_config.logical_schema());
-        let column_mapping_mode = table_config.column_mapping_mode();
-        let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
-        // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
-        // strip below needs from it. Captured as a bool (not a clone) before
-        // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
-        // `None` mode, where no strip fires.
-        let current_has_cm = column_mapping_mode == ColumnMappingMode::None
-            && schema_has_column_mapping_metadata(&schema);
-        let SchemaEvolutionResult {
-            schema: evolved_schema,
-            new_max_column_id,
-        } = apply_schema_operations(
-            schema,
-            self.operations,
-            column_mapping_mode,
-            current_max_column_id,
-        )?;
-
-        // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
-        // that was clean before it, strip them; residual annotations already present on the
-        // table are left in place (see `strip_stray_column_mapping_metadata`).
-        let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
-            strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
-                .map_or(evolved_schema, Arc::new)
-        } else {
-            evolved_schema
-        };
-
-        let evolved_metadata = table_config
-            .metadata()
-            .clone()
-            .with_schema(evolved_schema.clone())?
-            .fold_with(new_max_column_id, |evolved_metadata, id| {
-                evolved_metadata
-                    .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
-            });
-
-        // Validates the evolved metadata against the protocol.
-        let evolved_table_config = TableConfiguration::try_new_with_schema(
-            table_config,
-            evolved_metadata,
-            evolved_schema,
-        )?;
+        let evolved_table_config = evolve_table_config(table_config, self.operations)?;
 
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
@@ -237,5 +191,18 @@ impl AlterTableTransactionBuilder<Modifying> {
             committer,
             self.correlation_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn builder_states_are_send_and_sync() {
+        assert_send_sync::<AlterTableTransactionBuilder<Ready>>();
+        assert_send_sync::<AlterTableTransactionBuilder<Modifying>>();
     }
 }

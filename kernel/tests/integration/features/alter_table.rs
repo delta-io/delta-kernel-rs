@@ -16,7 +16,8 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::DeltaResult;
+use delta_kernel::transaction::schema_evolution::AddField;
+use delta_kernel::{DeltaResult, Engine};
 use rstest::rstest;
 use test_utils::{
     add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
@@ -48,6 +49,39 @@ fn max_column_id(snap: &Snapshot) -> Option<i64> {
         .configuration()
         .get("delta.columnMapping.maxColumnId")
         .and_then(|v| v.parse().ok())
+}
+
+/// The public entry points into schema evolution. Both funnel through the same table-config
+/// evolution, so guards for features kernel cannot evolve yet must reject through either one.
+#[derive(Debug, Clone, Copy)]
+enum EvolutionEntryPoint {
+    AlterTable,
+    WriteTransaction,
+}
+
+fn unsupported_feature_message(feature: &str) -> String {
+    format!("Schema changes are not yet supported on tables with {feature} enabled")
+}
+
+/// Adds a column through `entry_point`, returning the error message it is rejected with.
+fn add_column_error(
+    snapshot: Arc<Snapshot>,
+    entry_point: EvolutionEntryPoint,
+    engine: &dyn Engine,
+) -> DeltaResult<String> {
+    let field = StructField::nullable("new_col", DataType::STRING);
+    let error = match entry_point {
+        EvolutionEntryPoint::AlterTable => snapshot
+            .alter_table()
+            .add_column(field)
+            .build(engine, committer())
+            .unwrap_err(),
+        EvolutionEntryPoint::WriteTransaction => snapshot
+            .transaction(committer(), engine)?
+            .with_schema_changes(vec![AddField::new(column_name!("new_col"), field).into()])
+            .unwrap_err(),
+    };
+    Ok(error.to_string())
 }
 
 // ============================================================================
@@ -909,8 +943,12 @@ async fn add_column_strip_is_none_mode_only(
     Ok(())
 }
 
+#[rstest]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn std::error::Error>> {
+async fn schema_evolution_blocked_when_iceberg_compat_v3_enabled(
+    #[values(EvolutionEntryPoint::AlterTable, EvolutionEntryPoint::WriteTransaction)]
+    entry_point: EvolutionEntryPoint,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let snapshot = create_table_and_load_snapshot(
         &table_path,
@@ -919,14 +957,9 @@ async fn alter_blocked_when_iceberg_compat_v3_enabled() -> Result<(), Box<dyn st
         &[("delta.enableIcebergCompatV3", "true")],
     )?;
 
-    let msg = snapshot
-        .alter_table()
-        .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build(engine.as_ref(), committer())
-        .unwrap_err()
-        .to_string();
+    let msg = add_column_error(snapshot, entry_point, engine.as_ref())?;
     assert!(
-        msg.contains("ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled"),
+        msg.contains(&unsupported_feature_message("icebergCompatV3")),
         "unexpected error: {msg}",
     );
 
@@ -968,9 +1001,12 @@ async fn add_column_with_orphan_default_metadata_succeeds() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rstest]
 #[tokio::test]
-async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn schema_evolution_blocked_when_allow_column_defaults_enabled(
+    #[values(EvolutionEntryPoint::AlterTable, EvolutionEntryPoint::WriteTransaction)]
+    entry_point: EvolutionEntryPoint,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_url) = engine_store_setup("alter_column_defaults", None);
     let table_url = create_test_table(
         store,
@@ -984,14 +1020,9 @@ async fn alter_blocked_when_allow_column_defaults_enabled() -> Result<(), Box<dy
     .await?;
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
 
-    let msg = snapshot
-        .alter_table()
-        .add_column(StructField::nullable("new_col", DataType::STRING))
-        .build(&engine, committer())
-        .unwrap_err()
-        .to_string();
+    let msg = add_column_error(snapshot, entry_point, &engine)?;
     assert!(
-        msg.contains("ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled"),
+        msg.contains(&unsupported_feature_message("allowColumnDefaults")),
         "unexpected error: {msg}",
     );
 
