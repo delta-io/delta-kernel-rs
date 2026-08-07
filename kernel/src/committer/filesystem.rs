@@ -163,6 +163,8 @@ mod tests {
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert_eq!(file_meta.last_modified, 12345);
+                // 214 = 19 prefix + 36 UUID + 46 format + 53 schema
+                //     + 22 partitions + 16 timestamp + 21 config + 1 newline.
                 assert_eq!(file_meta.size, 214);
                 assert!(file_meta
                     .location

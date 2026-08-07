@@ -893,6 +893,7 @@ mod tests {
 
         // Verify the first write is successful and reports the expected size.
         let write_result = result?;
+        // 32 = (10 JSON + 4 "remi" + 1 newline) + (10 JSON + 6 "wilson" + 1 newline).
         assert_eq!(write_result.size, 32);
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
@@ -906,6 +907,7 @@ mod tests {
         if overwrite {
             // Verify the second write is successful and reports the expected size.
             let write_result = result?;
+            // 28 = 2 * (10 JSON + 3 value + 1 newline).
             assert_eq!(write_result.size, 28);
             let json = read_json_file(&store, &object_path).await?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
@@ -934,6 +936,7 @@ mod tests {
         let stored_meta = store.head(&object_path).await?;
         let stored_bytes = store.get(&object_path).await?.bytes().await?;
 
+        // Zero rows serialize to zero bytes.
         assert_eq!(write_result.size, 0);
         assert_eq!(stored_meta.size, 0);
         assert!(stored_bytes.is_empty());

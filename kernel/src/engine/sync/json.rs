@@ -144,6 +144,7 @@ mod tests {
 
         // Verify the first write is successful and reports the expected size.
         let write_result = result?;
+        // 32 = (10 JSON + 4 "remi" + 1 newline) + (10 JSON + 6 "wilson" + 1 newline).
         assert_eq!(write_result.size, 32);
         let json = read_json_file(&path)?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
@@ -157,6 +158,7 @@ mod tests {
         if overwrite {
             // Verify the second write is successful and reports the expected size.
             let write_result = result?;
+            // 28 = 2 * (10 JSON + 3 value + 1 newline).
             assert_eq!(write_result.size, 28);
             let json = read_json_file(&path)?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
