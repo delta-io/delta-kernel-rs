@@ -699,7 +699,9 @@ pub fn evaluate_predicate(
                     }
                 }
                 (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                    let exists = ad.array_elements().contains(lit);
+                    // Logical (SQL) equality, so a NULL never matches -- not even another NULL.
+                    // `Scalar`'s `PartialEq` is physical and would match them structurally.
+                    let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
                     Ok(BooleanArray::from(vec![exists]))
                 }
                 (l, r) => Err(Error::invalid_expression(format!(
@@ -1118,6 +1120,7 @@ mod tests {
     use crate::expressions::{
         col, column_expr, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, Predicate as Pred,
+        StructData,
     };
     use crate::schema::{schema, schema_ref, ArrayType, DataType, StructField, StructType};
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -1973,6 +1976,80 @@ mod tests {
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result.null_count(), 0);
         assert_eq!(result.value(0), expected);
+    }
+
+    /// A NULL element matches nothing, not even a NULL needle: membership uses logical (SQL)
+    /// equality, where NULL is incomparable to everything including itself.
+    #[rstest]
+    #[case::null_needle_and_null_element(None, &[Some(1), None], false)]
+    #[case::null_needle_and_only_null_element(None, &[None], false)]
+    #[case::present_alongside_null_element(Some(1), &[Some(1), None], true)]
+    #[case::absent_alongside_null_element(Some(9), &[Some(1), None], false)]
+    fn test_in_null_element_matches_nothing(
+        #[case] needle: Option<i32>,
+        #[case] elements: &[Option<i32>],
+        #[case] expected: bool,
+    ) {
+        let elements: Vec<Scalar> = elements
+            .iter()
+            .map(|e| match e {
+                Some(n) => Scalar::Integer(*n),
+                None => Scalar::Null(DataType::INTEGER),
+            })
+            .collect();
+        let elements =
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), elements).unwrap();
+        let needle = match needle {
+            Some(n) => lit(n),
+            None => Expr::null_literal(DataType::INTEGER),
+        };
+
+        let pred = Pred::binary(
+            BinaryPredicateOp::In,
+            needle,
+            Expr::Literal(Scalar::Array(elements)),
+        );
+        let result = evaluate_predicate(&pred, &in_batch(), false).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(result.value(0), expected);
+
+        // `IN` never produces NULL, so `NOT IN` is always its exact complement.
+        let result = evaluate_predicate(&Pred::not(pred), &in_batch(), false).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert_eq!(result.value(0), !expected);
+    }
+
+    /// Struct/array/map elements have no logical comparison, so they never match. See
+    /// [`Scalar::logical_partial_cmp`].
+    #[test]
+    fn test_in_nested_element_never_matches() {
+        let make_struct = |v| {
+            Scalar::Struct(
+                StructData::try_new(
+                    vec![StructField::nullable("a", DataType::INTEGER)],
+                    vec![Scalar::Integer(v)],
+                )
+                .unwrap(),
+            )
+        };
+        let element_type: DataType =
+            StructType::try_new([StructField::nullable("a", DataType::INTEGER)])
+                .unwrap()
+                .into();
+        let elements = ArrayData::try_new(
+            ArrayType::new(element_type, true),
+            vec![make_struct(1), make_struct(2)],
+        )
+        .unwrap();
+
+        let pred = Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal(make_struct(1)),
+            Expr::Literal(Scalar::Array(elements)),
+        );
+        let result = evaluate_predicate(&pred, &in_batch(), false).unwrap();
+        assert_eq!(result.null_count(), 0);
+        assert!(!result.value(0));
     }
 
     /// Only a literal left operand is supported, so a column needle is rejected regardless of where

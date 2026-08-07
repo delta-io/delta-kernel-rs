@@ -95,6 +95,10 @@ pub enum BinaryPredicateOp {
     /// Testing a literal against a list column is the shape data skipping uses, and it is the
     /// reason the operands sit this way around rather than the more familiar
     /// column-on-the-left form.
+    ///
+    /// Membership uses logical (SQL) equality, so a NULL matches nothing -- not even another NULL.
+    /// Struct, array, and map elements have no logical comparison and therefore never match, even
+    /// when structurally identical. See [`Scalar::logical_partial_cmp`].
     In,
 }
 
