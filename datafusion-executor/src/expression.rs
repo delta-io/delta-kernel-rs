@@ -568,7 +568,8 @@ mod tests {
             .to_string()
     }
 
-    /// Input schema for top-level patch tests: `{ a: long, b: long }`.
+    /// Input struct `{ a: long, b: long }` for patch tests: the whole input schema for a top-level
+    /// patch, or the nested source struct for a nested one.
     fn ab_schema() -> StructType {
         StructType::try_new([
             StructField::nullable("a", DataType::LONG),
@@ -577,14 +578,11 @@ mod tests {
         .unwrap()
     }
 
-    /// Input nested struct `{ a: long, b: long }` for nested-patch tests.
-    fn pq_input_struct() -> DataType {
-        StructType::try_new([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable("b", DataType::LONG),
-        ])
-        .unwrap()
-        .into()
+    /// Asserts `res` is an error whose message contains `message`.
+    #[track_caller]
+    fn assert_error_message<T>(res: DeltaResult<T>, message: &str) {
+        let error = res.err().expect("expected an error").to_string();
+        assert!(error.contains(message), "{error}");
     }
 
     #[test]
@@ -663,18 +661,16 @@ mod tests {
     #[test]
     fn nested_patch_wraps_in_null_guard_case() {
         // Input schema: { s: { a: long, b: long } }. Patch replaces s.a with a literal.
-        let input = StructType::try_new([StructField::nullable("s", pq_input_struct())]).unwrap();
+        let input = StructType::try_new([StructField::nullable("s", ab_schema())]).unwrap();
         let patch = ExpressionStructPatchBuilder::new_nested(["s"])
             .replace("a", KernelExpr::literal(7i64))
             .build()
             .unwrap();
-        let rendered = lower_patch(patch, &input, &pq_struct());
-        assert!(
-            rendered.starts_with("CASE WHEN s IS NOT NULL THEN named_struct("),
-            "{rendered}"
+        assert_eq!(
+            lower_patch(patch, &input, &pq_struct()),
+            "CASE WHEN s IS NOT NULL THEN named_struct(Utf8(\"p\"), Int64(7), Utf8(\"q\"), \
+             get_field(s, Utf8(\"b\"))) ELSE NULL END"
         );
-        assert!(rendered.contains("get_field(s, Utf8(\"b\"))"), "{rendered}");
-        assert!(rendered.ends_with("END"), "{rendered}");
     }
 
     #[test]
@@ -689,7 +685,10 @@ mod tests {
         .unwrap()
         .into();
         let expr = KernelExpr::struct_patch(patch).unwrap();
-        to_df_expr(&expr, &ab_schema(), Some(&target)).unwrap_err();
+        assert_error_message(
+            to_df_expr(&expr, &ab_schema(), Some(&target)),
+            "StructPatch produced fewer fields than the output schema has",
+        );
     }
 
     #[test]
@@ -700,14 +699,20 @@ mod tests {
             .unwrap()
             .into();
         let expr = KernelExpr::struct_patch(patch).unwrap();
-        to_df_expr(&expr, &ab_schema(), Some(&target)).unwrap_err();
+        assert_error_message(
+            to_df_expr(&expr, &ab_schema(), Some(&target)),
+            "StructPatch produced more fields than the output schema has",
+        );
     }
 
     #[test]
     fn patch_without_target_is_unsupported() {
         let patch = ExpressionStructPatchBuilder::new().build().unwrap();
         let expr = KernelExpr::struct_patch(patch).unwrap();
-        to_df_expr(&expr, &ab_schema(), None).unwrap_err();
+        assert_error_message(
+            to_df_expr(&expr, &ab_schema(), None),
+            "converting a StructPatch expression requires a struct output type",
+        );
     }
 
     #[test]
@@ -718,7 +723,10 @@ mod tests {
             .unwrap();
         let expr = KernelExpr::struct_patch(patch).unwrap();
         let target: DataType = pq_struct().into();
-        to_df_expr(&expr, &ab_schema(), Some(&target)).unwrap_err();
+        assert_error_message(
+            to_df_expr(&expr, &ab_schema(), Some(&target)),
+            "StructPatch has non-optional field patches that reference missing input fields",
+        );
     }
 
     #[test]
