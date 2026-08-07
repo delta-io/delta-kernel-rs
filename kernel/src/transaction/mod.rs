@@ -391,7 +391,8 @@ impl<S> Transaction<S> {
 
         // If a data-changing transaction has add files together with remove files or DV updates,
         // block it when CDF is enabled. Kernel cannot discern DML operations. DML operations that
-        // update rows require a `cdc` file, but Kernel does not support writing CDC files.
+        // update rows require a `cdc` file, but Kernel does not currently support writing CDC
+        // files.
         if !self.is_create_table()
             && !self.add_files_metadata.is_empty()
             && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
