@@ -16,7 +16,6 @@ use crate::{
 ///
 /// Operations not yet implemented on the plan-execution path delegate to `fallback` when one is
 /// configured, and otherwise return an unsupported error.
-/// handler.
 pub struct PlanBasedParquetHandler {
     executor: Arc<dyn PlanExecutor>,
     fallback: Option<Arc<dyn ParquetHandler>>,
