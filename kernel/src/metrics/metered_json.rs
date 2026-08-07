@@ -164,7 +164,9 @@ mod tests {
             _data: DeltaResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
         ) -> DeltaResult<JsonWriteResult> {
-            Ok(JsonWriteResult::new(0))
+            Err(crate::Error::generic(
+                "StubJsonHandler does not support writes",
+            ))
         }
     }
 
