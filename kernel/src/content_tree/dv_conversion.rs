@@ -5,8 +5,7 @@ use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
 use crate::schema::{
-    column_name, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, StructField,
-    StructType,
+    column_name, ArrayType, ColumnName, DataType, SchemaRef, StructField, StructType,
 };
 use crate::{DeltaResult, EngineData, Error};
 
@@ -71,6 +70,43 @@ static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+/// Types of the DV descriptor leaves [`DecodedDvVisitor`] decodes, in getter order. Shared across
+/// all source layouts: only the *names* (the projection path to the DV struct) vary per layout, so
+/// they live on the visitor as [`DecodedDvVisitor::names`] rather than here.
+static DV_LEAF_TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
+    vec![
+        DataType::STRING,
+        DataType::STRING,
+        DataType::INTEGER,
+        DataType::INTEGER,
+        DataType::LONG,
+    ]
+});
+
+/// Projection paths locating the DV descriptor leaves in scan-transform rows, where the DV struct
+/// is projected at `deletionVector`. Pass to [`DecodedDvVisitor::new`].
+static SCAN_ROW_DV_COLUMNS: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
+    vec![
+        column_name!("deletionVector.storageType"),
+        column_name!("deletionVector.pathOrInlineDv"),
+        column_name!("deletionVector.offset"),
+        column_name!("deletionVector.sizeInBytes"),
+        column_name!("deletionVector.cardinality"),
+    ]
+});
+
+/// Projection paths locating the DV descriptor leaves in raw log batches, where the DV struct is
+/// nested under `add.deletionVector`. Pass to [`DecodedDvVisitor::new`].
+static ADD_DV_COLUMNS: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
+    vec![
+        column_name!("add.deletionVector.storageType"),
+        column_name!("add.deletionVector.pathOrInlineDv"),
+        column_name!("add.deletionVector.offset"),
+        column_name!("add.deletionVector.sizeInBytes"),
+        column_name!("add.deletionVector.cardinality"),
+    ]
+});
+
 /// Visits rows in one pass, accumulating decoded DV columns.
 ///
 /// For rows with a DV: decodes path (base85 UUID -> relative path), widens offset/sizeInBytes
@@ -84,22 +120,30 @@ static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// [`Self::append_decoded_dv_columns`], so visit exactly the batch you pass there. Reusing one
 /// visitor across batches would append the concatenated columns onto only the last batch, with
 /// mismatched row counts.
+///
+/// The visitor is layout-agnostic: it reads getters positionally and shares the leaf *types* (via
+/// [`DV_LEAF_TYPES`]). The projection locating the DV struct in the source layout is injected at
+/// construction as [`Self::names`] (e.g. [`SCAN_ROW_DV_COLUMNS`] or [`ADD_DV_COLUMNS`]), so the
+/// visitor is self-describing and drives [`RowVisitor::visit_rows_of`] directly.
 struct DecodedDvVisitor {
+    /// Projection paths to the DV descriptor leaves, in getter order, matching [`DV_LEAF_TYPES`].
+    names: &'static [ColumnName],
     decoded_paths: Vec<Scalar>,
     decoded_offsets: Vec<Scalar>,
     decoded_sizes: Vec<Scalar>,
     decoded_cardinalities: Vec<Scalar>,
-    is_log_batch: bool,
 }
 
 impl DecodedDvVisitor {
-    fn with_capacity(n: usize, is_log_batch: bool) -> Self {
+    /// Builds a visitor reading the DV descriptor leaves at `names` (see [`SCAN_ROW_DV_COLUMNS`] /
+    /// [`ADD_DV_COLUMNS`]), pre-sized for `n` rows.
+    fn new(names: &'static [ColumnName], n: usize) -> Self {
         Self {
+            names,
             decoded_paths: Vec::with_capacity(n),
             decoded_offsets: Vec::with_capacity(n),
             decoded_sizes: Vec::with_capacity(n),
             decoded_cardinalities: Vec::with_capacity(n),
-            is_log_batch,
         }
     }
 
@@ -127,16 +171,6 @@ impl DecodedDvVisitor {
         self.decoded_cardinalities.push(cardinality);
     }
 
-    /// Visitor for scan-transform rows, where DV fields are projected at `deletionVector.*`.
-    fn for_scan_rows(n: usize) -> Self {
-        Self::with_capacity(n, false)
-    }
-
-    /// Visitor for raw log batches, where DV fields are nested under `add.deletionVector.*`.
-    fn for_log_batch(n: usize) -> Self {
-        Self::with_capacity(n, true)
-    }
-
     fn has_any_dv(&self) -> bool {
         self.decoded_paths.iter().any(|s| !s.is_null())
     }
@@ -159,45 +193,7 @@ impl DecodedDvVisitor {
 
 impl RowVisitor for DecodedDvVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        if self.is_log_batch {
-            static LOG_BATCH: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                let names = vec![
-                    column_name!("add.deletionVector.storageType"),
-                    column_name!("add.deletionVector.pathOrInlineDv"),
-                    column_name!("add.deletionVector.offset"),
-                    column_name!("add.deletionVector.sizeInBytes"),
-                    column_name!("add.deletionVector.cardinality"),
-                ];
-                let types = vec![
-                    DataType::STRING,
-                    DataType::STRING,
-                    DataType::INTEGER,
-                    DataType::INTEGER,
-                    DataType::LONG,
-                ];
-                (names, types).into()
-            });
-            LOG_BATCH.as_ref()
-        } else {
-            static SCAN_ROW: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
-                let names = vec![
-                    column_name!("deletionVector.storageType"),
-                    column_name!("deletionVector.pathOrInlineDv"),
-                    column_name!("deletionVector.offset"),
-                    column_name!("deletionVector.sizeInBytes"),
-                    column_name!("deletionVector.cardinality"),
-                ];
-                let types = vec![
-                    DataType::STRING,
-                    DataType::STRING,
-                    DataType::INTEGER,
-                    DataType::INTEGER,
-                    DataType::LONG,
-                ];
-                (names, types).into()
-            });
-            SCAN_ROW.as_ref()
-        }
+        (self.names, &DV_LEAF_TYPES)
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
@@ -237,7 +233,7 @@ mod tests {
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
-    use crate::schema::ToSchema;
+    use crate::schema::{ColumnNamesAndTypes, ToSchema};
     use crate::Engine;
 
     /// Decoded DV columns read back from an augmented batch, one entry per row.
@@ -406,10 +402,12 @@ mod tests {
                 .unwrap()
         }
 
-        fn visitor(self, n: usize) -> DecodedDvVisitor {
+        /// Projection paths locating the DV struct leaves for this shape, matching
+        /// [`Self::schema`].
+        fn columns(self) -> &'static [ColumnName] {
             match self {
-                DvColumnShape::ScanRow => DecodedDvVisitor::for_scan_rows(n),
-                DvColumnShape::LogBatch => DecodedDvVisitor::for_log_batch(n),
+                DvColumnShape::ScanRow => &SCAN_ROW_DV_COLUMNS,
+                DvColumnShape::LogBatch => &ADD_DV_COLUMNS,
             }
         }
     }
@@ -423,7 +421,7 @@ mod tests {
         dvs: &[Option<DeletionVectorDescriptor>],
     ) -> Result<DecodedColumnsVisitor, Box<dyn std::error::Error>> {
         let data = shape.engine_data(dvs);
-        let mut decoder = shape.visitor(dvs.len());
+        let mut decoder = DecodedDvVisitor::new(shape.columns(), dvs.len());
         decoder.visit_rows_of(data.as_ref())?;
 
         let augmented = decoder.append_decoded_dv_columns(data.as_ref())?;
@@ -496,7 +494,7 @@ mod tests {
         let dvs: Vec<Option<DeletionVectorDescriptor>> =
             presence.iter().map(|p| p.map(|()| sample_dv())).collect();
         let data = DvColumnShape::ScanRow.engine_data(&dvs);
-        let mut decoder = DvColumnShape::ScanRow.visitor(dvs.len());
+        let mut decoder = DecodedDvVisitor::new(DvColumnShape::ScanRow.columns(), dvs.len());
         decoder.visit_rows_of(data.as_ref())?;
         assert_eq!(decoder.has_any_dv(), expected);
         Ok(())
@@ -530,7 +528,7 @@ mod tests {
         );
         let data = shape.engine_data_for(nullable_dv_schema, partial_dv);
 
-        let mut decoder = shape.visitor(1);
+        let mut decoder = DecodedDvVisitor::new(shape.columns(), 1);
         assert_result_error_with_message(decoder.visit_rows_of(data.as_ref()), "pathOrInlineDv");
     }
 
