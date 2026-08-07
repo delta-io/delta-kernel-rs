@@ -260,6 +260,13 @@ impl From<&Agg> for proto_plan::Agg {
             Agg::Max(value) => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
+            Agg::Sum(value) => proto_agg::Func::Sum(proto_plan::SumAgg {
+                value: Some(value.into()),
+            }),
+            Agg::Count(value) => proto_agg::Func::Count(proto_plan::CountAgg {
+                value: Some(value.into()),
+            }),
+            Agg::CountStar => proto_agg::Func::CountStar(proto_plan::CountStarAgg {}),
             Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some((&operands.value).into()),
@@ -1478,6 +1485,9 @@ mod tests {
     #[rstest]
     #[case(Agg::min(ColumnName::new(["a"])), "min")]
     #[case(Agg::max(ColumnName::new(["a"])), "max")]
+    #[case(Agg::sum(ColumnName::new(["a"])), "sum")]
+    #[case(Agg::count(ColumnName::new(["a"])), "count")]
+    #[case(Agg::count_star(), "count_star")]
     #[case(Agg::min_non_null_by(
         ColumnName::new(["a"]),
         ColumnName::new(["s"]),
@@ -1494,6 +1504,9 @@ mod tests {
         let kind = match proto.func.unwrap() {
             Func::Min(_) => "min",
             Func::Max(_) => "max",
+            Func::Sum(_) => "sum",
+            Func::Count(_) => "count",
+            Func::CountStar(_) => "count_star",
             Func::MinNonNullBy(_) => "min_non_null_by",
             Func::MaxNonNullBy(_) => "max_non_null_by",
         };

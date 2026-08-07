@@ -29,7 +29,7 @@ trait AggUpdater {
 
 /// Bound aggregate operator: init/prepare/materialize with type-erased per-group state.
 trait BoundAggregate {
-    /// Creates a new agg state (i.e. NULL for MIN/MAX)
+    /// Creates a new agg state (i.e. NULL for MIN, 0 for COUNT)
     fn init_state(&self) -> Box<dyn Any>;
     /// Creates an `AggUpdater` for processing the rows of `batch`
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> DeltaResult<Box<dyn AggUpdater + 'a>>;
@@ -38,8 +38,8 @@ trait BoundAggregate {
 }
 
 /// Evaluates an [`Aggregate`].
-///
-/// Currently supports Min, Max, MinNonNullBy, and MaxNonNullBy. Comparison operands are LONG-only.
+/// Currently supports Min, Max, Sum, Count, CountStar, MinNonNullBy, and MaxNonNullBy. Comparison
+/// and arithmetic operands are LONG-only; Count accepts an arbitrary column or `COUNT(*)`.
 pub(super) fn eval_aggregate(
     aggregate: &Aggregate,
     input: &[RecordBatch],
@@ -108,8 +108,17 @@ fn interleave_column_values(arrays: &[ArrayRef], indices: &[InputRow]) -> DeltaR
 
 fn bind_aggregate(agg: &Agg, output_type: &DataType) -> DeltaResult<Box<dyn BoundAggregate>> {
     match agg {
-        Agg::Min(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Min),
-        Agg::Max(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Max),
+        Agg::Min(value) => {
+            let op = LongAccumulator::MinMax(Comparison::Min);
+            LongAccumulatorAgg::try_new(value, output_type, op)
+        }
+        Agg::Max(value) => {
+            let op = LongAccumulator::MinMax(Comparison::Max);
+            LongAccumulatorAgg::try_new(value, output_type, op)
+        }
+        Agg::Sum(value) => LongAccumulatorAgg::try_new(value, output_type, LongAccumulator::Sum),
+        Agg::Count(value) => CountAgg::try_new(Some(value), output_type),
+        Agg::CountStar => CountAgg::try_new(None, output_type),
         Agg::MinNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Min),
         Agg::MaxNonNullBy(ops) => NonNullByAgg::try_new(ops, output_type, Comparison::Max),
     }
@@ -133,8 +142,8 @@ impl Comparison {
 
 #[derive(Clone, Copy)]
 enum LongAccumulator {
-    Min,
-    Max,
+    MinMax(Comparison),
+    Sum,
 }
 
 struct LongAccumulatorAgg {
@@ -150,7 +159,7 @@ impl LongAccumulatorAgg {
     ) -> DeltaResult<Box<dyn BoundAggregate>> {
         if output_type != &DataType::LONG {
             return Err(Error::unsupported(
-                "SyncPlanExecutor min/max aggregate with non-LONG value",
+                "SyncPlanExecutor min/max/sum aggregate with non-LONG value",
             ));
         }
         Ok(Box::new(Self {
@@ -194,17 +203,73 @@ impl AggUpdater for LongAccumulatorUpdater<'_> {
             let state = downcast_state_mut::<LongAccumulatorState>(state)?;
             let candidate = self.values.value(row_idx);
             match self.op {
-                LongAccumulator::Min => {
-                    if Comparison::Min.replaces(state.0, candidate) {
+                LongAccumulator::MinMax(cmp) => {
+                    if cmp.replaces(state.0, candidate) {
                         state.0 = Some(candidate);
                     }
                 }
-                LongAccumulator::Max => {
-                    if Comparison::Max.replaces(state.0, candidate) {
-                        state.0 = Some(candidate);
-                    }
+                LongAccumulator::Sum => {
+                    state.0 = Some(match state.0 {
+                        None => candidate,
+                        Some(sum) => i64::checked_add(sum, candidate).ok_or_else(|| {
+                            Error::generic("SyncPlanExecutor SUM aggregate overflowed i64")
+                        })?,
+                    });
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+/// COUNT non-null values of Some column, else count rows as COUNT(*)
+struct CountAgg(Option<ColumnName>);
+
+impl CountAgg {
+    fn try_new(
+        value: Option<&ColumnName>,
+        output_type: &DataType,
+    ) -> DeltaResult<Box<dyn BoundAggregate>> {
+        if output_type != &DataType::LONG {
+            return Err(Error::unsupported(
+                "SyncPlanExecutor count aggregate with non-LONG output",
+            ));
+        }
+        Ok(Box::new(Self(value.cloned())))
+    }
+}
+
+struct CountState(i64);
+
+impl BoundAggregate for CountAgg {
+    fn init_state(&self) -> Box<dyn Any> {
+        Box::new(CountState(0))
+    }
+
+    fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> DeltaResult<Box<dyn AggUpdater + 'a>> {
+        Ok(Box::new(CountUpdater(match &self.0 {
+            Some(name) => Some(extract_column_ref(batch, name)?),
+            None => None,
+        })))
+    }
+
+    fn finalize(&self, states: &[&dyn Any], _input: &[RecordBatch]) -> DeltaResult<ArrayRef> {
+        let values = states
+            .iter()
+            .map(|state| Ok(downcast_state::<CountState>(*state)?.0))
+            .collect::<DeltaResult<Vec<_>>>()?;
+        Ok(Arc::new(Int64Array::from(values)))
+    }
+}
+
+struct CountUpdater<'a>(Option<&'a ArrayRef>);
+
+impl AggUpdater for CountUpdater<'_> {
+    fn update(&self, state: &mut dyn Any, (_, row_idx): InputRow) -> DeltaResult<()> {
+        if self.0.is_none_or(|values| values.is_valid(row_idx)) {
+            let state = downcast_state_mut::<CountState>(state)?;
+            state.0 = i64::checked_add(state.0, 1)
+                .ok_or_else(|| Error::generic("SyncPlanExecutor COUNT aggregate overflowed i64"))?;
         }
         Ok(())
     }
@@ -373,6 +438,9 @@ mod tests {
                 ),
                 Agg::max(column_name!("key")),
                 Agg::min(column_name!("key")),
+                Agg::sum(column_name!("key")),
+                Agg::count(column_name!("sentinel")),
+                Agg::count_star(),
             ],
             schema: schema_ref! {
                 not_null "group": STRING,
@@ -380,6 +448,9 @@ mod tests {
                 nullable "minimum": STRING,
                 nullable "max_key": LONG,
                 nullable "min_key": LONG,
+                nullable "sum_key": LONG,
+                not_null "qualified": LONG,
+                not_null "rows": LONG,
             },
         };
 
@@ -390,6 +461,9 @@ mod tests {
         let minimums = extract_string_column(output, &column_name!("minimum"))?;
         let max_keys = extract_long_column(output, &column_name!("max_key"))?;
         let min_keys = extract_long_column(output, &column_name!("min_key"))?;
+        let sum_keys = extract_long_column(output, &column_name!("sum_key"))?;
+        let qualified = extract_long_column(output, &column_name!("qualified"))?;
+        let rows = extract_long_column(output, &column_name!("rows"))?;
         let results: HashMap<_, _> = (0..output.num_rows())
             .map(|row| {
                 (
@@ -399,13 +473,19 @@ mod tests {
                         minimums.is_valid(row).then(|| minimums.value(row)),
                         max_keys.is_valid(row).then(|| max_keys.value(row)),
                         min_keys.is_valid(row).then(|| min_keys.value(row)),
+                        sum_keys.is_valid(row).then(|| sum_keys.value(row)),
+                        qualified.value(row),
+                        rows.value(row),
                     ),
                 )
             })
             .collect();
 
-        assert_eq!(results["a"], (Some("high"), Some("low"), Some(3), Some(1)));
-        assert_eq!(results["b"], (None, None, None, None));
+        assert_eq!(
+            results["a"],
+            (Some("high"), Some("low"), Some(3), Some(1), Some(4), 2, 2)
+        );
+        assert_eq!(results["b"], (None, None, None, None, None, 0, 1));
         Ok(())
     }
 
@@ -463,6 +543,9 @@ mod tests {
             aggs: vec![
                 Agg::min(column_name!("key")),
                 Agg::max(column_name!("key")),
+                Agg::sum(column_name!("key")),
+                Agg::count(column_name!("sentinel")),
+                Agg::count_star(),
                 Agg::min_non_null_by(
                     column_name!("value"),
                     column_name!("sentinel"),
@@ -477,6 +560,9 @@ mod tests {
             schema: schema_ref! {
                 nullable "minimum": LONG,
                 nullable "maximum": LONG,
+                nullable "total": LONG,
+                not_null "qualified": LONG,
+                not_null "rows": LONG,
                 nullable "first": STRING,
                 nullable "last": STRING,
             },
@@ -487,6 +573,15 @@ mod tests {
         assert_eq!(output.num_rows(), 1);
         assert!(extract_long_column(output, &column_name!("minimum"))?.is_null(0));
         assert!(extract_long_column(output, &column_name!("maximum"))?.is_null(0));
+        assert!(extract_long_column(output, &column_name!("total"))?.is_null(0));
+        assert_eq!(
+            extract_long_column(output, &column_name!("qualified"))?.value(0),
+            0
+        );
+        assert_eq!(
+            extract_long_column(output, &column_name!("rows"))?.value(0),
+            0
+        );
         assert!(extract_string_column(output, &column_name!("first"))?.is_null(0));
         assert!(extract_string_column(output, &column_name!("last"))?.is_null(0));
 
@@ -536,6 +631,7 @@ mod tests {
             group_by: vec![column_name!("outer.group")],
             aggs: vec![
                 Agg::min(column_name!("outer.key")),
+                Agg::count(column_name!("outer.sentinel")),
                 Agg::max_non_null_by(
                     column_name!("outer.value"),
                     column_name!("outer.sentinel"),
@@ -545,6 +641,7 @@ mod tests {
             schema: schema_ref! {
                 not_null "group": STRING,
                 nullable "minimum": LONG,
+                not_null "qualified": LONG,
                 nullable "winner": STRING,
             },
         };
@@ -558,6 +655,10 @@ mod tests {
         assert_eq!(
             extract_long_column(output, &column_name!("minimum"))?.value(0),
             7
+        );
+        assert_eq!(
+            extract_long_column(output, &column_name!("qualified"))?.value(0),
+            1
         );
         assert_eq!(
             extract_string_column(output, &column_name!("winner"))?.value(0),
