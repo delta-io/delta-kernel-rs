@@ -115,6 +115,8 @@ the `default-engine/` crate.
 return `DeltaResult`. Public `Error` values have exactly one origin: `Error::Delta` carries a
 structured Delta condition, and `Error::Engine` carries a typed engine failure. Preserve engine
 sources when adapting errors so retry detection and connector diagnostics retain their origin.
+`DeltaErrorCode` metadata is generated from the pinned OSS Delta catalog plus Kernel-owned entries
+under `kernel/src/error/catalog/`; edit those JSON inputs rather than generated Rust.
 
 **EngineData:** opaque columnar data interface. NEVER access `EngineData` columns
 directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` accessors).

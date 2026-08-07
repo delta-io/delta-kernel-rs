@@ -105,7 +105,9 @@ engines only need to replace specific handlers -- they can reuse defaults for th
 Engine handler and evaluator methods return `EngineResult`, which carries a typed `EngineError`.
 Kernel-facing APIs return `DeltaResult`. At that boundary, the public `Error` distinguishes
 structured Delta conditions (`Error::Delta`) from connector-provided engine failures
-(`Error::Engine`) without discarding the underlying source.
+(`Error::Engine`) without discarding the underlying source. The complete `DeltaErrorCode` catalog
+is generated at build time from a pinned OSS Delta JSON catalog and a separate Kernel-owned JSON
+catalog; semantic constructors remain handwritten so they can retain typed parameters and sources.
 
 ## EngineData Trait
 

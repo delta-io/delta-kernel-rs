@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "https://github.com/delta-io/delta",
+    "path": "spark/src/main/resources/error/delta-error-classes.json",
+    "commit": "3d5207529591dfeb2ddfa0ca3111b4b64dcb7a3e",
+    "sha256": "9a6f0b50ec1e474441458634f401dc4a99e6a7499cbc40f6930fb3a1e26ff388",
+    "license": "Apache-2.0"
+  },
+  "expectedCounts": {
+    "topLevelClasses": 511,
+    "subclasses": 48
+  }
+}

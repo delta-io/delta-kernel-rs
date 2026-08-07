@@ -417,117 +417,7 @@ impl Error {
     }
 }
 
-/// Stable, string-identified Delta error conditions.
-///
-/// Enum layout and discriminant values are deliberately unspecified. Consumers must persist or
-/// transmit [`Self::condition`] rather than casting this enum to an integer.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum DeltaErrorCode {
-    /// A Delta log already exists at the requested creation path.
-    DeltaLogAlreadyExists,
-    /// A requested table version is outside the available version range.
-    DeltaVersionNotFound,
-    /// A multipart checkpoint is missing one or more part files.
-    DeltaMissingPartFiles,
-    /// Protocol or metadata state could not be reconstructed.
-    DeltaStateRecoverError,
-    /// A table requires an unsupported protocol version.
-    DeltaInvalidProtocolVersion,
-    /// A table requires unsupported reader features.
-    DeltaUnsupportedFeaturesForRead,
-    /// A table requires unsupported writer features.
-    DeltaUnsupportedFeaturesForWrite,
-    /// Delta log versions needed to reconstruct a table are not contiguous.
-    DeltaVersionsNotContiguous,
-    /// A kernel failure without a specific Delta condition.
-    DeltaKernelUnclassified,
-}
-
-impl DeltaErrorCode {
-    /// Returns the stable string identity of this condition.
-    pub const fn condition(self) -> &'static str {
-        match self {
-            Self::DeltaLogAlreadyExists => "DELTA_LOG_ALREADY_EXISTS",
-            Self::DeltaVersionNotFound => "DELTA_VERSION_NOT_FOUND",
-            Self::DeltaMissingPartFiles => "DELTA_MISSING_PART_FILES",
-            Self::DeltaStateRecoverError => "DELTA_STATE_RECOVER_ERROR",
-            Self::DeltaInvalidProtocolVersion => "DELTA_INVALID_PROTOCOL_VERSION",
-            Self::DeltaUnsupportedFeaturesForRead => "DELTA_UNSUPPORTED_FEATURES_FOR_READ",
-            Self::DeltaUnsupportedFeaturesForWrite => "DELTA_UNSUPPORTED_FEATURES_FOR_WRITE",
-            Self::DeltaVersionsNotContiguous => "DELTA_VERSIONS_NOT_CONTIGUOUS",
-            Self::DeltaKernelUnclassified => "DELTA_KERNEL_UNCLASSIFIED",
-        }
-    }
-
-    /// Returns the SQLSTATE associated with this condition, when defined.
-    pub const fn sql_state(self) -> Option<&'static str> {
-        match self {
-            Self::DeltaLogAlreadyExists => Some("42K04"),
-            Self::DeltaVersionNotFound => Some("22003"),
-            Self::DeltaMissingPartFiles => Some("42KD6"),
-            Self::DeltaStateRecoverError => Some("XXKDS"),
-            Self::DeltaInvalidProtocolVersion => Some("KD004"),
-            Self::DeltaUnsupportedFeaturesForRead | Self::DeltaUnsupportedFeaturesForWrite => {
-                Some("56038")
-            }
-            Self::DeltaVersionsNotContiguous => Some("KD00C"),
-            Self::DeltaKernelUnclassified => None,
-        }
-    }
-
-    /// Returns the ordered names of this condition's message parameters.
-    pub const fn parameter_names(self) -> &'static [&'static str] {
-        match self {
-            Self::DeltaLogAlreadyExists => &["path"],
-            Self::DeltaVersionNotFound => &["userVersion", "earliest", "latest"],
-            Self::DeltaMissingPartFiles => &["version"],
-            Self::DeltaStateRecoverError => &["operation", "version"],
-            Self::DeltaInvalidProtocolVersion => &[
-                "tableNameOrPath",
-                "readerRequired",
-                "writerRequired",
-                "deltaVersion",
-                "supportedReaders",
-                "supportedWriters",
-            ],
-            Self::DeltaUnsupportedFeaturesForRead | Self::DeltaUnsupportedFeaturesForWrite => {
-                &["tableNameOrPath", "deltaVersion", "unsupported"]
-            }
-            Self::DeltaVersionsNotContiguous => {
-                &["versionList", "startVersion", "endVersion", "versionToLoad"]
-            }
-            Self::DeltaKernelUnclassified => &[],
-        }
-    }
-
-    pub(crate) const fn message_template(self) -> &'static str {
-        match self {
-            Self::DeltaLogAlreadyExists => "A Delta log already exists at <path>.",
-            Self::DeltaVersionNotFound => "Cannot time travel Delta table to version <userVersion>. Available versions: [<earliest>, <latest>].",
-            Self::DeltaMissingPartFiles => "Couldn't find all part files of the checkpoint version: <version>.",
-            Self::DeltaStateRecoverError => "The <operation> of your Delta table could not be recovered while reconstructing version <version>. Did you manually delete files in the _delta_log directory?",
-            Self::DeltaInvalidProtocolVersion => "Unsupported Delta protocol version: table \"<tableNameOrPath>\" requires reader version <readerRequired> and writer version <writerRequired>, but Delta Lake \"<deltaVersion>\" supports reader versions <supportedReaders> and writer versions <supportedWriters>. Please upgrade to a newer release.",
-            Self::DeltaUnsupportedFeaturesForRead => "Unsupported Delta read feature: table \"<tableNameOrPath>\" requires reader table feature(s) that are unsupported by Delta Lake \"<deltaVersion>\": <unsupported>.",
-            Self::DeltaUnsupportedFeaturesForWrite => "Unsupported Delta write feature: table \"<tableNameOrPath>\" requires writer table feature(s) that are unsupported by Delta Lake \"<deltaVersion>\": <unsupported>.",
-            Self::DeltaVersionsNotContiguous => "Versions (<versionList>) are not contiguous. A gap in the Delta log between versions <startVersion> and <endVersion> was detected while trying to load version <versionToLoad>.",
-            Self::DeltaKernelUnclassified => "An unclassified Delta Kernel error occurred.",
-        }
-    }
-}
-
-#[cfg(test)]
-const ALL_DELTA_ERROR_CODES: &[DeltaErrorCode] = &[
-    DeltaErrorCode::DeltaLogAlreadyExists,
-    DeltaErrorCode::DeltaVersionNotFound,
-    DeltaErrorCode::DeltaMissingPartFiles,
-    DeltaErrorCode::DeltaStateRecoverError,
-    DeltaErrorCode::DeltaInvalidProtocolVersion,
-    DeltaErrorCode::DeltaUnsupportedFeaturesForRead,
-    DeltaErrorCode::DeltaUnsupportedFeaturesForWrite,
-    DeltaErrorCode::DeltaVersionsNotContiguous,
-    DeltaErrorCode::DeltaKernelUnclassified,
-];
+include!(concat!(env!("OUT_DIR"), "/delta_error_codes.rs"));
 
 /// A named message parameter carried by a [`DeltaError`].
 #[derive(Debug, Eq, PartialEq)]
@@ -1400,55 +1290,66 @@ mod tests {
     #[test]
     fn catalog_has_unique_string_conditions_and_matching_parameters() {
         let mut conditions = HashSet::new();
-        for code in ALL_DELTA_ERROR_CODES {
+        assert_eq!(DeltaErrorCode::all().len(), 560);
+        for &code in DeltaErrorCode::all() {
             assert!(conditions.insert(code.condition()));
-            let template = code.message_template();
-            let placeholders: Vec<&str> = template
+            assert_eq!(DeltaErrorCode::from_condition(code.condition()), Some(code));
+
+            let mut placeholders = code
+                .message_template()
                 .split('<')
                 .skip(1)
                 .filter_map(|suffix| suffix.split_once('>').map(|(name, _)| name))
-                .collect();
+                .collect::<Vec<_>>();
+            let mut seen_parameters = HashSet::new();
+            placeholders.retain(|name| seen_parameters.insert(*name));
             assert_eq!(placeholders, code.parameter_names(), "{}", code.condition());
         }
+        assert!(DeltaErrorCode::from_condition("NOT_A_DELTA_CONDITION").is_none());
+
+        let subclass = DeltaErrorCode::from_condition("DELTA_METADATA_MISMATCH.SCHEMA_MISMATCH")
+            .expect("OSS subclass should be generated");
+        assert_eq!(subclass.sql_state(), Some("42KDG"));
+        assert_eq!(
+            subclass.parameter_names(),
+            &["id", "tableSchema", "dataSchema"]
+        );
     }
 
     #[test]
-    fn curated_conditions_match_pinned_sqlstates_and_parameter_names() {
-        let catalog: Value =
-            serde_json::from_str(include_str!("error/delta-error-codes-curated.json")).unwrap();
+    fn catalog_joins_message_fragments_with_newlines() {
+        let code = DeltaErrorCode::from_condition("DELTA_CANNOT_DROP_CHECK_CONSTRAINT_FEATURE")
+            .expect("OSS condition should be generated");
         assert_eq!(
-            catalog["source"]["repository"].as_str(),
-            Some("delta-io/delta")
+            code.message_template(),
+            concat!(
+                "Cannot drop the CHECK constraints table feature.\n",
+                "The following constraints must be dropped first: <constraints>."
+            )
         );
+    }
+
+    #[test]
+    fn catalog_joins_parent_and_subclass_templates_with_one_space() {
+        let code = DeltaErrorCode::from_condition("DELTA_METADATA_MISMATCH.OVERWRITE_REQUIRED")
+            .expect("OSS subclass should be generated");
         assert_eq!(
-            catalog["source"]["commit"].as_str(),
-            Some("8ba5e37b9a21aba2859cdd09063d561928f7c641")
+            code.message_template(),
+            concat!(
+                "A metadata mismatch was detected when writing to the Delta table. ",
+                "To overwrite your schema or change partitioning, please set: ",
+                "'.option(\"overwriteSchema\", \"true\")'.\n",
+                "Note that the schema can't be overwritten when using 'replaceWhere'."
+            )
         );
-        let conditions = &catalog["conditions"];
-        assert_eq!(
-            conditions.as_object().unwrap().len(),
-            ALL_DELTA_ERROR_CODES.len() - 1
-        );
-        for code in ALL_DELTA_ERROR_CODES {
-            if code == &DeltaErrorCode::DeltaKernelUnclassified {
-                continue;
-            }
-            let entry = &conditions[code.condition()];
-            assert!(entry.is_object(), "missing {}", code.condition());
-            assert_eq!(entry["sqlState"].as_str(), code.sql_state());
-            let parameter_names: Vec<_> = entry["parameterNames"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|name| name.as_str().unwrap())
-                .collect();
-            assert_eq!(
-                parameter_names,
-                code.parameter_names(),
-                "{}",
-                code.condition()
-            );
-        }
+    }
+
+    #[test]
+    fn catalog_deduplicates_repeated_parameters_in_first_occurrence_order() {
+        let code = DeltaErrorCode::from_condition("DELTA_CANNOT_UPDATE_ARRAY_FIELD")
+            .expect("OSS condition should be generated");
+        assert_eq!(code.parameter_names(), &["tableName", "fieldName"]);
+        assert_eq!(code.message_template().matches("<fieldName>").count(), 2);
     }
 
     #[test]
@@ -1461,7 +1362,8 @@ mod tests {
         assert_eq!(error.sql_state(), Some("XXKDS"));
         assert_eq!(error.parameters()[0].name(), "operation");
         assert_eq!(error.parameters()[0].value(), "metadata");
-        assert!(error.to_string().contains("reconstructing version 12"));
+        assert!(error.to_string().contains("Reconstructing"));
+        assert!(error.to_string().contains("version: 12"));
         assert!(!error.to_string().contains("internal detail"));
         assert_eq!(error.source().unwrap().to_string(), "internal detail");
         let _ = error.backtrace();
@@ -1486,7 +1388,7 @@ mod tests {
         assert!(delta.as_engine_error().is_none());
         assert_eq!(
             delta.to_string(),
-            "[DELTA_LOG_ALREADY_EXISTS] A Delta log already exists at /table.\nSQLSTATE: 42K04"
+            "[DELTA_LOG_ALREADY_EXISTS] A Delta log already exists at /table\nSQLSTATE: 42K04"
         );
 
         let engine = Error::file_not_found("/table/missing");

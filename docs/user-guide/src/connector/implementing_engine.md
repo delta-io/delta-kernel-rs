@@ -37,6 +37,10 @@ Kernel-originated failures use `Error::Delta`. For programmatic handling, inspec
 `DeltaError::condition()`, `sql_state()`, and named `parameters()`. Conditions, SQLSTATE values, and
 parameter names are stable; rendered messages are diagnostic and can change. Kernel failures
 without a specific Delta condition use `DELTA_KERNEL_UNCLASSIFIED` and have no SQLSTATE.
+`DeltaErrorCode::all()` exposes the pinned OSS Delta catalog plus Kernel-owned conditions, and
+`DeltaErrorCode::from_condition()` resolves a stable condition string. Catalog presence does not
+mean Kernel currently emits every condition; semantic constructors are added as Kernel implements
+the corresponding behavior.
 
 The data iterator passed to `write_json_file()` and `write_parquet_file()` still contains
 `DeltaResult` items because Kernel produces that input before calling the handler. The handler's

@@ -20,7 +20,9 @@ use tracing::debug;
 use super::workload::{ReadResult, SnapshotResult};
 use crate::data::assert_data_matches;
 
-const STRUCTURED_ERROR_CODES: &[DeltaErrorCode] = &[
+// Catalog membership alone does not mean Kernel emits a condition. Acceptance tests compare only
+// conditions with semantic mappings so catalog growth does not claim unimplemented behavior.
+const IMPLEMENTED_ERROR_CODES: &[DeltaErrorCode] = &[
     DeltaErrorCode::DeltaLogAlreadyExists,
     DeltaErrorCode::DeltaVersionNotFound,
     DeltaErrorCode::DeltaMissingPartFiles,
@@ -55,7 +57,7 @@ fn validate_error_condition(
 }
 
 fn is_structured_condition(condition: &str) -> bool {
-    STRUCTURED_ERROR_CODES
+    IMPLEMENTED_ERROR_CODES
         .iter()
         .any(|code| code.condition() == condition)
 }
@@ -221,7 +223,7 @@ pub fn validate_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_error_condition, STRUCTURED_ERROR_CODES};
+    use super::{validate_error_condition, IMPLEMENTED_ERROR_CODES};
 
     #[test]
     fn matching_error_condition_is_accepted() {
@@ -249,8 +251,8 @@ mod tests {
     }
 
     #[test]
-    fn every_structured_condition_is_compared_exactly() {
-        for code in STRUCTURED_ERROR_CODES {
+    fn every_implemented_condition_is_compared_exactly() {
+        for code in IMPLEMENTED_ERROR_CODES {
             let expected = code.condition();
             let error =
                 validate_error_condition(Some("OTHER_CONDITION"), expected, "error").unwrap_err();
