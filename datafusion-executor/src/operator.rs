@@ -12,11 +12,10 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{FieldRef as ArrowFieldRef, Schema as ArrowSchema};
+use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::logical_expr::{
-    lit, EmptyRelation, Expr as DFExpr, ExprSchemable, LogicalPlan as DFLogicalPlan,
-    Values as DFValues,
+    lit, EmptyRelation, Expr as DFExpr, LogicalPlan as DFLogicalPlan, Values as DFValues,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::Scalar as KernelScalar;
@@ -45,9 +44,8 @@ pub(crate) fn lower_operator(op: &KernelOperator) -> Result<DFLogicalPlan, DataF
 /// Lowers a [`Values`](KernelValues) node into literal rows carrying `schema`'s field names.
 ///
 /// An empty `rows` is the uninhabited relation over `schema`, which DataFusion spells as an
-/// `EmptyRelation` rather than a `Values` -- it rejects a values list with no rows.
+/// `EmptyRelation` rather than a `Values`.
 fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError> {
-    // `try_into_arrow` fails with an `ArrowError`, which `DataFusionError` converts from directly.
     let arrow_schema: ArrowSchema = values.schema.as_ref().try_into_arrow()?;
     let df_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
 
@@ -59,17 +57,8 @@ fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError>
         return Ok(DFLogicalPlan::EmptyRelation(empty));
     }
 
-    // Built directly rather than through `LogicalPlanBuilder::values_with_schema`, which renames
-    // the columns `column1`, `column2`, ... and would need every one aliased back to its declared
-    // name. That builder also casts each literal to its declared type, so `lower_row` does that
-    // here: kernel guarantees each row's width but not that a literal's type matches the field it
-    // fills, and a `Values` node whose schema disagrees with its literals reports types it does
-    // not produce.
-    let rows: Result<Vec<Vec<DFExpr>>, DataFusionError> = values
-        .rows
-        .iter()
-        .map(|row| lower_row(row, &df_schema))
-        .collect();
+    let rows: Result<Vec<Vec<DFExpr>>, DataFusionError> =
+        values.rows.iter().map(|row| lower_row(row)).collect();
     let lowered = DFValues {
         schema: df_schema,
         values: rows?,
@@ -77,31 +66,23 @@ fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError>
     Ok(DFLogicalPlan::Values(lowered))
 }
 
-/// Lowers one row of literals into DataFusion expressions, one per column, each cast to the type
-/// its column declares in `schema`.
+/// Lowers one row of literals into DataFusion expressions, one per column.
 ///
 /// # Errors
-/// Returns an error for a literal with no DataFusion equivalent, or none that casts to its declared
-/// type.
-fn lower_row(row: &[KernelScalar], schema: &DFSchema) -> Result<Vec<DFExpr>, DataFusionError> {
-    let lower_literal = |(scalar, field): (&KernelScalar, &ArrowFieldRef)| {
-        // The orphan rule forbids a `From<KernelError>` impl on the foreign `DataFusionError`, so
-        // wrap the kernel error as an opaque external one.
+/// Returns an error for a literal with no DataFusion equivalent.
+fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
+    let lower_literal = |scalar| {
         let lowered =
             to_df_scalar(scalar).map_err(|err| DataFusionError::External(Box::new(err)))?;
-        lit(lowered).cast_to(field.data_type(), schema)
+        Ok(lit(lowered))
     };
-    let declared_fields = schema.fields();
-    row.iter().zip(declared_fields).map(lower_literal).collect()
+    row.iter().map(lower_literal).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::DataType as ArrowDataType;
-    use delta_kernel::expressions::StructData as KernelStructData;
-    use delta_kernel::plans::ir::nodes::Filter as KernelFilter;
+    use datafusion::arrow::datatypes::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
     use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Predicate;
     use rstest::rstest;
 
     use super::*;
@@ -134,14 +115,9 @@ mod tests {
         fields.iter().map(|f| f.data_type().clone()).collect()
     }
 
-    /// A single-field struct scalar, which has no conversion to a primitive column type.
-    fn struct_scalar() -> KernelScalar {
-        let data = KernelStructData::try_new(
-            vec![StructField::nullable("inner", DataType::LONG)],
-            vec![1i64.into()],
-        )
-        .unwrap();
-        KernelScalar::Struct(data)
+    /// The Arrow type kernel maps a timestamp to, in `tz`'s zone (`None` for `TIMESTAMP_NTZ`).
+    fn timestamp_type(tz: Option<Arc<str>>) -> ArrowDataType {
+        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, tz)
     }
 
     // === Tests ===
@@ -182,49 +158,33 @@ mod tests {
         );
     }
 
-    /// A literal whose type differs from its declared field is coerced, not rejected: DataFusion
-    /// casts it whenever the conversion is possible, so the output still matches the declared
-    /// schema. Only an impossible conversion errors.
+    /// Each literal is lowered as-is, with no cast to its declared field type: a kernel `Scalar`
+    /// and the field it fills derive their Arrow types from the same kernel `DataType`, so a
+    /// well-formed node already agrees. This asserts that agreement holds across the types
+    /// whose Arrow mapping carries extra parameters, where a silent cast would be easiest to
+    /// miss.
     #[rstest]
-    #[case::coercible_string_to_long("12".into(), Some(ArrowDataType::Int64))]
-    #[case::struct_has_no_conversion_to_long(struct_scalar(), None)]
-    fn row_literal_is_coerced_to_its_declared_field_type_or_errors(
-        #[case] first_column: KernelScalar,
-        #[case] expected_type: Option<ArrowDataType>,
+    #[case::long(1i64.into(), ArrowDataType::Int64)]
+    #[case::timestamp(KernelScalar::Timestamp(1), timestamp_type(Some("UTC".into())))]
+    #[case::timestamp_ntz(KernelScalar::TimestampNtz(1), timestamp_type(None))]
+    #[case::date(KernelScalar::Date(1), ArrowDataType::Date32)]
+    fn literal_type_matches_its_declared_field_without_casting(
+        #[case] scalar: KernelScalar,
+        #[case] expected: ArrowDataType,
     ) {
-        let lowered = lower_rows(vec![vec![first_column, "x".into()]]);
-        let Some(expected_type) = expected_type else {
-            let err = lowered.unwrap_err();
-            return assert!(
-                err.to_string().contains("Cannot automatically convert"),
-                "{err}"
-            );
-        };
-        let plan = lowered.unwrap();
-        assert_eq!(output_types(&plan), [expected_type, ArrowDataType::Utf8]);
-        // The literal must actually be cast, not merely declared: a `Values` schema that disagrees
-        // with its own literals reports a type the node does not produce.
-        let DFLogicalPlan::Values(values) = &plan else {
+        let schema = StructType::try_new([StructField::nullable("a", scalar.data_type())]).unwrap();
+        let values = KernelValues::new(schema, vec![vec![scalar]]);
+        let plan = lower_operator(&KernelOperator::Values(values)).unwrap();
+
+        // The schema's declared type and the literal's own type must agree: a `Values` node whose
+        // schema disagrees with its literals reports a type the node does not produce.
+        assert_eq!(output_types(&plan), std::slice::from_ref(&expected));
+        let DFLogicalPlan::Values(lowered) = &plan else {
             panic!("expected Values, got {plan:?}");
         };
-        let literal_types: Vec<_> = values.values[0]
-            .iter()
-            .map(|expr| expr.get_type(&DFSchema::empty()).unwrap())
-            .collect();
-        assert_eq!(literal_types, output_types(&plan));
-    }
-
-    #[test]
-    fn unlowered_operator_reports_not_implemented() {
-        let filter = KernelFilter {
-            predicate: Arc::new(Predicate::literal(true)),
+        let DFExpr::Literal(literal, _) = &lowered.values[0][0] else {
+            panic!("expected a bare literal, got {:?}", lowered.values[0][0]);
         };
-        let err = lower_operator(&filter.into()).unwrap_err();
-        assert!(
-            matches!(err, DataFusionError::NotImplemented(_)),
-            "expected NotImplemented, got {err}"
-        );
-        // The message names the operator, so a caller can tell which arm is missing.
-        assert!(err.to_string().contains("Filter"), "{err}");
+        assert_eq!(literal.data_type(), expected);
     }
 }

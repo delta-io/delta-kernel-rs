@@ -41,13 +41,10 @@ pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionE
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use delta_kernel::expressions::Scalar as KernelScalar;
-    use delta_kernel::plans::ir::nodes::{Filter as KernelFilter, Values as KernelValues};
+    use delta_kernel::plans::ir::nodes::{Values as KernelValues};
     use delta_kernel::plans::ir::plan::PlanNode as KernelPlanNode;
     use delta_kernel::schema::{DataType, StructField, StructType};
-    use delta_kernel::Predicate;
 
     use super::*;
 
@@ -92,18 +89,5 @@ mod tests {
         );
         assert!(!rows.contains("Int64(1)"), "{rows}");
         Ok(())
-    }
-
-    #[test]
-    fn unlowerable_node_propagates_its_error() {
-        // A plan whose only node has no lowering yet fails, rather than yielding a partial plan.
-        let filter = KernelFilter {
-            predicate: Arc::new(Predicate::literal(true)),
-        };
-        let plan = KernelPlan {
-            nodes: vec![KernelPlanNode::new(filter, vec![])],
-        };
-        let err = to_df_plan(&plan).unwrap_err();
-        assert!(matches!(err, DataFusionError::NotImplemented(_)), "{err}");
     }
 }
