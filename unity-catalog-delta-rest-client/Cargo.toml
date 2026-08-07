@@ -8,14 +8,14 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 # for cargo-release
 [package.metadata.release]
 release = false
 
 [dependencies]
-unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api" }
+unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", version = "0.1.0" }
 # Hardcodes rustls (always used alongside default-engine-rustls in practice).
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "rustls", "system-proxy"] }
 percent-encoding = "2"
