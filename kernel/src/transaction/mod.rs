@@ -389,14 +389,13 @@ impl<S> Transaction<S> {
             validate_schema_for_write(&self.effective_table_config.logical_schema())?;
         }
 
-        // CDF check only applies to existing tables (not create table)
-        // If there are add and remove files with data change in the same transaction, we block it.
-        // This is because kernel does not yet have a way to discern DML operations. For DML
-        // operations that perform updates on rows, ChangeDataFeed requires that a `cdc` file be
-        // written to the delta log.
+        // If a data-changing transaction has add files together with remove files or DV updates,
+        // block it when CDF is enabled. Kernel cannot discern DML operations. DML operations that
+        // update rows require a `cdc` file, but Kernel does not currently support writing CDC
+        // files.
         if !self.is_create_table()
             && !self.add_files_metadata.is_empty()
-            && !self.remove_files_metadata.is_empty()
+            && (!self.remove_files_metadata.is_empty() || self.num_dv_updates > 0)
             && self.data_change
         {
             let cdf_enabled = self
