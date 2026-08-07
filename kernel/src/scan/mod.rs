@@ -1084,23 +1084,15 @@ impl Scan {
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        let log_segment = self.snapshot.log_segment();
-        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
-        // whether the checkpoint carries a compatible parsed-stats column.
+        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and retains the
+        // leaf schema when output or pruning requires checkpoint-specific columns.
         let plan_executor = engine.require_plan_executor()?;
-        let shape = CheckpointShape::try_new(
-            plan_executor.as_ref(),
-            &self.snapshot,
-            self.state_info.physical_stats_schema.as_ref(),
-        )?;
-        scan_plan::build_metadata_scan_plan(
-            &self.state_info,
-            log_segment,
-            &shape,
-            &self.stats,
-            &self.partition_values,
-            self.physical_stats_output_schema.as_ref(),
-        )
+        let needs_leaf_schema = self.stats.synthesize_json
+            || self.state_info.physical_stats_schema.is_some()
+            || self.partition_values.parsed_struct;
+        let shape =
+            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot, needs_leaf_schema)?;
+        self.build_metadata_scan_plan(&shape)
     }
 
     // Factored out to facilitate testing
