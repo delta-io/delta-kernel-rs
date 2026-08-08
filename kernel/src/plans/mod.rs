@@ -47,11 +47,14 @@
 //!   payload struct carries its semantics, invariants, and worked examples.
 //! - [`crate::expressions`] defines the expressions and predicates operators evaluate, including
 //!   the type and null semantics an executor must match.
+//! - [`state_machines`] defines resumable workflows for connectors that execute plans one request
+//!   at a time rather than implementing [`PlanExecutor`] directly.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
 mod builder;
 pub mod ir;
 pub mod proto;
+pub mod state_machines;
 
 pub use builder::PlanBuilder;
 use bytes::Bytes;

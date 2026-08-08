@@ -43,6 +43,7 @@ delta_kernel_derive = { path = "../derive-macros", version = "0.26.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
+genawaiter2 = { version = "0.100", optional = true }
 indexmap = "2.10.0"
 itertools = "0.14"
 percent-encoding = "2"
@@ -115,7 +116,13 @@ arrow-expression = ["need-arrow"]
 schema-diff = []
 
 # Declarative plan IR (experimental).
-declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored"]
+declarative-plans = [
+  "internal-api",
+  "dep:genawaiter2",
+  "dep:prost",
+  "dep:prost-build",
+  "dep:protoc-bin-vendored",
+]
 
 # Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
 # work: the SQL predicate parser and, later, `checkConstraints` write enforcement. Remove once
