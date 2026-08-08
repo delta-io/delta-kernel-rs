@@ -98,21 +98,16 @@ pub(crate) fn build_metadata_scan_plan(
         },
     )?;
 
-    let deduped_commit = commit_actions
-        // Wrap `add` so removes, whose inner `add` is null, survive `MaxNonNullBy`. Unwrap it
-        // after aggregation.
-        .project_patch(|patch| {
-            patch.replace(
-                ADD_NAME,
-                StructField::not_null(ADD_NAME, schema! { (add_field.clone()) }),
-                Expr::struct_from([col!("add")]),
-            )
-        })?
-        .aggregate_by([ColumnName::new([FILE_ACTION_KEY])], |a| {
-            a.max_non_null_by(ColumnName::new([ADD_NAME]), ColumnName::new([VERSION]))
-        })?
-        // We unwrap `add.add` to the top level now that MaxNonNullBy is complete.
-        .project_patch(|patch| patch.replace(ADD_NAME, add_field.clone(), col!("add.add")))?;
+    let deduped_commit = commit_actions.aggregate_by([column_name!(FILE_ACTION_KEY)], |a| {
+        // Each group with a non-null FILE_ACTION_KEY contains the adds and removes for a given
+        // file; winning adds pass through unchanged while winning removes produce NULL. All
+        // non-file actions map to a single group with NULL FILE_ACTION_KEY, and also produce NULL.
+        a.max_non_null_by(
+            column_name!(ADD_NAME),
+            column_name!(FILE_ACTION_KEY),
+            column_name!(VERSION),
+        )
+    })?;
 
     let checkpoint_adds = checkpoint_arm(log_segment, shape, stats_schema, partition_schema)?
         .try_fold_with(prune, |p, prune| p.filter(prune.clone()))?;
@@ -120,8 +115,8 @@ pub(crate) fn build_metadata_scan_plan(
     let checkpoint_live_adds = checkpoint_adds
         .anti_join(
             deduped_commit.clone(),
-            [ColumnName::new([FILE_ACTION_KEY])],
-            [ColumnName::new([FILE_ACTION_KEY])],
+            [column_name!(FILE_ACTION_KEY)],
+            [column_name!(FILE_ACTION_KEY)],
         )?
         .project(output_expr.clone(), output_schema.clone())?;
 
@@ -816,9 +811,7 @@ mod tests {
         "scan_json", // commits
         "filter",    // keep file actions
         "project",   // normalize
-        "project",   // wrap add for dedup
         "aggregate", // newest-action-per-key
-        "project",   // unwrap newest add
         "filter",    // live commit adds
         "project",   // extract add
     ];

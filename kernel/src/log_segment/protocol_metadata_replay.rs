@@ -175,8 +175,16 @@ impl LogSegment {
 
         let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
             .aggregate_ungrouped(|a| {
-                a.max_non_null_by(column_name!(PROTOCOL_NAME), column_name!("version"))
-                    .max_non_null_by(column_name!(METADATA_NAME), column_name!("version"))
+                a.max_non_null_by(
+                    column_name!(PROTOCOL_NAME),
+                    column_name!(PROTOCOL_NAME),
+                    column_name!("version"),
+                )
+                .max_non_null_by(
+                    column_name!(METADATA_NAME),
+                    column_name!(METADATA_NAME),
+                    column_name!("version"),
+                )
             })?
             .build()?;
 

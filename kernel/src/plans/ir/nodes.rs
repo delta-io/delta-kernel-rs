@@ -589,6 +589,7 @@ pub enum Agg {
 #[derive(Debug, Clone)]
 pub struct NonNullByOperands {
     pub value: ColumnName,
+    pub null_sentinel: ColumnName,
     pub key: ColumnName,
 }
 
@@ -618,39 +619,45 @@ impl Agg {
 
     /// Like [`max_non_null_by`](Self::max_non_null_by), but selects the `value` from the qualifying
     /// row with the *least* `key`.
-    pub fn min_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
+    pub fn min_non_null_by(
+        value: impl Into<ColumnName>,
+        null_sentinel: impl Into<ColumnName>,
+        key: impl Into<ColumnName>,
+    ) -> Self {
         Self::MinNonNullBy(NonNullByOperands {
             value: value.into(),
+            null_sentinel: null_sentinel.into(),
             key: key.into(),
         })
     }
 
-    /// The `value` from a row with the greatest `key`, considering only rows where both `value` and
-    /// `key` are non-NULL. Returns NULL if no qualifying row exists. It is unspecified which of
-    /// multiple rows with greatest `key` provides the winning `value`. The output is always
-    /// nullable, with name and type matching `value`.
+    /// The `value` from a row with the greatest `key` where `null_sentinel` and `key` are both
+    /// non-NULL. Returns NULL if no qualifying row exists. A winning `value` may itself be NULL. It
+    /// is unspecified which of multiple rows with greatest `key` provides the winning `value`. The
+    /// output is always nullable, with name and type matching `value`.
     ///
     /// ```text
-    ///  key | value  ->  c
-    /// -----+------
-    ///    1 | a
-    ///    3 | c          (greatest key among qualifying rows)
-    ///    5 | NULL       (ignored: NULL value)
-    /// NULL | e          (ignored: NULL key)
+    ///  key | sentinel | value  ->  NULL
+    /// -----+----------+------
+    ///    1 | present  | a
+    ///    3 | present  | c
+    ///    5 | present  | NULL       (greatest qualifying key; NULL value is retained)
+    ///    7 | NULL     | d          (ignored: NULL sentinel)
+    /// NULL | present  | e          (ignored: NULL key)
     ///
-    /// (no rows)   ->  NULL
+    /// (no rows)        ->  NULL
     /// ```
     ///
     /// Most systems with a native `max_by` only provide a two-arg form that considers all rows with
-    /// non-NULL keys. The non-NULL `value` check can be added manually in one of two ways:
+    /// non-NULL keys. The sentinel check can be added manually in one of two ways:
     ///
     /// ```sql
-    /// -- FILTER that drops NULL-value rows before aggregating
-    /// max_by(value, key) FILTER (WHERE value IS NOT NULL)
+    /// -- FILTER that drops NULL-sentinel rows before aggregating
+    /// max_by(value, key) FILTER (WHERE sentinel IS NOT NULL)
     ///
-    /// -- NULL out the key when value is NULL, which max_by then ignores. Use this where
+    /// -- NULL out the key when sentinel is NULL, which max_by then ignores. Use this where
     /// -- FILTER is unavailable, such as a DataFrame API with no filtered-aggregate form.
-    /// max_by(value, CASE WHEN value IS NOT NULL THEN key END)
+    /// max_by(value, CASE WHEN sentinel IS NOT NULL THEN key END)
     /// ```
     ///
     /// In systems without `max_by`, it can also be expressed using window functions, with the
@@ -670,12 +677,17 @@ impl Agg {
     ///             ORDER BY key DESC
     ///         ) AS rn
     ///     FROM input
-    ///     WHERE key IS NOT NULL AND value IS NOT NULL
+    ///     WHERE key IS NOT NULL AND null_sentinel IS NOT NULL
     /// ) WHERE rn = 1
     /// ```
-    pub fn max_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
+    pub fn max_non_null_by(
+        value: impl Into<ColumnName>,
+        null_sentinel: impl Into<ColumnName>,
+        key: impl Into<ColumnName>,
+    ) -> Self {
         Self::MaxNonNullBy(NonNullByOperands {
             value: value.into(),
+            null_sentinel: null_sentinel.into(),
             key: key.into(),
         })
     }
@@ -701,6 +713,7 @@ impl Agg {
             Agg::Min(value) | Agg::Max(value) => resolve(value),
             Agg::MinNonNullBy(operands) | Agg::MaxNonNullBy(operands) => {
                 let _ = input_schema.field_at(&operands.key)?;
+                let _ = input_schema.field_at(&operands.null_sentinel)?;
                 resolve(&operands.value)
             }
         }
@@ -747,14 +760,26 @@ impl AggregateBuilder {
         self.aggregate(Agg::max(value))
     }
 
-    /// Adds an unaliased [`Agg::min_non_null_by`] over `value`, keyed on `key`.
-    pub fn min_non_null_by(self, value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        self.aggregate(Agg::min_non_null_by(value, key))
+    /// Adds an unaliased [`Agg::min_non_null_by`] over `value`, qualifying rows with
+    /// `null_sentinel` and keyed on `key`.
+    pub fn min_non_null_by(
+        self,
+        value: impl Into<ColumnName>,
+        null_sentinel: impl Into<ColumnName>,
+        key: impl Into<ColumnName>,
+    ) -> Self {
+        self.aggregate(Agg::min_non_null_by(value, null_sentinel, key))
     }
 
-    /// Adds an unaliased [`Agg::max_non_null_by`] over `value`, keyed on `key`.
-    pub fn max_non_null_by(self, value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        self.aggregate(Agg::max_non_null_by(value, key))
+    /// Adds an unaliased [`Agg::max_non_null_by`] over `value`, qualifying rows with
+    /// `null_sentinel` and keyed on `key`.
+    pub fn max_non_null_by(
+        self,
+        value: impl Into<ColumnName>,
+        null_sentinel: impl Into<ColumnName>,
+        key: impl Into<ColumnName>,
+    ) -> Self {
+        self.aggregate(Agg::max_non_null_by(value, null_sentinel, key))
     }
 
     /// Resolves group keys and aggregators against the input schema and builds the [`Aggregate`].
@@ -920,11 +945,11 @@ mod tests {
     #[case::min(Agg::min(column_name!("a")), "a")]
     #[case::max(Agg::max(column_name!("a")), "a")]
     #[case::min_non_null_by(
-        Agg::min_non_null_by(column_name!("a"), column_name!("v")),
+        Agg::min_non_null_by(column_name!("a"), column_name!("s"), column_name!("v")),
         "a"
     )]
     #[case::max_non_null_by(
-        Agg::max_non_null_by(column_name!("a"), column_name!("v")),
+        Agg::max_non_null_by(column_name!("a"), column_name!("s"), column_name!("v")),
         "a"
     )]
     fn agg_output_nullability(
@@ -993,7 +1018,24 @@ mod tests {
     fn build_rejects_missing_non_null_by_key() {
         let input = schema(&[("a", true)]);
         let result = Aggregate::group_by(input, [])
-            .max_non_null_by(column_name!("a"), column_name!("missing"))
+            .max_non_null_by(
+                column_name!("a"),
+                column_name!("a"),
+                column_name!("missing"),
+            )
+            .build();
+        assert_result_error_with_message(result, "missing");
+    }
+
+    #[test]
+    fn build_rejects_missing_non_null_by_sentinel_column() {
+        let input = schema(&[("a", true), ("v", true)]);
+        let result = Aggregate::group_by(input, [])
+            .max_non_null_by(
+                column_name!("a"),
+                column_name!("missing"),
+                column_name!("v"),
+            )
             .build();
         assert_result_error_with_message(result, "missing");
     }

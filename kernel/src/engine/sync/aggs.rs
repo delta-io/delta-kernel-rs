@@ -210,10 +210,10 @@ impl AggUpdater for LongAccumulatorUpdater<'_> {
     }
 }
 
-/// Min/max-by selector: compare LONG keys among rows with non-NULL `value` and `key`, gather the
-/// winning `value`.
+/// Min/max-by selector: compare LONG keys among rows with a non-null sentinel, gather `value`.
 struct NonNullByAgg {
     value: ColumnName,
+    null_sentinel: ColumnName,
     key: ColumnName,
     comparison: Comparison,
     output_type: ArrowDataType,
@@ -227,6 +227,7 @@ impl NonNullByAgg {
     ) -> DeltaResult<Box<dyn BoundAggregate>> {
         Ok(Box::new(Self {
             value: operands.value.clone(),
+            null_sentinel: operands.null_sentinel.clone(),
             key: operands.key.clone(),
             comparison,
             output_type: output_type.try_into_arrow()?,
@@ -243,7 +244,7 @@ impl BoundAggregate for NonNullByAgg {
 
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> DeltaResult<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(NonNullByUpdater {
-            values: extract_column_ref(batch, &self.value)?,
+            null_sentinels: extract_column_ref(batch, &self.null_sentinel)?,
             keys: extract_long_column(batch, &self.key)?,
             comparison: self.comparison,
         }))
@@ -268,14 +269,14 @@ impl BoundAggregate for NonNullByAgg {
 }
 
 struct NonNullByUpdater<'a> {
-    values: &'a ArrayRef,
+    null_sentinels: &'a ArrayRef,
     keys: &'a Int64Array,
     comparison: Comparison,
 }
 
 impl AggUpdater for NonNullByUpdater<'_> {
     fn update(&self, state: &mut dyn Any, (batch_idx, row_idx): InputRow) -> DeltaResult<()> {
-        if self.values.is_valid(row_idx) && self.keys.is_valid(row_idx) {
+        if self.null_sentinels.is_valid(row_idx) && self.keys.is_valid(row_idx) {
             let state = downcast_state_mut::<NonNullByState>(state)?;
             let best = state.0.map(|(_, best)| best);
             let candidate = self.keys.value(row_idx);
@@ -322,7 +323,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::arrow::array::{StringArray, StructArray};
+    use crate::arrow::array::{BooleanArray, StringArray, StructArray};
     use crate::arrow::datatypes::Field;
     use crate::expressions::column_name;
     use crate::schema::schema_ref;
@@ -349,6 +350,10 @@ mod tests {
                 Arc::new(StringArray::from(vec!["low", "high", "none"])),
             ),
             (
+                "sentinel",
+                Arc::new(BooleanArray::from(vec![Some(true), Some(true), None])),
+            ),
+            (
                 "key",
                 Arc::new(Int64Array::from(vec![Some(1), Some(3), None])),
             ),
@@ -356,8 +361,16 @@ mod tests {
         let aggregate = Aggregate {
             group_by: vec![column_name!("group")],
             aggs: vec![
-                Agg::max_non_null_by(column_name!("value"), column_name!("key")),
-                Agg::min_non_null_by(column_name!("value"), column_name!("key")),
+                Agg::max_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
+                Agg::min_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
                 Agg::max(column_name!("key")),
                 Agg::min(column_name!("key")),
             ],
@@ -401,8 +414,16 @@ mod tests {
         let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![
-                Agg::min_non_null_by(column_name!("value"), column_name!("key")),
-                Agg::max_non_null_by(column_name!("value"), column_name!("key")),
+                Agg::min_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
+                Agg::max_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
             ],
             schema: schema_ref! {
                 nullable "minimum": STRING,
@@ -414,6 +435,7 @@ mod tests {
                 "value",
                 Arc::new(StringArray::from(vec!["low"])) as ArrayRef,
             ),
+            ("sentinel", Arc::new(BooleanArray::from(vec![true]))),
             ("key", Arc::new(Int64Array::from(vec![1]))),
         ])?;
         let second = RecordBatch::try_from_iter([
@@ -421,6 +443,7 @@ mod tests {
                 "value",
                 Arc::new(StringArray::from(vec!["high"])) as ArrayRef,
             ),
+            ("sentinel", Arc::new(BooleanArray::from(vec![true]))),
             ("key", Arc::new(Int64Array::from(vec![2]))),
         ])?;
 
@@ -440,8 +463,16 @@ mod tests {
             aggs: vec![
                 Agg::min(column_name!("key")),
                 Agg::max(column_name!("key")),
-                Agg::min_non_null_by(column_name!("value"), column_name!("key")),
-                Agg::max_non_null_by(column_name!("value"), column_name!("key")),
+                Agg::min_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
+                Agg::max_non_null_by(
+                    column_name!("value"),
+                    column_name!("sentinel"),
+                    column_name!("key"),
+                ),
             ],
             schema: schema_ref! {
                 nullable "minimum": LONG,
@@ -483,6 +514,10 @@ mod tests {
                 Arc::new(StringArray::from(vec!["nested_value"])) as ArrayRef,
             ),
             (
+                Arc::new(Field::new("sentinel", ArrowDataType::Boolean, true)),
+                Arc::new(BooleanArray::from(vec![Some(true)])) as ArrayRef,
+            ),
+            (
                 Arc::new(Field::new("key", ArrowDataType::Int64, true)),
                 Arc::new(Int64Array::from(vec![Some(7)])) as ArrayRef,
             ),
@@ -493,6 +528,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["trap_group"])) as ArrayRef,
             ),
             ("value", Arc::new(StringArray::from(vec!["trap_value"]))),
+            ("sentinel", Arc::new(BooleanArray::from(vec![None]))),
             ("key", Arc::new(Int64Array::from(vec![Some(99)]))),
             ("outer", Arc::new(outer)),
         ])?;
@@ -500,7 +536,11 @@ mod tests {
             group_by: vec![column_name!("outer.group")],
             aggs: vec![
                 Agg::min(column_name!("outer.key")),
-                Agg::max_non_null_by(column_name!("outer.value"), column_name!("outer.key")),
+                Agg::max_non_null_by(
+                    column_name!("outer.value"),
+                    column_name!("outer.sentinel"),
+                    column_name!("outer.key"),
+                ),
             ],
             schema: schema_ref! {
                 not_null "group": STRING,
@@ -523,6 +563,33 @@ mod tests {
             extract_string_column(output, &column_name!("winner"))?.value(0),
             "nested_value"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn non_null_by_can_select_a_null_value() -> DeltaResult<()> {
+        let input = RecordBatch::try_from_iter([
+            (
+                "value",
+                Arc::new(StringArray::from(vec![Some("fallback"), None])) as ArrayRef,
+            ),
+            ("sentinel", Arc::new(BooleanArray::from(vec![true, true]))),
+            ("key", Arc::new(Int64Array::from(vec![1, 2]))),
+        ])?;
+        let aggregate = Aggregate {
+            group_by: vec![],
+            aggs: vec![Agg::max_non_null_by(
+                column_name!("value"),
+                column_name!("sentinel"),
+                column_name!("key"),
+            )],
+            schema: schema_ref! {
+                nullable "winner": STRING,
+            },
+        };
+
+        let output = eval_aggregate(&aggregate, &[input])?;
+        assert!(extract_string_column(&output[0], &column_name!("winner"))?.is_null(0));
         Ok(())
     }
 }

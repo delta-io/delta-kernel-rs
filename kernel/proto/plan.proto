@@ -94,11 +94,13 @@ message MaxAgg {
 }
 message MinNonNullByAgg {
   delta.kernel.expressions.ColumnName value = 1;
-  delta.kernel.expressions.ColumnName key = 2;
+  delta.kernel.expressions.ColumnName null_sentinel = 2;
+  delta.kernel.expressions.ColumnName key = 3;
 }
 message MaxNonNullByAgg {
   delta.kernel.expressions.ColumnName value = 1;
-  delta.kernel.expressions.ColumnName key = 2;
+  delta.kernel.expressions.ColumnName null_sentinel = 2;
+  delta.kernel.expressions.ColumnName key = 3;
 }
 
 message Agg {
