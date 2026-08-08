@@ -10,33 +10,32 @@
 // TODO: The `IoOperation` paths will eventually be used to replace SyncEngine with an
 // PlanBasedEngine (backed by this PlanExecutor)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use itertools::Itertools;
 
+use super::aggs::eval_aggregate;
 use super::json::try_create_from_json;
 use super::parquet::{parquet_footer, try_create_from_parquet};
 use super::read_files_arrow;
 use super::storage::SyncStorageHandler;
 use crate::arrow::array::{
-    new_null_array, Array, ArrayRef, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
 };
-use crate::arrow::compute::{filter_record_batch, interleave};
-use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
-};
+use crate::arrow::compute::filter_record_batch;
+use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::row::{OwnedRow, RowConverter, SortField};
-use crate::engine::arrow_conversion::{TryFromArrow as _, TryFromKernel as _, TryIntoArrow as _};
+use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
+use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::arrow_expression::{extract_column, ArrowEvaluationHandler};
 use crate::engine::arrow_utils::coerce_columns_to_schema;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, FileType, Load, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin,
-    Values,
+    FileType, Load, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
@@ -244,9 +243,21 @@ impl SyncPlanExecutor {
     fn eval_load(&self, load: Load, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
         let mut files = Vec::new();
         for batch in input {
-            let path = extract_column(batch, load.file_meta.path_column.path())?;
-            let size = extract_column(batch, load.file_meta.file_size_column.path())?;
-            let dv = extract_column(batch, load.dv_column.path())?;
+            let path = extract_column_ref(batch, load.file_meta.path_column.path())?;
+            let path = path.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                Error::generic(format!(
+                    "Expected STRING Load path, got {:?}",
+                    path.data_type()
+                ))
+            })?;
+            let size = extract_column_ref(batch, load.file_meta.file_size_column.path())?;
+            let size = size.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                Error::generic(format!(
+                    "Expected LONG Load file size, got {:?}",
+                    size.data_type()
+                ))
+            })?;
+            let dv = extract_column_ref(batch, load.dv_column.path())?;
 
             for row in 0..batch.num_rows() {
                 if path.is_null(row) {
@@ -257,15 +268,15 @@ impl SyncPlanExecutor {
                         "SyncPlanExecutor Load with deletion vectors",
                     ));
                 }
-                let path = string_value(path.as_ref(), row)?;
+                let path = path.value(row);
                 let location = match &load.base_url {
-                    Some(base) => base.join(&path)?,
-                    None => url::Url::parse(&path)?,
+                    Some(base) => base.join(path)?,
+                    None => url::Url::parse(path)?,
                 };
                 if size.is_null(row) {
                     return Err(Error::generic("Load file size must not be null"));
                 }
-                let size = long_value(size.as_ref(), row)?;
+                let size = size.value(row);
                 if size <= 0 {
                     return Err(Error::generic("Load file size must be positive"));
                 }
@@ -274,7 +285,7 @@ impl SyncPlanExecutor {
                 let file_constants = load
                     .file_constant_columns
                     .iter()
-                    .map(|name| scalar_value(extract_column(batch, &[name])?.as_ref(), row))
+                    .map(|name| scalar_value(extract_column_ref(batch, &[name])?, row))
                     .try_collect()?;
                 files.push(ScanFile {
                     meta: FileMeta {
@@ -346,13 +357,13 @@ fn eval_semi_join(
 ) -> DeltaResult<Vec<RecordBatch>> {
     let mut build_keys = HashSet::new();
     for batch in build {
-        build_keys.extend(batch_to_rows(batch, &join.build_keys)?);
+        build_keys.extend(encode_keys(batch, &join.build_keys)?);
     }
 
     probe
         .iter()
         .map(|batch| {
-            let keep = batch_to_rows(batch, &join.probe_keys)?
+            let keep = encode_keys(batch, &join.probe_keys)?
                 .into_iter()
                 .map(|key| join.inverted != build_keys.contains(&key));
             Ok(filter_record_batch(batch, &BooleanArray::from_iter(keep))?)
@@ -384,151 +395,20 @@ fn splice_file_constants(
         .collect()
 }
 
-/// Evaluates an [`Aggregate`].
-/// Currently supports MaxNonNullBy aggregates comparing LONG-typed keys.
-fn eval_aggregate(aggregate: &Aggregate, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
-    if !aggregate.group_by.is_empty() {
-        return eval_grouped_max_non_null_by(aggregate, input);
-    }
-    let mut fields = Vec::with_capacity(aggregate.aggs.len());
-    let mut columns = Vec::with_capacity(aggregate.aggs.len());
-    // Output schema lists aggregate columns in order (no group keys), so zip aligns each agg with
-    // its output field (which already carries any alias).
-    for (agg, field) in aggregate.aggs.iter().zip(aggregate.schema.fields()) {
-        let Agg::MaxNonNullBy { value, key } = agg else {
-            return Err(Error::unsupported(
-                "SyncPlanExecutor Aggregate other than max_non_null_by",
-            ));
-        };
-        let data_type = ArrowDataType::try_from_kernel(field.data_type())?;
-        columns.push(max_non_null_by(input, value, key, &data_type)?);
-        fields.push(ArrowField::new(field.name(), data_type, true));
-    }
-    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?;
-    Ok(vec![batch])
-}
-
-/// The winning input cell for a group: `(batch index, row index)` into `input`.
-type Winner = (usize, usize);
-
-fn eval_grouped_max_non_null_by(
-    aggregate: &Aggregate,
-    input: &[RecordBatch],
-) -> DeltaResult<Vec<RecordBatch>> {
-    let [Agg::MaxNonNullBy { value, key }] = aggregate.aggs.as_slice() else {
-        return Err(Error::unsupported(
-            "SyncPlanExecutor grouped Aggregate other than a single max_non_null_by",
-        ));
-    };
-    if input.is_empty() {
-        return Ok(vec![]);
-    }
-    let value_name = simple_column_name(value)?;
-    let key_name = simple_column_name(key)?;
-    // Track the winning cell and its key per group as batches stream by.
-    let mut best = HashMap::<OwnedRow, (Winner, i64)>::new();
-    for (batch_idx, batch) in input.iter().enumerate() {
-        let values = extract_column(batch, &[value_name])?;
-        let keys = extract_column(batch, &[key_name])?;
-        let keys = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-            Error::unsupported("SyncPlanExecutor max_non_null_by with non-LONG key")
-        })?;
-        let group_key_rows = batch_to_rows(batch, &aggregate.group_by)?;
-        for (row_idx, group_keys) in group_key_rows.iter().enumerate().take(batch.num_rows()) {
-            if values.is_null(row_idx) || keys.is_null(row_idx) {
-                continue;
-            }
-            let candidate = keys.value(row_idx);
-            if matches!(best.get(group_keys), Some((_, best_key)) if candidate <= *best_key) {
-                continue;
-            }
-            best.insert(group_keys.clone(), ((batch_idx, row_idx), candidate));
-        }
-    }
-
-    // One winning cell per group; every output column is gathered at these same cells.
-    let winners: Vec<Winner> = best.into_values().map(|(winner, _)| winner).collect();
-    let mut columns = Vec::with_capacity(aggregate.schema.fields().len());
-    for group_by in &aggregate.group_by {
-        columns.push(gather_winners(
-            input,
-            &winners,
-            simple_column_name(group_by)?,
-        )?);
-    }
-    columns.push(gather_winners(input, &winners, value_name)?);
-
-    let output_schema = Arc::new(aggregate.schema.as_ref().try_into_arrow()?);
-    Ok(vec![RecordBatch::try_new(output_schema, columns)?])
-}
-
-/// Gathers column `name` at each winning `(batch, row)` cell into a single array, preserving the
-/// order of `winners`. Uses [`interleave`] so cells from different input batches are collected in
-/// one pass.
-fn gather_winners(input: &[RecordBatch], winners: &[Winner], name: &str) -> DeltaResult<ArrayRef> {
-    let columns: Vec<ArrayRef> = input
-        .iter()
-        .map(|batch| extract_column(batch, &[name]))
-        .try_collect()?;
-    let refs: Vec<&dyn Array> = columns.iter().map(|a| a.as_ref()).collect();
-    Ok(interleave(&refs, winners)?)
-}
-
-/// The `value` from the input row with the greatest `key`, considering only rows where both
-/// `value` and `key` are non-null (see [`Agg::max_non_null_by`]). Returns a one-row array: the
-/// winning value, or NULL (typed by `output_type`) when no row qualifies.
+/// Encodes `columns` of `batch` as one comparable/hashable [`OwnedRow`] key per input row.
 ///
-/// Extraction is deferred: the winning `(column, row)` is tracked as batches stream by, then sliced
-/// once at the end -- avoiding a per-candidate copy of the (possibly struct-typed) value. The
-/// grouped case ([`eval_grouped_max_non_null_by`]) generalizes this, gathering one winning cell per
-/// group with [`interleave`].
-///
-/// [`Agg::max_non_null_by`]: crate::plans::ir::nodes::Agg::max_non_null_by
-fn max_non_null_by(
-    input: &[RecordBatch],
-    value: &ColumnName,
-    key: &ColumnName,
-    output_type: &ArrowDataType,
-) -> DeltaResult<ArrayRef> {
-    let value_name = simple_column_name(value)?;
-    let key_name = simple_column_name(key)?;
-    let mut best: Option<(ArrayRef, usize, i64)> = None;
-    for batch in input {
-        let values = extract_column(batch, &[value_name])?;
-        let keys = extract_column(batch, &[key_name])?;
-        let keys = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-            Error::unsupported("SyncPlanExecutor max_non_null_by with non-LONG key")
-        })?;
-        for row in 0..batch.num_rows() {
-            if values.is_null(row) || keys.is_null(row) {
-                continue;
-            }
-            let candidate = keys.value(row);
-            if matches!(best, Some((_, _, best_key)) if candidate <= best_key) {
-                continue;
-            }
-            best = Some((values.clone(), row, candidate));
-        }
+/// Empty `columns` (e.g. ungrouped aggregation) yields a vec of empty keys that self-compare equal
+pub(super) fn encode_keys(
+    batch: &RecordBatch,
+    columns: &[ColumnName],
+) -> DeltaResult<Vec<OwnedRow>> {
+    if columns.is_empty() {
+        let key = RowConverter::new(vec![])?.parser().parse(&[]).owned();
+        return Ok(vec![key; batch.num_rows()]);
     }
-    match best {
-        Some((values, row, _)) => Ok(values.slice(row, 1)),
-        None => Ok(new_null_array(output_type, 1)),
-    }
-}
-
-fn simple_column_name(name: &ColumnName) -> DeltaResult<&str> {
-    match name.path() {
-        [segment] => Ok(segment.as_str()),
-        _ => Err(Error::unsupported(format!(
-            "SyncPlanExecutor aggregate operand nested column `{name}`"
-        ))),
-    }
-}
-
-fn batch_to_rows(batch: &RecordBatch, columns: &[ColumnName]) -> DeltaResult<Vec<OwnedRow>> {
     let arrays: Vec<_> = columns
         .iter()
-        .map(|name| extract_column(batch, name.path()))
+        .map(|name| extract_column(batch, name))
         .try_collect()?;
     // Constructing RowConverter requires a `SortField`. We initialize default, unsorted field for
     // each column.
@@ -539,26 +419,6 @@ fn batch_to_rows(batch: &RecordBatch, columns: &[ColumnName]) -> DeltaResult<Vec
     let converter = RowConverter::new(sort_fields)?;
     let rows = converter.convert_columns(&arrays)?;
     Ok(rows.iter().map(|row| row.owned()).collect())
-}
-
-fn string_value(array: &dyn Array, row: usize) -> DeltaResult<String> {
-    let Some(strings) = array.as_any().downcast_ref::<StringArray>() else {
-        return Err(Error::generic(format!(
-            "Expected STRING array, got {:?}",
-            array.data_type()
-        )));
-    };
-    Ok(strings.value(row).to_string())
-}
-
-fn long_value(array: &dyn Array, row: usize) -> DeltaResult<i64> {
-    let Some(longs) = array.as_any().downcast_ref::<Int64Array>() else {
-        return Err(Error::generic(format!(
-            "Expected LONG array, got {:?}",
-            array.data_type()
-        )));
-    };
-    Ok(longs.value(row))
 }
 
 fn scalar_value(array: &dyn Array, row: usize) -> DeltaResult<Scalar> {
@@ -601,4 +461,21 @@ fn values_to_record_batch(values: Values) -> DeltaResult<RecordBatch> {
         .try_collect()?;
     let schema = Arc::new(schema.as_ref().try_into_arrow()?);
     Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_keys_synthesizes_empty_keys_when_ungrouped() -> DeltaResult<()> {
+        let batch = RecordBatch::try_from_iter([(
+            "x",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])?;
+        let keys = encode_keys(&batch, &[])?;
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        Ok(())
+    }
 }

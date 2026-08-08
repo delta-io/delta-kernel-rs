@@ -254,22 +254,24 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
         let func = match agg {
-            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
+            Agg::Min(value) => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
+            Agg::Max(value) => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            Agg::MinNonNullBy { value, key } => {
+            Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
-            Agg::MaxNonNullBy { value, key } => {
+            Agg::MaxNonNullBy(operands) => {
                 proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
         };
@@ -1476,8 +1478,16 @@ mod tests {
     #[rstest]
     #[case(Agg::min(ColumnName::new(["a"])), "min")]
     #[case(Agg::max(ColumnName::new(["a"])), "max")]
-    #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
-    #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
+    #[case(Agg::min_non_null_by(
+        ColumnName::new(["a"]),
+        ColumnName::new(["s"]),
+        ColumnName::new(["k"])
+    ), "min_non_null_by")]
+    #[case(Agg::max_non_null_by(
+        ColumnName::new(["a"]),
+        ColumnName::new(["s"]),
+        ColumnName::new(["k"])
+    ), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
         use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);

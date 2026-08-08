@@ -85,21 +85,30 @@ impl ProvidesColumnByName for StructArray {
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
 #[internal_api]
 pub(crate) fn extract_column(
-    mut parent: &dyn ProvidesColumnByName,
+    parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
 ) -> DeltaResult<ArrayRef> {
+    Ok(extract_column_ref(parent, col)?.clone())
+}
+
+/// Like [`extract_column`], but returns a borrowed [`ArrayRef`] reference.
+#[internal_api]
+pub(crate) fn extract_column_ref<'a>(
+    mut parent: &'a dyn ProvidesColumnByName,
+    col: &[impl AsRef<str>],
+) -> DeltaResult<&'a ArrayRef> {
     let mut field_names = col.iter();
-    let Some(field_name) = field_names.next() else {
-        return Err(ArrowError::SchemaError("Empty column path".to_string()))?;
+    let mut field_name = match field_names.next() {
+        Some(name) => name.as_ref(),
+        None => return Err(ArrowError::SchemaError("Empty column path".to_string()))?,
     };
-    let mut field_name = field_name.as_ref();
     loop {
         let child = parent
             .column_by_name(field_name)
             .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))?;
         field_name = match field_names.next() {
             Some(name) => name.as_ref(),
-            None => return Ok(child.clone()),
+            None => return Ok(child),
         };
         parent = child
             .as_any()
