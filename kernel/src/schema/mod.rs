@@ -716,15 +716,6 @@ impl StructField {
         &self.metadata
     }
 
-    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
-    /// expensive for large metadata
-    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(key, val)| (key.clone(), val.to_string()))
-            .collect()
-    }
-
     /// Applies physical name and field ID mappings to this field.
     ///
     /// This function sets the field ID for the physical [`StructField`] only if the

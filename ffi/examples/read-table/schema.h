@@ -110,12 +110,13 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
   }
 }
 
-void print_physical_name(const char *name, const CStringMap* metadata, SharedExternEngine* engine)
+void print_physical_name(const char *name, const CMetadataMap* metadata, SharedExternEngine* engine)
 {
 #ifdef VERBOSE
   char* key_str = "delta.columnMapping.physicalName";
   KernelStringSlice key = { key_str, strlen(key_str) };
-  ExternResultNullableCvoid res = get_from_string_map(metadata, key, allocate_string, engine);
+  CMetadataValueKind kind;
+  ExternResultNullableCvoid res = get_from_metadata_map(metadata, key, &kind, allocate_string, engine);
   if (res.tag != OkNullableCvoid) {
     printf("Failed to get physical name\n");
     free_error((Error*)res.err);
@@ -159,7 +160,7 @@ void visit_struct(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
@@ -175,7 +176,7 @@ void visit_array(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
@@ -191,7 +192,7 @@ void visit_map(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
@@ -207,7 +208,7 @@ void visit_decimal(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   uint8_t precision,
   uint8_t scale)
 {
@@ -225,7 +226,7 @@ void visit_simple_type(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  const CStringMap * metadata,
+  const CMetadataMap * metadata,
   char* type)
 {
   SchemaBuilder* builder = data;
@@ -236,7 +237,7 @@ void visit_simple_type(
 }
 
 #define DEFINE_VISIT_SIMPLE_TYPE(typename)                                                                                                  \
-  void visit_##typename(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const CStringMap * metadata)\
+  void visit_##typename(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const CMetadataMap * metadata)\
   {                                                                                                                                         \
     visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, #typename);                                                       \
   }
