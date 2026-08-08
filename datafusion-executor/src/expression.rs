@@ -11,6 +11,7 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
+use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
 /// Converts a kernel [`Expression`](KernelExpression) into the equivalent DataFusion
@@ -25,11 +26,7 @@ pub fn to_df_expr(expr: &KernelExpression, input_schema: &StructType) -> DeltaRe
         KernelExpression::Column(name) => column_to_df_expr(name, input_schema),
         KernelExpression::Binary(binary) => binary_expr_to_df_expr(binary, input_schema),
         KernelExpression::Variadic(variadic) => variadic_to_df_expr(variadic, input_schema),
-
-        // TODO: wire up in the predicate-conversion PR (needs the `Predicate -> Expr` converter).
-        KernelExpression::Predicate(_) => Err(Error::unsupported(
-            "converting an embedded Predicate expression is not yet supported",
-        )),
+        KernelExpression::Predicate(pred) => to_df_predicate_expr(pred, input_schema),
 
         // TODO: wire up once this function takes an output schema (`Struct` needs it for field
         // names; `MapToStruct`/`StructPatch` for field types). Each arm's lowering follows later.
@@ -221,6 +218,12 @@ mod tests {
     )]
     fn variadic_lowers_to_call(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
+    }
+
+    #[test]
+    fn embedded_predicate_delegates_to_predicate_converter() {
+        let kernel = KernelExpr::Predicate(Box::new(column_expr!("b").is_null()));
+        assert_eq!(lower(kernel), "b IS NULL");
     }
 
     /// A column reference that does not resolve against the input schema fails at conversion time,
