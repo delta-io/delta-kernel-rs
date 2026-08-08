@@ -4655,7 +4655,7 @@ mod tests {
         #[rstest]
         #[case::parsable_literal(DataType::INTEGER, "42", true)]
         #[case::null_primitive(DataType::INTEGER, "NULL", true)]
-        #[case::unparsable_function_call(DataType::TIMESTAMP, "current_timestamp()", false)]
+        #[case::current_timestamp(DataType::TIMESTAMP, "current_timestamp()", true)]
         #[case::unparsable_type_mismatch(DataType::TIMESTAMP, "0.18", false)]
         fn exposes_default_for_primitive(
             #[case] data_type: DataType,

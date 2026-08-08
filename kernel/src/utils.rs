@@ -144,6 +144,13 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
+/// Returns the current time in microseconds since Unix epoch.
+pub(crate) fn current_time_micros() -> DeltaResult<i64> {
+    let duration = current_time_duration()?;
+    i64::try_from(duration.as_micros())
+        .map_err(|_| Error::generic("Current timestamp exceeds i64 microsecond range"))
+}
+
 /// Extension trait for folding zero or one value from an [`Option`] into a base value.
 #[internal_api]
 pub(crate) trait FoldWithOption: Sized {
@@ -235,6 +242,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_time_micros_is_within_system_time_bounds() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let current = u128::try_from(current_time_micros().unwrap()).unwrap();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+
+        assert!(before <= current && current <= after);
+    }
 
     #[test]
     fn test_path_parsing() {

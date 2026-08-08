@@ -2249,7 +2249,12 @@ mod tests {
         fn collects_present_defaults_and_skips_columns_without_one() {
             let schema = StructType::try_new(vec![
                 field_with_default("parsable", DataType::INTEGER, "42"),
-                field_with_default("unparsable", DataType::TIMESTAMP, "current_timestamp()"),
+                field_with_default(
+                    "current_timestamp",
+                    DataType::TIMESTAMP,
+                    "CURRENT_TIMESTAMP",
+                ),
+                field_with_default("unparsable", DataType::TIMESTAMP, "NOW()"),
                 StructField::nullable("no_default", DataType::STRING),
             ])
             .unwrap();
@@ -2258,7 +2263,7 @@ mod tests {
             let defaults = txn.top_level_column_defaults().unwrap();
             assert_eq!(
                 defaults.len(),
-                2,
+                3,
                 "only columns with a default are returned"
             );
             assert!(!defaults.contains_key("no_default"));
@@ -2267,8 +2272,15 @@ mod tests {
             assert_eq!(parsable.raw_sql(), "42");
             assert!(parsable.to_scalar().unwrap().is_some());
 
+            let current_timestamp = &defaults["current_timestamp"];
+            assert_eq!(current_timestamp.raw_sql(), "CURRENT_TIMESTAMP");
+            assert!(matches!(
+                current_timestamp.to_scalar().unwrap(),
+                Some(Scalar::Timestamp(_))
+            ));
+
             let unparsable = &defaults["unparsable"];
-            assert_eq!(unparsable.raw_sql(), "current_timestamp()");
+            assert_eq!(unparsable.raw_sql(), "NOW()");
             assert!(unparsable.to_scalar().unwrap().is_none());
         }
 
