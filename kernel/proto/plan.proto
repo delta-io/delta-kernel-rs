@@ -92,13 +92,22 @@ message MinAgg {
 message MaxAgg {
   delta.kernel.expressions.ColumnName value = 1;
 }
+message SumAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message CountAgg {
+  delta.kernel.expressions.ColumnName value = 1;
+}
+message CountStarAgg {}
 message MinNonNullByAgg {
   delta.kernel.expressions.ColumnName value = 1;
-  delta.kernel.expressions.ColumnName key = 2;
+  delta.kernel.expressions.ColumnName null_sentinel = 2;
+  delta.kernel.expressions.ColumnName key = 3;
 }
 message MaxNonNullByAgg {
   delta.kernel.expressions.ColumnName value = 1;
-  delta.kernel.expressions.ColumnName key = 2;
+  delta.kernel.expressions.ColumnName null_sentinel = 2;
+  delta.kernel.expressions.ColumnName key = 3;
 }
 
 message Agg {
@@ -107,6 +116,9 @@ message Agg {
     MaxAgg max = 2;
     MinNonNullByAgg min_non_null_by = 3;
     MaxNonNullByAgg max_non_null_by = 4;
+    SumAgg sum = 5;
+    CountAgg count = 6;
+    CountStarAgg count_star = 7;
   }
 }
 
