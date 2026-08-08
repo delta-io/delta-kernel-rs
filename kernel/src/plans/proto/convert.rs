@@ -255,12 +255,14 @@ impl From<&Agg> for proto_plan::Agg {
             Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
                     value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
                     key: Some((&operands.key).into()),
                 })
             }
             Agg::MaxNonNullBy(operands) => {
                 proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
                     value: Some((&operands.value).into()),
+                    null_sentinel: Some((&operands.null_sentinel).into()),
                     key: Some((&operands.key).into()),
                 })
             }
@@ -1502,8 +1504,16 @@ mod tests {
     #[rstest]
     #[case(Agg::min(ColumnName::new(["a"])), "min")]
     #[case(Agg::max(ColumnName::new(["a"])), "max")]
-    #[case(Agg::min_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "min_non_null_by")]
-    #[case(Agg::max_non_null_by(ColumnName::new(["a"]), ColumnName::new(["k"])), "max_non_null_by")]
+    #[case(Agg::min_non_null_by(
+        ColumnName::new(["a"]),
+        ColumnName::new(["s"]),
+        ColumnName::new(["k"])
+    ), "min_non_null_by")]
+    #[case(Agg::max_non_null_by(
+        ColumnName::new(["a"]),
+        ColumnName::new(["s"]),
+        ColumnName::new(["k"])
+    ), "max_non_null_by")]
     fn from_agg(#[case] agg: Agg, #[case] expected: &str) {
         use proto_plan::agg::Func;
         let proto = proto_plan::Agg::from(&agg);
