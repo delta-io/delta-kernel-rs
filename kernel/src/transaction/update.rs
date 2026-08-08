@@ -264,6 +264,45 @@ impl Transaction {
     /// txn.update_deletion_vectors(dv_map, files.into_iter())?;
     /// txn.commit(engine)?;
     /// ```
+    ///
+    /// ## Data shape
+    ///
+    /// Given the following scan metadata input:
+    ///
+    /// ```text
+    /// path            size  stats                                      deletionVector
+    /// part-1.parquet  100   {"numRecords":10,"tightBounds":true}      old_dv
+    /// part-2.parquet  200   {"numRecords":20,"tightBounds":true}      null
+    /// ```
+    ///
+    /// And a `new_dv_descriptors` map that updates `part-1.parquet`:
+    ///
+    /// ```text
+    /// {
+    ///   "part-1.parquet": new_dv
+    /// }
+    /// ```
+    ///
+    /// `update_deletion_vectors` matches rows by file path and stages the selected
+    /// scan row with two temporary columns, `newDeletionVector` and `newStats`:
+    ///
+    /// ```text
+    /// path            ...  deletionVector  newDeletionVector  newStats
+    /// part-1.parquet  ...  old_dv          new_dv             {"numRecords":10,"tightBounds":false}
+    /// ```
+    ///
+    /// On commit, this produces a `Remove` action for the old file state and an
+    /// `Add` action with the updated deletion vector and rewritten stats:
+    ///
+    /// ```text
+    /// Remove(path="part-1.parquet", deletionVector=old_dv)
+    /// Add(
+    ///   path="part-1.parquet",
+    ///   deletionVector=new_dv,
+    ///   stats={"numRecords":10,"tightBounds":false},
+    ///   ...preserved file metadata
+    /// )
+    /// ```
     #[internal_api]
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[instrument(
