@@ -1921,106 +1921,74 @@ mod tests {
         assert_eq!(result.value(0), expected);
     }
 
-    /// `{ n: 1 }` plus a `list` column holding `[1, 2]`, covering both element sources `IN`
-    /// accepts.
-    fn in_batch() -> RecordBatch {
+    /// The two element sources `IN` accepts, both holding `elements`: a literal `Array` scalar
+    /// and a single-row `list` column. The batch also carries an `n` column (always `1`) so the
+    /// needle can be a column in the operand-shape rejection test.
+    fn in_sources(elements: &[Option<i32>]) -> (Expr, Expr, RecordBatch) {
+        let scalars = elements
+            .iter()
+            .map(|e| e.map_or(Scalar::Null(DataType::INTEGER), Scalar::Integer));
+        let literal = Expr::Literal(Scalar::Array(
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), scalars).unwrap(),
+        ));
+
         let item = Arc::new(ArrowField::new("item", ArrowDataType::Int32, true));
         let list = ListArray::new(
             Arc::clone(&item),
-            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2])),
-            Arc::new(Int32Array::from(vec![1, 2])),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, elements.len() as i32])),
+            Arc::new(Int32Array::from(elements.to_vec())),
             None,
         );
         let schema = ArrowSchema::new(vec![
             ArrowField::new("n", ArrowDataType::Int32, true),
             ArrowField::new("list", ArrowDataType::List(item), true),
         ]);
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![Arc::new(Int32Array::from(vec![1])), Arc::new(list)],
         )
-        .unwrap()
+        .unwrap();
+        (literal, column_expr!("list"), batch)
     }
 
-    fn int_array_literal() -> Expr {
-        let elements =
-            ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), vec![1, 2]).unwrap();
-        Expr::Literal(Scalar::Array(elements))
-    }
-
-    /// A NULL needle is not null-propagating: it answers `false` rather than NULL.
+    /// `IN` reports membership as a plain boolean and never yields NULL, identically across both
+    /// element sources (a literal array and a list column). Because membership uses logical (SQL)
+    /// equality -- under which NULL is incomparable to everything, including itself -- a NULL
+    /// needle matches nothing (answering `false`, not NULL), and a NULL element matches nothing,
+    /// not even a NULL needle.
     #[rstest]
-    #[case::present_in_literal_array(Some(2), true, true)]
-    #[case::absent_from_literal_array(Some(9), false, true)]
-    #[case::null_needle_in_literal_array(None, false, true)]
-    #[case::present_in_list_column(Some(2), true, false)]
-    #[case::absent_from_list_column(Some(9), false, false)]
-    #[case::null_needle_in_list_column(None, false, false)]
-    fn test_in_matches_membership_and_never_nulls(
-        #[case] needle: Option<i32>,
-        #[case] expected: bool,
-        #[case] literal_elements: bool,
-    ) {
-        let batch = in_batch();
-        let needle = match needle {
-            Some(n) => lit(n),
-            None => Expr::null_literal(DataType::INTEGER),
-        };
-        let elements = if literal_elements {
-            int_array_literal()
-        } else {
-            column_expr!("list")
-        };
-
-        let pred = Pred::binary(BinaryPredicateOp::In, needle, elements);
-        let result = evaluate_predicate(&pred, &batch, false).unwrap();
-        assert_eq!(result.null_count(), 0);
-        assert_eq!(result.value(0), expected);
-    }
-
-    /// A NULL element matches nothing, not even a NULL needle: membership uses logical (SQL)
-    /// equality, where NULL is incomparable to everything including itself.
-    #[rstest]
-    #[case::null_needle_and_null_element(None, &[Some(1), None], false)]
-    #[case::null_needle_and_only_null_element(None, &[None], false)]
+    #[case::present(Some(2), &[Some(1), Some(2)], true)]
+    #[case::absent(Some(9), &[Some(1), Some(2)], false)]
+    #[case::null_needle(None, &[Some(1), Some(2)], false)]
+    #[case::null_needle_with_null_element(None, &[Some(1), None], false)]
+    #[case::null_needle_with_only_null_element(None, &[None], false)]
     #[case::present_alongside_null_element(Some(1), &[Some(1), None], true)]
     #[case::absent_alongside_null_element(Some(9), &[Some(1), None], false)]
-    fn test_in_null_element_matches_nothing(
+    fn test_in_membership_never_nulls(
         #[case] needle: Option<i32>,
         #[case] elements: &[Option<i32>],
         #[case] expected: bool,
     ) {
-        let elements: Vec<Scalar> = elements
-            .iter()
-            .map(|e| match e {
-                Some(n) => Scalar::Integer(*n),
-                None => Scalar::Null(DataType::INTEGER),
-            })
-            .collect();
-        let elements =
-            ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), elements).unwrap();
+        let (literal_source, column_source, batch) = in_sources(elements);
         let needle = match needle {
             Some(n) => lit(n),
             None => Expr::null_literal(DataType::INTEGER),
         };
+        for elements in [literal_source, column_source] {
+            let pred = Pred::binary(BinaryPredicateOp::In, needle.clone(), elements);
+            let result = evaluate_predicate(&pred, &batch, false).unwrap();
+            assert_eq!(result.null_count(), 0);
+            assert_eq!(result.value(0), expected);
 
-        let pred = Pred::binary(
-            BinaryPredicateOp::In,
-            needle,
-            Expr::Literal(Scalar::Array(elements)),
-        );
-        let result = evaluate_predicate(&pred, &in_batch(), false).unwrap();
-        assert_eq!(result.null_count(), 0);
-        assert_eq!(result.value(0), expected);
-
-        // `IN` never produces NULL, so `NOT IN` is always its exact complement.
-        let result = evaluate_predicate(&Pred::not(pred), &in_batch(), false).unwrap();
-        assert_eq!(result.null_count(), 0);
-        assert_eq!(result.value(0), !expected);
+            // `IN` never produces NULL, so `NOT IN` is always its exact complement.
+            let result = evaluate_predicate(&Pred::not(pred), &batch, false).unwrap();
+            assert_eq!(result.null_count(), 0);
+            assert_eq!(result.value(0), !expected);
+        }
     }
 
-    /// Struct/array/map elements have no logical comparison, so they never match. See
-    /// [`Scalar::logical_partial_cmp`].
+    /// Struct/array/map elements have no logical comparison, so they never match -- not even a
+    /// structurally identical needle. See [`Scalar::logical_partial_cmp`].
     #[test]
     fn test_in_nested_element_never_matches() {
         let make_struct = |v| {
@@ -2042,12 +2010,13 @@ mod tests {
         )
         .unwrap();
 
+        let (_, _, batch) = in_sources(&[Some(1)]);
         let pred = Pred::binary(
             BinaryPredicateOp::In,
             Expr::literal(make_struct(1)),
             Expr::Literal(Scalar::Array(elements)),
         );
-        let result = evaluate_predicate(&pred, &in_batch(), false).unwrap();
+        let result = evaluate_predicate(&pred, &batch, false).unwrap();
         assert_eq!(result.null_count(), 0);
         assert!(!result.value(0));
     }
@@ -2055,13 +2024,14 @@ mod tests {
     /// Only a literal left operand is supported, so a column needle is rejected regardless of where
     /// the elements come from, as is a right operand that holds no elements at all.
     #[rstest]
-    #[case::column_in_literal_array(int_array_literal())]
-    #[case::column_in_column(column_expr!("list"))]
+    #[case::column_in_literal_array(in_sources(&[Some(1), Some(2)]).0)]
+    #[case::column_in_column(in_sources(&[Some(1), Some(2)]).1)]
     #[case::non_array_right_operand(lit(1))]
-    fn test_in_rejects_unsupported_operand_shapes(#[case] elements: Expr) {
-        let pred = Pred::binary(BinaryPredicateOp::In, column_expr!("n"), elements);
+    fn test_in_rejects_unsupported_operand_shapes(#[case] right: Expr) {
+        let (.., batch) = in_sources(&[Some(1), Some(2)]);
+        let pred = Pred::binary(BinaryPredicateOp::In, column_expr!("n"), right);
         assert_result_error_with_message(
-            evaluate_predicate(&pred, &in_batch(), false),
+            evaluate_predicate(&pred, &batch, false),
             "Invalid right value for (NOT) IN comparison",
         );
     }
