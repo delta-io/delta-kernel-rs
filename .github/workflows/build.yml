@@ -192,9 +192,9 @@ jobs:
       - name: lint without default features - packages which don't depend on kernel with features enabled
         run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel declarative-plans feature-only build
-        run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans
+        run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans,vendored-protoc
       - name: lint kernel declarative-plans feature-only build
-        run: cargo clippy --locked -p delta_kernel --no-default-features --features declarative-plans --tests -- -D warnings
+        run: cargo clippy --locked -p delta_kernel --no-default-features --features declarative-plans,vendored-protoc --tests -- -D warnings
       - name: check kernel builds with default-engine-native-tls
         run: cargo build --locked -p feature_tests --features default-engine-native-tls
       - name: test native-tls backend has no crypto provider conflict
@@ -423,7 +423,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest

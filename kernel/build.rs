@@ -9,7 +9,7 @@ fn main() {
 
     // Generate prost bindings for the declarative-plans proto schema only when the feature is
     // enabled. Off-by-default consumers don't pay the protoc / codegen cost and don't pull in
-    // prost-build / protoc-bin-vendored.
+    // prost-build.
     #[cfg(feature = "declarative-plans")]
     compile_proto_definitions();
 }
@@ -33,9 +33,8 @@ fn compile_proto_definitions() {
         .map(|f| format!("{proto_dir}/{f}"))
         .collect();
 
-    // Point prost-build at a vendored `protoc` so the build doesn't require a system install.
-    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc binary");
-    std::env::set_var("PROTOC", protoc);
+    #[cfg(feature = "vendored-protoc")]
+    set_vendored_protoc();
 
     // Don't propagate `.proto` comments into the generated code as doc comments: they contain
     // angle-bracket generics (`Vec<...>`, `Option<...>`) that rustdoc would parse as unclosed
@@ -44,4 +43,13 @@ fn compile_proto_definitions() {
         .disable_comments(["."])
         .compile_protos(&files, &[proto_dir])
         .expect("failed to compile .proto files");
+}
+
+#[cfg(all(feature = "declarative-plans", feature = "vendored-protoc"))]
+fn set_vendored_protoc() {
+    // Leave a caller-supplied `protoc` alone, so a pinned toolchain wins over the vendored binary.
+    if std::env::var_os("PROTOC").is_none() {
+        let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc binary");
+        std::env::set_var("PROTOC", protoc);
+    }
 }
