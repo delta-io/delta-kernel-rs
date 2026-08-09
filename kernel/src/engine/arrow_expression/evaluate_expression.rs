@@ -699,8 +699,7 @@ pub fn evaluate_predicate(
                     }
                 }
                 (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                    // Logical (SQL) equality, so a NULL never matches -- not even another NULL.
-                    // `Scalar`'s `PartialEq` is physical and would match them structurally.
+                    // Logical equality, so a NULL never matches another NULL.
                     let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
                     Ok(BooleanArray::from(vec![exists]))
                 }
