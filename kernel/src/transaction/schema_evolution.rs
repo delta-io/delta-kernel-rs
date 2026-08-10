@@ -68,18 +68,25 @@ impl SchemaChange {
     ) -> DeltaResult<()> {
         match self {
             Self::AddField { column, field } => {
-                apply_traversal(fields, &AddFieldTraversal { column, field }, context)
+                let traversal = AddFieldTraversal { column, field };
+                modify_field_at_path(fields, traversal.path(), &traversal, context)
+                    .map_err(|error| traversal.wrap_error(error))
             }
             Self::SetNullable { column } => {
-                apply_traversal(fields, &SetNullableTraversal { column }, context)
+                let traversal = SetNullableTraversal { column };
+                modify_field_at_path(fields, traversal.path(), &traversal, context)
+                    .map_err(|error| traversal.wrap_error(error))
             }
         }
     }
 }
 
+/// Trait for traversal policies that can be used to apply schema changes to a schema.
 trait TraversalPolicy {
+    /// Returns the path to the field to be modified.
     fn path(&self) -> &[String];
 
+    /// Applies the schema change to the leaf field at the given index.
     fn apply_at_leaf(
         &self,
         fields: &mut IndexMap<String, StructField>,
@@ -103,15 +110,6 @@ struct AddFieldTraversal<'a> {
 
 struct SetNullableTraversal<'a> {
     column: &'a ColumnName,
-}
-
-fn apply_traversal(
-    fields: &mut IndexMap<String, StructField>,
-    traversal: &impl TraversalPolicy,
-    context: &mut SchemaEvolutionContext,
-) -> DeltaResult<()> {
-    modify_field_at_path(fields, traversal.path(), traversal, context)
-        .map_err(|error| traversal.wrap_error(error))
 }
 
 fn modify_field_at_path(
@@ -334,7 +332,7 @@ pub(crate) fn apply_schema_operations(
         Ordering::Equal => None,
         Ordering::Less => {
             return Err(Error::internal_error(
-                "max column ID went backwards during schema evolution",
+                "max column ID decreased during schema evolution",
             ))
         }
     };
@@ -386,9 +384,8 @@ pub(crate) fn evolve_table_config(
     TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
 }
 
-// Rejects tables whose enabled features kernel cannot evolve the schema of yet. Lives on the one
-// path every caller funnels through so the ALTER TABLE builder and
-// `Transaction::with_schema_changes` cannot drift apart on which tables they accept.
+/// Rejects tables whose enabled features don't yet support schema evolution.
+/// Should be called before committing any schema changes (schema evolution, ALTER TABLE).
 fn ensure_schema_evolution_supported(table_config: &TableConfiguration) -> DeltaResult<()> {
     // Added columns would not receive the required column-mapping nested ids. See
     // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
@@ -398,7 +395,7 @@ fn ensure_schema_evolution_supported(table_config: &TableConfiguration) -> Delta
             "Schema changes are not yet supported on tables with icebergCompatV3 enabled"
         )
     );
-    // TODO(#2630): Support schema evolution on tables with column defaults.
+
     require!(
         !table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults),
         Error::unsupported(
