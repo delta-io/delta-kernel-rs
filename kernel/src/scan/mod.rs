@@ -1087,11 +1087,14 @@ impl Scan {
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and retains the
         // leaf schema when output or pruning requires checkpoint-specific columns.
         let plan_executor = engine.require_plan_executor()?;
-        let needs_leaf_schema = self.stats.synthesize_json
+        let shape = if self.stats.synthesize_json
             || self.state_info.physical_stats_schema.is_some()
-            || self.partition_values.parsed_struct;
-        let shape =
-            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot, needs_leaf_schema)?;
+            || self.partition_values.parsed_struct
+        {
+            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
+        } else {
+            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
+        };
         self.build_metadata_scan_plan(&shape)
     }
 

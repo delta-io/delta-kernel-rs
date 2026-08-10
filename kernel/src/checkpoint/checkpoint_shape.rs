@@ -39,13 +39,29 @@ pub(crate) struct CheckpointShape {
 }
 
 impl CheckpointShape {
-    /// Resolves `snapshot`'s checkpoint topology. When `needs_leaf_schema` is true, also loads and
-    /// retains the schema of the files containing leaf actions. Schema retention does not affect
-    /// checkpoint classification.
+    /// Resolves `snapshot`'s checkpoint topology without retaining the leaf-action schema.
     ///
     /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
     /// read.
     pub(crate) fn try_new(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+    ) -> DeltaResult<CheckpointShape> {
+        Self::try_new_impl(exec, snapshot, false)
+    }
+
+    /// Resolves `snapshot`'s checkpoint topology and retains the leaf-action schema.
+    ///
+    /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
+    /// read.
+    pub(crate) fn try_new_with_leaf_schema(
+        exec: &dyn PlanExecutor,
+        snapshot: &Snapshot,
+    ) -> DeltaResult<CheckpointShape> {
+        Self::try_new_impl(exec, snapshot, true)
+    }
+
+    fn try_new_impl(
         exec: &dyn PlanExecutor,
         snapshot: &Snapshot,
         needs_leaf_schema: bool,
@@ -315,8 +331,12 @@ mod tests {
         let exec = SyncPlanExecutor::default();
         let stats_schema = expect_parsed.map(|_| probe_stats_schema());
 
-        let shape =
-            CheckpointShape::try_new(&exec, snapshot.as_ref(), stats_schema.is_some()).unwrap();
+        let shape = if stats_schema.is_some() {
+            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+        } else {
+            CheckpointShape::try_new(&exec, snapshot.as_ref())
+        }
+        .unwrap();
         let parsed_stats_schema = stats_schema
             .as_ref()
             .and_then(|stats_schema| shape.compatible_stats_parsed_schema(stats_schema));
@@ -385,8 +405,11 @@ mod tests {
             StructField::nullable(MAX_VALUES, columns()),
         ]));
 
-        let shape = CheckpointShape::try_new(&SyncPlanExecutor::default(), snapshot.as_ref(), true)
-            .unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(
+            &SyncPlanExecutor::default(),
+            snapshot.as_ref(),
+        )
+        .unwrap();
 
         assert!(shape
             .compatible_stats_parsed_schema(&incompatible)
@@ -406,7 +429,12 @@ mod tests {
             load_test_table("v2-checkpoints-parquet-with-sidecars").unwrap();
         let exec = CountingExecutor::new();
 
-        let shape = CheckpointShape::try_new(&exec, snapshot.as_ref(), needs_leaf_schema).unwrap();
+        let shape = if needs_leaf_schema {
+            CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref())
+        } else {
+            CheckpointShape::try_new(&exec, snapshot.as_ref())
+        }
+        .unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert_eq!(
@@ -452,7 +480,7 @@ mod tests {
             .unwrap();
 
         let exec = CountingExecutor::new();
-        let shape = CheckpointShape::try_new(&exec, snapshot.as_ref(), true).unwrap();
+        let shape = CheckpointShape::try_new_with_leaf_schema(&exec, snapshot.as_ref()).unwrap();
 
         assert_eq!(shape.checkpoint_type, CheckpointType::Manifest);
         assert!(
