@@ -871,6 +871,13 @@ impl Expression {
 }
 
 impl Predicate {
+    /// Literal boolean true
+    pub const TRUE: Self = Self::literal(true);
+    /// Literal boolean false
+    pub const FALSE: Self = Self::literal(false);
+    /// NULL boolean literal
+    pub const NULL: Self = Self::null_literal();
+
     /// Returns a set of columns referenced by this predicate.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
@@ -879,16 +886,16 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column(field_names: impl CollectInto<ColumnName>) -> Predicate {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Self {
         Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Create a new literal boolean value
+    /// Create a new literal boolean value. See also [`Self::TRUE`] and [`Self::FALSE`].
     pub const fn literal(value: bool) -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
     }
 
-    /// Creates a NULL literal boolean value
+    /// Creates a NULL literal boolean value. Prefer [`Self::NULL`].
     pub const fn null_literal() -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
     }
@@ -907,12 +914,12 @@ impl Predicate {
     }
 
     /// Create a new predicate `self IS NULL`
-    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_null(expr: impl Into<Expression>) -> Self {
         Self::unary(UnaryPredicateOp::IsNull, expr)
     }
 
     /// Create a new predicate `self IS NOT NULL`
-    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_not_null(expr: impl Into<Expression>) -> Self {
         Self::not(Self::is_null(expr))
     }
 
@@ -1609,8 +1616,8 @@ mod tests {
                 // Boolean expression
                 Predicate::from_expr(column_expr!("is_active")),
                 // Literals
-                Predicate::literal(true),
-                Predicate::literal(false),
+                Predicate::TRUE,
+                Predicate::FALSE,
                 // NOT
                 Predicate::not(Predicate::from_expr(column_expr!("x"))),
                 // Nested NOT
@@ -1632,8 +1639,7 @@ mod tests {
 
         #[test]
         fn test_predicate_null_literal_roundtrip() {
-            let pred = Predicate::null_literal();
-            assert_roundtrip(&pred);
+            assert_roundtrip(&Predicate::NULL);
         }
 
         #[test]
@@ -1846,12 +1852,12 @@ mod tests {
     #[test]
     fn empty_and_from_returns_identity_literal() {
         let result = Pred::and_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(true));
+        assert_eq!(result, Pred::TRUE);
     }
 
     #[test]
     fn empty_or_from_returns_identity_literal() {
         let result = Pred::or_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(false));
+        assert_eq!(result, Pred::FALSE);
     }
 }

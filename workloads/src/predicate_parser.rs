@@ -564,8 +564,8 @@ mod tests {
 
     // -- Boolean literals --
     #[rstest]
-    #[case("TRUE", KPred::literal(true))]
-    #[case("FALSE", KPred::literal(false))]
+    #[case("TRUE", KPred::TRUE)]
+    #[case("FALSE", KPred::FALSE)]
     fn boolean_literals(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
         assert_eq!(parse_predicate(sql, &schema).unwrap(), expected);

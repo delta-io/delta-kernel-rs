@@ -105,7 +105,7 @@ fn test_junctions() {
             .iter()
             .map(|val| match val {
                 Some(v) => Pred::literal(*v),
-                None => Pred::null_literal(),
+                None => Pred::NULL,
             })
             .collect();
 
