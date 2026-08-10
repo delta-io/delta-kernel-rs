@@ -15,17 +15,20 @@ use delta_kernel::{DeltaResult, Error};
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
-/// Converts a kernel [`Expression`](KernelExpression) into the equivalent DataFusion
-/// [`Expr`](DFExpr), validating columns against `input_schema`. `output_type` is the caller's
-/// declared result type when known; the container-shaped arms (`Struct`, `StructPatch`, and an
-/// `Array` of structs) take from it the field names and per-child types a constructor needs but the
-/// expression does not carry. Other arms ignore it, so callers without one pass `None`.
+/// Converts `expr` into the equivalent DataFusion [`Expr`](DFExpr), resolving column references
+/// against `input_schema`.
+///
+/// `output_type` supplies result type information that the expression itself does not carry.
+/// `Struct` and `StructPatch` require a struct type for output field names and computed child
+/// types. `Array` validates that a supplied type is an array and forwards its element type, while
+/// `Coalesce` forwards the result type unchanged to every branch. Callers pass `None` when the
+/// result type is unknown or the expression does not need it.
 ///
 /// # Errors
-/// Returns an error for a column that does not resolve against `input_schema`; a struct-shaped arm
-/// without a struct `output_type` or with a mismatched field count; an `Array` arm whose
-/// `output_type` is not an array; and [`Error::unsupported`] for arms with no DataFusion equivalent
-/// (see the `TODO`s below).
+/// Returns an error when a column cannot be resolved, a scalar cannot be converted, supplied type
+/// information is incompatible with the expression, or a `StructPatch` is inconsistent with its
+/// input or output schema. Returns [`Error::unsupported`] when no DataFusion equivalent is
+/// implemented.
 pub fn to_df_expr(
     expr: &KernelExpression,
     input_schema: &StructType,
@@ -207,12 +210,12 @@ fn struct_to_df_expr(
     Ok(struct_null_when_not(guard, body))
 }
 
-/// Lowers a struct patch (a sparse edit of an input struct) to a `named_struct(..)` rebuild,
-/// drawing output field names and types positionally from `output_type`. Walks the evaluator's
-/// emission order: prepends, each input field (passed through unless dropped/replaced, then its
-/// insertions), appends. A nested patch (`input_path` set) nulls the output where the source struct
-/// row is null, via `<input_path> IS NOT NULL` -- matching the evaluator, which clones the source
-/// struct's null buffer.
+/// Lowers a struct patch (a sparse edit of an input struct) to a `named_struct(..)` rebuild. Output
+/// field names come positionally from `output_type`, whose corresponding field types are forwarded
+/// when lowering computed values. Walks the evaluator's emission order: prepends, each input field
+/// (passed through unless dropped/replaced, then its insertions), and appends. A nested patch
+/// (`input_path` set) nulls the output where the source struct row is null, matching the
+/// evaluator's preservation of the source struct's null buffer.
 fn struct_patch_to_df_expr(
     patch: &ExpressionStructPatch,
     input_schema: &StructType,
@@ -273,7 +276,8 @@ fn struct_patch_to_df_expr(
         append_field_with_converted_expr(&mut args, &mut output_fields, expr)?;
     }
 
-    let mut used_field_patches = 0usize;
+    // Should only count required field patches (excluding optional)
+    let mut used_required_field_patches = 0usize;
     for input_field in source_struct.fields() {
         let name = input_field.name();
         let field_patch = patch.field_patches.get(name);
@@ -288,7 +292,9 @@ fn struct_patch_to_df_expr(
         for expr in &field_patch.insertions {
             append_field_with_converted_expr(&mut args, &mut output_fields, expr)?;
         }
-        used_field_patches += 1;
+        if !field_patch.optional {
+            used_required_field_patches += 1;
+        }
     }
 
     let required = patch
@@ -296,7 +302,7 @@ fn struct_patch_to_df_expr(
         .values()
         .filter(|fp| !fp.optional)
         .count();
-    if used_field_patches < required {
+    if used_required_field_patches < required {
         return Err(Error::generic(
             "StructPatch has non-optional field patches that reference missing input fields",
         ));
@@ -438,7 +444,7 @@ mod tests {
     fn array_of_struct_threads_element_schema_to_each_element() {
         let element = KernelExpr::struct_from([column_expr!("b"), KernelExpr::literal(1i64)]);
         let kernel = KernelExpr::array([element]);
-        let target: DataType = ArrayType::new(pq_struct(), true).into();
+        let target: DataType = ArrayType::new(pq_output_schema(), true).into();
         assert_eq!(
             lower_typed(kernel, target),
             "make_array(named_struct(Utf8(\"p\"), b, Utf8(\"q\"), Int64(1)))"
@@ -494,8 +500,8 @@ mod tests {
 
     // === Struct ===
 
-    /// A two-field target struct `{ p: long, q: long }` for struct/patch tests.
-    fn pq_struct() -> StructType {
+    /// Output schema with names distinct from the input schema, proving names come from the target.
+    fn pq_output_schema() -> StructType {
         StructType::try_new([
             StructField::nullable("p", DataType::LONG),
             StructField::nullable("q", DataType::LONG),
@@ -507,7 +513,7 @@ mod tests {
     fn struct_lowers_to_named_struct_with_target_names() {
         let kernel = KernelExpr::struct_from([column_expr!("b"), KernelExpr::literal(1i64)]);
         assert_eq!(
-            lower_typed(kernel, pq_struct().into()),
+            lower_typed(kernel, pq_output_schema().into()),
             "named_struct(Utf8(\"p\"), b, Utf8(\"q\"), Int64(1))"
         );
     }
@@ -516,7 +522,8 @@ mod tests {
     fn nested_struct_recurses_with_child_target_names() {
         let inner = KernelExpr::struct_from([column_expr!("b"), KernelExpr::literal(1i64)]);
         let kernel = KernelExpr::struct_from([inner]);
-        let target = StructType::try_new([StructField::nullable("outer", pq_struct())]).unwrap();
+        let target =
+            StructType::try_new([StructField::nullable("outer", pq_output_schema())]).unwrap();
         assert_eq!(
             lower_typed(kernel, target.into()),
             "named_struct(Utf8(\"outer\"), named_struct(Utf8(\"p\"), b, Utf8(\"q\"), Int64(1)))"
@@ -530,7 +537,7 @@ mod tests {
             KernelExpr::Predicate(Box::new(column_expr!("x").is_not_null())),
         );
         // Kernel models IS NOT NULL as Not(IsNull), so the guard renders as "NOT x IS NULL".
-        let rendered = lower_typed(kernel, pq_struct().into());
+        let rendered = lower_typed(kernel, pq_output_schema().into());
         assert!(
             rendered.starts_with("CASE WHEN NOT x IS NULL THEN named_struct("),
             "{rendered}"
@@ -589,7 +596,7 @@ mod tests {
     fn empty_top_level_patch_passes_all_fields_through() {
         let patch = ExpressionStructPatchBuilder::new().build().unwrap();
         assert_eq!(
-            lower_patch(patch, &ab_schema(), &pq_struct()),
+            lower_patch(patch, &ab_schema(), &pq_output_schema()),
             "named_struct(Utf8(\"p\"), a, Utf8(\"q\"), b)"
         );
     }
@@ -601,7 +608,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            lower_patch(patch, &ab_schema(), &pq_struct()),
+            lower_patch(patch, &ab_schema(), &pq_output_schema()),
             "named_struct(Utf8(\"p\"), Int64(7), Utf8(\"q\"), b)"
         );
     }
@@ -667,7 +674,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            lower_patch(patch, &input, &pq_struct()),
+            lower_patch(patch, &input, &pq_output_schema()),
             "CASE WHEN s IS NOT NULL THEN named_struct(Utf8(\"p\"), Int64(7), Utf8(\"q\"), \
              get_field(s, Utf8(\"b\"))) ELSE NULL END"
         );
@@ -715,14 +722,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn required_patch_on_missing_field_is_an_error() {
-        let patch = ExpressionStructPatchBuilder::new()
+    #[rstest]
+    #[case::only_missing_required(
+        ExpressionStructPatchBuilder::new()
             .replace("nonexistent", KernelExpr::literal(1i64))
             .build()
-            .unwrap();
+            .unwrap(),
+        pq_output_schema()
+    )]
+    #[case::matched_optional_does_not_mask_missing_required(
+        ExpressionStructPatchBuilder::new()
+            .drop_if_exists("b")
+            .replace("nonexistent", KernelExpr::literal(1i64))
+            .build()
+            .unwrap(),
+        StructType::try_new([StructField::nullable("p", DataType::LONG)]).unwrap()
+    )]
+    fn required_patch_on_missing_field_is_an_error(
+        #[case] patch: ExpressionStructPatch,
+        #[case] target: StructType,
+    ) {
         let expr = KernelExpr::struct_patch(patch).unwrap();
-        let target: DataType = pq_struct().into();
+        let target: DataType = target.into();
         assert_error_message(
             to_df_expr(&expr, &ab_schema(), Some(&target)),
             "StructPatch has non-optional field patches that reference missing input fields",
@@ -737,7 +758,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            lower_patch(patch, &ab_schema(), &pq_struct()),
+            lower_patch(patch, &ab_schema(), &pq_output_schema()),
             "named_struct(Utf8(\"p\"), a, Utf8(\"q\"), b)"
         );
     }
