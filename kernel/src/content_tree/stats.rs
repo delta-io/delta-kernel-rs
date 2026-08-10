@@ -1,6 +1,5 @@
 //! Stats manipulation utilities for Adaptive Metadata Tree (AMT).
 //!
-//! This module provides functions for working with stats columns in the AMT.
 //! The AMT stores statistics as shredded columns within parquet files. Stats are stored
 //! in a column-major format (each column has an associated struct with fields representing
 //! min, max, etc).
@@ -58,9 +57,8 @@ const MAX_DATA_FIELD_ID: i32 = (MAX_DATA_STATS_FIELD_ID
     - STATS_SPACE_FIELD_ID_START_FOR_DATA_FIELDS)
     / NUM_SUPPORTED_STATS_PER_COLUMN;
 
-// These mirror the Iceberg reserved field-id space, part of which is also declared as `i64` in
-// [`crate::reserved_field_ids`] (e.g. `FILE_NAME`); kept as `i32` here to match the stats field-id
-// arithmetic. See that module for the canonical reserved-id definitions.
+// Duplicated as `i32` (`crate::reserved_field_ids` declares `FILE_NAME` from the same Iceberg
+// reserved space as `i64`) to keep the stats field-id arithmetic in `i32`.
 
 /// Iceberg reserved field ID for `_last_updated_sequence_number` (`Integer.MAX_VALUE - 108`).
 const LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID: i32 = 2_147_483_539;
@@ -137,11 +135,8 @@ fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32)
 
 /// Extracts the parquet field ID from a [`StructField`]'s metadata, or `None` if absent.
 fn get_field_id(field: &StructField) -> Option<i32> {
-    match field
-        .metadata()
-        .get(ColumnMetadataKey::ParquetFieldId.as_ref())
-    {
-        Some(MetadataValue::Number(id)) => Some(*id as i32),
+    match field.get_config_value(&ColumnMetadataKey::ParquetFieldId) {
+        Some(MetadataValue::Number(id)) => (*id).try_into().ok(),
         _ => None,
     }
 }
@@ -164,8 +159,7 @@ fn wrap_struct_or_variant(original: &DataType, inner: StructType) -> DataType {
 /// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
-/// the variant's inner `value` type for variants. `is_variant` selects the variant rules (no
-/// `tight_bounds`, always a size stat).
+/// the variant's inner `value` type for variants.
 fn build_stats_struct(
     base_field_id: i32,
     bounds_type: &DataType,
@@ -181,58 +175,50 @@ fn build_stats_struct(
     };
     let has_size_stats = has_size_stats || is_variant;
 
-    let mut fields = vec![
-        field_with_id(
+    // (name, type, offset, include) -- filtered in declaration order to preserve field ordering.
+    let specs = [
+        (
             LOWER_BOUND,
             bounds_type.clone(),
+            STATS_OFFSET_LOWER_BOUND,
             true,
-            base_field_id + STATS_OFFSET_LOWER_BOUND,
         ),
-        field_with_id(
+        (
             UPPER_BOUND,
             bounds_type.clone(),
+            STATS_OFFSET_UPPER_BOUND,
             true,
-            base_field_id + STATS_OFFSET_UPPER_BOUND,
         ),
-    ];
-    if !is_variant {
-        fields.push(field_with_id(
+        (
             TIGHT_BOUNDS,
             DataType::BOOLEAN,
-            true,
-            base_field_id + STATS_OFFSET_TIGHT_BOUNDS,
-        ));
-    }
-    fields.push(field_with_id(
-        VALUE_COUNT,
-        DataType::LONG,
-        true,
-        base_field_id + STATS_OFFSET_VALUE_COUNT,
-    ));
-    if nullable {
-        fields.push(field_with_id(
+            STATS_OFFSET_TIGHT_BOUNDS,
+            !is_variant,
+        ),
+        (VALUE_COUNT, DataType::LONG, STATS_OFFSET_VALUE_COUNT, true),
+        (
             NULL_VALUE_COUNT,
             DataType::LONG,
-            true,
-            base_field_id + STATS_OFFSET_NULL_VALUE_COUNT,
-        ));
-    }
-    if has_nan_count {
-        fields.push(field_with_id(
+            STATS_OFFSET_NULL_VALUE_COUNT,
+            nullable,
+        ),
+        (
             NAN_VALUE_COUNT,
             DataType::LONG,
-            true,
-            base_field_id + STATS_OFFSET_NAN_VALUE_COUNT,
-        ));
-    }
-    if has_size_stats {
-        fields.push(field_with_id(
+            STATS_OFFSET_NAN_VALUE_COUNT,
+            has_nan_count,
+        ),
+        (
             AVG_VALUE_SIZE_IN_BYTES,
             DataType::INTEGER,
-            true,
-            base_field_id + STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
-        ));
-    }
+            STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES,
+            has_size_stats,
+        ),
+    ];
+    let fields = specs
+        .into_iter()
+        .filter(|&(.., include)| include)
+        .map(|(name, ty, offset, _)| field_with_id(name, ty, true, base_field_id + offset));
 
     StructType::new_unchecked(fields)
 }
@@ -272,12 +258,10 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
 
         // Build the stats data type for this column; `None` means "drop this column".
         let stats_data_type = match field.data_type() {
-            DataType::Primitive(_) => Some(DataType::Struct(Box::new(build_stats_struct(
-                base_stats_id,
+            DataType::Primitive(_) => Some(wrap_struct_or_variant(
                 field.data_type(),
-                field.is_nullable(),
-                false,
-            )))),
+                build_stats_struct(base_stats_id, field.data_type(), field.is_nullable(), false),
+            )),
             DataType::Variant(inner) => match inner.field(VARIANT_VALUE_FIELD_NAME) {
                 // Variant inner fields carry no field IDs of their own, so we cannot recurse
                 // through `transform_struct` (which requires them). The variant's base stats ID
@@ -293,7 +277,7 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
                         true,
                     );
                     let variant_stats = StructType::new_unchecked([StructField::nullable(
-                        value_field.name(),
+                        VARIANT_VALUE_FIELD_NAME,
                         DataType::Struct(Box::new(value_stats)),
                     )]);
                     Some(wrap_struct_or_variant(field.data_type(), variant_stats))
@@ -312,19 +296,10 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
             return Ok(None);
         };
 
-        // The stats group field uses the base stats field ID (e.g. 10_200 for field_id 1), not the
-        // original column field ID. Remap the field-id metadata; preserve everything else.
-        let metadata = field.metadata().iter().map(|(k, v)| {
-            let v = if k == ColumnMetadataKey::ParquetFieldId.as_ref() {
-                MetadataValue::Number(base_stats_id as i64)
-            } else {
-                v.clone()
-            };
-            (k.as_str(), v)
-        });
-
-        let stats_field =
-            StructField::nullable(field.name(), stats_data_type).with_metadata(metadata);
+        // The stats group field is a fresh physical field: it uses the base stats field ID (e.g.
+        // 10_200 for field_id 1), not the original column field ID, and carries no logical
+        // (column-mapping) metadata from the source column.
+        let stats_field = field_with_id(field.name(), stats_data_type, true, base_stats_id);
         Ok(Some(Cow::Owned(stats_field)))
     }
 }
@@ -431,8 +406,7 @@ mod tests {
         );
     }
 
-    /// A single primitive column produces a stats struct with the expected field count and IDs.
-    /// `expected_count` reflects: lower/upper/tight/value (4) + null_value_count (if nullable) +
+    /// `expected_count`: lower/upper/tight/value (4) + null_value_count (if nullable) +
     /// nan_value_count (float/double) + avg_value_size_in_bytes (string/binary).
     #[rstest]
     #[case(DataType::INTEGER, false, 1, 10_200, 4)] // fixed-length, non-null
@@ -496,6 +470,25 @@ mod tests {
     fn stats_schema_missing_field_id_errors() {
         let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
         assert!(stats_schema(&schema).is_err());
+    }
+
+    #[test]
+    fn stats_schema_nested_missing_field_id_errors() {
+        // A child missing its field ID must error (not silently drop) even inside a valid parent
+        // struct -- the abort-vs-drop distinction of the filtering carrier survives recursion.
+        let inner = StructType::new_unchecked([StructField::not_null("b", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
+        assert!(stats_schema(&schema).is_err());
+    }
+
+    #[test]
+    fn stats_schema_non_numeric_field_id_metadata_errors() {
+        // A field-id annotation of the wrong metadata type is treated as missing => error.
+        let field = StructField::not_null("c", DataType::INTEGER).with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::String("1".to_string()),
+        )]);
+        assert!(stats_schema(&StructType::new_unchecked([field])).is_err());
     }
 
     #[test]
@@ -703,6 +696,23 @@ mod tests {
             Some(MAX_DATA_STATS_FIELD_ID)
         );
         assert!(stats.field("over").is_none());
+    }
+
+    #[rstest]
+    #[case(MAX_DATA_FIELD_ID + 1)] // out of range
+    #[case(-5)] // negative
+    fn stats_schema_nested_out_of_range_child_is_dropped(#[case] bad_id: i32) {
+        // A child whose field ID is out of range (or negative) is warn-dropped, not an error; the
+        // parent keeps its surviving children.
+        let inner = StructType::new_unchecked([
+            field_with_id("keep", DataType::INTEGER, false, 2),
+            field_with_id("drop", DataType::INTEGER, false, bad_id),
+        ]);
+        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
+        let stats = stats_schema(&schema).expect("out-of-range child warn-drops, not errors");
+        let a_stats = field_stats_struct_for(stats.field("a").unwrap(), &stats);
+        assert!(a_stats.field("keep").is_some());
+        assert!(a_stats.field("drop").is_none());
     }
 
     #[test]
