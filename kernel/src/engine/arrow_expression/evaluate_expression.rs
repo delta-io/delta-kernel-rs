@@ -1120,10 +1120,12 @@ mod tests {
     };
     use crate::expressions::{
         col, column_expr, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, Predicate as Pred,
-        StructData,
+        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
+        Predicate as Pred, StructData,
     };
-    use crate::schema::{schema, schema_ref, ArrayType, DataType, StructField, StructType};
+    use crate::schema::{
+        schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
+    };
     use crate::unit_test_utils::assert_result_error_with_message;
 
     fn create_test_batch() -> RecordBatch {
@@ -1988,33 +1990,38 @@ mod tests {
         }
     }
 
-    /// Struct/array/map elements have no logical comparison, so they never match -- not even a
-    /// structurally identical needle. See [`Scalar::logical_partial_cmp`].
-    #[test]
-    fn test_in_nested_element_never_matches() {
-        let make_struct = |v| {
-            Scalar::Struct(
-                StructData::try_new(
-                    vec![StructField::nullable("a", DataType::INTEGER)],
-                    vec![Scalar::Integer(v)],
-                )
-                .unwrap(),
-            )
-        };
-        let element_type: DataType =
-            StructType::try_new([StructField::nullable("a", DataType::INTEGER)])
-                .unwrap()
-                .into();
+    /// Nested elements (struct, array, map) have no logical comparison, See
+    /// [`Scalar::logical_partial_cmp`].
+    #[rstest]
+    #[case::struct_element(Scalar::Struct(
+        StructData::try_new(
+            vec![StructField::nullable("a", DataType::INTEGER)],
+            vec![Scalar::Integer(1)],
+        )
+        .unwrap(),
+    ))]
+    #[case::array_element(Scalar::Array(
+        ArrayData::try_new(ArrayType::new(DataType::INTEGER, true), vec![1, 2]).unwrap(),
+    ))]
+    #[case::map_element(Scalar::Map(
+        MapData::try_new(
+            MapType::new(DataType::STRING, DataType::INTEGER, false),
+            vec![("k", 1)],
+        )
+        .unwrap(),
+    ))]
+    fn test_in_nested_element_never_matches(#[case] needle: Scalar) {
+        // A single-element literal array holding a structurally identical copy of the needle.
         let elements = ArrayData::try_new(
-            ArrayType::new(element_type, true),
-            vec![make_struct(1), make_struct(2)],
+            ArrayType::new(needle.data_type(), true),
+            vec![needle.clone()],
         )
         .unwrap();
 
         let (_, _, batch) = in_element_sources(&[Some(1)]);
         let pred = Pred::binary(
             BinaryPredicateOp::In,
-            Expr::Literal(make_struct(1)),
+            Expr::Literal(needle),
             Expr::Literal(Scalar::Array(elements)),
         );
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
