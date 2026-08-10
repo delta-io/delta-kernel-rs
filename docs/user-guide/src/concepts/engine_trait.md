@@ -153,7 +153,7 @@ let engine_data = engine
 ```
 
 This is not part of the `Engine` trait itself. It's a helper on `DefaultEngine` that
-orchestrates the lower-level `ParquetHandler` methods with a `WriteContext` (write directory,
+orchestrates the lower-level `ParquetHandler` methods with a `BoundWriteContext` (write directory,
 schema, stats columns, partition values).
 
 ## Configuring the Default Engine

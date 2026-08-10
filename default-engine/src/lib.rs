@@ -16,7 +16,7 @@ use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::metrics::{MeteredJsonHandler, MeteredParquetHandler, MeteredStorageHandler};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
-use delta_kernel::transaction::WriteContext;
+use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
     CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
     ParquetHandler, StorageHandler,
@@ -380,7 +380,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     pub async fn write_parquet(
         &self,
         data: &ArrowEngineData,
-        write_context: &WriteContext,
+        write_context: &BoundWriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
@@ -398,7 +398,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 }
 
 /// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values and
-/// table root from the provided [`WriteContext`].
+/// table root from the provided [`BoundWriteContext`].
 ///
 /// Paths in the returned Add action metadata are stored relative to the table root.
 ///
@@ -411,7 +411,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 /// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
 pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
-    write_context: &WriteContext,
+    write_context: &BoundWriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let add_path = write_context.resolve_file_path(file_metadata.location())?;
     file_metadata.as_record_batch(write_context.physical_partition_values(), &add_path)

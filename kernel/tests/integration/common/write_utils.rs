@@ -27,7 +27,7 @@ use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{schema_ref, SchemaRef, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::{CommitResult, Transaction, WriteContext};
+use delta_kernel::transaction::{BoundWriteContext, CommitResult, Transaction};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -477,7 +477,7 @@ pub fn get_scan_files(
 /// Serialize a deletion vector, write it to the object store, and return its descriptor.
 pub async fn write_deletion_vector_to_store(
     store: &Arc<dyn ObjectStore>,
-    write_context: &WriteContext,
+    write_context: &BoundWriteContext,
     dv: KernelDeletionVector,
     prefix: &str,
 ) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {

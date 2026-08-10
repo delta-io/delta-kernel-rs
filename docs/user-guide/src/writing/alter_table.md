@@ -124,7 +124,7 @@ time. In particular, the following are not callable on an `AlterTableTransaction
 
 | Method | Used for |
 |--------|----------|
-| `unpartitioned_write_context()` / `partitioned_write_context()` | Obtaining a `WriteContext` to write Parquet files |
+| `unpartitioned_write_context()` / `partitioned_write_context()` | Obtaining a `BoundWriteContext` to write Parquet files |
 | `add_files()` | Registering newly written data files |
 | `stats_schema()` | Retrieving the statistics schema for written files |
 

@@ -1,6 +1,6 @@
 # Writing to partitioned tables
 
-To write data to a partitioned table, you create a `WriteContext` for each distinct
+To write data to a partitioned table, you create a `BoundWriteContext` for each distinct
 set of partition values, write Parquet files through the engine for each one, and
 commit. Kernel validates partition values, serializes them per the Delta protocol,
 and constructs the correct directory paths.
@@ -11,20 +11,20 @@ Before reading this page, make sure you understand
 
 ## How partitioned writes differ
 
-For unpartitioned tables, you create one `WriteContext` and write all data through it.
-For partitioned tables, you create one `WriteContext` per distinct partition value
-combination. Partition values are file-constant metadata baked into the `WriteContext`
+For unpartitioned tables, you create one `BoundWriteContext` and write all data through it.
+For partitioned tables, you create one `BoundWriteContext` per distinct partition value
+combination. Partition values are file-constant metadata baked into the `BoundWriteContext`
 at creation time, not data columns passed at write time.
 
 ```text
-Unpartitioned:  1 WriteContext  -->  write all data
-Partitioned:    1 WriteContext per distinct partition  -->  write that partition's data
+Unpartitioned:  1 BoundWriteContext  -->  write all data
+Partitioned:    1 BoundWriteContext per distinct partition  -->  write that partition's data
 ```
 
 ## The write flow
 
 The pattern for partitioned writes is: **group your data by partition values, create a
-`WriteContext` per group, and write each group**.
+`BoundWriteContext` per group, and write each group**.
 
 ```rust,no_run
 # extern crate delta_kernel;
@@ -49,11 +49,11 @@ let mut txn = snapshot
     .with_data_change(true);
 
 // Suppose you have data grouped by partition values already.
-// For each partition, create a WriteContext and write.
+// For each partition, create a BoundWriteContext and write.
 let partitions: Vec<(HashMap<String, Scalar>, RecordBatch)> = todo!("group your data");
 
 for (partition_values, batch) in partitions {
-    // 1. Create a WriteContext for this partition
+    // 1. Create a BoundWriteContext for this partition
     let wc = txn.partitioned_write_context(partition_values)?;
 
     // 2. Write the data (the logical write schema excludes partition columns)
@@ -113,7 +113,7 @@ which you can collect into a `Vec<Option<String>>` group key for use in a `HashM
 ## Partition value validation
 
 `partitioned_write_context` validates the provided values before creating the
-`WriteContext`:
+`BoundWriteContext`:
 
 | Check | Example |
 |-------|---------|
@@ -138,7 +138,7 @@ Your connector does not need to implement any of this:
 5. **Key translation**: logical column names translated to physical names when
    column mapping is enabled
 
-`write_dir()` on the resulting `WriteContext` returns the directory where data files
+`write_dir()` on the resulting `BoundWriteContext` returns the directory where data files
 should be written. Without column mapping, this is a Hive-style path like
 `<table_root>/year=2024/month=3/`. With column mapping enabled, this is a
 random two-character prefix directory like `<table_root>/aB/` that avoids

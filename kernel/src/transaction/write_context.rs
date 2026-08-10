@@ -1,55 +1,200 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
-use crate::expressions::{ColumnName, ExpressionRef};
+use crate::expressions::{lit, ColumnName, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
-use crate::schema::SchemaRef;
+use crate::partition::serialization::serialize_partition_value;
+use crate::partition::validation::validate_partition_values;
+use crate::schema::void_utils::add_void_stripping;
+use crate::schema::{SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::{DeltaResult, Error};
+use crate::utils::require;
+use crate::{DataType, DeltaResult, Error, Expression};
 
-/// Table-wide write state shared across all [`WriteContext`] instances created by a
-/// [`Transaction`]. Holds the target directory, schemas, column mapping mode, stats columns,
-/// logical partition column names, and randomized-prefix configuration.
+/// Table-wide state required to create [`BoundWriteContext`] instances.
 ///
-/// [`Transaction`]: super::Transaction
-#[derive(Debug)]
-pub(super) struct SharedWriteState {
+/// A transaction creates this state once on the driver through
+/// [`Transaction::write_state`](super::Transaction::write_state). Distributed writers can encode
+/// it, transport it to another process, decode it, and bind partition values there without
+/// transporting the transaction itself.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WriteState {
     pub(super) table_root: Url,
-    /// Logical schema of the data to write: the table schema minus partition columns.
-    pub(super) logical_schema: SchemaRef,
+    pub(super) full_logical_schema: SchemaRef,
     pub(super) physical_schema: SchemaRef,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
+    pub(super) materialize_partition_columns: bool,
     /// Resolved value of the `delta.randomizeFilePrefixes` table property. When true,
-    /// [`WriteContext::write_dir`] emits a random alphanumeric prefix regardless of column
+    /// [`BoundWriteContext::write_dir`] emits a random alphanumeric prefix regardless of column
     /// mapping mode.
     pub(super) randomize_file_prefixes: bool,
     /// Resolved value of the `delta.randomPrefixLength` table property. Drives the length
-    /// of the random prefix in [`WriteContext::write_dir`] for both the column mapping and
+    /// of the random prefix in [`BoundWriteContext::write_dir`] for both the column mapping and
     /// `randomizeFilePrefixes` paths.
     pub(super) random_prefix_length: NonZero<usize>,
 }
 
-/// A write context for a specific partition or an unpartitioned table. Created by
-/// [`Transaction::partitioned_write_context`] or [`Transaction::unpartitioned_write_context`].
+impl WriteState {
+    /// Creates a write context for writing data to a specific partition.
+    ///
+    /// The supplied map must contain exactly one entry for every logical partition column. Keys
+    /// are matched case-insensitively and values are validated against the table schema before
+    /// being serialized according to the Delta partition-value rules.
+    ///
+    /// Returns an error if the table is not partitioned or if the partition keys or values are
+    /// invalid.
+    pub fn partitioned_write_context(
+        &self,
+        partition_values: HashMap<String, Scalar>,
+    ) -> DeltaResult<BoundWriteContext> {
+        require!(
+            !self.logical_partition_columns.is_empty(),
+            Error::generic("table is not partitioned; use unpartitioned_write_context() instead")
+        );
+        let normalized = validate_partition_values(
+            &self.logical_partition_columns,
+            &self.full_logical_schema,
+            partition_values,
+        )?;
+
+        let mut serialized = HashMap::with_capacity(normalized.len());
+        for logical_name in &self.logical_partition_columns {
+            let scalar = normalized.get(logical_name).ok_or_else(|| {
+                Error::internal_error(format!(
+                    "partition column '{logical_name}' missing after validation"
+                ))
+            })?;
+            let value = serialize_partition_value(scalar)?;
+            let physical_name = self
+                .full_logical_schema
+                .field(logical_name)
+                .ok_or_else(|| {
+                    Error::internal_error(format!(
+                        "partition column '{logical_name}' not found in schema after validation"
+                    ))
+                })?
+                .physical_name(self.column_mapping_mode)
+                .to_string();
+            serialized.insert(physical_name, value);
+        }
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
+
+        Ok(BoundWriteContext {
+            shared: Arc::new(self.clone()),
+            logical_schema: self.logical_schema_without_partition_columns(),
+            logical_to_physical,
+            physical_partition_values: serialized,
+        })
+    }
+
+    /// Creates a write context for writing data to an unpartitioned table.
+    ///
+    /// Returns an error if the table has partition columns.
+    pub fn unpartitioned_write_context(&self) -> DeltaResult<BoundWriteContext> {
+        require!(
+            self.logical_partition_columns.is_empty(),
+            Error::generic("table is partitioned; use partitioned_write_context() instead")
+        );
+        let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
+        Ok(BoundWriteContext {
+            shared: Arc::new(self.clone()),
+            logical_schema: self.logical_schema_without_partition_columns(),
+            logical_to_physical,
+            physical_partition_values: HashMap::new(),
+        })
+    }
+
+    /// Encodes this write state as JSON bytes.
+    ///
+    /// Returns an error if any field cannot be serialized.
+    pub fn encode(&self) -> DeltaResult<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Decodes a write state from JSON bytes produced by [`encode`](Self::encode).
+    ///
+    /// Returns an error if the bytes do not contain a valid serialized write state.
+    pub fn decode(bytes: &[u8]) -> DeltaResult<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    fn logical_schema_without_partition_columns(&self) -> SchemaRef {
+        if self.logical_partition_columns.is_empty() {
+            return self.full_logical_schema.clone();
+        }
+        let partition_columns: HashSet<&str> = self
+            .logical_partition_columns
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let fields = self
+            .full_logical_schema
+            .fields()
+            .filter(|field| !partition_columns.contains(field.name().as_str()))
+            .cloned();
+        Arc::new(StructType::new_unchecked(fields))
+    }
+
+    fn generate_logical_to_physical(
+        &self,
+        partition_values: Option<&HashMap<String, Scalar>>,
+    ) -> DeltaResult<Expression> {
+        let mut patch = ExpressionStructPatchBuilder::new();
+        if self.materialize_partition_columns {
+            let partition_cols: HashSet<&str> = self
+                .logical_partition_columns
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let mut predecessor: Option<&str> = None;
+            for field in self.full_logical_schema.fields() {
+                let name = field.name().as_str();
+                if partition_cols.contains(name) {
+                    let value = partition_values
+                        .and_then(|values| values.get(name))
+                        .ok_or_else(|| {
+                            Error::internal_error(format!(
+                                "partition column '{name}' missing while building \
+                                 logical-to-physical expression"
+                            ))
+                        })?;
+                    let literal = lit(value.clone());
+                    patch = match predecessor {
+                        Some(predecessor) => patch.insert_after(predecessor, literal),
+                        None => patch.prepend(literal),
+                    };
+                } else if *field.data_type() != DataType::VOID {
+                    predecessor = Some(name);
+                }
+            }
+        }
+        let patch = add_void_stripping(patch, &self.full_logical_schema);
+        Expression::struct_patch(patch)
+    }
+}
+
+/// A write context for a specific partition or an unpartitioned table. Created by either a
+/// [`WriteState`] or the convenience methods on [`Transaction`](super::Transaction).
 ///
 /// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
 /// Contains both table-wide state (shared cheaply via `Arc`) and per-partition state
 /// (serialized partition values with physical column names as keys). How you use a
-/// `WriteContext` depends on your engine:
+/// `BoundWriteContext` depends on your engine:
 ///
 /// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet`, which handles
 ///   everything (transform, write, partition metadata).
 /// - **Arrow-based custom engines**: write parquet yourself, then call `build_add_file_metadata`
-///   with the resulting `DataFileMetadata` and this `WriteContext` to produce the Add action
+///   with the resulting `DataFileMetadata` and this `BoundWriteContext` to produce the Add action
 ///   `EngineData` for [`Transaction::add_files`].
 /// - **Fully custom (non-Arrow) engines**: use [`physical_partition_values`] to build the
 ///   `partitionValues` map in Add actions directly.
@@ -57,10 +202,12 @@ pub(super) struct SharedWriteState {
 /// [`Transaction::partitioned_write_context`]: super::Transaction::partitioned_write_context
 /// [`Transaction::unpartitioned_write_context`]: super::Transaction::unpartitioned_write_context
 /// [`Transaction::add_files`]: super::Transaction::add_files
-/// [`physical_partition_values`]: WriteContext::physical_partition_values
+/// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
 #[derive(Debug)]
-pub struct WriteContext {
-    pub(super) shared: Arc<SharedWriteState>,
+pub struct BoundWriteContext {
+    pub(super) shared: Arc<WriteState>,
+    /// Logical schema of the data to write: the table schema minus partition columns.
+    pub(super) logical_schema: SchemaRef,
     /// Transforms logical data to physical data for writing. The logical data must not contain
     /// any partition columns. The expression injects the partition columns when needed.
     pub(super) logical_to_physical: ExpressionRef,
@@ -70,7 +217,7 @@ pub struct WriteContext {
     pub(super) physical_partition_values: HashMap<String, Option<String>>,
 }
 
-impl WriteContext {
+impl BoundWriteContext {
     /// Returns the table root URL.
     pub fn table_root_dir(&self) -> &Url {
         &self.shared.table_root
@@ -107,9 +254,9 @@ impl WriteContext {
     ///
     /// 2. **`add.path` in the Delta log** — keep the URL URI-encoded. After writing the parquet
     ///    file, pass the full (still-encoded) file URL — this URL plus the generated filename — to
-    ///    [`WriteContext::resolve_file_path`] to produce `add.path`. `make_relative` preserves the
-    ///    URI-encoded form, which is what the Delta protocol requires. Arrow-based engines can use
-    ///    `build_add_file_metadata` which handles this step.
+    ///    [`BoundWriteContext::resolve_file_path`] to produce `add.path`. `make_relative` preserves
+    ///    the URI-encoded form, which is what the Delta protocol requires. Arrow-based engines can
+    ///    use `build_add_file_metadata` which handles this step.
     ///
     /// `DefaultEngine::write_parquet` handles both steps automatically via `object_store`
     /// and `build_add_file_metadata`.
@@ -162,7 +309,7 @@ impl WriteContext {
 
     /// Returns the schema which connectors' logical data should conform to.
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.shared.logical_schema
+        &self.logical_schema
     }
 
     /// Returns the physical schema (partition columns removed if applicable, column mapping
@@ -307,21 +454,23 @@ mod tests {
         partition_values: HashMap<String, Option<String>>,
         randomize_file_prefixes: bool,
         random_prefix_length: usize,
-    ) -> WriteContext {
+    ) -> BoundWriteContext {
         let schema = schema_ref! { nullable "value": INTEGER };
-        let shared = Arc::new(SharedWriteState {
+        let shared = Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
-            logical_schema: schema.clone(),
+            full_logical_schema: schema.clone(),
             physical_schema: schema.clone(),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
+            materialize_partition_columns: false,
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
         });
-        WriteContext {
+        BoundWriteContext {
             shared,
+            logical_schema: schema,
             logical_to_physical: Arc::new(lit(true)),
             physical_partition_values: partition_values,
         }
@@ -619,5 +768,63 @@ mod tests {
             Ok(exp) => assert_eq!(wc.resolve_file_path(&file).unwrap(), exp),
             Err(()) => assert!(wc.resolve_file_path(&file).is_err()),
         }
+    }
+
+    fn partitioned_write_state() -> WriteState {
+        WriteState {
+            table_root: Url::parse("s3://bucket/table/").unwrap(),
+            full_logical_schema: schema_ref! {
+                not_null "year": INTEGER,
+                nullable "value": INTEGER
+            },
+            physical_schema: schema_ref! { nullable "value": INTEGER },
+            column_mapping_mode: ColumnMappingMode::None,
+            stats_columns: vec![ColumnName::new(["value"])],
+            logical_partition_columns: vec!["year".into()],
+            materialize_partition_columns: false,
+            randomize_file_prefixes: false,
+            random_prefix_length: NonZero::new(2).unwrap(),
+        }
+    }
+
+    #[test]
+    fn write_state_json_round_trip_preserves_partition_binding() {
+        let original = partitioned_write_state();
+        let encoded = original.encode().unwrap();
+        assert!(!String::from_utf8(encoded.clone())
+            .unwrap()
+            .contains("\"logical_schema\""));
+        let decoded = WriteState::decode(&encoded).unwrap();
+
+        let values = || HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
+        let original_context = original.partitioned_write_context(values()).unwrap();
+        let decoded_context = decoded.partitioned_write_context(values()).unwrap();
+
+        assert_eq!(
+            decoded_context.table_root_dir(),
+            original_context.table_root_dir()
+        );
+        assert_eq!(
+            decoded_context.logical_schema(),
+            original_context.logical_schema()
+        );
+        assert_eq!(
+            decoded_context.physical_schema(),
+            original_context.physical_schema()
+        );
+        assert_eq!(
+            decoded_context.stats_columns(),
+            original_context.stats_columns()
+        );
+        assert_eq!(
+            decoded_context.physical_partition_values(),
+            original_context.physical_partition_values()
+        );
+    }
+
+    #[test]
+    fn write_state_decode_rejects_malformed_json() {
+        let error = WriteState::decode(b"not valid json").unwrap_err();
+        assert!(error.to_string().contains("expected ident"));
     }
 }
