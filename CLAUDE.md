@@ -121,8 +121,7 @@ table at a specific version. From it you build a `Scan` (reads) or `Transaction`
 (via `partitioned_write_context` or `unpartitioned_write_context`) for local writers. Distributed
 writers can create and transport a `WriteState`, then bind partition values on each writer to get
 a `BoundWriteContext`. Kernel assembles commit actions, enforces protocol compliance, and delegates
-the
-atomic commit to a `Committer`.
+the atomic commit to a `Committer`.
 
 **Engine trait:** exposes `StorageHandler`, `JsonHandler`, `ParquetHandler`, and
 `EvaluationHandler`, plus an optional `PlanExecutor` under `declarative-plans`. Metrics use tracing

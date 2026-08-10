@@ -113,7 +113,10 @@ impl WriteState {
         })
     }
 
-    /// Encodes this write state as JSON bytes.
+    /// Encodes this write state as opaque JSON bytes for transport.
+    ///
+    /// The bytes are tied to this delta-kernel version. Do not inspect them or persist them across
+    /// kernel upgrades.
     ///
     /// Returns an error if any field cannot be serialized.
     pub fn encode(&self) -> DeltaResult<Vec<u8>> {
@@ -121,6 +124,9 @@ impl WriteState {
     }
 
     /// Decodes a write state from JSON bytes produced by [`encode`](Self::encode).
+    ///
+    /// The bytes must come from the same delta-kernel version. Cross-version decoding is not
+    /// supported.
     ///
     /// Returns an error if the bytes do not contain a valid serialized write state.
     pub fn decode(bytes: &[u8]) -> DeltaResult<Self> {
@@ -445,8 +451,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::lit;
-    use crate::schema::schema_ref;
+    use crate::expressions::{lit, Expression};
+    use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue, StructField};
 
     fn make_write_context(
         cm_mode: ColumnMappingMode,
@@ -770,26 +776,64 @@ mod tests {
         }
     }
 
-    fn partitioned_write_state() -> WriteState {
+    fn partitioned_write_state(
+        column_mapping_mode: ColumnMappingMode,
+        materialize_partition_columns: bool,
+        randomize_file_prefixes: bool,
+        random_prefix_length: usize,
+    ) -> WriteState {
+        let year = StructField::not_null("year", DataType::INTEGER).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(1),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("phys_year".into()),
+            ),
+        ]);
+        let value = StructField::nullable("value", DataType::INTEGER).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(2),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String("phys_value".into()),
+            ),
+        ]);
         WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
-            full_logical_schema: schema_ref! {
-                not_null "year": INTEGER,
-                nullable "value": INTEGER
-            },
+            full_logical_schema: Arc::new(StructType::new_unchecked([year, value])),
             physical_schema: schema_ref! { nullable "value": INTEGER },
-            column_mapping_mode: ColumnMappingMode::None,
+            column_mapping_mode,
             stats_columns: vec![ColumnName::new(["value"])],
             logical_partition_columns: vec!["year".into()],
-            materialize_partition_columns: false,
-            randomize_file_prefixes: false,
-            random_prefix_length: NonZero::new(2).unwrap(),
+            materialize_partition_columns,
+            randomize_file_prefixes,
+            random_prefix_length: NonZero::new(random_prefix_length).unwrap(),
         }
     }
 
-    #[test]
-    fn write_state_json_round_trip_preserves_partition_binding() {
-        let original = partitioned_write_state();
+    #[rstest]
+    #[case::default(ColumnMappingMode::None, false, false, 2, "year", false)]
+    #[case::column_mapping(ColumnMappingMode::Name, false, false, 7, "phys_year", true)]
+    #[case::materialized_partition(ColumnMappingMode::None, true, false, 2, "year", false)]
+    #[case::randomized_prefix(ColumnMappingMode::None, false, true, 7, "year", true)]
+    fn write_state_json_round_trip_preserves_worker_behavior(
+        #[case] column_mapping_mode: ColumnMappingMode,
+        #[case] materialize_partition_columns: bool,
+        #[case] randomize_file_prefixes: bool,
+        #[case] random_prefix_length: usize,
+        #[case] expected_partition_key: &str,
+        #[case] expect_random_prefix: bool,
+    ) {
+        let original = partitioned_write_state(
+            column_mapping_mode,
+            materialize_partition_columns,
+            randomize_file_prefixes,
+            random_prefix_length,
+        );
         let encoded = original.encode().unwrap();
         assert!(!String::from_utf8(encoded.clone())
             .unwrap()
@@ -820,6 +864,28 @@ mod tests {
             decoded_context.physical_partition_values(),
             original_context.physical_partition_values()
         );
+        assert_eq!(
+            decoded_context.logical_to_physical(),
+            original_context.logical_to_physical()
+        );
+        assert_eq!(decoded_context.column_mapping_mode(), column_mapping_mode);
+        assert_eq!(
+            decoded_context.physical_partition_values(),
+            &HashMap::from([(expected_partition_key.into(), Some("2024".into()))])
+        );
+
+        let write_dir = decoded_context.write_dir().path().to_string();
+        if expect_random_prefix {
+            let prefix = write_dir
+                .strip_prefix("/table/")
+                .unwrap()
+                .strip_suffix('/')
+                .unwrap();
+            assert_eq!(prefix.len(), random_prefix_length);
+            assert!(prefix.chars().all(|c| c.is_ascii_alphanumeric()));
+        } else {
+            assert_eq!(write_dir, "/table/year=2024/");
+        }
     }
 
     #[test]

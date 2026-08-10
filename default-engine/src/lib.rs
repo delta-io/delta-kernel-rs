@@ -371,10 +371,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// `materializePartitionColumns` or `icebergCompatV3`), this function automatically inserts
     /// them into the data.
     ///
-    /// The `write_context` must be created by [`Transaction::partitioned_write_context`] or
-    /// [`Transaction::unpartitioned_write_context`], which handle partition value validation,
-    /// serialization, and logical-to-physical key translation.
+    /// Create `write_context` from [`WriteState`] or the convenience methods on [`Transaction`].
+    /// Both paths validate and serialize partition values and build the logical-to-physical
+    /// transformation.
     ///
+    /// [`WriteState`]: delta_kernel::transaction::WriteState
+    /// [`Transaction`]: delta_kernel::transaction::Transaction
     /// [`Transaction::partitioned_write_context`]: delta_kernel::transaction::Transaction::partitioned_write_context
     /// [`Transaction::unpartitioned_write_context`]: delta_kernel::transaction::Transaction::unpartitioned_write_context
     pub async fn write_parquet(

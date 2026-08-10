@@ -230,8 +230,8 @@ feature is enabled; the rest are always available.
 
 Use a `BoundWriteContext` to learn where to write parquet files and what schema to
 write. For unpartitioned writes, one context serves the whole transaction.
-Partitioned writes (which would use one context per partition) are tracked in
-[#2355](https://github.com/delta-io/delta-kernel-rs/issues/2355).
+For partitioned writes, create one context per partition by passing a
+`PartitionValueMap` to `get_partitioned_write_context`.
 
 Engines must append their own `<uuid>.parquet` filename (and any subdirectory
 layout) onto the returned table root. For partitioned tables, use

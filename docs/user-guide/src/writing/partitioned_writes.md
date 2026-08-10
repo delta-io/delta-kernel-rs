@@ -48,13 +48,15 @@ let mut txn = snapshot
     .with_operation("INSERT".to_string())
     .with_data_change(true);
 
+// Build the reusable state before iterating over partitions.
+let write_state = txn.write_state()?;
+
 // Suppose you have data grouped by partition values already.
-// For each partition, create a BoundWriteContext and write.
 let partitions: Vec<(HashMap<String, Scalar>, RecordBatch)> = todo!("group your data");
 
 for (partition_values, batch) in partitions {
     // 1. Create a BoundWriteContext for this partition
-    let wc = txn.partitioned_write_context(partition_values)?;
+    let wc = write_state.partitioned_write_context(partition_values)?;
 
     // 2. Write the data (the logical write schema excludes partition columns)
     let data = ArrowEngineData::new(batch);
@@ -78,7 +80,21 @@ let partition_values = HashMap::from([
     ("year".to_string(), Scalar::Integer(2024)),
     ("month".to_string(), Scalar::Integer(3)),
 ]);
-let wc = txn.partitioned_write_context(partition_values)?;
+let wc = write_state.partitioned_write_context(partition_values)?;
+```
+
+For distributed writes, encode the state on the coordinator and decode it on each worker before
+binding that worker's partition values. The transport representation only supports the same
+delta-kernel version on both sides.
+
+```rust,ignore
+// Coordinator
+let encoded = txn.write_state()?.encode()?;
+send_to_workers(encoded);
+
+// Worker
+let write_state = WriteState::decode(&encoded)?;
+let wc = write_state.partitioned_write_context(partition_values)?;
 ```
 
 Key points:

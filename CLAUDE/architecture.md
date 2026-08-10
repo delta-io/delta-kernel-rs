@@ -69,12 +69,18 @@ file listing without re-scanning the table.
 
 `Snapshot` -> `Transaction` -> (`WriteState` -> `BoundWriteContext`) -> commit
 
+<<<<<<< HEAD
 
 The kernel coordinates the write transaction: it freezes table-wide write configuration in a
 serializable `WriteState`, binds partition values into a `BoundWriteContext` (validated partition
 values, recommended write directory, physical schema, stats columns), assembles commit actions
 (CommitInfo, Add files), enforces protocol compliance (table features, schema validation), and
 delegates the atomic commit to a `Committer`.
+=======
+Kernel captures table-wide configuration in a transportable `WriteState`. Each writer binds
+partition values to create a `BoundWriteContext`; the transaction then registers the resulting
+files and commits them.
+>>>>>>> 78d1a6cc (self review feedback and humanize)
 
 **Data-write steps:**
 1. Create `Transaction` from a snapshot with a `Committer` (e.g. `FileSystemCommitter`)
