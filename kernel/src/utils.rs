@@ -152,7 +152,7 @@ pub(crate) fn current_time_micros() -> DeltaResult<i64> {
 
 fn duration_to_micros(duration: Duration) -> DeltaResult<i64> {
     i64::try_from(duration.as_micros())
-        .map_err(|_| Error::generic("Current timestamp exceeds i64 microsecond range"))
+        .map_err(|_| Error::generic("Duration exceeds i64 microsecond range"))
 }
 
 /// Extension trait for folding zero or one value from an [`Option`] into a base value.

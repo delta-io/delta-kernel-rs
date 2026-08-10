@@ -30,8 +30,8 @@ use crate::{DeltaResult, Error};
 /// Holds the raw SQL and the column's declared type. On construction the kernel parses the SQL
 /// with its built-in parser and caches the result. [`to_scalar`](Self::to_scalar) returns the
 /// parsed [`Scalar`], or `None` when the kernel could not parse the SQL, in which case a connector
-/// can evaluate [`raw_sql`](Self::raw_sql) itself. Dynamic defaults such as `CURRENT_TIMESTAMP`
-/// are evaluated each time [`to_scalar`](Self::to_scalar) is called.
+/// can evaluate [`raw_sql`](Self::raw_sql) itself. Kernel-supported non-literal defaults such as
+/// `CURRENT_TIMESTAMP` are evaluated each time [`to_scalar`](Self::to_scalar) is called.
 ///
 /// The declared type is borrowed from the logical schema, which outlives the carrier.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,13 +91,14 @@ impl<'a> ColumnDefault<'a> {
 
     /// The default as a [`Scalar`], or `None` when the kernel could not parse the SQL.
     ///
-    /// Dynamic defaults such as `CURRENT_TIMESTAMP` are evaluated when this method is called. On
-    /// `None` the connector can evaluate [`raw_sql`](Self::raw_sql) with its own SQL engine.
+    /// Kernel-supported non-literal defaults such as `CURRENT_TIMESTAMP` are evaluated when this
+    /// method is called. On `None` the connector can evaluate [`raw_sql`](Self::raw_sql) with its
+    /// own SQL engine.
     ///
     /// # Errors
     ///
-    /// Returns an error if a parsed expression is neither a literal nor a kernel-supported dynamic
-    /// default, or if evaluation of a supported dynamic default fails.
+    /// Returns an error if a parsed expression is neither a literal nor a kernel-supported
+    /// non-literal default, or if evaluation of a supported non-literal default fails.
     pub fn to_scalar(&self) -> DeltaResult<Option<Scalar>> {
         match &self.parsed_sql {
             None => Ok(None),
@@ -467,7 +468,7 @@ mod tests {
 
     #[rstest]
     #[case::literal("42", DataType::INTEGER, ParseStatus::Literal)]
-    #[case::dynamic("CURRENT_TIMESTAMP", DataType::TIMESTAMP, ParseStatus::NonLiteral)]
+    #[case::non_literal("CURRENT_TIMESTAMP", DataType::TIMESTAMP, ParseStatus::NonLiteral)]
     #[case::unparsed("NOW()", DataType::TIMESTAMP, ParseStatus::Unparsed)]
     fn classifies_parsed_defaults(
         #[case] raw_sql: &str,
