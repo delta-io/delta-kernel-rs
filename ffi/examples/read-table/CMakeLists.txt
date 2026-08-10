@@ -28,6 +28,10 @@ add_test(NAME read_and_print_with_short_dv COMMAND ${TestRunner} ${KernelTestPat
 # does not call read_parquet_file, so the data section is "[No data]"; this test still
 # requires PRINT_DATA=ON because iterate_scan_metadata_arrow is gated behind it.
 add_test(NAME read_arrow_metadata_basic COMMAND ${TestRunner} ${DatPath}/basic_partitioned/delta/ ${ExpectedPath}/basic-partitioned-arrow-metadata.expected -a)
+# Exercises typed field metadata across the FFI: the column_mapping table's fields carry
+# `delta.columnMapping.id`, which the schema visitor reads back via get_from_metadata_map and
+# prints per field.
+add_test(NAME read_column_mapping_metadata COMMAND ${TestRunner} ${DatPath}/column_mapping/delta/ ${ExpectedPath}/column-mapping-arrow-metadata.expected -a)
 
 if(WIN32)
   set(CMAKE_C_FLAGS_DEBUG "/MT")
