@@ -25,7 +25,7 @@ use crate::table_features::{
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{CollectInto, DeltaResult, Error};
 
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
@@ -1058,6 +1058,12 @@ impl StructType {
         field.ok_or_else(|| Error::generic("Empty path"))
     }
 
+    /// Checks whether this schema contains the field at the given column path.
+    pub fn contains_col(&self, col: impl CollectInto<ColumnName>) -> bool {
+        let col = col.collect_into();
+        self.field_at(&col).is_ok()
+    }
+
     /// Visits all fields along the given column path.
     ///
     /// Returns an error if the path is empty, a field is not found, or an intermediate field is not
@@ -1612,28 +1618,6 @@ impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
 /// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
 pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
     NonNullFieldChecker.transform_struct(schema).is_err()
-}
-
-#[cfg(not(feature = "interval-type-in-dev"))]
-struct UsesIntervalType;
-
-#[cfg(not(feature = "interval-type-in-dev"))]
-impl<'a> SchemaTransform<'a> for UsesIntervalType {
-    transform_output_type!(|'a, T| Result<(), ()>);
-
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
-        if ptype.is_interval() {
-            Err(())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Returns whether `schema` contains an ANSI interval type at any nesting level.
-#[cfg(not(feature = "interval-type-in-dev"))]
-pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
-    UsesIntervalType.transform_struct(schema).is_err()
 }
 
 /// Normalizes column name field names to match the casing in the schema.
@@ -2732,7 +2716,7 @@ mod tests {
 
     use super::*;
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };
@@ -3743,64 +3727,6 @@ mod tests {
     #[case::variant_skipped(variant_only_schema(), false)]
     fn test_schema_contains_non_null_fields(#[case] schema: StructType, #[case] expected: bool) {
         assert_eq!(schema_contains_non_null_fields(&schema), expected);
-    }
-
-    #[cfg(not(feature = "interval-type-in-dev"))]
-    #[test]
-    fn test_schema_contains_interval_type() {
-        for interval in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
-            let schemas = [
-                (
-                    "top-level",
-                    StructType::new_unchecked([StructField::nullable("iv", interval.clone())]),
-                ),
-                (
-                    "nested struct",
-                    StructType::new_unchecked([StructField::nullable(
-                        "nested",
-                        StructType::new_unchecked([StructField::nullable(
-                            "inner_iv",
-                            interval.clone(),
-                        )]),
-                    )]),
-                ),
-                (
-                    "array element",
-                    StructType::new_unchecked([StructField::nullable(
-                        "array",
-                        ArrayType::new(interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map value",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(DataType::STRING, interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map key",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(interval.clone(), DataType::STRING, true),
-                    )]),
-                ),
-            ];
-
-            for (case, schema) in schemas {
-                assert!(
-                    schema_contains_interval_type(&schema),
-                    "expected {case} schema to contain {interval:?}"
-                );
-            }
-        }
-
-        for schema in [
-            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]),
-            variant_only_schema(),
-        ] {
-            assert!(!schema_contains_interval_type(&schema));
-        }
     }
 
     #[test]

@@ -214,12 +214,12 @@ mod tests {
 
     use crate::engine::sync::SyncEngine;
     #[cfg(feature = "declarative-plans")]
+    use crate::engine::test_delegating::DelegatingEngine;
+    #[cfg(feature = "declarative-plans")]
     use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
-    use crate::{
-        DeltaResult, Engine, Error, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-    };
+    use crate::{DeltaResult, Error};
 
     // A [`PlanExecutor`] whose every operation fails, used to prove that a plan-path failure
     // surfaces from P&M replay rather than falling back to legacy replay.
@@ -230,30 +230,6 @@ mod tests {
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
             Err(Error::generic("plan executor deliberately failed"))
-        }
-    }
-
-    // Forwards every handler to an inner [`SyncEngine`] but returns a [`FailingPlanExecutor`], so
-    // P&M replay takes the plan path and hits the failure.
-    #[cfg(feature = "declarative-plans")]
-    struct FailingPlanEngine(Arc<SyncEngine>);
-
-    #[cfg(feature = "declarative-plans")]
-    impl Engine for FailingPlanEngine {
-        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-            self.0.evaluation_handler()
-        }
-        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-            self.0.storage_handler()
-        }
-        fn json_handler(&self) -> Arc<dyn JsonHandler> {
-            self.0.json_handler()
-        }
-        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-            self.0.parquet_handler()
-        }
-        fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
-            Some(Arc::new(FailingPlanExecutor))
         }
     }
 
@@ -344,7 +320,8 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine = FailingPlanEngine(Arc::new(SyncEngine::new()));
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_plan_executor(Arc::new(FailingPlanExecutor));
 
         let result = Snapshot::builder_for(url).build(&engine);
 

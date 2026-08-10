@@ -25,7 +25,7 @@ use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::{ENABLE_ROW_TRACKING, ROW_TRACKING_SUSPENDED};
-use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+use crate::unit_test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
 fn get_schema() -> SchemaRef {

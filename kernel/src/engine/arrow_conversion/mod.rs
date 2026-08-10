@@ -671,12 +671,12 @@ mod tests {
         StructType,
     };
     use crate::transforms::{transform_output_type, SchemaTransform};
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
         complex_nested_with_field_ids,
     };
     #[cfg(feature = "geo-type-in-dev")]
-    use crate::utils::test_utils::{geography_type, geometry_type};
+    use crate::unit_test_utils::{geography_type, geometry_type};
     use crate::DeltaResult;
 
     #[cfg(feature = "geo-type-in-dev")]

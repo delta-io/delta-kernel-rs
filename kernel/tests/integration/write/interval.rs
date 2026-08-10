@@ -4,36 +4,8 @@ use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, StructField, StructType};
 use test_utils::load_and_begin_transaction;
-#[cfg(not(feature = "interval-type-in-dev"))]
-use test_utils::{create_table, engine_store_setup};
 
-/// Writing interval data is gated by the `interval-type-in-dev` cargo feature.
-#[cfg(not(feature = "interval-type-in-dev"))]
-#[tokio::test]
-async fn test_write_interval_table_gate() -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "iv",
-        DataType::INTERVAL_DAY_TIME,
-    )])?);
-
-    let (store, engine, table_location) =
-        engine_store_setup("test_interval_requires_feature", None);
-    let table_url = create_table(store, table_location, schema, &[], true, vec![], vec![]).await?;
-
-    let transaction = load_and_begin_transaction(table_url, &engine)?;
-    let err = transaction
-        .unpartitioned_write_context()
-        .expect_err("interval write contexts should be blocked when the cargo feature is disabled")
-        .to_string();
-    assert!(
-        err.contains("interval-type-in-dev"),
-        "error must explain the missing cargo feature; got: {err}",
-    );
-    Ok(())
-}
-
-#[cfg(feature = "interval-type-in-dev")]
-mod feature_enabled {
+mod supported {
     use std::collections::HashMap;
 
     use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, STATS_PARSED};

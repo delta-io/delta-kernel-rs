@@ -7,7 +7,7 @@ use delta_kernel::arrow::array::{
 };
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
-use delta_kernel::arrow::util::display::array_value_to_string;
+use delta_kernel::arrow::util::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -91,8 +91,13 @@ fn assert_stats_struct_matches_json(
                 }
             }
             serde_json::Value::String(s) => {
-                let actual = array_value_to_string(col.as_ref(), row_idx)
-                    .unwrap_or_else(|e| panic!("{path}: cannot format parsed value: {e}"));
+                let format_options = FormatOptions::default()
+                    .with_display_error(true)
+                    .with_timestamp_format(Some("%Y-%m-%dT%H:%M:%S%.3f"))
+                    .with_timestamp_tz_format(Some("%Y-%m-%dT%H:%M:%S%.3fZ"));
+                let formatter = ArrayFormatter::try_new(col.as_ref(), &format_options)
+                    .unwrap_or_else(|e| panic!("{path}: cannot build formatter: {e}"));
+                let actual = formatter.value(row_idx).to_string();
                 assert_eq!(&actual, s, "{path} mismatch at row {row_idx}");
             }
             serde_json::Value::Object(sub_obj) => {
@@ -219,4 +224,54 @@ fn scan_metadata_with_stats_columns_kernel_written(
     // file with the default 10 rows.
     assert_eq!(file_count, 1, "Should have processed exactly one file");
     assert_eq!(total_num_records, 10, "Should have exactly 10 numRecords");
+}
+
+#[test]
+fn json_stats_truncate_timestamps_to_milliseconds() {
+    let (engine, snapshot, _table) = test_context!(
+        LogState::with_latest_version(1).with_checkpoint_at([1]),
+        FeatureSet::empty(),
+        unpartitioned(),
+        TableConfig::new().write_stats_as_struct(true),
+        version_latest(),
+    );
+
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all())
+        .build()
+        .unwrap();
+
+    let mut checked = 0;
+    for scan_metadata in scan.scan_metadata(&engine).unwrap() {
+        let (underlying_data, selection_vector) = scan_metadata.unwrap().scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered_batch =
+            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+        let stats_json = get_column!(filtered_batch, "stats", StringArray);
+
+        for i in 0..filtered_batch.num_rows() {
+            let json: serde_json::Value = serde_json::from_str(stats_json.value(i)).unwrap();
+            for bound in [MIN_VALUES, MAX_VALUES] {
+                for (col, rendered) in json[bound].as_object().unwrap() {
+                    let Some(ts) = rendered.as_str().filter(|s| s.contains('T')) else {
+                        continue; // not a timestamp column
+                    };
+                    let fraction = ts
+                        .trim_end_matches('Z')
+                        .rsplit_once('.')
+                        .unwrap_or_else(|| panic!("{bound}.{col} = {ts:?} has no fraction"))
+                        .1;
+                    assert_eq!(fraction.len(), 3, "{bound}.{col} = {ts:?}");
+                    // The builder's values end in .298677, which floors to .298 rather than
+                    // rounding to .299.
+                    assert!(ts.ends_with(".298Z") || ts.ends_with(".298"), "{ts:?}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "no timestamp stats were checked");
 }

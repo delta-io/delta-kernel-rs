@@ -103,6 +103,7 @@ impl Transaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
+            column_defaults_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
@@ -297,26 +298,13 @@ impl Transaction {
             visitor.new_entries.clear();
             visitor.matched_file_indexes.clear();
             visitor.visit_rows_of(&scan_file)?;
-            let (data, mut selection_vector) = scan_file.into_parts();
+            let (data, _) = scan_file.into_parts();
 
             // Update selection vector to keep only files that matched DV descriptors.
             // This ensures we only generate remove/add actions for files being updated.
-            let mut current_matched_index = 0;
-            for (i, selected) in selection_vector.iter_mut().enumerate() {
-                if current_matched_index < visitor.matched_file_indexes.len() {
-                    if visitor.matched_file_indexes[current_matched_index] != i {
-                        *selected = false;
-                    } else {
-                        // `matched_file_indexes` is populated from a FilteredRowVisitor, so every
-                        // matched row was selected in the original scan metadata.
-                        current_matched_index += 1;
-                        matched_dv_files += 1;
-                    }
-                } else {
-                    // Deselect any files after the last matched file
-                    *selected = false;
-                }
-            }
+            let selection_vector =
+                selection_vector_for_matches(data.len(), &visitor.matched_file_indexes);
+            matched_dv_files += visitor.matched_file_indexes.len();
 
             // Append two temporary columns to the scan data: the new DV descriptor and the
             // rewritten stats (with `tightBounds: false`).
@@ -363,6 +351,20 @@ impl Transaction {
         }
         Ok(())
     }
+}
+
+fn selection_vector_for_matches(num_rows: usize, matched_file_indexes: &[usize]) -> Vec<bool> {
+    let mut next_match = 0;
+    (0..num_rows)
+        .map(|row_index| {
+            if matched_file_indexes.get(next_match) == Some(&row_index) {
+                next_match += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
 }
 
 // =============================================================================

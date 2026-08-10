@@ -1182,7 +1182,7 @@ mod tests {
         schema_ref, DataType, MetadataColumnSpec, SchemaRef, StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{DeltaResult, Expression as Expr, ExpressionRef};
 
     fn test_checkpoint_info() -> CheckpointReadInfo {

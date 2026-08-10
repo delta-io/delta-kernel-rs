@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD};
 use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
@@ -42,7 +42,8 @@ use crate::schema::{
     lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
     StructType, ToSchema as _,
 };
-use crate::table_features::{ColumnMappingMode, Operation};
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -417,10 +418,17 @@ impl ScanBuilder {
         // per-row partition-value parse done only to build them.
         state_info.skip_row_transforms = self.without_row_transforms;
 
+        let physical_stats_output_schema = build_physical_stats_output_schema(
+            self.snapshot.table_configuration(),
+            &state_info,
+            &self.stats,
+        )?;
+
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
             stats: self.stats,
+            physical_stats_output_schema,
             correlation_id: self.correlation_id,
             partition_values: self.partition_values,
             cancellation_token: self.cancellation_token,
@@ -683,11 +691,54 @@ pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
     stats: StatsOptions,
+    #[allow(dead_code)] // Only used when `declarative-plans` is enabled
+    physical_stats_output_schema: Option<SchemaRef>,
     correlation_id: Option<Arc<str>>,
     partition_values: PartitionValuesOptions,
     /// Optional cooperative cancellation token supplied via
     /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
     cancellation_token: Option<CancellationTokenRef>,
+}
+
+/// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
+///
+/// For example, if the caller requests `[a, b]` and the predicate references `c`,
+/// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
+/// Returns `None` when no eligible struct stats are requested and errors when a requested column
+/// cannot be resolved.
+fn build_physical_stats_output_schema(
+    table_configuration: &TableConfiguration,
+    state_info: &StateInfo,
+    stats: &StatsOptions,
+) -> DeltaResult<Option<SchemaRef>> {
+    match &stats.struct_stats {
+        StructStats::None => Ok(None),
+        StructStats::All => Ok(state_info.physical_stats_schema.clone()),
+        StructStats::Columns(columns) if columns.is_empty() => Ok(None),
+        StructStats::Columns(columns) => {
+            let logical_schema = table_configuration.logical_schema();
+            let column_mapping_mode = table_configuration.column_mapping_mode();
+            let physical_columns: Vec<_> = columns
+                .iter()
+                .map(|column| {
+                    get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
+                })
+                .try_collect()?;
+            let stats_schema = table_configuration
+                .build_expected_stats_schemas(None, Some(&physical_columns))?
+                .physical;
+
+            Ok(stats_schema_with_data_columns(stats_schema))
+        }
+    }
+}
+
+/// Returns `schema` only when it contains stats for at least one data column.
+///
+/// Expected stats schemas always contain `numRecords` and `tightBounds`. `nullCount` is present
+/// only when at least one data column survives stats filtering.
+fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
+    schema.field(NULL_COUNT).is_some().then_some(schema)
 }
 
 impl std::fmt::Debug for Scan {
@@ -1033,7 +1084,6 @@ impl Scan {
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        let log_segment = self.snapshot.log_segment();
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
         let plan_executor = engine.require_plan_executor()?;
@@ -1042,7 +1092,7 @@ impl Scan {
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
         )?;
-        scan_plan::build_metadata_scan_plan(&self.state_info, log_segment, &shape)
+        self.build_metadata_scan_plan(&shape)
     }
 
     // Factored out to facilitate testing

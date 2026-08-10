@@ -47,6 +47,8 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod alloc_stats;
+
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
@@ -1602,7 +1604,10 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot.table_configuration().partition_columns().len()
+    snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -1615,7 +1620,10 @@ pub unsafe extern "C" fn get_partition_columns(
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
     // NOTE: Clippy doesn't like it, but we need to_vec+into_iter to decouple lifetimes
-    let partition_columns = snapshot.table_configuration().partition_columns().to_vec();
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
     let iter: Box<StringIter> = Box::new(partition_columns.into_iter());
     iter.into()
 }
@@ -2600,6 +2608,18 @@ mod tests {
         }),
         4
     )]
+    // Skipped under Miri: writes checkpoint parquet (minutes of safe work under the interpreter).
+    // Its unsafe (checkpoint_snapshot) is unconditional in `spec`, so the Some(V2WithSidecar) path
+    // adds no unsafe over test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error (runs
+    // under Miri); the checkpoint/free handles are covered by test_setting_multithread_executor.
+    // Sidecar-shape is safe kernel logic. Runs (all cases) under normal cargo test / nextest.
+    //
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_sidecar_shape(
         #[case] is_v2: bool,
@@ -2682,6 +2702,16 @@ mod tests {
     // the first checkpoint.)
     //
     // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. AlreadyExists/overwrite is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2721,6 +2751,16 @@ mod tests {
     // `checkpoint_snapshot` returns `AlreadyExists` (same table version). Also validates the
     // `_delta_log/_last_checkpoint` content (version, numOfAddFiles, size, sizeInBytes), which
     // `test_checkpoint_snapshot_sidecar_shape` doesn't cover.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. _last_checkpoint content is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_checkpoint_snapshot_written_snapshot_is_usable(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2778,6 +2818,11 @@ mod tests {
     // Test checkpoint using FFI engine builder APIs with multithreaded executor.
     // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to
     // build engine without existing tokio runtime.
+    //
+    // Miri anchor for checkpoint FFI: covers the success-path checkpoint_snapshot -> Written
+    // handle -> free_snapshot that the skipped checkpoint tests share, and uniquely covers
+    // set_builder_with_multithreaded_executor (no other test calls it). Skipping it drops that
+    // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {

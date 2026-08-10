@@ -938,7 +938,7 @@ mod tests {
     };
     use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::struct_patch::ProjectionStructPatchBuilder;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     fn projection_patch(expr: &ExpressionRef) -> &ExpressionStructPatch {
         let Expr::StructPatch(patch) = expr.as_ref() else {

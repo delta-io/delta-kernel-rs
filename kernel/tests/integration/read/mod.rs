@@ -1360,13 +1360,13 @@ fn not_and_or_predicates(
 }
 
 #[rstest::rstest]
-#[case::literal_false(Pred::literal(false), table_for_numbers(vec![]))]
+#[case::literal_false(Pred::FALSE, table_for_numbers(vec![]))]
 #[case::and_with_literal_false(
-    Pred::and(column_pred!("number"), Pred::literal(false)),
+    Pred::and(column_pred!("number"), Pred::FALSE),
     table_for_numbers(vec![])
 )]
 #[case::literal_true(
-    Pred::literal(true),
+    Pred::TRUE,
     table_for_numbers(vec![1, 2, 3, 4, 5, 6])
 )]
 #[case::from_literal_expr(
