@@ -33,9 +33,7 @@ use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::transaction::alter_table::AlterTableTransaction;
-use crate::transaction::schema_evolution::{
-    evolve_table_config, AddField, SchemaChange, SetNullable,
-};
+use crate::transaction::schema_evolution::{evolve_table_config, SchemaChange};
 use crate::{DeltaResult, Engine};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
@@ -123,7 +121,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
         let column = ColumnName::new([field.name().clone()]);
-        self.operations.push(AddField::new(column, field).into());
+        self.operations.push(SchemaChange::add_field(column, field));
         self.transition()
     }
 
@@ -139,7 +137,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         column: ColumnName,
         field: StructField,
     ) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations.push(AddField::new(column, field).into());
+        self.operations.push(SchemaChange::add_field(column, field));
         self.transition()
     }
 
@@ -148,7 +146,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// Note: this matches Spark's behavior.
     pub fn set_nullable(mut self, column: ColumnName) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations.push(SetNullable::new(column).into());
+        self.operations.push(SchemaChange::set_nullable(column));
         self.transition()
     }
 }

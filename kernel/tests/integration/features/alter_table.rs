@@ -16,7 +16,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
-use delta_kernel::transaction::schema_evolution::AddField;
+use delta_kernel::transaction::schema_evolution::SchemaChange;
 use delta_kernel::{DeltaResult, Engine};
 use rstest::rstest;
 use test_utils::{
@@ -31,6 +31,16 @@ fn simple_schema() -> SchemaRef {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("name", DataType::STRING),
         ])
+        .unwrap(),
+    )
+}
+
+fn nested_schema() -> SchemaRef {
+    Arc::new(
+        StructType::try_new([StructField::nullable(
+            "address",
+            StructType::try_new([StructField::nullable("city", DataType::STRING)]).unwrap(),
+        )])
         .unwrap(),
     )
 }
@@ -78,7 +88,10 @@ fn add_column_error(
             .unwrap_err(),
         EvolutionEntryPoint::WriteTransaction => snapshot
             .transaction(committer(), engine)?
-            .with_schema_changes(vec![AddField::new(column_name!("new_col"), field).into()])
+            .with_schema_changes(vec![SchemaChange::add_field(
+                column_name!("new_col"),
+                field,
+            )])
             .unwrap_err(),
     };
     Ok(error.to_string())
@@ -220,6 +233,43 @@ async fn add_columns_lifecycle(
         assert_eq!(null_count, 2, "column {name} should have 2 NULLs");
     }
 
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn add_nested_column_commits_through_each_entry_point(
+    #[values(EvolutionEntryPoint::AlterTable, EvolutionEntryPoint::WriteTransaction)]
+    entry_point: EvolutionEntryPoint,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, nested_schema(), engine.as_ref(), &[])?;
+    let column = column_name!("address.zip");
+    let field = StructField::nullable("zip", DataType::INTEGER);
+
+    let snapshot = match entry_point {
+        EvolutionEntryPoint::AlterTable => snapshot
+            .alter_table()
+            .add_column_at_path(column, field)
+            .build(engine.as_ref(), committer())?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot(),
+        EvolutionEntryPoint::WriteTransaction => snapshot
+            .transaction(committer(), engine.as_ref())?
+            .with_schema_changes(vec![SchemaChange::add_field(column, field)])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot(),
+    };
+
+    let schema = snapshot.schema();
+    let DataType::Struct(address) = schema.field("address").unwrap().data_type() else {
+        panic!("address must remain a struct");
+    };
+    assert_eq!(
+        address.field("zip"),
+        Some(&StructField::nullable("zip", DataType::INTEGER))
+    );
     Ok(())
 }
 

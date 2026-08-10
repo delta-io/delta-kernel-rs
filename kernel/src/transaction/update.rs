@@ -141,8 +141,9 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// Returns an error if `changes` is empty, an operation is invalid, or the evolved schema is
-    /// incompatible with the table protocol.
+    /// Returns an error if `changes` is empty, data file actions have already been staged, the
+    /// table enables a feature that schema evolution does not support, an operation is invalid, or
+    /// the evolved schema is incompatible with the table protocol.
     pub fn with_schema_changes(mut self, changes: Vec<SchemaChange>) -> DeltaResult<Self> {
         require!(
             !changes.is_empty(),

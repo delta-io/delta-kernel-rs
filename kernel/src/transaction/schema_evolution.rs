@@ -1,4 +1,4 @@
-//! Schema evolution operations for ALTER TABLE.
+//! Schema evolution operations for table and write transactions.
 //!
 //! This module defines operations for validating and applying schema changes.
 
@@ -21,61 +21,10 @@ use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::utils::{require, FoldWithOption as _};
 use crate::DeltaResult;
 
-/// Context shared by schema operations while they are applied.
-pub(crate) struct SchemaOperationContext {
+/// Context shared by schema changes while they are applied.
+struct SchemaEvolutionContext {
     column_mapping_enabled: bool,
     max_column_id: Option<i64>,
-}
-
-/// Internal behavior shared by schema evolution operations.
-pub(crate) trait SchemaOperation: Send + Sync + std::fmt::Debug {
-    /// Returns the path to the field affected by this operation.
-    fn path(&self) -> &[String];
-
-    /// Applies the operation at the final path component.
-    fn apply_at_leaf(
-        &self,
-        fields: &mut IndexMap<String, StructField>,
-        field_index: Option<usize>,
-        context: &mut SchemaOperationContext,
-    ) -> DeltaResult<()>;
-
-    /// Descends through the data type according to this operation's recursion policy.
-    fn descend<'a>(
-        &self,
-        data_type: &'a mut DataType,
-        path_component: &str,
-    ) -> DeltaResult<&'a mut StructType>;
-
-    /// Adds operation-specific context to an error returned by the shared traversal.
-    fn wrap_error(&self, error: Error) -> Error;
-}
-
-#[derive(Debug, Clone)]
-/// Adds a field at a column path.
-pub struct AddField {
-    column: ColumnName,
-    field: StructField,
-}
-
-impl AddField {
-    /// Creates an operation that adds `field` at `column`.
-    pub fn new(column: ColumnName, field: StructField) -> Self {
-        Self { column, field }
-    }
-}
-
-#[derive(Debug, Clone)]
-/// Makes an existing field nullable.
-pub struct SetNullable {
-    column: ColumnName,
-}
-
-impl SetNullable {
-    /// Creates an operation that makes `column` nullable.
-    pub fn new(column: ColumnName) -> Self {
-        Self { column }
-    }
 }
 
 /// A schema change that can be applied to a transaction.
@@ -83,44 +32,93 @@ impl SetNullable {
 #[derive(Debug, Clone)]
 pub enum SchemaChange {
     /// Adds a field at a column path.
-    AddField(AddField),
+    ///
+    /// Traversal through arrays uses their element type and traversal through maps uses their
+    /// value type. Map keys cannot be evolved.
+    AddField {
+        /// Full path to the new field, including its name as the final component.
+        column: ColumnName,
+        /// The nullable field to add.
+        field: StructField,
+    },
     /// Makes an existing field nullable.
-    SetNullable(SetNullable),
-}
-
-impl From<AddField> for SchemaChange {
-    fn from(operation: AddField) -> Self {
-        Self::AddField(operation)
-    }
-}
-
-impl From<SetNullable> for SchemaChange {
-    fn from(operation: SetNullable) -> Self {
-        Self::SetNullable(operation)
-    }
+    ///
+    /// Every intermediate path component must be a struct field.
+    SetNullable {
+        /// Path to the field whose nullability should be relaxed.
+        column: ColumnName,
+    },
 }
 
 impl SchemaChange {
-    fn as_operation(&self) -> &dyn SchemaOperation {
+    /// Creates a change that adds `field` at `column`.
+    pub fn add_field(column: ColumnName, field: StructField) -> Self {
+        Self::AddField { column, field }
+    }
+
+    /// Creates a change that makes `column` nullable.
+    pub fn set_nullable(column: ColumnName) -> Self {
+        Self::SetNullable { column }
+    }
+
+    fn apply(
+        &self,
+        fields: &mut IndexMap<String, StructField>,
+        context: &mut SchemaEvolutionContext,
+    ) -> DeltaResult<()> {
         match self {
-            Self::AddField(operation) => operation,
-            Self::SetNullable(operation) => operation,
+            Self::AddField { column, field } => {
+                apply_traversal(fields, &AddFieldTraversal { column, field }, context)
+            }
+            Self::SetNullable { column } => {
+                apply_traversal(fields, &SetNullableTraversal { column }, context)
+            }
         }
     }
 }
 
-/// Helper to modify a nested column. For each component in `path`, locates the matching field
-/// (case-insensitive), then delegates container traversal and leaf behavior to `operation`.
-///
-/// # Example
-///
-/// For the path `address.city`, the walker locates `address`, asks the operation how to enter its
-/// data type, and then applies the operation to `city` in the returned struct.
+trait TraversalPolicy {
+    fn path(&self) -> &[String];
+
+    fn apply_at_leaf(
+        &self,
+        fields: &mut IndexMap<String, StructField>,
+        field_index: Option<usize>,
+        context: &mut SchemaEvolutionContext,
+    ) -> DeltaResult<()>;
+
+    fn descend<'a>(
+        &self,
+        data_type: &'a mut DataType,
+        path_component: &str,
+    ) -> DeltaResult<&'a mut StructType>;
+
+    fn wrap_error(&self, error: Error) -> Error;
+}
+
+struct AddFieldTraversal<'a> {
+    column: &'a ColumnName,
+    field: &'a StructField,
+}
+
+struct SetNullableTraversal<'a> {
+    column: &'a ColumnName,
+}
+
+fn apply_traversal(
+    fields: &mut IndexMap<String, StructField>,
+    traversal: &impl TraversalPolicy,
+    context: &mut SchemaEvolutionContext,
+) -> DeltaResult<()> {
+    modify_field_at_path(fields, traversal.path(), traversal, context)
+        .map_err(|error| traversal.wrap_error(error))
+}
+
 fn modify_field_at_path(
     fields: &mut IndexMap<String, StructField>,
     path: &[String],
-    operation: &dyn SchemaOperation,
-    context: &mut SchemaOperationContext,
+    traversal: &impl TraversalPolicy,
+    context: &mut SchemaEvolutionContext,
 ) -> DeltaResult<()> {
     let (first, rest) = path
         .split_first()
@@ -133,7 +131,7 @@ fn modify_field_at_path(
         .position(|(_, field)| field.name().to_lowercase() == lowered);
 
     if rest.is_empty() {
-        return operation.apply_at_leaf(fields, field_index, context);
+        return traversal.apply_at_leaf(fields, field_index, context);
     }
 
     let field_index =
@@ -141,14 +139,11 @@ fn modify_field_at_path(
     let (_, field) = fields
         .get_index_mut(field_index)
         .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
-    let inner = operation.descend(&mut field.data_type, first)?;
-    modify_field_at_path(inner.field_map_mut(), rest, operation, context)
+    let inner = traversal.descend(&mut field.data_type, first)?;
+    modify_field_at_path(inner.field_map_mut(), rest, traversal, context)
 }
 
-/// Apply rules for additive change to schema.
-/// Can add a field as a top-level column or inside
-///  a nested struct, array, or map value.
-impl SchemaOperation for AddField {
+impl TraversalPolicy for AddFieldTraversal<'_> {
     fn path(&self) -> &[String] {
         self.column.path()
     }
@@ -157,7 +152,7 @@ impl SchemaOperation for AddField {
         &self,
         fields: &mut IndexMap<String, StructField>,
         field_index: Option<usize>,
-        context: &mut SchemaOperationContext,
+        context: &mut SchemaEvolutionContext,
     ) -> DeltaResult<()> {
         let leaf = self
             .column
@@ -179,7 +174,7 @@ impl SchemaOperation for AddField {
             ));
         }
         if !matches!(self.field.data_type, DataType::Primitive(_)) {
-            StructType::ensure_no_metadata_columns_in_field(&self.field)?;
+            StructType::ensure_no_metadata_columns_in_field(self.field)?;
         }
         if !self.field.is_nullable() {
             return Err(Error::schema(
@@ -195,7 +190,7 @@ impl SchemaOperation for AddField {
                      table properties",
                 )
             })?;
-            try_assign_flat_column_mapping_info(&self.field, id)?
+            try_assign_flat_column_mapping_info(self.field, id)?
         } else {
             self.field.clone()
         };
@@ -220,16 +215,17 @@ impl SchemaOperation for AddField {
 
     fn wrap_error(&self, error: Error) -> Error {
         if matches!(error, Error::InvalidProtocol(_)) {
-            return error;
+            error
+        } else {
+            Error::schema(format!(
+                "Cannot add column '{}': {error}",
+                self.field.name()
+            ))
         }
-        Error::schema(format!(
-            "Cannot add column '{}': {error}",
-            self.field.name()
-        ))
     }
 }
 
-impl SchemaOperation for SetNullable {
+impl TraversalPolicy for SetNullableTraversal<'_> {
     fn path(&self) -> &[String] {
         self.column.path()
     }
@@ -238,7 +234,7 @@ impl SchemaOperation for SetNullable {
         &self,
         fields: &mut IndexMap<String, StructField>,
         field_index: Option<usize>,
-        _context: &mut SchemaOperationContext,
+        _context: &mut SchemaEvolutionContext,
     ) -> DeltaResult<()> {
         let field_index = field_index.ok_or_else(|| {
             let leaf = self.column.path().last().map_or("", String::as_str);
@@ -321,19 +317,12 @@ pub(crate) fn apply_schema_operations(
         current_max_column_id
     };
 
-    let mut context = SchemaOperationContext {
+    let mut context = SchemaEvolutionContext {
         column_mapping_enabled: cm_enabled,
         max_column_id: max_id,
     };
     for operation in operations {
-        let operation = operation.as_operation();
-        modify_field_at_path(
-            schema.field_map_mut(),
-            operation.path(),
-            operation,
-            &mut context,
-        )
-        .map_err(|error| operation.wrap_error(error))?;
+        operation.apply(schema.field_map_mut(), &mut context)?;
     }
 
     validate_schema(&schema, column_mapping_mode)?;
@@ -406,7 +395,7 @@ fn ensure_schema_evolution_supported(table_config: &TableConfiguration) -> Delta
     require!(
         !table_config.is_feature_enabled(&TableFeature::IcebergCompatV3),
         Error::unsupported(
-            "Schema evolution is not yet supported on tables with icebergCompatV3 enabled"
+            "Schema changes are not yet supported on tables with icebergCompatV3 enabled"
         )
     );
     // TODO(#2630): Support schema evolution on tables with column defaults.
@@ -443,7 +432,7 @@ mod tests {
     type Operation = SchemaChange;
 
     fn add_field_at(column: ColumnName, field: StructField) -> Operation {
-        AddField::new(column, field).into()
+        SchemaChange::add_field(column, field)
     }
 
     fn add_field(field: StructField) -> Operation {
@@ -452,7 +441,7 @@ mod tests {
     }
 
     fn set_nullable(column: ColumnName) -> Operation {
-        SetNullable::new(column).into()
+        SchemaChange::set_nullable(column)
     }
 
     fn add_col(name: &str, nullable: bool) -> Operation {
@@ -504,12 +493,12 @@ mod tests {
         path: &[String],
     ) -> DeltaResult<IndexMap<String, StructField>> {
         let mut fields = into_field_map(schema);
-        let operation = SetNullable::new(ColumnName::new(path.to_vec()));
-        let mut context = SchemaOperationContext {
+        let mut context = SchemaEvolutionContext {
             column_mapping_enabled: false,
             max_column_id: None,
         };
-        modify_field_at_path(&mut fields, path, &operation, &mut context)?;
+        SchemaChange::set_nullable(ColumnName::new(path.to_vec()))
+            .apply(&mut fields, &mut context)?;
         Ok(fields)
     }
 
