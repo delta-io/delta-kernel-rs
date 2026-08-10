@@ -86,7 +86,6 @@ trait TraversalPolicy {
     /// Returns the path to the field to be modified.
     fn path(&self) -> &[String];
 
-    /// Applies the schema change to the leaf field at the given index.
     fn apply_at_leaf(
         &self,
         fields: &mut IndexMap<String, StructField>,
@@ -395,7 +394,7 @@ fn ensure_schema_evolution_supported(table_config: &TableConfiguration) -> Delta
             "Schema changes are not yet supported on tables with icebergCompatV3 enabled"
         )
     );
-
+    // TODO(#2630): Support schema evolution on tables with column defaults.
     require!(
         !table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults),
         Error::unsupported(

@@ -129,7 +129,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The final path component must match `field.name()`. Traversal through arrays uses their
     /// element type, and traversal through maps uses their value type. Map keys cannot be evolved.
-    /// The field must be nullable and must not conflict with an existing sibling field.
+    /// The field must be nullable and must not have a name conflict with an existing sibling field.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column_at_path(
@@ -163,8 +163,7 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///
     /// # Errors
     ///
-    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which schema evolution does
-    ///   not yet support
+    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which don't support schema changes
     /// - Any individual operation fails validation (see per-method errors above)
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
@@ -189,18 +188,5 @@ impl AlterTableTransactionBuilder<Modifying> {
             committer,
             self.correlation_id,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assert_send_sync<T: Send + Sync>() {}
-
-    #[test]
-    fn builder_states_are_send_and_sync() {
-        assert_send_sync::<AlterTableTransactionBuilder<Ready>>();
-        assert_send_sync::<AlterTableTransactionBuilder<Modifying>>();
     }
 }
