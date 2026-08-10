@@ -42,7 +42,7 @@ pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionE
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::Scalar as KernelScalar;
-    use delta_kernel::plans::ir::nodes::{Values as KernelValues};
+    use delta_kernel::plans::ir::nodes::Values as KernelValues;
     use delta_kernel::plans::ir::plan::PlanNode as KernelPlanNode;
     use delta_kernel::schema::{DataType, StructField, StructType};
 
