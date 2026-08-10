@@ -147,6 +147,10 @@ pub(crate) fn current_time_ms() -> DeltaResult<i64> {
 /// Returns the current time in microseconds since Unix epoch.
 pub(crate) fn current_time_micros() -> DeltaResult<i64> {
     let duration = current_time_duration()?;
+    duration_to_micros(duration)
+}
+
+fn duration_to_micros(duration: Duration) -> DeltaResult<i64> {
     i64::try_from(duration.as_micros())
         .map_err(|_| Error::generic("Current timestamp exceeds i64 microsecond range"))
 }
@@ -256,6 +260,18 @@ mod tests {
             .as_micros();
 
         assert!(before <= current && current <= after);
+    }
+
+    #[test]
+    fn duration_to_micros_checks_i64_bounds() {
+        let max = Duration::from_micros(i64::MAX as u64);
+        assert_eq!(duration_to_micros(max).unwrap(), i64::MAX);
+
+        let overflow = Duration::from_micros(i64::MAX as u64 + 1);
+        assert!(duration_to_micros(overflow)
+            .unwrap_err()
+            .to_string()
+            .contains("i64 microsecond range"));
     }
 
     #[test]

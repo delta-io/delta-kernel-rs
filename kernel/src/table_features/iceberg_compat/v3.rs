@@ -189,16 +189,23 @@ mod column_default_tests {
         )])
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ExpectedValidation {
+        Valid,
+        Warning(&'static str),
+        Unsupported(&'static str),
+    }
+
     #[rstest]
     #[case::primitive_literal(
         StructType::try_new([field_with_default("a", DataType::INTEGER, "42")]).unwrap(),
         "a",
-        None
+        ExpectedValidation::Valid
     )]
     #[case::primitive_null(
         StructType::try_new([field_with_default("a", DataType::INTEGER, "NULL")]).unwrap(),
         "a",
-        None
+        ExpectedValidation::Valid
     )]
     #[case::null_on_non_primitive(
         StructType::try_new([field_with_default(
@@ -207,7 +214,7 @@ mod column_default_tests {
             "NULL"
         )]).unwrap(),
         "a",
-        None
+        ExpectedValidation::Valid
     )]
     #[case::non_null_on_non_primitive(
         StructType::try_new([field_with_default(
@@ -216,40 +223,18 @@ mod column_default_tests {
             "ARRAY(1)"
         )]).unwrap(),
         "a",
-        Some("could not verify")
+        ExpectedValidation::Warning("could not verify")
     )]
-    fn v3_column_default_validation(
-        #[case] schema: StructType,
-        #[case] expected_path: &str,
-        #[case] expected_warning: Option<&str>,
-    ) {
-        let table_configuration = table_config_with_schema(schema);
-        let logging = LoggingTest::new();
-        iceberg_compat_v3_column_defaults_validation(&table_configuration).unwrap();
-        let logs = logging.logs();
-
-        match expected_warning {
-            None => assert!(
-                !logs.contains("icebergCompatV3 column default"),
-                "logs: {logs}"
-            ),
-            Some(needle) => {
-                assert!(logs.contains(expected_path), "logs: {logs}");
-                assert!(logs.contains(needle), "logs: {logs}");
-            }
-        }
-    }
-
-    #[rstest]
-    #[case::top_level(
+    #[case::recognized_non_literal_top_level(
         StructType::try_new([field_with_default(
             "a",
             DataType::TIMESTAMP,
             "current_timestamp()"
         )]).unwrap(),
-        "a"
+        "a",
+        ExpectedValidation::Unsupported("current_timestamp()")
     )]
-    #[case::nested(
+    #[case::recognized_non_literal_nested(
         StructType::try_new([StructField::nullable(
             "s",
             DataType::try_struct_type([field_with_default(
@@ -258,23 +243,45 @@ mod column_default_tests {
                 "current_timestamp()"
             )]).unwrap(),
         )]).unwrap(),
-        "s.inner"
+        "s.inner",
+        ExpectedValidation::Unsupported("current_timestamp()")
     )]
-    fn v3_column_default_validation_rejects_recognized_non_literal(
+    fn v3_column_default_validation(
         #[case] schema: StructType,
         #[case] expected_path: &str,
+        #[case] expected: ExpectedValidation,
     ) {
         let table_configuration = table_config_with_schema(schema);
-        let error = iceberg_compat_v3_column_defaults_validation(&table_configuration)
-            .expect_err("icebergCompatV3 must reject a recognized non-literal default");
+        let logging = LoggingTest::new();
+        let result = iceberg_compat_v3_column_defaults_validation(&table_configuration);
 
-        assert!(matches!(&error, crate::Error::Unsupported(_)));
-        let message = error.to_string();
-        assert!(message.contains(expected_path), "got: {message}");
-        assert!(message.contains("current_timestamp()"), "got: {message}");
-        assert!(
-            message.contains("requires column defaults to be literals"),
-            "got: {message}"
-        );
+        match expected {
+            ExpectedValidation::Valid => {
+                result.unwrap();
+                let logs = logging.logs();
+                assert!(
+                    !logs.contains("icebergCompatV3 column default"),
+                    "logs: {logs}"
+                );
+            }
+            ExpectedValidation::Warning(needle) => {
+                result.unwrap();
+                let logs = logging.logs();
+                assert!(logs.contains(expected_path), "logs: {logs}");
+                assert!(logs.contains(needle), "logs: {logs}");
+            }
+            ExpectedValidation::Unsupported(default_sql) => {
+                let error = result
+                    .expect_err("icebergCompatV3 must reject a recognized non-literal default");
+                assert!(matches!(&error, crate::Error::Unsupported(_)));
+                let message = error.to_string();
+                assert!(message.contains(expected_path), "got: {message}");
+                assert!(message.contains(default_sql), "got: {message}");
+                assert!(
+                    message.contains("requires column defaults to be literals"),
+                    "got: {message}"
+                );
+            }
+        }
     }
 }

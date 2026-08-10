@@ -476,65 +476,62 @@ async fn test_transaction_top_level_column_defaults_excludes_nested_defaults(
     Ok(())
 }
 
-/// On an `icebergCompatV3` table, a default whose SQL expression kernel cannot parse produces a
-/// warning rather than an error, so the snapshot loads and a DML transaction constructs.
+#[derive(Clone, Copy, Debug)]
+enum V3ValidationOutcome {
+    Warning(&'static str),
+    Unsupported(&'static str),
+}
+
+#[rstest]
+#[case::unparseable(
+    "test_v3_tolerates_unparseable_default",
+    DataType::from(ArrayType::new(DataType::INTEGER, true)),
+    "ARRAY(1)",
+    V3ValidationOutcome::Warning("could not verify")
+)]
+#[case::recognized_non_literal(
+    "test_v3_rejects_recognized_non_literal_default",
+    DataType::TIMESTAMP,
+    "current_timestamp()",
+    V3ValidationOutcome::Unsupported("requires column defaults to be literals")
+)]
 #[tokio::test]
-async fn test_load_and_write_tolerate_v3_unparseable_default(
+async fn test_v3_column_default_validation_e2e(
+    #[case] table_name: &str,
+    #[case] field_type: DataType,
+    #[case] default_sql: &str,
+    #[case] expected: V3ValidationOutcome,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let field_type = DataType::from(ArrayType::new(DataType::INTEGER, true));
-    let default_sql = "ARRAY(1)";
     let base = StructType::try_new(vec![StructField::nullable("c", field_type)])?;
     let schema = schema_with_column_defaults(&base, HashMap::from([("c", default_sql)]))?;
 
     let (engine, table_url) = setup_unpartitioned_table(
-        "test_v3_tolerates_unparseable_default",
+        table_name,
         schema,
         vec!["allowColumnDefaults", "icebergCompatV3"],
     )
     .await?;
 
-    // Read: the snapshot loads despite the unverifiable default.
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-
     let logging = LoggingTest::new();
-    snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    assert!(
-        logging.logs().contains("could not verify"),
-        "logs: {}",
-        logging.logs()
-    );
 
-    Ok(())
-}
-
-/// A snapshot containing a recognized non-literal default remains readable, but IcebergCompatV3
-/// rejects construction of a DML transaction because the feature requires literal defaults.
-#[tokio::test]
-async fn test_load_allows_but_write_rejects_v3_recognized_non_literal_default(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let base = StructType::try_new(vec![StructField::nullable("c", DataType::TIMESTAMP)])?;
-    let schema = schema_with_column_defaults(&base, HashMap::from([("c", "current_timestamp()")]))?;
-
-    let (engine, table_url) = setup_unpartitioned_table(
-        "test_v3_rejects_recognized_non_literal_default",
-        schema,
-        vec!["allowColumnDefaults", "icebergCompatV3"],
-    )
-    .await?;
-
-    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-    let error = snapshot
-        .transaction(Box::new(FileSystemCommitter::new()), &engine)
-        .expect_err("icebergCompatV3 must reject a recognized non-literal default");
-
-    assert!(matches!(&error, delta_kernel::Error::Unsupported(_)));
-    let message = error.to_string();
-    assert!(message.contains("icebergCompatV3"), "got: {message}");
-    assert!(message.contains("current_timestamp()"), "got: {message}");
-    assert!(
-        message.contains("requires column defaults to be literals"),
-        "got: {message}"
-    );
+    match expected {
+        V3ValidationOutcome::Warning(needle) => {
+            snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            let logs = logging.logs();
+            assert!(logs.contains(needle), "logs: {logs}");
+        }
+        V3ValidationOutcome::Unsupported(needle) => {
+            let error = snapshot
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)
+                .expect_err("icebergCompatV3 must reject a recognized non-literal default");
+            assert!(matches!(&error, delta_kernel::Error::Unsupported(_)));
+            let message = error.to_string();
+            assert!(message.contains("icebergCompatV3"), "got: {message}");
+            assert!(message.contains(default_sql), "got: {message}");
+            assert!(message.contains(needle), "got: {message}");
+        }
+    }
 
     Ok(())
 }

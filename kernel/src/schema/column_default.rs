@@ -46,11 +46,8 @@ pub struct ColumnDefault<'a> {
 /// Kernel's classification of a parsed column-default expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParseStatus {
-    /// The SQL parsed to a literal expression.
     Literal,
-    /// The SQL parsed to a non-literal expression.
     NonLiteral,
-    /// Kernel could not parse the SQL expression.
     Unparsed,
 }
 
