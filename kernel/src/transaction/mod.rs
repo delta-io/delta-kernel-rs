@@ -72,6 +72,7 @@ pub use alter_table::AlterTableTransaction;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
+pub use schema_evolution::{PathSegment, SchemaOperation};
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
@@ -2135,7 +2136,7 @@ mod tests {
     fn write_context_reflects_updated_effective_table_config(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snapshot) = setup_non_dv_table();
-        let mut txn = snapshot
+        let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
@@ -2147,24 +2148,9 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
-        let mut evolved_fields: Vec<StructField> = txn
-            .effective_table_config
-            .logical_schema()
-            .fields()
-            .cloned()
-            .collect();
-        evolved_fields.push(StructField::nullable("fresh_column", DataType::INTEGER));
-        let evolved_schema = Arc::new(StructType::new_unchecked(evolved_fields));
-        let evolved_metadata = txn
-            .effective_table_config
-            .metadata()
-            .clone()
-            .with_schema(evolved_schema.clone())?;
-        txn.effective_table_config = TableConfiguration::try_new_with_schema(
-            &txn.effective_table_config,
-            evolved_metadata,
-            evolved_schema,
-        )?;
+        let txn = txn.with_schema_changes(vec![SchemaOperation::AddColumn {
+            field: StructField::nullable("fresh_column", DataType::INTEGER),
+        }])?;
 
         let updated_write_context = txn.unpartitioned_write_context()?;
         assert!(updated_write_context

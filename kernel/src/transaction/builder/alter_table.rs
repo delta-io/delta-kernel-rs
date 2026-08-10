@@ -39,7 +39,7 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
-    apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
+    apply_schema_operations, PathSegment, SchemaEvolutionResult, SchemaOperation,
 };
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Error};
@@ -129,6 +129,22 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
         self.operations.push(SchemaOperation::AddColumn { field });
+        self.transition()
+    }
+
+    /// Add a new column at an explicit schema path.
+    ///
+    /// The final path segment must be [`PathSegment::Field`] and must match `field.name()`.
+    /// Preceding segments may traverse nested structs, array elements, map keys, and map values.
+    ///
+    /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
+    pub fn add_column_at(
+        mut self,
+        path: Vec<PathSegment>,
+        field: StructField,
+    ) -> AlterTableTransactionBuilder<Modifying> {
+        self.operations
+            .push(SchemaOperation::AddColumnAt { path, field });
         self.transition()
     }
 

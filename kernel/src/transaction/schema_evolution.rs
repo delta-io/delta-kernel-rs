@@ -4,6 +4,7 @@
 //! that validates and applies schema changes to produce an evolved schema.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
@@ -11,21 +12,43 @@ use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
-    ColumnMappingMode,
+    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
+    validate_column_mapping_id, ColumnMappingMode,
 };
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
-/// A schema evolution operation to be applied during ALTER TABLE.
+/// One segment in a path to a nested schema field.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSegment {
+    Field(String),
+    ArrayElement,
+    MapKey,
+    MapValue,
+}
+
+/// A schema evolution operation to apply to a table.
 ///
-/// Operations are validated and applied in order during
-/// [`apply_schema_operations`]. Each operation sees the schema state after all prior operations
-/// have been applied.
+/// Operations are validated and applied in order. Each operation sees the schema state after all
+/// prior operations have been applied.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
-pub(crate) enum SchemaOperation {
+pub enum SchemaOperation {
     /// Add a top-level column.
     AddColumn { field: StructField },
+
+    /// Add a column at an explicit schema path.
+    ///
+    /// The final segment must be [`PathSegment::Field`] and must match `field.name()`.
+    AddColumnAt {
+        path: Vec<PathSegment>,
+        field: StructField,
+    },
 
     /// Change a column's nullability from NOT NULL to nullable.
     SetNullable { column: ColumnName },
@@ -82,6 +105,97 @@ fn modify_field_at_path(
     modifier(field)
 }
 
+fn add_column_at_path(
+    data_type: &mut DataType,
+    path: &[PathSegment],
+    field: StructField,
+    cm_enabled: bool,
+    max_id: &mut Option<i64>,
+) -> DeltaResult<()> {
+    let (segment, rest) = path
+        .split_first()
+        .ok_or_else(|| Error::schema("Cannot add column: empty column path"))?;
+
+    match (segment, data_type) {
+        // Adding the field to the current struct.
+        (PathSegment::Field(name), DataType::Struct(parent)) if rest.is_empty() => {
+            if !name.eq_ignore_ascii_case(field.name()) {
+                return Err(Error::schema(format!(
+                    "Cannot add column '{}': path leaf '{name}' does not match field name",
+                    field.name()
+                )));
+            }
+            if field.is_metadata_column() {
+                return Err(Error::schema(format!(
+                    "Cannot add column '{}': metadata columns are not allowed in \
+                     a table schema",
+                    field.name()
+                )));
+            }
+            if !matches!(field.data_type, DataType::Primitive(_)) {
+                StructType::ensure_no_metadata_columns_in_field(&field)?;
+            }
+            if !field.is_nullable() {
+                return Err(Error::schema(format!(
+                    "Cannot add non-nullable column '{}'. Added columns must be nullable \
+                     because existing data files do not contain this column.",
+                    field.name()
+                )));
+            }
+            let lowered = field.name().to_lowercase();
+            if parent
+                .fields()
+                .any(|existing| existing.name().to_lowercase() == lowered)
+            {
+                return Err(Error::schema(format!(
+                    "Cannot add column '{}': a column with that name already exists",
+                    field.name()
+                )));
+            }
+            let field = if cm_enabled {
+                let id = max_id.as_mut().ok_or_else(|| {
+                    Error::invalid_protocol(
+                        "Column mapping is enabled but delta.columnMapping.maxColumnId \
+                         is not set in table properties",
+                    )
+                })?;
+                try_assign_flat_column_mapping_info(&field, id)?
+            } else {
+                field
+            };
+            parent.field_map_mut().insert(field.name().clone(), field);
+            Ok(())
+        }
+        (PathSegment::Field(name), DataType::Struct(parent)) => {
+            let lowered = name.to_lowercase();
+            let index = parent
+                .fields()
+                .position(|existing| existing.name().to_lowercase() == lowered)
+                .ok_or_else(|| Error::schema(format!("field '{name}' does not exist")))?;
+            let nested = &mut parent
+                .field_map_mut()
+                .get_index_mut(index)
+                .ok_or_else(|| Error::internal_error("field index became invalid"))?
+                .1
+                .data_type;
+            add_column_at_path(nested, rest, field, cm_enabled, max_id)
+        }
+        (PathSegment::ArrayElement, DataType::Array(array)) => {
+            add_column_at_path(&mut array.element_type, rest, field, cm_enabled, max_id)
+        }
+        (PathSegment::MapKey, DataType::Map(map)) => {
+            add_column_at_path(&mut map.key_type, rest, field, cm_enabled, max_id)
+        }
+        (PathSegment::MapValue, DataType::Map(map)) => {
+            add_column_at_path(&mut map.value_type, rest, field, cm_enabled, max_id)
+        }
+        (segment, data_type) => Err(Error::schema(format!(
+            "Cannot add column '{}': path segment {segment:?} does not match {data_type}",
+            field.name()
+        ))),
+    }
+}
+
 /// The result of applying schema operations.
 #[derive(Debug)]
 pub(crate) struct SchemaEvolutionResult {
@@ -132,61 +246,11 @@ pub(crate) fn apply_schema_operations(
     };
 
     for op in operations {
-        match op {
-            // Protocol feature checks for the field's data type (e.g. `timestampNtz`) happen
-            // later when the caller builds a new TableConfiguration from the evolved schema --
-            // the alter is rejected if the table doesn't already have the required feature
-            // enabled. This matches Spark, which also rejects with
-            // `DELTA_FEATURES_REQUIRE_MANUAL_ENABLEMENT` and requires the user to enable the
-            // feature explicitly before adding such a column.
+        let (path, field) = match op {
             SchemaOperation::AddColumn { field } => {
-                if field.is_metadata_column() {
-                    return Err(Error::schema(format!(
-                        "Cannot add column '{}': metadata columns are not allowed in \
-                         a table schema",
-                        field.name()
-                    )));
-                }
-                if !matches!(field.data_type, DataType::Primitive(_)) {
-                    StructType::ensure_no_metadata_columns_in_field(&field)?;
-                }
-                // Case-insensitive sibling-conflict check (O(N) per AddColumn).
-                let lowered = field.name().to_lowercase();
-                if schema.fields().any(|f| f.name().to_lowercase() == lowered) {
-                    return Err(Error::schema(format!(
-                        "Cannot add column '{}': a column with that name already exists",
-                        field.name()
-                    )));
-                }
-                // Validate field is nullable (Delta protocol requires added columns to be
-                // nullable so existing data files can return NULL for the new column)
-                // NOTE: non-nullable columns depend on invariants feature
-                if !field.is_nullable() {
-                    return Err(Error::schema(format!(
-                        "Cannot add non-nullable column '{}'. Added columns must be nullable \
-                         because existing data files do not contain this column.",
-                        field.name()
-                    )));
-                }
-                let field = if cm_enabled {
-                    let id = max_id.as_mut().ok_or_else(|| {
-                        Error::invalid_protocol(
-                            "Column mapping is enabled but delta.columnMapping.maxColumnId \
-                             is not set in table properties",
-                        )
-                    })?;
-                    // ALTER TABLE doesn't support icebergCompatV3 yet, so the new field never
-                    // gets `delta.columnMapping.nested.ids` here. Tracking issue:
-                    // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
-                    try_assign_flat_column_mapping_info(&field, id)?
-                } else {
-                    // Stray CM metadata on a mapping-disabled table is handled by the AlterTable
-                    // builder, which strips annotations this ALTER newly introduces from the
-                    // evolved schema.
-                    field
-                };
-                schema.field_map_mut().insert(field.name().clone(), field);
+                (vec![PathSegment::Field(field.name().clone())], field)
             }
+            SchemaOperation::AddColumnAt { path, field } => (path, field),
             SchemaOperation::SetNullable { column } => {
                 modify_field_at_path(schema.field_map_mut(), column.path(), &|f| {
                     f.nullable = true;
@@ -195,8 +259,20 @@ pub(crate) fn apply_schema_operations(
                 .map_err(|e| {
                     Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
+                continue;
             }
-        }
+        };
+
+        // Protocol feature checks for the field's data type (e.g. `timestampNtz`) happen
+        // later when the caller builds a new TableConfiguration from the evolved schema.
+        let mut root = DataType::from(schema);
+        add_column_at_path(&mut root, &path, field, cm_enabled, &mut max_id)?;
+        let DataType::Struct(updated_schema) = root else {
+            return Err(Error::internal_error(
+                "schema root changed type while adding a column",
+            ));
+        };
+        schema = *updated_schema;
     }
 
     validate_schema(&schema, column_mapping_mode)?;
@@ -216,6 +292,46 @@ pub(crate) fn apply_schema_operations(
         schema: schema.into(),
         new_max_column_id,
     })
+}
+
+/// Applies schema changes and validates the resulting table configuration.
+///
+/// # Errors
+///
+/// Returns an error when an operation is invalid, the evolved schema violates Delta schema
+/// rules, or the evolved metadata is incompatible with the table protocol.
+pub(crate) fn evolve_table_config(
+    table_config: &TableConfiguration,
+    operations: Vec<SchemaOperation>,
+) -> DeltaResult<TableConfiguration> {
+    let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+    let column_mapping_mode = table_config.column_mapping_mode();
+    let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+    let current_has_cm = column_mapping_mode == ColumnMappingMode::None
+        && schema_has_column_mapping_metadata(&schema);
+    let SchemaEvolutionResult {
+        schema: evolved_schema,
+        new_max_column_id,
+    } = apply_schema_operations(
+        schema,
+        operations,
+        column_mapping_mode,
+        current_max_column_id,
+    )?;
+    let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+        strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
+            .map_or(evolved_schema, Arc::new)
+    } else {
+        evolved_schema
+    };
+    let evolved_metadata = table_config
+        .metadata()
+        .clone()
+        .with_schema(evolved_schema.clone())?
+        .fold_with(new_max_column_id, |metadata, id| {
+            metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+        });
+    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
 }
 
 #[cfg(test)]
@@ -379,6 +495,20 @@ mod tests {
         }],
         "metadata columns are not allowed"
     )]
+    #[case::empty_add_path(
+        vec![SchemaOperation::AddColumnAt {
+            path: vec![],
+            field: StructField::nullable("added", DataType::STRING),
+        }],
+        "empty column path"
+    )]
+    #[case::add_path_leaf_mismatch(
+        vec![SchemaOperation::AddColumnAt {
+            path: vec![PathSegment::Field("other".to_string())],
+            field: StructField::nullable("added", DataType::STRING),
+        }],
+        "does not match field name"
+    )]
     fn apply_schema_operations_rejects(
         #[case] ops: Vec<SchemaOperation>,
         #[case] error_contains: &str,
@@ -402,6 +532,79 @@ mod tests {
             apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None).unwrap();
         let actual: Vec<&str> = result.schema.fields().map(|f| f.name().as_str()).collect();
         assert_eq!(&actual, expected_names);
+    }
+
+    fn struct_with_existing_field() -> StructType {
+        StructType::try_new([StructField::nullable("existing", DataType::STRING)]).unwrap()
+    }
+
+    fn nested_struct_at<'a>(mut data_type: &'a DataType, path: &[PathSegment]) -> &'a StructType {
+        for segment in path {
+            data_type = match (segment, data_type) {
+                (PathSegment::ArrayElement, DataType::Array(array)) => array.element_type(),
+                (PathSegment::MapKey, DataType::Map(map)) => map.key_type(),
+                (PathSegment::MapValue, DataType::Map(map)) => map.value_type(),
+                (segment, data_type) => {
+                    panic!("path segment {segment:?} does not match {data_type}")
+                }
+            };
+        }
+        let DataType::Struct(parent) = data_type else {
+            panic!("path does not resolve to a struct");
+        };
+        parent
+    }
+
+    #[rstest]
+    #[case::struct_parent(
+        DataType::from(struct_with_existing_field()),
+        vec![],
+    )]
+    #[case::array_element(
+        DataType::from(ArrayType::new(struct_with_existing_field(), true)),
+        vec![PathSegment::ArrayElement],
+    )]
+    #[case::map_key(
+        DataType::from(MapType::new(
+            struct_with_existing_field(),
+            DataType::INTEGER,
+            true,
+        )),
+        vec![PathSegment::MapKey],
+    )]
+    #[case::map_value(
+        DataType::from(MapType::new(
+            DataType::INTEGER,
+            struct_with_existing_field(),
+            true,
+        )),
+        vec![PathSegment::MapValue],
+    )]
+    fn add_column_at_traverses_nested_types(
+        #[case] parent_type: DataType,
+        #[case] container_path: Vec<PathSegment>,
+    ) {
+        let schema =
+            StructType::try_new([StructField::nullable("container", parent_type)]).unwrap();
+        let mut path = vec![PathSegment::Field("container".to_string())];
+        path.extend(container_path.iter().cloned());
+        path.push(PathSegment::Field("added".to_string()));
+        let operation = SchemaOperation::AddColumnAt {
+            path,
+            field: StructField::nullable("added", DataType::INTEGER),
+        };
+
+        let result =
+            apply_schema_operations(schema, vec![operation], ColumnMappingMode::None, None)
+                .unwrap();
+        let container = result.schema.field("container").unwrap();
+        let parent = nested_struct_at(container.data_type(), &container_path);
+
+        assert!(parent.field("existing").is_some());
+        assert_eq!(
+            parent.field("added"),
+            Some(&StructField::nullable("added", DataType::INTEGER))
+        );
     }
 
     // === apply_schema_operations: SetNullable tests ===
