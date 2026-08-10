@@ -970,8 +970,9 @@ mod tests {
     #[tokio::test]
     // Keeps local storage: `canonicalize` on the FFI-returned write path has no in-memory
     // equivalent.
-    // DO NOT ADD `unsafe` HERE: Miri never runs this test, so `unsafe` added here is never checked
-    // for undefined behavior. Put it in a test that runs under Miri.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in a test that
+    // runs under Miri.
     #[cfg_attr(
         miri,
         ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
@@ -1152,8 +1153,9 @@ mod tests {
     #[tokio::test]
     // Keeps local storage: the test creates the Hive partition directory on disk, which an object
     // store does not have.
-    // DO NOT ADD `unsafe` HERE: Miri never runs this test, so `unsafe` added here is never checked
-    // for undefined behavior. Put it in a test that runs under Miri.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in a test that
+    // runs under Miri.
     #[cfg_attr(
         miri,
         ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"

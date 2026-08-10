@@ -657,8 +657,9 @@ mod tests {
     // full rustls crypto-init cost under the interpreter. Their `unsafe` is already run under Miri
     // by groups 1-2, so skipping drops no coverage. See the group-3 banner above.
     //
-    // DO NOT ADD `unsafe` TO A TEST BELOW. Miri never runs them, so `unsafe` added here is never
-    // checked for undefined behavior and nothing in CI reports the gap. Put it in a group 1-2 test.
+    // DO NOT ADD NEW `unsafe` TO A TEST BELOW (unsafe groups 1-2 don't already run). Miri never
+    // runs them, so unsafe unique to them goes unchecked for undefined behavior and nothing in CI
+    // reports the gap. Put it in a group 1-2 test.
 
     #[test]
     #[cfg_attr(
