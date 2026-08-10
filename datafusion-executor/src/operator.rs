@@ -82,6 +82,7 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
+    use datafusion::common::ScalarValue as DFScalarValue;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use rstest::rstest;
 
@@ -123,21 +124,23 @@ mod tests {
     // === Tests ===
 
     #[rstest]
-    #[case::single_row(vec![vec![1i64.into(), "x".into()]], 1)]
+    #[case::single_row(
+        vec![vec![1i64.into(), "x".into()]],
+        vec![vec![lit(1i64), lit("x")]]
+    )]
     #[case::multiple_rows(
         vec![vec![1i64.into(), "x".into()], vec![2i64.into(), "y".into()]],
-        2
+        vec![vec![lit(1i64), lit("x")], vec![lit(2i64), lit("y")]]
     )]
     fn values_lowers_to_literal_rows(
         #[case] rows: Vec<Vec<KernelScalar>>,
-        #[case] expected_rows: usize,
+        #[case] expected: Vec<Vec<DFExpr>>,
     ) -> Result<(), DataFusionError> {
         let plan = lower_rows(rows)?;
         let DFLogicalPlan::Values(values) = &plan else {
             panic!("expected Values, got {plan:?}");
         };
-        assert_eq!(values.values.len(), expected_rows);
-        // The declared field names carry straight through, with no aliasing projection.
+        assert_eq!(values.values, expected);
         assert_eq!(output_names(&plan), ["a", "b"]);
         Ok(())
     }
@@ -164,13 +167,30 @@ mod tests {
     /// whose Arrow mapping carries extra parameters, where a silent cast would be easiest to
     /// miss.
     #[rstest]
-    #[case::long(1i64.into(), ArrowDataType::Int64)]
-    #[case::timestamp(KernelScalar::Timestamp(1), timestamp_type(Some("UTC".into())))]
-    #[case::timestamp_ntz(KernelScalar::TimestampNtz(1), timestamp_type(None))]
-    #[case::date(KernelScalar::Date(1), ArrowDataType::Date32)]
+    #[case::long(
+        1i64.into(),
+        DFScalarValue::Int64(Some(1)),
+        ArrowDataType::Int64
+    )]
+    #[case::timestamp(
+        KernelScalar::Timestamp(1),
+        DFScalarValue::TimestampMicrosecond(Some(1), Some("UTC".into())),
+        timestamp_type(Some("UTC".into()))
+    )]
+    #[case::timestamp_ntz(
+        KernelScalar::TimestampNtz(1),
+        DFScalarValue::TimestampMicrosecond(Some(1), None),
+        timestamp_type(None)
+    )]
+    #[case::date(
+        KernelScalar::Date(1),
+        DFScalarValue::Date32(Some(1)),
+        ArrowDataType::Date32
+    )]
     fn literal_type_matches_its_declared_field_without_casting(
         #[case] scalar: KernelScalar,
-        #[case] expected: ArrowDataType,
+        #[case] expected_literal: DFScalarValue,
+        #[case] expected_type: ArrowDataType,
     ) {
         let schema = StructType::try_new([StructField::nullable("a", scalar.data_type())]).unwrap();
         let values = KernelValues::new(schema, vec![vec![scalar]]);
@@ -178,13 +198,14 @@ mod tests {
 
         // The schema's declared type and the literal's own type must agree: a `Values` node whose
         // schema disagrees with its literals reports a type the node does not produce.
-        assert_eq!(output_types(&plan), std::slice::from_ref(&expected));
+        assert_eq!(output_types(&plan), std::slice::from_ref(&expected_type));
         let DFLogicalPlan::Values(lowered) = &plan else {
             panic!("expected Values, got {plan:?}");
         };
         let DFExpr::Literal(literal, _) = &lowered.values[0][0] else {
             panic!("expected a bare literal, got {:?}", lowered.values[0][0]);
         };
-        assert_eq!(literal.data_type(), expected);
+        assert_eq!(literal, &expected_literal);
+        assert_eq!(literal.data_type(), expected_type);
     }
 }
