@@ -100,6 +100,15 @@ impl From<SetNullable> for SchemaChange {
     }
 }
 
+impl SchemaChange {
+    fn as_operation(&self) -> &dyn SchemaOperation {
+        match self {
+            Self::AddField(operation) => operation,
+            Self::SetNullable(operation) => operation,
+        }
+    }
+}
+
 /// Helper to modify a nested column. For each component in `path`, locates the matching field
 /// (case-insensitive), then delegates container traversal and leaf behavior to `operation`.
 ///
@@ -263,45 +272,6 @@ impl SchemaOperation for SetNullable {
     }
 }
 
-impl SchemaOperation for SchemaChange {
-    fn path(&self) -> &[String] {
-        match self {
-            Self::AddField(operation) => operation.path(),
-            Self::SetNullable(operation) => operation.path(),
-        }
-    }
-
-    fn apply_at_leaf(
-        &self,
-        fields: &mut IndexMap<String, StructField>,
-        field_index: Option<usize>,
-        context: &mut SchemaOperationContext,
-    ) -> DeltaResult<()> {
-        match self {
-            Self::AddField(operation) => operation.apply_at_leaf(fields, field_index, context),
-            Self::SetNullable(operation) => operation.apply_at_leaf(fields, field_index, context),
-        }
-    }
-
-    fn descend<'a>(
-        &self,
-        data_type: &'a mut DataType,
-        path_component: &str,
-    ) -> DeltaResult<&'a mut StructType> {
-        match self {
-            Self::AddField(operation) => operation.descend(data_type, path_component),
-            Self::SetNullable(operation) => operation.descend(data_type, path_component),
-        }
-    }
-
-    fn wrap_error(&self, error: Error) -> Error {
-        match self {
-            Self::AddField(operation) => operation.wrap_error(error),
-            Self::SetNullable(operation) => operation.wrap_error(error),
-        }
-    }
-}
-
 /// The result of applying schema operations.
 #[derive(Debug)]
 pub(crate) struct SchemaEvolutionResult {
@@ -356,10 +326,11 @@ pub(crate) fn apply_schema_operations(
         max_column_id: max_id,
     };
     for operation in operations {
+        let operation = operation.as_operation();
         modify_field_at_path(
             schema.field_map_mut(),
             operation.path(),
-            &operation,
+            operation,
             &mut context,
         )
         .map_err(|error| operation.wrap_error(error))?;
