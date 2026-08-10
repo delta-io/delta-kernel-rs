@@ -334,10 +334,10 @@ fn read_scan_file(
         // If sv is None here, but we used to have one (is_dv_resolved_pair == true) it means we've
         // split the selection vector beyond the range of the original. split_vector will return
         // None for rest in that case. When we try and extend that None we still get None, but in
-        // the CDF case we actually DO want to filter out those rows because it means nothing has changed.
-        // Hence, in the case that sv==None and is_dv_resolved_pair==true we need a full array of false.
-        // This only applies to remove/add cases where the associated pair may have a selection vector
-        // that crosses batch sizes.
+        // the CDF case we actually DO want to filter out those rows because it means nothing has
+        // changed. Hence, in the case that sv==None and is_dv_resolved_pair==true we need a
+        // full array of false. This only applies to remove/add cases where the associated
+        // pair may have a selection vector that crosses batch sizes.
         let sv = match sv {
             None if is_dv_resolved_pair => Some(vec![false; len]),
             other => other,
