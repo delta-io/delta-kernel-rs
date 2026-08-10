@@ -1762,7 +1762,13 @@ mod tests {
             fallback: &Handle<SharedExternEngine>,
         ) -> Handle<SharedExternEngine> {
             let executor = unsafe { get_plan_executor(None, unreachable_executor) };
-            unsafe { get_plan_based_engine(executor, fallback.shallow_copy(), allocate_err) }
+            unsafe {
+                get_plan_based_engine(
+                    executor,
+                    OptionalValue::Some(fallback.shallow_copy()),
+                    allocate_err,
+                )
+            }
         }
 
         #[tokio::test]

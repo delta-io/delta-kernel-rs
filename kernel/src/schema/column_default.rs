@@ -181,7 +181,8 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
     }
 }
 
-/// Validates the column-default metadata on a table's logical schema (see [Errors](#errors)).
+/// Validates the column-default metadata on a table's logical schema and reports whether any
+/// field declares a default (see [Errors](#errors)).
 ///
 /// Run eagerly at [`TableConfiguration`] construction so an invalid table is rejected at load.
 /// Inspects nested fields as well as top-level columns; see [`try_collect_column_defaults`].
@@ -195,9 +196,8 @@ impl<'a> SchemaTransform<'a> for ColumnDefaultCollector<'a> {
 ///
 /// Propagates any error from [`try_collect_column_defaults`]: a `CURRENT_DEFAULT` whose value is
 /// not a string, or a non-NULL default on a Variant column.
-pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<()> {
-    try_collect_column_defaults(schema)?;
-    Ok(())
+pub(crate) fn validate_column_defaults_metadata(schema: &StructType) -> DeltaResult<bool> {
+    Ok(!try_collect_column_defaults(schema)?.is_empty())
 }
 
 /// A nullable field named `name` carrying `raw_sql` as its `CURRENT_DEFAULT` metadata.
@@ -343,16 +343,23 @@ mod tests {
             field_with_default("c", DataType::INTEGER, "42"),
             StructField::nullable("no_default", DataType::STRING),
         ],
+        true,
         None
     )]
-    #[case::no_defaults(vec![StructField::nullable("c", DataType::INTEGER)], None)]
-    #[case::non_string_metadata(vec![field_with_invalid_default("c")], Some("non-string"))]
+    #[case::no_defaults(vec![StructField::nullable("c", DataType::INTEGER)], false, None)]
+    #[case::non_string_metadata(
+        vec![field_with_invalid_default("c")],
+        false,
+        Some("non-string")
+    )]
     #[case::non_null_default_on_array_tolerated(
         vec![field_with_default("arr", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")],
+        true,
         None
     )]
     #[case::non_null_default_on_variant_rejected(
         vec![field_with_default("v", DataType::unshredded_variant(), "1")],
+        false,
         Some("Variant")
     )]
     #[case::nested_default(
@@ -360,15 +367,17 @@ mod tests {
             "s",
             DataType::try_struct_type([field_with_default("inner", DataType::INTEGER, "42")]).unwrap(),
         )],
+        true,
         None
     )]
     fn validate_column_defaults_cases(
         #[case] fields: Vec<StructField>,
+        #[case] expected_has_default: bool,
         #[case] expected_error: Option<&str>,
     ) {
         let schema = StructType::try_new(fields).unwrap();
         match (validate_column_defaults_metadata(&schema), expected_error) {
-            (Ok(()), None) => {}
+            (Ok(has_default), None) => assert_eq!(has_default, expected_has_default),
             (Err(e), Some(needle)) => assert!(e.to_string().contains(needle), "got: {e}"),
             (result, expected) => panic!("unexpected outcome: {result:?} vs {expected:?}"),
         }

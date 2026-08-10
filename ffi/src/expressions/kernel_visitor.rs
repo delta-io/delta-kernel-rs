@@ -785,7 +785,7 @@ fn visit_predicate_opaque_impl(
         return Ok(0);
     }
     tracing::info!("opaque predicate `{name}`: no eval callbacks; kernel will not prune on it");
-    Ok(wrap_predicate(state, Predicate::null_literal()))
+    Ok(wrap_predicate(state, Predicate::NULL))
 }
 
 /// Build an opaque predicate over `FfiOpaquePredicateOp(name, callbacks)` and
@@ -1154,7 +1154,7 @@ mod tests {
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
         // No eval callbacks => NULL boolean literal, which abstains everywhere (even under NOT).
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
         // Children are drained from the visitor state even though they're discarded.
         assert!(state.inflight_ids.is_empty());
     }
@@ -1194,7 +1194,7 @@ mod tests {
         let id = ok_or_panic(result);
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
     }
 
     /// Drives `visit_predicate_opaque_with_eval` end to end: pass the callbacks struct by value,

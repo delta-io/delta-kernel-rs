@@ -47,6 +47,8 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod alloc_stats;
+
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
@@ -1602,7 +1604,10 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot.table_configuration().partition_columns().len()
+    snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -1615,7 +1620,10 @@ pub unsafe extern "C" fn get_partition_columns(
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
     // NOTE: Clippy doesn't like it, but we need to_vec+into_iter to decouple lifetimes
-    let partition_columns = snapshot.table_configuration().partition_columns().to_vec();
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
     let iter: Box<StringIter> = Box::new(partition_columns.into_iter());
     iter.into()
 }

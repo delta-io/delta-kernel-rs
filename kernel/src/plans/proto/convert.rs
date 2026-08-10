@@ -1298,7 +1298,7 @@ mod tests {
         }),
         "project"
     )]
-    #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::literal(true)) }), "filter")]
+    #[case(Operator::Filter(Filter { predicate: Arc::new(Predicate::TRUE) }), "filter")]
     #[case(
         Operator::DynamicScan(DynamicScan {
             schema: sample_schema(),
@@ -1404,7 +1404,7 @@ mod tests {
     #[test]
     fn from_filter() {
         let node = Filter {
-            predicate: Arc::new(Predicate::literal(true)),
+            predicate: Arc::new(Predicate::TRUE),
         };
         let proto = proto_plan::FilterNode::from(&node);
         assert!(proto.predicate.is_some());
@@ -1543,7 +1543,7 @@ mod tests {
     #[rstest]
     #[case(lit(1), "literal")]
     #[case(Expression::Column(ColumnName::new(["a"])), "column")]
-    #[case(Expression::Predicate(Box::new(Predicate::literal(true))), "predicate")]
+    #[case(Expression::Predicate(Box::new(Predicate::TRUE)), "predicate")]
     #[case(Expression::struct_from([lit(1)]), "struct_expr")]
     #[case(
         Expression::StructPatch(
@@ -1579,14 +1579,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Predicate::literal(true), "boolean_expression")]
-    #[case(Predicate::not(Predicate::literal(true)), "not")]
+    #[case(Predicate::TRUE, "boolean_expression")]
+    #[case(Predicate::not(Predicate::TRUE), "not")]
     #[case(Predicate::is_null(lit(1)), "unary")]
     #[case(Predicate::gt(lit(1), lit(2)), "binary")]
-    #[case(
-        Predicate::and(Predicate::literal(true), Predicate::literal(false)),
-        "junction"
-    )]
+    #[case(Predicate::and(Predicate::TRUE, Predicate::FALSE), "junction")]
     #[case(Predicate::opaque(TestOpaquePredOp, [lit(1)]), "opaque")]
     #[case(Predicate::Unknown("x".to_string()), "unknown")]
     fn from_predicate(#[case] pred: Predicate, #[case] expected: &str) {
@@ -1721,10 +1718,9 @@ mod tests {
 
     #[test]
     fn from_junction_predicate() {
-        let proto_expr::predicate::Kind::Junction(junction) = pred_kind_of(Predicate::and(
-            Predicate::literal(true),
-            Predicate::literal(false),
-        )) else {
+        let proto_expr::predicate::Kind::Junction(junction) =
+            pred_kind_of(Predicate::and(Predicate::TRUE, Predicate::FALSE))
+        else {
             panic!("expected a junction predicate");
         };
         assert_eq!(junction.op, proto_expr::JunctionPredicateOp::And as i32);

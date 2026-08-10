@@ -983,8 +983,8 @@ mod tests {
                         Expr::unknown("unknown") - column_expr!("b"),
                     ],
                 ),
-                Pred::literal(true),
-                Pred::not(Pred::literal(true)),
+                Pred::TRUE,
+                Pred::not(Pred::TRUE),
             ]),
             Pred::and_from([
                 Pred::is_null(column_expr!("b")),
@@ -1148,7 +1148,7 @@ mod tests {
             }
         }
 
-        let pred = Pred::and(column_pred!("x"), Pred::literal(true));
+        let pred = Pred::and(column_pred!("x"), Pred::TRUE);
         let mut transform = LiteralRemover;
         let result = transform.transform_pred(&pred);
         let result = result.map(Cow::into_owned);

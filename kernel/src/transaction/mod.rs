@@ -34,7 +34,7 @@ use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
-    PARTITION_VALUES_PARSED_NAME, STATS_PARSED_NAME, TAGS_NAME,
+    PARTITION_VALUES_NAME, PARTITION_VALUES_PARSED_NAME, SIZE_NAME, STATS_PARSED_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
@@ -49,7 +49,7 @@ use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{
     version_as_i64, DataType, DeltaResult, Engine, EngineData, Expression, FileMeta,
-    IntoEngineData, RowVisitor, Version,
+    IntoEngineData, Predicate, RowVisitor, Version,
 };
 
 #[cfg(feature = "internal-api")]
@@ -241,6 +241,10 @@ pub struct Transaction<S = ExistingTable> {
     user_domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // TODO(#2499): Replace this state when Conntector responsibilities encode column-default
+    // handling. Whether the connector acknowledged responsibility for applying column
+    // defaults.
+    column_defaults_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
@@ -418,8 +422,10 @@ impl<S> Transaction<S> {
         self.validate_add_files_stats(&self.add_files_metadata)?;
 
         // Validate required fields for addFile.
-        write_validation::StagedDataValidator::staged_add_file()
-            .validate(&self.add_files_metadata)?;
+        write_validation::StagedDataValidator::staged_add_file(
+            self.effective_table_config.physical_partition_columns(),
+        )
+        .validate(&self.add_files_metadata)?;
 
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
@@ -803,6 +809,23 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Rejects write-context creation when a table declares column defaults and the connector has
+    /// not acknowledged handling them.
+    fn ensure_column_defaults_acknowledged(&self) -> DeltaResult<()> {
+        require!(
+            self.column_defaults_acknowledged
+                || !self
+                    .effective_table_config
+                    .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+                || !self.effective_table_config.has_column_with_default(),
+            Error::invalid_transaction_state(
+                "Writing data to a table with column defaults requires calling \
+                 Transaction::ack_column_defaults() first",
+            )
+        );
+        Ok(())
+    }
+
     /// Returns true if this is a create-table transaction.
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
@@ -895,6 +918,18 @@ impl<S> Transaction<S> {
 // Data file methods -- only available on transaction types that support data files
 // =============================================================================
 impl<S: SupportsDataFiles> Transaction<S> {
+    // TODO(#2499): Remove this API when Engine responsibilities encode column-default handling.
+    /// Acknowledges that the connector applies column defaults before writing data files.
+    ///
+    /// Call this before requesting a write context for a table that enables the
+    /// `allowColumnDefaults` feature and declares at least one column default. The connector must
+    /// materialize every omitted column's default itself; this method records that responsibility
+    /// but does not apply any defaults. Without this acknowledgement, write-context creation fails
+    /// with an error.
+    pub fn ack_column_defaults(&mut self) {
+        self.column_defaults_acknowledged = true;
+    }
+
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -957,7 +992,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         {
             let partition_cols: HashSet<&str> = self
                 .effective_table_config
-                .partition_columns()
+                .logical_partition_columns()
                 .iter()
                 .map(String::as_str)
                 .collect();
@@ -990,15 +1025,18 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     /// Returns the logical partition column names for this table.
     pub fn logical_partition_columns(&self) -> &[String] {
-        self.effective_table_config.partition_columns()
+        self.effective_table_config.logical_partition_columns()
     }
 
+    // TODO(#2630): Expose nested column defaults through the transaction API.
     /// Returns the column default for every top-level column in this table's logical schema that
     /// declares one, keyed by logical column name.
     ///
     /// Connectors use this to discover which columns have defaults, then call
     /// [`ColumnDefault::to_scalar`] on each (or fall back to [`ColumnDefault::raw_sql`] when the
-    /// kernel cannot parse the default) to materialize the column before writing.
+    /// kernel cannot parse the default) to materialize the column before writing. After handling
+    /// every omitted column, call [`ack_column_defaults`](Self::ack_column_defaults) before
+    /// requesting a write context.
     ///
     /// Keys are `String` rather than [`ColumnName`] because the kernel currently surfaces defaults
     /// only for top-level columns, consistent with partition columns. This is a kernel limitation,
@@ -1054,7 +1092,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
             physical_schema: table_config.physical_write_schema(),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
-            logical_partition_columns: table_config.partition_columns().to_vec(),
+            logical_partition_columns: table_config.logical_partition_columns().to_vec(),
             randomize_file_prefixes: props.should_randomize_file_prefixes(),
             random_prefix_length: props.random_prefix_length(),
         }))
@@ -1098,7 +1136,9 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// target directory (Hive-style paths when column mapping is off, random prefix when on).
     ///
     /// Returns an error if the table is not partitioned (use
-    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead).
+    /// [`unpartitioned_write_context`](Self::unpartitioned_write_context) instead), or if the
+    /// table enables `allowColumnDefaults`, declares at least one column default, and
+    /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
     ///
     /// [`write_dir`]: WriteContext::write_dir
     /// [`logical_to_physical`]: WriteContext::logical_to_physical
@@ -1107,6 +1147,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
@@ -1154,9 +1195,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Creates a write context for writing data to an unpartitioned table.
     ///
     /// Returns an error if the table has partition columns (use
-    /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
+    /// [`partitioned_write_context`](Self::partitioned_write_context) instead), or if the table
+    /// enables `allowColumnDefaults`, declares at least one column default, and
+    /// [`ack_column_defaults`](Self::ack_column_defaults) has not been called.
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
         let shared = self.shared_write_state()?;
         require!(
@@ -1551,14 +1595,23 @@ fn build_remove_struct_patch(
     columns_to_drop: &[&str],
     coalesce_stats_with_parsed: bool,
 ) -> DeltaResult<ExpressionStructPatch> {
+    // Note: The Delta protocol requires `partitionValues`, `size`, and `tags` when
+    // `extendedFileMetadata` is true. We require only `partitionValues` and `size` to match Spark.
+    let extended_file_metadata = Predicate::and_from([
+        col!(SIZE_NAME).is_not_null(),
+        col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
+    ]);
     let mut patch = ExpressionStructPatchBuilder::new()
         // deletionTimestamp
         .insert_after("path", lit(commit_timestamp))
         // dataChange
         .insert_after("path", lit(data_change))
         // extended_file_metadata
-        .insert_after("path", lit(true))
-        .insert_after("path", col!(FILE_CONSTANT_VALUES_NAME, "partitionValues"));
+        .insert_after("path", Expression::from(extended_file_metadata))
+        .insert_after(
+            "path",
+            col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
+        );
 
     if coalesce_stats_with_parsed {
         // Replace stats with COALESCE(stats, TO_JSON(stats_parsed)) and drop stats_parsed.
@@ -1765,7 +1818,7 @@ mod tests {
     use crate::table_features::ColumnMappingMode;
     use crate::transaction::create_table::create_table;
     use crate::transaction::data_layout::DataLayout;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         copy_test_table, create_valid_add_file_batch, install_thread_local_metrics_reporter,
         load_test_table, string_array_to_engine_data, test_schema_flat, test_schema_nested,
         test_schema_with_array, test_schema_with_map, CapturingReporter,
@@ -2016,6 +2069,30 @@ mod tests {
             schema.field("stats").unwrap().data_type(),
             &DataType::STRING
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_action_projection_sets_extended_metadata() -> DeltaResult<()> {
+        let patch = build_remove_struct_patch(
+            0,     /* commit_timestamp */
+            true,  /* data_change */
+            &[],   /* columns_to_drop */
+            false, /* coalesce_stats_with_parsed */
+        )?;
+        let path_patch = patch
+            .field_patches
+            .get("path")
+            .expect("path should have inserted fields");
+        let extended_file_metadata = path_patch
+            .insertions
+            .get(2)
+            .expect("extendedFileMetadata should follow deletionTimestamp and dataChange");
+        let expected = Expression::from_pred(Predicate::and_from([
+            col!(SIZE_NAME).is_not_null(),
+            col!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME).is_not_null(),
+        ]));
+        assert_eq!(extended_file_metadata.as_ref(), &expected);
         Ok(())
     }
 
@@ -2871,9 +2948,9 @@ mod tests {
         #[case] schema: SchemaRef,
         #[case] mode: ColumnMappingMode,
     ) -> DeltaResult<()> {
-        let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.unpartitioned_write_context().unwrap();
-        crate::utils::test_utils::validate_physical_schema_column_mapping(
+        crate::unit_test_utils::validate_physical_schema_column_mapping(
             write_context.logical_schema(),
             write_context.physical_schema(),
             mode,
@@ -2919,7 +2996,7 @@ mod tests {
     /// children.
     fn validate_logical_to_physical_transform(mode: ColumnMappingMode) -> DeltaResult<()> {
         let schema = test_schema_nested();
-        let (_engine, txn) = crate::utils::test_utils::setup_column_mapping_txn(schema, mode)?;
+        let (_engine, txn) = crate::unit_test_utils::setup_column_mapping_txn(schema, mode)?;
         let write_context = txn.unpartitioned_write_context().unwrap();
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();

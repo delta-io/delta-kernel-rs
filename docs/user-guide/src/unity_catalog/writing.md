@@ -1,7 +1,7 @@
 # Writing to Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-client-default -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-api, unity-catalog-delta-rest-client -->
 
 To write to a Unity Catalog-managed Delta table, you create a `UCCommitter`,
 pass it to a Kernel transaction, and then publish the staged commit to make it
@@ -13,7 +13,7 @@ Before reading this page, make sure you understand the generic
 
 > [!NOTE]
 > This page uses the `delta-kernel-unity-catalog` and
-> `unity-catalog-delta-client-default` crates. All code examples use
+> `unity-catalog-delta-rest-client` crates. All code examples use
 > `rust,ignore` because they require these external crates.
 
 ## Set up clients and resolve the table
@@ -25,9 +25,9 @@ Use `UCClient` to load the table and fetch read-write credentials, and build a
 ```rust,ignore
 use std::sync::Arc;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
-let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
+let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
 let uc_client = UCClient::new(config.clone())?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
@@ -188,6 +188,51 @@ Publishing copies each staged commit from `_staged_commits/<version>.<uuid>.json
 to `_delta_log/<version>.json`. If a published file already exists (from a
 previous publish attempt), the copy is silently skipped.
 
+## Report commit metrics
+
+After a successful commit, report commit metrics to the catalog. For a
+catalog-managed table, the catalog owns table maintenance, not your connector.
+Unity Catalog uses the per-commit metrics you report to decide when to schedule
+OPTIMIZE and VACUUM.
+
+> [!NOTE]
+> Support for the metrics endpoint depends on the catalog. Some catalogs accept
+> reported metrics; others, including the open-source Unity Catalog server, do
+> not implement it yet and return a 404. Treat the report as best-effort: a
+> failure never affects commit correctness.
+
+You supply the counts the write engine observed. The row counts and the
+file-size histogram are only known to your engine. File and byte counts are
+derivable from the commit's add and remove actions.
+
+The catalog requires the commit version on every report, and reads it from
+`file_size_histogram.commit_version`. Set it to the version your commit
+produced. When you have no size distribution to report, send a histogram with
+empty bins that carries only the version.
+
+```rust,ignore
+use unity_catalog_delta_client_api::{CommitReport, FileSizeHistogram};
+
+let report = CommitReport {
+    num_files_added: 3,
+    num_bytes_added: 4096,
+    num_rows_inserted: Some(1000),
+    file_size_histogram: FileSizeHistogram {
+        commit_version,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+
+// table_id comes from the load_table response (metadata.table_uuid).
+if let Err(e) = uc_client
+    .report_metrics("my_catalog", "my_schema", "my_table", &table_id, report)
+    .await
+{
+    eprintln!("metrics report failed (non-fatal): {e}");
+}
+```
+
 ## Post-publish maintenance
 
 Once commits are published, you can checkpoint the table:
@@ -206,10 +251,10 @@ use std::sync::Arc;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::{snapshot_builder_from_load_table, UCCommitter};
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
 // 1. Set up clients
-let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).build()?;
+let config = ClientConfig::build("my-workspace.cloud.databricks.com", token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
 let uc_client = UCClient::new(config.clone())?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 

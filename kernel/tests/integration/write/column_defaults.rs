@@ -255,6 +255,73 @@ async fn test_blind_append_to_column_defaults_table_is_supported(
     Ok(())
 }
 
+#[rstest]
+#[case::unpartitioned("unpartitioned", &[])]
+#[case::partitioned("partitioned", &["p"])]
+#[tokio::test]
+async fn write_context_acknowledgement_depends_on_column_defaults(
+    #[case] label: &str,
+    #[case] partition_columns: &[&str],
+    #[values(false, true)] has_default: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = StructType::try_new(vec![
+        StructField::nullable("c", DataType::INTEGER),
+        StructField::nullable("p", DataType::INTEGER),
+    ])?;
+    let schema = if has_default {
+        schema_with_column_defaults(&base, HashMap::from([("c", "42")]))?
+    } else {
+        Arc::new(base)
+    };
+    let table_name = format!("write_context_ack_{label}_{has_default}");
+    let (store, engine, table_location) = engine_store_setup(&table_name, None);
+    let table_url = create_table(
+        store,
+        table_location,
+        schema,
+        partition_columns,
+        true,
+        vec![],
+        vec!["allowColumnDefaults"],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+    let mut txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+
+    let defaults = txn.top_level_column_defaults()?;
+    if has_default {
+        assert_eq!(defaults["c"].to_scalar()?, Some(Scalar::Integer(42)));
+    } else {
+        assert!(defaults.is_empty());
+    }
+    drop(defaults);
+
+    let partition_values = HashMap::from([("p".to_string(), Scalar::Integer(7))]);
+    if has_default {
+        let error = if partition_columns.is_empty() {
+            txn.unpartitioned_write_context()
+        } else {
+            txn.partitioned_write_context(partition_values.clone())
+        }
+        .expect_err("inspecting defaults must not implicitly acknowledge them");
+        assert!(matches!(
+            &error,
+            delta_kernel::Error::InvalidTransactionState(_)
+        ));
+        assert!(error.to_string().contains("ack_column_defaults"));
+
+        txn.ack_column_defaults();
+    }
+    if partition_columns.is_empty() {
+        txn.unpartitioned_write_context()?;
+    } else {
+        txn.partitioned_write_context(partition_values)?;
+    }
+
+    Ok(())
+}
+
 /// Creates a single-column table, materializes its default through the connector-facing API,
 /// and asserts the metadata and written value round-trip.
 async fn assert_materialized_column_default_round_trips(

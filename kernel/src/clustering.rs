@@ -8,6 +8,7 @@
 //! as a JSON object with a `clusteringColumns` field containing an array of column paths,
 //! where each path is an array of field names (to handle nested columns).
 
+use delta_kernel_derive::internal_api;
 use serde::{Deserialize, Serialize};
 
 use crate::actions::DomainMetadata;
@@ -37,6 +38,26 @@ struct ClusteringDomainMetadata {
 
 /// The domain name for clustering metadata.
 pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
+
+/// A resolved descriptor for one clustering column on a snapshot.
+///
+/// Pairs the physical column reference (as stored in the `delta.clustering` domain) with the
+/// logical reference resolved against the snapshot's schema, plus the data type at that path.
+/// The two references differ only when column mapping is enabled. Both are multi-part for
+/// nested-field clustering.
+///
+/// Callers needing to correlate a clustering column with per-file statistics must use
+/// [`physical_column`]: stats are keyed on physical names.
+#[derive(Debug, Clone, PartialEq)]
+#[internal_api]
+pub(crate) struct ClusteringColumnInfo {
+    /// The physical column reference as stored in the `delta.clustering` domain.
+    pub physical_column: ColumnName,
+    /// The logical column reference, resolved against the snapshot's schema.
+    pub logical_column: ColumnName,
+    /// The data type of the column at the resolved path.
+    pub data_type: DataType,
+}
 
 /// Validates clustering columns against the table schema.
 ///
