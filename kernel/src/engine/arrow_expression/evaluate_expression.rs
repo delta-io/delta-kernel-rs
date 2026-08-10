@@ -769,8 +769,8 @@ pub fn evaluate_predicate(
 
 /// `chrono` formats implementing the timestamp encoding [`UnaryExpressionOp::ToJson`] requires.
 ///
-/// `%.3f` truncates rather than rounds, and floors below the epoch because arrow normalizes the
-/// subsecond field before formatting, so `-1500us` renders `...:59.998`.
+/// `%.3f` truncates rather than rounds, and floors below the epoch. Reader subtracts .000999
+/// from the query value before comparing it to the max stat so it doesn't skip the wrong files.
 ///
 /// The `Z` is literal rather than `%:z`, which spells a zero offset `+00:00`. Both are valid ISO
 /// 8601, but every Delta writer emits `Z` (including this crate's own partition-value
