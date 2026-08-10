@@ -6,22 +6,26 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
+use delta_kernel::arrow::compute::concat_batches;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::expressions::{column_expr, Scalar};
+use delta_kernel::expressions::{column_expr, lit, ExpressionStructPatchBuilder, MapData, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::scan::StatsOptions;
-use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
+use delta_kernel::scan::{scan_row_schema, StatsOptions};
+use delta_kernel::schema::{schema_ref, DataType, MapType, StructField, StructType};
+use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
+use delta_kernel::{Engine, Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 use test_utils::{
-    begin_transaction, copy_directory, create_default_engine, create_default_engine_mt_executor,
-    load_and_begin_transaction, read_actions_from_commit, setup_test_tables,
+    assert_result_error_with_message, begin_transaction, copy_directory, create_default_engine,
+    create_default_engine_mt_executor, insert_data, into_record_batch, load_and_begin_transaction,
+    read_actions_from_commit, setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -191,6 +195,92 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
         }
         _ => panic!("Transaction should be committed"),
     }
+
+    Ok(())
+}
+
+/// Verifies `extendedFileMetadata` is true exactly when `size` and `partitionValues` are present;
+/// `tags` does not affect it.
+#[rstest::rstest]
+#[case::all_present(&[], true)]
+#[case::missing_size(&[ExtendedMetadataField::Size], false)]
+#[case::missing_partition_values(&[ExtendedMetadataField::PartitionValues], false)]
+#[case::missing_tags(&[ExtendedMetadataField::Tags], true)]
+#[case::only_size(&[
+    ExtendedMetadataField::PartitionValues,
+    ExtendedMetadataField::Tags,
+], false)]
+#[case::only_partition_values(&[ExtendedMetadataField::Size, ExtendedMetadataField::Tags], false)]
+#[case::only_tags(&[
+    ExtendedMetadataField::Size,
+    ExtendedMetadataField::PartitionValues,
+], false)]
+#[case::none_present(&ExtendedMetadataField::ALL, false)]
+#[tokio::test]
+async fn test_remove_scanned_file_sets_extended_metadata(
+    #[case] missing_fields: &[ExtendedMetadataField],
+    #[case] expected_extended_file_metadata: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let schema = schema_ref! { nullable "number": INTEGER };
+
+    let snapshot = create_table(&table_path, schema, "Test/1.0")
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let snapshot = insert_data(
+        snapshot,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+
+    let scan = snapshot.clone().scan_builder().build()?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        txn.remove_files(with_missing_extended_metadata_fields(
+            engine.as_ref(),
+            scan_metadata?.scan_files,
+            missing_fields,
+        )?);
+    }
+    let commit_result = txn.commit(engine.as_ref());
+    if missing_fields.contains(&ExtendedMetadataField::Size) {
+        // TODO(#2717): The commit is materialized before post-commit validation returns this error,
+        // so the committed Remove action remains available for validation below.
+        assert_result_error_with_message(commit_result, "Data missing for field size");
+    } else {
+        commit_result?.unwrap_committed();
+    }
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+
+    let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
+    assert_eq!(remove_actions.len(), 1);
+    let remove = &remove_actions[0];
+    assert_eq!(
+        remove["extendedFileMetadata"],
+        expected_extended_file_metadata
+    );
+    for field in ExtendedMetadataField::ALL {
+        let present = remove
+            .get(field.name())
+            .is_some_and(|value| !value.is_null());
+        assert_eq!(present, !missing_fields.contains(&field));
+    }
+
+    let scan = snapshot.scan_builder().build()?;
+    let mut surviving_files = 0;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        surviving_files += scan_metadata?
+            .scan_files
+            .selection_vector()
+            .iter()
+            .filter(|selected| **selected)
+            .count();
+    }
+    assert_eq!(surviving_files, 0);
 
     Ok(())
 }
@@ -640,10 +730,20 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// A DV update over a batch where only some files are targeted: only the matched files get
-/// remove/add pairs.
+#[rstest::rstest]
+#[case::target_in_explicit_prefix(&[true, true], &[0], false)]
+#[case::target_in_implicit_tail(&[true, true], &[3], false)]
+#[case::multiple_targets(&[true, true], &[0, 3], false)]
+#[case::empty_selection_vector(&[], &[3], false)]
+#[case::unselected_rows_are_ignored(&[true, false, true, false], &[2], false)]
+#[case::unselected_target_is_rejected(&[true, false, true, false], &[2, 3], true)]
+#[case::no_updates_short_selection_vector(&[true, true], &[], false)]
+#[case::no_updates_empty_selection_vector(&[], &[], false)]
 #[tokio::test]
-async fn test_update_deletion_vectors_updates_only_matched_files(
+async fn test_update_deletion_vectors_respects_selection_vector(
+    #[case] selection_vector: &[bool],
+    #[case] target_indexes: &[usize],
+    #[case] expect_mismatch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::INTEGER),
@@ -659,8 +759,27 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
     let (store, engine, table_url, file_paths) =
         create_dv_table_with_files("test_table", schema, file_names).await?;
 
-    // Target only files 1 and 3 for a DV update; files 0 and 2 must be left untouched.
-    let targeted = [file_paths[1].clone(), file_paths[3].clone()];
+    // Attach DV to all files first, if later DV updates incorrectly remove the existing DV,
+    // the test will fail.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut setup_txn = begin_transaction(snapshot.clone(), engine.as_ref())?;
+    let initial_dvs = sequential_dv_descriptors(&file_paths);
+    let initial_dv_ids: HashMap<_, _> = initial_dvs
+        .iter()
+        .map(|(path, dv)| (path.clone(), dv.unique_id()))
+        .collect();
+    setup_txn.update_deletion_vectors(
+        initial_dvs,
+        get_scan_files(snapshot, engine.as_ref())?
+            .into_iter()
+            .map(Ok),
+    )?;
+    setup_txn.commit(engine.as_ref())?.unwrap_committed();
+
+    let targeted: Vec<String> = target_indexes
+        .iter()
+        .map(|&index| file_paths[index].clone())
+        .collect();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = begin_transaction(snapshot.clone(), engine.as_ref())?
         .with_engine_info("test engine")
@@ -682,9 +801,30 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
             )
         })
         .collect();
+    let updated_dv_ids: HashMap<_, _> = dv_map
+        .iter()
+        .map(|(path, dv)| (path.clone(), dv.unique_id()))
+        .collect();
 
-    let scan_files = get_scan_files(snapshot, engine.as_ref())?;
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+    let batches = get_scan_files(snapshot, engine.as_ref())?
+        .into_iter()
+        .map(|scan_files| scan_files.apply_selection_vector().map(into_record_batch))
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let scan_files = FilteredEngineData::try_new(
+        Box::new(ArrowEngineData::new(batch)),
+        selection_vector.to_vec(),
+    )?;
+
+    let update_result = txn.update_deletion_vectors(dv_map, std::iter::once(Ok(scan_files)));
+    if expect_mismatch {
+        assert_result_error_with_message(
+            update_result,
+            "Number of matched DV files does not match number of new DV descriptors",
+        );
+    } else {
+        update_result?;
+    }
     let committed = txn.commit(engine.as_ref())?.unwrap_committed();
     let version = committed.commit_version();
 
@@ -701,22 +841,53 @@ async fn test_update_deletion_vectors_updates_only_matched_files(
     let adds: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("add")).collect();
     let removes: Vec<&serde_json::Value> = actions.iter().filter_map(|a| a.get("remove")).collect();
 
-    // Only the two targeted files produce remove/add pairs.
-    assert_eq!(adds.len(), 2, "only the targeted files should be re-added");
-    assert_eq!(
-        removes.len(),
-        2,
-        "only the targeted files should be removed"
-    );
+    let expected_count = if expect_mismatch {
+        0
+    } else {
+        target_indexes.len()
+    };
+    assert_eq!(adds.len(), expected_count, "unexpected re-added files");
+    assert_eq!(removes.len(), expected_count, "unexpected removed files");
 
     let mut added_paths: Vec<&str> = adds.iter().map(|a| a["path"].as_str().unwrap()).collect();
     added_paths.sort();
-    let mut expected: Vec<&str> = targeted.iter().map(String::as_str).collect();
+    let mut removed_paths: Vec<&str> = removes
+        .iter()
+        .map(|a| a["path"].as_str().unwrap())
+        .collect();
+    removed_paths.sort();
+    let mut expected: Vec<&str> = if expect_mismatch {
+        Vec::new()
+    } else {
+        targeted.iter().map(String::as_str).collect()
+    };
     expected.sort();
     assert_eq!(
         added_paths, expected,
         "re-added paths must be exactly the targeted files"
     );
+    assert_eq!(
+        removed_paths, expected,
+        "removed paths must be exactly the targeted files"
+    );
+
+    let dv_id = |action: &serde_json::Value| {
+        let dv = &action["deletionVector"];
+        format!(
+            "{}{}@{}",
+            dv["storageType"].as_str().unwrap(),
+            dv["pathOrInlineDv"].as_str().unwrap(),
+            dv["offset"].as_i64().unwrap()
+        )
+    };
+    for add in &adds {
+        let path = add["path"].as_str().unwrap();
+        assert_eq!(dv_id(add), updated_dv_ids[path]);
+    }
+    for remove in &removes {
+        let path = remove["path"].as_str().unwrap();
+        assert_eq!(dv_id(remove), initial_dv_ids[path]);
+    }
 
     // Each new add carries its DV and widened tightBounds, with numRecords preserved.
     for add in &adds {
@@ -813,6 +984,60 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtendedMetadataField {
+    Size,
+    PartitionValues,
+    Tags,
+}
+
+impl ExtendedMetadataField {
+    const ALL: [Self; 3] = [Self::Size, Self::PartitionValues, Self::Tags];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::PartitionValues => "partitionValues",
+            Self::Tags => "tags",
+        }
+    }
+}
+
+fn with_missing_extended_metadata_fields(
+    engine: &dyn Engine,
+    scan_files: FilteredEngineData,
+    missing_fields: &[ExtendedMetadataField],
+) -> Result<FilteredEngineData, Box<dyn std::error::Error>> {
+    let (data, selection_vector) = scan_files.into_parts();
+    let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let tags = if missing_fields.contains(&ExtendedMetadataField::Tags) {
+        Scalar::Null(DataType::from(map_type.clone()))
+    } else {
+        Scalar::Map(MapData::try_new(map_type.clone(), [("key", "value")])?)
+    };
+    let mut patch =
+        ExpressionStructPatchBuilder::new().replace_at(["fileConstantValues"], "tags", lit(tags));
+    for field in missing_fields {
+        patch = match field {
+            ExtendedMetadataField::Size => patch.replace("size", lit(Scalar::Null(DataType::LONG))),
+            ExtendedMetadataField::PartitionValues => patch.replace_at(
+                ["fileConstantValues"],
+                field.name(),
+                lit(Scalar::Null(DataType::from(map_type.clone()))),
+            ),
+            ExtendedMetadataField::Tags => patch,
+        };
+    }
+    let schema = scan_row_schema();
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        schema.clone(),
+        Arc::new(Expr::struct_patch(patch)?),
+        schema.into(),
+    )?;
+    let data = evaluator.evaluate(data.as_ref())?;
+    Ok(FilteredEngineData::try_new(data, selection_vector)?)
 }
 
 #[tokio::test]

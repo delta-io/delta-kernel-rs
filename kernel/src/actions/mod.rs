@@ -1051,6 +1051,21 @@ impl SetTransaction {
             last_updated,
         }
     }
+
+    /// Whether this transaction is expired: `last_updated <= expiration_timestamp` with both
+    /// present. A `None` `last_updated` (no timestamp recorded) or a `None` `expiration_timestamp`
+    /// (no retention duration configured) never expires.
+    pub(crate) fn is_expired(&self, expiration_timestamp: Option<i64>) -> bool {
+        matches!(
+            (expiration_timestamp, self.last_updated),
+            (Some(exp_ts), Some(lu)) if lu <= exp_ts
+        )
+    }
+
+    /// This transaction's `version`, unless it is expired under `expiration_timestamp`.
+    pub(crate) fn non_expired_version(&self, expiration_timestamp: Option<i64>) -> Option<i64> {
+        (!self.is_expired(expiration_timestamp)).then_some(self.version)
+    }
 }
 
 /// Reference to a root of an adaptive metadata tree.
@@ -1364,7 +1379,6 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
-    use super::set_transaction::is_set_txn_expired;
     use super::*;
     use crate::arrow::array::{
         Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
@@ -1375,7 +1389,7 @@ mod tests {
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::schema::{schema_ref, ArrayType, DataType, MapType, StructField};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
         Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
@@ -1449,14 +1463,16 @@ mod tests {
     #[case::last_updated_before_expiration(Some(2000), Some(1000), true)]
     #[case::last_updated_at_expiration(Some(1000), Some(1000), true)]
     #[case::last_updated_after_expiration(Some(2000), Some(3000), false)]
-    fn test_is_set_txn_expired(
+    fn test_set_transaction_expiration(
         #[case] expiration_timestamp: Option<i64>,
         #[case] last_updated: Option<i64>,
-        #[case] expected: bool,
+        #[case] expired: bool,
     ) {
+        let txn = SetTransaction::new("app".to_string(), 7, last_updated);
+        assert_eq!(txn.is_expired(expiration_timestamp), expired);
         assert_eq!(
-            is_set_txn_expired(expiration_timestamp, last_updated),
-            expected
+            txn.non_expired_version(expiration_timestamp),
+            (!expired).then_some(7)
         );
     }
 

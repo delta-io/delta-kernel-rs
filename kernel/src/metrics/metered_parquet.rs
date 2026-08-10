@@ -115,7 +115,7 @@ mod tests {
     use super::*;
     use crate::metrics::MetricEvent;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     #[derive(Debug, Default)]
     struct StubParquetHandler {

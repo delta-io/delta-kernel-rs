@@ -49,9 +49,7 @@ mod tests {
     use crate::schema::{
         ArrayType, DataType, EdgeInterpolationAlgorithm, MapType, StructField, StructType,
     };
-    use crate::utils::test_utils::{
-        assert_schema_feature_validation, geography_type, geometry_type,
-    };
+    use crate::unit_test_utils::{assert_schema_feature_validation, geography_type, geometry_type};
 
     fn schema_with_field(dt: DataType) -> StructType {
         StructType::new_unchecked([

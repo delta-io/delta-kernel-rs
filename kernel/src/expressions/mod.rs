@@ -59,54 +59,108 @@ pub type ExpressionStructPatchBuilder = crate::struct_patch::StructPatchBuilder<
 /// A unary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum UnaryPredicateOp {
-    /// Unary Is Null
+    /// SQL `expr IS NULL`: `true` when the input is null and `false` otherwise, never null itself.
+    /// A wrapping `NOT` inverts it to `IS NOT NULL`.
     IsNull,
 }
 
 /// A binary predicate operator.
+///
+/// The ordering and equality comparisons follow SQL three-valued logic, so a NULL operand yields
+/// NULL rather than `false`. [`Distinct`](Self::Distinct) and [`In`](Self::In) instead tolerate
+/// NULL and always answer `true` or `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
-    /// Comparison Less Than
+    /// `left < right`.
     LessThan,
-    /// Comparison Greater Than
+    /// `left > right`.
     GreaterThan,
-    /// Comparison Equal
+    /// `left = right`.
     Equal,
-    /// Distinct
+    /// SQL `left IS DISTINCT FROM right`: null-safe inequality, treating NULL as an ordinary
+    /// value. `DISTINCT(1, 1)` and `DISTINCT(NULL, NULL)` are `false`; `DISTINCT(NULL, 1)` is
+    /// `true`.
     Distinct,
-    /// IN
+    /// SQL `left IN (elements)`: `true` when `left` equals one of the elements, and `false`
+    /// otherwise, including when `left` is NULL. `left` must be a literal, and the elements are
+    /// either a list-typed column or an [`Expression::Literal`] holding a [`Scalar::Array`], never
+    /// a list of expressions or a subquery:
+    ///
+    /// ```sql
+    /// 2 IN (1, 2, 3)         -- literal elements
+    /// 2 IN (SELECT ...)      -- unsupported: no subquery form
+    /// col IN (1, 2, 3)       -- unsupported: the left operand must be a literal
+    /// ```
+    ///
+    /// Testing a literal against a list column is the shape data skipping uses, and it is the
+    /// reason the operands sit this way around rather than the more familiar
+    /// column-on-the-left form.
     In,
 }
 
 /// A unary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
-    /// Convert struct data to JSON-encoded strings
+    /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
+    /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
+    /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
+    /// timestamps, whose sub-millisecond precision this operator discards (see below).
+    ///
+    /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
+    /// hex rather than base64, two digits per byte in the order the bytes appear, so
+    /// `{ b: 0xABCD, l: [1, 2], n: { z: 7 } }` becomes:
+    ///
+    /// ```text
+    /// {"b":"abcd","l":[1,2],"n":{"z":7}}
+    /// ```
+    ///
+    /// Timestamps must encode with exactly three fractional digits, truncated toward negative
+    /// infinity, because kernel writes `add.stats` with this operator and [Per-file Statistics]
+    /// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
+    /// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
+    /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
+    /// prune files that hold matching rows.
+    ///
+    /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
 }
 
-/// A binary expression operator.
+/// A binary arithmetic operator over two numeric operands.
+///
+/// Both operands share a numeric type and the result takes that type. Kernel inserts no implicit
+/// casts, so widening a result (decimal precision or scale, for instance) needs an explicit
+/// [`Expression::cast`] to match a declared output type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryExpressionOp {
-    /// Arithmetic Plus
+    /// `left + right`.
     Plus,
-    /// Arithmetic Minus
+    /// `left - right`.
     Minus,
-    /// Arithmetic Multiply
+    /// `left * right`.
     Multiply,
-    /// Arithmetic Divide
+    /// `left / right`. A zero divisor never yields NULL.
+    ///
+    /// Integer operands divide truncating toward zero, and a zero divisor fails. Float operands
+    /// follow IEEE 754: `+/-inf` for a non-zero numerator, `NaN` for `0.0 / 0.0`. In a dialect
+    /// whose `/` is always fractional, the integer case is the other division operator:
+    ///
+    /// ```sql
+    /// 7 DIV 2      -- 3, this operator over integers
+    /// 7 / 2        -- 3.5, NOT this operator
+    /// ```
     Divide,
 }
 
 /// A variadic expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
-    /// Collapse multiple values into one by taking the first non-null value
+    /// SQL `COALESCE(exprs...)`: the first non-null value, or null when every input is null. All
+    /// inputs share one type, which is also the result type. Requires at least one input.
     Coalesce,
-    /// Construct an Array by evaluating each input expression. For example, the expression
-    /// `Array(1, (1 + 2), col("my_int_col"))` evaluates to the array
-    /// `[1, 3, <my_int_col value>]` per row. All inputs must share the same element type.
-    /// Requires at least one element; the element type is inferred from the inputs.
+    /// SQL `ARRAY(exprs...)`: an array built by evaluating each input per row, so
+    /// `ARRAY(1, 1 + 2, my_int_col)` yields `[1, 3, <my_int_col value>]`. All inputs must share
+    /// the same element type. Requires at least one element; the element type is inferred from
+    /// the inputs.
     ///
     /// For static array literals whose elements are all compile-time constants, use
     /// [`Scalar::Array`] instead. The difference is that `Array` is evaluated at runtime, while
@@ -114,12 +168,17 @@ pub enum VariadicExpressionOp {
     Array,
 }
 
-/// A junction (AND/OR) predicate operator.
+/// A junction (AND/OR) predicate operator over N child predicates.
+///
+/// Both use SQL three-valued (Kleene) logic, treating a NULL child as unknown rather than false: a
+/// decisive child wins over a NULL sibling, so `AND` is `false` and `OR` is `true` despite the
+/// NULL, and only an undecided junction yields NULL. [`Predicate::junction`] folds an empty
+/// junction to its operator's identity, `true` for `AND` and `false` for `OR`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JunctionPredicateOp {
-    /// Conjunction
+    /// SQL `a AND b AND ...`: true when every child is true.
     And,
-    /// Disjunction
+    /// SQL `a OR b OR ...`: true when any child is true.
     Or,
 }
 
@@ -269,9 +328,28 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
-/// An expression that parses a JSON string into a struct with the given schema.
-/// This is the inverse of `ToJson` - it converts a JSON-encoded string column into a
-/// struct column.
+/// An expression that parses a JSON string column into a struct column of `output_schema`, the
+/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
+/// that operator discards.
+///
+/// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
+/// `add.stats` with this operator and data skipping reads null stats as "include the file". The
+/// required part is that it does not error; whether a given row comes back as a null struct or as a
+/// struct of null fields is unspecified, since data skipping treats the two alike.
+///
+/// An empty string is not valid JSON here, so it is unparseable. This operator does not share
+/// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
+/// output_schema)` in a dialect whose `from_json` is permissive rather than strict.
+///
+/// # Default engine behavior
+///
+/// `arrow-json`'s typed decoders reject a whole batch when one cell fails to parse. The default
+/// engine works around that for the leaf types that fail most often (timestamp, date, decimal) by
+/// decoding them as strings and safe-casting back, so a bad value in one of those degrades to a
+/// NULL for that field alone. Anything the workaround does not cover, namely structurally invalid
+/// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
+/// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
+/// rest of the batch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.
@@ -386,13 +464,26 @@ where
 pub enum Expression {
     /// A literal value.
     Literal(Scalar),
-    /// A column reference by name.
+    /// A column reference by name. A [`ColumnName`] is a path, so a multi-segment name like
+    /// `add.stats.numRecords` descends one nested struct field per segment, matching by name.
     Column(ColumnName),
     /// A predicate treated as a boolean expression
     Predicate(Box<Predicate>), // should this be Arc?
-    /// A struct computed from a Vec of expressions.
-    /// The optional nullability predicate, if provided and evaluates to false/null, makes the
-    /// entire struct null.
+    /// A struct computed from one expression per output field, in field order.
+    ///
+    /// Field names and nullability come from the surrounding output schema (the evaluator's
+    /// `result_type`, such as a [`Project`]'s target field), and each field expression's type is
+    /// validated against the schema, so building a struct takes both. The expression count must
+    /// equal the output field count.
+    ///
+    /// The optional nullability predicate says when to *keep* the struct: a row survives only
+    /// where it is true, and nulls entirely where it is false or null.
+    ///
+    /// ```sql
+    /// CASE WHEN keep_pred THEN struct(expr1, expr2, ...) END
+    /// ```
+    ///
+    /// [`Project`]: crate::plans::ir::nodes::Project
     Struct(Vec<ExpressionRef>, Option<ExpressionRef>),
     /// A sparse patch of a struct. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
@@ -418,7 +509,9 @@ pub enum Expression {
     /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
     /// for expressions kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
-    /// Parse a JSON string expression into a struct with the given schema.
+    /// Parse a JSON string expression into a struct with the given schema. Unparseable input,
+    /// which includes an empty string, must yield NULL rather than error; see
+    /// [`ParseJsonExpression`].
     ParseJson(ParseJsonExpression),
     /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
     /// [`MapToStructExpression`] for how values are parsed.
@@ -552,7 +645,8 @@ impl ParseJsonExpression {
 /// the output struct column: a `key` -> `value` mapping in the map means the struct field named
 /// `key` receives `value`, parsed into the field's target type via [`PrimitiveType::parse_scalar`].
 /// An empty-string value is the exception (aligning with Spark): it casts to itself for string, to
-/// empty bytes for binary, and to null for every other type.
+/// empty bytes for binary, and to null for every other type. This empty-string rule is specific to
+/// this operator; [`ParseJsonExpression`] does not share it.
 ///
 /// - Missing keys produce null values
 /// - A value that cannot be parsed as its target field type returns [`Error::ParseError`]
@@ -754,7 +848,9 @@ impl Expression {
     }
 
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
-    /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
+    /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
+    /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
+    /// `ToJson` truncates it.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
@@ -775,6 +871,13 @@ impl Expression {
 }
 
 impl Predicate {
+    /// Literal boolean true
+    pub const TRUE: Self = Self::literal(true);
+    /// Literal boolean false
+    pub const FALSE: Self = Self::literal(false);
+    /// NULL boolean literal
+    pub const NULL: Self = Self::null_literal();
+
     /// Returns a set of columns referenced by this predicate.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
@@ -783,16 +886,16 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column(field_names: impl CollectInto<ColumnName>) -> Predicate {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Self {
         Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Create a new literal boolean value
+    /// Create a new literal boolean value. See also [`Self::TRUE`] and [`Self::FALSE`].
     pub const fn literal(value: bool) -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
     }
 
-    /// Creates a NULL literal boolean value
+    /// Creates a NULL literal boolean value. Prefer [`Self::NULL`].
     pub const fn null_literal() -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
     }
@@ -811,12 +914,12 @@ impl Predicate {
     }
 
     /// Create a new predicate `self IS NULL`
-    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_null(expr: impl Into<Expression>) -> Self {
         Self::unary(UnaryPredicateOp::IsNull, expr)
     }
 
     /// Create a new predicate `self IS NOT NULL`
-    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_not_null(expr: impl Into<Expression>) -> Self {
         Self::not(Self::is_null(expr))
     }
 
@@ -1253,7 +1356,7 @@ mod tests {
             Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
-        use crate::utils::test_utils::assert_result_error_with_message;
+        use crate::unit_test_utils::assert_result_error_with_message;
 
         // ==================== Expression::Literal Tests ====================
 
@@ -1513,8 +1616,8 @@ mod tests {
                 // Boolean expression
                 Predicate::from_expr(column_expr!("is_active")),
                 // Literals
-                Predicate::literal(true),
-                Predicate::literal(false),
+                Predicate::TRUE,
+                Predicate::FALSE,
                 // NOT
                 Predicate::not(Predicate::from_expr(column_expr!("x"))),
                 // Nested NOT
@@ -1536,8 +1639,7 @@ mod tests {
 
         #[test]
         fn test_predicate_null_literal_roundtrip() {
-            let pred = Predicate::null_literal();
-            assert_roundtrip(&pred);
+            assert_roundtrip(&Predicate::NULL);
         }
 
         #[test]
@@ -1750,12 +1852,12 @@ mod tests {
     #[test]
     fn empty_and_from_returns_identity_literal() {
         let result = Pred::and_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(true));
+        assert_eq!(result, Pred::TRUE);
     }
 
     #[test]
     fn empty_or_from_returns_identity_literal() {
         let result = Pred::or_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(false));
+        assert_eq!(result, Pred::FALSE);
     }
 }

@@ -18,6 +18,7 @@ use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
@@ -27,6 +28,7 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::ArrowWriter;
+use crate::path::tests::multipart_checkpoint_name;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, adds_only_batch, remove_only_batch,
@@ -38,14 +40,14 @@ use crate::scan::{
 use crate::schema::{
     schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
 };
-use crate::utils::test_utils::{
+use crate::unit_test_utils::{
     assert_batch_matches, assert_result_error_with_message, create_log_path,
     create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, EvaluationHandler, Expression,
-    FileDataReadResultIterator, FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, Expression, FileDataReadResultIterator,
+    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -85,9 +87,8 @@ fn process_sidecars(
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
 // parts
 fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u32) -> Path {
-    let path =
-        format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet");
-    Path::from(path.as_str())
+    let name = multipart_checkpoint_name(version, part_num, num_parts);
+    Path::from(format!("_delta_log/{name}").as_str())
 }
 
 // Utility method to build a log using a list of log paths and an optional checkpoint hint. The
@@ -247,37 +248,10 @@ impl ParquetHandler for IgnorePredicateParquetHandler {
     }
 }
 
-struct IgnorePredicateEngine {
-    inner: Arc<SyncEngine>,
-    parquet_handler: Arc<IgnorePredicateParquetHandler>,
-}
-
-impl IgnorePredicateEngine {
-    fn new(inner: Arc<SyncEngine>) -> Self {
-        let parquet_handler = Arc::new(IgnorePredicateParquetHandler(inner.parquet_handler()));
-        Self {
-            inner,
-            parquet_handler,
-        }
-    }
-}
-
-impl Engine for IgnorePredicateEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet_handler.clone()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
-    }
+fn ignore_predicate_engine(sync_engine: &Arc<SyncEngine>) -> DelegatingEngine {
+    DelegatingEngine::new(sync_engine.clone()).with_parquet_handler(Arc::new(
+        IgnorePredicateParquetHandler(sync_engine.parquet_handler()),
+    ))
 }
 
 /// Writes all actions to a _delta_log/_sidecars file in the store and return the [`FileMeta`].
@@ -652,13 +626,22 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     )
 }
 
+/// v5 holds three complete checkpoints (classic, 2-part, 3-part), so the 3-part one always wins.
+/// The hint's `parts` decides only whether the hint describes that winner.
+#[rstest]
+#[case::hint_names_winner(Some(3), true)]
+#[case::hint_names_losing_multipart(Some(2), false)]
+#[case::hint_names_losing_classic(None, false)]
 #[tokio::test]
-async fn build_snapshot_with_bad_checkpoint_hint_fails() {
+async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkpoint(
+    #[case] hint_parts: Option<usize>,
+    #[case] expect_hint_applies: bool,
+) {
     let checkpoint_metadata = LastCheckpointHint {
         v2_checkpoint: None,
         version: 5,
         size: 10,
-        parts: Some(1),
+        parts: hint_parts,
         size_in_bytes: None,
         num_of_add_files: None,
         checkpoint_schema: None,
@@ -675,8 +658,12 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
             delta_path_for_version(3, "checkpoint.parquet"),
             delta_path_for_version(3, "json"),
             delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
             delta_path_for_multipart_checkpoint(5, 1, 2),
             delta_path_for_multipart_checkpoint(5, 2, 2),
+            delta_path_for_multipart_checkpoint(5, 1, 3),
+            delta_path_for_multipart_checkpoint(5, 2, 3),
+            delta_path_for_multipart_checkpoint(5, 3, 3),
             delta_path_for_version(5, "json"),
             delta_path_for_version(6, "json"),
             delta_path_for_version(7, "json"),
@@ -691,12 +678,38 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-    );
-    assert_result_error_with_message(
-        log_segment,
-        "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
-        it has 2",
     )
+    .unwrap();
+
+    assert_eq!(log_segment.checkpoint_version, Some(5));
+    assert_eq!(log_segment.end_version, 7);
+    let checkpoint_filenames = log_segment
+        .listed
+        .checkpoint_parts
+        .iter()
+        .map(|p| p.filename.as_str())
+        .collect_vec();
+    assert_eq!(
+        checkpoint_filenames,
+        vec![
+            "00000000000000000005.checkpoint.0000000001.0000000003.parquet",
+            "00000000000000000005.checkpoint.0000000002.0000000003.parquet",
+            "00000000000000000005.checkpoint.0000000003.0000000003.parquet",
+        ]
+    );
+
+    // The hint is always retained; describing some other checkpoint only makes its fields
+    // untrustworthy, and readers fall back to the checkpoint footer.
+    assert!(log_segment.last_checkpoint_metadata.is_some());
+    assert_eq!(log_segment.checkpoint_hint().is_some(), expect_hint_applies);
+
+    let commit_versions = log_segment
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect_vec();
+    assert_eq!(commit_versions, vec![6, 7]);
 }
 
 #[tokio::test]
@@ -1518,7 +1531,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    let ignore_predicate_engine = IgnorePredicateEngine::new(sync_engine.clone());
+    let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
     } else {
@@ -1632,7 +1645,7 @@ async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
-    let ignore_predicate_engine = IgnorePredicateEngine::new(sync_engine.clone());
+    let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
     let engine: &dyn Engine = if ignore_predicate {
         &ignore_predicate_engine
     } else {
@@ -2586,7 +2599,7 @@ fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch(
 
 #[test]
 fn test_validate_listed_log_file_multiple_single_part_checkpoints() {
-    // Two SinglePartCheckpoints at the same version: n=2 but neither is a MultiPartCheckpoint
+    // Two ClassicCheckpoints at the same version: n=2 but neither is a MultiPartCheckpoint
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
         LogSegmentFiles {

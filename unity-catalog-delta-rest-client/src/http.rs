@@ -20,7 +20,7 @@ pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
         // Identifies the calling client to UC.
         (
             header::USER_AGENT,
-            header::HeaderValue::from_str(&config.user_agent)?,
+            header::HeaderValue::from_str(config.user_agent())?,
         ),
     ]);
 
@@ -75,33 +75,83 @@ where
     Err(Error::MaxRetriesExceeded)
 }
 
+pub async fn execute_without_retry<F, Fut>(f: F) -> Result<Response>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<Response, reqwest::Error>>,
+{
+    f().await.map_err(Error::from)
+}
+
 /// Handle HTTP response and deserialize.
 pub async fn handle_response<T>(response: Response) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let status = response.status();
-
-    if status.is_success() {
+    if response.status().is_success() {
         response.json::<T>().await.map_err(Error::from)
     } else {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        Err(error_from_response(response).await)
+    }
+}
 
-        match status {
-            StatusCode::UNAUTHORIZED => {
-                Err(unity_catalog_delta_client_api::Error::AuthenticationFailed.into())
-            }
-            StatusCode::NOT_FOUND => Err(Error::HttpStatusError {
-                status: status.as_u16(),
-                message: format!("Resource not found: {error_body}"),
-            }),
-            _ => Err(Error::HttpStatusError {
-                status: status.as_u16(),
-                message: error_body,
-            }),
+/// Handle a response that carries no body (or a body the caller ignores). Preserves the server's
+/// error message on failure without decoding the success body.
+pub async fn handle_empty_response(response: Response) -> Result<()> {
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(error_from_response(response).await)
+    }
+}
+
+/// Build an error from a non-success response, preserving the server's body and mapping
+/// authentication / not-found statuses.
+async fn error_from_response(response: Response) -> Error {
+    let status = response.status();
+    let error_body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "Unknown error".to_string());
+
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            unity_catalog_delta_client_api::Error::AuthenticationFailed.into()
         }
+        StatusCode::NOT_FOUND => Error::HttpStatusError {
+            status: status.as_u16(),
+            message: format!("Resource not found: {error_body}"),
+        },
+        _ => Error::HttpStatusError {
+            status: status.as_u16(),
+            message: error_body,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClientConfig;
+
+    #[test]
+    fn build_http_client_accepts_composed_user_agent() {
+        let config = ClientConfig::build("example.com", "t")
+            .with_additional_user_agent([("Spark", "3.5.0")])
+            .build()
+            .unwrap();
+        build_http_client(&config).expect("composed user_agent must be a valid header value");
+    }
+
+    #[test]
+    fn build_http_client_rejects_invalid_additional_user_agent_chars() {
+        let config = ClientConfig::build("example.com", "t")
+            .with_additional_user_agent([("bad\nname", "1.0")])
+            .build()
+            .unwrap();
+        assert!(matches!(
+            build_http_client(&config),
+            Err(Error::InvalidHeaderValue(_))
+        ));
     }
 }

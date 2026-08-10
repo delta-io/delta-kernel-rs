@@ -1301,7 +1301,7 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<
     let columns = columns
         .into_iter()
         .zip(target.fields().iter())
-        .map(|(arr, field)| safe_cast_array(arr, field.data_type(), &opts))
+        .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
         .collect::<DeltaResult<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
         target.clone(),
@@ -1310,12 +1310,62 @@ fn safe_cast_back(decoded: RecordBatch, target: &ArrowSchemaRef) -> DeltaResult<
     )?)
 }
 
-/// Recursive worker for [`safe_cast_back`]. Recurses through `Struct` containers preserving
-/// the parent null buffer; applies `cast_with_options` at the leaves.
+/// Casts each column to the type of the `target` field at the same position, so the columns can be
+/// assembled into a [`RecordBatch`] with `target` as its schema.
 ///
-/// Delta doesn't track min/max stats for `Array`/`Map`/`Variant`, so a failure-prone leaf
-/// only ever reaches here inside a `Struct`.
-fn safe_cast_array(
+/// A map's inner entry field and an array's inner element field are named by whoever wrote the
+/// file, so they can disagree with what kernel expects:
+///
+/// | Container | Kernel expects | Some writers emit |
+/// |-----------|----------------|-------------------|
+/// | map       | `key_value`    | `entries`         |
+/// | array     | `element`      | `item`            |
+///
+/// Kernel's two names are defined as [`MAP_ROOT_DEFAULT`] (`key_value`) and [`LIST_ARRAY_ROOT`]
+/// (`element`), and [`arrow_conversion`] applies them whenever it converts a kernel schema to an
+/// Arrow schema.
+///
+/// Arrow counts those names as part of the type, so a column whose names differ is unequal to
+/// `target` and [`RecordBatch::try_new`] rejects it. Casting to `target` rebuilds the container
+/// under `target`'s names.
+///
+/// This is a general cast, not a rename: it also converts primitive types (`Int32` to `Int64`) and
+/// renames struct fields. Columns whose type already equals `target` pass through untouched.
+///
+/// # Errors
+///
+/// Casts strictly, so a leaf whose type cannot convert (`Utf8` to `Date32` on a non-date string)
+/// errors rather than nulling the offending cells.
+///
+/// [`MAP_ROOT_DEFAULT`]: crate::engine::arrow_conversion::MAP_ROOT_DEFAULT
+/// [`LIST_ARRAY_ROOT`]: crate::engine::arrow_conversion::LIST_ARRAY_ROOT
+/// [`arrow_conversion`]: crate::engine::arrow_conversion
+#[cfg(test)]
+pub(crate) fn coerce_columns_to_schema(
+    columns: Vec<ArrowArrayRef>,
+    target: &ArrowSchemaRef,
+) -> DeltaResult<Vec<ArrowArrayRef>> {
+    let opts = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    columns
+        .into_iter()
+        .zip(target.fields().iter())
+        .map(|(arr, field)| cast_array_to_type(arr, field.data_type(), &opts))
+        .collect()
+}
+
+/// Casts one Arrow [`ArrowArray`] of any type to `target`.
+///
+/// A struct tracks which of its rows are null separately from its children, so casting a child
+/// means rebuilding the struct around it. This recurses into `Struct` by hand, carrying that
+/// row-level null information onto the rebuilt struct: given a struct column whose row 0 is null,
+/// row 0 is still null after the cast. Everything else, `Map` and `List` included, goes to
+/// [`cast_with_options`], which rebuilds the container using the field names in `target`.
+///
+/// `opts` decides what a failed leaf cast does: `safe: true` nulls the cell, strict errors.
+fn cast_array_to_type(
     array: ArrowArrayRef,
     target: &ArrowDataType,
     opts: &CastOptions<'_>,
@@ -1325,13 +1375,26 @@ fn safe_cast_array(
     }
     match target {
         ArrowDataType::Struct(target_fields) => {
-            let s = array.as_struct();
+            let s = array.as_struct_opt().ok_or_else(|| {
+                Error::generic(format!(
+                    "cannot cast {} to a struct target",
+                    array.data_type()
+                ))
+            })?;
             let nulls = s.nulls().cloned();
+            require!(
+                s.columns().len() == target_fields.len(),
+                Error::generic(format!(
+                    "cannot cast struct with {} children to target with {} fields",
+                    s.columns().len(),
+                    target_fields.len()
+                ))
+            );
             let new_children = s
                 .columns()
                 .iter()
                 .zip(target_fields.iter())
-                .map(|(c, f)| safe_cast_array(c.clone(), f.data_type(), opts))
+                .map(|(c, f)| cast_array_to_type(c.clone(), f.data_type(), opts))
                 .collect::<DeltaResult<Vec<_>>>()?;
             Ok(Arc::new(StructArray::try_new(
                 target_fields.clone(),
@@ -1499,21 +1562,21 @@ mod tests {
     use super::*;
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray, Int32Array,
-        Int32Builder, Int64Array, MapArray, MapBuilder, StringArray, StringBuilder, StructArray,
-        StructBuilder,
+        Int32Builder, Int64Array, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray,
+        StringBuilder, StructArray, StructBuilder,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
+        DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, Int32Type,
         Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     };
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::schema::{
-        schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
+        schema, schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataColumnSpec,
         MetadataValue, StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     fn column_mapping_cases() -> [ColumnMappingMode; 3] {
         [
@@ -4310,5 +4373,185 @@ mod tests {
         assert!(!val_col.is_null(1));
         assert!(!val_col.is_null(2));
         assert!(!val_col.is_null(3));
+    }
+
+    // === coerce_columns_to_schema ===
+
+    // Wraps [`TryIntoArrow`] in an `Arc` for brevity at the call sites below. Going through the
+    // kernel conversion is the point: that is what names the map entry `key_value` and the array
+    // element `element`, which hand-written Arrow fields would not.
+    fn kernel_target_schema(schema: StructType) -> ArrowSchemaRef {
+        Arc::new((&schema).try_into_arrow().unwrap())
+    }
+
+    // A one-entry `{"k": "v"}` map whose entry struct is named `entry`. That struct holds the
+    // key/value pair of every entry, and is the field whose name writers disagree on.
+    fn map_string_string_with_entry_name(entry: &str) -> MapArray {
+        let names = MapFieldNames {
+            entry: entry.to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        };
+        let mut builder = MapBuilder::new(Some(names), StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("k");
+        builder.values().append_value("v");
+        builder.append(true).unwrap();
+        builder.finish()
+    }
+
+    #[test]
+    fn test_coerce_columns_renames_entries_map_to_key_value() {
+        let map = map_string_string_with_entry_name("entries"); // <-- writer's name
+        let ArrowDataType::Map(entry_field, _) = map.data_type() else {
+            panic!("expected map");
+        };
+        assert_eq!(entry_field.name(), "entries");
+
+        let target = kernel_target_schema(schema! { nullable "m": { STRING => nullable STRING } });
+        let coerced = coerce_columns_to_schema(vec![Arc::new(map)], &target).unwrap();
+
+        let ArrowDataType::Map(out_entry, _) = coerced[0].data_type() else {
+            panic!("expected map");
+        };
+        assert_eq!(out_entry.name(), "key_value"); // <-- kernel's name
+        assert_eq!(coerced[0].data_type(), target.field(0).data_type());
+    }
+
+    #[test]
+    fn test_coerce_columns_renames_list_item_to_element() {
+        // Arrow's `ListArray::from_iter_primitive` names the element field `item`.
+        let list: ListArray =
+            ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1), Some(2)])]);
+        let ArrowDataType::List(elem_field) = list.data_type() else {
+            panic!("expected list");
+        };
+        assert_eq!(elem_field.name(), "item"); // <-- writer's name
+
+        let target = kernel_target_schema(schema! { nullable "l": [ nullable INTEGER ] });
+        let coerced = coerce_columns_to_schema(vec![Arc::new(list)], &target).unwrap();
+
+        let ArrowDataType::List(out_elem) = coerced[0].data_type() else {
+            panic!("expected list");
+        };
+        assert_eq!(out_elem.name(), "element"); // <-- kernel's name
+        assert_eq!(coerced[0].data_type(), target.field(0).data_type());
+    }
+
+    #[test]
+    fn test_coerce_columns_passes_through_matching_columns() {
+        let col: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let target = kernel_target_schema(schema! { nullable "i": INTEGER });
+
+        let coerced = coerce_columns_to_schema(vec![col.clone()], &target).unwrap();
+
+        // An already-matching column is returned as the same allocation (no rebuild).
+        assert!(Arc::ptr_eq(&col, &coerced[0]));
+    }
+
+    // `metaData.configuration` arrives this shape: the map that needs renaming sits one level down,
+    // reachable only through the struct-recursion arm.
+    #[test]
+    fn test_coerce_columns_renames_map_nested_in_struct() {
+        let map = map_string_string_with_entry_name("entries"); // <-- writer's name
+        let config_field = ArrowField::new("config", map.data_type().clone(), true);
+        let outer = StructArray::from(vec![(
+            Arc::new(config_field),
+            Arc::new(map) as ArrowArrayRef,
+        )]);
+
+        let target = kernel_target_schema(schema! {
+            nullable "meta": { nullable "config": { STRING => nullable STRING } },
+        });
+        let coerced = coerce_columns_to_schema(vec![Arc::new(outer)], &target).unwrap();
+
+        assert_eq!(coerced[0].data_type(), target.field(0).data_type());
+    }
+
+    // Beyond renaming, this is a real cast: a primitive column converts to the target's type.
+    #[test]
+    fn test_coerce_columns_casts_primitive_to_target_type() {
+        let col: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3])); // <-- source: Int32
+        let target = kernel_target_schema(schema! { nullable "n": LONG }); // <-- target: Int64
+
+        let coerced = coerce_columns_to_schema(vec![col], &target).unwrap();
+
+        assert_eq!(coerced[0].data_type(), &ArrowDataType::Int64);
+    }
+
+    // Casting a child rebuilds the struct around it, which must keep the struct's own null rows.
+    #[test]
+    fn test_coerce_columns_preserves_struct_null_rows() {
+        let child: ArrowArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2)]));
+        let fields: ArrowFields = vec![ArrowField::new("n", ArrowDataType::Int32, true)].into();
+        let nulls = NullBuffer::from(vec![false, true]); // <-- row 0 is a null struct
+        let outer = StructArray::try_new(fields, vec![child], Some(nulls)).unwrap();
+
+        // Widening the child to Int64 forces the struct to be rebuilt.
+        let target = kernel_target_schema(schema! { nullable "s": { nullable "n": LONG } });
+        let coerced = coerce_columns_to_schema(vec![Arc::new(outer)], &target).unwrap();
+
+        let out = coerced[0].as_struct();
+        assert!(out.is_null(0), "null struct row must survive the rebuild");
+        assert!(!out.is_null(1));
+        assert_eq!(out.column(0).data_type(), &ArrowDataType::Int64);
+    }
+
+    #[test]
+    fn test_coerce_columns_incompatible_leaf_type_errors() {
+        let col: ArrowArrayRef = Arc::new(StringArray::from(vec!["not_a_date"]));
+        let target = kernel_target_schema(schema! { nullable "d": DATE });
+
+        assert!(coerce_columns_to_schema(vec![col], &target).is_err());
+    }
+
+    // A primitive source against a struct target: the struct arm must reject it, not panic on the
+    // `as_struct` downcast.
+    #[test]
+    fn test_coerce_columns_non_struct_source_to_struct_target_errors() {
+        let col: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let target = kernel_target_schema(schema! { nullable "s": { nullable "n": INTEGER } });
+
+        let result = coerce_columns_to_schema(vec![col], &target);
+        assert_result_error_with_message(result, "to a struct target");
+    }
+
+    // A struct source with fewer children than the struct target has fields.
+    #[test]
+    fn test_coerce_columns_struct_child_count_mismatch_errors() {
+        let child: ArrowArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let fields: ArrowFields = vec![ArrowField::new("a", ArrowDataType::Int32, true)].into();
+        let source = StructArray::try_new(fields, vec![child], None).unwrap();
+
+        let target = kernel_target_schema(schema! {
+            nullable "s": { nullable "a": INTEGER, nullable "b": INTEGER },
+        });
+
+        let result = coerce_columns_to_schema(vec![Arc::new(source)], &target);
+        assert_result_error_with_message(result, "cannot cast struct with 1 children");
+    }
+
+    // Recursion must reach through every container: struct -> list -> map, with `entries`/`item`
+    // names at each level, all renamed in one pass.
+    #[test]
+    fn test_coerce_columns_recurses_through_struct_list_map() {
+        let map = map_string_string_with_entry_name("entries"); // <-- writer's name
+        let list_field = Arc::new(ArrowField::new("item", map.data_type().clone(), true));
+        let list = ListArray::new(
+            list_field,
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(map),
+            None,
+        );
+        let outer = StructArray::from(vec![(
+            Arc::new(ArrowField::new("maps", list.data_type().clone(), true)),
+            Arc::new(list) as ArrowArrayRef,
+        )]);
+
+        let target = kernel_target_schema(schema! {
+            nullable "s": { nullable "maps": [ nullable { STRING => nullable STRING } ] },
+        });
+        let coerced = coerce_columns_to_schema(vec![Arc::new(outer)], &target).unwrap();
+
+        assert_eq!(coerced[0].data_type(), target.field(0).data_type());
     }
 }

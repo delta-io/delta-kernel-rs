@@ -31,6 +31,8 @@ the caller's memory space.
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
+- `src/alloc_stats.rs` -- `peak_alloc` global allocator and native-heap FFI getters
+  (`alloc-tracking`)
 
 ## Read Flow
 
@@ -53,6 +55,14 @@ Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O 
 `snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
 `num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
 complete file stats).
+
+Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
+`visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
+descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),
+and a type tag -- without exposing the guarded `delta.*` domain JSON directly. It returns
+`OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns. The
+type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that don't fit a
+compact tag (struct, array, map, variant, void, and geometry/geography).
 
 ## Commit Range Flow
 
@@ -182,3 +192,6 @@ Feature flags:
 - `arrow-59`, `arrow-58`
 - `delta-kernel-unity-catalog`
 - `tracing`
+- `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful
+  `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
+  another `#[global_allocator]` if linked as an rlib)

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ::test_utils::{get_column, load_test_data};
+use ::test_utils::{assert_result_error_with_message, get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
 use url::Url;
@@ -17,6 +17,7 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
     column_expr, column_name, column_pred, Expression as Expr, Predicate as Pred,
 };
@@ -30,8 +31,8 @@ use crate::schema::{
 };
 use crate::transaction::create_table::create_table;
 use crate::{
-    DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
-    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
+    DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
+    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -40,19 +41,18 @@ fn field_names(s: &StructArray) -> Vec<String> {
 
 #[test]
 fn test_static_skipping() {
-    const NULL: Pred = Pred::null_literal();
     let test_cases = [
         (false, column_pred!("a")),
-        (true, Pred::literal(false)),
-        (false, Pred::literal(true)),
-        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
-        (true, Pred::and(column_pred!("a"), Pred::literal(false))),
-        (false, Pred::or(column_pred!("a"), Pred::literal(true))),
-        (false, Pred::or(column_pred!("a"), Pred::literal(false))),
+        (true, Pred::FALSE),
+        (false, Pred::TRUE),
+        (false, Pred::NULL), // NULL is unknown, not false -- conservative (no skip)
+        (true, Pred::and(column_pred!("a"), Pred::FALSE)),
+        (false, Pred::or(column_pred!("a"), Pred::TRUE)),
+        (false, Pred::or(column_pred!("a"), Pred::FALSE)),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
+        (false, Pred::and(Pred::NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -102,8 +102,8 @@ fn test_physical_predicate() {
     // NOTE: We break several column mapping rules here because they don't matter for this
     // test. For example, we do not provide field ids, and not all columns have physical names.
     let test_cases = [
-        (Pred::literal(true), Some(PhysicalPredicate::None)),
-        (Pred::literal(false), Some(PhysicalPredicate::StaticSkipAll)),
+        (Pred::TRUE, Some(PhysicalPredicate::None)),
+        (Pred::FALSE, Some(PhysicalPredicate::StaticSkipAll)),
         (column_pred!("x"), None), // no such column
         (
             column_pred!("a"),
@@ -176,9 +176,9 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
+            Pred::and(column_pred!("mapped.n"), Pred::TRUE),
             Some(PhysicalPredicate::Some(
-                Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
+                Pred::and(column_pred!("phys_mapped.phys_n"), Pred::TRUE).into(),
                 StructType::new_unchecked(vec![StructField::nullable(
                     "phys_mapped",
                     StructType::new_unchecked(vec![StructField::nullable(
@@ -198,7 +198,7 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::literal(false)),
+            Pred::and(column_pred!("mapped.n"), Pred::FALSE),
             Some(PhysicalPredicate::StaticSkipAll),
         ),
     ];
@@ -1156,7 +1156,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 
     // A predicate that statically evaluates to false should produce StaticSkipAll,
     // which means build_actions_meta_predicate returns None.
-    let predicate = Arc::new(Pred::literal(false));
+    let predicate = Arc::new(Pred::FALSE);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1766,6 +1766,19 @@ struct RecordingParquetHandler {
     reads: Mutex<Vec<RecordedParquetRead>>,
 }
 
+impl RecordingParquetHandler {
+    fn new(inner: Arc<dyn ParquetHandler>) -> Self {
+        Self {
+            inner,
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_reads(&self) -> Vec<RecordedParquetRead> {
+        std::mem::take(&mut *self.reads.lock().unwrap())
+    }
+}
+
 impl ParquetHandler for RecordingParquetHandler {
     fn read_parquet_files(
         &self,
@@ -1795,45 +1808,6 @@ impl ParquetHandler for RecordingParquetHandler {
     }
 }
 
-struct RecordingParquetEngine {
-    inner: Arc<SyncEngine>,
-    parquet: Arc<RecordingParquetHandler>,
-}
-
-impl RecordingParquetEngine {
-    fn new(inner: Arc<SyncEngine>) -> Self {
-        Self {
-            parquet: Arc::new(RecordingParquetHandler {
-                inner: inner.parquet_handler(),
-                reads: Mutex::new(Vec::new()),
-            }),
-            inner,
-        }
-    }
-
-    fn take_reads(&self) -> Vec<RecordedParquetRead> {
-        std::mem::take(&mut *self.parquet.reads.lock().unwrap())
-    }
-}
-
-impl Engine for RecordingParquetEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.inner.evaluation_handler()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.inner.json_handler()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        self.parquet.clone()
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.inner.storage_handler()
-    }
-}
-
 #[rstest]
 #[case::all_struct(StatsOptions::all_struct(), false, false)]
 #[case::all(StatsOptions::all(), true, false)]
@@ -1857,9 +1831,11 @@ fn test_checkpoint_stats_projection_matches_requested_output(
             fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
         });
     let url = Url::from_directory_path(path).unwrap();
-    let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    engine.take_reads();
+    recorder.take_reads();
 
     let predicate: Option<PredicateRef> = skip_stats
         .then(|| Arc::new(Pred::gt(column_expr!("id"), Expr::literal(0i64))) as PredicateRef);
@@ -1873,7 +1849,7 @@ fn test_checkpoint_stats_projection_matches_requested_output(
         action.unwrap();
     }
 
-    let reads = engine.take_reads();
+    let reads = recorder.take_reads();
     let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
     let expect_parsed_stats = !skip_stats && compatible_structured_stats;
     let expect_json_stats = !skip_stats && (request_json_stats || !expect_parsed_stats);
@@ -1977,9 +1953,11 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
 ) {
     let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = RecordingParquetEngine::new(Arc::new(SyncEngine::new()));
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-    engine.take_reads();
+    recorder.take_reads();
 
     let scan = snapshot
         .scan_builder()
@@ -1990,7 +1968,7 @@ fn test_checkpoint_predicate_reaches_parquet_handler(
         action.unwrap();
     }
 
-    let reads = engine.take_reads();
+    let reads = recorder.take_reads();
     assert!(
         reads.iter().any(|read| {
             read.files
@@ -2157,6 +2135,40 @@ fn test_scan_metadata_with_specific_stats_columns(#[case] stats: StatsOptions) {
     }
 }
 
+#[rstest]
+fn scan_builder_validates_predicate_and_stats_columns(
+    #[values(
+        (column_pred!("missing_predicate"), false),
+        (column_pred!("id"), true)
+    )]
+    predicate: (Pred, bool),
+    #[values(
+        (StatsOptions::struct_columns(vec![column_name!("missing_stats")]), false),
+        (StatsOptions::struct_columns(vec![column_name!("id")]), true)
+    )]
+    stats: (StatsOptions, bool),
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (predicate, predicate_exists) = predicate;
+    let (stats, stats_columns_exist) = stats;
+    let result = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats(stats)
+        .build();
+
+    match (predicate_exists, stats_columns_exist) {
+        (true, true) => {
+            result.expect("valid predicate and stats columns");
+        }
+        (false, _) => assert_result_error_with_message(result, "missing_predicate"),
+        (true, false) => assert_result_error_with_message(result, "missing_stats"),
+    }
+}
+
 /// Test that [`StructStats::Columns`] with multiple specific columns returns stats for all of them.
 #[test]
 fn test_scan_metadata_with_multiple_stats_columns() {
@@ -2229,8 +2241,7 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that [`StructStats::Columns`] with a nonexistent column name produces empty stats for
-/// that column.
+/// Test that [`StructStats::Columns`] rejects nonexistent columns.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -2238,43 +2249,15 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let scan = snapshot
+    let result = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
         })
-        .build()
-        .unwrap();
+        .build();
 
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    assert!(
-        !scan_metadata_results.is_empty(),
-        "Should have scan metadata"
-    );
-
-    for scan_metadata in scan_metadata_results {
-        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-            .unwrap()
-            .into();
-        let filtered_batch =
-            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-
-        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-
-        // Should have numRecords but no minValues/maxValues/nullCount
-        // (or they exist but are empty structs)
-        assert!(
-            stats_parsed.column_by_name(NUM_RECORDS).is_some(),
-            "Should still have numRecords"
-        );
-    }
+    assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
@@ -2304,28 +2287,6 @@ impl ParquetHandler for EmptyParquetHandler {
     }
 }
 
-/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`, which
-/// returns [`EmptyParquetHandler`].
-struct EmptyParquetEngine(Arc<SyncEngine>);
-
-impl Engine for EmptyParquetEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.0.evaluation_handler()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.0.json_handler()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        Arc::new(EmptyParquetHandler)
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.0.storage_handler()
-    }
-}
-
 /// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
 /// iterator, `execute` must surface an error rather than silently producing no rows.
 #[test]
@@ -2333,7 +2294,10 @@ fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
     let path =
         std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+    );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
@@ -2354,7 +2318,10 @@ fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
 fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+    );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
@@ -2379,7 +2346,7 @@ mod scan_metadata_completed_tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
     use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
 
@@ -2424,7 +2391,7 @@ mod scan_metadata_completed_tests {
     #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
-        Some(Arc::new(Pred::literal(false))),
+        Some(Arc::new(Pred::FALSE)),
         0,
         0,
         0,

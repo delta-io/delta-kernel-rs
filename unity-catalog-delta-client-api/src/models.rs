@@ -5,51 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::credentials::StorageCredential;
 
 // ============================================================================
-// Delta-Commits API (legacy)
-//
-// These types back the current Delta-Commits read/commit path. They are superseded by the
-// Delta-Tables types below (update_table / load_table) and will be deleted once the read and
-// commit paths are swapped onto the new API. Kept here so the crate and its downstream consumers
-// keep compiling during the migration.
+// update_table: typed requirements + updates
 // ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitsRequest {
-    pub table_id: String,
-    pub table_uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_version: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_version: Option<i64>,
-}
-
-impl CommitsRequest {
-    pub fn new(table_id: impl Into<String>, table_uri: impl Into<String>) -> Self {
-        Self {
-            table_id: table_id.into(),
-            table_uri: table_uri.into(),
-            start_version: None,
-            end_version: None,
-        }
-    }
-
-    pub fn with_start_version(mut self, version: i64) -> Self {
-        self.start_version = Some(version);
-        self
-    }
-
-    pub fn with_end_version(mut self, version: i64) -> Self {
-        self.end_version = Some(version);
-        self
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitsResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commits: Option<Vec<Commit>>,
-    pub latest_table_version: i64,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -78,55 +35,7 @@ impl Commit {
             file_modification_timestamp,
         }
     }
-
-    pub fn timestamp_as_datetime(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        chrono::DateTime::from_timestamp_millis(self.timestamp)
-    }
-
-    pub fn file_modification_as_datetime(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        chrono::DateTime::from_timestamp_millis(self.file_modification_timestamp)
-    }
 }
-
-/// Request to commit a new version to the table. It must include either a `commit_info` or
-/// `latest_backfilled_version`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitRequest {
-    pub table_id: String,
-    pub table_uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_info: Option<Commit>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_backfilled_version: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<serde_json::Value>,
-}
-
-impl CommitRequest {
-    pub fn new(
-        table_id: impl Into<String>,
-        table_uri: impl Into<String>,
-        commit_info: Commit,
-        latest_backfilled_version: Option<i64>,
-    ) -> Self {
-        Self {
-            table_id: table_id.into(),
-            table_uri: table_uri.into(),
-            commit_info: Some(commit_info),
-            latest_backfilled_version,
-            metadata: None,
-            protocol: None,
-        }
-    }
-
-    // TODO: expose metadata/protocol (with_metadata, with_protocol)
-}
-
-// ============================================================================
-// update_table: typed requirements + updates
-// ============================================================================
 
 /// A precondition that the catalog server must validate before applying a
 /// commit.
@@ -155,19 +64,39 @@ pub enum DeltaTableUpdate {
     },
 }
 
+/// The three-part identifier for a UC table (catalog, schema, table), used to route requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableIdentifier {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+}
+
+impl TableIdentifier {
+    pub fn new(
+        catalog: impl Into<String>,
+        schema: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Self {
+        Self {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TableIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.catalog, self.schema, self.table)
+    }
+}
+
 /// Body of a `POST /delta/v1/catalogs/{c}/schemas/{s}/tables/{t}`
-/// (`update_table`) request.
+/// (`update_table`) request. The target table is routed separately (see
+/// [`crate::UpdateTableClient::update_table`]); this struct is purely the serialized body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateTableRequest {
-    /// Catalog name. Used for URL routing.
-    #[serde(skip)]
-    pub catalog: String,
-    /// Schema name. Used for URL routing.
-    #[serde(skip)]
-    pub schema: String,
-    /// Table name. Used for URL routing.
-    #[serde(skip)]
-    pub table_name: String,
     /// Preconditions the catalog must validate.
     pub requirements: Vec<DeltaTableRequirement>,
     /// Updates to apply atomically.
@@ -175,32 +104,48 @@ pub struct UpdateTableRequest {
 }
 
 impl UpdateTableRequest {
+    /// Build a request from its preconditions and updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a singleton entry appears more than once. The UC `updateTable` endpoint
+    /// accepts at most one each of `AssertTableUuid`, `AssertEtag`, `AddCommit`, and
+    /// `SetLatestBackfilledVersion`.
     pub fn new(
-        catalog: impl Into<String>,
-        schema: impl Into<String>,
-        table_name: impl Into<String>,
         requirements: Vec<DeltaTableRequirement>,
         updates: Vec<DeltaTableUpdate>,
     ) -> crate::error::Result<Self> {
-        let count = |is_variant: fn(&DeltaTableRequirement) -> bool| {
+        let num_requirements = |is_variant: fn(&DeltaTableRequirement) -> bool| {
             requirements.iter().filter(|r| is_variant(r)).count()
         };
-        if count(|r| matches!(r, DeltaTableRequirement::AssertTableUuid { .. })) > 1 {
+        if num_requirements(|r| matches!(r, DeltaTableRequirement::AssertTableUuid { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one AssertTableUuid requirement"
                     .to_string(),
             ));
         }
-        if count(|r| matches!(r, DeltaTableRequirement::AssertEtag { .. })) > 1 {
+        if num_requirements(|r| matches!(r, DeltaTableRequirement::AssertEtag { .. })) > 1 {
             return Err(crate::error::Error::Generic(
                 "update_table request must not contain more than one AssertEtag requirement"
                     .to_string(),
             ));
         }
+        let num_updates = |is_variant: fn(&DeltaTableUpdate) -> bool| {
+            updates.iter().filter(|u| is_variant(u)).count()
+        };
+        if num_updates(|u| matches!(u, DeltaTableUpdate::AddCommit { .. })) > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one AddCommit update".to_string(),
+            ));
+        }
+        if num_updates(|u| matches!(u, DeltaTableUpdate::SetLatestBackfilledVersion { .. })) > 1 {
+            return Err(crate::error::Error::Generic(
+                "update_table request must not contain more than one SetLatestBackfilledVersion \
+                 update"
+                    .to_string(),
+            ));
+        }
         Ok(Self {
-            catalog: catalog.into(),
-            schema: schema.into(),
-            table_name: table_name.into(),
             requirements,
             updates,
         })
@@ -219,6 +164,16 @@ impl UpdateTableRequest {
     pub fn staged_commit(&self) -> Option<&Commit> {
         self.updates.iter().find_map(|u| match u {
             DeltaTableUpdate::AddCommit { commit } => Some(commit),
+            _ => None,
+        })
+    }
+
+    /// The latest backfilled (published) version in this request's updates, if present.
+    pub fn latest_backfilled_version(&self) -> Option<i64> {
+        self.updates.iter().find_map(|u| match u {
+            DeltaTableUpdate::SetLatestBackfilledVersion {
+                latest_published_version,
+            } => Some(*latest_published_version),
             _ => None,
         })
     }
@@ -389,9 +344,78 @@ pub struct CreateTableRequest {
     pub last_commit_timestamp_ms: i64,
 }
 
+// ============================================================================
+// reportMetrics: post-commit telemetry
+// ============================================================================
+
+/// Body of a `POST /delta/v1/catalogs/{c}/schemas/{s}/tables/{t}/metrics` request.
+///
+/// Commit telemetry reported to the catalog after a commit succeeds. This is best-effort
+/// telemetry, not part of the commit's correctness path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct ReportMetricsRequest {
+    /// Table UUID; must match the table identified by the URL path.
+    pub table_id: String,
+    /// The metrics being reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<MetricsReport>,
+}
+
+/// Wrapper matching the server's `report` envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct MetricsReport {
+    /// Per-commit statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_report: Option<CommitReport>,
+}
+
+/// Statistics describing a single commit.
+///
+/// File and byte counts are derivable from the commit's add/remove actions. Row counts are only
+/// known to the connector's write engine, so they are optional. The catalog requires a commit
+/// version on every report and reads it from `file_size_histogram.commit_version`, so the histogram
+/// is required.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommitReport {
+    pub num_files_added: i64,
+    pub num_bytes_added: i64,
+    pub num_files_removed: i64,
+    pub num_bytes_removed: i64,
+    /// `None` when the write engine did not observe a row count (distinct from `0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_rows_inserted: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_rows_removed: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_rows_updated: Option<i64>,
+    pub file_size_histogram: FileSizeHistogram,
+}
+
+/// File-size histogram as index-aligned arrays mirroring the server's `file-size-histogram`
+/// wire schema: `file_counts[i]` and `total_bytes[i]` describe the bin bounded by
+/// `sorted_bin_boundaries[i]`. The three arrays have equal length.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct FileSizeHistogram {
+    pub sorted_bin_boundaries: Vec<i64>,
+    pub file_counts: Vec<i64>,
+    pub total_bytes: Vec<i64>,
+    /// The commit version this histogram is for.
+    pub commit_version: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_identifier_displays_as_dotted_three_part_name() {
+        let id = TableIdentifier::new("main", "default", "my_table");
+        assert_eq!(id.to_string(), "main.default.my_table");
+    }
 
     #[test]
     fn load_table_response_decodes_full_body() {
@@ -478,16 +502,15 @@ mod tests {
     }
 
     #[test]
-    fn update_table_request_skips_routing_fields() {
-        let req = UpdateTableRequest::new("cat", "sch", "tbl", vec![], vec![]).unwrap();
+    fn update_table_request_serializes_only_body_fields() {
+        let req = UpdateTableRequest::new(vec![], vec![]).unwrap();
         let v = serde_json::to_value(&req).unwrap();
         let obj = v.as_object().unwrap();
-        for key in ["catalog", "schema", "table_name", "table-name"] {
-            assert!(
-                !obj.contains_key(key),
-                "routing field {key} must not be serialized"
-            );
-        }
+        assert_eq!(
+            obj.len(),
+            2,
+            "body should have exactly requirements + updates"
+        );
         assert!(obj.contains_key("requirements"));
         assert!(obj.contains_key("updates"));
     }
@@ -495,9 +518,6 @@ mod tests {
     #[test]
     fn table_uuid_returns_none_when_only_etag_requirement_present() {
         let req = UpdateTableRequest::new(
-            "c",
-            "s",
-            "t",
             vec![DeltaTableRequirement::AssertEtag { etag: "e1".into() }],
             vec![],
         )
@@ -508,9 +528,6 @@ mod tests {
     #[test]
     fn table_uuid_returns_uuid_when_assert_table_uuid_present() {
         let req = UpdateTableRequest::new(
-            "c",
-            "s",
-            "t",
             vec![DeltaTableRequirement::AssertTableUuid { uuid: "abc".into() }],
             vec![],
         )
@@ -531,16 +548,13 @@ mod tests {
             ],
         ] {
             assert!(
-                UpdateTableRequest::new("c", "s", "t", dup, vec![]).is_err(),
+                UpdateTableRequest::new(dup, vec![]).is_err(),
                 "duplicate requirement of the same type must be rejected"
             );
         }
 
         // One of each type is allowed.
         assert!(UpdateTableRequest::new(
-            "c",
-            "s",
-            "t",
             vec![
                 DeltaTableRequirement::AssertTableUuid { uuid: "a".into() },
                 DeltaTableRequirement::AssertEtag { etag: "e1".into() },
@@ -551,11 +565,57 @@ mod tests {
     }
 
     #[test]
+    fn new_rejects_duplicate_set_latest_backfilled_version() {
+        assert!(
+            UpdateTableRequest::new(
+                vec![],
+                vec![
+                    DeltaTableUpdate::SetLatestBackfilledVersion {
+                        latest_published_version: 1,
+                    },
+                    DeltaTableUpdate::SetLatestBackfilledVersion {
+                        latest_published_version: 2,
+                    },
+                ],
+            )
+            .is_err(),
+            "more than one SetLatestBackfilledVersion must be rejected"
+        );
+
+        assert!(
+            UpdateTableRequest::new(
+                vec![],
+                vec![
+                    DeltaTableUpdate::AddCommit {
+                        commit: sample_commit(),
+                    },
+                    DeltaTableUpdate::AddCommit {
+                        commit: sample_commit(),
+                    },
+                ],
+            )
+            .is_err(),
+            "more than one AddCommit must be rejected"
+        );
+
+        // A single AddCommit alongside the other singletons is accepted.
+        assert!(UpdateTableRequest::new(
+            vec![],
+            vec![
+                DeltaTableUpdate::AddCommit {
+                    commit: sample_commit(),
+                },
+                DeltaTableUpdate::SetLatestBackfilledVersion {
+                    latest_published_version: 3,
+                },
+            ],
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn staged_commit_returns_commit_when_add_commit_present() {
         let req = UpdateTableRequest::new(
-            "c",
-            "s",
-            "t",
             vec![],
             vec![DeltaTableUpdate::AddCommit {
                 commit: sample_commit(),
@@ -568,9 +628,6 @@ mod tests {
     #[test]
     fn staged_commit_returns_none_when_no_add_commit_present() {
         let req = UpdateTableRequest::new(
-            "c",
-            "s",
-            "t",
             vec![],
             vec![DeltaTableUpdate::SetLatestBackfilledVersion {
                 latest_published_version: 9,
@@ -705,5 +762,54 @@ mod tests {
             v["domain-metadata"]["delta.clustering"]["clusteringColumns"][0],
             serde_json::json!(["c1"])
         );
+    }
+
+    #[test]
+    fn report_metrics_request_wire_shape() {
+        let req = ReportMetricsRequest {
+            table_id: "abc".to_string(),
+            report: Some(MetricsReport {
+                commit_report: Some(CommitReport {
+                    num_files_added: 3,
+                    num_bytes_added: 300,
+                    num_files_removed: 1,
+                    num_bytes_removed: 100,
+                    num_rows_inserted: Some(42),
+                    num_rows_removed: None,
+                    num_rows_updated: None,
+                    file_size_histogram: FileSizeHistogram {
+                        sorted_bin_boundaries: vec![0, 1000],
+                        file_counts: vec![2, 1],
+                        total_bytes: vec![150, 150],
+                        commit_version: 7,
+                    },
+                }),
+            }),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["table-id"], "abc");
+        let cr = &v["report"]["commit-report"];
+        assert_eq!(cr["num-files-added"], 3);
+        assert_eq!(cr["num-bytes-removed"], 100);
+        assert_eq!(cr["num-rows-inserted"], 42);
+        // Absent optional row counts are omitted from the wire body.
+        assert!(cr.get("num-rows-removed").is_none());
+        assert!(cr.get("num-rows-updated").is_none());
+        assert_eq!(cr["file-size-histogram"]["commit-version"], 7);
+        assert_eq!(
+            cr["file-size-histogram"]["sorted-bin-boundaries"],
+            serde_json::json!([0, 1000])
+        );
+    }
+
+    #[test]
+    fn report_metrics_request_omits_absent_report() {
+        let req = ReportMetricsRequest {
+            table_id: "abc".to_string(),
+            report: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["table-id"], "abc");
+        assert!(v.get("report").is_none());
     }
 }

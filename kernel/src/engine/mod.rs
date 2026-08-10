@@ -51,6 +51,9 @@ pub mod plans;
 #[cfg(test)]
 pub(crate) mod sync;
 
+#[cfg(test)]
+pub(crate) mod test_delegating;
+
 #[cfg(feature = "default-engine-base")]
 pub mod arrow_data;
 #[cfg(feature = "default-engine-base")]

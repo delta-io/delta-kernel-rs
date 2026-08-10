@@ -19,7 +19,7 @@ use crate::metrics::ProtocolMetadataSource;
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::FileType;
 #[cfg(feature = "declarative-plans")]
-use crate::plans::{Operation, PlanBuilder};
+use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 #[cfg(feature = "declarative-plans")]
 use crate::schema::column_name;
 use crate::schema::schema_ref;
@@ -122,14 +122,12 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // With `declarative-plans`, replay P&M through the declarative plan, falling back to legacy
-        // replay on any plan failure while the plan path is experimental.
+        // Providing a plan executor opts the engine into declarative P&M replay.
         #[cfg(feature = "declarative-plans")]
-        let actions_batches = self.read_pm_batches_via_plan(engine).or_else(|err| {
-            info!("declarative P&M plan failed, using legacy replay: {err}");
-            self.read_pm_batches(engine)
-                .map(|batches| Box::new(batches) as _)
-        })?;
+        let actions_batches = match engine.plan_executor() {
+            Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
+            None => Box::new(self.read_pm_batches(engine)?) as _,
+        };
 
         #[cfg(not(feature = "declarative-plans"))]
         let actions_batches = self.read_pm_batches(engine)?;
@@ -154,7 +152,7 @@ impl LogSegment {
     #[cfg(feature = "declarative-plans")]
     fn read_pm_batches_via_plan(
         &self,
-        engine: &dyn Engine,
+        executor: &dyn PlanExecutor,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
         let versioned_schema = schema_ref! {
             (&PROTOCOL_FIELD),
@@ -185,8 +183,7 @@ impl LogSegment {
             .build()?;
 
         // NOTE: The plan dedupes all actions, so mark all results as coming from checkpoint
-        let batches = engine
-            .plan_executor()
+        let batches = executor
             .execute_op(Operation::QueryPlan(plan))?
             .into_data()?
             .map(|batch| Ok(ActionsBatch::new(batch?, true)));
@@ -209,12 +206,32 @@ impl LogSegment {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    #[cfg(feature = "declarative-plans")]
+    use std::sync::Arc;
 
     use itertools::Itertools;
     use test_log::test;
 
     use crate::engine::sync::SyncEngine;
+    #[cfg(feature = "declarative-plans")]
+    use crate::engine::test_delegating::DelegatingEngine;
+    #[cfg(feature = "declarative-plans")]
+    use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::Snapshot;
+    #[cfg(feature = "declarative-plans")]
+    use crate::{DeltaResult, Error};
+
+    // A [`PlanExecutor`] whose every operation fails, used to prove that a plan-path failure
+    // surfaces from P&M replay rather than falling back to legacy replay.
+    #[cfg(feature = "declarative-plans")]
+    struct FailingPlanExecutor;
+
+    #[cfg(feature = "declarative-plans")]
+    impl PlanExecutor for FailingPlanExecutor {
+        fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
+            Err(Error::generic("plan executor deliberately failed"))
+        }
+    }
 
     // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
     // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
@@ -256,5 +273,61 @@ mod tests {
         // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
         // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
         assert_eq!(data.len(), 4);
+    }
+
+    // With the `declarative-plans` feature flag on, `SyncEngine` resolves P&M through the
+    // declarative plan.
+    //
+    // This fixture's checkpoint names its map entry fields `entries` where kernel expects
+    // `key_value`. Parquet takes that name from the writer's Arrow schema unless the writer sets
+    // `WriterProperties::coerce_types`, which is off by default, and Arrow's own
+    // `MapFieldNames::default()` is `entries`. So a writer that builds its maps from Arrow defaults
+    // produces a file kernel must translate on read. Spark and kernel both write `key_value`,
+    // covered by
+    // `scan_plan::execution_tests::declarative_metadata_reconciles_checkpoint_with_later_commits`.
+    #[test]
+    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_entries_named_maps() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(snapshot.schema().fields().count(), 3);
+    }
+
+    // The array counterpart of the test above. This fixture's checkpoint names its array element
+    // fields `item` where kernel expects `element`, so it covers the other half of the naming
+    // disagreement. `metaData.partitionColumns` is the array in question, and it is present in
+    // every `metaData` action, so its element name is checked on every P&M replay.
+    #[test]
+    fn test_snapshot_build_via_plan_over_parquet_checkpoint_with_item_named_arrays() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        assert_eq!(snapshot.version(), 5);
+        assert_eq!(snapshot.schema().fields().count(), 5);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    #[test]
+    fn test_snapshot_build_via_failing_plan_executor_surfaces_error_without_fallback() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_plan_executor(Arc::new(FailingPlanExecutor));
+
+        let result = Snapshot::builder_for(url).build(&engine);
+
+        assert!(
+            result.is_err(),
+            "plan failure must surface, not fall back to legacy replay"
+        );
     }
 }

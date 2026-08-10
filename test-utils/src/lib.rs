@@ -161,6 +161,7 @@ define_sweeps! {
     ),
 }
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
@@ -172,7 +173,7 @@ use delta_kernel::actions::{
 };
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, MapArray,
-    RecordBatch, StringArray, StructArray,
+    MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{
@@ -511,14 +512,104 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// Helper to create a DefaultEngine with the default executor for tests.
+/// A modification to an add-file batch's `partitionValues` keys.
+#[derive(Clone, Copy)]
+pub enum AddFilePartitionKeyModify<'a> {
+    Drop {
+        key: &'a str,
+    },
+    Insert {
+        key: &'a str,
+        value: Option<&'a str>,
+    },
+}
+
+/// Applies `modifications` in order to a single-row add-file batch.
 ///
-/// Uses `TokioBackgroundExecutor` as the default executor.
+/// # Panics
+///
+/// Panics when `batch` does not have exactly one row with a string-keyed and string-valued
+/// `partitionValues` map, or when the modified batch cannot be constructed.
+pub fn modify_add_file_partition_keys(
+    batch: RecordBatch,
+    modifications: &[AddFilePartitionKeyModify<'_>],
+) -> RecordBatch {
+    if modifications.is_empty() {
+        return batch;
+    }
+
+    assert_eq!(batch.num_rows(), 1, "add-file batch must contain one row");
+    let index = batch
+        .schema()
+        .index_of("partitionValues")
+        .expect("partitionValues field in add-file batch");
+    let map = batch.column(index).as_map();
+    let entries = map.value(0);
+    let keys = entries.column(0).as_string::<i32>();
+    let values = entries.column(1).as_string::<i32>();
+    let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
+        .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
+        .collect();
+    for modification in modifications {
+        match *modification {
+            AddFilePartitionKeyModify::Drop { key } => {
+                partition_values.retain(|(existing_key, _)| *existing_key != key);
+            }
+            AddFilePartitionKeyModify::Insert { key, value } => {
+                partition_values.push((key, value));
+            }
+        }
+    }
+
+    let (entry_field, ordered) = match map.data_type() {
+        ArrowDataType::Map(entry_field, ordered) => (entry_field.clone(), *ordered),
+        _ => unreachable!("partitionValues column must be a map"),
+    };
+    let (key_field, value_field) = map.entries_fields();
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(key_field.clone())
+        .with_values_field(value_field.clone());
+    for (key, value) in partition_values {
+        builder.keys().append_value(key);
+        match value {
+            Some(v) => builder.values().append_value(v),
+            None => builder.values().append_null(),
+        }
+    }
+    builder
+        .append(true)
+        .expect("failed to append partition-values map row");
+    let (_, offsets, entries, nulls, _) = builder.finish().into_parts();
+    let new_map: ArrayRef = Arc::new(
+        MapArray::try_new(entry_field, offsets, entries, nulls, ordered)
+            .expect("failed to rebuild partition-values map"),
+    );
+
+    let mut columns = batch.columns().to_vec();
+    columns[index] = new_map;
+    RecordBatch::try_new(batch.schema(), columns)
+        .expect("failed to rebuild add-file batch after modifying a partition key")
+}
+
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+    create_default_engine_with_batch(table_root, None)
+}
+
+/// Helper to create a DefaultEngine with the default executor for tests.
+///
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine_with_batch(
+    table_root: &url::Url,
+    batch_size: Option<usize>,
+) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+    let mut builder = DefaultEngineBuilder::new(store);
+    if let Some(batch_size) = batch_size {
+        builder = builder.with_batch_size(NonZero::new(batch_size).unwrap());
+    }
+    Ok(Arc::new(builder.build()))
 }
 
 /// Helper to create a DefaultEngine with the default executor for tests.
@@ -950,6 +1041,7 @@ pub async fn insert_data_with<E: TaskExecutor>(
         .transaction(committer, engine.as_ref())?
         .with_operation(operation.to_string())
         .with_data_change(data_change);
+    txn.ack_column_defaults();
     if is_blind_append {
         txn = txn.with_blind_append();
     }
@@ -1370,6 +1462,7 @@ pub async fn write_batch_to_table(
         .transaction(Box::new(FileSystemCommitter::new()), engine)?
         .with_engine_info("DefaultEngine")
         .with_data_change(true);
+    txn.ack_column_defaults();
     let write_context = if txn.logical_partition_columns().is_empty() {
         assert!(
             partition_values.is_empty(),

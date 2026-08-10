@@ -28,9 +28,9 @@ use crate::kernel_predicates::{
 #[cfg(feature = "geo-type-in-dev")]
 use crate::schema::EdgeInterpolationAlgorithm;
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
-use crate::utils::test_utils::assert_result_error_with_message;
+use crate::unit_test_utils::assert_result_error_with_message;
 #[cfg(feature = "geo-type-in-dev")]
-use crate::utils::test_utils::{geography_type, geometry_type};
+use crate::unit_test_utils::{geography_type, geometry_type};
 use crate::EvaluationHandlerExtension as _;
 
 #[test]
@@ -629,7 +629,7 @@ fn test_logical() {
     let expected = BooleanArray::from(vec![t, f, f, f, n, f]);
     assert_eq!(results, expected);
 
-    let pred_and_lit = Pred::and(column_a.clone(), Pred::literal(true));
+    let pred_and_lit = Pred::and(column_a.clone(), Pred::TRUE);
     let results = evaluate_predicate(&pred_and_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
@@ -639,7 +639,7 @@ fn test_logical() {
     let expected = BooleanArray::from(vec![t, t, t, f, t, n]);
     assert_eq!(results, expected);
 
-    let pred_or_lit = Pred::or(column_a.clone(), Pred::literal(false));
+    let pred_or_lit = Pred::or(column_a.clone(), Pred::FALSE);
     let results = evaluate_predicate(&pred_or_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
