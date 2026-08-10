@@ -699,7 +699,9 @@ pub fn evaluate_predicate(
                     }
                 }
                 (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                    // Logical equality, so a NULL never matches another NULL.
+                    // Logical (SQL) equality, so a NULL never matches another NULL. Struct, array,
+                    // and map elements/needles are unsupported: `logical_eq` returns `false` for
+                    // them, so they never match, not even a structurally identical value.
                     let exists = ad.array_elements().iter().any(|e| lit.logical_eq(e));
                     Ok(BooleanArray::from(vec![exists]))
                 }
@@ -1923,7 +1925,7 @@ mod tests {
     /// The two element sources `IN` accepts, both holding `elements`: a literal `Array` scalar
     /// and a single-row `list` column. The batch also carries an `n` column (always `1`) so the
     /// needle can be a column in the operand-shape rejection test.
-    fn in_sources(elements: &[Option<i32>]) -> (Expr, Expr, RecordBatch) {
+    fn in_element_sources(elements: &[Option<i32>]) -> (Expr, Expr, RecordBatch) {
         let scalars = elements
             .iter()
             .map(|e| e.map_or(Scalar::Null(DataType::INTEGER), Scalar::Integer));
@@ -1968,7 +1970,7 @@ mod tests {
         #[case] elements: &[Option<i32>],
         #[case] expected: bool,
     ) {
-        let (literal_source, column_source, batch) = in_sources(elements);
+        let (literal_source, column_source, batch) = in_element_sources(elements);
         let needle = match needle {
             Some(n) => lit(n),
             None => Expr::null_literal(DataType::INTEGER),
@@ -2009,10 +2011,10 @@ mod tests {
         )
         .unwrap();
 
-        let (_, _, batch) = in_sources(&[Some(1)]);
+        let (_, _, batch) = in_element_sources(&[Some(1)]);
         let pred = Pred::binary(
             BinaryPredicateOp::In,
-            Expr::literal(make_struct(1)),
+            Expr::Literal(make_struct(1)),
             Expr::Literal(Scalar::Array(elements)),
         );
         let result = evaluate_predicate(&pred, &batch, false).unwrap();
@@ -2023,11 +2025,11 @@ mod tests {
     /// Only a literal left operand is supported, so a column needle is rejected regardless of where
     /// the elements come from, as is a right operand that holds no elements at all.
     #[rstest]
-    #[case::column_in_literal_array(in_sources(&[Some(1), Some(2)]).0)]
-    #[case::column_in_column(in_sources(&[Some(1), Some(2)]).1)]
+    #[case::column_in_literal_array(in_element_sources(&[Some(1), Some(2)]).0)]
+    #[case::column_in_column(in_element_sources(&[Some(1), Some(2)]).1)]
     #[case::non_array_right_operand(lit(1))]
     fn test_in_rejects_unsupported_operand_shapes(#[case] right: Expr) {
-        let (.., batch) = in_sources(&[Some(1), Some(2)]);
+        let (.., batch) = in_element_sources(&[Some(1), Some(2)]);
         let pred = Pred::binary(BinaryPredicateOp::In, column_expr!("n"), right);
         assert_result_error_with_message(
             evaluate_predicate(&pred, &batch, false),
