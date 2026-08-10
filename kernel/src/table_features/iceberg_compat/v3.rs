@@ -7,7 +7,7 @@ use super::{
     IcebergCompatValidator, IcebergCompatVersion,
 };
 use crate::schema::PrimitiveType::*;
-use crate::schema::{try_collect_column_defaults, DataType};
+use crate::schema::{column_default, try_collect_column_defaults, DataType};
 use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Error};
 
@@ -68,18 +68,22 @@ pub(crate) fn iceberg_compat_v3_column_defaults_validation(
     for (path, column_default) in
         try_collect_column_defaults(table_configuration.logical_schema_ref())?
     {
-        if column_default.is_kernel_parsable_non_literal() {
-            return Err(Error::unsupported(format!(
-                "icebergCompatV3 requires column defaults to be literals, but the default for \
-                 '{path}' is a non-literal expression: {}",
-                column_default.raw_sql()
-            )));
-        } else if !column_default.is_kernel_parsable_literal() {
-            warn!(
-                "kernel could not verify that the icebergCompatV3 column default for '{path}' is a \
-                 literal, got: {}",
-                column_default.raw_sql()
-            );
+        match column_default.parse_status() {
+            column_default::ParseStatus::Literal => {}
+            column_default::ParseStatus::NonLiteral => {
+                return Err(Error::unsupported(format!(
+                    "icebergCompatV3 requires column defaults to be literals, but the default for \
+                     '{path}' is a non-literal expression: {}",
+                    column_default.raw_sql()
+                )));
+            }
+            column_default::ParseStatus::Unparsed => {
+                warn!(
+                    "kernel could not verify that the icebergCompatV3 column default for '{path}' \
+                     is a literal, got: {}",
+                    column_default.raw_sql()
+                );
+            }
         }
     }
     Ok(())

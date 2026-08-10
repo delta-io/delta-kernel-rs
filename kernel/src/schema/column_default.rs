@@ -43,6 +43,17 @@ pub struct ColumnDefault<'a> {
     parsed_sql: Option<Expression>,
 }
 
+/// Kernel's classification of a parsed column-default expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseStatus {
+    /// The SQL parsed to a literal expression.
+    Literal,
+    /// The SQL parsed to a non-literal expression.
+    NonLiteral,
+    /// Kernel could not parse the SQL expression.
+    Unparsed,
+}
+
 impl<'a> ColumnDefault<'a> {
     /// Build a `ColumnDefault` from a raw SQL string and the column's declared type.
     ///
@@ -110,23 +121,15 @@ impl<'a> ColumnDefault<'a> {
         }
     }
 
-    /// Returns `true` iff the default parsed to a literal expression.
+    /// Classifies the default according to kernel's SQL parser coverage.
     ///
-    /// Returns `false` for both recognized non-literals such as `CURRENT_TIMESTAMP` and SQL the
-    /// kernel could not parse, such as arithmetic or unsupported function calls. Note that NULL
-    /// parses to a literal, so this is `true` for a NULL default regardless of the column type.
-    pub(crate) fn is_kernel_parsable_literal(&self) -> bool {
-        matches!(self.parsed_sql, Some(Expression::Literal(_)))
-    }
-
-    /// Returns `true` iff the kernel parsed the default as a non-literal expression.
-    ///
-    /// Unlike [`is_kernel_parsable_literal`](Self::is_kernel_parsable_literal), this distinguishes
-    /// recognized dynamic defaults from SQL the kernel could not parse. IcebergCompatV3 validation
-    /// uses that distinction to reject known non-literals while retaining raw-SQL fallback for
-    /// expressions whose literal status is unknown.
-    pub(crate) fn is_kernel_parsable_non_literal(&self) -> bool {
-        matches!(self.parsed_sql, Some(ref expr) if !matches!(expr, Expression::Literal(_)))
+    /// NULL is classified as [`ParseStatus::Literal`] regardless of the column type.
+    pub(crate) fn parse_status(&self) -> ParseStatus {
+        match &self.parsed_sql {
+            Some(Expression::Literal(_)) => ParseStatus::Literal,
+            Some(_) => ParseStatus::NonLiteral,
+            None => ParseStatus::Unparsed,
+        }
     }
 }
 
@@ -466,17 +469,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::literal("42", DataType::INTEGER, true, false)]
-    #[case::dynamic("CURRENT_TIMESTAMP", DataType::TIMESTAMP, false, true)]
-    #[case::unparsed("NOW()", DataType::TIMESTAMP, false, false)]
+    #[case::literal("42", DataType::INTEGER, ParseStatus::Literal)]
+    #[case::dynamic("CURRENT_TIMESTAMP", DataType::TIMESTAMP, ParseStatus::NonLiteral)]
+    #[case::unparsed("NOW()", DataType::TIMESTAMP, ParseStatus::Unparsed)]
     fn classifies_parsed_defaults(
         #[case] raw_sql: &str,
         #[case] data_type: DataType,
-        #[case] is_literal: bool,
-        #[case] is_non_literal: bool,
+        #[case] expected: ParseStatus,
     ) {
         let default = ColumnDefault::new(raw_sql.to_string(), &data_type).unwrap();
-        assert_eq!(default.is_kernel_parsable_literal(), is_literal);
-        assert_eq!(default.is_kernel_parsable_non_literal(), is_non_literal);
+        assert_eq!(default.parse_status(), expected);
     }
 }
