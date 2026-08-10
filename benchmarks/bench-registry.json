@@ -8,48 +8,48 @@
   "crc1Col200Commits1ChkptCrc150": {
     "snapshotLatest": [
       {
-        "name": "fresh",
-        "snapshotBuilder": "for"
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable"
       },
       {
         "name": "from199",
-        "snapshotBuilder": { "from": { "version": 199 } }
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } }
       }
     ]
   },
   "crc1Col200Commits1ChkptCrc195": {
     "snapshotLatest": [
       {
-        "name": "fresh",
-        "snapshotBuilder": "for"
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable"
       },
       {
         "name": "from199",
-        "snapshotBuilder": { "from": { "version": 199 } }
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } }
       }
     ]
   },
   "crc1Col200Commits1ChkptCrcLatest": {
     "snapshotLatest": [
       {
-        "name": "fresh",
-        "snapshotBuilder": "for"
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable"
       },
       {
         "name": "from199",
-        "snapshotBuilder": { "from": { "version": 199 } }
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } }
       }
     ]
   },
   "crc1Col200Commits1ChkptNoCrc": {
     "snapshotLatest": [
       {
-        "name": "fresh",
-        "snapshotBuilder": "for"
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable"
       },
       {
         "name": "from199",
-        "snapshotBuilder": { "from": { "version": 199 } }
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } }
       }
     ]
   }

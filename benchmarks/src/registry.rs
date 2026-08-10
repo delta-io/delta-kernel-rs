@@ -55,11 +55,11 @@ pub struct SnapshotConstructionConfig {
     pub snapshot_builder: SnapshotBuilderConfig,
 }
 
-/// The built-in fresh snapshot-construction config.
+/// The built-in from-table snapshot-construction config.
 pub fn default_snapshot_construction_config() -> SnapshotConstructionConfig {
     SnapshotConstructionConfig {
-        name: "fresh".into(),
-        snapshot_builder: SnapshotBuilderConfig::For,
+        name: "fromTable".into(),
+        snapshot_builder: SnapshotBuilderConfig::FromTable,
     }
 }
 
@@ -67,10 +67,10 @@ pub fn default_snapshot_construction_config() -> SnapshotConstructionConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum SnapshotBuilderConfig {
-    /// Build a fresh snapshot using the table's resolved loading strategy.
-    For,
+    /// Build a snapshot from the table using its resolved loading strategy.
+    FromTable,
     /// Build from a snapshot preconstructed at `version` outside the timed loop.
-    From {
+    FromSnapshot {
         /// Version of the preconstructed base snapshot.
         version: u64,
     },
@@ -123,7 +123,7 @@ pub type RegistryResult<T> = Result<T, Box<dyn std::error::Error>>;
 ///
 /// Each configuration creates a separate Criterion benchmark whose final name segment is the
 /// configuration `name`. Unregistered read workloads use the built-in serial config, while
-/// unregistered snapshot-construction workloads retain their default fresh-snapshot behavior.
+/// unregistered snapshot-construction workloads retain their default from-table behavior.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(transparent)]
 pub struct BenchRegistry {
@@ -317,12 +317,12 @@ mod tests {
             ],
             "snapshotLatest": [
                 {
-                    "name": "fresh",
-                    "snapshotBuilder": "for"
+                    "name": "fromTable",
+                    "snapshotBuilder": "fromTable"
                 },
                 {
                     "name": "from199",
-                    "snapshotBuilder": { "from": { "version": 199 } }
+                    "snapshotBuilder": { "fromSnapshot": { "version": 199 } }
                 }
             ]
         }
@@ -358,10 +358,13 @@ mod tests {
             .snapshot_configs(&read_workload("v2", "snapshotLatest"))
             .unwrap()
             .unwrap();
-        assert_eq!(configs[0].snapshot_builder, SnapshotBuilderConfig::For);
+        assert_eq!(
+            configs[0].snapshot_builder,
+            SnapshotBuilderConfig::FromTable
+        );
         assert_eq!(
             configs[1].snapshot_builder,
-            SnapshotBuilderConfig::From { version: 199 }
+            SnapshotBuilderConfig::FromSnapshot { version: 199 }
         );
     }
 
@@ -461,7 +464,7 @@ mod tests {
                 { "name": "read", "parallelScan": "disabled" },
                 {
                     "name": "snapshot",
-                    "snapshotBuilder": "for"
+                    "snapshotBuilder": "fromTable"
                 }
             ] }
         }"#;

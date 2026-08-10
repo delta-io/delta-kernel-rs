@@ -134,7 +134,7 @@ fn validate_snapshot_versions(
     snapshot_spec: &SnapshotConstructionSpec,
     snapshot_builder: &SnapshotBuilderConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let SnapshotBuilderConfig::From { version } = snapshot_builder else {
+    let SnapshotBuilderConfig::FromSnapshot { version } = snapshot_builder else {
         return Ok(());
     };
     if let Some(time_travel) = snapshot_spec.time_travel.as_ref() {
@@ -147,7 +147,8 @@ fn validate_snapshot_strategy(
     snapshot_builder: &SnapshotBuilderConfig,
     is_catalog_managed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if is_catalog_managed && matches!(snapshot_builder, SnapshotBuilderConfig::From { .. }) {
+    if is_catalog_managed && matches!(snapshot_builder, SnapshotBuilderConfig::FromSnapshot { .. })
+    {
         return Err("Snapshot::builder_from is unsupported for catalog-managed benchmarks".into());
     }
     Ok(())
@@ -417,8 +418,8 @@ pub fn create_read_runner(
 }
 
 enum SnapshotConstructionSource {
-    Fresh(SnapshotStrategy),
-    Existing(Arc<Snapshot>),
+    FromTable(SnapshotStrategy),
+    FromSnapshot(Arc<Snapshot>),
 }
 
 pub struct SnapshotConstructionRunner {
@@ -433,9 +434,9 @@ impl SnapshotConstructionRunner {
     /// Prepares a snapshot-construction benchmark and state excluded from timing.
     ///
     /// `name` is the Criterion benchmark identifier, `snapshot_spec` selects the target version,
-    /// `snapshot_builder` selects fresh or incremental construction, `table_info` identifies the
-    /// table, and `runtime` executes asynchronous setup work. Incremental benchmarks load their
-    /// base snapshot during setup.
+    /// `snapshot_builder` selects from-table or incremental construction, `table_info` identifies
+    /// the table, and `runtime` executes asynchronous setup work. Incremental benchmarks load
+    /// their base snapshot during setup.
     ///
     /// Returns a runner whose [`WorkloadRunner::execute`] method performs only the measured
     /// snapshot construction.
@@ -456,8 +457,10 @@ impl SnapshotConstructionRunner {
         validate_snapshot_strategy(&snapshot_builder, is_catalog_managed)?;
 
         let source = match snapshot_builder {
-            SnapshotBuilderConfig::For => SnapshotConstructionSource::Fresh(snapshot_strategy),
-            SnapshotBuilderConfig::From { version } => {
+            SnapshotBuilderConfig::FromTable => {
+                SnapshotConstructionSource::FromTable(snapshot_strategy)
+            }
+            SnapshotBuilderConfig::FromSnapshot { version } => {
                 let base_time_travel = TimeTravel::Version {
                     version: version.try_into()?,
                 };
@@ -472,7 +475,7 @@ impl SnapshotConstructionRunner {
                         .version();
                     validate_base_precedes_target(version, target_version)?;
                 }
-                SnapshotConstructionSource::Existing(existing_snapshot)
+                SnapshotConstructionSource::FromSnapshot(existing_snapshot)
             }
         };
 
@@ -489,13 +492,13 @@ impl SnapshotConstructionRunner {
 impl WorkloadRunner for SnapshotConstructionRunner {
     fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = match &self.source {
-            SnapshotConstructionSource::Fresh(snapshot_strategy) => snapshot_strategy
+            SnapshotConstructionSource::FromTable(snapshot_strategy) => snapshot_strategy
                 .load_snapshot(
                     self.engine.as_ref(),
                     &self.runtime,
                     self.time_travel.as_ref(),
                 )?,
-            SnapshotConstructionSource::Existing(existing_snapshot) => {
+            SnapshotConstructionSource::FromSnapshot(existing_snapshot) => {
                 let mut builder = Snapshot::builder_from(existing_snapshot.clone());
                 if let Some(time_travel) = self.time_travel.as_ref() {
                     builder = builder.at_version(time_travel.as_version()?);
@@ -611,8 +614,8 @@ mod tests {
             "basic_partitioned/snapshotLatest"
         );
         assert_eq!(
-            snapshot_benchmark_name(&table_info, "snapshotLatest", Some("fresh")),
-            "basic_partitioned/snapshotLatest/fresh"
+            snapshot_benchmark_name(&table_info, "snapshotLatest", Some("fromTable")),
+            "basic_partitioned/snapshotLatest/fromTable"
         );
     }
 
@@ -662,15 +665,15 @@ mod tests {
     }
 
     fn from_snapshot_config(version: u64) -> SnapshotBuilderConfig {
-        SnapshotBuilderConfig::From { version }
+        SnapshotBuilderConfig::FromSnapshot { version }
     }
 
     #[test]
-    fn test_fresh_snapshot_construction_runner() {
+    fn test_from_table_snapshot_construction_runner() {
         let runner = SnapshotConstructionRunner::setup(
             benchmark_name(&test_table_info(), "testCase"),
             &test_snapshot_spec(),
-            SnapshotBuilderConfig::For,
+            SnapshotBuilderConfig::FromTable,
             &test_table_info(),
             test_runtime(),
         )
@@ -817,10 +820,13 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing config '{name}' for '{table}'"))
             };
 
-            assert_eq!(config("fresh").snapshot_builder, SnapshotBuilderConfig::For);
+            assert_eq!(
+                config("fromTable").snapshot_builder,
+                SnapshotBuilderConfig::FromTable
+            );
             assert_eq!(
                 config("from199").snapshot_builder,
-                SnapshotBuilderConfig::From { version: 199 }
+                SnapshotBuilderConfig::FromSnapshot { version: 199 }
             );
             assert_eq!(snapshots.len(), 2, "unexpected configs for '{table}'");
         }
@@ -869,7 +875,8 @@ mod tests {
                             .as_version()
                             .expect("snapshot workload target must be a version");
                         for config in &configs {
-                            if let SnapshotBuilderConfig::From { version } = config.snapshot_builder
+                            if let SnapshotBuilderConfig::FromSnapshot { version } =
+                                config.snapshot_builder
                             {
                                 assert!(
                                     version < target_version,
@@ -958,7 +965,7 @@ mod tests {
         let runner = SnapshotConstructionRunner::setup(
             benchmark_name(&test_table_info(), "testCase"),
             &spec,
-            SnapshotBuilderConfig::For,
+            SnapshotBuilderConfig::FromTable,
             &test_table_info(),
             test_runtime(),
         )

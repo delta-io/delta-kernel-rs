@@ -35,11 +35,11 @@ snapshot-construction benchmarks retain the unsuffixed name:
 - `{table_name}` — the human-readable `name` from the table's `tableInfo.json`
 - `{spec_file_name}` — the spec filename without its `.json` extension (the `case_name`)
 - `{config_name}` — the harness config from
-  [`bench-registry.json`](#registry-bench-registryjson), such as `serial`, `fresh`, or `from199`
+  [`bench-registry.json`](#registry-bench-registryjson), such as `serial`, `fromTable`, or `from199`
 
 Examples:
 ```
-crcVeryStale/snapshotLatest/fresh
+crcVeryStale/snapshotLatest/fromTable
 v1Checkpoint/readMetadataLatest/serial
 v2Checkpoint/readMetadataLatest/parallel2
 ```
@@ -61,7 +61,7 @@ cargo bench -p delta_kernel_benchmarks --bench workload_bench "crcVeryStale.*sna
 
 # profile a specific benchmark with samply
 samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench \
-  "crcVeryStale/snapshotLatest/fresh"
+  "crcVeryStale/snapshotLatest/fromTable"
 ```
 
 #### By tag (`BENCH_TAGS`)
@@ -145,7 +145,7 @@ CI timings are noisy and tend to run higher than on dedicated hardware, but prop
 harness configs they run. Each registered workload expands into one Criterion benchmark per
 config, and the config `name` becomes the trailing path segment of the benchmark name (see
 [By benchmark name](#by-benchmark-name)). Unregistered snapshot-construction workloads retain
-their existing unsuffixed name and fresh snapshot behavior.
+their existing unsuffixed name and from-table snapshot behavior.
 
 The registry is a checked-in file under the crate root, separate from the spec files: the
 workload archive (`benchmarks/workloads/`) is downloaded at build time and gitignored, so configs
@@ -156,12 +156,12 @@ that belong with the source live here and reference benchmarks by name.
   "crc1Col200Commits1ChkptCrc195": {
     "snapshotLatest": [
       {
-        "name": "fresh",
-        "snapshotBuilder": "for"
+        "name": "fromTable",
+        "snapshotBuilder": "fromTable"
       },
       {
         "name": "from199",
-        "snapshotBuilder": { "from": { "version": 199 } }
+        "snapshotBuilder": { "fromSnapshot": { "version": 199 } }
       }
     ]
   },
@@ -177,7 +177,7 @@ that belong with the source live here and reference benchmarks by name.
 - The file nests config lists by table directory name then case name
   (`{ table: { case: [configs] } }`).
 - A read benchmark whose `(table, case)` key is absent from the registry falls back to the built-in
-  serial config. An unlisted snapshot-construction benchmark uses fresh construction without
+  serial config. An unlisted snapshot-construction benchmark builds from the table without
   changing its benchmark name. An explicit but empty config list is rejected at load rather than
   silently dropping the benchmark.
 - Config `name`s within a list must be unique and non-empty (they form the benchmark name's last
@@ -188,13 +188,12 @@ Config-field value forms:
 - `parallelScan` (read configs): `"disabled"` or `{ "enabled": { "numThreads": <n> } }` — serde
   externally-tagged, so the fieldless variant is a bare string and the parameterized variant a
   single-key object.
-- `snapshotBuilder` (snapshot-construction configs): `"for"` performs fresh construction using
-  the table's normal loading strategy, while
-  `{ "from": { "version": <n> } }` prebuilds snapshot version `n` outside the timed loop and uses
-  `Snapshot::builder_from` during each iteration. The base version must be strictly lower than an
-  explicit target version. For a latest-target workload, setup resolves the actual latest snapshot
-  version before accepting the base.
-- Catalog-managed snapshot benchmarks support only `"snapshotBuilder": "for"`.
+- `snapshotBuilder` (snapshot-construction configs): `"fromTable"` constructs from the table using
+  its normal loading strategy, while `{ "fromSnapshot": { "version": <n> } }` prebuilds snapshot
+  version `n` outside the timed loop and uses `Snapshot::builder_from` during each iteration. The
+  base version must be strictly lower than an explicit target version. For a latest-target
+  workload, setup resolves the actual latest snapshot version before accepting the base.
+- Catalog-managed snapshot benchmarks support only `"snapshotBuilder": "fromTable"`.
 
 ## Workload data layout
 
@@ -316,8 +315,8 @@ Deserialized from a JSON file in a table's `specs/` directory. Describes a singl
 
 - **`Read`** — scan a table at an optional version (defaults to latest). A single `Read` spec expands into one benchmark per `ReadOperation` × `ReadConfig` combination — every relevant operation and parallelism mode is benchmarked. Currently only `ReadMetadata` is implemented; `ReadData` is not yet supported.
 - **`SnapshotConstruction`** — measure the cost of constructing a `Snapshot` at an optional target
-  version (defaults to latest). The harness config selects fresh construction or construction from
-  a prebuilt earlier snapshot.
+  version (defaults to latest). The harness config selects construction from the table or from a
+  prebuilt earlier snapshot.
 
 Read specs:
 ```json
