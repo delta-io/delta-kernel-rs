@@ -1048,21 +1048,23 @@ mod tests {
         StructType::try_new([StructField::nullable("j", DataType::STRING)]).unwrap()
     }
 
+    fn nested_parse_type() -> StructType {
+        StructType::try_new([
+            StructField::nullable("n", DataType::LONG),
+            StructField::nullable("s", DataType::STRING),
+        ])
+        .unwrap()
+    }
+
     /// Target parse schema `{ n: long, s: string }`.
     fn parse_target() -> KernelSchemaRef {
-        Arc::new(
-            StructType::try_new([
-                StructField::nullable("n", DataType::LONG),
-                StructField::nullable("s", DataType::STRING),
-            ])
-            .unwrap(),
-        )
+        Arc::new(nested_parse_type())
     }
 
     /// Lowers `parse_json(col("j"), schema)`, builds a physical expr over a one-column string batch
     /// carrying `rows`, evaluates it, and returns the resulting struct column.
     fn eval_parse_json(schema: KernelSchemaRef, rows: Vec<Option<&str>>) -> StructArray {
-        let kernel = KernelExpr::parse_json(column_expr!("j"), schema);
+        let kernel = KernelExpr::parse_json(col!("j"), schema);
         // Self-typed: no output_type is threaded in, yet lowering still succeeds.
         let logical = to_df_expr(&kernel, &json_input_schema(), None).unwrap();
 
@@ -1101,7 +1103,7 @@ mod tests {
 
     #[test]
     fn parse_json_lowers_to_udf_call() {
-        let kernel = KernelExpr::parse_json(column_expr!("j"), parse_target());
+        let kernel = KernelExpr::parse_json(col!("j"), parse_target());
         assert_eq!(
             to_df_expr(&kernel, &json_input_schema(), None)
                 .unwrap()
@@ -1169,6 +1171,117 @@ mod tests {
             ],
             &[batch]
         );
+    }
+
+    #[rstest]
+    #[case::array(
+        DataType::from(ArrayType::new(DataType::INTEGER, true)),
+        r#"[1, null, 3]"#,
+        "[1, , 3]"
+    )]
+    #[case::struct_(
+        DataType::from(nested_parse_type()),
+        r#"{"n": 1, "s": "a"}"#,
+        "{n: 1, s: a}"
+    )]
+    #[case::map(
+        DataType::from(MapType::new(DataType::STRING, DataType::LONG, true)),
+        r#"{"x": 1, "y": null}"#,
+        "{x: 1, y: }"
+    )]
+    #[case::array_of_structs(
+        DataType::from(ArrayType::new(nested_parse_type(), true)),
+        r#"[{"n": 1, "s": "a"}, null, {"n": 2, "s": "b"}]"#,
+        "[{n: 1, s: a}, , {n: 2, s: b}]"
+    )]
+    #[case::array_of_maps(
+        DataType::from(ArrayType::new(
+            MapType::new(DataType::STRING, DataType::LONG, true),
+            true,
+        )),
+        r#"[{"x": 1, "y": null}, {"z": 2}]"#,
+        "[{x: 1, y: }, {z: 2}]"
+    )]
+    #[case::array_of_arrays(
+        DataType::from(ArrayType::new(ArrayType::new(DataType::INTEGER, true), true)),
+        r#"[[1, null], [2, 3]]"#,
+        "[[1, ], [2, 3]]"
+    )]
+    #[case::struct_of_structs(
+        DataType::from(
+            StructType::try_new([StructField::nullable("inner", nested_parse_type())]).unwrap()
+        ),
+        r#"{"inner": {"n": 1, "s": "a"}}"#,
+        "{inner: {n: 1, s: a}}"
+    )]
+    #[case::struct_of_arrays(
+        DataType::from(
+            StructType::try_new([StructField::nullable(
+                "items",
+                ArrayType::new(DataType::INTEGER, true),
+            )])
+            .unwrap()
+        ),
+        r#"{"items": [1, null, 3]}"#,
+        "{items: [1, , 3]}"
+    )]
+    #[case::struct_of_maps(
+        DataType::from(
+            StructType::try_new([StructField::nullable(
+                "items",
+                MapType::new(DataType::STRING, DataType::LONG, true),
+            )])
+            .unwrap()
+        ),
+        r#"{"items": {"x": 1, "y": null}}"#,
+        "{items: {x: 1, y: }}"
+    )]
+    #[case::map_of_structs(
+        DataType::from(MapType::new(DataType::STRING, nested_parse_type(), true)),
+        r#"{"x": {"n": 1, "s": "a"}, "y": {"n": 2, "s": "b"}}"#,
+        "{x: {n: 1, s: a}, y: {n: 2, s: b}}"
+    )]
+    #[case::map_of_arrays(
+        DataType::from(MapType::new(
+            DataType::STRING,
+            ArrayType::new(DataType::INTEGER, true),
+            true,
+        )),
+        r#"{"x": [1, null], "y": [2, 3]}"#,
+        "{x: [1, ], y: [2, 3]}"
+    )]
+    #[case::map_of_maps(
+        DataType::from(MapType::new(
+            DataType::STRING,
+            MapType::new(DataType::STRING, DataType::LONG, true),
+            true,
+        )),
+        r#"{"x": {"a": 1}, "y": {"b": 2}}"#,
+        "{x: {a: 1}, y: {b: 2}}"
+    )]
+    fn parse_json_decodes_nested_container_field(
+        #[case] field_type: DataType,
+        #[case] json_value: &str,
+        #[case] expected_value: &str,
+    ) {
+        let target: KernelSchemaRef =
+            Arc::new(StructType::try_new([StructField::nullable("value", field_type)]).unwrap());
+        let row = format!(r#"{{"value": {json_value}}}"#);
+        let batch = eval_parse_json_batch(target.clone(), vec![Some(row.as_str())]);
+        assert_matches_target(&batch, &target);
+
+        let width = expected_value.len().max("value".len());
+        let border = format!("+{}+", "-".repeat(width + 2));
+        let header = format!("| {:width$} |", "value");
+        let value = format!("| {expected_value:width$} |");
+        let expected = [
+            border.as_str(),
+            header.as_str(),
+            border.as_str(),
+            value.as_str(),
+            border.as_str(),
+        ];
+        assert_batches_eq!(expected, &[batch]);
     }
 
     /// `Binary` has no JSON decoder in arrow-json, so any row hits kernel's whole-batch parse error
