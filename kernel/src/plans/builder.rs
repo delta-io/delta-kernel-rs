@@ -118,7 +118,31 @@ impl PlanBuilder {
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(FileType::Parquet, files, file_constant_columns, schema)
+        Self::scan_source(
+            FileType::Parquet,
+            files,
+            file_constant_columns,
+            schema,
+            false,
+        )
+    }
+
+    /// An ordered Parquet scan source over `files` producing rows matching `schema`.
+    ///
+    /// The resulting scan preserves the input file order, row order within each file, and file
+    /// boundaries in its output batches.
+    pub fn scan_parquet_ordered(
+        files: impl IntoIterator<Item = impl Into<ScanFile>>,
+        file_constant_columns: &[&str],
+        schema: impl Into<SchemaRef>,
+    ) -> DeltaResult<Self> {
+        Self::scan_source(
+            FileType::Parquet,
+            files,
+            file_constant_columns,
+            schema,
+            true,
+        )
     }
 
     /// A newline-delimited JSON scan source over `files` producing rows matching `schema`. See
@@ -128,7 +152,20 @@ impl PlanBuilder {
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
     ) -> DeltaResult<Self> {
-        Self::scan_source(FileType::Json, files, file_constant_columns, schema)
+        Self::scan_source(FileType::Json, files, file_constant_columns, schema, false)
+    }
+
+    /// An ordered newline-delimited JSON scan source over `files` producing rows matching
+    /// `schema`.
+    ///
+    /// The resulting scan preserves the input file order, row order within each file, and file
+    /// boundaries in its output batches.
+    pub fn scan_json_ordered(
+        files: impl IntoIterator<Item = impl Into<ScanFile>>,
+        file_constant_columns: &[&str],
+        schema: impl Into<SchemaRef>,
+    ) -> DeltaResult<Self> {
+        Self::scan_source(FileType::Json, files, file_constant_columns, schema, true)
     }
 
     /// Shared body of [`Self::scan_parquet`] / [`Self::scan_json`]. Normalizes and validates the
@@ -139,6 +176,7 @@ impl PlanBuilder {
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
         schema: impl Into<SchemaRef>,
+        ordered_scan: bool,
     ) -> DeltaResult<Self> {
         let schema = schema.into();
         let files = Vec::from_iter(files.into_iter().map(Into::into));
@@ -164,11 +202,13 @@ impl PlanBuilder {
                 files,
                 file_constant_columns,
                 schema: Arc::clone(&schema),
+                ordered_scan,
             }),
             FileType::Json => Operator::from(ScanJson {
                 files,
                 file_constant_columns,
                 schema: Arc::clone(&schema),
+                ordered_scan,
             }),
         };
         Ok(Self::present(schema, op, vec![]))

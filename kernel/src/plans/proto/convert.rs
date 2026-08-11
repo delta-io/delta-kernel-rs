@@ -171,6 +171,7 @@ impl From<&ScanParquet> for proto_plan::ScanParquetNode {
             files: convert_vec(&node.files),
             file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
+            ordered_scan: node.ordered_scan,
         }
     }
 }
@@ -181,6 +182,7 @@ impl From<&ScanJson> for proto_plan::ScanJsonNode {
             files: convert_vec(&node.files),
             file_constant_columns: node.file_constant_columns.clone(),
             schema: Some(node.schema.as_ref().into()),
+            ordered_scan: node.ordered_scan,
         }
     }
 }
@@ -1232,6 +1234,7 @@ mod tests {
                         files: vec![ScanFile::new(sample_file_meta())],
                         file_constant_columns: vec![],
                         schema: schema.clone(),
+                        ordered_scan: false,
                     }),
                     inputs: vec![],
                 },
@@ -1288,6 +1291,7 @@ mod tests {
             files: vec![],
             file_constant_columns: vec![],
             schema: sample_schema(),
+            ordered_scan: false,
         }),
         "scan_parquet"
     )]
@@ -1296,6 +1300,7 @@ mod tests {
             files: vec![],
             file_constant_columns: vec![],
             schema: sample_schema(),
+            ordered_scan: false,
         }),
         "scan_json"
     )]
@@ -1367,6 +1372,7 @@ mod tests {
             files: vec![ScanFile::new(sample_file_meta())],
             file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
+            ordered_scan: false,
         };
         let proto = proto_plan::ScanParquetNode::from(&node);
         assert_eq!(proto.files.len(), 1);
@@ -1380,6 +1386,7 @@ mod tests {
             files: vec![ScanFile::new(sample_file_meta())],
             file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
+            ordered_scan: false,
         };
         let proto = proto_plan::ScanJsonNode::from(&node);
         assert_eq!(proto.files.len(), 1);

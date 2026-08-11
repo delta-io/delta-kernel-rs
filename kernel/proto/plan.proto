@@ -34,12 +34,14 @@ message ScanParquetNode {
   repeated ScanFile files = 1;
   repeated string file_constant_columns = 2;
   delta.kernel.schema.StructType schema = 3;
+  bool ordered_scan = 4;
 }
 
 message ScanJsonNode {
   repeated ScanFile files = 1;
   repeated string file_constant_columns = 2;
   delta.kernel.schema.StructType schema = 3;
+  bool ordered_scan = 4;
 }
 
 message ValuesRow {

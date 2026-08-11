@@ -101,8 +101,10 @@ impl From<FileMeta> for ScanFile {
 /// Reads Parquet `files` into row batches matching `schema`. The engine returns exactly the
 /// columns named by `schema`, in schema order.
 ///
-/// Output row order is unspecified: the engine is free to read `files` in any order, in
-/// parallel, and to interleave rows from different files.
+/// When `ordered_scan` is false, output row order is unspecified: the engine is free to read
+/// `files` in any order, in parallel, and to interleave rows from different files. When it is true,
+/// output follows the input file order, preserves row order within each file, and does not merge
+/// batches across file boundaries.
 ///
 /// # Column resolution
 ///
@@ -184,6 +186,8 @@ pub struct ScanParquet {
     pub files: Vec<ScanFile>,
     pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
+    /// Whether output must preserve input file order and row order within each file.
+    pub ordered_scan: bool,
 }
 
 /// Reads newline-delimited JSON `files` (one JSON object per line) into row batches matching
@@ -194,8 +198,9 @@ pub struct ScanParquet {
 /// each JSON line. Missing JSON fields produce NULL for nullable `schema` fields and an error for
 /// non-nullable fields.
 ///
-/// Output row order is unspecified: the engine is free to read `files` in any order, in
-/// parallel, and to interleave rows from different files.
+/// When `ordered_scan` is false, output row order is unspecified. When it is true, output follows
+/// the input file order, preserves row order within each file, and does not merge batches across
+/// file boundaries.
 ///
 /// # File-constant columns
 ///
@@ -209,6 +214,8 @@ pub struct ScanJson {
     pub files: Vec<ScanFile>,
     pub file_constant_columns: Vec<String>,
     pub schema: SchemaRef,
+    /// Whether output must preserve input file order and row order within each file.
+    pub ordered_scan: bool,
 }
 
 /// Inline literal rows. Each `rows[i]` carries one [`Scalar`] per **top-level** field
