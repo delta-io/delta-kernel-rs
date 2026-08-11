@@ -10,9 +10,7 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
-use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
-use crate::transforms::SchemaTransform as _;
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error, FileMeta};
 
@@ -607,7 +605,8 @@ impl DynamicScan {
 /// - **Group keys** pass through verbatim: each key column keeps its input type, nullability, and
 ///   metadata.
 /// - **Aggregate columns**: name, type, and nullability come from each [`Agg`] (see per-function
-///   docs); use [`AggregateBuilder::aggregate_as`] to override the name.
+///   docs); use [`AggregateBuilder::aggregate_as`] to override the name. Aggregates preserve their
+///   value column's type and field metadata.
 ///
 /// # SQL equivalent
 ///
@@ -624,39 +623,42 @@ impl DynamicScan {
 ///
 /// # Example
 ///
-/// Each person's favorite food as of their most recent year -- group by `person`, then take the
-/// `likes_to_eat` from the row with the greatest `year`:
+/// Each person's best and worst score across their bowling games:
 ///
 /// ```text
 /// Aggregate {
-///     group_by: [person],
-///     aggs: [max_non_null_by(likes_to_eat, year)],
-///     schema: { person: string, likes_to_eat: string },
+///     group_by: [name],
+///     aggs: [max(score) AS high, min(score) AS low],
+///     schema: { name: string, high: long, low: long },
 /// }
 /// ```
 ///
 /// Input:
 ///
 /// ```text
-/// person   | year | likes_to_eat
-/// ---------+------+-------------
-///  Bob     | 2020 | pizza
-///  Alice   | 2026 | sushi
-///  Charlie | 2021 | ice cream
-///  Bob     | 2025 | watermelon
-///  Alice   | 2020 | pizza
-///  Charlie | 2026 | egg
+/// name    | score
+/// --------+------
+///  Alice  | 140
+///  Bob    | 200
+///  Alice  | 180
+///  Bob    | 160
+///  Alice  | 155
+///  Charlie| 175
 /// ```
 ///
 /// Output:
 ///
 /// ```text
-/// person   | likes_to_eat
-/// ---------+-------------
-///  Bob     | watermelon
-///  Charlie | egg
-///  Alice   | sushi
+/// name    | high | low
+/// --------+------+-----
+///  Bob    |  200 | 160
+///  Charlie|  175 | 175
+///  Alice  |  180 | 140
 /// ```
+///
+/// An ungrouped aggregate (`group_by` empty) always emits one row. Over empty input that row
+/// holds each agg's default (NULL for [`Agg::min`] / [`Agg::max`]). See individual [`Agg`] docs
+/// for per-function default value and NULL-handling semantics.
 #[derive(Debug, Clone)]
 pub struct Aggregate {
     /// Group-by key columns, emitted first in the output schema. Empty means a single global
@@ -697,14 +699,21 @@ impl Aggregate {
 /// An aggregate function and its operand column(s) within an [`Aggregate`] operator.
 #[derive(Debug, Clone)]
 pub enum Agg {
-    /// Operands for [`Agg::min`].
-    Min { value: ColumnName },
-    /// Operands for [`Agg::max`].
-    Max { value: ColumnName },
+    /// Operand for [`Agg::min`].
+    Min(ColumnName),
+    /// Operand for [`Agg::max`].
+    Max(ColumnName),
     /// Operands for [`Agg::min_non_null_by`].
-    MinNonNullBy { value: ColumnName, key: ColumnName },
+    MinNonNullBy(NonNullByOperands),
     /// Operands for [`Agg::max_non_null_by`].
-    MaxNonNullBy { value: ColumnName, key: ColumnName },
+    MaxNonNullBy(NonNullByOperands),
+}
+
+/// Operands for [`Agg::min_non_null_by`] and [`Agg::max_non_null_by`].
+#[derive(Debug, Clone)]
+pub struct NonNullByOperands {
+    pub value: ColumnName,
+    pub key: ColumnName,
 }
 
 impl Agg {
@@ -716,9 +725,7 @@ impl Agg {
     /// []              -> NULL
     /// ```
     pub fn min(value: impl Into<ColumnName>) -> Self {
-        Self::Min {
-            value: value.into(),
-        }
+        Self::Min(value.into())
     }
 
     /// The greatest non-NULL value in each group, or NULL if the group has no non-NULL value.
@@ -730,53 +737,49 @@ impl Agg {
     /// []              -> NULL
     /// ```
     pub fn max(value: impl Into<ColumnName>) -> Self {
-        Self::Max {
-            value: value.into(),
-        }
+        Self::Max(value.into())
     }
 
-    /// Like [`max_non_null_by`](Self::max_non_null_by), but selects the `value` from the row with
-    /// the *least* `key`.
+    /// Like [`max_non_null_by`](Self::max_non_null_by), but selects the `value` from the qualifying
+    /// row with the *least* `key`.
     pub fn min_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        Self::MinNonNullBy {
+        Self::MinNonNullBy(NonNullByOperands {
             value: value.into(),
             key: key.into(),
-        }
+        })
     }
 
-    /// The `value` from the row with the greatest `key`, considering only rows where *both* `value`
-    /// and `key` are non-null. NULL if no such row exists. If multiple rows tie for the greatest
-    /// `key`, which one's `value` is returned is unspecified. The output is always nullable, with
-    /// name and type matching `value`.
+    /// The `value` from a row with the greatest `key`, considering only rows where both `value` and
+    /// `key` are non-NULL. Returns NULL if no qualifying row exists. It is unspecified which of
+    /// multiple rows with greatest `key` provides the winning `value`. The output is always
+    /// nullable, with name and type matching `value`.
     ///
     /// ```text
-    ///  key | value     ->  c
+    ///  key | value  ->  c
     /// -----+------
     ///    1 | a
-    ///    3 | c             (greatest key with both key and value non-NULL)
-    ///    5 | NULL          (ignored: NULL value)
-    /// NULL | d             (ignored: NULL key)
+    ///    3 | c          (greatest key among qualifying rows)
+    ///    5 | NULL       (ignored: NULL value)
+    /// NULL | e          (ignored: NULL key)
     ///
-    /// (no rows)        ->  NULL
+    /// (no rows)   ->  NULL
     /// ```
     ///
-    /// A native `max_by` ignores NULL keys but keeps NULL values, so it needs help to drop the
-    /// latter. Both of the first two forms below do that, and are equivalent:
+    /// Most systems with a native `max_by` only provide a two-arg form that considers all rows with
+    /// non-NULL keys. The non-NULL `value` check can be added manually in one of two ways:
     ///
     /// ```sql
-    /// -- CORRECT: the filter drops NULL-value rows before aggregating
+    /// -- FILTER that drops NULL-value rows before aggregating
     /// max_by(value, key) FILTER (WHERE value IS NOT NULL)
     ///
-    /// -- CORRECT: nulls the key on NULL-value rows, which max_by then ignores anyway. Use this
-    /// -- where FILTER is unavailable, such as a DataFrame API with no filtered-aggregate form.
+    /// -- NULL out the key when value is NULL, which max_by then ignores. Use this where
+    /// -- FILTER is unavailable, such as a DataFrame API with no filtered-aggregate form.
     /// max_by(value, CASE WHEN value IS NOT NULL THEN key END)
-    ///
-    /// -- WRONG: keeps NULL values, so it returns NULL whenever the greatest-key row has one
-    /// -- instead of the next-greatest row that does not
-    /// max_by(value, key)
     /// ```
     ///
-    /// In systems without `max_by`, it can also be expressed using window functions:
+    /// In systems without `max_by`, it can also be expressed using window functions, with the
+    /// caveat that window functions don't work correctly for ungrouped aggs over empty input
+    /// (produces no rows when it should produce one row containing initial agg values):
     ///
     /// ```sql
     /// SELECT
@@ -795,36 +798,36 @@ impl Agg {
     /// ) WHERE rn = 1
     /// ```
     pub fn max_non_null_by(value: impl Into<ColumnName>, key: impl Into<ColumnName>) -> Self {
-        Self::MaxNonNullBy {
+        Self::MaxNonNullBy(NonNullByOperands {
             value: value.into(),
             key: key.into(),
-        }
+        })
     }
 
     /// Derives this aggregate's output [`StructField`] over `input_schema`, validating that every
-    /// operand column resolves. The output takes the value column's type (with field metadata
-    /// stripped).
+    /// operand column resolves.
     fn output_field(
         &self,
         input_schema: &StructType,
         alias: Option<String>,
     ) -> DeltaResult<StructField> {
-        let value = match self {
-            Agg::Min { value } | Agg::Max { value } => value,
-            Agg::MinNonNullBy { value, key } | Agg::MaxNonNullBy { value, key } => {
-                input_schema.field_at(key)?;
-                value
-            }
+        // Every aggregate is nullable and preserves its value column's type and metadata.
+        let resolve = |value: &ColumnName| {
+            let field = input_schema.field_at(value)?;
+            Ok(StructField {
+                name: alias.unwrap_or_else(|| field.name.clone()),
+                data_type: field.data_type.clone(),
+                metadata: field.metadata.clone(),
+                nullable: true,
+            })
         };
-        let name = alias
-            .or_else(|| value.path().last().cloned())
-            .ok_or_else(|| {
-                Error::generic("Cannot derive default output name from empty column path")
-            })?;
-        let data_type = StripFieldMetadataTransform
-            .transform(input_schema.field_at(value)?.data_type())
-            .into_owned();
-        Ok(StructField::nullable(name, data_type))
+        match self {
+            Agg::Min(value) | Agg::Max(value) => resolve(value),
+            Agg::MinNonNullBy(operands) | Agg::MaxNonNullBy(operands) => {
+                let _ = input_schema.field_at(&operands.key)?;
+                resolve(&operands.value)
+            }
+        }
     }
 }
 
@@ -994,7 +997,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::column_name;
-    use crate::schema::{DataType, StructField};
+    use crate::schema::{DataType, MetadataValue, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     /// Builds a flat `LONG` schema from `(name, nullable)` pairs.
@@ -1016,40 +1019,50 @@ mod tests {
         assert_eq!(names, ["g", "a", "b"]);
     }
 
+    /// Group keys and type-preserving aggregates keep input field metadata; only nullability
+    /// changes.
     #[test]
-    fn group_key_passes_through_verbatim() {
-        let input = schema(&[("g", false), ("a", true)]);
+    fn output_fields_preserve_input_field_metadata() {
+        let metadata = [("k", MetadataValue::Number(7))];
+        let input = Arc::new(StructType::new_unchecked([
+            StructField::not_null("g", DataType::LONG).with_metadata(metadata.clone()),
+            StructField::not_null("a", DataType::LONG).with_metadata(metadata),
+        ]));
         let agg = Aggregate::group_by(input, [column_name!("g")])
             .max(column_name!("a"))
             .build()
             .unwrap();
+
         let key = agg.schema.field("g").unwrap();
-        // A non-nullable key column stays non-nullable.
         assert!(!key.nullable);
+        assert_eq!(key.metadata()["k"], MetadataValue::Number(7));
+        let max = agg.schema.field("a").unwrap();
+        assert!(max.nullable);
+        assert_eq!(max.metadata()["k"], MetadataValue::Number(7));
     }
 
-    /// Aggregate output is always nullable, regardless of grouping or input column nullability.
+    /// Aggregate outputs are always nullable, independent of input nullability.
     #[rstest::rstest]
-    fn output_field_always_nullable(
-        #[values(true, false)] grouped: bool,
-        #[values(true, false)] has_key: bool,
+    #[case::min(Agg::min(column_name!("a")), "a")]
+    #[case::max(Agg::max(column_name!("a")), "a")]
+    #[case::min_non_null_by(
+        Agg::min_non_null_by(column_name!("a"), column_name!("v")),
+        "a"
+    )]
+    #[case::max_non_null_by(
+        Agg::max_non_null_by(column_name!("a"), column_name!("v")),
+        "a"
+    )]
+    fn agg_output_nullability(
+        #[case] agg: Agg,
+        #[case] name: &str,
         #[values(true, false)] value_nullable: bool,
-        #[values(true, false)] key_nullable: bool,
     ) {
-        let mut fields = vec![("g", false), ("a", value_nullable)];
-        if has_key {
-            fields.push(("v", key_nullable));
-        }
-        let input = schema(&fields);
-        let keys: Vec<ColumnName> = grouped.then(|| column_name!("g")).into_iter().collect();
-        let builder = Aggregate::group_by(input, keys);
-        let builder = if has_key {
-            builder.max_non_null_by(column_name!("a"), column_name!("v"))
-        } else {
-            builder.max(column_name!("a"))
-        };
-        let agg = builder.build().unwrap();
-        assert!(agg.schema.field("a").unwrap().nullable);
+        let input = schema(&[("a", value_nullable), ("s", true), ("v", true)]);
+        let built = Aggregate::ungrouped(input).aggregate(agg).build().unwrap();
+        let field = built.schema.field(name).unwrap();
+        assert!(field.nullable);
+        assert_eq!(field.data_type(), &DataType::LONG);
     }
 
     #[test]

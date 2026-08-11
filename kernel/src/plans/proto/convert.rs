@@ -246,22 +246,22 @@ impl From<&Aggregate> for proto_plan::AggregateNode {
 impl From<&Agg> for proto_plan::Agg {
     fn from(agg: &Agg) -> Self {
         let func = match agg {
-            Agg::Min { value } => proto_agg::Func::Min(proto_plan::MinAgg {
+            Agg::Min(value) => proto_agg::Func::Min(proto_plan::MinAgg {
                 value: Some(value.into()),
             }),
-            Agg::Max { value } => proto_agg::Func::Max(proto_plan::MaxAgg {
+            Agg::Max(value) => proto_agg::Func::Max(proto_plan::MaxAgg {
                 value: Some(value.into()),
             }),
-            Agg::MinNonNullBy { value, key } => {
+            Agg::MinNonNullBy(operands) => {
                 proto_agg::Func::MinNonNullBy(proto_plan::MinNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
-            Agg::MaxNonNullBy { value, key } => {
+            Agg::MaxNonNullBy(operands) => {
                 proto_agg::Func::MaxNonNullBy(proto_plan::MaxNonNullByAgg {
-                    value: Some(value.into()),
-                    key: Some(key.into()),
+                    value: Some((&operands.value).into()),
+                    key: Some((&operands.key).into()),
                 })
             }
         };
