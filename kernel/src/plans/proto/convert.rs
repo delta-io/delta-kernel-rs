@@ -1372,12 +1372,13 @@ mod tests {
             files: vec![ScanFile::new(sample_file_meta())],
             file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
-            ordered_scan: false,
+            ordered_scan: true,
         };
         let proto = proto_plan::ScanParquetNode::from(&node);
         assert_eq!(proto.files.len(), 1);
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.schema.is_some());
+        assert!(proto.ordered_scan);
     }
 
     #[test]
@@ -1386,12 +1387,13 @@ mod tests {
             files: vec![ScanFile::new(sample_file_meta())],
             file_constant_columns: vec!["c".to_string()],
             schema: sample_schema(),
-            ordered_scan: false,
+            ordered_scan: true,
         };
         let proto = proto_plan::ScanJsonNode::from(&node);
         assert_eq!(proto.files.len(), 1);
         assert_eq!(proto.file_constant_columns.len(), 1);
         assert!(proto.schema.is_some());
+        assert!(proto.ordered_scan);
     }
 
     #[test]

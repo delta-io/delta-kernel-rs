@@ -84,6 +84,7 @@ mod tests {
     use tempfile::tempdir;
     use url::Url;
 
+    use super::super::assert_batches_sorted_eq;
     use super::PlanBasedParquetHandler;
     use crate::arrow::array::{Array, Int64Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
@@ -189,6 +190,48 @@ mod tests {
                 .unwrap()
                 .values(),
             &[10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn test_read_parquet_files_preserves_input_file_order() {
+        let temp_dir = tempdir().unwrap();
+        let first_batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let second_batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![3, 4])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let (first, schema) =
+            make_test_parquet_file(&temp_dir.path().join("first.parquet"), &first_batch);
+        let (second, _) =
+            make_test_parquet_file(&temp_dir.path().join("second.parquet"), &second_batch);
+
+        let batches: Vec<RecordBatch> = make_handler()
+            .read_parquet_files(&[second, first], schema, None)
+            .unwrap()
+            .map(|result| {
+                ArrowEngineData::try_from_engine_data(result.unwrap())
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+        assert_batches_sorted_eq(
+            &[
+                "+-------+",
+                "| value |",
+                "+-------+",
+                "| 1     |",
+                "| 2     |",
+                "| 3     |",
+                "| 4     |",
+                "+-------+",
+            ],
+            &batches,
         );
     }
 

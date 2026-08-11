@@ -88,6 +88,7 @@ mod tests {
     use tempfile::{tempdir, NamedTempFile};
     use url::Url;
 
+    use super::super::assert_batches_sorted_eq;
     use super::PlanBasedJsonHandler;
     use crate::arrow::array::{Array, Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
@@ -180,6 +181,28 @@ mod tests {
             &[1, 2, 3]
         );
         assert!(iter.next().is_none(), "expected exactly one batch");
+    }
+
+    #[test]
+    fn test_read_json_files_preserves_input_file_order() {
+        let (_first, first) = temp_json_file(&[r#"{"x": 1}"#, r#"{"x": 2}"#]);
+        let (_second, second) = temp_json_file(&[r#"{"x": 3}"#, r#"{"x": 4}"#]);
+        let schema = test_schema();
+        let batches: Vec<RecordBatch> = make_handler()
+            .read_json_files(&[second, first], schema, None)
+            .unwrap()
+            .map(|result| {
+                ArrowEngineData::try_from_engine_data(result.unwrap())
+                    .unwrap()
+                    .into()
+            })
+            .collect();
+        assert_batches_sorted_eq(
+            &[
+                "+---+", "| x |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "+---+",
+            ],
+            &batches,
+        );
     }
 
     fn test_schema() -> SchemaRef {

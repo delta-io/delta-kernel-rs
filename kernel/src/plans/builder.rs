@@ -715,6 +715,25 @@ mod tests {
         assert_plan(src, &[(&[], "scan_parquet")]);
     }
 
+    #[test]
+    fn ordered_scan_sources_set_ordered_flag() -> DeltaResult<()> {
+        let parquet =
+            PlanBuilder::scan_parquet_ordered([test_file("file:///a.parquet")], &[], id_schema())?
+                .build()?;
+        let json = PlanBuilder::scan_json_ordered([test_file("file:///a.json")], &[], id_schema())?
+            .build()?;
+
+        let Operator::ScanParquet(parquet) = &parquet.nodes[0].op else {
+            panic!("expected ScanParquet");
+        };
+        let Operator::ScanJson(json) = &json.nodes[0].op else {
+            panic!("expected ScanJson");
+        };
+        assert!(parquet.ordered_scan);
+        assert!(json.ordered_scan);
+        Ok(())
+    }
+
     /// `{ id, part }`, with `part` used as a file-constant column.
     fn part_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked([
