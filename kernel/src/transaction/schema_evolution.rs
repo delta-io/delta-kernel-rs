@@ -32,10 +32,7 @@ pub enum PathSegment {
     MapValue,
 }
 
-/// A schema evolution operation to apply to a table.
-///
-/// Operations are validated and applied in order. Each operation sees the schema state after all
-/// prior operations have been applied.
+/// A schema evolution operation to be applied to a table.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum SchemaOperation {
@@ -119,26 +116,10 @@ fn add_column_at_path(
     match (segment, data_type) {
         // Adding the field to the current struct.
         (PathSegment::Field(name), DataType::Struct(parent)) if rest.is_empty() => {
+            // The path leaf is supposed to be the field we are trying to add.
             if !name.eq_ignore_ascii_case(field.name()) {
                 return Err(Error::schema(format!(
                     "Cannot add column '{}': path leaf '{name}' does not match field name",
-                    field.name()
-                )));
-            }
-            if field.is_metadata_column() {
-                return Err(Error::schema(format!(
-                    "Cannot add column '{}': metadata columns are not allowed in \
-                     a table schema",
-                    field.name()
-                )));
-            }
-            if !matches!(field.data_type, DataType::Primitive(_)) {
-                StructType::ensure_no_metadata_columns_in_field(&field)?;
-            }
-            if !field.is_nullable() {
-                return Err(Error::schema(format!(
-                    "Cannot add non-nullable column '{}'. Added columns must be nullable \
-                     because existing data files do not contain this column.",
                     field.name()
                 )));
             }
@@ -263,8 +244,23 @@ pub(crate) fn apply_schema_operations(
             }
         };
 
-        // Protocol feature checks for the field's data type (e.g. `timestampNtz`) happen
-        // later when the caller builds a new TableConfiguration from the evolved schema.
+        if field.is_metadata_column() {
+            return Err(Error::schema(format!(
+                "Cannot add column '{}': metadata columns are not allowed in a table schema",
+                field.name()
+            )));
+        }
+        if !matches!(field.data_type, DataType::Primitive(_)) {
+            StructType::ensure_no_metadata_columns_in_field(&field)?;
+        }
+        if !field.is_nullable() {
+            return Err(Error::schema(format!(
+                "Cannot add non-nullable column '{}'. Added columns must be nullable \
+                 because existing data files do not contain this column.",
+                field.name()
+            )));
+        }
+
         let mut root = DataType::from(schema);
         add_column_at_path(&mut root, &path, field, cm_enabled, &mut max_id)?;
         let DataType::Struct(updated_schema) = root else {
