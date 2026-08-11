@@ -434,9 +434,8 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 /// - `From<Self> for StructData` — field values via `.into()`, schema from `ToSchema`
 /// - `From<Self> for Scalar` — `Scalar::Struct(self.into())`
 ///
-/// Honors `#[skip_schema]` via the shared `schema_fields` helper (same field set as `ToSchema`).
-/// Every schema field type must implement `Into<Scalar>` (and the struct must implement
-/// `ToSchema`).
+/// Honors `#[skip_schema]`, producing the same field set as `ToSchema`. Every schema field type
+/// must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
 #[proc_macro_derive(IntoStructData)]
 pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
