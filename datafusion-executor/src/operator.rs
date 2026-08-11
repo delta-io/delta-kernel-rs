@@ -13,48 +13,104 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
-use datafusion::common::{DFSchema, DataFusionError};
+use datafusion::common::DataFusionError;
 use datafusion::logical_expr::{
-    lit, EmptyRelation, Expr as DFExpr, LogicalPlan as DFLogicalPlan, Values as DFValues,
+    lit, EmptyRelation, Expr as DFExpr, Filter as DFFilter, LogicalPlan as DFLogicalPlan,
+    Values as DFValues,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::Scalar as KernelScalar;
-use delta_kernel::plans::ir::nodes::{Operator as KernelOperator, Values as KernelValues};
+use delta_kernel::plans::ir::nodes::{
+    Filter as KernelFilter, Operator as KernelOperator, Values as KernelValues,
+};
+use delta_kernel::schema::SchemaRef as KernelSchemaRef;
 
+use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
-/// Lowers one kernel [`Operator`](KernelOperator) into the equivalent DataFusion
-/// [`LogicalPlan`](DFLogicalPlan) node.
+/// One lowered relation and the kernel schema used to resolve its downstream expressions.
+///
+/// DataFusion input edges share immutable plans through [`Arc`], so retaining the same handle here
+/// lets downstream operators reuse a parent without cloning its plan node. The kernel schema
+/// remains authoritative for expression lowering because converting DataFusion's inferred Arrow
+/// schema back would lose kernel-specific type semantics.
+#[derive(Debug)]
+pub(crate) struct LoweredNode {
+    pub(crate) plan: Arc<DFLogicalPlan>,
+    pub(crate) schema: KernelSchemaRef,
+}
+
+impl LoweredNode {
+    fn new(plan: DFLogicalPlan, schema: KernelSchemaRef) -> Self {
+        Self {
+            plan: Arc::new(plan),
+            schema,
+        }
+    }
+}
+
+/// Lowers one kernel [`Operator`](KernelOperator) over its already-lowered parents.
 ///
 /// # Errors
-/// Returns an error if the operator has no DataFusion lowering yet, or if lowering its payload
-/// fails.
-pub(crate) fn lower_operator(op: &KernelOperator) -> Result<DFLogicalPlan, DataFusionError> {
+/// Returns an error if the operator has the wrong number of parents, has no DataFusion lowering
+/// yet, or if lowering its payload fails.
+pub(crate) fn lower_operator(
+    op: &KernelOperator,
+    parents: &[&LoweredNode],
+) -> Result<LoweredNode, DataFusionError> {
+    let parent_count_error = |expected: usize| {
+        DataFusionError::Plan(format!(
+            "{op} expects {expected} parent(s), but received {}",
+            parents.len()
+        ))
+    };
     match op {
-        KernelOperator::Values(values) => lower_values(values),
-        // TODO: lower the remaining operators (scans, Project/Filter/Load/Aggregate, SemiJoin,
-        // UnionAll), each in its own change. Those read their inputs, so they will also need the
-        // upstream nodes and the kernel schema each produces threaded in here.
+        KernelOperator::Values(values) => {
+            let [] = parents else {
+                return Err(parent_count_error(0));
+            };
+            lower_values(values)
+        }
+        KernelOperator::Filter(filter) => {
+            let [parent] = parents else {
+                return Err(parent_count_error(1));
+            };
+            lower_filter(filter, parent)
+        }
+        // TODO: lower the remaining operators (scans, Project/Load/Aggregate, SemiJoin, UnionAll),
+        // each in its own change.
         _ => Err(DataFusionError::NotImplemented(format!(
             "lowering operator {op} to a DataFusion LogicalPlan"
         ))),
     }
 }
 
+fn lower_filter(
+    filter: &KernelFilter,
+    parent: &LoweredNode,
+) -> Result<LoweredNode, DataFusionError> {
+    let predicate = to_df_predicate_expr(&filter.predicate, parent.schema.as_ref())
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let filter = DFFilter::try_new(predicate, Arc::clone(&parent.plan))?;
+    let plan = DFLogicalPlan::Filter(filter);
+    Ok(LoweredNode::new(plan, Arc::clone(&parent.schema)))
+}
+
 /// Lowers a [`Values`](KernelValues) node into literal rows carrying `schema`'s field names.
 ///
 /// An empty `rows` is the uninhabited relation over `schema`, which DataFusion spells as an
 /// `EmptyRelation` rather than a `Values`.
-fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError> {
+fn lower_values(values: &KernelValues) -> Result<LoweredNode, DataFusionError> {
     let arrow_schema: ArrowSchema = values.schema.as_ref().try_into_arrow()?;
-    let df_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
+    let df_schema = Arc::new(arrow_schema.try_into()?);
 
     if values.rows.is_empty() {
         let empty = EmptyRelation {
             produce_one_row: false,
             schema: df_schema,
         };
-        return Ok(DFLogicalPlan::EmptyRelation(empty));
+        let plan = DFLogicalPlan::EmptyRelation(empty);
+        return Ok(LoweredNode::new(plan, Arc::clone(&values.schema)));
     }
 
     let rows: Result<Vec<Vec<DFExpr>>, DataFusionError> =
@@ -63,7 +119,8 @@ fn lower_values(values: &KernelValues) -> Result<DFLogicalPlan, DataFusionError>
         schema: df_schema,
         values: rows?,
     };
-    Ok(DFLogicalPlan::Values(lowered))
+    let plan = DFLogicalPlan::Values(lowered);
+    Ok(LoweredNode::new(plan, Arc::clone(&values.schema)))
 }
 
 /// Lowers one row of literals into DataFusion expressions, one per column.
@@ -83,6 +140,7 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
 mod tests {
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
     use datafusion::common::ScalarValue as DFScalarValue;
+    use delta_kernel::expressions::{col, Predicate as KernelPredicate};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use rstest::rstest;
 
@@ -100,9 +158,9 @@ mod tests {
     }
 
     /// Lowers a `Values` over [`test_schema`] holding `rows`.
-    fn lower_rows(rows: Vec<Vec<KernelScalar>>) -> Result<DFLogicalPlan, DataFusionError> {
+    fn lower_rows(rows: Vec<Vec<KernelScalar>>) -> Result<Arc<DFLogicalPlan>, DataFusionError> {
         let values = KernelValues::new(test_schema(), rows);
-        lower_operator(&KernelOperator::Values(values))
+        Ok(lower_operator(&KernelOperator::Values(values), &[])?.plan)
     }
 
     /// The field names DataFusion reports for `plan`'s output columns.
@@ -121,6 +179,15 @@ mod tests {
         ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, tz)
     }
 
+    /// An empty parent relation with `schema`.
+    fn parent_with_schema(schema: StructType) -> LoweredNode {
+        lower_operator(
+            &KernelOperator::Values(KernelValues::new(schema, vec![])),
+            &[],
+        )
+        .unwrap()
+    }
+
     // === Tests ===
 
     #[rstest]
@@ -137,7 +204,7 @@ mod tests {
         #[case] expected: Vec<Vec<DFExpr>>,
     ) -> Result<(), DataFusionError> {
         let plan = lower_rows(rows)?;
-        let DFLogicalPlan::Values(values) = &plan else {
+        let DFLogicalPlan::Values(values) = plan.as_ref() else {
             panic!("expected Values, got {plan:?}");
         };
         assert_eq!(values.values, expected);
@@ -150,7 +217,7 @@ mod tests {
     #[test]
     fn empty_values_lowers_to_empty_relation() {
         let plan = lower_rows(vec![]).unwrap();
-        let DFLogicalPlan::EmptyRelation(empty) = &plan else {
+        let DFLogicalPlan::EmptyRelation(empty) = plan.as_ref() else {
             panic!("expected EmptyRelation, got {plan:?}");
         };
         assert!(!empty.produce_one_row);
@@ -194,12 +261,14 @@ mod tests {
     ) {
         let schema = StructType::try_new([StructField::nullable("a", scalar.data_type())]).unwrap();
         let values = KernelValues::new(schema, vec![vec![scalar]]);
-        let plan = lower_operator(&KernelOperator::Values(values)).unwrap();
+        let plan = lower_operator(&KernelOperator::Values(values), &[])
+            .unwrap()
+            .plan;
 
         // The schema's declared type and the literal's own type must agree: a `Values` node whose
         // schema disagrees with its literals reports a type the node does not produce.
         assert_eq!(output_types(&plan), std::slice::from_ref(&expected_type));
-        let DFLogicalPlan::Values(lowered) = &plan else {
+        let DFLogicalPlan::Values(lowered) = plan.as_ref() else {
             panic!("expected Values, got {plan:?}");
         };
         let DFExpr::Literal(literal, _) = &lowered.values[0][0] else {
@@ -207,5 +276,56 @@ mod tests {
         };
         assert_eq!(literal, &expected_literal);
         assert_eq!(literal.data_type(), expected_type);
+    }
+
+    #[test]
+    fn filter_wraps_its_parent_and_inherits_kernel_schema() {
+        let parent = parent_with_schema(test_schema());
+        let filter = KernelFilter {
+            predicate: KernelPredicate::is_null(col!("a")).into(),
+        };
+        let lowered = lower_operator(&KernelOperator::Filter(filter), &[&parent]).unwrap();
+
+        assert!(Arc::ptr_eq(&lowered.schema, &parent.schema));
+        let DFLogicalPlan::Filter(filter) = lowered.plan.as_ref() else {
+            panic!("expected Filter, got {:?}", lowered.plan);
+        };
+        assert!(Arc::ptr_eq(&filter.input, &parent.plan));
+    }
+
+    #[rstest]
+    #[case::values(
+        KernelOperator::Values(KernelValues::new(test_schema(), vec![])),
+        0,
+        1
+    )]
+    #[case::filter_missing(
+        KernelOperator::Filter(KernelFilter {
+            predicate: KernelPredicate::is_null(col!("a")).into(),
+        }),
+        1,
+        0
+    )]
+    #[case::filter_extra(
+        KernelOperator::Filter(KernelFilter {
+            predicate: KernelPredicate::is_null(col!("a")).into(),
+        }),
+        1,
+        2
+    )]
+    fn operator_rejects_wrong_parent_count(
+        #[case] op: KernelOperator,
+        #[case] expected: usize,
+        #[case] actual: usize,
+    ) {
+        let parent = parent_with_schema(test_schema());
+        let parents = vec![&parent; actual];
+        let err = lower_operator(&op, &parents).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "{op} expects {expected} parent(s), but received {actual}"
+            )),
+            "{err}"
+        );
     }
 }
