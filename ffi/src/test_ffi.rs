@@ -196,8 +196,8 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
 
     let mut sub_exprs = vec![
         column_pred!("col"),
-        Pred::literal(true),
-        Pred::literal(false),
+        Pred::TRUE,
+        Pred::FALSE,
         Pred::binary(
             BinaryPredicateOp::In,
             Expr::literal(10),
@@ -297,8 +297,8 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
 pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedPredicate> {
     let sub_preds = vec![
         column_pred!("pred_col"),
-        Pred::literal(true),
-        Pred::literal(false),
+        Pred::TRUE,
+        Pred::FALSE,
         Pred::eq(Expr::literal(10), Expr::literal(10)),
         Pred::ne(Expr::literal(5), Expr::literal(10)),
         Pred::lt(Expr::literal(5), Expr::literal(10)),
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedP
         Pred::distinct(Expr::literal(1), Expr::literal(2)),
         Pred::is_null(column_expr!("nullable_col")),
         Pred::is_not_null(column_expr!("nonnull_col")),
-        Pred::not(Pred::literal(false)),
+        Pred::not(Pred::FALSE),
         Pred::or_from(vec![
             Pred::eq(Expr::literal(1), Expr::literal(1)),
             Pred::eq(Expr::literal(2), Expr::literal(2)),

@@ -41,19 +41,18 @@ fn field_names(s: &StructArray) -> Vec<String> {
 
 #[test]
 fn test_static_skipping() {
-    const NULL: Pred = Pred::null_literal();
     let test_cases = [
         (false, column_pred!("a")),
-        (true, Pred::literal(false)),
-        (false, Pred::literal(true)),
-        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
-        (true, Pred::and(column_pred!("a"), Pred::literal(false))),
-        (false, Pred::or(column_pred!("a"), Pred::literal(true))),
-        (false, Pred::or(column_pred!("a"), Pred::literal(false))),
+        (true, Pred::FALSE),
+        (false, Pred::TRUE),
+        (false, Pred::NULL), // NULL is unknown, not false -- conservative (no skip)
+        (true, Pred::and(column_pred!("a"), Pred::FALSE)),
+        (false, Pred::or(column_pred!("a"), Pred::TRUE)),
+        (false, Pred::or(column_pred!("a"), Pred::FALSE)),
         (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
+        (false, Pred::and(Pred::NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -103,8 +102,8 @@ fn test_physical_predicate() {
     // NOTE: We break several column mapping rules here because they don't matter for this
     // test. For example, we do not provide field ids, and not all columns have physical names.
     let test_cases = [
-        (Pred::literal(true), Some(PhysicalPredicate::None)),
-        (Pred::literal(false), Some(PhysicalPredicate::StaticSkipAll)),
+        (Pred::TRUE, Some(PhysicalPredicate::None)),
+        (Pred::FALSE, Some(PhysicalPredicate::StaticSkipAll)),
         (column_pred!("x"), None), // no such column
         (
             column_pred!("a"),
@@ -177,9 +176,9 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
+            Pred::and(column_pred!("mapped.n"), Pred::TRUE),
             Some(PhysicalPredicate::Some(
-                Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
+                Pred::and(column_pred!("phys_mapped.phys_n"), Pred::TRUE).into(),
                 StructType::new_unchecked(vec![StructField::nullable(
                     "phys_mapped",
                     StructType::new_unchecked(vec![StructField::nullable(
@@ -199,7 +198,7 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::literal(false)),
+            Pred::and(column_pred!("mapped.n"), Pred::FALSE),
             Some(PhysicalPredicate::StaticSkipAll),
         ),
     ];
@@ -1157,7 +1156,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 
     // A predicate that statically evaluates to false should produce StaticSkipAll,
     // which means build_actions_meta_predicate returns None.
-    let predicate = Arc::new(Pred::literal(false));
+    let predicate = Arc::new(Pred::FALSE);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -2392,7 +2391,7 @@ mod scan_metadata_completed_tests {
     #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
-        Some(Arc::new(Pred::literal(false))),
+        Some(Arc::new(Pred::FALSE)),
         0,
         0,
         0,

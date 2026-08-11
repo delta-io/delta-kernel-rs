@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
+use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -698,6 +699,112 @@ pub unsafe extern "C" fn visit_string_map(
             engine_context,
             kernel_string_slice!(key),
             kernel_string_slice!(val),
+        );
+    }
+}
+
+// === Typed field metadata ===
+
+/// The type of a [`MetadataValue`] carried across the FFI boundary. Each value is delivered as a
+/// string (via `Display`); this tag tells the engine how to interpret it: a signed 64-bit integer,
+/// a plain string, a boolean value, or arbitrary JSON text.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CMetadataValueKind {
+    MetadataNumber = 0,
+    MetadataString = 1,
+    MetadataBoolean = 2,
+    MetadataJson = 3,
+}
+
+impl From<&MetadataValue> for CMetadataValueKind {
+    fn from(val: &MetadataValue) -> Self {
+        match val {
+            MetadataValue::Number(_) => CMetadataValueKind::MetadataNumber,
+            MetadataValue::String(_) => CMetadataValueKind::MetadataString,
+            MetadataValue::Boolean(_) => CMetadataValueKind::MetadataBoolean,
+            MetadataValue::Other(_) => CMetadataValueKind::MetadataJson,
+        }
+    }
+}
+
+/// A field-metadata map that preserves each value's [`MetadataValue`] type. Used for schema field
+/// metadata, where the kernel knows each value's type; the engine recovers that type via
+/// [`CMetadataValueKind`] rather than inferring it from the key name.
+#[derive(Default)]
+pub struct CMetadataMap {
+    values: HashMap<String, MetadataValue>,
+}
+
+impl From<HashMap<String, MetadataValue>> for CMetadataMap {
+    fn from(values: HashMap<String, MetadataValue>) -> Self {
+        Self { values }
+    }
+}
+
+/// Probe a [`CMetadataMap`] for a single key. If the key is present, kernel calls `allocate_fn`
+/// with its value rendered to a string, writes the value's [`CMetadataValueKind`] to `kind_out`
+/// (unless `kind_out` is null), and returns the pointer `allocate_fn` produced. If the key is
+/// absent, returns NULL and leaves `kind_out` untouched.
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CMetadataMap`] pointer, [`KernelStringSlice`],
+/// and (when non-null) a valid `kind_out` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn get_from_metadata_map(
+    map: &CMetadataMap,
+    key: KernelStringSlice,
+    kind_out: *mut CMetadataValueKind,
+    allocate_fn: AllocateStringFn,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<NullableCvoid> {
+    let engine = unsafe { engine.as_ref() };
+    get_from_metadata_map_impl(map, key, kind_out, allocate_fn).into_extern_result(&engine)
+}
+fn get_from_metadata_map_impl(
+    map: &CMetadataMap,
+    key: KernelStringSlice,
+    kind_out: *mut CMetadataValueKind,
+    allocate_fn: AllocateStringFn,
+) -> DeltaResult<NullableCvoid> {
+    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
+    let Some(val) = map.values.get(string_key) else {
+        return Ok(None);
+    };
+    if !kind_out.is_null() {
+        unsafe { *kind_out = CMetadataValueKind::from(val) };
+    }
+    let value = val.to_string();
+    Ok(allocate_fn(kernel_string_slice!(value)))
+}
+
+/// Visit all entries in a [`CMetadataMap`]. The callback is invoked once per entry with the key,
+/// the value's [`CMetadataValueKind`], and the value rendered to a string. The engine uses the
+/// kind to parse the string back into a typed value.
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CMetadataMap`] pointer and callback.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_map(
+    map: &CMetadataMap,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        kind: CMetadataValueKind,
+        value: KernelStringSlice,
+    ),
+) {
+    for (key, val) in &map.values {
+        let kind = CMetadataValueKind::from(val);
+        let value = val.to_string();
+        visitor(
+            engine_context,
+            kernel_string_slice!(key),
+            kind,
+            kernel_string_slice!(value),
         );
     }
 }
@@ -1762,7 +1869,13 @@ mod tests {
             fallback: &Handle<SharedExternEngine>,
         ) -> Handle<SharedExternEngine> {
             let executor = unsafe { get_plan_executor(None, unreachable_executor) };
-            unsafe { get_plan_based_engine(executor, fallback.shallow_copy(), allocate_err) }
+            unsafe {
+                get_plan_based_engine(
+                    executor,
+                    OptionalValue::Some(fallback.shallow_copy()),
+                    allocate_err,
+                )
+            }
         }
 
         #[tokio::test]
@@ -1835,5 +1948,82 @@ mod tests {
             unsafe { free_engine(plan_engine) };
             unsafe { free_engine(engine) };
         }
+    }
+
+    extern "C" fn visit_metadata_entry(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        kind: super::CMetadataValueKind,
+        value: KernelStringSlice,
+    ) {
+        let map_ptr: *mut HashMap<String, (super::CMetadataValueKind, String)> =
+            engine_context.unwrap().as_ptr().cast();
+        let key = unsafe { String::try_from_slice(&key).unwrap() };
+        let value = unsafe { String::try_from_slice(&value).unwrap() };
+        unsafe {
+            (*map_ptr).insert(key, (kind, value));
+        }
+    }
+
+    #[test]
+    fn visit_metadata_map_maps_kind_and_renders_each_variant() {
+        use delta_kernel::schema::MetadataValue;
+
+        use super::CMetadataValueKind::*;
+
+        // `Number` is i64-only, so a JSON number with a fractional part lands in `Other` -- cover
+        // both so the "parse as i64" contract for `MetadataNumber` stays honest.
+        let test_map = HashMap::from([
+            ("num".to_string(), MetadataValue::Number(-7)),
+            ("str".to_string(), MetadataValue::String("hi".into())),
+            ("bool".to_string(), MetadataValue::Boolean(true)),
+            (
+                "obj".to_string(),
+                MetadataValue::Other(serde_json::json!({"a": 1})),
+            ),
+            (
+                "float".to_string(),
+                MetadataValue::Other(serde_json::json!(1.5)),
+            ),
+        ]);
+        let cmap: super::CMetadataMap = test_map.into();
+
+        let ctx: Box<HashMap<String, (super::CMetadataValueKind, String)>> = Box::default();
+        let ctx_ptr = Box::into_raw(ctx);
+        unsafe {
+            let ptr = NonNull::new_unchecked(ctx_ptr.cast());
+            super::visit_metadata_map(&cmap, Some(ptr), visit_metadata_entry);
+        }
+        let out = *unsafe { Box::from_raw(ctx_ptr) };
+
+        assert_eq!(out["num"], (MetadataNumber, "-7".to_string()));
+        assert_eq!(out["str"], (MetadataString, "hi".to_string()));
+        assert_eq!(out["bool"], (MetadataBoolean, "true".to_string()));
+        assert_eq!(out["obj"], (MetadataJson, "{\"a\":1}".to_string()));
+        assert_eq!(out["float"], (MetadataJson, "1.5".to_string()));
+    }
+
+    #[test]
+    fn visit_metadata_map_empty_never_invokes_callback() {
+        let cmap = super::CMetadataMap::default();
+        let ctx: Box<HashMap<String, (super::CMetadataValueKind, String)>> = Box::default();
+        let ctx_ptr = Box::into_raw(ctx);
+        unsafe {
+            let ptr = NonNull::new_unchecked(ctx_ptr.cast());
+            super::visit_metadata_map(&cmap, Some(ptr), visit_metadata_entry);
+        }
+        let out = *unsafe { Box::from_raw(ctx_ptr) };
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn metadata_value_kind_discriminants_are_stable() {
+        // These integers are the FFI ABI contract -- C consumers switch on them. Reordering the
+        // enum silently renumbers, so pin them here.
+        use super::CMetadataValueKind::*;
+        assert_eq!(MetadataNumber as i32, 0);
+        assert_eq!(MetadataString as i32, 1);
+        assert_eq!(MetadataBoolean as i32, 2);
+        assert_eq!(MetadataJson as i32, 3);
     }
 }

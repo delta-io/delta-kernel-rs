@@ -794,7 +794,7 @@ fn get_earliest_recreatable_commit(
                     }
                 }
             }
-            LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint => {
+            LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
                 last_complete_checkpoint = Some(parsed_log_path.version);
             }
             LogPathFileType::MultiPartCheckpoint {

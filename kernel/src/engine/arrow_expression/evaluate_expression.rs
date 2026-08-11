@@ -767,6 +767,19 @@ pub fn evaluate_predicate(
     }
 }
 
+/// `chrono` formats implementing the timestamp encoding [`UnaryExpressionOp::ToJson`] requires.
+///
+/// `%.3f` truncates rather than rounds, and floors below the epoch. Reader subtracts .000999
+/// from the query value before comparing it to the max stat so it doesn't skip the wrong files.
+///
+/// The `Z` is literal rather than `%:z`, which spells a zero offset `+00:00`. Both are valid ISO
+/// 8601, but every Delta writer emits `Z` (including this crate's own partition-value
+/// serialization), so matching it keeps stats parseable by readers that accept only that form.
+/// Hardcoding it is safe because a Delta `TIMESTAMP` stat is always UTC: `arrow_conversion` accepts
+/// a timezone-annotated array only when the annotation is UTC.
+const STATS_TIMESTAMP_TZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
+const STATS_TIMESTAMP_NTZ_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f";
+
 /// Converts a StructArray to JSON-encoded strings
 pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
     let (array_ref, _is_scalar) = input.get();
@@ -790,7 +803,10 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
                 struct_array.fields().iter().cloned().collect_vec(),
                 true,
             ));
-            let options = EncoderOptions::default().with_struct_mode(StructMode::ObjectOnly);
+            let options = EncoderOptions::default()
+                .with_struct_mode(StructMode::ObjectOnly)
+                .with_timestamp_format(STATS_TIMESTAMP_NTZ_FORMAT.to_string())
+                .with_timestamp_tz_format(STATS_TIMESTAMP_TZ_FORMAT.to_string());
             let mut encoder = make_encoder(&field, struct_array, &options)?;
 
             // Pre-allocate the various buffers
@@ -2012,7 +2028,7 @@ mod tests {
 
         let operand = |v: Option<bool>| match v {
             Some(b) => Pred::literal(b),
-            None => Pred::null_literal(),
+            None => Pred::NULL,
         };
         let pred = Pred::junction(op, [operand(left), operand(right)]);
 
@@ -2128,6 +2144,77 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, Some(&output_type)).unwrap();
         let result = result.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(result.is_null(0), expect_null_struct);
+    }
+
+    /// Delta truncates timestamp stats down to milliseconds, so `ToJson` must emit exactly three
+    /// fractional digits, floored: a max stat above the true value lets readers prune a file that
+    /// still holds a matching row. `Timestamp` carries a `Z` suffix, `TimestampNtz` none.
+    #[rstest]
+    // Sub-millisecond digits are dropped, not rounded (.298677 -> .298).
+    #[case::micros_dropped(1_783_007_755_298_677, "2026-07-02T15:55:55.298")]
+    // A value that would carry to the next second if the formatter rounded instead of truncating.
+    #[case::no_round_up(1_783_007_755_999_900, "2026-07-02T15:55:55.999")]
+    // Pre-epoch: -1500us must floor to -2ms (.998), not truncate toward zero to -1ms (.999).
+    #[case::pre_epoch_floors(-1_500, "1969-12-31T23:59:59.998")]
+    // Whole milliseconds keep their trailing zeros rather than collapsing to fewer digits.
+    #[case::exact_millis(1_783_007_755_000_000, "2026-07-02T15:55:55.000")]
+    fn test_to_json_truncates_timestamps_to_milliseconds(
+        #[case] micros: i64,
+        #[case] expected: &str,
+        #[values(None, Some("UTC"))] timezone: Option<&str>,
+    ) {
+        let array = TimestampMicrosecondArray::from(vec![micros]);
+        let array: ArrayRef = match timezone {
+            Some(tz) => Arc::new(array.with_timezone(tz)),
+            None => Arc::new(array),
+        };
+        let field = ArrowField::new("ts", array.data_type().clone(), true);
+        let value = StructArray::from(vec![(Arc::new(field), array)]);
+
+        // A UTC-annotated array renders the protocol's `Z` suffix; NTZ has no offset at all.
+        let suffix = if timezone.is_some() { "Z" } else { "" };
+        assert_eq!(
+            to_json_string(value),
+            format!(r#"{{"ts":"{expected}{suffix}"}}"#)
+        );
+    }
+
+    /// A Delta `TIMESTAMP` stat is always UTC, so every spelling of the UTC annotation must render
+    /// the same literal `Z` form rather than a numeric offset a strict reader would reject. Nested
+    /// too, since arrow applies the format per array at any depth.
+    #[rstest]
+    fn test_to_json_renders_utc_timestamps_with_a_z_suffix(
+        #[values("UTC", "Etc/UTC", "+00:00")] timezone: &str,
+    ) {
+        let expected = "2026-07-02T15:55:55.298Z";
+        let ts = Arc::new(
+            TimestampMicrosecondArray::from(vec![1_783_007_755_298_677i64]).with_timezone(timezone),
+        ) as ArrayRef;
+        let leaf = ArrowField::new("ts", ts.data_type().clone(), true);
+        let inner = StructArray::from(vec![(Arc::new(leaf), ts)]);
+
+        let nested_field = ArrowField::new("minValues", inner.data_type().clone(), true);
+        let outer = StructArray::from(vec![(
+            Arc::new(nested_field),
+            Arc::new(inner.clone()) as ArrayRef,
+        )]);
+
+        for (value, expected) in [
+            (inner, format!(r#"{{"ts":"{expected}"}}"#)),
+            (outer, format!(r#"{{"minValues":{{"ts":"{expected}"}}}}"#)),
+        ] {
+            assert_eq!(to_json_string(value), expected, "timezone {timezone}");
+        }
+    }
+
+    /// Evaluates `ToJson` over a one-column batch wrapping `value` and returns the encoded row.
+    fn to_json_string(value: StructArray) -> String {
+        let schema = ArrowSchema::new(vec![ArrowField::new("s", value.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(value)]).unwrap();
+        let expr = Expr::unary(UnaryExpressionOp::ToJson, column_expr!("s"));
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+        result.value(0).to_string()
     }
 
     /// Base64 would render `0xABCD` as `q80=`.

@@ -28,6 +28,7 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::ArrowWriter;
+use crate::path::tests::multipart_checkpoint_name;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, adds_only_batch, remove_only_batch,
@@ -86,9 +87,8 @@ fn process_sidecars(
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
 // parts
 fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u32) -> Path {
-    let path =
-        format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet");
-    Path::from(path.as_str())
+    let name = multipart_checkpoint_name(version, part_num, num_parts);
+    Path::from(format!("_delta_log/{name}").as_str())
 }
 
 // Utility method to build a log using a list of log paths and an optional checkpoint hint. The
@@ -626,13 +626,22 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     )
 }
 
+/// v5 holds three complete checkpoints (classic, 2-part, 3-part), so the 3-part one always wins.
+/// The hint's `parts` decides only whether the hint describes that winner.
+#[rstest]
+#[case::hint_names_winner(Some(3), true)]
+#[case::hint_names_losing_multipart(Some(2), false)]
+#[case::hint_names_losing_classic(None, false)]
 #[tokio::test]
-async fn build_snapshot_with_bad_checkpoint_hint_fails() {
+async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkpoint(
+    #[case] hint_parts: Option<usize>,
+    #[case] expect_hint_applies: bool,
+) {
     let checkpoint_metadata = LastCheckpointHint {
         v2_checkpoint: None,
         version: 5,
         size: 10,
-        parts: Some(1),
+        parts: hint_parts,
         size_in_bytes: None,
         num_of_add_files: None,
         checkpoint_schema: None,
@@ -649,8 +658,12 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
             delta_path_for_version(3, "checkpoint.parquet"),
             delta_path_for_version(3, "json"),
             delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
             delta_path_for_multipart_checkpoint(5, 1, 2),
             delta_path_for_multipart_checkpoint(5, 2, 2),
+            delta_path_for_multipart_checkpoint(5, 1, 3),
+            delta_path_for_multipart_checkpoint(5, 2, 3),
+            delta_path_for_multipart_checkpoint(5, 3, 3),
             delta_path_for_version(5, "json"),
             delta_path_for_version(6, "json"),
             delta_path_for_version(7, "json"),
@@ -665,12 +678,38 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-    );
-    assert_result_error_with_message(
-        log_segment,
-        "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
-        it has 2",
     )
+    .unwrap();
+
+    assert_eq!(log_segment.checkpoint_version, Some(5));
+    assert_eq!(log_segment.end_version, 7);
+    let checkpoint_filenames = log_segment
+        .listed
+        .checkpoint_parts
+        .iter()
+        .map(|p| p.filename.as_str())
+        .collect_vec();
+    assert_eq!(
+        checkpoint_filenames,
+        vec![
+            "00000000000000000005.checkpoint.0000000001.0000000003.parquet",
+            "00000000000000000005.checkpoint.0000000002.0000000003.parquet",
+            "00000000000000000005.checkpoint.0000000003.0000000003.parquet",
+        ]
+    );
+
+    // The hint is always retained; describing some other checkpoint only makes its fields
+    // untrustworthy, and readers fall back to the checkpoint footer.
+    assert!(log_segment.last_checkpoint_metadata.is_some());
+    assert_eq!(log_segment.checkpoint_hint().is_some(), expect_hint_applies);
+
+    let commit_versions = log_segment
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect_vec();
+    assert_eq!(commit_versions, vec![6, 7]);
 }
 
 #[tokio::test]
@@ -2560,7 +2599,7 @@ fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch(
 
 #[test]
 fn test_validate_listed_log_file_multiple_single_part_checkpoints() {
-    // Two SinglePartCheckpoints at the same version: n=2 but neither is a MultiPartCheckpoint
+    // Two ClassicCheckpoints at the same version: n=2 but neither is a MultiPartCheckpoint
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
         LogSegmentFiles {

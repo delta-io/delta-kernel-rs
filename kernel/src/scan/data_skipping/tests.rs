@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rstest::rstest;
 
 use super::*;
-use crate::expressions::{column_expr_ref, column_name};
+use crate::expressions::{col, column_expr_ref, column_name};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, UnimplementedColumnResolver,
 };
@@ -170,7 +170,7 @@ fn test_eval_junction() {
             .iter()
             .map(|val| match val {
                 Some(v) => Pred::literal(*v),
-                None => Pred::null_literal(),
+                None => Pred::NULL,
             })
             .collect();
 
@@ -265,11 +265,7 @@ fn test_eval_distinct() {
 
 #[test]
 fn test_sql_where() {
-    let col = &column_expr!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(10));
-    const NULL: Pred = Pred::null_literal();
-    const FALSE: Pred = Pred::literal(false);
-    const TRUE: Pred = Pred::literal(true);
 
     const ROWCOUNT: i64 = 2;
     const ALL_NULL: i64 = ROWCOUNT;
@@ -321,22 +317,22 @@ fn test_sql_where() {
     // Sanity tests -- only all-null columns should behave differently between normal and SQL WHERE.
     const MISSING: bool = true;
     const PRESENT: bool = false;
-    let pred = &Pred::lt(TRUE, FALSE);
+    let pred = &Pred::lt(Pred::TRUE, Pred::FALSE);
     do_test(ALL_NULL, pred, MISSING, Some(false), Some(false));
 
-    let pred = &Pred::is_not_null(col.clone());
+    let pred = &Pred::is_not_null(col!("x"));
     do_test(ALL_NULL, pred, PRESENT, Some(false), Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
     // SQL WHERE allows a present-but-all-null column to be pruned, but not a missing column.
-    let pred = &Pred::lt(col.clone(), VAL);
+    let pred = &Pred::lt(col!("x"), VAL);
     do_test(NO_NULL, pred, PRESENT, Some(true), Some(true));
     do_test(SOME_NULL, pred, PRESENT, Some(true), Some(true));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
     // Comparison inside AND works
-    let pred = &Pred::and(TRUE, Pred::lt(VAL, col.clone()));
+    let pred = &Pred::and(Pred::TRUE, Pred::lt(VAL, col!("x")));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
@@ -344,22 +340,22 @@ fn test_sql_where() {
     // force static skipping on its own. With present-but-all-null stats, the comparison arm
     // still evaluates to false (null-safe check fails), so AND(unknown, false) = false.
     // With missing stats, both arms are unknown, so AND(unknown, unknown) = unknown.
-    let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
+    let pred = &Pred::and(Pred::NULL, Pred::lt(col!("x"), VAL));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
     // Comparison inside AND inside AND works
-    let pred = &Pred::and(TRUE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    let pred = &Pred::and(Pred::TRUE, Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL)));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
     // Comparison inside OR works
-    let pred = &Pred::or(FALSE, Pred::lt(col.clone(), VAL));
+    let pred = &Pred::or(Pred::FALSE, Pred::lt(col!("x"), VAL));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 
     // Comparison inside AND inside OR works
-    let pred = &Pred::or(FALSE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    let pred = &Pred::or(Pred::FALSE, Pred::and(Pred::TRUE, Pred::lt(col!("x"), VAL)));
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 }

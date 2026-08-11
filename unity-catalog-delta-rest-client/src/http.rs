@@ -20,7 +20,7 @@ pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
         // Identifies the calling client to UC.
         (
             header::USER_AGENT,
-            header::HeaderValue::from_str(&config.user_agent)?,
+            header::HeaderValue::from_str(config.user_agent())?,
         ),
     ]);
 
@@ -75,6 +75,14 @@ where
     Err(Error::MaxRetriesExceeded)
 }
 
+pub async fn execute_without_retry<F, Fut>(f: F) -> Result<Response>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<Response, reqwest::Error>>,
+{
+    f().await.map_err(Error::from)
+}
+
 /// Handle HTTP response and deserialize.
 pub async fn handle_response<T>(response: Response) -> Result<T>
 where
@@ -118,5 +126,32 @@ async fn error_from_response(response: Response) -> Error {
             status: status.as_u16(),
             message: error_body,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClientConfig;
+
+    #[test]
+    fn build_http_client_accepts_composed_user_agent() {
+        let config = ClientConfig::build("example.com", "t")
+            .with_additional_user_agent([("Spark", "3.5.0")])
+            .build()
+            .unwrap();
+        build_http_client(&config).expect("composed user_agent must be a valid header value");
+    }
+
+    #[test]
+    fn build_http_client_rejects_invalid_additional_user_agent_chars() {
+        let config = ClientConfig::build("example.com", "t")
+            .with_additional_user_agent([("bad\nname", "1.0")])
+            .build()
+            .unwrap();
+        assert!(matches!(
+            build_http_client(&config),
+            Err(Error::InvalidHeaderValue(_))
+        ));
     }
 }
