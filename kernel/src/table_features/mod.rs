@@ -943,17 +943,21 @@ pub(crate) fn protocol_with_added_features(
     // explicit as part of the transition to writer version 7 (and, when needed, reader version 3).
     let mut reader_features = protocol.reader_features().unwrap_or_default().to_vec();
     let mut writer_features = protocol.writer_features().unwrap_or_default().to_vec();
+    let enabled_writer_features = extract_enabled_writer_features(protocol);
 
     if protocol.min_writer_version() < TABLE_FEATURES_MIN_WRITER_VERSION {
-        for feature in extract_enabled_writer_features(protocol) {
-            if !writer_features.contains(&feature) {
-                writer_features.push(feature);
+        for feature in &enabled_writer_features {
+            if !writer_features.contains(feature) {
+                writer_features.push(feature.clone());
             }
         }
     }
 
     if protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION {
         for feature in extract_enabled_reader_features(protocol) {
+            if !enabled_writer_features.contains(&feature) {
+                continue;
+            }
             if !writer_features.contains(&feature) {
                 writer_features.push(feature.clone());
             }
@@ -1150,6 +1154,77 @@ mod tests {
                 TableFeature::ColumnMapping,
             ],
         );
+    }
+
+    #[test]
+    fn adding_unrelated_feature_does_not_expand_reader_2_writer_7_capabilities() {
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            None::<Vec<TableFeature>>,
+            Some(Vec::<TableFeature>::new()),
+        )
+        .unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::DomainMetadata], false).unwrap();
+
+        assert_feature_protocol(&evolved, 2, None, &[TableFeature::DomainMetadata]);
+    }
+
+    #[test]
+    fn adding_unrelated_feature_does_not_expand_reader_2_writer_4_capabilities() {
+        let protocol = Protocol::try_new_legacy(2, 4).unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::DomainMetadata], true).unwrap();
+
+        assert_feature_protocol(
+            &evolved,
+            2,
+            None,
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::Invariants,
+                TableFeature::CheckConstraints,
+                TableFeature::ChangeDataFeed,
+                TableFeature::GeneratedColumns,
+                TableFeature::DomainMetadata,
+            ],
+        );
+    }
+
+    #[test]
+    fn adding_unrelated_feature_preserves_explicit_column_mapping_writer_support() {
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            None::<Vec<TableFeature>>,
+            Some([TableFeature::ColumnMapping]),
+        )
+        .unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::DomainMetadata], false).unwrap();
+
+        assert_feature_protocol(
+            &evolved,
+            2,
+            None,
+            &[TableFeature::ColumnMapping, TableFeature::DomainMetadata],
+        );
+    }
+
+    #[test]
+    fn explicitly_adding_column_mapping_to_reader_2_writer_7_adds_writer_support() {
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            None::<Vec<TableFeature>>,
+            Some(Vec::<TableFeature>::new()),
+        )
+        .unwrap();
+        let evolved =
+            protocol_with_added_features(&protocol, [TableFeature::ColumnMapping], false).unwrap();
+
+        assert_feature_protocol(&evolved, 2, None, &[TableFeature::ColumnMapping]);
     }
 
     #[test]

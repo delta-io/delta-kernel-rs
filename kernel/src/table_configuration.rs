@@ -263,6 +263,14 @@ impl TableConfiguration {
 
     /// Validate that the kernel supports adding `feature` to this table configuration.
     pub(crate) fn validate_feature_for_addition(&self, feature: &TableFeature) -> DeltaResult<()> {
+        require!(
+            !matches!(
+                feature,
+                TableFeature::CatalogManaged | TableFeature::CatalogOwnedPreview
+            ),
+            Error::unsupported("Upgrading an existing table to catalog-managed is not supported")
+        );
+
         match feature.feature_type() {
             FeatureType::WriterOnly => self.check_feature_support(feature, Operation::Write),
             FeatureType::ReaderWriter => {

@@ -293,6 +293,37 @@ async fn add_unsupported_known_feature_fails_without_commit() -> DeltaResult<()>
 }
 
 #[rstest]
+#[case::catalog_managed(TableFeature::CatalogManaged)]
+#[case::catalog_owned_preview(TableFeature::CatalogOwnedPreview)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_catalog_management_feature_fails_without_commit(
+    #[case] feature: TableFeature,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let error = snapshot
+        .alter_table()
+        .add_table_feature(feature)
+        .with_allow_protocol_versions_increase(true)
+        .build(engine.as_ref(), committer())
+        .expect_err("catalog-management transition must be rejected");
+
+    assert!(error
+        .to_string()
+        .contains("Upgrading an existing table to catalog-managed is not supported"));
+    assert_eq!(
+        Snapshot::builder_for(&table_path)
+            .build(engine.as_ref())?
+            .version(),
+        0
+    );
+
+    Ok(())
+}
+
+#[rstest]
 #[case::writer_3(1, 3)]
 #[case::writer_4(1, 4)]
 #[case::writer_6(2, 6)]
