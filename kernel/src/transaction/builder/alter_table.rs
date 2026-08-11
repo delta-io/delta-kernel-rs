@@ -134,8 +134,9 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
 
     /// Add a new column at an explicit schema path.
     ///
-    /// The final path segment must be [`PathSegment::Field`] and must match `field.name()`.
-    /// Preceding segments may traverse nested structs, array elements, map keys, and map values.
+    /// `path` identifies the struct that will contain `field`. An empty path targets the table's
+    /// root schema; path segments may traverse nested structs, array elements, map keys, and map
+    /// values.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column_at(

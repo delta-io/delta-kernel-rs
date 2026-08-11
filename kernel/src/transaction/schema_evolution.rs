@@ -6,8 +6,6 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
-
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
@@ -41,7 +39,8 @@ pub enum SchemaOperation {
 
     /// Add a column at an explicit schema path.
     ///
-    /// The final segment must be [`PathSegment::Field`] and must match `field.name()`.
+    /// The path identifies the struct that will contain `field`. An empty path adds `field` to the
+    /// table's root schema.
     AddColumnAt {
         path: Vec<PathSegment>,
         field: StructField,
@@ -51,128 +50,73 @@ pub enum SchemaOperation {
     SetNullable { column: ColumnName },
 }
 
-// Helper to modify a nested column. For each component in `path`, locates the matching field
-// (case-insensitive), then descends into the next nested struct. At the leaf, calls `modifier`
-// to mutate the field in place.
-//
-// `modifier` is expected to mutate the field's nullability, metadata, or `data_type` -- but
-// not its name. Renames need additional handling (IndexMap re-keying + sibling-conflict check)
-// that downstream PRs will introduce alongside the rename caller.
-//
-// Returns an error if a field in the path does not exist or an intermediate field is not a struct.
-//
-// Example:
-//   fields   = [ id: int not null, address: struct { city: string not null, zip: string } ]
-//   path     = ["address", "city"]
-//   modifier = |f| { f.nullable = true; Ok(()) }
-// yields:
-//   [ id: int not null, address: struct { city: string, zip: string } ]
-fn modify_field_at_path(
-    fields: &mut IndexMap<String, StructField>,
-    path: &[String],
-    modifier: &dyn Fn(&mut StructField) -> DeltaResult<()>,
-) -> DeltaResult<()> {
-    let (first, rest) = path
-        .split_first()
-        .ok_or_else(|| Error::generic("empty column path"))?;
-
-    // Delta column names are case-insensitive.
-    let lowered = first.to_lowercase();
-    let idx = fields
-        .iter()
-        .position(|(_, f)| f.name().to_lowercase() == lowered)
-        .ok_or_else(|| Error::generic(format!("field '{first}' does not exist")))?;
-
-    if !rest.is_empty() {
-        let (_, field) = fields
-            .get_index_mut(idx)
-            .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
-        let DataType::Struct(inner) = &mut field.data_type else {
-            return Err(Error::generic(format!(
-                "intermediate field '{first}' is not a struct"
-            )));
-        };
-        return modify_field_at_path(inner.field_map_mut(), rest, modifier);
+fn add_field(parent: &mut StructType, field: StructField) -> DeltaResult<()> {
+    let lowered = field.name().to_lowercase();
+    if parent
+        .fields()
+        .any(|existing| existing.name().to_lowercase() == lowered)
+    {
+        return Err(Error::schema(format!(
+            "Cannot add column '{}': a column with that name already exists",
+            field.name()
+        )));
     }
-
-    // === Leaf handling ===
-    let (_, field) = fields
-        .get_index_mut(idx)
-        .ok_or_else(|| Error::internal_error("idx from position() invalid"))?;
-    modifier(field)
+    parent.field_map_mut().insert(field.name().clone(), field);
+    Ok(())
 }
 
-fn add_column_at_path(
+fn set_field_nullable(field: &mut StructType, name: &str) -> DeltaResult<()> {
+    let field = field
+        .field_map_mut()
+        .values_mut()
+        .find(|field| field.name().to_lowercase() == name.to_lowercase())
+        .ok_or_else(|| Error::generic(format!("field '{}' does not exist", name)))?;
+    field.nullable = true;
+    Ok(())
+}
+
+fn to_path_segments(path: &[String]) -> Vec<PathSegment> {
+    path.iter()
+        .cloned()
+        .map(PathSegment::Field)
+        .collect::<Vec<_>>()
+}
+
+// Resolves `path` to a struct and calls `modifier` on it. Field names are matched
+// case-insensitively; explicit segments select array elements and map keys or values.
+fn modify_field_at_path(
     data_type: &mut DataType,
     path: &[PathSegment],
-    field: StructField,
-    cm_enabled: bool,
-    max_id: &mut Option<i64>,
+    modifier: impl FnOnce(&mut StructType) -> DeltaResult<()>,
 ) -> DeltaResult<()> {
-    let (segment, rest) = path
-        .split_first()
-        .ok_or_else(|| Error::schema("Cannot add column: empty column path"))?;
+    let Some((segment, rest)) = path.split_first() else {
+        let DataType::Struct(parent) = data_type else {
+            return Err(Error::generic("path target is not a struct"));
+        };
+        return modifier(parent);
+    };
 
     match (segment, data_type) {
-        // Adding the field to the current struct.
-        (PathSegment::Field(name), DataType::Struct(parent)) if rest.is_empty() => {
-            // The path leaf is supposed to be the field we are trying to add.
-            if !name.eq_ignore_ascii_case(field.name()) {
-                return Err(Error::schema(format!(
-                    "Cannot add column '{}': path leaf '{name}' does not match field name",
-                    field.name()
-                )));
-            }
-            let lowered = field.name().to_lowercase();
-            if parent
-                .fields()
-                .any(|existing| existing.name().to_lowercase() == lowered)
-            {
-                return Err(Error::schema(format!(
-                    "Cannot add column '{}': a column with that name already exists",
-                    field.name()
-                )));
-            }
-            let field = if cm_enabled {
-                let id = max_id.as_mut().ok_or_else(|| {
-                    Error::invalid_protocol(
-                        "Column mapping is enabled but delta.columnMapping.maxColumnId \
-                         is not set in table properties",
-                    )
-                })?;
-                try_assign_flat_column_mapping_info(&field, id)?
-            } else {
-                field
-            };
-            parent.field_map_mut().insert(field.name().clone(), field);
-            Ok(())
-        }
         (PathSegment::Field(name), DataType::Struct(parent)) => {
             let lowered = name.to_lowercase();
-            let index = parent
-                .fields()
-                .position(|existing| existing.name().to_lowercase() == lowered)
-                .ok_or_else(|| Error::schema(format!("field '{name}' does not exist")))?;
-            let nested = &mut parent
+            let field = parent
                 .field_map_mut()
-                .get_index_mut(index)
-                .ok_or_else(|| Error::internal_error("field index became invalid"))?
-                .1
-                .data_type;
-            add_column_at_path(nested, rest, field, cm_enabled, max_id)
+                .values_mut()
+                .find(|field| field.name().to_lowercase() == lowered)
+                .ok_or_else(|| Error::schema(format!("field '{name}' does not exist")))?;
+            modify_field_at_path(&mut field.data_type, rest, modifier)
         }
         (PathSegment::ArrayElement, DataType::Array(array)) => {
-            add_column_at_path(&mut array.element_type, rest, field, cm_enabled, max_id)
+            modify_field_at_path(&mut array.element_type, rest, modifier)
         }
         (PathSegment::MapKey, DataType::Map(map)) => {
-            add_column_at_path(&mut map.key_type, rest, field, cm_enabled, max_id)
+            modify_field_at_path(&mut map.key_type, rest, modifier)
         }
         (PathSegment::MapValue, DataType::Map(map)) => {
-            add_column_at_path(&mut map.value_type, rest, field, cm_enabled, max_id)
+            modify_field_at_path(&mut map.value_type, rest, modifier)
         }
         (segment, data_type) => Err(Error::schema(format!(
-            "Cannot add column '{}': path segment {segment:?} does not match {data_type}",
-            field.name()
+            "path segment {segment:?} does not match {data_type}"
         ))),
     }
 }
@@ -227,45 +171,60 @@ pub(crate) fn apply_schema_operations(
     };
 
     for op in operations {
-        let (path, field) = match op {
-            SchemaOperation::AddColumn { field } => {
-                (vec![PathSegment::Field(field.name().clone())], field)
-            }
-            SchemaOperation::AddColumnAt { path, field } => (path, field),
+        let mut root = DataType::from(schema);
+        let add_column = match op {
+            SchemaOperation::AddColumn { field } => Some((Vec::new(), field)),
+            SchemaOperation::AddColumnAt { path, field } => Some((path, field)),
             SchemaOperation::SetNullable { column } => {
-                modify_field_at_path(schema.field_map_mut(), column.path(), &|f| {
-                    f.nullable = true;
-                    Ok(())
+                let (leaf, parent) = column
+                    .path()
+                    .split_last()
+                    .ok_or_else(|| Error::generic("empty column path"))?;
+                let parent = to_path_segments(parent);
+                modify_field_at_path(&mut root, &parent, |parent| {
+                    set_field_nullable(parent, leaf)
                 })
                 .map_err(|e| {
                     Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
-                continue;
+                None
             }
         };
 
-        if field.is_metadata_column() {
-            return Err(Error::schema(format!(
-                "Cannot add column '{}': metadata columns are not allowed in a table schema",
-                field.name()
-            )));
-        }
-        if !matches!(field.data_type, DataType::Primitive(_)) {
-            StructType::ensure_no_metadata_columns_in_field(&field)?;
-        }
-        if !field.is_nullable() {
-            return Err(Error::schema(format!(
-                "Cannot add non-nullable column '{}'. Added columns must be nullable \
-                 because existing data files do not contain this column.",
-                field.name()
-            )));
+        if let Some((path, field)) = add_column {
+            if field.is_metadata_column() {
+                return Err(Error::schema(format!(
+                    "Cannot add column '{}': metadata columns are not allowed in a table schema",
+                    field.name()
+                )));
+            }
+            if !matches!(field.data_type, DataType::Primitive(_)) {
+                StructType::ensure_no_metadata_columns_in_field(&field)?;
+            }
+            if !field.is_nullable() {
+                return Err(Error::schema(format!(
+                    "Cannot add non-nullable column '{}'. Added columns must be nullable \
+                     because existing data files do not contain this column.",
+                    field.name()
+                )));
+            }
+            let field = if cm_enabled {
+                let id = max_id.as_mut().ok_or_else(|| {
+                    Error::invalid_protocol(
+                        "Column mapping is enabled but delta.columnMapping.maxColumnId \
+                         is not set in table properties",
+                    )
+                })?;
+                try_assign_flat_column_mapping_info(&field, id)?
+            } else {
+                field
+            };
+            modify_field_at_path(&mut root, &path, |parent| add_field(parent, field))?;
         }
 
-        let mut root = DataType::from(schema);
-        add_column_at_path(&mut root, &path, field, cm_enabled, &mut max_id)?;
         let DataType::Struct(updated_schema) = root else {
             return Err(Error::internal_error(
-                "schema root changed type while adding a column",
+                "schema root changed type during schema evolution",
             ));
         };
         schema = *updated_schema;
@@ -388,34 +347,35 @@ mod tests {
 
     // === modify_field_at_path tests ===
 
-    // Convert a StructType into the IndexMap<String, StructField> shape that
-    // `modify_field_at_path` operates on.
-    fn into_field_map(schema: StructType) -> IndexMap<String, StructField> {
-        schema
-            .into_fields()
-            .map(|f| (f.name().clone(), f))
-            .collect()
-    }
-
-    fn set_nullable_modifier(f: &mut StructField) -> DeltaResult<()> {
-        f.nullable = true;
-        Ok(())
-    }
-
     fn modify_field_at_path_test_helper(
         schema: StructType,
         path: &[String],
-    ) -> DeltaResult<IndexMap<String, StructField>> {
-        let mut fields = into_field_map(schema);
-        modify_field_at_path(&mut fields, path, &set_nullable_modifier)?;
-        Ok(fields)
+    ) -> DeltaResult<StructType> {
+        let (leaf, parent) = path
+            .split_last()
+            .ok_or_else(|| Error::generic("empty column path"))?;
+        let parent = parent
+            .iter()
+            .cloned()
+            .map(PathSegment::Field)
+            .collect::<Vec<_>>();
+        let mut root = DataType::from(schema);
+        modify_field_at_path(&mut root, &parent, |parent| {
+            set_field_nullable(parent, leaf)
+        })?;
+        let DataType::Struct(schema) = root else {
+            return Err(Error::internal_error(
+                "schema root changed type while testing path modification",
+            ));
+        };
+        Ok(*schema)
     }
 
     #[test]
     fn modify_top_level_field_sets_nullable() {
         let path = vec!["id".to_string()];
         let result = modify_field_at_path_test_helper(simple_schema(), &path).unwrap();
-        let id = result.values().find(|f| f.name() == "id").unwrap();
+        let id = result.fields().find(|f| f.name() == "id").unwrap();
         assert!(id.is_nullable());
     }
 
@@ -423,7 +383,7 @@ mod tests {
     fn modify_nested_field_modifies_only_leaf() {
         let path = vec!["address".to_string(), "city".to_string()];
         let result = modify_field_at_path_test_helper(nested_schema(), &path).unwrap();
-        let addr = result.values().find(|f| f.name() == "address").unwrap();
+        let addr = result.fields().find(|f| f.name() == "address").unwrap();
         match addr.data_type() {
             DataType::Struct(s) => assert!(s.field("city").unwrap().is_nullable()),
             other => panic!("Expected Struct, got: {other:?}"),
@@ -437,9 +397,9 @@ mod tests {
     fn modify_nested_leaf_preserves_other_fields() {
         let path = vec!["address".to_string(), "city".to_string()];
         let result = modify_field_at_path_test_helper(nested_schema(), &path).unwrap();
-        let id = result.values().find(|f| f.name() == "id").unwrap();
+        let id = result.fields().find(|f| f.name() == "id").unwrap();
         assert!(!id.is_nullable());
-        let addr = result.values().find(|f| f.name() == "address").unwrap();
+        let addr = result.fields().find(|f| f.name() == "address").unwrap();
         match addr.data_type() {
             DataType::Struct(s) => assert!(s.field("zip").unwrap().is_nullable()),
             other => panic!("Expected Struct, got: {other:?}"),
@@ -466,7 +426,7 @@ mod tests {
     fn modify_case_insensitive_lookup_finds_field() {
         let path = vec!["ID".to_string()];
         let result = modify_field_at_path_test_helper(simple_schema(), &path).unwrap();
-        let id = result.values().find(|f| f.name() == "id").unwrap();
+        let id = result.fields().find(|f| f.name() == "id").unwrap();
         assert!(id.is_nullable());
     }
 
@@ -491,19 +451,12 @@ mod tests {
         }],
         "metadata columns are not allowed"
     )]
-    #[case::empty_add_path(
+    #[case::missing_add_parent(
         vec![SchemaOperation::AddColumnAt {
-            path: vec![],
+            path: vec![PathSegment::Field("missing".to_string())],
             field: StructField::nullable("added", DataType::STRING),
         }],
-        "empty column path"
-    )]
-    #[case::add_path_leaf_mismatch(
-        vec![SchemaOperation::AddColumnAt {
-            path: vec![PathSegment::Field("other".to_string())],
-            field: StructField::nullable("added", DataType::STRING),
-        }],
-        "does not match field name"
+        "does not exist"
     )]
     fn apply_schema_operations_rejects(
         #[case] ops: Vec<SchemaOperation>,
@@ -516,6 +469,13 @@ mod tests {
 
     #[rstest]
     #[case::single(vec![add_col("email", true)], &["id", "name", "email"])]
+    #[case::at_root(
+        vec![SchemaOperation::AddColumnAt {
+            path: vec![],
+            field: StructField::nullable("email", DataType::STRING),
+        }],
+        &["id", "name", "email"],
+    )]
     #[case::multiple(
         vec![add_col("email", true), add_col("age", true)],
         &["id", "name", "email", "age"]
@@ -584,7 +544,6 @@ mod tests {
             StructType::try_new([StructField::nullable("container", parent_type)]).unwrap();
         let mut path = vec![PathSegment::Field("container".to_string())];
         path.extend(container_path.iter().cloned());
-        path.push(PathSegment::Field("added".to_string()));
         let operation = SchemaOperation::AddColumnAt {
             path,
             field: StructField::nullable("added", DataType::INTEGER),
