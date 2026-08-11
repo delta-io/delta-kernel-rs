@@ -278,8 +278,7 @@ pub unsafe extern "C" fn visit_partition_values(
 ///
 /// # Safety
 /// Engine is responsible for providing a valid BoundWriteContext pointer, a valid `file_url`
-/// slice, and
-/// a valid engine handle.
+/// slice, and a valid engine handle.
 #[no_mangle]
 pub unsafe extern "C" fn resolve_file_path(
     write_context: Handle<SharedWriteContext>,
