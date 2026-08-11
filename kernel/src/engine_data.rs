@@ -243,7 +243,7 @@ pub struct StructList<'a> {
 
 impl<'a> StructList<'a> {
     /// Constructs a handle to the element structs at `offsets` within `values`.
-    pub(crate) fn new(
+    pub fn new(
         values: &'a dyn StructArrayAccessor,
         offsets: Range<usize>,
     ) -> StructList<'a> {
