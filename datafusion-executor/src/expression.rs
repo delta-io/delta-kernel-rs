@@ -276,7 +276,8 @@ fn struct_patch_to_df_expr(
         append_field_with_converted_expr(&mut args, &mut output_fields, expr)?;
     }
 
-    // Should only count required field patches (excluding optional)
+    // Should only count required field patches (excluding optional) for missing input fields
+    // validation. An existing optional field can shadow a missing required field.
     let mut used_required_field_patches = 0usize;
     for input_field in source_struct.fields() {
         let name = input_field.name();
