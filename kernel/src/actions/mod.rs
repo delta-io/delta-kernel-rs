@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
@@ -18,8 +19,8 @@ use crate::schema::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{schema, ArrayType};
 use crate::table_features::{
-    FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -688,20 +689,41 @@ impl Protocol {
                     )));
                 }
 
-                // Check all writer features that are ReaderWriter must also be in reader features
+                // Every ReaderWriter feature in writerFeatures must also appear in readerFeatures.
                 // Unknown features are treated as potentially Writer-only for forward
                 // compatibility.
-                if let Some(offending) = writer_features.iter().find(|feature| {
-                    matches!(feature.feature_type(), FeatureType::ReaderWriter)
-                        && !reader_features.contains(*feature)
-                }) {
-                    return Err(Error::invalid_protocol(format!(
-                        "Writer features must be Writer-only or also listed in reader features, \
-                         but ReaderWriter feature {offending:?} is listed in writerFeatures and \
-                         missing from readerFeatures \
-                         (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
-                         minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
-                    )));
+                //
+                // ColumnMapping is the exception. An upgrade to (3, 7) can leave it in
+                // writerFeatures while readerFeatures ends up empty, and the table still reads
+                // correctly because the mode comes from writerFeatures rather than the reader list.
+                // delta-spark accepts that shape, so we accept it too and only warn.
+                // The strict reading (PROTOCOL.md: "Reader Version 3 with the columnMapping table
+                // feature listed as supported") would resolve logical names against physical-named
+                // data and return nulls, so it is the wrong behavior here.
+                for feature in writer_features.iter() {
+                    let orphaned_reader_writer_feature =
+                        matches!(feature.feature_type(), FeatureType::ReaderWriter)
+                            && !reader_features.contains(feature);
+                    if !orphaned_reader_writer_feature {
+                        continue;
+                    }
+                    if LEGACY_READER_FEATURES.contains(feature) {
+                        warn!(
+                            "ReaderWriter feature {feature:?} is listed in writerFeatures but \
+                             missing from readerFeatures at minReaderVersion={min_reader_version}; \
+                             treating it as reader-enabled (malformed protocol)"
+                        );
+                    } else {
+                        return Err(Error::invalid_protocol(format!(
+                            "Writer features must be Writer-only or also listed in reader features, \
+                             but ReaderWriter feature {feature:?} is listed in writerFeatures and \
+                             missing from readerFeatures \
+                             (readerFeatures={reader_features:?}, \
+                             writerFeatures={writer_features:?}, \
+                             minReaderVersion={min_reader_version}, \
+                             minWriterVersion={min_writer_version})"
+                        )));
+                    }
                 }
                 Ok(())
             }
