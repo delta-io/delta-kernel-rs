@@ -53,11 +53,35 @@ use crate::{DeltaResult, Engine, Error};
 pub struct Ready;
 
 /// State after at least one schema operation has been added. `build()` is available.
+///
+/// Feature operations are unavailable once schema modification begins:
+///
+/// ```compile_fail
+/// # use delta_kernel::table_features::TableFeature;
+/// # use delta_kernel::transaction::builder::alter_table::{
+/// #     AlterTableTransactionBuilder, Modifying,
+/// # };
+/// # fn cannot_add_feature(builder: AlterTableTransactionBuilder<Modifying>) {
+/// builder.add_table_feature(TableFeature::DeletionVectors);
+/// # }
+/// ```
 /// See [`Chainable`] for the operations available on this state.
 pub struct Modifying;
 
 /// State after at least one table feature has been added. `build()` is available, but schema
 /// operations are not.
+///
+/// Schema operations are unavailable once feature addition begins:
+///
+/// ```compile_fail
+/// # use delta_kernel::schema::{DataType, StructField};
+/// # use delta_kernel::transaction::builder::alter_table::{
+/// #     AddingFeatures, AlterTableTransactionBuilder,
+/// # };
+/// # fn cannot_add_column(builder: AlterTableTransactionBuilder<AddingFeatures>) {
+/// builder.add_column(StructField::nullable("value", DataType::INTEGER));
+/// # }
+/// ```
 pub struct AddingFeatures;
 
 /// Marker trait for builder states that accept chainable schema operations. Grouping states
