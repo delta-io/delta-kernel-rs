@@ -545,6 +545,28 @@ impl TableConfiguration {
         &self.table_properties
     }
 
+    /// Returns the configured physical names of the materialized row ID and row commit version
+    /// columns, in that order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either required table property is absent.
+    pub(crate) fn materialized_row_tracking_column_names(&self) -> DeltaResult<(&str, &str)> {
+        let row_id_name = self
+            .table_properties
+            .materialized_row_id_column_name
+            .as_deref()
+            .ok_or_else(|| Error::missing_data("missing materialized row ID column name"))?;
+        let row_commit_version_name = self
+            .table_properties
+            .materialized_row_commit_version_column_name
+            .as_deref()
+            .ok_or_else(|| {
+                Error::missing_data("missing materialized row commit version column name")
+            })?;
+        Ok((row_id_name, row_commit_version_name))
+    }
+
     /// Whether this table is catalog-managed (has the CatalogManaged or CatalogOwnedPreview
     /// table feature).
     #[internal_api]

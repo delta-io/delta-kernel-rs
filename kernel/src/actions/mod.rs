@@ -827,6 +827,8 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
+    /// String tags describing protocol-relevant properties of this commit.
+    pub(crate) tags: Option<HashMap<String, String>>,
 }
 
 impl CommitInfo {
@@ -846,6 +848,7 @@ impl CommitInfo {
             is_blind_append: is_blind_append.then_some(true),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
+            tags: None,
         }
     }
 }
@@ -1776,6 +1779,10 @@ mod tests {
                 StructField::nullable("isBlindAppend", DataType::BOOLEAN),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
+                StructField::nullable(
+                    "tags",
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                ),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -2090,6 +2097,10 @@ mod tests {
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
 
+        let mut map_builder = create_string_map_builder(false);
+        map_builder.append(false).unwrap();
+        let tags = Arc::new(map_builder.finish());
+
         let expected = RecordBatch::try_new(
             record_batch.schema(),
             vec![
@@ -2101,6 +2112,7 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![None::<bool>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
+                tags,
             ],
         )
         .unwrap();

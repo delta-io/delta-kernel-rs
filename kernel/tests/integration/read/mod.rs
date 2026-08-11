@@ -2000,7 +2000,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         (
             "row_commit_version",
             MetadataColumnSpec::RowCommitVersion,
-            "Row commit versions not supported",
+            "Row commit versions are not enabled on this table",
         ),
     ];
 

@@ -52,6 +52,11 @@ pub(crate) enum FieldTransformSpec {
         /// column name which contains row indexes
         row_index_field_name: String,
     },
+    /// Generate the stable row commit version column.
+    GenerateRowCommitVersion {
+        /// Column name which should contain the stable row commit version.
+        field_name: String,
+    },
     /// Insert a partition column after the named input column.
     /// The partition column is identified by its field index in the logical table schema.
     /// Its value varies from file to file and is obtained from file metadata.
@@ -111,6 +116,7 @@ pub(crate) fn parse_partition_values(
             FieldTransformSpec::DynamicColumn { .. }
             | FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::GenerateRowId { .. }
+            | FieldTransformSpec::GenerateRowCommitVersion { .. }
             | FieldTransformSpec::StaticDrop { .. } => None,
         })
         .try_collect()
@@ -126,6 +132,7 @@ pub(crate) fn get_transform_expr(
     mut metadata_values: HashMap<usize, (String, Scalar)>,
     physical_schema: &StructType,
     base_row_id: Option<i64>,
+    default_row_commit_version: Option<i64>,
 ) -> DeltaResult<ExpressionRef> {
     let mut patch = ExpressionStructPatchBuilder::new();
 
@@ -146,6 +153,18 @@ pub(crate) fn get_transform_expr(
                 let expr = Arc::new(Expression::coalesce([
                     col!(field_name),
                     lit(base_row_id) + col!(row_index_field_name),
+                ]));
+                patch.replace(field_name.clone(), expr)
+            }
+            GenerateRowCommitVersion { field_name } => {
+                let default_row_commit_version = default_row_commit_version.ok_or_else(|| {
+                    Error::generic(
+                        "Asked to generate row commit versions, but no defaultRowCommitVersion found.",
+                    )
+                })?;
+                let expr = Arc::new(Expression::coalesce([
+                    col!(field_name),
+                    lit(default_row_commit_version),
                 ]));
                 patch.replace(field_name.clone(), expr)
             }
@@ -395,6 +414,7 @@ mod tests {
             partition_values,
             &physical_schema,
             None, /* base_row_id */
+            None, /* default_row_commit_version */
         );
         assert_result_error_with_message(result, "missing partition value");
     }
@@ -423,6 +443,7 @@ mod tests {
             metadata_values,
             &physical_schema,
             None, /* base_row_id */
+            None, /* default_row_commit_version */
         )
         .unwrap();
 
@@ -465,6 +486,7 @@ mod tests {
             metadata_values,
             &physical_schema,
             None, /* base_row_id */
+            None, /* default_row_commit_version */
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -513,6 +535,7 @@ mod tests {
             metadata_values,
             &physical_schema,
             None, /* base_row_id */
+            None, /* default_row_commit_version */
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -551,6 +574,7 @@ mod tests {
             metadata_values,
             &physical_schema,
             None, /* base_row_id */
+            None, /* default_row_commit_version */
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -591,6 +615,7 @@ mod tests {
             metadata_values,
             &physical_schema,
             None, /* base_row_id */
+            None, /* default_row_commit_version */
         );
         assert_result_error_with_message(result, "missing partition value for dynamic column");
     }
@@ -614,6 +639,7 @@ mod tests {
             metadata_values,
             &physical_schema,
             Some(4), /* base_row_id */
+            None,    /* default_row_commit_version */
         );
         let patch_expr = result.expect("StructPatch expression should be created successfully");
 
@@ -660,6 +686,7 @@ mod tests {
                 metadata_values,
                 &physical_schema,
                 None, /* base_row_id */
+                None, /* default_row_commit_version */
             ),
             "Asked to generate RowIds, but no baseRowId found",
         );

@@ -121,6 +121,7 @@ pub(crate) fn get_cdf_transform_expr(
         partition_values,
         physical_schema,
         None, /* base_row_id */
+        None, /* default_row_commit_version */
     )
     .map(Some)
 }

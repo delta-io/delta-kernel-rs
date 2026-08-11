@@ -171,6 +171,7 @@ impl CreateTableTransaction {
             user_domain_removals: vec![],
             data_change: true,
             column_defaults_acknowledged: false,
+            row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
