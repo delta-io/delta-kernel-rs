@@ -384,6 +384,7 @@ mod tests {
         struct_list_fixture, struct_list_fixture_opt, CollectNVisitor,
     };
     use crate::engine_data::GetData;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     // =========================================================================
     // Scalar type tests
@@ -561,19 +562,10 @@ mod tests {
         assert_eq!(row1.values, vec![Some(30)]);
     }
 
-    /// `StructList` has no `Debug`, so unwrap the error by pattern rather than `expect_err`.
-    fn unwrap_err(result: DeltaResult<Option<StructList<'_>>>) -> Error {
-        match result {
-            Err(err) => err,
-            Ok(_) => panic!("expected an error"),
-        }
-    }
-
     #[test]
     fn test_get_struct_list_on_non_list_errors() {
         let array = LargeStringArray::from(vec![Some("hello")]);
-        let err = unwrap_err(array.get_struct_list(0, "f"));
-        assert!(matches!(err, Error::UnexpectedColumnType(_)));
+        assert_result_error_with_message(array.get_struct_list(0, "f"), "is not of type");
     }
 
     /// A non-struct element type is a type error for every row, including a null one -- the
@@ -588,8 +580,10 @@ mod tests {
         builder.append_value([Some("a")]);
         let list: ListArray = builder.finish();
 
-        let err = unwrap_err(list.get_struct_list(row, "arr"));
-        assert!(matches!(err, Error::UnexpectedColumnType(_)));
+        assert_result_error_with_message(
+            list.get_struct_list(row, "arr"),
+            "list values are not structs",
+        );
     }
 
     #[test]
