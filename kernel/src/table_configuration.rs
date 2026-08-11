@@ -253,27 +253,22 @@ impl TableConfiguration {
 
         // Note that while we could pick apart the protocol/metadata updates and validate them
         // individually, instead we re-parse so that we can recycle the try_new validation.
-        let protocol_changed = new_protocol.is_some();
-        let evolved = Self::try_new(
+        Self::try_new(
             new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
             new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
             table_configuration.table_root.clone(),
             new_version,
-        )?;
+        )
+    }
 
-        if protocol_changed {
-            // Validate dependencies for newly explicit features against the evolved metadata.
-            // This intentionally does not run the broad write-support gate: ADD FEATURE may
-            // preserve unsupported existing capabilities, and supporting a feature need not
-            // enable its property.
-            for feature in evolved.get_enabled_writer_features() {
-                if !table_configuration.is_feature_supported(&feature) {
-                    evolved.validate_feature_requirements(&feature)?;
-                }
+    /// Validate dependencies for features supported by this configuration but not by `previous`.
+    pub(crate) fn validate_added_feature_requirements(&self, previous: &Self) -> DeltaResult<()> {
+        for feature in self.get_enabled_writer_features() {
+            if !previous.is_feature_supported(&feature) {
+                self.validate_feature_requirements(&feature)?;
             }
         }
-
-        Ok(evolved)
+        Ok(())
     }
 
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately

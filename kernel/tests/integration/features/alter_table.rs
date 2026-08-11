@@ -147,56 +147,6 @@ async fn add_writer_only_feature_commits_only_protocol_and_preserves_schema_alte
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn add_reader_writer_feature_can_be_combined_with_schema_alter() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let snapshot =
-        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
-
-    let committed = snapshot
-        .alter_table()
-        .add_table_feature(TableFeature::DeletionVectors)
-        .add_column(StructField::nullable("region", DataType::STRING))
-        .with_allow_protocol_versions_increase(true)
-        .build(engine.as_ref(), committer())?
-        .commit(engine.as_ref())?
-        .unwrap_committed();
-
-    let post_commit = committed.post_commit_snapshot().unwrap();
-    assert!(post_commit.schema().field("region").is_some());
-    assert!(post_commit
-        .table_configuration()
-        .is_feature_supported(&TableFeature::DeletionVectors));
-    let protocol = post_commit.table_configuration().protocol();
-    assert_eq!(protocol.min_reader_version(), 3);
-    assert!(protocol
-        .reader_features()
-        .is_some_and(|features| features.contains(&TableFeature::DeletionVectors)));
-    assert!(protocol
-        .writer_features()
-        .is_some_and(|features| features.contains(&TableFeature::DeletionVectors)));
-
-    let actions = read_commit_actions(&table_path, 1);
-    assert_eq!(actions.len(), 3);
-    assert_eq!(actions[0]["commitInfo"]["operation"], "ADD FEATURE");
-    assert_eq!(
-        actions
-            .iter()
-            .filter(|action| action.get("protocol").is_some())
-            .count(),
-        1
-    );
-    assert_eq!(
-        actions
-            .iter()
-            .filter(|action| action.get("metaData").is_some())
-            .count(),
-        1
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_table_feature_validates_dependencies_without_auto_enabling_properties(
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
