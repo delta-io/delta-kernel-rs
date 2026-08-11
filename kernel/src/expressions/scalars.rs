@@ -276,7 +276,7 @@ impl StructData {
     /// [`ToSchema`](delta_kernel::schema::ToSchema) and `Into<Scalar>`. Does not re-validate types
     /// or lengths.
     #[internal_api]
-    pub(crate) fn from_values(schema: StructType, values: Vec<Scalar>) -> Self {
+    pub(crate) fn from_values_unchecked(schema: StructType, values: Vec<Scalar>) -> Self {
         Self {
             fields: schema.into_fields().collect(),
             values,

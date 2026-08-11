@@ -456,7 +456,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
             #(#field_types: Into<delta_kernel::expressions::Scalar>,)*
         {
             fn from(value: #struct_name) -> Self {
-                Self::from_values(
+                Self::from_values_unchecked(
                     <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
                     vec![ #(value.#field_idents.into()),* ],
                 )
