@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(max.metadata()["k"], MetadataValue::Number(7));
     }
 
-    /// Output nullability is fixed by the aggregate kind, independent of input nullability.
+    /// Aggregate outputs are always nullable, independent of input nullability.
     #[rstest::rstest]
     #[case::min(Agg::min(column_name!("a")), "a")]
     #[case::max(Agg::max(column_name!("a")), "a")]

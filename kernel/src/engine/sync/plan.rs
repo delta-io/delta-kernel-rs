@@ -357,13 +357,13 @@ fn eval_semi_join(
 ) -> DeltaResult<Vec<RecordBatch>> {
     let mut build_keys = HashSet::new();
     for batch in build {
-        build_keys.extend(encode_keys(batch, &join.build_keys)?);
+        build_keys.extend(encode_keys_as_rows(batch, &join.build_keys)?);
     }
 
     probe
         .iter()
         .map(|batch| {
-            let keep = encode_keys(batch, &join.probe_keys)?
+            let keep = encode_keys_as_rows(batch, &join.probe_keys)?
                 .into_iter()
                 .map(|key| join.inverted != build_keys.contains(&key));
             Ok(filter_record_batch(batch, &BooleanArray::from_iter(keep))?)
@@ -398,7 +398,7 @@ fn splice_file_constants(
 /// Encodes `columns` of `batch` as one comparable/hashable [`OwnedRow`] key per input row.
 ///
 /// Empty `columns` (e.g. ungrouped aggregation) yields a vec of empty keys that self-compare equal
-pub(super) fn encode_keys(
+pub(super) fn encode_keys_as_rows(
     batch: &RecordBatch,
     columns: &[ColumnName],
 ) -> DeltaResult<Vec<OwnedRow>> {
@@ -468,12 +468,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encode_keys_synthesizes_empty_keys_when_ungrouped() -> DeltaResult<()> {
+    fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> DeltaResult<()> {
         let batch = RecordBatch::try_from_iter([(
             "x",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
         )])?;
-        let keys = encode_keys(&batch, &[])?;
+        let keys = encode_keys_as_rows(&batch, &[])?;
         assert_eq!(keys.len(), 3);
         assert!(keys.iter().all(|key| key == &keys[0]));
         Ok(())
