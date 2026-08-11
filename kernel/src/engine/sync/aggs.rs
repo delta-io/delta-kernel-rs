@@ -385,22 +385,26 @@ fn downcast_state_mut<T: 'static>(state: &mut dyn Any) -> DeltaResult<&mut T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::arrow::array::{BooleanArray, StringArray, StructArray};
     use crate::arrow::datatypes::Field;
+    use crate::arrow::util::pretty::pretty_format_batches;
     use crate::expressions::column_name;
     use crate::schema::schema_ref;
 
-    fn extract_string_column<'a>(
-        batch: &'a RecordBatch,
-        name: &ColumnName,
-    ) -> DeltaResult<&'a StringArray> {
-        let array = extract_column_ref(batch, name)?;
-        array.as_any().downcast_ref().ok_or_else(|| {
-            Error::generic(format!("Aggregate output `{name}` is not a STRING column"))
-        })
+    /// Asserts `batches` pretty-print equal to `expected`, sorting data rows so HashMap group order
+    /// does not matter. `expected` is the full pretty table (header, body, footer).
+    fn assert_eq_sorted_batches(batches: &[RecordBatch], expected: &str) {
+        let formatted = pretty_format_batches(batches).unwrap().to_string();
+        let sort_body = |s: &str| -> String {
+            let mut lines: Vec<_> = s.trim().lines().map(str::to_string).collect();
+            let len = lines.len();
+            if len > 3 {
+                lines[2..len - 1].sort_unstable();
+            }
+            lines.join("\n")
+        };
+        assert_eq!(sort_body(&formatted), sort_body(expected));
     }
 
     #[test]
@@ -454,38 +458,16 @@ mod tests {
             },
         };
 
-        let output = eval_aggregate(&aggregate, &[input])?;
-        let output = &output[0];
-        let groups = extract_string_column(output, &column_name!("group"))?;
-        let maximums = extract_string_column(output, &column_name!("maximum"))?;
-        let minimums = extract_string_column(output, &column_name!("minimum"))?;
-        let max_keys = extract_long_column(output, &column_name!("max_key"))?;
-        let min_keys = extract_long_column(output, &column_name!("min_key"))?;
-        let sum_keys = extract_long_column(output, &column_name!("sum_key"))?;
-        let qualified = extract_long_column(output, &column_name!("qualified"))?;
-        let rows = extract_long_column(output, &column_name!("rows"))?;
-        let results: HashMap<_, _> = (0..output.num_rows())
-            .map(|row| {
-                (
-                    groups.value(row),
-                    (
-                        maximums.is_valid(row).then(|| maximums.value(row)),
-                        minimums.is_valid(row).then(|| minimums.value(row)),
-                        max_keys.is_valid(row).then(|| max_keys.value(row)),
-                        min_keys.is_valid(row).then(|| min_keys.value(row)),
-                        sum_keys.is_valid(row).then(|| sum_keys.value(row)),
-                        qualified.value(row),
-                        rows.value(row),
-                    ),
-                )
-            })
-            .collect();
-
-        assert_eq!(
-            results["a"],
-            (Some("high"), Some("low"), Some(3), Some(1), Some(4), 2, 2)
+        assert_eq_sorted_batches(
+            &eval_aggregate(&aggregate, &[input])?,
+            "\
++-------+---------+---------+---------+---------+---------+-----------+------+
+| group | maximum | minimum | max_key | min_key | sum_key | qualified | rows |
++-------+---------+---------+---------+---------+---------+-----------+------+
+| a     | high    | low     | 3       | 1       | 4       | 2         | 2    |
+| b     |         |         |         |         |         | 0         | 1    |
++-------+---------+---------+---------+---------+---------+-----------+------+",
         );
-        assert_eq!(results["b"], (None, None, None, None, None, 0, 1));
         Ok(())
     }
 
@@ -527,18 +509,21 @@ mod tests {
             ("key", Arc::new(Int64Array::from(vec![2]))),
         ])?;
 
-        let output = eval_aggregate(&aggregate, &[first, second])?;
-        let output = &output[0];
-        let minimums = extract_string_column(output, &column_name!("minimum"))?;
-        let maximums = extract_string_column(output, &column_name!("maximum"))?;
-        assert_eq!(minimums.value(0), "low");
-        assert_eq!(maximums.value(0), "high");
+        assert_eq_sorted_batches(
+            &eval_aggregate(&aggregate, &[first, second])?,
+            "\
++---------+---------+
+| minimum | maximum |
++---------+---------+
+| low     | high    |
++---------+---------+",
+        );
         Ok(())
     }
 
     #[test]
-    fn empty_input_distinguishes_grouped_and_ungrouped_aggregates() -> DeltaResult<()> {
-        let ungrouped = Aggregate {
+    fn ungrouped_empty_input_emits_initial_aggregate_values() -> DeltaResult<()> {
+        let aggregate = Aggregate {
             group_by: vec![],
             aggs: vec![
                 Agg::min(column_name!("key")),
@@ -567,25 +552,21 @@ mod tests {
                 nullable "last": STRING,
             },
         };
-
-        let output = eval_aggregate(&ungrouped, &[])?;
-        let output = &output[0];
-        assert_eq!(output.num_rows(), 1);
-        assert!(extract_long_column(output, &column_name!("minimum"))?.is_null(0));
-        assert!(extract_long_column(output, &column_name!("maximum"))?.is_null(0));
-        assert!(extract_long_column(output, &column_name!("total"))?.is_null(0));
-        assert_eq!(
-            extract_long_column(output, &column_name!("qualified"))?.value(0),
-            0
+        assert_eq_sorted_batches(
+            &eval_aggregate(&aggregate, &[])?,
+            "\
++---------+---------+-------+-----------+------+-------+------+
+| minimum | maximum | total | qualified | rows | first | last |
++---------+---------+-------+-----------+------+-------+------+
+|         |         |       | 0         | 0    |       |      |
++---------+---------+-------+-----------+------+-------+------+",
         );
-        assert_eq!(
-            extract_long_column(output, &column_name!("rows"))?.value(0),
-            0
-        );
-        assert!(extract_string_column(output, &column_name!("first"))?.is_null(0));
-        assert!(extract_string_column(output, &column_name!("last"))?.is_null(0));
+        Ok(())
+    }
 
-        let grouped = Aggregate {
+    #[test]
+    fn grouped_empty_input_emits_no_rows() -> DeltaResult<()> {
+        let aggregate = Aggregate {
             group_by: vec![column_name!("group")],
             aggs: vec![Agg::max(column_name!("key"))],
             schema: schema_ref! {
@@ -593,7 +574,95 @@ mod tests {
                 nullable "max_key": LONG,
             },
         };
-        assert!(eval_aggregate(&grouped, &[])?.is_empty());
+        assert!(eval_aggregate(&aggregate, &[])?.is_empty());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::all_null(
+        &[None, None],
+        "\
++-------+-----------+------+
+| total | non_nulls | rows |
++-------+-----------+------+
+|       | 0         | 2    |
++-------+-----------+------+"
+    )]
+    #[case::some_null(
+        &[None, Some(3), Some(1)],
+        "\
++-------+-----------+------+
+| total | non_nulls | rows |
++-------+-----------+------+
+| 4     | 2         | 3    |
++-------+-----------+------+"
+    )]
+    #[case::all_non_null(
+        &[Some(3), Some(1), Some(2)],
+        "\
++-------+-----------+------+
+| total | non_nulls | rows |
++-------+-----------+------+
+| 6     | 3         | 3    |
++-------+-----------+------+"
+    )]
+    fn sum_and_count_null_patterns(
+        #[case] values: &[Option<i64>],
+        #[case] expected: &str,
+    ) -> DeltaResult<()> {
+        let input = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
+        )])?;
+        let aggregate = Aggregate {
+            group_by: vec![],
+            aggs: vec![
+                Agg::sum(column_name!("value")),
+                Agg::count(column_name!("value")),
+                Agg::count_star(),
+            ],
+            schema: schema_ref! {
+                nullable "total": LONG,
+                not_null "non_nulls": LONG,
+                not_null "rows": LONG,
+            },
+        };
+        assert_eq_sorted_batches(&eval_aggregate(&aggregate, &[input])?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn count_over_struct_counts_non_null_structs() -> DeltaResult<()> {
+        let nested = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", ArrowDataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+        )]));
+        // Make the middle struct itself NULL while keeping child arrays aligned.
+        let validity = crate::arrow::buffer::BooleanBuffer::from(vec![true, false, true]);
+        let structs = Arc::new(StructArray::new(
+            nested.fields().clone(),
+            nested.columns().to_vec(),
+            Some(crate::arrow::buffer::NullBuffer::new(validity)),
+        ));
+        let input = RecordBatch::try_from_iter([("payload", structs as ArrayRef)])?;
+        let aggregate = Aggregate {
+            group_by: vec![],
+            aggs: vec![Agg::count(column_name!("payload")), Agg::count_star()],
+            schema: schema_ref! {
+                not_null "payloads": LONG,
+                not_null "rows": LONG,
+            },
+        };
+
+        assert_eq_sorted_batches(
+            &eval_aggregate(&aggregate, &[input])?,
+            "\
++----------+------+
+| payloads | rows |
++----------+------+
+| 2        | 3    |
++----------+------+",
+        );
         Ok(())
     }
 
@@ -646,23 +715,14 @@ mod tests {
             },
         };
 
-        let output = eval_aggregate(&aggregate, &[input])?;
-        let output = &output[0];
-        assert_eq!(
-            extract_string_column(output, &column_name!("group"))?.value(0),
-            "nested_group"
-        );
-        assert_eq!(
-            extract_long_column(output, &column_name!("minimum"))?.value(0),
-            7
-        );
-        assert_eq!(
-            extract_long_column(output, &column_name!("qualified"))?.value(0),
-            1
-        );
-        assert_eq!(
-            extract_string_column(output, &column_name!("winner"))?.value(0),
-            "nested_value"
+        assert_eq_sorted_batches(
+            &eval_aggregate(&aggregate, &[input])?,
+            "\
++--------------+---------+-----------+--------------+
+| group        | minimum | qualified | winner       |
++--------------+---------+-----------+--------------+
+| nested_group | 7       | 1         | nested_value |
++--------------+---------+-----------+--------------+",
         );
         Ok(())
     }
@@ -689,8 +749,15 @@ mod tests {
             },
         };
 
-        let output = eval_aggregate(&aggregate, &[input])?;
-        assert!(extract_string_column(&output[0], &column_name!("winner"))?.is_null(0));
+        assert_eq_sorted_batches(
+            &eval_aggregate(&aggregate, &[input])?,
+            "\
++--------+
+| winner |
++--------+
+|        |
++--------+",
+        );
         Ok(())
     }
 }

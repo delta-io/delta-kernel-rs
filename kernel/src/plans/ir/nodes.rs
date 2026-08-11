@@ -742,10 +742,11 @@ impl Agg {
         input_schema: &StructType,
         alias: Option<String>,
     ) -> DeltaResult<StructField> {
-        let resolve = |value: &ColumnName, data_type: Option<DataType>, nullable: bool| {
+        // `output_data_type: None` preserves the input field's type and metadata; `Some` overrides
+        // the type and strips metadata (new column).
+        let resolve = |value: &ColumnName, output_data_type: Option<DataType>, nullable: bool| {
             let field = input_schema.field_at(value)?;
-            // Overriding the data type also strips metadata because we're creating a new column.
-            let (data_type, metadata) = match data_type {
+            let (data_type, metadata) = match output_data_type {
                 Some(data_type) => (data_type, HashMap::new()),
                 None => (field.data_type.clone(), field.metadata.clone()),
             };
