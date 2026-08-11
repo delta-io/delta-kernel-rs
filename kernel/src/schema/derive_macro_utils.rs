@@ -10,6 +10,16 @@ use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
 
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
+///
+/// # Warning
+///
+/// If a type implementing this trait also implements `Into<Scalar>`, then for every value `v`, the
+/// scalar `s: Scalar = v.into()` **must** satisfy:
+/// - `!s.is_null()`, and
+/// - `s.data_type() == Self::to_data_type()`.
+///
+/// `IntoScalar` automatically marks every type with both impls, and infallible conversions like
+/// `impl<T: IntoScalar> From<Vec<T>> for Scalar` rely on this contract without runtime validation.
 #[internal_api]
 pub(crate) trait ToDataType {
     fn to_data_type() -> DataType;

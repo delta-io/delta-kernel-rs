@@ -8,9 +8,9 @@ use std::sync::Arc;
 use strum::Display;
 use url::Url;
 
-use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
+use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
 use crate::transforms::SchemaTransform as _;
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error, FileMeta};
@@ -275,6 +275,19 @@ impl Values {
             schema: schema.into(),
             rows,
         }
+    }
+}
+
+/// Collect POD rows into a [`Values`] node.
+///
+/// Schema comes from [`ToSchema`]. Each row is converted via [`Into<StructData>`] and peeled into
+/// top-level field scalars (nested fields remain [`Scalar::Struct`]).
+impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let rows = iter
+            .into_iter()
+            .map(|row| StructData::into_values(row.into()));
+        Self::new(Arc::new(T::to_schema()), rows.collect())
     }
 }
 
@@ -866,6 +879,8 @@ pub struct UnionAll;
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel_derive::{IntoStructData, ToSchema};
+
     use super::*;
     use crate::expressions::column_name;
     use crate::schema::{DataType, StructField};
@@ -983,5 +998,47 @@ mod tests {
             .max_non_null_by(column_name!("a"), column_name!("missing"))
             .build();
         assert_result_error_with_message(result, "missing");
+    }
+
+    #[derive(Debug, ToSchema, IntoStructData)]
+    struct Address {
+        city: String,
+    }
+
+    #[derive(Debug, ToSchema, IntoStructData)]
+    struct Person {
+        id: i32,
+        address: Address,
+    }
+
+    #[test]
+    fn values_from_iter_peels_top_level_and_keeps_nested_struct() {
+        let values = Values::from_iter([Person {
+            id: 1,
+            address: Address { city: "NYC".into() },
+        }]);
+
+        assert_eq!(
+            values
+                .schema
+                .fields()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["id", "address"]
+        );
+        assert_eq!(values.rows.len(), 1);
+        assert_eq!(values.rows[0].len(), 2);
+        assert_eq!(values.rows[0][0], Scalar::Integer(1));
+        let Scalar::Struct(address) = &values.rows[0][1] else {
+            panic!("expected nested Struct for address");
+        };
+        assert_eq!(address.values(), &[Scalar::String("NYC".into())]);
+    }
+
+    #[test]
+    fn values_from_iter_empty_still_carries_schema() {
+        let values: Values = std::iter::empty::<Person>().collect();
+        assert!(values.rows.is_empty());
+        assert_eq!(values.schema.num_fields(), 2);
     }
 }

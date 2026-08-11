@@ -44,8 +44,8 @@ use super::ir::nodes::{
     ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
-use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::SchemaRef;
+use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
+use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
@@ -200,11 +200,7 @@ impl PlanBuilder {
                 )));
             }
         }
-        if rows.is_empty() {
-            return Ok(Self::absent(schema));
-        }
-        let op = Values::new(schema, rows);
-        Ok(Self::present(op.schema.clone(), op, vec![]))
+        Ok(Values::new(schema, rows).into())
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -574,6 +570,25 @@ impl PlanBuilder {
     }
 }
 
+/// A literal relation. Empty rows is the absent relation, which the builder eliminates as dead
+/// code (see the module docs).
+impl From<Values> for PlanBuilder {
+    fn from(values: Values) -> Self {
+        match values.rows.is_empty() {
+            true => Self::absent(values.schema),
+            false => Self::present(values.schema.clone(), values, vec![]),
+        }
+    }
+}
+
+/// A literal relation over POD rows, whose schema and values come from the same
+/// [`ToSchema`] / [`Into<StructData>`] pairing. See [`Values`]'s own [`FromIterator`].
+impl<T: Into<StructData> + ToSchema> FromIterator<T> for PlanBuilder {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Values::from_iter(iter).into()
+    }
+}
+
 /// Error if any of `cols` fails to resolve against `schema` (nested paths supported).
 fn check_columns_resolve<'a>(
     schema: &SchemaRef,
@@ -617,6 +632,8 @@ fn check_file_constant_columns<'a>(
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel_derive::{IntoStructData, ToSchema};
+
     use super::*;
     use crate::expressions::{col, column_name, lit, Expression};
     use crate::plans::ir::nodes::{FileType, LoadColumnFileMeta};
@@ -702,6 +719,28 @@ mod tests {
         let src = scan(id_schema());
         assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
+    }
+
+    #[derive(ToSchema, IntoStructData)]
+    struct IdRow {
+        id: i32,
+    }
+
+    #[test]
+    fn values_from_iter_builds_present_relation() -> DeltaResult<()> {
+        let plan = PlanBuilder::from_iter([IdRow { id: 7 }]).build()?;
+        let Operator::Values(values) = &plan.nodes[0].op else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.rows, vec![vec![Scalar::Integer(7)]]);
+        Ok(())
+    }
+
+    #[test]
+    fn values_from_iter_empty_is_absent() -> DeltaResult<()> {
+        let builder = PlanBuilder::from_iter(std::iter::empty::<IdRow>());
+        assert!(builder.build_opt()?.is_none());
+        Ok(())
     }
 
     /// `{ id, part }`, with `part` used as a file-constant column.
