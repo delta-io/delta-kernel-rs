@@ -269,7 +269,7 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
     assert!(plan
         .nodes
         .iter()
-        .all(|node| !matches!(&node.op, Operator::Load(_))));
+        .all(|node| !matches!(&node.op, Operator::DynamicScan(_))));
     assert!(plan.nodes.iter().any(|node| {
         let Operator::ScanParquet(scan) = &node.op else {
             return false;

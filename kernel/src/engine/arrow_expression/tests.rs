@@ -601,7 +601,7 @@ fn test_logical() {
     let expected = BooleanArray::from(vec![t, f, f, f, n, f]);
     assert_eq!(results, expected);
 
-    let pred_and_lit = Pred::and(column_a.clone(), Pred::literal(true));
+    let pred_and_lit = Pred::and(column_a.clone(), Pred::TRUE);
     let results = evaluate_predicate(&pred_and_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
@@ -611,7 +611,7 @@ fn test_logical() {
     let expected = BooleanArray::from(vec![t, t, t, f, t, n]);
     assert_eq!(results, expected);
 
-    let pred_or_lit = Pred::or(column_a.clone(), Pred::literal(false));
+    let pred_or_lit = Pred::or(column_a.clone(), Pred::FALSE);
     let results = evaluate_predicate(&pred_or_lit, &batch, false).unwrap();
     let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);

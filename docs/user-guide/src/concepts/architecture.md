@@ -273,7 +273,7 @@ The project is organized into several crates:
 | `delta_kernel_derive` | Procedural macros for internal code generation |
 | `delta_kernel_unity_catalog` | Unity Catalog integration for catalog-managed tables (see [Unity Catalog Integration](../unity_catalog/overview.md)) |
 | `unity_catalog_delta_client_api` | Trait definitions for Unity Catalog client implementations |
-| `unity_catalog_delta_client_default` | REST-based Unity Catalog client built on the client API |
+| `unity_catalog_delta_rest_client` | REST-based Unity Catalog client built on the client API |
 | `acceptance` | Delta Acceptance Tests (DAT) validation suite |
 | `test_utils` | Shared test utilities |
 | `feature_tests` | Feature flag compatibility tests |

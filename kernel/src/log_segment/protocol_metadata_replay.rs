@@ -12,8 +12,6 @@ use crate::actions::{Metadata, Protocol, METADATA_FIELD, PROTOCOL_FIELD};
 #[cfg(feature = "declarative-plans")]
 use crate::actions::{METADATA_NAME, PROTOCOL_NAME};
 use crate::crc::Crc;
-#[cfg(feature = "declarative-plans")]
-use crate::expressions::ColumnName;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::ProtocolMetadataSource;
 #[cfg(feature = "declarative-plans")]
@@ -177,8 +175,8 @@ impl LogSegment {
 
         let plan = PlanBuilder::union_all(std::iter::once(commits).chain(checkpoint))?
             .aggregate_ungrouped(|a| {
-                a.max_non_null_by(ColumnName::new([PROTOCOL_NAME]), column_name!("version"))
-                    .max_non_null_by(ColumnName::new([METADATA_NAME]), column_name!("version"))
+                a.max_non_null_by(column_name!(PROTOCOL_NAME), column_name!("version"))
+                    .max_non_null_by(column_name!(METADATA_NAME), column_name!("version"))
             })?
             .build()?;
 

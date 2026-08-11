@@ -6,9 +6,13 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
 
-async fn build_scan_over_interval_table(
-    name: &str,
-    interval: DataType,
+#[rstest::rstest]
+#[case::year_month("interval_read_ym", DataType::INTERVAL_YEAR_MONTH)]
+#[case::day_time("interval_read_dt", DataType::INTERVAL_DAY_TIME)]
+#[tokio::test]
+async fn test_build_scan_over_interval_table(
+    #[case] name: &str,
+    #[case] interval: DataType,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "iv", interval,
@@ -18,17 +22,5 @@ async fn build_scan_over_interval_table(
 
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
     snapshot.scan_builder().build()?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_scan_interval_table_is_not_gated_by_cargo_feature(
-) -> Result<(), Box<dyn std::error::Error>> {
-    for (name, interval) in [
-        ("interval_read_ym", DataType::INTERVAL_YEAR_MONTH),
-        ("interval_read_dt", DataType::INTERVAL_DAY_TIME),
-    ] {
-        build_scan_over_interval_table(name, interval).await?;
-    }
     Ok(())
 }

@@ -232,7 +232,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::expressions::BinaryExpressionOp;
+    use crate::expressions::{col, BinaryExpressionOp};
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::unit_test_utils::assert_result_error_with_message;
 
@@ -627,12 +627,8 @@ mod tests {
         assert!(!row_id_patch.keep_input);
 
         let expected_expr = Arc::new(Expression::coalesce([
-            Expression::column(["row_id_col"]),
-            Expression::binary(
-                BinaryExpressionOp::Plus,
-                Expression::literal(4i64),
-                Expression::column(["row_index_col"]),
-            ),
+            col!("row_id_col"),
+            Expression::binary(BinaryExpressionOp::Plus, lit(4i64), col!("row_index_col")),
         ]));
         let expr = &row_id_patch.insertions[0];
         assert_eq!(expr, &expected_expr);

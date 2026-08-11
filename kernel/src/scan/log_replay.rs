@@ -737,6 +737,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
 }
 
 pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
+pub(crate) static PATH_NAME: &str = "path";
 pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
 pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
 pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
@@ -753,7 +754,7 @@ pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
     schema_ref! {
-        nullable "path": STRING,
+        nullable PATH_NAME: STRING,
         nullable SIZE_NAME: LONG,
         nullable "modificationTime": LONG,
         nullable "stats": STRING,
@@ -834,11 +835,8 @@ fn get_add_transform_expr(
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
-            Expression::column(["add", "stats"]),
-            Expression::unary(
-                UnaryExpressionOp::ToJson,
-                Expression::column(["add", "stats_parsed"]),
-            ),
+            col!("add.stats"),
+            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
@@ -1421,11 +1419,11 @@ mod tests {
                 assert_eq!(row_id_patch.insertions.len(), 1);
                 let expr = &row_id_patch.insertions[0];
                 let expected_expr = Arc::new(Expr::coalesce([
-                    Expr::column(["row_id_col"]),
+                    col!("row_id_col"),
                     Expr::binary(
                         BinaryExpressionOp::Plus,
-                        Expr::literal(42i64),
-                        Expr::column(["row_indexes_for_row_id_0"]),
+                        lit(42i64),
+                        col!("row_indexes_for_row_id_0"),
                     ),
                 ]));
                 assert_eq!(expr, &expected_expr);
@@ -1497,10 +1495,7 @@ mod tests {
             StructField::new("id", DataType::INTEGER, true),
             StructField::new("value", DataType::STRING, true),
         ]));
-        let predicate = Arc::new(crate::expressions::Predicate::eq(
-            Expr::column(["id"]),
-            Expr::literal(10i32),
-        ));
+        let predicate = Arc::new(crate::expressions::Predicate::eq(col!("id"), lit(10i32)));
         let state_info = Arc::new(
             get_state_info(
                 schema.clone(),

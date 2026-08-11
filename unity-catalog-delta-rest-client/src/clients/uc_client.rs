@@ -1,20 +1,35 @@
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::StatusCode;
 use tracing::instrument;
 use unity_catalog_delta_client_api::{
-    CatalogConfig, CommitReport, CredentialsResponse, LoadTableResponse, MetricsReport, Operation,
+    CatalogConfig, CommitReport, CreateStagingTableRequest, CreateStagingTableResponse,
+    CreateTableRequest, CredentialsResponse, LoadTableResponse, MetricsReport, Operation,
     ReportMetricsRequest,
 };
 use url::Url;
 
 use crate::config::ClientConfig;
 use crate::error::Result;
-use crate::http::{build_http_client, execute_with_retry, handle_empty_response, handle_response};
+use crate::http::{
+    build_http_client, execute_with_retry, execute_without_retry, handle_empty_response,
+    handle_response,
+};
+
+/// Percent-encodes a name for use as a single URL path segment.
+fn encode_segment(name: &str) -> impl std::fmt::Display + '_ {
+    utf8_percent_encode(name, NON_ALPHANUMERIC)
+}
 
 /// Builds the Delta-Tables per-table resource path
 /// (`delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}`) that the `load_table` and
 /// credential-vending endpoints share.
 fn table_path(catalog: &str, schema: &str, table: &str) -> String {
-    format!("delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}")
+    format!(
+        "delta/v1/catalogs/{}/schemas/{}/tables/{}",
+        encode_segment(catalog),
+        encode_segment(schema),
+        encode_segment(table)
+    )
 }
 
 /// An HTTP client for interacting with the Unity Catalog API.
@@ -133,5 +148,49 @@ impl UCClient {
         })
         .await?;
         handle_empty_response(response).await
+    }
+
+    /// `POST /delta/v1/catalogs/{catalog}/schemas/{schema}/staging-tables`: reserve a staging
+    /// table, allocating its UUID and storage location and returning temporary credentials for
+    /// the version 0 commit.
+    #[instrument(skip(self, request))]
+    pub async fn create_staging_table(
+        &self,
+        catalog: &str,
+        schema: &str,
+        request: CreateStagingTableRequest,
+    ) -> Result<CreateStagingTableResponse> {
+        let path = format!(
+            "delta/v1/catalogs/{}/schemas/{}/staging-tables",
+            encode_segment(catalog),
+            encode_segment(schema)
+        );
+        let url = self.base_url.join(&path)?;
+        let response =
+            execute_without_retry(|| self.http_client.post(url.clone()).json(&request).send())
+                .await?;
+        handle_response(response).await
+    }
+
+    /// `POST /delta/v1/catalogs/{catalog}/schemas/{schema}/tables`: register a table with the
+    /// catalog after its version 0 commit, promoting the staging table. Returns the registered
+    /// table as a `LoadTableResponse`.
+    #[instrument(skip(self, request))]
+    pub async fn create_table(
+        &self,
+        catalog: &str,
+        schema: &str,
+        request: CreateTableRequest,
+    ) -> Result<LoadTableResponse> {
+        let path = format!(
+            "delta/v1/catalogs/{}/schemas/{}/tables",
+            encode_segment(catalog),
+            encode_segment(schema)
+        );
+        let url = self.base_url.join(&path)?;
+        let response =
+            execute_without_retry(|| self.http_client.post(url.clone()).json(&request).send())
+                .await?;
+        handle_response(response).await
     }
 }

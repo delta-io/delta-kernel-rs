@@ -1435,8 +1435,8 @@ async fn removes_are_never_filtered_by_predicate() -> Result<(), Box<dyn std::er
 // stream, but Removes are still reported. A tautology (`id > 25 OR TRUE`) is useless for
 // skipping and behaves like no predicate.
 #[rstest]
-#[case::static_skip_all(Pred::and(col!("id").gt(lit(25i32)), Pred::literal(false)), 0)]
-#[case::tautology(Pred::or(col!("id").gt(lit(25i32)), Pred::literal(true)), 2)]
+#[case::static_skip_all(Pred::and(col!("id").gt(lit(25i32)), Pred::FALSE), 0)]
+#[case::tautology(Pred::or(col!("id").gt(lit(25i32)), Pred::TRUE), 2)]
 #[tokio::test]
 async fn static_skip_all_and_tautology(
     #[case] predicate: Pred,
@@ -1836,7 +1836,7 @@ async fn column_free_predicate_keeps_all_added_files() -> Result<(), Box<dyn std
         .at_version(1)
         .build(engine.as_ref())?;
 
-    let predicate: PredicateRef = Arc::new(Pred::literal(true));
+    let predicate: PredicateRef = Arc::new(Pred::TRUE);
     let listing = unwrap_listing(
         target
             .incremental_scan_builder(0)

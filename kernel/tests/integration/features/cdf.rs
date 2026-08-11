@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{col, lit, Predicate as Pred};
@@ -11,7 +12,8 @@ use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 use itertools::Itertools;
 use test_utils::{
-    add_commit, create_default_engine, create_table, engine_store_setup, load_test_data,
+    add_commit, create_default_engine, create_default_engine_with_batch, create_table,
+    engine_store_setup, load_test_data,
 };
 use url::Url;
 
@@ -21,10 +23,20 @@ fn read_cdf_for_table(
     end_version: impl Into<Option<Version>>,
     predicate: impl Into<Option<PredicateRef>>,
 ) -> DeltaResult<Vec<RecordBatch>> {
+    read_cdf_for_table_with_batch_size(test_name, start_version, end_version, predicate, None)
+}
+
+fn read_cdf_for_table_with_batch_size(
+    test_name: impl AsRef<str>,
+    start_version: Version,
+    end_version: impl Into<Option<Version>>,
+    predicate: impl Into<Option<PredicateRef>>,
+    batch_size: Option<usize>,
+) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
     let test_path = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string"))?;
-    let engine = test_utils::create_default_engine(&test_path)?;
+    let engine = create_default_engine_with_batch(&test_path, batch_size)?;
     let table_changes = TableChanges::try_new(
         test_path,
         engine.as_ref(),
@@ -53,7 +65,7 @@ fn read_cdf_for_table(
         .map(|data| -> DeltaResult<_> {
             let record_batch = data?.try_into_record_batch()?;
             // Verify that the arrow record batches match the expected schema
-            assert!(record_batch.schema().as_ref() == &scan_schema_as_arrow);
+            assert_eq!(record_batch.schema().as_ref(), &scan_schema_as_arrow);
             Ok(record_batch)
         })
         .try_collect()?;
@@ -103,6 +115,31 @@ fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
     ];
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
+    Ok(())
+}
+
+#[test]
+fn cdf_with_deletion_vector_is_batch_size_invariant() -> Result<(), Box<dyn error::Error>> {
+    let expected = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
+    for batch_size in [1usize, 2, 3, 4, 7] {
+        let actual = read_cdf_for_table_with_batch_size(
+            "cdf-table-with-dv",
+            0,
+            None,
+            None,
+            Some(batch_size),
+        )?;
+        let expected_rows: usize = expected.iter().map(RecordBatch::num_rows).sum();
+        let actual_rows: usize = actual.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            actual_rows, expected_rows,
+            "row count changed at batch_size={batch_size}: got {actual_rows}, want {expected_rows}"
+        );
+        let formatted = pretty_format_batches(&expected)?.to_string();
+        let mut expected_lines: Vec<&str> = formatted.trim().lines().collect();
+        sort_lines!(expected_lines);
+        assert_batches_sorted_eq!(expected_lines, &actual);
+    }
     Ok(())
 }
 

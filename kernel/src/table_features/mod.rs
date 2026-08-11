@@ -6,10 +6,11 @@ pub use column_mapping::ColumnMappingMode;
 #[internal_api]
 pub(crate) use column_mapping::{assign_column_mapping_metadata, find_max_column_id_in_schema};
 pub(crate) use column_mapping::{
-    column_mapping_mode, get_column_mapping_mode_from_properties, physical_to_logical_column_name,
-    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata,
-    try_assign_flat_column_mapping_info, validate_and_extract_column_mapping_annotations,
-    validate_column_mapping_id, StaleAnnotationPolicy,
+    column_mapping_mode, get_column_mapping_mode_from_properties,
+    physical_to_logical_column_name_and_type, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
+    validate_and_extract_column_mapping_annotations, validate_column_mapping_id,
+    StaleAnnotationPolicy,
 };
 use delta_kernel_derive::internal_api;
 #[cfg(feature = "geo-type-in-dev")]
