@@ -2428,6 +2428,17 @@ impl DataType {
     pub const INTERVAL_YEAR_MONTH: Self = DataType::Primitive(PrimitiveType::IntervalYearMonth);
     pub const INTERVAL_DAY_TIME: Self = DataType::Primitive(PrimitiveType::IntervalDayTime);
 
+    /// Compact type name for diagnostics that must not expand nested schemas.
+    pub(crate) fn kind_name(&self) -> String {
+        match self {
+            Self::Primitive(primitive) => primitive.to_string(),
+            Self::Array(_) => "array".to_string(),
+            Self::Struct(_) => "struct".to_string(),
+            Self::Map(_) => "map".to_string(),
+            Self::Variant(_) => "variant".to_string(),
+        }
+    }
+
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())

@@ -131,6 +131,7 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 ///   Currently this can _only_ be set on `HashMap` fields.
 /// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
 ///   derives `IntoEngineData` / `IntoStructData`, from the produced engine data / struct scalar).
+///   `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
 #[proc_macro_derive(
     ToSchema,
     attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
@@ -355,13 +356,23 @@ fn has_skip_schema(field: &Field) -> bool {
 
 /// Schema-facing fields of a named struct, in declaration order, with `#[skip_schema]` dropped.
 ///
-/// Shared by `ToSchema`, `IntoEngineData`, and `IntoStructData` so they cannot disagree on which
-/// fields participate (or in what order).
+/// Shared by all derives that walk a struct's fields, so they cannot disagree on which fields
+/// participate (or in what order).
 fn schema_fields<'a>(
     data: &'a Data,
     derive_name: &str,
     span: Span,
 ) -> Result<Vec<&'a Field>, Error> {
+    Ok(partition_fields(data, derive_name, span)?.0)
+}
+
+/// Splits a named struct's fields into schema-facing fields and `#[skip_schema]` fields, each in
+/// declaration order. Derives that must also account for skipped fields use this directly.
+fn partition_fields<'a>(
+    data: &'a Data,
+    derive_name: &str,
+    span: Span,
+) -> Result<(Vec<&'a Field>, Vec<&'a Field>), Error> {
     let Data::Struct(DataStruct {
         fields: Fields::Named(fields),
         ..
@@ -372,11 +383,22 @@ fn schema_fields<'a>(
             format!("{derive_name} can only be derived for structs with named fields"),
         ));
     };
-    Ok(fields
-        .named
-        .iter()
-        .filter(|f| !has_skip_schema(f))
-        .collect())
+    Ok(fields.named.iter().partition(|f| !has_skip_schema(f)))
+}
+
+fn try_from_struct_data_fields<'a>(
+    data: &'a Data,
+    derive_name: &str,
+    span: Span,
+) -> Result<Vec<&'a Field>, Error> {
+    let (fields, skipped) = partition_fields(data, derive_name, span)?;
+    if let Some(field) = skipped.first() {
+        return Err(Error::new(
+            field.span(),
+            "TryFromStructData does not support #[skip_schema] fields",
+        ));
+    }
+    Ok(fields)
 }
 
 fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
@@ -475,6 +497,89 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     };
 
     proc_macro::TokenStream::from(expanded)
+}
+
+/// Derive the inverse of [`IntoStructData`](macro@IntoStructData): `TryFrom` conversions from
+/// `StructData` and `Scalar` for a rust struct.
+///
+/// Emits both:
+/// - `TryFrom<StructData> for Self` — values matched by schema field name and converted via each
+///   field's `TryFrom<Scalar>`
+/// - `TryFrom<Scalar> for Self` — unwraps `Scalar::Struct`, else errors
+///
+/// Missing, duplicate, and unknown fields are errors. Every field type must implement
+/// `TryFrom<Scalar, Error = Error>`. `#[skip_schema]` is rejected because the reverse conversion
+/// cannot infer a value or schema for a field omitted by `ToSchema`.
+#[proc_macro_derive(TryFromStructData, attributes(skip_schema))]
+pub fn try_from_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    try_from_struct_data_impl(&input)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn try_from_struct_data_impl(input: &DeriveInput) -> Result<TokenStream, Error> {
+    let struct_name = &input.ident;
+    let fields = try_from_struct_data_fields(&input.data, "TryFromStructData", struct_name.span())?;
+    let (field_idents, field_types): (Vec<_>, Vec<_>) =
+        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+    let schema_field_names: Vec<_> = field_idents
+        .iter()
+        .map(|ident| ident.as_ref().map(get_schema_name))
+        .collect::<Option<_>>()
+        .ok_or_else(|| {
+            Error::new(
+                struct_name.span(),
+                "TryFromStructData can only be derived for structs with named fields",
+            )
+        })?;
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl TryFrom<delta_kernel::expressions::StructData> for #struct_name
+        where
+            #struct_name: delta_kernel::schema::ToSchema,
+            #(#field_types:
+                TryFrom<delta_kernel::expressions::Scalar, Error = delta_kernel::Error>,)*
+        {
+            type Error = delta_kernel::Error;
+
+            fn try_from(
+                value: delta_kernel::expressions::StructData,
+            ) -> delta_kernel::DeltaResult<Self> {
+                let mut fields =
+                    delta_kernel::schema::derive_macro_utils::StructDataFields::try_new(
+                        value,
+                        <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
+                    )?;
+                let result = Self {
+                    #(#field_idents: fields.take_field(stringify!(#schema_field_names))?,)*
+                };
+                fields.finish()?;
+                Ok(result)
+            }
+        }
+
+        #[automatically_derived]
+        impl TryFrom<delta_kernel::expressions::Scalar> for #struct_name
+        where
+            #struct_name: TryFrom<
+                delta_kernel::expressions::StructData,
+                Error = delta_kernel::Error,
+            >,
+        {
+            type Error = delta_kernel::Error;
+
+            fn try_from(
+                value: delta_kernel::expressions::Scalar,
+            ) -> delta_kernel::DeltaResult<Self> {
+                match value {
+                    delta_kernel::expressions::Scalar::Struct(data) => data.try_into(),
+                    other => Err(other.conversion_error(stringify!(#struct_name))),
+                }
+            }
+        }
+    })
 }
 
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
@@ -665,6 +770,27 @@ mod tests {
         assert!(
             !tokens.contains("skipped"),
             "skipped field must be absent: {tokens}"
+        );
+    }
+
+    #[test]
+    fn try_from_struct_data_rejects_skipped_field() {
+        let input = syn::parse_str::<DeriveInput>(
+            r#"
+            struct TestStruct {
+                #[skip_schema]
+                skipped: String,
+                kept: i32,
+            }
+            "#,
+        )
+        .unwrap();
+        let error =
+            try_from_struct_data_fields(&input.data, "TryFromStructData", input.ident.span())
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TryFromStructData does not support #[skip_schema] fields"
         );
     }
 

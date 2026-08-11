@@ -5,10 +5,12 @@
 
 use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
 use strum::Display;
 use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::error::add_scalar_path_context;
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
 use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema};
@@ -287,10 +289,27 @@ impl Values {
 /// top-level field scalars (nested fields remain [`Scalar::Struct`]).
 impl<T: Into<StructData> + ToSchema> FromIterator<T> for Values {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let rows = iter
-            .into_iter()
-            .map(|row| StructData::into_values(row.into()));
+        let rows = iter.into_iter().map(|row| row.into().into_parts().1);
         Self::new(Arc::new(T::to_schema()), rows.collect())
+    }
+}
+
+/// Inverse of [`FromIterator<T> for Values`]: rebuild each row as [`StructData`] and convert via
+/// [`TryFrom`].
+impl<T> TryFrom<Values> for Vec<T>
+where
+    T: TryFrom<StructData, Error = Error> + ToSchema,
+{
+    type Error = Error;
+
+    fn try_from(Values { schema, rows }: Values) -> DeltaResult<Self> {
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                T::try_from(StructData::from_values(schema.as_ref().clone(), row))
+                    .map_err(|error| add_scalar_path_context(error, format!("[{index}]")))
+            })
+            .try_collect()
     }
 }
 
@@ -990,7 +1009,7 @@ pub struct UnionAll;
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel_derive::{IntoStructData, ToSchema};
+    use delta_kernel_derive::{IntoStructData, ToSchema, TryFromStructData};
 
     use super::*;
     use crate::expressions::column_name;
@@ -1111,12 +1130,12 @@ mod tests {
         assert_result_error_with_message(result, "missing");
     }
 
-    #[derive(Debug, ToSchema, IntoStructData)]
+    #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
     struct Address {
         city: String,
     }
 
-    #[derive(Debug, ToSchema, IntoStructData)]
+    #[derive(Clone, Debug, PartialEq, ToSchema, IntoStructData, TryFromStructData)]
     struct Person {
         id: i32,
         address: Address,
@@ -1151,5 +1170,34 @@ mod tests {
         let values: Values = std::iter::empty::<Person>().collect();
         assert!(values.rows.is_empty());
         assert_eq!(values.schema.num_fields(), 2);
+    }
+
+    #[test]
+    fn values_round_trips_through_vec() {
+        let people = vec![
+            Person {
+                id: 1,
+                address: Address { city: "NYC".into() },
+            },
+            Person {
+                id: 2,
+                address: Address { city: "SF".into() },
+            },
+        ];
+        let values = Values::from_iter(people.clone());
+        assert_eq!(Vec::<Person>::try_from(values).unwrap(), people);
+    }
+
+    #[test]
+    fn values_conversion_adds_row_index_to_error_path() {
+        let mut values = Values::from_iter([Person {
+            id: 1,
+            address: Address { city: "NYC".into() },
+        }]);
+        values.rows[0][0] = Scalar::from("not an integer");
+        assert_result_error_with_message(
+            Vec::<Person>::try_from(values),
+            "[0].id: expected i32, found string",
+        );
     }
 }

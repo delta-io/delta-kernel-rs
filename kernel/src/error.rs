@@ -13,6 +13,71 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
+/// Details of a failed conversion from a scalar into a Rust value.
+///
+/// Conversion code adds path elements as an error unwinds, producing a path from the outermost
+/// value to the value that failed without carrying mutable path state through successful parsing.
+#[derive(Debug)]
+pub struct ScalarConversionError {
+    expected: String,
+    actual: String,
+    // Stored innermost-first because parent context is appended as conversion errors unwind.
+    path: Vec<String>,
+}
+
+impl ScalarConversionError {
+    pub(crate) fn new(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+        Self {
+            expected: expected.into(),
+            actual: actual.into(),
+            path: Vec::new(),
+        }
+    }
+
+    fn add_path_context(mut self, element: impl Into<String>) -> Self {
+        self.path.push(element.into());
+        self
+    }
+
+    fn path_string(&self) -> String {
+        let mut path = String::new();
+        for element in self.path.iter().rev() {
+            if !path.is_empty() && !element.starts_with('[') {
+                path.push('.');
+            }
+            path.push_str(element);
+        }
+        path
+    }
+}
+
+impl std::fmt::Display for ScalarConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut target = self.path_string();
+        if target.is_empty() {
+            target.push_str("scalar");
+        }
+        write!(
+            f,
+            "Cannot convert {target}: expected {}, found {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for ScalarConversionError {}
+
+/// Adds an outer path element to a scalar conversion error as nested conversion unwinds.
+///
+/// Other error variants are returned unchanged: a field's `TryFrom<Scalar>` implementation may
+/// report a failure unrelated to scalar shape, and this helper must not reclassify it.
+pub(crate) fn add_scalar_path_context(error: Error, element: impl Into<String>) -> Error {
+    match error {
+        Error::ScalarConversion(error) => Error::ScalarConversion(error.add_path_context(element)),
+        other => other,
+    }
+}
+
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
@@ -55,6 +120,10 @@ pub enum Error {
     /// Could not extract the specified type
     #[error("Error extracting type {0}: {1}")]
     Extract(&'static str, &'static str),
+
+    /// A scalar could not be converted into the requested Rust value.
+    #[error(transparent)]
+    ScalarConversion(#[from] ScalarConversionError),
 
     /// A generic error with a message
     #[error("Generic delta kernel error: {0}")]
@@ -282,6 +351,13 @@ pub enum Error {
 
 // Convenience constructors for Error types that take a String argument
 impl Error {
+    pub(crate) fn scalar_conversion(
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        ScalarConversionError::new(expected, actual).into()
+    }
+
     pub(crate) fn checkpoint_write(msg: impl ToString) -> Self {
         Self::CheckpointWrite(msg.to_string())
     }

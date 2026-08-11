@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use delta_kernel_derive::{internal_api, IntoEngineData, IntoStructData, ToSchema};
+use delta_kernel_derive::{
+    internal_api, IntoEngineData, IntoStructData, ToSchema, TryFromStructData,
+};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -277,7 +279,9 @@ pub(crate) fn as_log_add_schema(add_schema: SchemaRef) -> SchemaRef {
 }
 
 // Serde derives are needed for CRC file deserialization (see `crc::reader`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, TryFromStructData,
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Format {
@@ -2161,33 +2165,37 @@ mod tests {
         assert_ne!(m1.id, m2.id);
     }
 
-    #[test]
-    fn test_format_from_scalar() {
-        let options = HashMap::from([
-            ("path".to_string(), "/delta/table".to_string()),
-            ("compressionType".to_string(), "snappy".to_string()),
-        ]);
+    #[rstest]
+    #[case::typical(HashMap::from([
+        ("path".to_string(), "/delta/table".to_string()),
+        ("compressionType".to_string(), "snappy".to_string()),
+    ]))]
+    #[case::empty(HashMap::new())]
+    #[case::special_characters(HashMap::from([
+        ("path".to_string(), "/path/with spaces".to_string()),
+        ("unicode".to_string(), "测试🎉".to_string()),
+        ("empty".to_string(), String::new()),
+    ]))]
+    fn test_format_scalar_round_trip(#[case] options: HashMap<String, String>) {
         let format = Format {
             provider: "parquet".to_string(),
-            options,
+            options: options.clone(),
         };
-        let scalar = Scalar::from(format);
+        let scalar = Scalar::from(format.clone());
 
-        let Scalar::Struct(struct_data) = scalar else {
-            panic!("Expected struct scalar");
+        let Scalar::Struct(struct_data) = &scalar else {
+            panic!("Expected struct scalar, got {scalar}");
         };
-        assert_eq!(struct_data.fields()[0].name(), "provider");
-        assert_eq!(struct_data.fields()[1].name(), "options");
-
-        let Scalar::String(provider) = &struct_data.values()[0] else {
-            panic!("Expected string provider");
-        };
-        assert_eq!(provider, "parquet");
+        let field_names: Vec<_> = struct_data.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(field_names, ["provider", "options"]);
+        assert_eq!(struct_data.values()[0], Scalar::from("parquet"));
 
         let Scalar::Map(map_data) = &struct_data.values()[1] else {
             panic!("Expected map options");
         };
-        assert_eq!(map_data.pairs().len(), 2);
+        assert_eq!(map_data.pairs().len(), options.len());
+
+        assert_eq!(Format::try_from(scalar).unwrap(), format);
     }
 
     #[test]
@@ -2198,45 +2206,6 @@ mod tests {
             options: HashMap::new(),
         };
         assert_eq!(format, expected);
-    }
-
-    #[test]
-    fn test_format_empty_options() {
-        let format = Format {
-            provider: "parquet".to_string(),
-            options: HashMap::new(),
-        };
-        let scalar = Scalar::from(format);
-
-        let Scalar::Struct(struct_data) = scalar else {
-            panic!("Expected struct");
-        };
-        let Scalar::Map(map_data) = &struct_data.values()[1] else {
-            panic!("Expected map");
-        };
-        assert!(map_data.pairs().is_empty());
-    }
-
-    #[test]
-    fn test_format_special_characters() {
-        let options = HashMap::from([
-            ("path".to_string(), "/path/with spaces".to_string()),
-            ("unicode".to_string(), "测试🎉".to_string()),
-            ("empty".to_string(), "".to_string()),
-        ]);
-        let format = Format {
-            provider: "custom".to_string(),
-            options,
-        };
-        let scalar = Scalar::from(format);
-
-        let Scalar::Struct(struct_data) = scalar else {
-            panic!("Expected struct");
-        };
-        let Scalar::Map(map_data) = &struct_data.values()[1] else {
-            panic!("Expected map");
-        };
-        assert_eq!(map_data.pairs().len(), 3);
     }
 
     #[test]
