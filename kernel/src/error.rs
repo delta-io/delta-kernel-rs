@@ -383,6 +383,18 @@ impl Error {
         )
     }
 
+    /// Creates an incompatible-schema error for partition columns at a specific version.
+    pub(crate) fn change_data_feed_incompatible_partition_columns_at_version(
+        expected: &[String],
+        actual: &[String],
+        version: Version,
+    ) -> Self {
+        Self::ChangeDataFeedIncompatibleSchema(
+            format!("partition columns {expected:?}"),
+            format!("partition columns {actual:?} at version {version}"),
+        )
+    }
+
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {
         Self::InvalidCheckpoint(msg.to_string())
     }
