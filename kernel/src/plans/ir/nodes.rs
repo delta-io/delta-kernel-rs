@@ -281,7 +281,7 @@ impl Values {
     }
 }
 
-/// Collect POD rows into a [`Values`] node.
+/// Collect rows of `T` into a [`Values`] node.
 ///
 /// Schema comes from [`ToSchema`]. Each row is converted via [`Into<StructData>`] and peeled into
 /// top-level field scalars (nested fields remain [`Scalar::Struct`]).

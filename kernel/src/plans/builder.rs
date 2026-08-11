@@ -205,7 +205,7 @@ impl PlanBuilder {
         Ok(Values::new(schema, rows).into())
     }
 
-    /// Infallible sibling of [`Self::values`] for typed POD rows.
+    /// Infallible sibling of [`Self::values`] containing rows of `T` converted to scalar data.
     ///
     /// Schema is [`ToSchema::to_schema`] for `T`. Each row converts via [`Into<StructData>`] and is
     /// peeled into top-level field scalars (nested fields remain [`Scalar::Struct`]); see

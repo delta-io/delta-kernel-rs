@@ -428,7 +428,7 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     proc_macro::TokenStream::from(expanded)
 }
 
-/// Derive `From` conversions into `StructData` and `Scalar` for a POD struct.
+/// Derive `From` conversions into `StructData` and `Scalar` for a rust struct.
 ///
 /// Emits both:
 /// - `From<Self> for StructData` — field values via `.into()`, schema from `ToSchema`
