@@ -28,6 +28,11 @@ Delta-kernel-rs is split into a few different crates:
 - derive-macros: A crate for our [derive-macros] to live in
 - ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
+- unity-catalog-delta-client-api: Transport-agnostic client traits and wire models for the Unity
+  Catalog Delta Tables API
+- unity-catalog-delta-rest-client: REST/HTTP client for the Unity Catalog Delta Tables API
+- delta-kernel-unity-catalog: Unity Catalog integration for the kernel, providing a catalog
+  `Committer` and helpers for catalog-managed tables
 
 ## Building
 By default we build only the `kernel` and `acceptance` crates, which will also build `derive-macros`

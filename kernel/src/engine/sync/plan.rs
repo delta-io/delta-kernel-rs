@@ -35,7 +35,7 @@ use crate::engine::arrow_utils::coerce_columns_to_schema;
 use crate::expressions::{ArrayData, ColumnName, PredicateRef, Scalar};
 use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::{
-    FileType, Load, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
+    DynamicScan, FileType, Operator, Project, ScanFile, ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation, PlanExecutor, PlanResult};
@@ -169,7 +169,9 @@ impl SyncPlanExecutor {
             )),
             Operator::Project(project) => eval_project(project, &results[inputs[0]]),
             Operator::Filter(filter) => eval_filter(filter.predicate, &results[inputs[0]]),
-            Operator::Load(load) => self.eval_load(load, &results[inputs[0]]),
+            Operator::DynamicScan(dynamic_scan) => {
+                self.eval_dynamic_scan(dynamic_scan, &results[inputs[0]])
+            }
             Operator::Aggregate(aggregate) => eval_aggregate(&aggregate, &results[inputs[0]]),
             Operator::SemiJoin(join) => {
                 eval_semi_join(join, &results[inputs[0]], &results[inputs[1]])
@@ -237,73 +239,100 @@ impl SyncPlanExecutor {
         Ok(batches)
     }
 
-    /// Reads files named by `input` rows. This intentionally supports only the shapes currently
-    /// emitted by prototype plans: string paths, positive LONG sizes, nullable DV (unsupported when
-    /// non-null), and scalar file constants.
-    fn eval_load(&self, load: Load, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
-        let mut files = Vec::new();
-        for batch in input {
-            let path = extract_column_ref(batch, load.file_meta.path_column.path())?;
-            let path = path.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                Error::generic(format!(
-                    "Expected STRING Load path, got {:?}",
-                    path.data_type()
-                ))
-            })?;
-            let size = extract_column_ref(batch, load.file_meta.file_size_column.path())?;
-            let size = size.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                Error::generic(format!(
-                    "Expected LONG Load file size, got {:?}",
-                    size.data_type()
-                ))
-            })?;
-            let dv = extract_column_ref(batch, load.dv_column.path())?;
-
-            for row in 0..batch.num_rows() {
-                if path.is_null(row) {
-                    return Err(Error::generic("Load path must not be null"));
-                }
-                if dv.is_valid(row) {
-                    return Err(Error::unsupported(
-                        "SyncPlanExecutor Load with deletion vectors",
-                    ));
-                }
-                let path = path.value(row);
-                let location = match &load.base_url {
-                    Some(base) => base.join(path)?,
-                    None => url::Url::parse(path)?,
-                };
-                if size.is_null(row) {
-                    return Err(Error::generic("Load file size must not be null"));
-                }
-                let size = size.value(row);
-                if size <= 0 {
-                    return Err(Error::generic("Load file size must be positive"));
-                }
-                let size = u64::try_from(size)
-                    .map_err(|_| Error::generic("Load file size must fit in a u64"))?;
-                let file_constants = load
-                    .file_constant_columns
-                    .iter()
-                    .map(|name| scalar_value(extract_column_ref(batch, &[name])?, row))
-                    .try_collect()?;
-                files.push(ScanFile {
-                    meta: FileMeta {
-                        location,
-                        last_modified: 0,
-                        size,
-                    },
-                    file_constants,
-                });
-            }
-        }
+    /// Reads files named by `input` rows.
+    fn eval_dynamic_scan(
+        &self,
+        dynamic_scan: DynamicScan,
+        input: &[RecordBatch],
+    ) -> DeltaResult<Vec<RecordBatch>> {
+        let files = dynamic_scan_files(&dynamic_scan, input)?;
         self.eval_scan(
-            load.file_type,
+            dynamic_scan.file_type,
             files,
-            load.file_constant_columns,
-            load.schema,
+            dynamic_scan.file_constant_columns,
+            dynamic_scan.schema,
         )
     }
+}
+
+fn dynamic_scan_files(
+    dynamic_scan: &DynamicScan,
+    input: &[RecordBatch],
+) -> DeltaResult<Vec<ScanFile>> {
+    let mut files = Vec::new();
+    for batch in input {
+        let path = extract_column(batch, dynamic_scan.path_column.path())?;
+        let path = path.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            Error::generic(format!(
+                "Expected STRING Load path, got {:?}",
+                path.data_type()
+            ))
+        })?;
+        let size = extract_column(batch, dynamic_scan.file_size_column.path())?;
+        let size = size.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            Error::generic(format!(
+                "Expected LONG Load file size, got {:?}",
+                size.data_type()
+            ))
+        })?;
+        let last_modified = extract_column_ref(batch, dynamic_scan.last_modified_column.path())?;
+        let last_modified = last_modified
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                Error::generic(format!(
+                    "Expected LONG Load last modified, got {:?}",
+                    last_modified.data_type()
+                ))
+            })?;
+        let dv_path = dynamic_scan.dv_column.path();
+        let dv = extract_column(batch, dv_path)?;
+        let dv_ancestors: Vec<_> = (1..dv_path.len())
+            .map(|len| extract_column(batch, &dv_path[..len]))
+            .try_collect()?;
+
+        for row in 0..batch.num_rows() {
+            if path.is_null(row) {
+                return Err(Error::generic("DynamicScan path must not be null"));
+            }
+            if dv.is_valid(row) && dv_ancestors.iter().all(|ancestor| ancestor.is_valid(row)) {
+                return Err(Error::unsupported(
+                    "SyncPlanExecutor DynamicScan with deletion vectors",
+                ));
+            }
+            let path = path.value(row);
+            let location = dynamic_scan.base_url.join(path)?;
+            if size.is_null(row) {
+                return Err(Error::generic("DynamicScan file size must not be null"));
+            }
+            let size = size.value(row);
+            if size <= 0 {
+                return Err(Error::generic("DynamicScan file size must be positive"));
+            }
+            let size = u64::try_from(size)
+                .map_err(|_| Error::generic("DynamicScan file size must fit in a u64"))?;
+            if last_modified.is_null(row) {
+                return Err(Error::generic(
+                    "DynamicScan last-modified time must not be null",
+                ));
+            }
+            let last_modified = last_modified.value(row);
+            let file_constants = dynamic_scan
+                .file_constant_columns
+                .iter()
+                .map(|name| scalar_value(extract_column(batch, &[name])?.as_ref(), row))
+                .try_collect()?;
+            files.push(ScanFile {
+                meta: FileMeta {
+                    location,
+                    last_modified,
+                    size,
+                },
+                file_constants,
+            });
+        }
+    }
+    Ok(files)
 }
 
 fn eval_project(project: Project, input: &[RecordBatch]) -> DeltaResult<Vec<RecordBatch>> {
@@ -465,7 +494,15 @@ fn values_to_record_batch(values: Values) -> DeltaResult<RecordBatch> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+    use url::Url;
+
     use super::*;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::arrow::array::StructArray;
+    use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    use crate::expressions::StructData;
+    use crate::schema::{StructField, ToSchema as _};
 
     #[test]
     fn encode_keys_as_rows_synthesizes_empty_keys_when_ungrouped() -> DeltaResult<()> {
@@ -477,5 +514,182 @@ mod tests {
         assert_eq!(keys.len(), 3);
         assert!(keys.iter().all(|key| key == &keys[0]));
         Ok(())
+    }
+
+    fn null_dv() -> Scalar {
+        Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema()))
+    }
+
+    fn present_dv() -> Scalar {
+        Scalar::Struct(
+            StructData::try_new(
+                DeletionVectorDescriptor::to_schema()
+                    .fields()
+                    .cloned()
+                    .collect(),
+                vec![
+                    Scalar::from("i"),
+                    Scalar::from("inline"),
+                    Scalar::Null(DataType::INTEGER),
+                    Scalar::from(1_i32),
+                    Scalar::from(1_i64),
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn dynamic_scan_files_result(
+        path: Scalar,
+        size: Scalar,
+        last_modified: Scalar,
+        dv: Scalar,
+    ) -> DeltaResult<Vec<ScanFile>> {
+        let input_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
+            StructField::nullable("filemod", DataType::LONG),
+            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
+        ]));
+        let input = values_to_record_batch(Values::new(
+            input_schema,
+            vec![vec![path, size, last_modified, dv]],
+        ))
+        .unwrap();
+        let dynamic_scan = DynamicScan {
+            schema: Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+            file_type: FileType::Parquet,
+            base_url: Url::parse("memory:///").unwrap(),
+            file_constant_columns: vec![],
+            path_column: ColumnName::new(["path"]),
+            file_size_column: ColumnName::new(["size"]),
+            last_modified_column: ColumnName::new(["filemod"]),
+            dv_column: ColumnName::new(["dv"]),
+        };
+
+        dynamic_scan_files(&dynamic_scan, &[input])
+    }
+
+    #[test]
+    fn dynamic_scan_executor_rejects_non_null_deletion_vector() {
+        let err = dynamic_scan_files_result(
+            "file.parquet".into(),
+            1_i64.into(),
+            0_i64.into(),
+            present_dv(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("with deletion vectors"), "{err}");
+    }
+
+    #[rstest]
+    #[case::path(
+        Scalar::Null(DataType::STRING),
+        1_i64.into(),
+        0_i64.into(),
+        "path must not be null"
+    )]
+    #[case::size(
+        "file.parquet".into(),
+        Scalar::Null(DataType::LONG),
+        0_i64.into(),
+        "file size must not be null"
+    )]
+    #[case::last_modified(
+        "file.parquet".into(),
+        1_i64.into(),
+        Scalar::Null(DataType::LONG),
+        "last-modified time must not be null"
+    )]
+    fn dynamic_scan_executor_rejects_null_required_field(
+        #[case] path: Scalar,
+        #[case] size: Scalar,
+        #[case] last_modified: Scalar,
+        #[case] needle: &str,
+    ) {
+        let err = dynamic_scan_files_result(path, size, last_modified, null_dv()).unwrap_err();
+        assert!(err.to_string().contains(needle), "{err}");
+    }
+
+    #[rstest]
+    #[case::zero(0_i64.into(), "file size must be positive")]
+    #[case::negative((-1_i64).into(), "file size must be positive")]
+    fn dynamic_scan_executor_rejects_invalid_size(#[case] size: Scalar, #[case] needle: &str) {
+        let err = dynamic_scan_files_result("file.parquet".into(), size, 0_i64.into(), null_dv())
+            .unwrap_err();
+        assert!(err.to_string().contains(needle), "{err}");
+    }
+
+    #[test]
+    fn dynamic_scan_executor_accepts_i64_max_file_size() {
+        let err = dynamic_scan_files_result(
+            "file.parquet".into(),
+            i64::MAX.into(),
+            Scalar::Null(DataType::LONG),
+            null_dv(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("last-modified time must not be null"),
+            "got a size validation error before last-modified validation: {err}"
+        );
+    }
+
+    #[test]
+    fn dynamic_scan_threads_last_modified_into_file_meta() {
+        let files = dynamic_scan_files_result(
+            "file.parquet".into(),
+            1_i64.into(),
+            1_700_000_000_123_i64.into(),
+            null_dv(),
+        )
+        .unwrap();
+
+        assert_eq!(files[0].meta.last_modified, 1_700_000_000_123);
+    }
+
+    #[test]
+    fn dynamic_scan_treats_dv_under_null_ancestor_as_null() {
+        let dv_field = StructField::nullable("dv", DeletionVectorDescriptor::to_schema());
+        let metadata_type = StructType::new_unchecked([dv_field]);
+        let input_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("filemod", DataType::LONG),
+            StructField::nullable("metadata", metadata_type.clone()),
+        ]));
+        let metadata_schema: ArrowSchema = (&metadata_type).try_into_arrow().unwrap();
+        let metadata = StructArray::new(
+            metadata_schema.fields().clone(),
+            vec![present_dv().to_array(1).unwrap()],
+            Some(NullBuffer::new(BooleanBuffer::from(vec![false]))),
+        );
+        let arrow_schema = Arc::new(input_schema.as_ref().try_into_arrow().unwrap());
+        let input = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["file.parquet"])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(metadata),
+            ],
+        )
+        .unwrap();
+        let dynamic_scan = DynamicScan {
+            schema: Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+            file_type: FileType::Parquet,
+            base_url: Url::parse("memory:///").unwrap(),
+            file_constant_columns: vec![],
+            path_column: ColumnName::new(["path"]),
+            file_size_column: ColumnName::new(["size"]),
+            last_modified_column: ColumnName::new(["filemod"]),
+            dv_column: ColumnName::new(["metadata", "dv"]),
+        };
+
+        assert_eq!(
+            dynamic_scan_files(&dynamic_scan, &[input]).unwrap().len(),
+            1
+        );
     }
 }

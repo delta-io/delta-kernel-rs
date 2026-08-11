@@ -293,6 +293,42 @@ fn timestamp_stats_schema() -> SchemaRef {
     )
 }
 
+/// Creates a `timestamp_stats_schema` table and returns the pieces needed to inject raw commits:
+/// `(tmp_dir, table_path, engine, table_url, store)`.
+#[allow(clippy::type_complexity)]
+fn timestamp_stats_table_setup(
+    properties: &[(&str, &str)],
+) -> Result<
+    (
+        tempfile::TempDir,
+        String,
+        Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+        Url,
+        Arc<delta_kernel::object_store::DynObjectStore>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    create_table_and_load_snapshot(
+        &table_path,
+        timestamp_stats_schema(),
+        engine.as_ref(),
+        properties,
+    )?;
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    Ok((tmp_dir, table_path, engine, table_url, store))
+}
+
+/// An `EventTime` predicate against a microsecond bound, e.g. `timestamp_pred(Pred::le, micros)`.
+fn timestamp_pred(op: fn(Expr, Expr) -> Pred, micros: i64) -> PredicateRef {
+    Arc::new(op(
+        column_expr!("EventTime"),
+        Expr::literal(Scalar::Timestamp(micros)),
+    ))
+}
+
 /// Builds a stringified Delta `stats` JSON given EventTime/UserId min/max bounds.
 fn stats_json(
     num_records: i64,
@@ -336,20 +372,7 @@ fn commit_with_remove(version: u64, path: &str, deletion_timestamp: i64) -> Stri
 async fn extended_year_timestamp_stats_dont_collapse_skipping(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let _ = create_table_and_load_snapshot(
-        &table_path,
-        timestamp_stats_schema(),
-        engine.as_ref(),
-        &[],
-    )?;
-
-    // Inject Adds via raw JSON commits using a separate `LocalFileSystem` instance pointing
-    // at the same on-disk root the kernel-managed engine uses. The kernel only reads commit
-    // files during scan_metadata, so a fake Add (no backing parquet) is fine for this test.
-    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
-    let table_url = Url::from_directory_path(&table_path)
-        .map_err(|_| "table_path should be a valid file URL")?;
+    let (_tmp_dir, table_path, engine, table_url, store) = timestamp_stats_table_setup(&[])?;
     let table_url_string = table_url.to_string();
 
     // Co-locate the malformed `file_B` with a valid `file_D` (Sep 2024, out of predicate
@@ -480,20 +503,11 @@ async fn extended_year_timestamp_stats_dont_collapse_skipping(
 async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     #[values(false, true)] use_parallel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
-    let table_url = Url::from_directory_path(&table_path)
-        .map_err(|_| "table_path should be a valid file URL")?;
+    // writeStatsAsStruct makes the checkpoint materialize stats_parsed, the column where the
+    // safe-cast result lands.
+    let (_tmp_dir, table_path, engine, table_url, store) =
+        timestamp_stats_table_setup(&[("delta.checkpoint.writeStatsAsStruct", "true")])?;
     let table_url_string = table_url.to_string();
-    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
-
-    // v0: create table with writeStatsAsStruct enabled so the checkpoint materializes
-    // stats_parsed (the column where the safe-cast result lands).
-    let _v0 = create_table_and_load_snapshot(
-        &table_path,
-        timestamp_stats_schema(),
-        engine.as_ref(),
-        &[("delta.checkpoint.writeStatsAsStruct", "true")],
-    )?;
 
     // v1: file_A + file_B + file_E in one commit. The shared batch is what makes the
     // per-cell NULL property observable during checkpoint write.
@@ -588,6 +602,66 @@ async fn extended_year_timestamp_round_trip_via_checkpoint_and_remove(
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,
         2
+    );
+    Ok(())
+}
+
+/// Millisecond-truncated timestamp stats must not over-prune files whose real values live in the
+/// dropped sub-millisecond tail. `adjust_scalar_for_max_stat_truncation` is what makes it safe.
+///
+/// The file holds timestamps in [.298677, .307735], so its truncated stats are [.298, .307]. Every
+/// predicate below selects a real row in the file, so pruning it would drop committed data.
+///
+/// The lower-bound cases are the ones that exercise `adjust_scalar_for_max_stat_truncation`: a
+/// `>=` bound between the stored (truncated) max `.307000` and the real max `.307735` compares
+/// against the max stat, and without the 999us widening the file is wrongly pruned.
+#[rstest]
+// Upper bound inside the truncated range.
+#[case::upper_bound_within_range(timestamp_pred(Pred::le, 1_783_007_755_299_000), 1)]
+// Upper bound in the tail below the real max but above the truncated min.
+#[case::upper_bound_in_truncated_tail(timestamp_pred(Pred::le, 1_783_007_755_298_900), 1)]
+// Upper bound below the file's truncated min: nothing in the file can match, prune is correct.
+#[case::upper_bound_below_min(timestamp_pred(Pred::le, 1_783_007_754_000_000), 0)]
+// Lower bound inside the sub-millisecond tail dropped from the max stat. The file really does
+// hold `.307735`, so it must survive despite the stat claiming `.307000`.
+#[case::lower_bound_in_truncated_tail(timestamp_pred(Pred::ge, 1_783_007_755_307_500), 1)]
+// Lower bound at the real max: still inside the tail, still must survive.
+#[case::lower_bound_at_real_max(timestamp_pred(Pred::ge, 1_783_007_755_307_735), 1)]
+// Lower bound far past the tail (beyond stored max + 999us): pruning is correct here.
+#[case::lower_bound_past_tail(timestamp_pred(Pred::ge, 1_783_007_755_400_000), 0)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn millisecond_truncated_timestamp_stats_dont_overprune(
+    #[case] predicate: PredicateRef,
+    #[case] expected_survivors: usize,
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine, table_url, store) = timestamp_stats_table_setup(&[])?;
+
+    // Real values span [.298677, .307735]; a protocol-conforming writer floors the stats to
+    // [.298, .307].
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        commit_with_adds(
+            1,
+            &[(
+                "file_streaming.parquet",
+                stats_json(
+                    10,
+                    "2026-07-02T15:55:55.298Z",
+                    "2026-07-02T15:55:55.307Z",
+                    1,
+                    100,
+                ),
+            )],
+        ),
+    )
+    .await?;
+
+    assert_eq!(
+        surviving_files(&table_path, engine, predicate, use_parallel)?,
+        expected_survivors,
     );
     Ok(())
 }
@@ -943,7 +1017,6 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     Ok(())
 }
 
-#[cfg(feature = "interval-type-in-dev")]
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
