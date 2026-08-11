@@ -268,6 +268,30 @@ async fn add_reader_writer_feature_commits_protocol_only_and_survives_reload() -
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_unsupported_known_feature_fails_without_commit() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    let error = snapshot
+        .alter_table()
+        .add_table_feature(TableFeature::GeospatialType)
+        .with_allow_protocol_versions_increase(true)
+        .build(engine.as_ref(), committer())
+        .expect_err("unsupported known feature must be rejected");
+
+    assert!(error.to_string().contains("not supported"));
+    assert_eq!(
+        Snapshot::builder_for(&table_path)
+            .build(engine.as_ref())?
+            .version(),
+        0
+    );
+
+    Ok(())
+}
+
 #[rstest]
 #[case::writer_3(1, 3)]
 #[case::writer_4(1, 4)]

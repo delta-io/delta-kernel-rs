@@ -282,9 +282,10 @@ impl AlterTableTransactionBuilder<AddingFeatures> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
+        let requested_features = self.table_features;
         let evolved_protocol = protocol_with_added_features(
             table_config.protocol(),
-            self.table_features,
+            requested_features.iter().cloned(),
             self.allow_protocol_versions_increase,
         )?;
         let evolved_table_config = TableConfiguration::try_new_from(
@@ -293,7 +294,9 @@ impl AlterTableTransactionBuilder<AddingFeatures> {
             Some(evolved_protocol),
             table_config.version(),
         )?;
-        evolved_table_config.validate_added_feature_requirements(table_config)?;
+        for feature in &requested_features {
+            evolved_table_config.validate_feature_for_addition(feature)?;
+        }
 
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,

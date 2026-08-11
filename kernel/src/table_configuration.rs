@@ -261,14 +261,18 @@ impl TableConfiguration {
         )
     }
 
-    /// Validate dependencies for features supported by this configuration but not by `previous`.
-    pub(crate) fn validate_added_feature_requirements(&self, previous: &Self) -> DeltaResult<()> {
-        for feature in self.get_enabled_writer_features() {
-            if !previous.is_feature_supported(&feature) {
-                self.validate_feature_requirements(&feature)?;
+    /// Validate that the kernel supports adding `feature` to this table configuration.
+    pub(crate) fn validate_feature_for_addition(&self, feature: &TableFeature) -> DeltaResult<()> {
+        match feature.feature_type() {
+            FeatureType::WriterOnly => self.check_feature_support(feature, Operation::Write),
+            FeatureType::ReaderWriter => {
+                self.check_feature_support(feature, Operation::Scan)?;
+                self.check_feature_support(feature, Operation::Write)
             }
+            FeatureType::Unknown => Err(Error::unsupported(format!(
+                "Unknown feature '{feature}' cannot be added"
+            ))),
         }
-        Ok(())
     }
 
     /// Creates a new [`TableConfiguration`] representing the table configuration immediately
@@ -1016,6 +1020,31 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
+    }
+
+    #[test]
+    fn validate_feature_for_addition_checks_required_kernel_operations() {
+        let supported_writer = create_mock_table_config(&[], &[TableFeature::DomainMetadata]);
+        assert!(supported_writer
+            .validate_feature_for_addition(&TableFeature::DomainMetadata)
+            .is_ok());
+
+        let supported_reader_writer =
+            create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        assert!(supported_reader_writer
+            .validate_feature_for_addition(&TableFeature::DeletionVectors)
+            .is_ok());
+
+        let unsupported = create_mock_table_config(&[], &[TableFeature::GeospatialType]);
+        assert!(unsupported
+            .validate_feature_for_addition(&TableFeature::GeospatialType)
+            .is_err());
+
+        let write_unsupported = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
+        assert_result_error_with_message(
+            write_unsupported.validate_feature_for_addition(&TableFeature::TypeWidening),
+            "Feature 'typeWidening' is not supported for writes",
+        );
     }
 
     #[test]
