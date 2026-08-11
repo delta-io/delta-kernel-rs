@@ -173,6 +173,102 @@ async fn add_table_feature_validates_dependencies_without_auto_enabling_properti
 }
 
 #[rstest]
+#[case::dependency_first([TableFeature::DomainMetadata, TableFeature::RowTracking])]
+#[case::dependent_first([TableFeature::RowTracking, TableFeature::DomainMetadata])]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_table_features_validates_dependencies_against_all_requested_features(
+    #[case] features: [TableFeature; 2],
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+    let mut builder = snapshot
+        .alter_table()
+        .add_table_feature(features[0].clone());
+    builder = builder.add_table_feature(features[1].clone());
+
+    let committed = builder
+        .with_allow_protocol_versions_increase(true)
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let post_commit = committed.post_commit_snapshot().unwrap();
+    assert!(post_commit
+        .table_configuration()
+        .is_feature_supported(&TableFeature::DomainMetadata));
+    assert!(post_commit
+        .table_configuration()
+        .is_feature_supported(&TableFeature::RowTracking));
+    assert!(!post_commit
+        .table_configuration()
+        .is_feature_enabled(&TableFeature::RowTracking));
+
+    let actions = read_commit_actions(&table_path, 1);
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0]["commitInfo"]["operation"], "ADD FEATURE");
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| action.get("protocol").is_some())
+            .count(),
+        1
+    );
+    assert!(!actions
+        .iter()
+        .any(|action| action.get("metaData").is_some()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_reader_writer_feature_commits_protocol_only_and_survives_reload() -> DeltaResult<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let table_path = temp_dir.path().to_string_lossy().into_owned();
+    let table_url = url::Url::from_directory_path(temp_dir.path())
+        .map_err(|_| delta_kernel::Error::generic("Invalid table path"))?;
+    let (store, engine, _) = engine_store_setup("unused", Some(&table_url));
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        0,
+        feature_only_table_json(1, 2),
+    )
+    .await
+    .map_err(|error| delta_kernel::Error::generic(error.to_string()))?;
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+    snapshot
+        .alter_table()
+        .add_table_feature(TableFeature::DeletionVectors)
+        .with_allow_protocol_versions_increase(true)
+        .build(&engine, committer())?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    let actions = read_commit_actions(&table_path, 1);
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0]["commitInfo"]["operation"], "ADD FEATURE");
+    assert!(actions[1].get("protocol").is_some());
+    assert!(!actions
+        .iter()
+        .any(|action| action.get("metaData").is_some()));
+
+    let reloaded = Snapshot::builder_for(&table_path).build(&engine)?;
+    let protocol = reloaded.table_configuration().protocol();
+    assert_eq!(protocol.min_reader_version(), 3);
+    assert_eq!(protocol.min_writer_version(), 7);
+    assert!(protocol
+        .reader_features()
+        .is_some_and(|features| features.contains(&TableFeature::DeletionVectors)));
+    assert!(protocol
+        .writer_features()
+        .is_some_and(|features| features.contains(&TableFeature::DeletionVectors)));
+
+    Ok(())
+}
+
+#[rstest]
 #[case::writer_3(1, 3)]
 #[case::writer_4(1, 4)]
 #[case::writer_6(2, 6)]
