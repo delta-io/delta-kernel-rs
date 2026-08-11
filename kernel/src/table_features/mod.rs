@@ -920,23 +920,16 @@ pub(crate) fn protocol_with_added_features(
         )
     );
 
-    let target_reader_version =
-        requested_features
-            .iter()
-            .fold(
-                protocol.min_reader_version(),
-                |target, feature| match feature.feature_type() {
-                    FeatureType::ReaderWriter
-                        if protocol.min_reader_version() < TABLE_FEATURES_MIN_READER_VERSION
-                            && feature
-                                .is_valid_for_legacy_reader(protocol.min_reader_version()) =>
-                    {
-                        target
-                    }
-                    FeatureType::ReaderWriter => TABLE_FEATURES_MIN_READER_VERSION,
-                    FeatureType::WriterOnly | FeatureType::Unknown => target,
-                },
-            );
+    let current_reader_version = protocol.min_reader_version();
+    let requires_modern_reader = requested_features.iter().any(|feature| {
+        feature.feature_type() == FeatureType::ReaderWriter
+            && !feature.is_valid_for_legacy_reader(current_reader_version)
+    });
+    let target_reader_version = if requires_modern_reader {
+        TABLE_FEATURES_MIN_READER_VERSION
+    } else {
+        current_reader_version
+    };
     let versions_must_increase = target_reader_version > protocol.min_reader_version()
         || TABLE_FEATURES_MIN_WRITER_VERSION > protocol.min_writer_version();
     require!(
