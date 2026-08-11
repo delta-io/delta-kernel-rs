@@ -11,7 +11,7 @@ use crate::arrow::array::{
 };
 use crate::engine::arrow_data::{as_string_accessor, ArrowEngineData};
 use crate::engine_data::{
-    EngineData, GetData, ListItem, MapItem, RowVisitor, StructArrayAccessor, StructList,
+    EngineData, GetData, ListItem, MapItem, RowVisitor, StructList, StructListAccessor,
 };
 use crate::schema::ColumnName;
 use crate::utils::require;
@@ -157,39 +157,70 @@ fn get_list_item<'a>(
     Ok(Some(ListItem::new(values, list.row_offsets(row_index))))
 }
 
-impl StructArrayAccessor for StructArray {
-    fn visit_slice(
-        &self,
-        offsets: Range<usize>,
-        column_names: &[ColumnName],
-        visitor: &mut dyn RowVisitor,
-    ) -> DeltaResult<()> {
-        let sliced = self.slice(offsets.start, offsets.len());
-        // A RecordBatch cannot represent a null struct row, so `ArrowEngineData::from` would panic
-        // on one; reject nulls here instead.
-        require!(
-            sliced.null_count() == 0,
-            Error::invalid_struct_data("struct-list elements contain nulls; cannot visit")
-        );
-        ArrowEngineData::from(sliced).visit_rows(column_names, visitor)
-    }
+/// Resolves the struct element type of a list-like array, erroring if the elements are not
+/// structs. A non-struct list is a type error for every row, even a null one.
+fn struct_elements<'a>(
+    list: &'a impl ListLikeArray,
+    field_name: &str,
+) -> DeltaResult<&'a StructArray> {
+    list.list_values().as_struct_opt().ok_or_else(|| {
+        Error::unexpected_column_type(format!("{field_name}: list values are not structs"))
+    })
 }
 
-/// Shared implementation of [`GetData::get_struct_list`] for the list array flavors.
+/// Shared implementation of [`StructListAccessor::visit_row`] for the list array flavors. Offsets
+/// are derived from `row_index` here and never surface in the accessor contract.
+fn visit_struct_list_row(
+    list: &impl ListLikeArray,
+    row_index: usize,
+    column_names: &[ColumnName],
+    visitor: &mut dyn RowVisitor,
+) -> DeltaResult<()> {
+    let offsets = list.row_offsets(row_index);
+    let sliced = struct_elements(list, "struct-list")?.slice(offsets.start, offsets.len());
+    // is_nullable means nulls may be present; a null element struct can't round-trip via
+    // RecordBatch.
+    require!(
+        !sliced.is_nullable(),
+        Error::invalid_struct_data("array<struct> elements are nullable; cannot visit")
+    );
+    ArrowEngineData::from(sliced).visit_rows(column_names, visitor)
+}
+
+/// Shared implementation of [`GetData::get_struct_list`] for the list array flavors. Validates the
+/// element type (a type error for every row, even a null one) before short-circuiting a null row.
 fn get_struct_list_item<'a>(
-    list: &'a impl ListLikeArray,
+    list: &'a (impl ListLikeArray + StructListAccessor),
     row_index: usize,
     field_name: &str,
 ) -> DeltaResult<Option<StructList<'a>>> {
-    // Resolve the element type before the null check: a non-struct list is a type error for every
-    // row, even a null one.
-    let values = list.list_values().as_struct_opt().ok_or_else(|| {
-        Error::unexpected_column_type(format!("{field_name}: list values are not structs"))
-    })?;
+    struct_elements(list, field_name)?;
     if !list.is_valid(row_index) {
         return Ok(None);
     }
-    Ok(Some(StructList::new(values, list.row_offsets(row_index))))
+    Ok(Some(StructList::new(list, row_index)))
+}
+
+impl<O: OffsetSizeTrait> StructListAccessor for GenericListArray<O> {
+    fn visit_row(
+        &self,
+        row_index: usize,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()> {
+        visit_struct_list_row(self, row_index, column_names, visitor)
+    }
+}
+
+impl<O: OffsetSizeTrait> StructListAccessor for GenericListViewArray<O> {
+    fn visit_row(
+        &self,
+        row_index: usize,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()> {
+        visit_struct_list_row(self, row_index, column_names, visitor)
+    }
 }
 
 impl<'a, OffsetSize: OffsetSizeTrait> GetData<'a> for GenericListArray<OffsetSize> {
@@ -518,8 +549,6 @@ mod tests {
 
         let mut row0 = CollectNVisitor::default();
         let elements = list.get_struct_list(0, "arr").unwrap().unwrap();
-        assert_eq!(elements.len(), 2);
-        assert!(!elements.is_empty());
         elements.visit_with(&mut row0).unwrap();
         assert_eq!(row0.values, vec![Some(10), Some(20)]);
 
@@ -587,8 +616,6 @@ mod tests {
 
         // Present-but-empty row -> visits zero rows.
         let elements = list.get_struct_list(1, "arr").unwrap().unwrap();
-        assert_eq!(elements.len(), 0);
-        assert!(elements.is_empty());
         let mut visitor = CollectNVisitor::default();
         elements.visit_with(&mut visitor).unwrap();
         assert!(visitor.values.is_empty());

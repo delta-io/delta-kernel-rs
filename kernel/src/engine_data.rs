@@ -216,60 +216,38 @@ impl<'a> MapItem<'a> {
     }
 }
 
-/// Read access to the element structs of an array-of-structs column, abstracting over the
-/// engine's struct representation. Backs [`StructList`], mirroring how [`StringArrayAccessor`]
-/// backs [`ListItem`].
-pub trait StructArrayAccessor {
-    /// Visit the element structs at `offsets` with `visitor`, one visited row per element,
-    /// extracting the element-struct leaves named by `column_names`.
-    ///
-    /// Implementations must reject, rather than skip, a null element struct: the nested visitor
-    /// sees one row per element and has no way to observe a skipped one, so silently dropping it
-    /// would misreport the row's element count.
-    fn visit_slice(
+/// Read access to the element structs of an array-of-structs column, abstracting over how the
+/// engine stores them. Backs [`StructList`], mirroring how [`StringArrayAccessor`] backs
+/// [`ListItem`]. Engines implement this for their list column types.
+pub trait StructListAccessor {
+    /// Visits the element structs of the list at `row_index`, one visited row per element.
+    /// Implementations must reject, not skip, a null element struct.
+    fn visit_row(
         &self,
-        offsets: Range<usize>,
+        row_index: usize,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
     ) -> DeltaResult<()>;
 }
 
-/// A pre-resolved view into a single row's array of element structs. Unlike [`ListItem`], which
-/// materializes strings, the elements are structs visited in place by a nested [`RowVisitor`].
+/// A handle to a single row's array of element structs. Unlike [`ListItem`], which materializes
+/// strings, the elements are structs visited in place by a nested [`RowVisitor`].
 pub struct StructList<'a> {
-    values: &'a dyn StructArrayAccessor,
-    offsets: Range<usize>,
+    list: &'a dyn StructListAccessor,
+    row_index: usize,
 }
 
 impl<'a> StructList<'a> {
-    /// Constructs a handle to the element structs at `offsets` within `values`.
-    pub fn new(
-        values: &'a dyn StructArrayAccessor,
-        offsets: Range<usize>,
-    ) -> StructList<'a> {
-        StructList { values, offsets }
+    pub fn new(list: &'a dyn StructListAccessor, row_index: usize) -> StructList<'a> {
+        StructList { list, row_index }
     }
 
-    /// The number of element structs in this row's list.
-    pub fn len(&self) -> usize {
-        self.offsets.len()
-    }
-
-    /// Returns true if this row's list has no elements.
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
-    }
-
-    /// Drive a nested [`RowVisitor`] over this row's element structs, one visited row per element.
-    /// The columns the visitor declares are resolved against the element struct's schema, not the
-    /// outer row's. Calls [`RowVisitor::visit`] exactly once, with `row_count == 0` for a
-    /// present-but-empty list.
-    ///
-    /// Returns an error if any element struct in this row is null.
+    /// Drives a nested [`RowVisitor`] over this row's element structs, one visited row per
+    /// element. The visitor's columns resolve against the element struct's schema, not the outer
+    /// row's. Errors if any element struct in this row is null.
     pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
         let column_names = visitor.selected_column_names_and_types().0;
-        self.values
-            .visit_slice(self.offsets.clone(), column_names, visitor)
+        self.list.visit_row(self.row_index, column_names, visitor)
     }
 }
 

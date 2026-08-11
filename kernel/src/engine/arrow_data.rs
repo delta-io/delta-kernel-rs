@@ -558,8 +558,8 @@ mod tests {
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, ListViewArray, MapArray, RecordBatch, RunArray,
-        StringArray, StringViewArray, StructArray,
+        LargeBinaryArray, LargeStringArray, ListArray, ListViewArray, MapArray, RecordBatch,
+        RunArray, StringArray, StringViewArray, StructArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -567,9 +567,7 @@ mod tests {
     };
     use crate::engine::sync::SyncEngine;
     use crate::engine::test_utils::{struct_list_fixture_as, CollectNVisitor, ListFlavor};
-    use crate::engine_data::{
-        GetData, ListItem, MapItem, RowVisitor, StructArrayAccessor as _, TypedGetData,
-    };
+    use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
     use crate::expressions::ArrayData;
     use crate::schema::{
         schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType, StructField, StructType,
@@ -1788,6 +1786,62 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_visit_rows_string_list() -> DeltaResult<()> {
+        // [["a", "b"], ["c"]] as a plain List<Utf8>.
+        let values = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
+        let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+        let list = ListArray::new(field, offsets, values, None);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "tags",
+                list.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(list)],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct Visitor {
+            values: Vec<Vec<String>>,
+        }
+        impl RowVisitor for Visitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["tags"])]);
+                static TYPES: LazyLock<Vec<DataType>> =
+                    LazyLock::new(|| vec![ArrayType::new(DataType::STRING, false).into()]);
+                (&NAMES, &TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let list: ListItem<'_> = getters[0].get(i, "tags")?;
+                    self.values.push(list.materialize());
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = Visitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["tags"])], &mut visitor)?;
+        assert_eq!(
+            visitor.values,
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()]
+            ]
+        );
+        Ok(())
+    }
+
     /// Outer visitor that collects each row's element `n`s via the struct-list getter. The declared
     /// element type is a parameter so a test can mis-declare it.
     #[derive(Default)]
@@ -1958,12 +2012,24 @@ mod tests {
             ),
         ]);
 
+        // Wrap the element structs in a single-row list so they are visited via the public
+        // `get_struct_list` -> `visit_with` path, which exposes no offsets.
+        let element_field = Arc::new(ArrowField::new("item", elements.data_type().clone(), false));
+        let list = ListArray::new(
+            element_field,
+            OffsetBuffer::from_lengths([elements.len()]),
+            Arc::new(elements),
+            None,
+        );
+
         let mut visitor = LeafCollector {
             declared,
             collected: vec![],
         };
-        let names = declared.as_ref().0;
-        let result = elements.visit_slice(0..2, names, &mut visitor);
+        let result = list
+            .get_struct_list(0, "elements")?
+            .expect("present struct list")
+            .visit_with(&mut visitor);
         match expect_err_containing {
             None => {
                 result?;
