@@ -1208,6 +1208,7 @@ async fn file_meta_timestamp() {
         &mut table_config,
         commit,
         &get_schema(),
+        &[],
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1496,6 +1497,7 @@ async fn test_timestamp_with_ict_enabled() {
         &mut table_config,
         commit,
         &get_schema(),
+        &[],
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1547,6 +1549,7 @@ async fn test_timestamp_with_ict_disabled() {
         &mut table_config,
         commit.clone(),
         &get_schema(),
+        &[],
         CdfMode::ChangeDataFeed,
     )
     .unwrap();
@@ -1605,6 +1608,7 @@ async fn test_timestamp_with_commit_info_not_first() {
         &mut table_config,
         commit,
         &get_schema(),
+        &[],
         CdfMode::ChangeDataFeed,
     );
 
