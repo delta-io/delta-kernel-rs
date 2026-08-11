@@ -23,7 +23,7 @@ use delta_kernel_workloads::models::{
 };
 use delta_kernel_workloads::predicate_parser::parse_predicate;
 use unity_catalog_delta_client_api::Operation;
-use unity_catalog_delta_client_default::{ClientConfig, UCClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient};
 use url::Url;
 
 use crate::registry::{ParallelScan, ReadConfig};

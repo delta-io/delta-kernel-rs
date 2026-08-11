@@ -55,14 +55,15 @@ contains no HTTP code or network dependencies. The key types are:
 Because this crate is transport-agnostic, you can swap in any backend (REST,
 gRPC, or in-memory) without changing the code that depends on these traits.
 
-### `unity-catalog-delta-client-default`: HTTP implementation
+### `unity-catalog-delta-rest-client`: HTTP implementation
 
 This crate provides the concrete REST-over-HTTP implementations:
 
-- **`UCClient`**: calls the UC Delta-Tables read APIs. `load_table` returns a
-  table's metadata plus its inline log tail in one call, and
-  `get_table_credentials` vends temporary cloud credentials scoped to the
-  table's storage.
+- **`UCClient`**: calls the UC Delta-Tables APIs. `load_table` returns a table's
+  metadata plus its inline log tail in one call, `get_table_credentials` vends
+  temporary cloud credentials scoped to the table's storage, and
+  `create_staging_table` / `create_table` reserve and register a new
+  catalog-managed table.
 - **`UCUpdateTableRestClient`**: implements `UpdateTableClient` over HTTP. It
   submits staged commits to the UC `update_table` endpoint, where Unity Catalog
   ratifies them.
@@ -177,7 +178,7 @@ To use the UC integration, add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 delta-kernel-unity-catalog = { version = "..." }
-unity-catalog-delta-client-default = { version = "..." }
+unity-catalog-delta-rest-client = { version = "..." }
 ```
 
 Depend on `unity-catalog-delta-client-api` whenever you import types from it
@@ -200,10 +201,36 @@ The `unity-catalog-delta-client-api` crate has one feature flag:
 | `test-utils` | No | Enables `InMemoryUpdateTableClient` for unit testing |
 
 > [!TIP]
-> The `unity-catalog-delta-client-default` crate also exposes a `test-utils`
+> The `unity-catalog-delta-rest-client` crate also exposes a `test-utils`
 > feature that enables the `test-utils` feature on the client API crate
 > transitively. Add it to your `[dev-dependencies]` to get the in-memory
 > client for tests.
+
+## Identifying your client (User-Agent)
+
+Some catalogs allowlist requests by `User-Agent` and reject callers they don't
+recognize. The client always identifies itself as
+`Unity-Catalog-Delta-Rest-Rust-Client/<version>`. Use `with_additional_user_agent`
+to add the other versions relevant to your setup. Providing them is voluntary,
+and which ones apply depends on the caller.
+
+Versions worth including, when they apply to your setup:
+
+- **compute engine**: the external query system, if any (e.g. Spark, Flink).
+- **connector**: your code integrating an engine with Delta and UC.
+- **client**: `Unity-Catalog-Delta-Rest-Rust-Client`, added for you.
+- **kernel**: `Delta-Kernel-Rust`, if your connector uses Kernel.
+
+```rust,ignore
+let config = ClientConfig::build(&endpoint, &token)
+    .with_additional_user_agent([
+        ("MyEngine", "1.0.0"),
+        ("MyConnector", "1.0.0"),
+        ("Delta-Kernel-Rust", "0.26.0"),
+    ])
+    .build()?;
+// User-Agent: Unity-Catalog-Delta-Rest-Rust-Client/<v> MyEngine/1.0.0 MyConnector/1.0.0 Delta-Kernel-Rust/0.26.0
+```
 
 ## Client configuration and retries
 
@@ -220,7 +247,7 @@ often benefit from raising timeouts or the retry budget.
 
 ```rust,ignore
 use std::time::Duration;
-use unity_catalog_delta_client_default::ClientConfig;
+use unity_catalog_delta_rest_client::ClientConfig;
 
 let config = ClientConfig::build(&endpoint, &token)
     .with_timeout(Duration::from_secs(60))

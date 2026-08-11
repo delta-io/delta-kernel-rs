@@ -161,6 +161,7 @@ define_sweeps! {
     ),
 }
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 
 pub use counting_reporter::{
@@ -590,14 +591,25 @@ pub fn modify_add_file_partition_keys(
         .expect("failed to rebuild add-file batch after modifying a partition key")
 }
 
-/// Helper to create a DefaultEngine with the default executor for tests.
-///
-/// Uses `TokioBackgroundExecutor` as the default executor.
 pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+    create_default_engine_with_batch(table_root, None)
+}
+
+/// Helper to create a DefaultEngine with the default executor for tests.
+///
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine_with_batch(
+    table_root: &url::Url,
+    batch_size: Option<usize>,
+) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
+    let mut builder = DefaultEngineBuilder::new(store);
+    if let Some(batch_size) = batch_size {
+        builder = builder.with_batch_size(NonZero::new(batch_size).unwrap());
+    }
+    Ok(Arc::new(builder.build()))
 }
 
 /// Helper to create a DefaultEngine with the default executor for tests.

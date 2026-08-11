@@ -484,7 +484,7 @@ fn collect_junction_preds(
             Some(pred) => Some(pred),
             None => keep_null.then(|| {
                 keep_null = false;
-                Pred::null_literal()
+                Pred::NULL
             }),
         })
         .collect();

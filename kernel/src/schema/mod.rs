@@ -716,15 +716,6 @@ impl StructField {
         &self.metadata
     }
 
-    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
-    /// expensive for large metadata
-    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(key, val)| (key.clone(), val.to_string()))
-            .collect()
-    }
-
     /// Applies physical name and field ID mappings to this field.
     ///
     /// This function sets the field ID for the physical [`StructField`] only if the
@@ -1618,28 +1609,6 @@ impl<'a> SchemaTransform<'a> for NonNullFieldChecker {
 /// Skips `Variant` internal struct fields, which are protocol-defined and always non-null.
 pub(crate) fn schema_contains_non_null_fields(schema: &Schema) -> bool {
     NonNullFieldChecker.transform_struct(schema).is_err()
-}
-
-#[cfg(not(feature = "interval-type-in-dev"))]
-struct UsesIntervalType;
-
-#[cfg(not(feature = "interval-type-in-dev"))]
-impl<'a> SchemaTransform<'a> for UsesIntervalType {
-    transform_output_type!(|'a, T| Result<(), ()>);
-
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
-        if ptype.is_interval() {
-            Err(())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Returns whether `schema` contains an ANSI interval type at any nesting level.
-#[cfg(not(feature = "interval-type-in-dev"))]
-pub(crate) fn schema_contains_interval_type(schema: &Schema) -> bool {
-    UsesIntervalType.transform_struct(schema).is_err()
 }
 
 /// Normalizes column name field names to match the casing in the schema.
@@ -3749,64 +3718,6 @@ mod tests {
     #[case::variant_skipped(variant_only_schema(), false)]
     fn test_schema_contains_non_null_fields(#[case] schema: StructType, #[case] expected: bool) {
         assert_eq!(schema_contains_non_null_fields(&schema), expected);
-    }
-
-    #[cfg(not(feature = "interval-type-in-dev"))]
-    #[test]
-    fn test_schema_contains_interval_type() {
-        for interval in [DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME] {
-            let schemas = [
-                (
-                    "top-level",
-                    StructType::new_unchecked([StructField::nullable("iv", interval.clone())]),
-                ),
-                (
-                    "nested struct",
-                    StructType::new_unchecked([StructField::nullable(
-                        "nested",
-                        StructType::new_unchecked([StructField::nullable(
-                            "inner_iv",
-                            interval.clone(),
-                        )]),
-                    )]),
-                ),
-                (
-                    "array element",
-                    StructType::new_unchecked([StructField::nullable(
-                        "array",
-                        ArrayType::new(interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map value",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(DataType::STRING, interval.clone(), true),
-                    )]),
-                ),
-                (
-                    "map key",
-                    StructType::new_unchecked([StructField::nullable(
-                        "map",
-                        MapType::new(interval.clone(), DataType::STRING, true),
-                    )]),
-                ),
-            ];
-
-            for (case, schema) in schemas {
-                assert!(
-                    schema_contains_interval_type(&schema),
-                    "expected {case} schema to contain {interval:?}"
-                );
-            }
-        }
-
-        for schema in [
-            StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]),
-            variant_only_schema(),
-        ] {
-            assert!(!schema_contains_interval_type(&schema));
-        }
     }
 
     #[test]
