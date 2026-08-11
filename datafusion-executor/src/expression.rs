@@ -121,7 +121,7 @@ fn variadic_to_df_expr(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{col, Expression as KernelExpr};
+    use delta_kernel::expressions::{col, lit, Expression as KernelExpr};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use rstest::rstest;
 
