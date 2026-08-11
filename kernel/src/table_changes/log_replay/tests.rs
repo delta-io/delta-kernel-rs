@@ -161,6 +161,7 @@ fn get_segment(
         log_root,
         start_version,
         end_version,
+        vec![],
     )?;
     Ok(log_segment.listed.ascending_commit_files)
 }

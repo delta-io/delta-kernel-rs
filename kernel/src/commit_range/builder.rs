@@ -77,6 +77,7 @@ impl CommitRangeBuilder {
                 log_root,
                 start_version,
                 end_version,
+                vec![],
             )?,
         };
 

@@ -44,11 +44,12 @@ use scan::TableChangesScanBuilder;
 use scan_file::scan_metadata_to_scan_file;
 use url::Url;
 
+use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::compare::SchemaComparison as _;
 use crate::schema::{DataType, Schema, StructField, StructType};
-use crate::snapshot::{Snapshot, SnapshotRef};
+use crate::snapshot::{Snapshot, SnapshotBuilder, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{Operation, TableFeature};
 use crate::table_properties::{
@@ -87,6 +88,51 @@ pub(crate) enum TableChangesListingMode {
     NetChanges,
 }
 
+/// Catalog metadata used while loading a table-changes range.
+#[derive(Debug, Clone, Default)]
+#[internal_api]
+pub(crate) struct TableChangesLoadOptions {
+    max_catalog_version: Option<Version>,
+    log_tail: Vec<LogPath>,
+}
+
+impl TableChangesLoadOptions {
+    /// Sets the highest table version ratified by the catalog.
+    ///
+    /// Range construction rejects this option for non-catalog-managed tables and rejects explicit
+    /// range versions above this limit.
+    #[internal_api]
+    pub(crate) fn with_max_catalog_version(mut self, max_catalog_version: Version) -> Self {
+        self.max_catalog_version = Some(max_catalog_version);
+        self
+    }
+
+    /// Sets the catalog-provided log tail, including staged commits absent from the numbered log.
+    ///
+    /// Entries must form a contiguous ascending sequence. Staged commits require
+    /// [`Self::with_max_catalog_version`], and range construction validates the tail endpoint
+    /// against the requested version.
+    #[internal_api]
+    pub(crate) fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
+        self.log_tail = log_tail;
+        self
+    }
+
+    fn configure_snapshot_builder(&self, mut builder: SnapshotBuilder) -> SnapshotBuilder {
+        if let Some(max_catalog_version) = self.max_catalog_version {
+            builder = builder.with_max_catalog_version(max_catalog_version);
+        }
+        if !self.log_tail.is_empty() {
+            builder = builder.with_log_tail(self.log_tail.clone());
+        }
+        builder
+    }
+
+    fn effective_end_version(&self, end_version: Option<Version>) -> Option<Version> {
+        end_version.or(self.max_catalog_version)
+    }
+}
+
 /// Identifies the table feature that must remain enabled across the change-feed range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CdfMode {
@@ -117,6 +163,14 @@ impl CdfMode {
         match self {
             CdfMode::ChangeDataFeed => Error::change_data_feed_unsupported(version),
             CdfMode::RowTracking => Error::row_tracking_change_feed_unsupported(version),
+        }
+    }
+
+    /// The read operation whose feature support is required by this mode.
+    pub(crate) fn read_operation(self) -> Operation {
+        match self {
+            CdfMode::ChangeDataFeed => Operation::Cdf,
+            CdfMode::RowTracking => Operation::Scan,
         }
     }
 
@@ -257,6 +311,7 @@ impl TableChanges {
             start_version,
             end_version,
             CdfMode::ChangeDataFeed,
+            TableChangesLoadOptions::default(),
         )
     }
 
@@ -264,26 +319,24 @@ impl TableChanges {
     ///
     /// This path requires `delta.enableRowTracking` and ignores `_change_data` files.
     /// [`TableChanges::scan_file_listing`] returns the `add` and `remove` actions whose data must
-    /// be reconciled by row ID.
-    ///
-    /// Construction validates the range boundaries. [`TableChanges::scan_file_listing`] validates
-    /// intermediate metadata and protocol updates while replaying the range. Every enabled reader
-    /// feature must be supported by Kernel, and each schema must be readable using the end-version
-    /// logical schema without datatype widening.
+    /// be reconciled by row ID. Catalog ratification and log-tail metadata from `load_options` are
+    /// applied while loading the range.
     ///
     /// # Parameters
     ///
     /// - `table_root`: URL of the table root containing `_delta_log`.
     /// - `engine`: Engine used to read the transaction log.
     /// - `start_version`: First version in the change feed.
-    /// - `end_version`: The end version (inclusive) of the change data feed. If this is none, this
-    ///   defaults to the newest table version.
+    /// - `end_version`: Optional inclusive end version. When omitted, the catalog maximum is used
+    ///   if present; otherwise the newest version is used.
+    /// - `load_options`: Catalog ratification and log-tail metadata used to load the range.
     ///
     /// # Errors
     ///
-    /// Returns an error if the range cannot be loaded or a boundary has unavailable row tracking,
-    /// unsupported reader features, or an incompatible schema. Errors from intermediate versions
-    /// are returned by [`TableChanges::scan_file_listing`].
+    /// Returns an error if the range or catalog inputs are invalid, a catalog maximum is supplied
+    /// for a non-catalog-managed table, or a boundary has unavailable row tracking, unsupported
+    /// reader features, or an incompatible schema. Errors from intermediate versions are returned
+    /// by [`TableChanges::scan_file_listing`].
     #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     #[internal_api]
     pub(crate) fn try_new_row_tracking_cdf_listing(
@@ -291,6 +344,7 @@ impl TableChanges {
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
+        load_options: TableChangesLoadOptions,
     ) -> DeltaResult<Self> {
         Self::try_new_internal(
             table_root,
@@ -298,6 +352,7 @@ impl TableChanges {
             start_version,
             end_version,
             CdfMode::RowTracking,
+            load_options,
         )
     }
 
@@ -307,31 +362,37 @@ impl TableChanges {
         start_version: Version,
         end_version: Option<Version>,
         mode: CdfMode,
+        load_options: TableChangesLoadOptions,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
+        let effective_end_version = load_options.effective_end_version(end_version);
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
             start_version,
-            end_version,
+            effective_end_version,
+            load_options.log_tail.clone(),
         )?;
 
-        let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
-            .at_version(start_version)
+        let start_snapshot = load_options
+            .configure_snapshot_builder(
+                Snapshot::builder_for(table_root.as_url().clone()).at_version(start_version),
+            )
             .build(engine)?;
         start_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Cdf)?;
+            .ensure_operation_supported(mode.read_operation())?;
 
-        let end_snapshot = match end_version {
-            Some(version) => Snapshot::builder_from(start_snapshot.clone())
-                .at_version(version)
-                .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+        let end_snapshot_builder = match end_version {
+            Some(version) => Snapshot::builder_from(start_snapshot.clone()).at_version(version),
+            None => Snapshot::builder_from(start_snapshot.clone()),
         };
+        let end_snapshot = load_options
+            .configure_snapshot_builder(end_snapshot_builder)
+            .build(engine)?;
         end_snapshot
             .table_configuration()
-            .ensure_operation_supported(Operation::Cdf)?;
+            .ensure_operation_supported(mode.read_operation())?;
 
         // Verify the change feed is enabled at the beginning and end of the interval to fail early.
         // The `ensure_operation_supported` calls above already validate that every enabled reader
@@ -546,15 +607,17 @@ impl TableChanges {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
+    use ::test_utils::{add_commit, add_staged_commit};
     use itertools::{assert_equal, Itertools};
 
     use super::*;
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::actions::{Add, Metadata, Protocol, Remove};
+    use crate::actions::{Add, CommitInfo, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
+    use crate::object_store::memory::InMemory;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::test_utils::{
         row_tracking_properties, row_tracking_protocol, row_tracking_setup_actions,
@@ -564,20 +627,80 @@ mod tests {
     use crate::table_changes::CDF_FIELDS;
     use crate::table_features::TableFeature;
     use crate::table_properties::{
-        COLUMN_MAPPING_MODE, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-        MATERIALIZED_ROW_ID_COLUMN_NAME,
+        COLUMN_MAPPING_MODE, ENABLE_IN_COMMIT_TIMESTAMPS,
+        MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
     };
     use crate::unit_test_utils::{
         assert_result_error_with_message, test_schema_flat_with_column_mapping, Action,
         LocalMockTable,
     };
-    use crate::{Engine, Error};
+    use crate::{Engine, Error, FileMeta};
 
     fn listing_test_schema() -> Arc<StructType> {
         Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]))
+    }
+
+    fn catalog_managed_row_tracking_setup_actions() -> Vec<Action> {
+        let mut properties = row_tracking_properties();
+        properties.insert(ENABLE_IN_COMMIT_TIMESTAMPS.to_string(), "true".to_string());
+        let metadata =
+            Metadata::try_new(None, None, listing_test_schema(), vec![], 0, properties).unwrap();
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::CatalogManaged],
+            [
+                TableFeature::CatalogManaged,
+                TableFeature::InCommitTimestamp,
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ],
+        )
+        .unwrap();
+        vec![Action::Protocol(protocol), Action::Metadata(metadata)]
+    }
+
+    fn commit_info_action(version: Version) -> Action {
+        let timestamp = 1_000 + version as i64;
+        Action::CommitInfo(CommitInfo::new(
+            timestamp,
+            Some(timestamp),
+            None,
+            None,
+            true,
+        ))
+    }
+
+    fn row_tracking_add_action(path: &str, version: Version) -> Action {
+        Action::Add(Add {
+            path: path.to_string(),
+            data_change: true,
+            size: 100,
+            base_row_id: Some(version as i64 * 10),
+            default_row_commit_version: Some(version as i64),
+            ..Default::default()
+        })
+    }
+
+    fn serialize_actions(actions: impl IntoIterator<Item = Action>) -> String {
+        actions
+            .into_iter()
+            .map(|action| serde_json::to_string(&action).unwrap())
+            .join("\n")
+    }
+
+    async fn write_catalog_managed_row_tracking_base(
+        store: &dyn crate::object_store::ObjectStore,
+        table_root: &Url,
+    ) {
+        let actions = [commit_info_action(0)]
+            .into_iter()
+            .chain(catalog_managed_row_tracking_setup_actions())
+            .chain([row_tracking_add_action("path_0", 0)]);
+        add_commit(table_root, store, 0, serialize_actions(actions))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -686,7 +809,13 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         assert_result_error_with_message(
-            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(0)),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                0,
+                Some(0),
+                TableChangesLoadOptions::default(),
+            ),
             missing_property,
         );
     }
@@ -698,7 +827,13 @@ mod tests {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
-        let res = TableChanges::try_new_row_tracking_cdf_listing(url, engine.as_ref(), 0, Some(1));
+        let res = TableChanges::try_new_row_tracking_cdf_listing(
+            url,
+            engine.as_ref(),
+            0,
+            Some(1),
+            TableChangesLoadOptions::default(),
+        );
         assert!(
             matches!(&res, Err(Error::RowTrackingChangeFeedUnsupported(_))),
             "expected a row-tracking-disabled error, got {res:?}"
@@ -746,8 +881,13 @@ mod tests {
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let res =
-            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 1, Some(2));
+        let res = TableChanges::try_new_row_tracking_cdf_listing(
+            table_root,
+            engine.as_ref(),
+            1,
+            Some(2),
+            TableChangesLoadOptions::default(),
+        );
         assert!(
             matches!(&res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
             "expected an incompatible start schema to be rejected, got {res:?}"
@@ -787,8 +927,14 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_changes = Arc::new(
-            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(1))
-                .unwrap(),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                0,
+                Some(1),
+                TableChangesLoadOptions::default(),
+            )
+            .unwrap(),
         );
         let listing: Vec<TableChangesFileAction> = table_changes
             .scan_file_listing(engine, TableChangesListingMode::AllChanges)
@@ -810,6 +956,109 @@ mod tests {
         assert!(listing.iter().all(|fa| fa.remove.is_none()));
         assert_eq!(add_side("path_0").base_row_id, Some(0));
         assert_eq!(add_side("path_1").base_row_id, Some(5));
+    }
+
+    #[tokio::test]
+    async fn catalog_managed_row_tracking_listing_reads_staged_commits() {
+        let store = Arc::new(InMemory::new());
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store.clone()));
+        let table_root = Url::parse("memory:///").unwrap();
+        write_catalog_managed_row_tracking_base(store.as_ref(), &table_root).await;
+
+        let mut log_tail = Vec::new();
+        for version in 1..=2 {
+            let body = serialize_actions([
+                commit_info_action(version),
+                row_tracking_add_action(&format!("path_{version}"), version),
+            ]);
+            let path = add_staged_commit(&table_root, store.as_ref(), version, body)
+                .await
+                .unwrap();
+            let file_meta = FileMeta {
+                location: table_root.join(path.as_ref()).unwrap(),
+                last_modified: 123,
+                size: 100,
+            };
+            log_tail.push(LogPath::try_new(file_meta).unwrap());
+        }
+        let options = TableChangesLoadOptions::default()
+            .with_max_catalog_version(2)
+            .with_log_tail(log_tail);
+
+        let table_changes = Arc::new(
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                0,
+                None,
+                options,
+            )
+            .unwrap(),
+        );
+        assert_eq!(table_changes.end_version(), 2);
+        let listing: Vec<TableChangesFileAction> = table_changes
+            .scan_file_listing(engine, TableChangesListingMode::AllChanges)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        let paths = listing
+            .iter()
+            .filter_map(|action| action.add.as_ref().map(|add| add.path.as_str()))
+            .collect::<HashSet<_>>();
+        assert_eq!(paths, HashSet::from(["path_0", "path_1", "path_2"]));
+    }
+
+    #[rstest::rstest]
+    #[case::catalog_latest(None, Some(2), &["path_0", "path_1", "path_2"])]
+    #[case::explicit_end(Some(1), Some(1), &["path_0", "path_1"])]
+    #[case::explicit_end_above_catalog_maximum(Some(3), None, &[])]
+    #[tokio::test]
+    async fn catalog_managed_row_tracking_listing_respects_version_bounds(
+        #[case] end_version: Option<Version>,
+        #[case] expected_end_version: Option<Version>,
+        #[case] expected_paths: &[&str],
+    ) {
+        let store = Arc::new(InMemory::new());
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new_with_store(store.clone()));
+        let table_root = Url::parse("memory:///").unwrap();
+        write_catalog_managed_row_tracking_base(store.as_ref(), &table_root).await;
+        for version in 1..=3 {
+            let body = serialize_actions([
+                commit_info_action(version),
+                row_tracking_add_action(&format!("path_{version}"), version),
+            ]);
+            add_commit(&table_root, store.as_ref(), version, body)
+                .await
+                .unwrap();
+        }
+        let options = TableChangesLoadOptions::default().with_max_catalog_version(2);
+
+        let table_changes = TableChanges::try_new_row_tracking_cdf_listing(
+            table_root,
+            engine.as_ref(),
+            0,
+            end_version,
+            options,
+        );
+        let Some(expected_end_version) = expected_end_version else {
+            assert_result_error_with_message(
+                table_changes,
+                "Requested version 3 exceeds max catalog version 2",
+            );
+            return;
+        };
+        let table_changes = Arc::new(table_changes.unwrap());
+        assert_eq!(table_changes.end_version(), expected_end_version);
+        let listing: Vec<TableChangesFileAction> = table_changes
+            .scan_file_listing(engine, TableChangesListingMode::AllChanges)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        let paths = listing
+            .iter()
+            .filter_map(|action| action.add.as_ref().map(|add| add.path.as_str()))
+            .collect::<HashSet<_>>();
+        assert_eq!(paths, expected_paths.iter().copied().collect());
     }
 
     #[tokio::test]
@@ -849,8 +1098,14 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_changes = Arc::new(
-            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(0))
-                .unwrap(),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                0,
+                Some(0),
+                TableChangesLoadOptions::default(),
+            )
+            .unwrap(),
         );
         assert_eq!(
             table_changes.materialized_row_id_column_name().unwrap(),
@@ -966,6 +1221,7 @@ mod tests {
                 engine.as_ref(),
                 1,
                 Some(end_version),
+                TableChangesLoadOptions::default(),
             )
             .unwrap(),
         );
@@ -1024,9 +1280,14 @@ mod tests {
             .await;
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-        let table_changes =
-            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(0))
-                .unwrap();
+        let table_changes = TableChanges::try_new_row_tracking_cdf_listing(
+            table_root,
+            engine.as_ref(),
+            0,
+            Some(0),
+            TableChangesLoadOptions::default(),
+        )
+        .unwrap();
         let res = table_changes.into_scan_builder().build();
         assert_result_error_with_message(
             res,
@@ -1051,8 +1312,14 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_changes = Arc::new(
-            TableChanges::try_new_row_tracking_cdf_listing(table_root, engine.as_ref(), 0, Some(0))
-                .unwrap(),
+            TableChanges::try_new_row_tracking_cdf_listing(
+                table_root,
+                engine.as_ref(),
+                0,
+                Some(0),
+                TableChangesLoadOptions::default(),
+            )
+            .unwrap(),
         );
         let listing: Vec<TableChangesFileAction> = table_changes
             .scan_file_listing(engine, mode)
