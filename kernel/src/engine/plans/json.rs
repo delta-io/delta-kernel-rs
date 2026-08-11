@@ -53,7 +53,8 @@ impl JsonHandler for PlanBasedJsonHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO: `_predicate` is dropped. Re-apply it as a Filter node over the scan; the
         // single-node executor can then match the filter -> scan shape.
-        let query = PlanBuilder::scan_json(files.to_vec(), &[], physical_schema)?.build()?;
+        let query =
+            PlanBuilder::scan_json_ordered(files.to_vec(), &[], physical_schema)?.build()?;
         self.executor
             .execute_op(Operation::QueryPlan(query))?
             .into_data()
