@@ -39,6 +39,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use super::ir::nodes::{
     Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, ScanFile,
     ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
@@ -201,6 +203,43 @@ impl PlanBuilder {
             }
         }
         Ok(Values::new(schema, rows).into())
+    }
+
+    /// Infallible sibling of [`Self::values`] for typed POD rows.
+    ///
+    /// Schema is [`ToSchema::to_schema`] for `T`. Each row converts via [`Into<StructData>`] and is
+    /// peeled into top-level field scalars (nested fields remain [`Scalar::Struct`]); see
+    /// [`Values`]'s [`FromIterator`]. Empty `rows` yields the absent relation.
+    ///
+    /// # Example
+    /// ```
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::expressions::Scalar;
+    /// # use delta_kernel::plans::ir::nodes::Operator;
+    /// # use delta_kernel_derive::{IntoStructData, ToSchema};
+    /// #
+    /// #[derive(ToSchema, IntoStructData)]
+    /// struct Row {
+    ///     id: i32,
+    /// }
+    ///
+    /// let plan = PlanBuilder::values_from([Row { id: 1 }, Row { id: 2 }]).build()?;
+    /// let Operator::Values(values) = &plan.nodes[0].op else { panic!("expected Values") };
+    /// assert_eq!(
+    ///     values.rows,
+    ///     vec![vec![Scalar::Integer(1)], vec![Scalar::Integer(2)]],
+    /// );
+    /// assert!(PlanBuilder::values_from(std::iter::empty::<Row>())
+    ///     .build_opt()?
+    ///     .is_none());
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
+    #[internal_api]
+    pub(crate) fn values_from<T>(rows: impl IntoIterator<Item = T>) -> Self
+    where
+        T: Into<StructData> + ToSchema,
+    {
+        Values::from_iter(rows).into()
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -564,14 +603,6 @@ impl From<Values> for PlanBuilder {
     }
 }
 
-/// A literal relation over POD rows, whose schema and values come from the same
-/// [`ToSchema`] / [`Into<StructData>`] pairing. See [`Values`]'s own [`FromIterator`].
-impl<T: Into<StructData> + ToSchema> FromIterator<T> for PlanBuilder {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Values::from_iter(iter).into()
-    }
-}
-
 /// Error if any of `cols` fails to resolve against `schema` (nested paths supported).
 fn check_columns_resolve<'a>(
     schema: &SchemaRef,
@@ -615,7 +646,6 @@ fn check_file_constant_columns<'a>(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel_derive::{IntoStructData, ToSchema};
     use test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -689,28 +719,6 @@ mod tests {
         let src = scan(id_schema());
         assert_eq!(src.schema(), &id_schema());
         assert_plan(src, &[(&[], "scan_parquet")]);
-    }
-
-    #[derive(ToSchema, IntoStructData)]
-    struct IdRow {
-        id: i32,
-    }
-
-    #[test]
-    fn values_from_iter_builds_present_relation() -> DeltaResult<()> {
-        let plan = PlanBuilder::from_iter([IdRow { id: 7 }]).build()?;
-        let Operator::Values(values) = &plan.nodes[0].op else {
-            panic!("expected Values");
-        };
-        assert_eq!(values.rows, vec![vec![Scalar::Integer(7)]]);
-        Ok(())
-    }
-
-    #[test]
-    fn values_from_iter_empty_is_absent() -> DeltaResult<()> {
-        let builder = PlanBuilder::from_iter(std::iter::empty::<IdRow>());
-        assert!(builder.build_opt()?.is_none());
-        Ok(())
     }
 
     /// `{ id, part }`, with `part` used as a file-constant column.

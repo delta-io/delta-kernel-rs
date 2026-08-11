@@ -125,7 +125,8 @@ impl ArrayData {
     }
 }
 
-/// Builds [`ArrayData`] from a Rust `Vec` whose element type implements [`IntoScalar`].
+/// Builds [`ArrayData`] from a Rust `Vec` whose element type implements both `Into<Scalar>` and
+/// [`ToSchema`].
 impl<T: IntoScalar> From<Vec<T>> for ArrayData {
     fn from(vec: Vec<T>) -> Self {
         Self::from_elements::<T>(vec, false)
@@ -209,7 +210,8 @@ impl MapData {
     }
 }
 
-/// Builds [`MapData`] from a Rust [`HashMap`] whose key/value types implement [`IntoScalar`].
+/// Builds [`MapData`] from a Rust [`HashMap`] whose key/value types implement both `Into<Scalar>`
+/// and [`ToSchema`].
 impl<K: IntoScalar, V: IntoScalar> From<HashMap<K, V>> for MapData {
     fn from(map: HashMap<K, V>) -> Self {
         Self::from_pairs::<K, V>(map, false)
@@ -272,6 +274,7 @@ impl StructData {
 
     /// Infallible constructor used by `From<Pod>` where `schema` and `values` are produced
     /// together from the same POD / [`IntoScalar`] pairing. Does not re-validate types or lengths.
+    #[internal_api]
     pub(crate) fn from_values(schema: StructType, values: Vec<Scalar>) -> Self {
         Self {
             fields: schema.into_fields().collect(),
@@ -288,6 +291,7 @@ impl StructData {
     }
 
     /// Consume this struct and return its field values in schema order.
+    #[internal_api]
     pub(crate) fn into_values(self) -> Vec<Scalar> {
         self.values
     }
