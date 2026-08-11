@@ -65,25 +65,24 @@ message FilterNode {
 
 message UnionAllNode {}
 
-message LoadColumnFileMeta {
-  delta.kernel.expressions.ColumnName path_column = 1;
-  delta.kernel.expressions.ColumnName file_size_column = 2;
-  delta.kernel.expressions.ColumnName num_records_column = 3;
-}
-
 enum FileType {
   FILE_TYPE_UNSPECIFIED = 0;
   FILE_TYPE_PARQUET = 1;
   FILE_TYPE_JSON = 2;
 }
 
-message LoadNode {
+message DynamicScanNode {
   delta.kernel.schema.StructType schema = 1;
   FileType file_type = 2;
-  optional string base_url = 3;
+  // Hierarchical base URL ending in `/` that relative file paths resolve against.
+  string base_url = 3;
   repeated string file_constant_columns = 4;
-  LoadColumnFileMeta file_meta = 5;
-  delta.kernel.expressions.ColumnName dv_column = 6;
+  // Required input columns: path is STRING; size and last-modified are LONG.
+  // Each column and every ancestor in its path must be non-nullable.
+  delta.kernel.expressions.ColumnName path_column = 5;
+  delta.kernel.expressions.ColumnName file_size_column = 6;
+  delta.kernel.expressions.ColumnName last_modified_column = 7;
+  delta.kernel.expressions.ColumnName dv_column = 8;
 }
 
 message MinAgg {
@@ -148,7 +147,7 @@ message Operator {
     ProjectNode project = 4;
     FilterNode filter = 5;
     UnionAllNode union_all = 6;
-    LoadNode load = 7;
+    DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
   }

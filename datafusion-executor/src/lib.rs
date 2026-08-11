@@ -13,8 +13,10 @@ use std::sync::Arc;
 use datafusion::execution::context::SessionContext;
 use delta_kernel::StorageHandler;
 
+mod expression;
 mod scalar;
 
+pub use expression::to_df_expr;
 pub use scalar::to_df_scalar;
 
 /// Executes kernel declarative plans on DataFusion.

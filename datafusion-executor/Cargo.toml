@@ -13,6 +13,7 @@ rust-version = "1.88"
 [dependencies]
 delta_kernel = { path = "../kernel", version = "0.26.0", default-features = false, features = [
   "declarative-plans",
+  "vendored-protoc",
   "arrow-58",
   "default-engine-base",
 ] }

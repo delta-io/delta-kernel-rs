@@ -1553,8 +1553,10 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
             Arc::new(Date32Array::from(values))
         }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            // The sub-millisecond component keeps stats-formatting tests honest: a whole-second
+            // value cannot distinguish a three-digit fraction from an elided one.
             let values: Vec<i64> = (0..rows)
-                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000)
+                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000 + 298_677)
                 .collect();
             let array = TimestampMicrosecondArray::from(values);
             match tz {

@@ -1,7 +1,7 @@
 # Creating Unity Catalog tables
 
 <!-- Page type: How-to -->
-<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-client-default, unity-catalog-delta-client-api -->
+<!-- Crates: delta-kernel-unity-catalog, unity-catalog-delta-rest-client, unity-catalog-delta-client-api -->
 
 To create a new Unity Catalog-managed Delta table, you register the table with
 your UC server to obtain a table ID and storage location, write a version 0
@@ -12,30 +12,24 @@ Before reading this page, make sure you understand
 [Creating a Table](../writing/create_table.md) and the
 [Unity Catalog Integration overview](./overview.md).
 
-> [!NOTE]
-> Steps 1 and 5 call UC endpoints that the Rust `unity-catalog-delta-client-default`
-> crate does not yet expose. Route those through your connector's own UC client;
-> the request and response wire types live in `unity-catalog-delta-client-api`.
-
 ## Prerequisites
 
 - A three-part table name, Delta schema, and target storage location.
-- A connector-owned UC client that can call UC's staging and create-table
-  endpoints.
+- A `UCClient` (from `unity-catalog-delta-rest-client`).
 
 ## Step 1: Reserve the table in Unity Catalog
 
-POST a `CreateStagingTableRequest` to the UC `staging-tables` endpoint. UC allocates a table ID
-and storage location and returns temporary credentials for the initial commit.
+Call `UCClient::create_staging_table`. UC allocates a table ID and storage location and returns
+temporary credentials for the initial commit.
 
 ```rust,ignore
-use unity_catalog_delta_client_api::{CreateStagingTableRequest, CreateStagingTableResponse};
+use unity_catalog_delta_client_api::CreateStagingTableRequest;
 
-// The `staging-tables` POST is not yet exposed as a method on `UCClient`. Send the request
-// through your connector's own UC HTTP client; the request and response wire types live in
-// `unity-catalog-delta-client-api`.
-let staging_req = CreateStagingTableRequest { name: "my_table".to_string() };
-let staging_info: CreateStagingTableResponse = my_uc_client.post_staging_table(staging_req).await?;
+let staging_info = uc_client
+    .create_staging_table("my_catalog", "my_schema", CreateStagingTableRequest {
+        name: "my_table".to_string(),
+    })
+    .await?;
 let table_id = staging_info.table_id;
 let table_uri = staging_info.location;
 ```
@@ -76,9 +70,9 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel_unity_catalog::UCCommitter;
 use unity_catalog_delta_client_api::{Operation, TableIdentifier};
-use unity_catalog_delta_client_default::{ClientConfig, UCClient, UCUpdateTableRestClient};
+use unity_catalog_delta_rest_client::{ClientConfig, UCClient, UCUpdateTableRestClient};
 
-let config = ClientConfig::build(&endpoint, &token).build()?;
+let config = ClientConfig::build(&endpoint, &token).with_additional_user_agent([("MyConnector", "1.0")]).build()?;
 let update_client = Arc::new(UCUpdateTableRestClient::new(config)?);
 
 // Build the engine over the staging storage location using the staging credentials
@@ -150,12 +144,13 @@ let create_req = build_uc_create_table_request(&post_commit_snapshot, &engine, "
 
 ## Step 5: Finalize the table in Unity Catalog
 
-POST the `CreateTableRequest` to UC's create-table (`tables`) endpoint to register the table.
+Call `UCClient::create_table` with the request from Step 4 to register the table. It returns the
+registered table as a `LoadTableResponse`.
 
 ```rust,ignore
-// The create-table POST is not yet exposed as a method on `UCClient`. Send the typed
-// `CreateTableRequest` through your connector's own UC HTTP client.
-my_uc_client.post_create_table(create_req).await?;
+uc_client
+    .create_table("my_catalog", "my_schema", create_req)
+    .await?;
 ```
 
 ## Clustered tables

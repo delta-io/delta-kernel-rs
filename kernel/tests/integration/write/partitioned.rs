@@ -132,9 +132,7 @@ async fn test_write_partitioned_normal_values_roundtrip(
 }
 
 /// Writes an interval partition column, asserts the partitionValues entry is the Spark ANSI
-/// interval literal (CM=None), and verifies the value round-trips through a scan. Gated on
-/// `interval-type-in-dev` because writing an interval table requires interval writer support.
-#[cfg(feature = "interval-type-in-dev")]
+/// interval literal (CM=None), and verifies the value round-trips through a scan.
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
@@ -202,7 +200,6 @@ async fn test_write_partitioned_interval_roundtrip(
 
 /// Materialized interval partition columns are written into the Parquet file as physical integer
 /// values and still round-trip through scan output as logical partition columns.
-#[cfg(feature = "interval-type-in-dev")]
 #[rstest]
 #[case::year_month(
     DataType::INTERVAL_YEAR_MONTH,
@@ -687,7 +684,6 @@ macro_rules! assert_col {
     };
 }
 
-#[cfg(feature = "interval-type-in-dev")]
 fn assert_interval_value(batch: &RecordBatch, column_name: &str, expected: &Scalar) {
     match expected {
         Scalar::IntervalYearMonth(months) => {
@@ -774,7 +770,6 @@ fn cm_mode_str(mode: ColumnMappingMode) -> &'static str {
     }
 }
 
-#[cfg(feature = "interval-type-in-dev")]
 fn create_interval_partitioned_table(
     table_path: &str,
     engine: &dyn delta_kernel::Engine,

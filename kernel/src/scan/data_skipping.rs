@@ -92,10 +92,10 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
 pub(crate) struct DataSkippingFilter {
     /// Evaluator that extracts file-level statistics from the input batch. The caller provides
     /// the expression at construction time, which determines where stats come from:
-    /// - Scan path: `column_expr!("stats_parsed")` reads the already-parsed struct from a
-    ///   transformed batch (where `add.*` fields are flattened to top-level columns).
-    /// - Table changes path: `Expression::parse_json(column_expr!("add.stats"), schema)` parses
-    ///   JSON from a raw action batch (where stats are nested under `add.stats`).
+    /// - Scan path: `col!("stats_parsed")` reads the already-parsed struct from a transformed
+    ///   batch (where `add.*` fields are flattened to top-level columns).
+    /// - Table changes path: `Expression::parse_json(col!("add.stats"), schema)` parses JSON from
+    ///   a raw action batch (where stats are nested under `add.stats`).
     stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
@@ -116,8 +116,8 @@ impl DataSkippingFilter {
     /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues). Pass
     ///   `None` if no data stats are available.
     /// - `stats_expr`: Expression to extract data stats from the batch, producing output matching
-    ///   `stats_schema`. For example, `column_expr!("stats_parsed")` for pre-parsed stats, or
-    ///   `Expression::parse_json(column_expr!("add.stats"), stats_schema)` for JSON parsing.
+    ///   `stats_schema`. For example, `col!("stats_parsed")` for pre-parsed stats, or
+    ///   `Expression::parse_json(col!("add.stats"), stats_schema)` for JSON parsing.
     /// - `partition_schema`: Schema of typed partition columns referenced by the predicate
     ///   (physical names). Pass `None` if no partition columns are referenced.
     /// - `partition_expr`: Expression to extract partition values from the batch, producing output
@@ -484,7 +484,7 @@ fn collect_junction_preds(
             Some(pred) => Some(pred),
             None => keep_null.then(|| {
                 keep_null = false;
-                Pred::null_literal()
+                Pred::NULL
             }),
         })
         .collect();

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use super::plan::encode_keys;
+use super::plan::encode_keys_as_rows;
 use crate::arrow::array::{new_null_array, Array, ArrayRef, Int64Array, RecordBatch};
 use crate::arrow::compute::interleave;
 use crate::arrow::datatypes::DataType as ArrowDataType;
@@ -56,7 +56,7 @@ pub(super) fn eval_aggregate(
     let initial_aggs = || ops.iter().map(|op| op.init_state()).collect();
     for (batch_idx, batch) in input.iter().enumerate() {
         let updaters: Vec<_> = ops.iter().map(|op| op.prepare(batch)).try_collect()?;
-        let group_keys = encode_keys(batch, &aggregate.group_by)?;
+        let group_keys = encode_keys_as_rows(batch, &aggregate.group_by)?;
         for (row_idx, group_key) in group_keys.into_iter().enumerate() {
             let row = (batch_idx, row_idx);
             let (_, aggs) = groups
@@ -394,7 +394,7 @@ mod tests {
 
     /// Asserts `batches` pretty-print equal to `expected`, sorting data rows so HashMap group order
     /// does not matter. `expected` is the full pretty table (header, body, footer).
-    fn assert_eq_sorted_batches(batches: &[RecordBatch], expected: &str) {
+    fn assert_batches_eq(batches: &[RecordBatch], expected: &str) {
         let formatted = pretty_format_batches(batches).unwrap().to_string();
         let sort_body = |s: &str| -> String {
             let mut lines: Vec<_> = s.trim().lines().map(str::to_string).collect();
@@ -458,7 +458,7 @@ mod tests {
             },
         };
 
-        assert_eq_sorted_batches(
+        assert_batches_eq(
             &eval_aggregate(&aggregate, &[input])?,
             "\
 +-------+---------+---------+---------+---------+---------+-----------+------+
@@ -509,7 +509,7 @@ mod tests {
             ("key", Arc::new(Int64Array::from(vec![2]))),
         ])?;
 
-        assert_eq_sorted_batches(
+        assert_batches_eq(
             &eval_aggregate(&aggregate, &[first, second])?,
             "\
 +---------+---------+
@@ -522,8 +522,8 @@ mod tests {
     }
 
     #[test]
-    fn ungrouped_empty_input_emits_initial_aggregate_values() -> DeltaResult<()> {
-        let aggregate = Aggregate {
+    fn empty_input_distinguishes_grouped_and_ungrouped_aggregates() -> DeltaResult<()> {
+        let ungrouped = Aggregate {
             group_by: vec![],
             aggs: vec![
                 Agg::min(column_name!("key")),
@@ -552,8 +552,8 @@ mod tests {
                 nullable "last": STRING,
             },
         };
-        assert_eq_sorted_batches(
-            &eval_aggregate(&aggregate, &[])?,
+        assert_batches_eq(
+            &eval_aggregate(&ungrouped, &[])?,
             "\
 +---------+---------+-------+-----------+------+-------+------+
 | minimum | maximum | total | qualified | rows | first | last |
@@ -561,12 +561,8 @@ mod tests {
 |         |         |       | 0         | 0    |       |      |
 +---------+---------+-------+-----------+------+-------+------+",
         );
-        Ok(())
-    }
 
-    #[test]
-    fn grouped_empty_input_emits_no_rows() -> DeltaResult<()> {
-        let aggregate = Aggregate {
+        let grouped = Aggregate {
             group_by: vec![column_name!("group")],
             aggs: vec![Agg::max(column_name!("key"))],
             schema: schema_ref! {
@@ -574,7 +570,7 @@ mod tests {
                 nullable "max_key": LONG,
             },
         };
-        assert!(eval_aggregate(&aggregate, &[])?.is_empty());
+        assert!(eval_aggregate(&grouped, &[])?.is_empty());
         Ok(())
     }
 
@@ -627,7 +623,7 @@ mod tests {
                 not_null "rows": LONG,
             },
         };
-        assert_eq_sorted_batches(&eval_aggregate(&aggregate, &[input])?, expected);
+        assert_batches_eq(&eval_aggregate(&aggregate, &[input])?, expected);
         Ok(())
     }
 
@@ -654,7 +650,7 @@ mod tests {
             },
         };
 
-        assert_eq_sorted_batches(
+        assert_batches_eq(
             &eval_aggregate(&aggregate, &[input])?,
             "\
 +----------+------+
@@ -715,7 +711,7 @@ mod tests {
             },
         };
 
-        assert_eq_sorted_batches(
+        assert_batches_eq(
             &eval_aggregate(&aggregate, &[input])?,
             "\
 +--------------+---------+-----------+--------------+
@@ -749,7 +745,7 @@ mod tests {
             },
         };
 
-        assert_eq_sorted_batches(
+        assert_batches_eq(
             &eval_aggregate(&aggregate, &[input])?,
             "\
 +--------+

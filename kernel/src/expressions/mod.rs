@@ -8,10 +8,10 @@ use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 #[doc(hidden)]
-pub use self::column_names::__require_valid_simple_column_segment;
+pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
 pub use self::column_names::{
-    col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
-    joined_column_name, ColumnName,
+    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
+    ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -103,7 +103,8 @@ pub enum BinaryPredicateOp {
 pub enum UnaryExpressionOp {
     /// SQL `to_json(expr)`: encode a struct as a JSON object string, one string per row. The input
     /// must be a struct and the output is STRING. A NULL input row produces a NULL string rather
-    /// than `"null"`. This is the inverse of [`ParseJsonExpression`].
+    /// than `"null"`. This is the inverse of [`ParseJsonExpression`] for every type except
+    /// timestamps, whose sub-millisecond precision this operator discards (see below).
     ///
     /// Nested structs and arrays encode as JSON objects and arrays. Binary encodes as lowercase
     /// hex rather than base64, two digits per byte in the order the bytes appear, so
@@ -112,6 +113,15 @@ pub enum UnaryExpressionOp {
     /// ```text
     /// {"b":"abcd","l":[1,2],"n":{"z":7}}
     /// ```
+    ///
+    /// Timestamps must encode with exactly three fractional digits, truncated toward negative
+    /// infinity, because kernel writes `add.stats` with this operator and [Per-file Statistics]
+    /// truncates timestamp statistics down to milliseconds. TIMESTAMP takes a literal `Z` suffix
+    /// and TIMESTAMP_NTZ takes no offset, so `{ ts: 2026-07-02T15:55:55.298677Z }` becomes
+    /// `{"ts":"2026-07-02T15:55:55.298Z"}`. Emitting more digits, or rounding up, makes readers
+    /// prune files that hold matching rows.
+    ///
+    /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
 }
 
@@ -319,7 +329,8 @@ pub struct VariadicExpression {
 }
 
 /// An expression that parses a JSON string column into a struct column of `output_schema`, the
-/// inverse of [`UnaryExpressionOp::ToJson`].
+/// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
+/// that operator discards.
 ///
 /// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
 /// `add.stats` with this operator and data skipping reads null stats as "include the file". The
@@ -837,7 +848,9 @@ impl Expression {
     }
 
     /// Creates a new ParseJson expression that parses a JSON string column into a struct.
-    /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
+    /// This is the inverse of [`UnaryExpressionOp::ToJson`] - it converts a JSON-encoded string
+    /// into a struct. Sub-millisecond timestamp precision does not survive the round trip, since
+    /// `ToJson` truncates it.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
@@ -858,6 +871,13 @@ impl Expression {
 }
 
 impl Predicate {
+    /// Literal boolean true
+    pub const TRUE: Self = Self::literal(true);
+    /// Literal boolean false
+    pub const FALSE: Self = Self::literal(false);
+    /// NULL boolean literal
+    pub const NULL: Self = Self::null_literal();
+
     /// Returns a set of columns referenced by this predicate.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
@@ -866,16 +886,16 @@ impl Predicate {
     }
 
     /// Creates a new boolean column reference. See also [`Expression::column`].
-    pub fn column(field_names: impl CollectInto<ColumnName>) -> Predicate {
+    pub fn column(field_names: impl CollectInto<ColumnName>) -> Self {
         Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Create a new literal boolean value
+    /// Create a new literal boolean value. See also [`Self::TRUE`] and [`Self::FALSE`].
     pub const fn literal(value: bool) -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
     }
 
-    /// Creates a NULL literal boolean value
+    /// Creates a NULL literal boolean value. Prefer [`Self::NULL`].
     pub const fn null_literal() -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
     }
@@ -894,12 +914,12 @@ impl Predicate {
     }
 
     /// Create a new predicate `self IS NULL`
-    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_null(expr: impl Into<Expression>) -> Self {
         Self::unary(UnaryPredicateOp::IsNull, expr)
     }
 
     /// Create a new predicate `self IS NOT NULL`
-    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+    pub fn is_not_null(expr: impl Into<Expression>) -> Self {
         Self::not(Self::is_null(expr))
     }
 
@@ -1596,8 +1616,8 @@ mod tests {
                 // Boolean expression
                 Predicate::from_expr(column_expr!("is_active")),
                 // Literals
-                Predicate::literal(true),
-                Predicate::literal(false),
+                Predicate::TRUE,
+                Predicate::FALSE,
                 // NOT
                 Predicate::not(Predicate::from_expr(column_expr!("x"))),
                 // Nested NOT
@@ -1619,8 +1639,7 @@ mod tests {
 
         #[test]
         fn test_predicate_null_literal_roundtrip() {
-            let pred = Predicate::null_literal();
-            assert_roundtrip(&pred);
+            assert_roundtrip(&Predicate::NULL);
         }
 
         #[test]
@@ -1833,12 +1852,12 @@ mod tests {
     #[test]
     fn empty_and_from_returns_identity_literal() {
         let result = Pred::and_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(true));
+        assert_eq!(result, Pred::TRUE);
     }
 
     #[test]
     fn empty_or_from_returns_identity_literal() {
         let result = Pred::or_from(std::iter::empty());
-        assert_eq!(result, Pred::literal(false));
+        assert_eq!(result, Pred::FALSE);
     }
 }
