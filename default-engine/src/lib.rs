@@ -7,6 +7,7 @@
 //! the [executor] module.
 
 use std::future::Future;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
@@ -17,8 +18,10 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::Schema;
 use delta_kernel::transaction::WriteContext;
 use delta_kernel::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    CancellationTokenRef, DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler,
+    ParquetHandler, StorageHandler,
 };
+use futures::future::{self, Either};
 use futures::stream::{BoxStream, StreamExt as _};
 use url::Url;
 
@@ -32,6 +35,7 @@ pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod rest_store;
 pub mod stats;
 pub mod storage;
 
@@ -55,6 +59,57 @@ pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor
         stream: Some(task_executor.block_on(stream_future)?),
         task_executor,
     }))
+}
+
+/// Like [`stream_future_to_iter`], but each blocking poll is raced against the cancellation
+/// token. When the token fires, the iterator yields a single `Err(Error::Cancelled)` and then
+/// ends, abandoning the in-flight read (dropping the stream releases its buffered work).
+///
+/// Restricted to `DeltaResult` streams so cancellation can be surfaced as an item. With a `None`
+/// token, behavior is identical to [`stream_future_to_iter`].
+pub(crate) fn stream_future_to_cancellable_iter<U: Send + 'static, E: executor::TaskExecutor>(
+    task_executor: Arc<E>,
+    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, DeltaResult<U>>>>
+        + Send
+        + 'static,
+    cancellation_token: Option<CancellationTokenRef>,
+) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<U>> + Send>> {
+    let Some(token) = cancellation_token else {
+        return stream_future_to_iter(task_executor, stream_future);
+    };
+    // Race even the initial stream-producing future against cancellation.
+    let stream = match block_on_or_cancelled(&task_executor, token.clone(), stream_future) {
+        Some(result) => result?,
+        None => return Err(Error::Cancelled),
+    };
+    Ok(Box::new(CancellableStreamIterator {
+        stream: Some(stream),
+        task_executor,
+        token,
+    }))
+}
+
+/// Blocks on `future`, racing it against `token`'s cancellation. Returns `Some(output)` if the
+/// future completed first, or `None` if cancellation won. Fast-paths an already-cancelled token.
+pub(crate) fn block_on_or_cancelled<T, E: executor::TaskExecutor>(
+    task_executor: &Arc<E>,
+    token: CancellationTokenRef,
+    future: impl Future<Output = T> + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    if token.is_cancelled() {
+        return None;
+    }
+    task_executor.block_on(async move {
+        let cancelled = token.cancelled_future();
+        futures::pin_mut!(cancelled);
+        match future::select(std::pin::pin!(future), cancelled).await {
+            Either::Left((output, _)) => Some(output),
+            Either::Right(((), _)) => None,
+        }
+    })
 }
 
 struct BlockingStreamIterator<T: Send + 'static, E: executor::TaskExecutor> {
@@ -81,8 +136,47 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
     }
 }
 
+/// Cancellation-aware counterpart to [`BlockingStreamIterator`]: each `next()` races the blocking
+/// `stream.next()` against the token and, once cancelled, drops the stream and yields exactly one
+/// terminal `Err(Error::Cancelled)`.
+struct CancellableStreamIterator<U: Send + 'static, E: executor::TaskExecutor> {
+    stream: Option<BoxStream<'static, DeltaResult<U>>>,
+    task_executor: Arc<E>,
+    token: CancellationTokenRef,
+}
+
+impl<U: Send + 'static, E: executor::TaskExecutor> Iterator for CancellableStreamIterator<U, E> {
+    type Item = DeltaResult<U>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut stream = self.stream.take()?;
+        match block_on_or_cancelled(&self.task_executor, self.token.clone(), async move {
+            let item = stream.next().await;
+            (item, stream)
+        }) {
+            Some((item, stream)) => {
+                // We must not poll an exhausted stream after it returned None.
+                if item.is_some() {
+                    self.stream = Some(stream);
+                }
+                item
+            }
+            // Cancelled: `stream` was moved into the (now-dropped) future, releasing buffered
+            // work. Emit one terminal error; the taken `self.stream` stays `None`, fusing us.
+            None => Some(Err(Error::Cancelled)),
+        }
+    }
+}
+
 const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
+
+/// Default file-level readahead depth for JSON and Parquet handlers.
+pub(crate) const DEFAULT_READ_BUFFER_SIZE: NonZero<usize> =
+    NonZero::new(DEFAULT_BUFFER_SIZE).unwrap();
+/// Default row batch size for JSON and Parquet read streams.
+pub(crate) const DEFAULT_READ_BATCH_SIZE: NonZero<usize> =
+    NonZero::new(DEFAULT_BATCH_SIZE).unwrap();
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
@@ -121,6 +215,21 @@ pub struct DefaultEngineBuilder<E> {
     object_store: Arc<DynObjectStore>,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
     task_executor: E,
+    /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
+    /// fall back to the handlers' defaults.
+    io_config: ReadIoConfig,
+}
+
+/// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
+///
+/// Both knobs default to the handlers' built-in defaults when left unset.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReadIoConfig {
+    /// Maximum number of files read concurrently (file-level readahead depth). See
+    /// [`DefaultEngineBuilder::with_buffer_size`].
+    buffer_size: Option<NonZero<usize>>,
+    /// Maximum number of rows per yielded batch. See [`DefaultEngineBuilder::with_batch_size`].
+    batch_size: Option<NonZero<usize>>,
 }
 
 /// Represents the default [`TaskExecutor`]. The executor is created lazily to avoid unnecessary
@@ -133,13 +242,14 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
         Self {
             object_store,
             task_executor: DefaultTaskExecutor,
+            io_config: ReadIoConfig::default(),
         }
     }
 
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor)
+        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
     }
 }
 
@@ -154,14 +264,36 @@ impl<E> DefaultEngineBuilder<E> {
         DefaultEngineBuilder {
             object_store: self.object_store,
             task_executor,
+            io_config: self.io_config,
         }
+    }
+
+    /// Set the maximum number of files read concurrently by the JSON and Parquet handlers in their
+    /// `read_*_files` paths. This is the file-level I/O readahead depth: higher values overlap more
+    /// object-store requests to hide latency, at the cost of more in-flight memory.
+    ///
+    /// Defaults to the handlers' built-in value when unset. Ordering of returned data is preserved
+    /// regardless of this value.
+    pub fn with_buffer_size(mut self, buffer_size: NonZero<usize>) -> Self {
+        self.io_config.buffer_size = Some(buffer_size);
+        self
+    }
+
+    /// Set the maximum number of rows per batch yielded by the JSON and Parquet handlers in their
+    /// `read_*_files` paths.
+    ///
+    /// Defaults to the handlers' built-in value when unset. Overall read memory usage is roughly
+    /// proportional to `buffer_size * batch_size`.
+    pub fn with_batch_size(mut self, batch_size: NonZero<usize>) -> Self {
+        self.io_config.batch_size = Some(batch_size);
+        self
     }
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor)
+        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
     }
 }
 
@@ -177,19 +309,26 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    fn new_with_opts(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    fn new_with_opts(
+        object_store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        io_config: ReadIoConfig,
+    ) -> Self {
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
             task_executor.clone(),
         ));
-        let raw_json: Arc<dyn JsonHandler> = Arc::new(DefaultJsonHandler::new(
-            object_store.clone(),
-            task_executor.clone(),
-        ));
-        let raw_parquet = Arc::new(DefaultParquetHandler::new(
-            object_store.clone(),
-            task_executor.clone(),
-        ));
+
+        let buffer_size = io_config.buffer_size.unwrap_or(DEFAULT_READ_BUFFER_SIZE);
+        let batch_size = io_config.batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
+        let json = DefaultJsonHandler::new(object_store.clone(), task_executor.clone())
+            .with_buffer_size(buffer_size)
+            .with_batch_size(batch_size);
+        let parquet = DefaultParquetHandler::new(object_store.clone(), task_executor.clone())
+            .with_buffer_size(buffer_size)
+            .with_batch_size(batch_size);
+        let raw_json: Arc<dyn JsonHandler> = Arc::new(json);
+        let raw_parquet = Arc::new(parquet);
         Self {
             storage: Arc::new(MeteredStorageHandler::new(raw_storage)),
             json: Arc::new(MeteredJsonHandler::new(raw_json)),
@@ -386,6 +525,8 @@ mod tests {
         let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
         let engine = DefaultEngineBuilder::new(object_store)
             .with_task_executor(executor)
+            .with_buffer_size(NonZero::new(4).unwrap())
+            .with_batch_size(NonZero::new(8).unwrap())
             .build();
         test_arrow_engine(&engine, &url);
     }
@@ -418,5 +559,59 @@ mod tests {
 
         let url = Url::parse("https://example.com").unwrap();
         assert!(!url.is_presigned());
+    }
+
+    // `block_on_or_cancelled` must return `None` (cancel won the race) when the future never
+    // completes on its own and the token fires while it is pending -- the `Either::Right` arm
+    // that the pre-cancelled fast-path never exercises.
+    #[test]
+    fn block_on_or_cancelled_none_when_cancel_wins_race() {
+        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        let token = Arc::new(test_utils::TestCancellationToken::default());
+        let ct: CancellationTokenRef = token.clone();
+
+        // Fire cancellation shortly after the block begins; the only way out is the cancel arm.
+        let firing = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            firing.cancel();
+        });
+
+        let out: Option<i32> = block_on_or_cancelled(&executor, ct, std::future::pending::<i32>());
+        assert!(out.is_none(), "cancel must win the select and yield None");
+    }
+
+    // A stream that yields two items then blocks forever is cancelled mid-stream: the iterator
+    // yields the ready items, then exactly one `Err(Cancelled)`, then fuses.
+    #[test]
+    fn cancellable_stream_iterator_cancels_mid_stream_then_fuses() {
+        use futures::stream;
+
+        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        let token = Arc::new(test_utils::TestCancellationToken::default());
+        let ct: CancellationTokenRef = token.clone();
+
+        // 0, 1, then a pending tail that never resolves on its own.
+        let make_stream = async move {
+            let head = stream::iter(vec![Ok(0i32), Ok(1i32)]);
+            let tail = stream::once(std::future::pending::<DeltaResult<i32>>());
+            Ok(head.chain(tail).boxed())
+        };
+        let mut iter = stream_future_to_cancellable_iter(executor, make_stream, Some(ct)).unwrap();
+
+        assert!(matches!(iter.next(), Some(Ok(0))));
+        assert!(matches!(iter.next(), Some(Ok(1))));
+
+        let firing = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            firing.cancel();
+        });
+
+        assert!(matches!(iter.next(), Some(Err(Error::Cancelled))));
+        assert!(
+            iter.next().is_none(),
+            "iterator must fuse after cancellation"
+        );
     }
 }

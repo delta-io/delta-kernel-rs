@@ -299,7 +299,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::Expression;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema_ref;
 
     fn make_write_context(
         cm_mode: ColumnMappingMode,
@@ -308,10 +308,7 @@ mod tests {
         randomize_file_prefixes: bool,
         random_prefix_length: usize,
     ) -> WriteContext {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]));
+        let schema = schema_ref! { nullable "value": INTEGER };
         let shared = Arc::new(SharedWriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             logical_schema: schema.clone(),

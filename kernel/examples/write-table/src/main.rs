@@ -67,7 +67,7 @@ async fn try_main() -> DeltaResult<()> {
         create_dir_all(&cli.location_args.path).map_err(|e| {
             Error::generic(format!(
                 "Failed to create directory {}: {e}",
-                &cli.location_args.path
+                cli.location_args.path
             ))
         })?;
     }

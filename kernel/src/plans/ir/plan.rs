@@ -18,6 +18,16 @@ pub struct PlanNode {
     pub inputs: Vec<usize>,
 }
 
+impl PlanNode {
+    /// A node applying `op` over the nodes at `inputs` (indices into [`Plan::nodes`]).
+    pub fn new(op: impl Into<Operator>, inputs: Vec<usize>) -> Self {
+        Self {
+            op: op.into(),
+            inputs,
+        }
+    }
+}
+
 // ============================================================================
 // Plans
 // ============================================================================

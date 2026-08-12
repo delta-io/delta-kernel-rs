@@ -1,10 +1,9 @@
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
 use url::Url;
@@ -26,10 +25,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a simple table schema: one int column named 'id'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     // Setup engine and storage - this creates a proper temporary table
     let (store, engine, table_location) = engine_store_setup("test_compaction_table", None);
@@ -199,10 +195,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
 async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
 
     let (store, engine, table_location) = engine_store_setup("test_expired_tombstone_table", None);
 

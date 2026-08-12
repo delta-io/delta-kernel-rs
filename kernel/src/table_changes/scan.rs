@@ -9,12 +9,13 @@ use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
-use super::TableChanges;
+use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::SchemaRef;
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
@@ -43,7 +44,7 @@ pub struct TableChangesScan {
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;
-/// # use delta_kernel::expressions::{column_expr, Scalar};
+/// # use delta_kernel::expressions::{col, lit};
 /// # use delta_kernel::Predicate;
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
@@ -55,7 +56,7 @@ pub struct TableChangesScan {
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
 ///     .unwrap();
-/// let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
+/// let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
 /// let scan = table_changes
 ///     .into_scan_builder()
 ///     .with_schema(schema)
@@ -108,6 +109,14 @@ impl TableChangesScanBuilder {
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
     pub fn build(self) -> DeltaResult<TableChangesScan> {
+        // Row-tracking CDF requires row-level reconciliation by row IDs, which this
+        // scanner does not perform.
+        if self.table_changes.mode != CdfMode::ChangeDataFeed {
+            return Err(Error::unsupported(
+                "A row-tracking TableChanges cannot be scanned for data; use \
+                 TableChanges::scan_file_listing instead",
+            ));
+        }
         // Predicates may reference any column in the full CDF-extended schema even when
         // `with_schema` narrows the output. Resolve predicate columns against the full schema
         // so valid references to unprojected columns aren't rejected.
@@ -321,10 +330,21 @@ fn read_scan_file(
         // because the selection vector is `None`.
         let extend = Some(!is_dv_resolved_pair);
         let rest = split_vector(sv.as_mut(), len, extend);
-        let result = match sv {
-            Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
-            None => logical,
+
+        // If sv is None here, but we used to have one (is_dv_resolved_pair == true) it means we've
+        // split the selection vector beyond the range of the original. split_vector will return
+        // None for rest in that case. When we try and extend that None we still get None, but in
+        // the CDF case we actually DO want to filter out those rows because it means nothing has
+        // changed. Hence, in the case that sv==None and is_dv_resolved_pair==true we need a
+        // full array of false. This only applies to remove/add cases where the associated
+        // pair may have a selection vector that crosses batch sizes.
+        let sv = match sv {
+            None if is_dv_resolved_pair => Some(vec![false; len]),
+            other => other,
         };
+        let result = logical.fold_with(sv, |logical, sv| {
+            logical.and_then(|data| data.apply_selection_vector(sv))
+        });
         selection_vector = rest;
         result
     });
@@ -337,7 +357,7 @@ mod tests {
 
     use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, Scalar};
+    use crate::expressions::{col, lit};
     use crate::object_store::memory::InMemory;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
@@ -417,7 +437,7 @@ mod tests {
             .schema()
             .project(&["id", COMMIT_VERSION_COL_NAME])
             .unwrap();
-        let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
+        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema.clone())
@@ -493,7 +513,7 @@ mod tests {
 
         // Project only "part"; predicate references unprojected "id".
         let schema = table_changes.schema().project(&["part"]).unwrap();
-        let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
+        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)
@@ -516,10 +536,7 @@ mod tests {
 
         // Project only "id"; predicate references unprojected `_commit_version`.
         let schema = table_changes.schema().project(&["id"]).unwrap();
-        let predicate = Arc::new(Predicate::ge(
-            column_expr!("_commit_version"),
-            Scalar::from(0_i64),
-        ));
+        let predicate = Arc::new(Predicate::ge(col!("_commit_version"), lit(0_i64)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)

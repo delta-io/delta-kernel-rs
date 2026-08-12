@@ -23,43 +23,43 @@ samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "som
 
 #### By benchmark name
 
-Benchmark names follow a hierarchical path structure assembled from the table name, the spec file name, the operation, and (for `Read` workloads) the read config name:
+Benchmark names use the human-readable table name and spec file name. Read benchmarks also
+include the harness config name:
 
 ```
-{table_name}/{spec_file_name}/{operation}/{config_name}
+{table_name}/{spec_file_name}               # snapshot construction
+{table_name}/{spec_file_name}/{config_name} # read
 ```
 
-- `{table_name}` — the `name` field from `tableInfo.json`
+- `{table_name}` — the human-readable `name` from the table's `tableInfo.json`
 - `{spec_file_name}` — the spec filename without its `.json` extension (the `case_name`)
-- `{operation}` — `snapshotConstruction` or `readMetadata`
-- `{config_name}` — only present for `Read` workloads; e.g. `serial`, `parallel2`, `parallel4`
-
-All path components use camelCase to match the JSON keys used throughout the workload spec format.
+- `{config_name}` — the read harness config from
+  [`bench-registry.json`](#registry-bench-registryjson), such as `serial` or `parallel2`
 
 Examples:
 ```
-101kAdds1000CommitsSinceChkpt1Chkpt/snapshotLatest/snapshotConstruction
-101kAdds1000CommitsSinceChkpt1Chkpt/snapshotLatest/readMetadata/serial
-10kAdds0CommitsSinceChkpt1V2Chkpt/snapshotLatest/readMetadata/parallel2
+crcVeryStale/snapshotLatest
+v1Checkpoint/readMetadataLatest/serial
+v2Checkpoint/readMetadataLatest/parallel2
 ```
 
 The filter argument is a regular expression, so you can create patterns to target the benchmarks that you want:
 
 ```bash
 # all benchmarks for a specific table name
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "crcVeryStale"
 
 # all benchmarks for either of two tables (| for OR)
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt|10kAdds0Chkpts"
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "crcVeryStale|crcLatest"
 
-# all snapshotConstruction benchmarks
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "snapshotConstruction"
+# all snapshot-construction benchmarks (the snapshotLatest spec)
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "snapshotLatest"
 
-# snapshotConstruction workloads for a specific table (.* to AND two parts of the name)
-cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt.*snapshotConstruction"
+# snapshot-construction workloads for a specific table (.* to AND two parts of the name)
+cargo bench -p delta_kernel_benchmarks --bench workload_bench "crcVeryStale.*snapshotLatest"
 
 # profile a specific benchmark with samply
-samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "101kAdds1000CommitsSinceChkpt1Chkpt/snapshotLatest/snapshotConstruction"
+samply record cargo bench -p delta_kernel_benchmarks --bench workload_bench "crcVeryStale/snapshotLatest"
 ```
 
 #### By tag (`BENCH_TAGS`)
@@ -129,13 +129,50 @@ Examples:
 ```
 /bench                                                  # BENCH_TAGS=base, all benchmark names
 /bench --tags base,my-tag                               # BENCH_TAGS=base,my-tag, all benchmark names
-/bench --filter snapshotConstruction                    # no BENCH_TAGS set, only snapshotConstruction benchmarks
-/bench --tags base --filter 101kAdds.*snapshotConstruction  # only snapshotConstruction benchmarks from tables tagged "base"
-/bench --filter 101kAdds|10kAdds                        # no BENCH_TAGS set, OR two table names
+/bench --filter snapshotLatest                          # no BENCH_TAGS set, only snapshot-construction benchmarks
+/bench --tags base --filter crcVeryStale.*snapshotLatest  # only snapshot-construction benchmarks from tables tagged "base"
+/bench --filter crcVeryStale|crcLatest                    # no BENCH_TAGS set, OR two table names
 ```
 
 See [By tag (`BENCH_TAGS`)](#by-tag-bench_tags) for how tags work and [By benchmark name](#by-benchmark-name) for regex pattern examples. Results are posted automatically as a PR comment, comparing the PR branch against the base branch.
 CI timings are noisy and tend to run higher than on dedicated hardware, but proportional differences between branches are a rough signal for performance changes.
+
+## Registry (`bench-registry.json`)
+
+[`bench-registry.json`](bench-registry.json) maps read benchmarks to the harness configs they run.
+Each registered read workload expands into one Criterion benchmark per config, and the config
+`name` becomes the trailing path segment of the benchmark name (see
+[By benchmark name](#by-benchmark-name)). Snapshot-construction workloads construct a new snapshot
+each iteration and are not configured through the registry.
+
+The registry is a checked-in file under the crate root, separate from the spec files: the
+workload archive (`benchmarks/workloads/`) is downloaded at build time and gitignored, so configs
+that belong with the source live here and reference benchmarks by name.
+
+```json
+{
+  "10kAdds0CommitsSinceChkpt1V2Chkpt": {
+    "readMetadataLatest": [
+      { "name": "serial",    "parallelScan": "disabled" },
+      { "name": "parallel2", "parallelScan": { "enabled": { "numThreads": 2 } } }
+    ]
+  }
+}
+```
+
+- The file nests read config lists by table directory name then case name
+  (`{ table: { case: [configs] } }`).
+- A read benchmark whose `(table, case)` key is absent from the registry falls back to the built-in
+  serial config. An explicit but empty config list is rejected at load rather than silently
+  dropping the benchmark.
+- Config `name`s within a list must be unique and non-empty (they form the benchmark name's last
+  segment).
+
+Config-field value forms:
+
+- `parallelScan` (read configs): `"disabled"` or `{ "enabled": { "numThreads": <n> } }` — serde
+  externally-tagged, so the fieldless variant is a bare string and the parameterized variant a
+  single-key object.
 
 ## Workload data layout
 
@@ -156,7 +193,7 @@ benchmarks/workloads/
 
 Workloads are downloaded from the DAT GitHub release and extracted to `benchmarks/workloads/` automatically by `build.rs` when the crate is built. A `.done` marker file is written on success to skip re-downloading on subsequent builds. To force a fresh download, delete `benchmarks/workloads/.done`.
 
-Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/workloads/benchmarks/`, loading `tableInfo.json` and every spec file under `specs/`. The spec filename (without extension) becomes the `case_name`.
+Workloads are discovered automatically by path. `load_all_workloads()` scans every subdirectory of `benchmarks/workloads/benchmarks/`, loading `tableInfo.json` and every spec file under `specs/`. The subdirectory name becomes the registry table key, the human-readable `name` from `tableInfo.json` becomes the benchmark identifier's first segment, and the spec filename (without extension) becomes the `case_name`.
 
 ## Current benchmarking workloads
 
@@ -226,7 +263,7 @@ KERNEL_BENCH_WORKLOAD_DIR=/path/to/my/tables \
 
 ### `TableInfo`
 
-Deserialized from `tableInfo.json`. Captures the table's identity (`name`, `description`), Delta schema and protocol, log statistics (`logInfo`), physical data layout, table properties, and benchmark tags. See [`workloads/src/models.rs`](../workloads/src/models.rs) for field-level documentation.
+Deserialized from `tableInfo.json`. Captures a human label (`name`) and `description`, Delta schema and protocol, log statistics (`logInfo`), physical data layout, table properties, and benchmark tags. The `name` field becomes the benchmark identifier's table segment, while the registry table key comes from the table's directory name. See [`workloads/src/models.rs`](../workloads/src/models.rs) for field-level documentation.
 
 #### Example
 
@@ -301,29 +338,31 @@ Or with a specific version:
 
 ### `Workload`
 
-The concrete unit of work that gets benchmarked. Assembled when loading workloads by pairing a `Spec` (the operation) with a `TableInfo` (the table) and a `case_name`. A `Spec` file on its own solely describes an operation without context of the table it is performed on; when combined with a table, it becomes a `Workload`. A single table therefore produces multiple workloads, one for each spec file in its `specs/` directory.
+The concrete unit of work that gets benchmarked. Assembled when loading workloads by pairing a `Spec` (the operation) with a `TableInfo` (the table, whose directory determines `TableInfo::registry_table_key()`) and a `case_name`. A `Spec` file on its own solely describes an operation without context of the table it is performed on; when combined with a table, it becomes a `Workload`. A single table therefore produces multiple workloads, one for each spec file in its `specs/` directory.
 
 ### `ReadConfig`
 
-Specifies runtime parameters for `Read` workloads that are not part of the spec JSON — currently whether to scan serially or in parallel, and how many threads to use. Multiple configs can be applied to the same workload to compare modes. By default all workloads run serial log replay; workloads with sidecar files additionally run parallel configs to benchmark parallel scanning.
+Specifies runtime parameters for `Read` workloads that are not part of the spec JSON — currently whether to scan serially or in parallel, and how many threads to use. Multiple configs can be applied to the same workload to compare modes. Which configs run for a given benchmark is determined by the [registry](#registry-bench-registryjson).
 
 ### `WorkloadRunner`
 
-Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so that `execute()` measures only the target operation. Each runner corresponds to one `Workload` plus whatever additional configuration that workload type requires — `Read` workloads take a `ReadConfig`, while `SnapshotConstruction` workloads require no extra configuration.
+Owns all pre-built state for a workload (e.g. a pre-constructed `Snapshot`) so that `execute()` measures only the target operation. Read runners also carry the `ReadConfig` selected by the registry. Snapshot-construction runners always construct a new snapshot each iteration.
 
 
 ## Source Layout
 
-The workload spec data types (`TableInfo`, `Spec`, `Workload`, `ReadConfig`, …) and the SQL
-predicate parser live in the shared [`delta_kernel_workloads`](../workloads/) crate, since they
-are also used by the `acceptance` crate.
+The workload spec data types (`TableInfo`, `Spec`, `Workload`, …) live in the shared
+[`delta_kernel_workloads`](../workloads/) crate, since the spec types are also used by the
+`acceptance` crate. The read harness config types (`ReadConfig`, `ParallelScan`) and the registry
+that maps read benchmarks to them are benchmark-specific and live in this crate.
 
 | File | Purpose |
 |------|---------|
-| `../workloads/src/models.rs` | Data types: `TableInfo`, `Spec`, `Workload`, `ReadConfig`, `ReadOperation` |
+| `../workloads/src/models.rs` | Workload spec types: `TableInfo`, `Spec`, `Workload`, `ReadOperation` |
 | `../workloads/src/predicate_parser.rs` | SQL WHERE clause to kernel `Predicate` parser |
+| `src/registry.rs` | Read harness config types and registry loader: `ReadConfig`, `ParallelScan`, `BenchRegistry` |
+| `bench-registry.json` | Checked-in registry mapping read benchmarks to their harness configs |
 | `src/runners.rs` | `WorkloadRunner` trait and implementations: `ReadMetadataRunner`, `SnapshotConstructionRunner` |
 | `src/utils.rs` | Workload loading: deserializes workloads from the extracted data directory |
-| `benches/workload_bench.rs` | Criterion entry point — loads workloads, builds runners, drives benchmarks |
+| `benches/workload_bench.rs` | Criterion entry point — loads workloads + registry, builds runners, drives benchmarks |
 | `build.rs` | Downloads and extracts benchmark workloads from the DAT GitHub release at build time |
-

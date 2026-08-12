@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, StructField, StructType,
+    schema_ref, ArrayType, ColumnMetadataKey, DataType, MapType, StructField, StructType,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{ColumnMappingMode, TableFeature};
@@ -92,20 +92,48 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
     Ok(())
 }
 
+/// IcebergV3 has no interval type, so icebergCompatV3 omits intervals from
+/// its type allowlist. Enabling V3 alongside an interval column must fail at `.build(...)`.
+#[rstest]
+fn v3_create_table_rejects_interval_column(
+    #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
+    #[values(false, true)] nested: bool,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let interval_field = if nested {
+        StructField::nullable(
+            "nested",
+            StructType::new_unchecked([StructField::nullable("iv", interval)]),
+        )
+    } else {
+        StructField::nullable("iv", interval)
+    };
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::LONG),
+        interval_field,
+    ])?);
+
+    let err = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.enableIcebergCompatV3", "true")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not support type at column"),
+        "expected V3 allowlist rejection of the interval column, got: {err}",
+    );
+    Ok(())
+}
+
 /// Listing IcebergCompatV3 in writerFeatures (i.e. "supported") without setting
 /// `delta.enableIcebergCompatV3=true` must not activate V3: column mapping stays off and
 /// no nested-id metadata is set on the Map field.
 #[test]
 fn v3_supported_but_not_enabled_skips_cm_and_nested_ids() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "data",
-        MapType::new(
-            DataType::INTEGER,
-            ArrayType::new(DataType::INTEGER, true),
-            true,
-        ),
-    )])?);
+    let schema = schema_ref! {
+        nullable "data": { INTEGER => nullable [nullable INTEGER] },
+    };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([("delta.feature.icebergCompatV3", "supported")])

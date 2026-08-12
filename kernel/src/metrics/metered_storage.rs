@@ -15,8 +15,8 @@ use crate::metrics::{emit_storage_span, MetricsIterator};
 use crate::{DeltaResult, FileMeta, FileSlice, StorageHandler};
 
 /// Decorator over an engine-provided `Arc<dyn StorageHandler>` that emits the kernel's
-/// standard `"storage"` spans on operations that produce metrics. `put` and `head` are
-/// pass-through and emit nothing.
+/// standard `"storage"` spans on operations that produce metrics. `put`, `head`, and `delete`
+/// are pass-through and emit nothing.
 pub struct MeteredStorageHandler {
     inner: Arc<dyn StorageHandler>,
 }
@@ -82,6 +82,10 @@ impl StorageHandler for MeteredStorageHandler {
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
         self.inner.head(path)
     }
+
+    fn delete(&self, path: &Url) -> DeltaResult<()> {
+        self.inner.delete(path)
+    }
 }
 
 #[cfg(test)]
@@ -90,7 +94,7 @@ mod tests {
 
     use super::*;
     use crate::metrics::MetricEvent;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
 
     /// Storage handler that returns N preconfigured FileMeta / byte slices.
     #[derive(Debug)]
@@ -126,6 +130,10 @@ mod tests {
 
         fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
             unreachable!("not exercised in these tests")
+        }
+
+        fn delete(&self, _path: &Url) -> DeltaResult<()> {
+            Ok(())
         }
     }
 

@@ -1,13 +1,61 @@
-//! This module defines the concept of a PlanExecutor and its associated input + output types.
+//! Declarative plans: the kernel describes data work as a relational plan; the engine executes it.
+//!
+//! Kernel does no I/O or data processing itself. When an operation needs data work, kernel builds a
+//! plan and hands it to the engine's [`PlanExecutor`], which compiles it into the engine's own
+//! representation (a Spark or DataFusion logical plan, an iterator pipeline) and runs it. The
+//! engine therefore applies its own optimizer, parallelism, and async I/O to all of kernel's data
+//! work, not just leaf scans.
+//!
+//! # What a plan is
+//!
+//! A [`Plan`](ir::plan::Plan) is a DAG of relational operators ([`Operator`](ir::nodes::Operator)):
+//! sources, transforms, and set combinators. Most map one-to-one onto a SQL operator, so a plan
+//! reads like a query. The live-add metadata plan built in `scan::scan_plan`, for example, is
+//! roughly:
+//!
+//! ```sql
+//! -- commits: keep the newest action per file, then keep only the live adds
+//! SELECT add FROM (
+//!     SELECT max_by(action, version) AS add FROM commits GROUP BY file_key
+//! ) WHERE add IS NOT NULL
+//! UNION ALL
+//! -- checkpoint adds that no newer commit superseded
+//! SELECT c.add FROM checkpoint c
+//! LEFT ANTI JOIN commit_keys k ON c.file_key = k.file_key
+//! ```
+//!
+//! # Writing an executor
+//!
+//! An executor implements [`PlanExecutor::execute_op`], dispatching on the [`Operation`] it
+//! receives and returning the matching [`PlanResult`] variant:
+//!
+//! - [`Operation::IoOperation`] is a single I/O request; each [`IoOperation`] variant documents the
+//!   [`PlanResult`] it must return.
+//! - [`Operation::QueryPlan`] is a [`Plan`](ir::plan::Plan), returning [`PlanResult::Data`]. Either
+//!   evaluate [`Plan::nodes`](ir::plan::Plan::nodes) in slice order, which is topologically sorted
+//!   so a node's inputs are already evaluated, or compile the DAG into the engine's own plan.
+//!
+//! Every operator, expression, and predicate a plan contains must be handled; returning an error
+//! for an unsupported one is fine, and kernel surfaces it to the caller. The sync engine's
+//! `SyncPlanExecutor` is a complete reference implementation.
+//!
+//! # Where to look
+//!
+//! - [`PlanBuilder`] builds plans through a fluent, schema-validating API, each method documenting
+//!   its operator with a runnable example.
+//! - [`ir::nodes`] is the operator catalog: each [`Operator`](ir::nodes::Operator) variant's
+//!   payload struct carries its semantics, invariants, and worked examples.
+//! - [`crate::expressions`] defines the expressions and predicates operators evaluate, including
+//!   the type and null semantics an executor must match.
 //!
 //! This module is opt-in behind the `declarative-plans` feature flag.
+mod builder;
 pub mod ir;
 pub mod proto;
-mod query_builder;
 
+pub use builder::PlanBuilder;
 use bytes::Bytes;
 pub use ir::{IoOperation, Operation};
-pub use query_builder::QueryPlanBuilder;
 
 use crate::{
     AsAny, DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileMeta, ParquetFooter,
@@ -20,16 +68,12 @@ use crate::{
 pub trait PlanExecutor: AsAny {
     /// Executes the given declarative plan and returns the result.
     fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult>;
-}
 
-/// The unit type is a trivial [`PlanExecutor`] that rejects every operation. It backs
-/// [`Engine::plan_executor`](crate::Engine::plan_executor)'s default so callers can attempt plan
-/// execution unconditionally and fall back on the resulting error when no real executor exists.
-impl PlanExecutor for () {
-    fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-        Err(Error::unsupported(
-            "this engine does not provide a PlanExecutor",
-        ))
+    /// Reads a parquet file's footer (schema and, in future, row-group stats) via a
+    /// [`IoOperation::ParquetFooter`] op.
+    fn read_parquet_footer(&self, file: FileMeta) -> DeltaResult<ParquetFooter> {
+        self.execute_op(Operation::IoOperation(IoOperation::parquet_footer(file)))?
+            .into_parquet_footer()
     }
 }
 

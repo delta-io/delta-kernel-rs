@@ -27,9 +27,10 @@ use crate::table_configuration::TableConfiguration;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::table_features::schema_contains_timestamp_nanos;
 use crate::table_features::{
-    assign_column_mapping_metadata, find_max_column_id_in_schema,
-    get_any_level_column_physical_name, get_column_mapping_mode_from_properties,
-    schema_contains_timestamp_ntz, ColumnMappingMode, EnablementCheck, FeatureType, TableFeature,
+    add_feature_to_lists, assign_column_mapping_metadata, auto_enable_property_driven_features,
+    find_max_column_id_in_schema, get_any_level_column_physical_name,
+    get_column_mapping_mode_from_properties, schema_contains_timestamp_ntz,
+    strip_stray_column_mapping_metadata, ColumnMappingMode, TableFeature,
     SET_TABLE_FEATURE_SUPPORTED_PREFIX, SET_TABLE_FEATURE_SUPPORTED_VALUE,
 };
 use crate::table_properties::{
@@ -196,34 +197,6 @@ impl ValidatedTableProperties {
     }
 }
 
-/// Adds a feature to the appropriate reader/writer feature lists based on its type.
-///
-/// - ReaderWriter features are added to both reader and writer lists
-/// - Writer and Unknown features are added only to the writer list
-///
-/// This function is idempotent - it won't add duplicate features.
-fn add_feature_to_lists(
-    feature: TableFeature,
-    reader_features: &mut Vec<TableFeature>,
-    writer_features: &mut Vec<TableFeature>,
-) {
-    match feature.feature_type() {
-        FeatureType::ReaderWriter => {
-            if !reader_features.contains(&feature) {
-                reader_features.push(feature.clone());
-            }
-            if !writer_features.contains(&feature) {
-                writer_features.push(feature);
-            }
-        }
-        FeatureType::WriterOnly | FeatureType::Unknown => {
-            if !writer_features.contains(&feature) {
-                writer_features.push(feature);
-            }
-        }
-    }
-}
-
 /// Test-only helper for clustering support during table creation.
 ///
 /// Validates clustering columns, adds the `DomainMetadata` and `ClusteredTable` features
@@ -275,8 +248,8 @@ struct DataLayoutResult {
 /// 1. Top-level columns (nested paths are not supported)
 /// 2. Present in the schema
 /// 3. Not duplicated
-/// 4. Of a primitive type (Struct, Array, Map are rejected because partition values must be
-///    representable as directory-path strings)
+/// 4. Of a supported primitive type (Struct, Array, and Map are rejected because the Delta protocol
+///    does not define their partition-value serialization)
 /// 5. A strict subset of the schema columns (at least one non-partition column required)
 fn validate_partition_columns(
     schema: &StructType,
@@ -313,13 +286,13 @@ fn validate_partition_columns(
             Error::generic(format!("Partition column '{col}' not found in schema"))
         })?;
 
-        if !matches!(field.data_type(), DataType::Primitive(_)) {
+        let DataType::Primitive(_) = field.data_type() else {
             return Err(Error::generic(format!(
                 "Partition column '{col}' has non-primitive type '{}'. \
                  Partition columns must have primitive types.",
                 field.data_type()
             )));
-        }
+        };
     }
     Ok(())
 }
@@ -457,30 +430,16 @@ fn maybe_enable_timestamp_nanos(schema: &SchemaRef, validated: &mut ValidatedTab
     }
 }
 
-/// Auto-enables allowed features whose [`EnablementCheck::EnabledIf`] check is satisfied by the
-/// table properties. Features with [`EnablementCheck::AlwaysIfSupported`] are skipped since they
-/// don't require property-driven enablement.
+/// Auto-enables allowed property-driven features from the table properties (see
+/// [`auto_enable_property_driven_features`]).
 fn maybe_auto_enable_property_driven_features(validated: &mut ValidatedTableProperties) {
     let table_properties = TableProperties::from(validated.properties.iter());
-    for feature in ALLOWED_DELTA_FEATURES {
-        if let EnablementCheck::EnabledIf(check) = feature.info().enablement_check {
-            if check(&table_properties) {
-                add_feature_to_lists(
-                    feature.clone(),
-                    &mut validated.reader_features,
-                    &mut validated.writer_features,
-                );
-                // RowTracking requires DomainMetadata as a dependency
-                if *feature == TableFeature::RowTracking {
-                    add_feature_to_lists(
-                        TableFeature::DomainMetadata,
-                        &mut validated.reader_features,
-                        &mut validated.writer_features,
-                    );
-                }
-            }
-        }
-    }
+    auto_enable_property_driven_features(
+        ALLOWED_DELTA_FEATURES,
+        &table_properties,
+        &mut validated.reader_features,
+        &mut validated.writer_features,
+    );
 }
 
 /// Sets materialized column name properties when row tracking is enabled.
@@ -787,6 +746,7 @@ pub struct CreateTableTransactionBuilder {
     engine_info: String,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
+    correlation_id: Option<Arc<str>>,
 }
 
 impl CreateTableTransactionBuilder {
@@ -801,6 +761,7 @@ impl CreateTableTransactionBuilder {
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
+            correlation_id: None,
         }
     }
 
@@ -888,6 +849,13 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Attach an opaque, caller-supplied correlation id for joining the create-table commit's
+    /// metric events to the caller's own request or operation id. An empty id is treated as unset.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
     /// Builds a [`CreateTableTransaction`] that can be committed to create the table.
     ///
     /// The returned [`CreateTableTransaction`] only exposes operations that are valid for
@@ -945,12 +913,23 @@ impl CreateTableTransactionBuilder {
         let pre_cm = maybe_enable_iceberg_compat_v3_dependencies(&mut validated)?;
 
         // Apply column mapping if mode is name or id (must happen BEFORE data layout)
-        let (effective_schema, column_mapping_mode) =
+        let (mut effective_schema, column_mapping_mode) =
             maybe_apply_column_mapping_for_table_create(&self.schema, &mut validated, pre_cm)?;
 
         // Validate schema (column names, duplicates, no `delta.invariants` metadata).
         // Empty schemas are intentionally allowed.
         validate_schema(&effective_schema, column_mapping_mode)?;
+
+        // Strip CM metadata in `None` mode: a new table has no prior schema (passed as `None`), so
+        // any annotation the caller supplied is newly introduced (see
+        // `strip_stray_column_mapping_metadata`).
+        if column_mapping_mode == ColumnMappingMode::None {
+            // A new table has no prior schema, so nothing was carried in (`current_has_cm =
+            // false`).
+            if let Some(stripped) = strip_stray_column_mapping_metadata(false, &effective_schema) {
+                effective_schema = Arc::new(stripped);
+            }
+        }
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
@@ -1010,6 +989,7 @@ impl CreateTableTransactionBuilder {
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
+            self.correlation_id,
         )
     }
 }
@@ -1023,23 +1003,21 @@ mod tests {
     use super::*;
     use crate::expressions::ColumnName;
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
-    use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{
+        schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
         COLUMN_MAPPING_MAX_COLUMN_ID, ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3,
         PARQUET_FORMAT_VERSION,
     };
     use crate::transforms::SchemaTransform;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, build_complex_nested_kernel_schema,
     };
 
     fn test_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]))
+        schema_ref! { not_null "id": INTEGER }
     }
 
     #[test]
@@ -1290,11 +1268,7 @@ mod tests {
     fn test_clustering_column_not_in_schema() {
         use crate::expressions::ColumnName;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            false,
-        )]));
+        let schema = schema_ref! { not_null "id": INTEGER };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1363,47 +1337,25 @@ mod tests {
 
     #[rstest::rstest]
     #[case::variant_top_level(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "v": (DataType::unshredded_variant()) },
         &[TableFeature::VariantType],
     )]
     #[case::variant_nested(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked(vec![StructField::new(
-                    "inner_v",
-                    DataType::unshredded_variant(),
-                    true,
-                )]),
-                true,
-            ),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_v": (DataType::unshredded_variant()) },
+        },
         &[TableFeature::VariantType],
     )]
     #[case::ntz_top_level(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "ts": TIMESTAMP_NTZ },
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::ntz_nested(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked(vec![StructField::new(
-                    "inner_ts",
-                    DataType::TIMESTAMP_NTZ,
-                    true,
-                )]),
-                true,
-            ),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": { nullable "inner_ts": TIMESTAMP_NTZ },
+        },
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::both_variant_and_ntz(
@@ -1457,32 +1409,19 @@ mod tests {
 
     #[rstest::rstest]
     #[case::all_nullable(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("name", DataType::STRING, true),
-        ])),
+        schema_ref! { nullable "id": INTEGER, nullable "name": STRING },
         false,
     )]
     #[case::top_level_non_null(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ])),
+        schema_ref! { not_null "id": INTEGER, nullable "name": STRING },
         true,
     )]
     #[case::nested_non_null(
-        Arc::new(StructType::new_unchecked(vec![StructField::new(
-            "parent",
-            StructType::new_unchecked(vec![StructField::new("child", DataType::INTEGER, false)]),
-            true,
-        )])),
+        schema_ref! { nullable "parent": { not_null "child": INTEGER } },
         true,
     )]
     #[case::variant_only(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("v", DataType::unshredded_variant(), true),
-        ])),
+        schema_ref! { nullable "id": INTEGER, nullable "v": (DataType::unshredded_variant()) },
         false,
     )]
     fn test_maybe_enable_invariants(#[case] schema: SchemaRef, #[case] expect_invariants: bool) {
@@ -1736,12 +1675,32 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn test_validate_partition_columns_nested_interval_types_rejected(
+        #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] data_type: DataType,
+    ) {
+        let schema = StructType::new_unchecked([
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::not_null(
+                "nested",
+                StructType::new_unchecked([StructField::not_null("col", data_type)]),
+            ),
+        ]);
+
+        let error = validate_partition_columns(&schema, &[ColumnName::new(["nested", "col"])])
+            .expect_err("nested partition columns must be rejected")
+            .to_string();
+        assert!(error.contains("must be a top-level column"));
+    }
+
+    #[rstest::rstest]
     #[case::integer(DataType::INTEGER)]
     #[case::string(DataType::STRING)]
     #[case::date(DataType::DATE)]
     #[case::timestamp(DataType::TIMESTAMP)]
     #[case::boolean(DataType::BOOLEAN)]
     #[case::long(DataType::LONG)]
+    #[case::interval_year_month(DataType::INTERVAL_YEAR_MONTH)]
+    #[case::interval_day_time(DataType::INTERVAL_DAY_TIME)]
     fn test_validate_partition_columns_primitive_types_accepted(#[case] data_type: DataType) {
         let schema = StructType::new_unchecked(vec![
             StructField::new("id", DataType::INTEGER, false),

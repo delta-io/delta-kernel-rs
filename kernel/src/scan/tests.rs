@@ -1,9 +1,11 @@
+use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use ::test_utils::{get_column, load_test_data};
+use ::test_utils::{assert_result_error_with_message, get_column, load_test_data};
 use bytes::Bytes;
 use rstest::rstest;
+use url::Url;
 
 use super::*;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
@@ -15,8 +17,9 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
+use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    column_expr, column_name, column_pred, ColumnName, Expression as Expr, Predicate as Pred,
+    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred,
 };
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -24,12 +27,12 @@ use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
 use crate::scan::state::ScanFile;
 use crate::schema::{
-    self, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
+    self, schema_ref, ColumnMetadataKey, DataType, MetadataColumnSpec, StructField, StructType,
 };
 use crate::transaction::create_table::create_table;
 use crate::{
-    DeltaResultIteratorStatic, Engine, EngineData, EvaluationHandler, FileDataReadResultIterator,
-    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, PredicateRef, Snapshot, StorageHandler,
+    DeltaResultIteratorStatic, Engine, EngineData, FileDataReadResultIterator, FileMeta,
+    ParquetFooter, ParquetHandler, PredicateRef, Snapshot,
 };
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -38,19 +41,18 @@ fn field_names(s: &StructArray) -> Vec<String> {
 
 #[test]
 fn test_static_skipping() {
-    const NULL: Pred = Pred::null_literal();
     let test_cases = [
         (false, column_pred!("a")),
-        (true, Pred::literal(false)),
-        (false, Pred::literal(true)),
-        (false, NULL), // NULL is unknown, not false -- conservative (no skip)
-        (true, Pred::and(column_pred!("a"), Pred::literal(false))),
-        (false, Pred::or(column_pred!("a"), Pred::literal(true))),
-        (false, Pred::or(column_pred!("a"), Pred::literal(false))),
-        (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
+        (true, Pred::FALSE),
+        (false, Pred::TRUE),
+        (false, Pred::NULL), // NULL is unknown, not false -- conservative (no skip)
+        (true, Pred::and(column_pred!("a"), Pred::FALSE)),
+        (false, Pred::or(column_pred!("a"), Pred::TRUE)),
+        (false, Pred::or(column_pred!("a"), Pred::FALSE)),
+        (false, Pred::lt(col!("a"), Expr::literal(10))),
         (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
         (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
-        (false, Pred::and(NULL, column_pred!("a"))), // NULL is unknown, not false
+        (false, Pred::and(Pred::NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {
         assert_eq!(
@@ -100,8 +102,8 @@ fn test_physical_predicate() {
     // NOTE: We break several column mapping rules here because they don't matter for this
     // test. For example, we do not provide field ids, and not all columns have physical names.
     let test_cases = [
-        (Pred::literal(true), Some(PhysicalPredicate::None)),
-        (Pred::literal(false), Some(PhysicalPredicate::StaticSkipAll)),
+        (Pred::TRUE, Some(PhysicalPredicate::None)),
+        (Pred::FALSE, Some(PhysicalPredicate::StaticSkipAll)),
         (column_pred!("x"), None), // no such column
         (
             column_pred!("a"),
@@ -174,9 +176,9 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
+            Pred::and(column_pred!("mapped.n"), Pred::TRUE),
             Some(PhysicalPredicate::Some(
-                Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
+                Pred::and(column_pred!("phys_mapped.phys_n"), Pred::TRUE).into(),
                 StructType::new_unchecked(vec![StructField::nullable(
                     "phys_mapped",
                     StructType::new_unchecked(vec![StructField::nullable(
@@ -196,7 +198,7 @@ fn test_physical_predicate() {
             )),
         ),
         (
-            Pred::and(column_pred!("mapped.n"), Pred::literal(false)),
+            Pred::and(column_pred!("mapped.n"), Pred::FALSE),
             Some(PhysicalPredicate::StaticSkipAll),
         ),
     ];
@@ -222,14 +224,14 @@ fn test_physical_predicate() {
         StructField::nullable("Value", DataType::LONG),
     ]),
     Pred::and(
-        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
-        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+        Pred::gt(col!("createdat"), lit(500i64)),
+        Pred::lt(col!("value"), lit(100i64)),
     ),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
         Arc::new(Pred::and(
-            Pred::gt(column_expr!("createdAt"), Expr::literal(500i64)),
-            Pred::lt(column_expr!("Value"), Expr::literal(100i64)),
+            Pred::gt(col!("createdAt"), lit(500i64)),
+            Pred::lt(col!("Value"), lit(100i64)),
         )),
         StructType::new_unchecked(vec![
             StructField::nullable("createdAt", DataType::LONG),
@@ -250,14 +252,14 @@ fn test_physical_predicate() {
         )]),
     ]),
     Pred::and(
-        Pred::gt(column_expr!("createdat"), Expr::literal(500i64)),
-        Pred::lt(column_expr!("value"), Expr::literal(100i64)),
+        Pred::gt(col!("createdat"), lit(500i64)),
+        Pred::lt(col!("value"), lit(100i64)),
     ),
     ColumnMappingMode::Name,
     PhysicalPredicate::Some(
         Arc::new(Pred::and(
-            Pred::gt(column_expr!("phys_created"), Expr::literal(500i64)),
-            Pred::lt(column_expr!("phys_value"), Expr::literal(100i64)),
+            Pred::gt(col!("phys_created"), lit(500i64)),
+            Pred::lt(col!("phys_value"), lit(100i64)),
         )),
         StructType::new_unchecked(vec![
             StructField::nullable("phys_created", DataType::LONG).with_metadata([(
@@ -277,14 +279,14 @@ fn test_physical_predicate() {
         StructField::nullable("Value", DataType::LONG),
     ]),
     Pred::and(
-        Pred::gt(column_expr!("value"), Expr::literal(5i64)),
-        Pred::lt(column_expr!("VALUE"), Expr::literal(10i64)),
+        Pred::gt(col!("value"), lit(5i64)),
+        Pred::lt(col!("VALUE"), lit(10i64)),
     ),
     ColumnMappingMode::None,
     PhysicalPredicate::Some(
         Arc::new(Pred::and(
-            Pred::gt(column_expr!("Value"), Expr::literal(5i64)),
-            Pred::lt(column_expr!("Value"), Expr::literal(10i64)),
+            Pred::gt(col!("Value"), lit(5i64)),
+            Pred::lt(col!("Value"), lit(10i64)),
         )),
         StructType::new_unchecked(vec![StructField::nullable("Value", DataType::LONG)])
             .into(),
@@ -354,7 +356,7 @@ fn test_scan_builder_accepts_predicate_on_unprojected_data_column() {
         .unwrap();
 
     let projection = snapshot.schema().project(&["a_float"]).unwrap();
-    let predicate = Arc::new(column_expr!("number").gt(Expr::literal(5_i64)));
+    let predicate = Arc::new(col!("number").gt(lit(5_i64)));
 
     let scan = snapshot
         .scan_builder()
@@ -372,10 +374,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
     let store = Arc::new(InMemory::new());
     let engine = SyncEngine::new_with_store(store);
 
-    let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "id",
-        DataType::LONG,
-    )]));
+    let schema = schema_ref! { nullable "id": LONG };
     create_table(url, schema, "DefaultEngine")
         .build(&engine, Box::new(FileSystemCommitter::new()))
         .unwrap()
@@ -395,7 +394,7 @@ fn test_scan_builder_rejects_predicate_on_projection_only_metadata_column() {
             .add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)
             .unwrap(),
     );
-    let predicate = Arc::new(column_expr!("my_row_index").gt(Expr::literal(5_i64)));
+    let predicate = Arc::new(col!("my_row_index").gt(lit(5_i64)));
 
     let err = snapshot
         .scan_builder()
@@ -787,11 +786,9 @@ fn test_replay_for_scan_metadata() {
     let scan = snapshot.scan_builder().build().unwrap();
     let result = scan.replay_for_scan_metadata(&engine).unwrap();
     let data: Vec<_> = result.actions.try_collect().unwrap();
-    // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
-    // could be skipped when looking for adds/removes.
-    //
-    // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
-    assert_eq!(data.len(), 5);
+    // Metadata and protocol parts have an all-null `add.path` column and are skipped. Transaction
+    // parts omit that column and are retained conservatively.
+    assert_eq!(data.len(), 3);
 }
 
 #[test]
@@ -810,8 +807,8 @@ fn test_data_row_group_skipping() {
     assert_eq!(data.len(), 1);
 
     // Ineffective predicate pushdown attempted, so the one data file should be returned.
-    let int_col = column_expr!("numeric.ints.int32");
-    let value = Expr::literal(1000i32);
+    let int_col = col!("numeric.ints.int32");
+    let value = lit(1000i32);
     let predicate = Arc::new(int_col.clone().gt(value.clone()));
     let scan = snapshot
         .clone()
@@ -850,7 +847,7 @@ fn test_missing_column_row_group_skipping() {
     //
     // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
     // optimization is currently disabled, so the one data file is still returned.
-    let predicate = Arc::new(column_expr!("missing").lt(Expr::literal(1000i64)));
+    let predicate = Arc::new(col!("missing").lt(lit(1000i64)));
     let scan = snapshot
         .clone()
         .scan_builder()
@@ -861,7 +858,7 @@ fn test_missing_column_row_group_skipping() {
     assert_eq!(data.len(), 1);
 
     // Predicate over a logically missing column fails the scan
-    let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(Expr::literal(1000)));
+    let predicate = Arc::new(col!("numeric.ints.invalid").lt(lit(1000)));
     snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1036,7 +1033,7 @@ fn test_scan_metadata_stats_columns_with_predicate() {
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
     // Build scan with both a predicate and stats_columns
-    let predicate = Arc::new(column_expr!("id").gt(Expr::literal(0i64)));
+    let predicate = Arc::new(col!("id").gt(lit(0i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1099,21 +1096,6 @@ fn test_scan_metadata_stats_columns_with_predicate() {
 }
 
 #[test]
-fn test_prefix_columns_simple() {
-    let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
-    };
-    // A simple binary predicate: x > 100
-    let pred = Pred::gt(column_expr!("x"), Expr::literal(100i64));
-    let result = prefixer.transform_pred(&pred).into_owned();
-
-    // The column reference should now be add.stats_parsed.x
-    let refs: Vec<_> = result.references().into_iter().collect();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(*refs[0], column_name!("add.stats_parsed.x"));
-}
-
-#[test]
 fn test_build_actions_meta_predicate_with_predicate() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
@@ -1121,7 +1103,7 @@ fn test_build_actions_meta_predicate_with_predicate() {
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
     // Build a scan with a predicate eligible for data skipping
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1174,7 +1156,7 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 
     // A predicate that statically evaluates to false should produce StaticSkipAll,
     // which means build_actions_meta_predicate returns None.
-    let predicate = Arc::new(Pred::literal(false));
+    let predicate = Arc::new(Pred::FALSE);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1187,33 +1169,183 @@ fn test_build_actions_meta_predicate_static_skip_all() {
     );
 }
 
-/// Helper to build a parquet file with the nested `add.stats_parsed.*` structure that
-/// checkpoint files have. Returns the parquet bytes and the arrow schema.
-///
-/// Each call to `write_row_group` writes one row group. Each row represents one add action's
-/// stats with maxValues.id, minValues.id, nullCount.id, and numRecords.
+// Partition-only scans have no stats schema, so the partition schema must enable the rewrite.
+#[rstest]
+#[case::equality(Pred::eq(
+    col!("modified"),
+    lit("2021-02-01"),
+), None)]
+#[case::date_cast_range(Pred::and(
+    Pred::ge(
+        Expr::cast(col!("modified"), DataType::DATE),
+        Scalar::Date(20_641),
+    ),
+    Pred::lt(
+        Expr::cast(col!("modified"), DataType::DATE),
+        Scalar::Date(20_644),
+    ),
+), Some("CAST(Column(add.partitionValues_parsed.modified) AS date)"))]
+fn test_build_actions_meta_predicate_partition_only(
+    #[case] predicate: Pred,
+    #[case] expected_cast: Option<&str>,
+) {
+    // `app-txn-checkpoint` is partitioned by `modified` (string), no column mapping.
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-checkpoint/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()
+        .unwrap();
+
+    let meta_pred = scan
+        .build_actions_meta_predicate()
+        .expect("partition-only predicate should produce a checkpoint meta-predicate");
+    let rendered = meta_pred.to_string();
+    if let Some(expected_cast) = expected_cast {
+        assert!(rendered.contains(expected_cast), "{rendered}");
+    }
+    let refs: Vec<String> = meta_pred
+        .references()
+        .into_iter()
+        .map(|c| c.to_string())
+        .collect();
+    assert_eq!(
+        refs,
+        vec!["add.partitionValues_parsed.modified".to_string()]
+    );
+}
+
+// Under column mapping, `partitionValues_parsed` is keyed by the physical partition name, so the
+// checkpoint meta-predicate must reference that physical name (not the logical one) in both name
+// and id mapping modes.
+#[rstest]
+#[case::name_mode("name")]
+#[case::id_mode("id")]
+fn test_build_actions_meta_predicate_partition_column_mapping(
+    #[case] mode: &str,
+    #[values(false, true)] casted: bool,
+) {
+    // `partition_cm/{name,id}` use column mapping, partitioned by `category`
+    // (physical name col-6dc68f07-711d-4f00-8bd6-1f5bc698e8ad in both fixtures).
+    let path =
+        std::fs::canonicalize(PathBuf::from(format!("./tests/data/partition_cm/{mode}/"))).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+    let predicate = if casted {
+        Pred::eq(
+            Expr::cast(col!("category"), DataType::DATE),
+            Scalar::Date(20_641),
+        )
+    } else {
+        Pred::eq(col!("category"), lit("a"))
+    };
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()
+        .unwrap();
+
+    let meta_pred = scan
+        .build_actions_meta_predicate()
+        .expect("partition predicate under column mapping should produce a meta-predicate");
+    let rendered = meta_pred.to_string();
+    assert_eq!(rendered.contains("CAST("), casted, "{rendered}");
+    let refs: Vec<String> = meta_pred
+        .references()
+        .into_iter()
+        .map(|c| c.to_string())
+        .collect();
+    // The hyphenated physical name is backtick-quoted in the column display.
+    assert!(
+        refs.iter().any(|r| r.contains("partitionValues_parsed")
+            && r.contains("col-6dc68f07-711d-4f00-8bd6-1f5bc698e8ad")),
+        "expected a reference to the PHYSICAL partition column under partitionValues_parsed, \
+         got {refs:?}"
+    );
+}
+
+struct RgSpec {
+    id: i64,
+    x_min: i64,
+    x_max: i64,
+    part: Option<&'static str>,
+}
+
+struct CheckpointRowGroup {
+    id_max: Vec<Option<i64>>,
+    id_min: Vec<Option<i64>>,
+    id_null_counts: Vec<Option<i64>>,
+    x_max: Vec<Option<i64>>,
+    x_min: Vec<Option<i64>>,
+    x_null_counts: Vec<Option<i64>>,
+    num_records: Vec<i64>,
+    parts: Vec<Option<&'static str>>,
+}
+
+/// Builds checkpoint parquet with one row group per write.
 struct CheckpointParquetBuilder {
     arrow_schema: Arc<ArrowSchema>,
-    id_fields: Fields,
+    stat_value_fields: Fields,
     stats_fields: Fields,
+    partition_fields: Fields,
+    add_fields: Fields,
+    include_partition_values: bool,
     buffer: Vec<u8>,
     writer: Option<ArrowWriter<Vec<u8>>>,
 }
 
 impl CheckpointParquetBuilder {
     fn new() -> Self {
-        let id_fields = Fields::from(vec![Field::new("id", ArrowDataType::Int64, true)]);
+        Self::with_partition_values(true)
+    }
+
+    fn without_partition_values() -> Self {
+        Self::with_partition_values(false)
+    }
+
+    fn with_partition_values(include_partition_values: bool) -> Self {
+        let stat_value_fields = Fields::from(vec![
+            Field::new("id", ArrowDataType::Int64, true),
+            Field::new("x", ArrowDataType::Int64, true),
+        ]);
         let stats_fields = Fields::from(vec![
-            Field::new(MAX_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new(MIN_VALUES, ArrowDataType::Struct(id_fields.clone()), true),
-            Field::new(NULL_COUNT, ArrowDataType::Struct(id_fields.clone()), true),
+            Field::new(
+                MAX_VALUES,
+                ArrowDataType::Struct(stat_value_fields.clone()),
+                true,
+            ),
+            Field::new(
+                MIN_VALUES,
+                ArrowDataType::Struct(stat_value_fields.clone()),
+                true,
+            ),
+            Field::new(
+                NULL_COUNT,
+                ArrowDataType::Struct(stat_value_fields.clone()),
+                true,
+            ),
             Field::new(NUM_RECORDS, ArrowDataType::Int64, true),
         ]);
-        let add_fields = Fields::from(vec![Field::new(
+        let partition_fields = Fields::from(vec![Field::new("part", ArrowDataType::Utf8, true)]);
+        let mut add_fields = vec![Field::new(
             "stats_parsed",
             ArrowDataType::Struct(stats_fields.clone()),
             true,
-        )]);
+        )];
+        if include_partition_values {
+            add_fields.push(Field::new(
+                "partitionValues_parsed",
+                ArrowDataType::Struct(partition_fields.clone()),
+                true,
+            ));
+        }
+        let add_fields = Fields::from(add_fields);
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "add",
             ArrowDataType::Struct(add_fields.clone()),
@@ -1221,11 +1353,13 @@ impl CheckpointParquetBuilder {
         )]));
         let buffer = Vec::new();
         let writer = ArrowWriter::try_new(buffer, arrow_schema.clone(), None).unwrap();
-        // ArrowWriter takes ownership of buffer, so we use a placeholder here.
         Self {
             arrow_schema,
-            id_fields,
+            stat_value_fields,
             stats_fields,
+            partition_fields,
+            add_fields,
+            include_partition_values,
             buffer: Vec::new(),
             writer: Some(writer),
         }
@@ -1239,50 +1373,83 @@ impl CheckpointParquetBuilder {
         null_counts: &[Option<i64>],
         num_records: &[i64],
     ) {
-        let make_id_struct = |vals: &[Option<i64>]| -> StructArray {
-            StructArray::from(vec![(
-                Arc::new(Field::new("id", ArrowDataType::Int64, true)),
-                Arc::new(Int64Array::from(vals.to_vec())) as Arc<dyn Array>,
-            )])
+        let len = max_ids.len();
+        self.write_values(CheckpointRowGroup {
+            id_max: max_ids.to_vec(),
+            id_min: min_ids.to_vec(),
+            id_null_counts: null_counts.to_vec(),
+            x_max: vec![None; len],
+            x_min: vec![None; len],
+            x_null_counts: vec![None; len],
+            num_records: num_records.to_vec(),
+            parts: vec![None; len],
+        });
+    }
+
+    fn write_rg_group(&mut self, group: &[RgSpec]) {
+        let ids: Vec<Option<i64>> = group.iter().map(|spec| Some(spec.id)).collect();
+        let zeros = vec![Some(0); group.len()];
+        self.write_values(CheckpointRowGroup {
+            id_max: ids.clone(),
+            id_min: ids,
+            id_null_counts: zeros.clone(),
+            x_max: group.iter().map(|spec| Some(spec.x_max)).collect(),
+            x_min: group.iter().map(|spec| Some(spec.x_min)).collect(),
+            x_null_counts: zeros,
+            num_records: vec![1; group.len()],
+            parts: group.iter().map(|spec| spec.part).collect(),
+        });
+    }
+
+    fn write_values(&mut self, values: CheckpointRowGroup) {
+        let make_stat_struct = |ids: Vec<Option<i64>>, xs: Vec<Option<i64>>| {
+            StructArray::from(vec![
+                (
+                    self.stat_value_fields[0].clone(),
+                    Arc::new(Int64Array::from(ids)) as Arc<dyn Array>,
+                ),
+                (
+                    self.stat_value_fields[1].clone(),
+                    Arc::new(Int64Array::from(xs)) as Arc<dyn Array>,
+                ),
+            ])
         };
         let stats_parsed = StructArray::from(vec![
             (
-                Arc::new(Field::new(
-                    MAX_VALUES,
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(max_ids)) as Arc<dyn Array>,
+                self.stats_fields[0].clone(),
+                Arc::new(make_stat_struct(values.id_max, values.x_max)) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new(
-                    MIN_VALUES,
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(min_ids)) as Arc<dyn Array>,
+                self.stats_fields[1].clone(),
+                Arc::new(make_stat_struct(values.id_min, values.x_min)) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new(
-                    NULL_COUNT,
-                    ArrowDataType::Struct(self.id_fields.clone()),
-                    true,
-                )),
-                Arc::new(make_id_struct(null_counts)) as Arc<dyn Array>,
+                self.stats_fields[2].clone(),
+                Arc::new(make_stat_struct(
+                    values.id_null_counts,
+                    values.x_null_counts,
+                )) as Arc<dyn Array>,
             ),
             (
-                Arc::new(Field::new(NUM_RECORDS, ArrowDataType::Int64, true)),
-                Arc::new(Int64Array::from(num_records.to_vec())) as Arc<dyn Array>,
+                self.stats_fields[3].clone(),
+                Arc::new(Int64Array::from(values.num_records)) as Arc<dyn Array>,
             ),
         ]);
-        let add = StructArray::from(vec![(
-            Arc::new(Field::new(
-                "stats_parsed",
-                ArrowDataType::Struct(self.stats_fields.clone()),
-                true,
-            )),
+        let mut add_children = vec![(
+            self.add_fields[0].clone(),
             Arc::new(stats_parsed) as Arc<dyn Array>,
-        )]);
+        )];
+        if self.include_partition_values {
+            let partition_values = StructArray::from(vec![(
+                self.partition_fields[0].clone(),
+                Arc::new(StringArray::from(values.parts)) as Arc<dyn Array>,
+            )]);
+            add_children.push((
+                self.add_fields[1].clone(),
+                Arc::new(partition_values) as Arc<dyn Array>,
+            ));
+        }
+        let add = StructArray::from(add_children);
         let batch = RecordBatch::try_new(self.arrow_schema.clone(), vec![Arc::new(add)]).unwrap();
         let writer = self.writer.as_mut().unwrap();
         writer.write(&batch).unwrap();
@@ -1297,12 +1464,37 @@ impl CheckpointParquetBuilder {
     }
 }
 
-/// Builds a checkpoint skipping predicate and prefixes column references with `add.stats_parsed`.
-fn build_prefixed_checkpoint_predicate(pred: &Pred) -> Option<Pred> {
-    let stats = all_referenced_columns(pred);
-    let skipping_pred = as_checkpoint_skipping_predicate(pred, &[], &stats)?;
+fn rg(id: i64, x_min: i64, x_max: i64, part: Option<&'static str>) -> RgSpec {
+    RgSpec {
+        id,
+        x_min,
+        x_max,
+        part,
+    }
+}
+
+fn write_checkpoint(groups: &[&[RgSpec]], include_partition_values: bool) -> Bytes {
+    let mut builder = if include_partition_values {
+        CheckpointParquetBuilder::new()
+    } else {
+        CheckpointParquetBuilder::without_partition_values()
+    };
+    for group in groups {
+        builder.write_rg_group(group);
+    }
+    builder.finish()
+}
+
+/// Builds a checkpoint meta-predicate scoped under `add`, mirroring `build_actions_meta_predicate`.
+fn build_checkpoint_meta_predicate(
+    pred: &Pred,
+    partition_columns: &HashSet<ColumnName>,
+    stats_columns: &HashSet<ColumnName>,
+) -> Option<Pred> {
+    let skipping_pred =
+        as_checkpoint_skipping_predicate(pred, partition_columns, &HashSet::new(), stats_columns)?;
     let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add", "stats_parsed"]),
+        prefix: ColumnName::new(["add"]),
     };
     Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }
@@ -1333,21 +1525,19 @@ fn apply_row_group_filter(parquet_bytes: Bytes, meta_predicate: &Pred) -> usize 
 /// | id IS NOT NULL | no predicate (col vs col, #1873)                                                       | 6     |
 #[rstest]
 #[case::comparison(
-    Pred::gt(column_expr!("id"), Expr::literal(200i64)),
-    // Should skip RG2 and RG3, but https://github.com/apache/arrow-rs/issues/9451
-    Some(6), // Some(3),
+    Pred::gt(col!("id"), lit(200i64)),
+    Some(3),
     "keep RG 0 (null stats) + RG 1 (max>200), skip RG 2 + RG 3 (max<200)"
 )]
 #[case::is_null(
-    Pred::is_null(column_expr!("id")),
-    // Should skip RG 1 (nullCount=0), but https://github.com/apache/arrow-rs/issues/9451
-    Some(6), // Some(5),
+    Pred::is_null(col!("id")),
+    Some(5),
     "keep RG 0 (nullCount>0) + RG 2 (nullCount>0) + RG 3 (null nullCount), skip RG 1 (nullCount=0)"
 )]
 #[case::is_not_null(
-    Pred::not(Pred::is_null(column_expr!("id"))),
+    Pred::not(Pred::is_null(col!("id"))),
     None,
-    "IS NOT NULL produces no skipping predicate — column vs column (#1873)"
+    "IS NOT NULL produces no skipping predicate (column vs column, #1873)"
 )]
 fn test_checkpoint_row_group_skipping(
     #[case] pred: Pred,
@@ -1376,7 +1566,8 @@ fn test_checkpoint_row_group_skipping(
     );
     let parquet_bytes = builder.finish();
 
-    let meta_predicate = build_prefixed_checkpoint_predicate(&pred);
+    let meta_predicate =
+        build_checkpoint_meta_predicate(&pred, &HashSet::new(), &all_referenced_columns(&pred));
 
     match expected_rows {
         Some(expected) => {
@@ -1399,6 +1590,399 @@ fn test_checkpoint_row_group_skipping(
     }
 }
 
+fn surviving_ids(parquet_bytes: Bytes, pred: &Pred) -> Vec<i64> {
+    let meta_predicate = build_checkpoint_meta_predicate(
+        pred,
+        &HashSet::from([column_name!("part")]),
+        &HashSet::from([column_name!("x")]),
+    );
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes).unwrap();
+    if let Some(meta_predicate) = &meta_predicate {
+        builder = builder.with_row_group_filter(meta_predicate, None);
+    }
+    let mut ids: Vec<i64> = builder
+        .build()
+        .unwrap()
+        .map(Result::unwrap)
+        .flat_map(|batch| {
+            let add = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let stats = struct_field(add, "stats_parsed");
+            let min = struct_field(stats, MIN_VALUES);
+            min.column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn struct_field<'a>(parent: &'a StructArray, name: &str) -> &'a StructArray {
+    parent
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+}
+
+fn standard_multi_rg() -> Bytes {
+    write_checkpoint(
+        &[
+            &[rg(1, 0, 10, Some("a"))],
+            &[rg(2, 100, 110, Some("b"))],
+            &[rg(3, 200, 210, Some("a"))],
+            &[rg(4, 900, 910, Some("c"))],
+        ],
+        true,
+    )
+}
+
+#[rstest]
+#[case::stats_gt(Pred::gt(col!("x"), lit(150i64)), vec![3, 4])]
+#[case::stats_le(Pred::le(col!("x"), lit(110i64)), vec![1, 2])]
+#[case::stats_all_kept(
+    Pred::ge(col!("x"), lit(0i64)),
+    vec![1, 2, 3, 4]
+)]
+#[case::partition_eq(Pred::eq(col!("part"), lit("a")), vec![1, 3])]
+#[case::partition_lt(Pred::lt(col!("part"), lit("b")), vec![1, 3])]
+#[case::partition_all_pruned(Pred::eq(col!("part"), lit("z")), vec![])]
+#[case::partition_cast_kept(
+    Pred::eq(
+        Expr::cast(col!("part"), DataType::DATE),
+        Scalar::Date(18_628),
+    ),
+    vec![1, 2, 3, 4]
+)]
+#[case::partition_cast_and_stats(
+    Pred::and(
+        Pred::eq(
+            Expr::cast(col!("part"), DataType::DATE),
+            Scalar::Date(18_628),
+        ),
+        Pred::gt(col!("x"), lit(150i64)),
+    ),
+    vec![3, 4]
+)]
+#[case::and_stats_and_partition(
+    Pred::and(
+        Pred::eq(col!("part"), lit("a")),
+        Pred::gt(col!("x"), lit(150i64)),
+    ),
+    vec![3]
+)]
+#[case::or_stats_or_partition(
+    Pred::or(
+        Pred::eq(col!("part"), lit("c")),
+        Pred::gt(col!("x"), lit(150i64)),
+    ),
+    vec![3, 4]
+)]
+#[case::partition_is_null(Pred::is_null(col!("part")), vec![])]
+#[case::partition_is_not_null(
+    Pred::is_not_null(col!("part")),
+    vec![1, 2, 3, 4]
+)]
+fn test_checkpoint_reader_skips_expected_row_groups(
+    #[case] pred: Pred,
+    #[case] expected: Vec<i64>,
+) {
+    assert_eq!(
+        surviving_ids(standard_multi_rg(), &pred),
+        expected,
+        "{pred:?}"
+    );
+}
+
+#[rstest]
+#[case::is_null_keeps_only_null_group(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None)], &[rg(3, 200, 210, Some("c"))]],
+    Pred::is_null(col!("part")),
+    vec![2],
+)]
+// Footer min/max ignore the null-valued Add, so the non-matching range prunes the group.
+#[case::mixed_group_with_null_partition_pruned(
+    &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, None)] as &[RgSpec]],
+    Pred::eq(col!("part"), lit("z")),
+    vec![],
+)]
+#[case::partition_range_contains_target(
+    &[&[rg(1, 0, 10, Some("a")), rg(2, 100, 110, Some("c"))] as &[RgSpec]],
+    Pred::eq(col!("part"), lit("b")),
+    vec![1, 2],
+)]
+#[case::all_null_group_pruned_under_eq(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Pred::eq(col!("part"), lit("z")),
+    vec![],
+)]
+#[case::all_null_group_pruned_under_gt(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Pred::gt(col!("part"), lit("m")),
+    vec![],
+)]
+#[case::all_null_group_pruned_under_is_not_null(
+    &[&[rg(1, 0, 10, Some("a"))] as &[RgSpec], &[rg(2, 100, 110, None), rg(3, 200, 210, None)]],
+    Pred::is_not_null(col!("part")),
+    vec![1],
+)]
+fn test_checkpoint_reader_handles_partition_groups(
+    #[case] groups: &[&[RgSpec]],
+    #[case] pred: Pred,
+    #[case] expected: Vec<i64>,
+) {
+    let parquet_bytes = write_checkpoint(groups, true);
+    assert_eq!(surviving_ids(parquet_bytes, &pred), expected, "{pred:?}");
+}
+
+/// A checkpoint may omit `partitionValues_parsed`; the absent leaf remains non-pruning.
+#[rstest]
+#[case::comparison(Pred::eq(col!("part"), lit("z")))]
+#[case::is_not_null(Pred::is_not_null(col!("part")))]
+fn test_checkpoint_reader_keeps_missing_partition_column(#[case] pred: Pred) {
+    let parquet_bytes = write_checkpoint(&[&[rg(1, 0, 10, Some("a"))] as &[RgSpec]], false);
+    assert_eq!(surviving_ids(parquet_bytes, &pred), vec![1]);
+}
+
+#[derive(Debug)]
+struct RecordedParquetRead {
+    files: Vec<String>,
+    physical_schema: schema::SchemaRef,
+    predicate: Option<PredicateRef>,
+}
+
+struct RecordingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    reads: Mutex<Vec<RecordedParquetRead>>,
+}
+
+impl RecordingParquetHandler {
+    fn new(inner: Arc<dyn ParquetHandler>) -> Self {
+        Self {
+            inner,
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_reads(&self) -> Vec<RecordedParquetRead> {
+        std::mem::take(&mut *self.reads.lock().unwrap())
+    }
+}
+
+impl ParquetHandler for RecordingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: schema::SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.reads.lock().unwrap().push(RecordedParquetRead {
+            files: files.iter().map(|file| file.location.to_string()).collect(),
+            physical_schema: physical_schema.clone(),
+            predicate: predicate.clone(),
+        });
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
+        self.inner.write_parquet_file(location, data)
+    }
+}
+
+#[rstest]
+#[case::all_struct(StatsOptions::all_struct(), false, false)]
+#[case::all(StatsOptions::all(), true, false)]
+#[case::none_with_predicate(StatsOptions::none(), false, true)]
+fn test_checkpoint_stats_projection_matches_requested_output(
+    #[values(
+        "v1-single-part-struct-stats-only",
+        "v2-parquet-sidecars-struct-stats-only",
+        "v2-checkpoints-parquet-with-sidecars"
+    )]
+    table: &str,
+    #[case] stats: StatsOptions,
+    #[case] request_json_stats: bool,
+    #[case] skip_stats: bool,
+) {
+    let extracted = load_test_data("tests/data", table).ok();
+    let path = extracted
+        .as_ref()
+        .map(|dir| dir.path().join(table))
+        .unwrap_or_else(|| {
+            fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap()
+        });
+    let url = Url::from_directory_path(path).unwrap();
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    recorder.take_reads();
+
+    let predicate: Option<PredicateRef> =
+        skip_stats.then(|| Arc::new(Pred::gt(col!("id"), lit(0i64))) as PredicateRef);
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_stats(stats)
+        .build()
+        .unwrap();
+    for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
+        action.unwrap();
+    }
+
+    let reads = recorder.take_reads();
+    let compatible_structured_stats = table != "v2-checkpoints-parquet-with-sidecars";
+    let expect_parsed_stats = !skip_stats && compatible_structured_stats;
+    let expect_json_stats = !skip_stats && (request_json_stats || !expect_parsed_stats);
+    let expected_file_fragment = if table.starts_with("v2-") {
+        "_sidecars/"
+    } else {
+        ".checkpoint."
+    };
+    let action_reads: Vec<_> = reads
+        .iter()
+        .filter(|read| {
+            read.files
+                .iter()
+                .any(|file| file.contains(expected_file_fragment))
+                && read.physical_schema.field("add").is_some()
+        })
+        .collect();
+    assert!(!action_reads.is_empty(), "expected checkpoint Add reads");
+    for read in action_reads {
+        let add_field = read
+            .physical_schema
+            .field("add")
+            .expect("checkpoint read schema must contain add");
+        let DataType::Struct(add) = add_field.data_type() else {
+            panic!("checkpoint add field must be a struct");
+        };
+        assert_eq!(
+            add.field("stats").is_some(),
+            expect_json_stats,
+            "JSON checkpoint stats projection must match the requested output"
+        );
+        assert_eq!(
+            add.field("stats_parsed").is_some(),
+            expect_parsed_stats,
+            "structured checkpoint stats projection must match the requested output"
+        );
+    }
+}
+
+#[test]
+fn test_all_struct_parses_json_commit_stats() {
+    let path = fs::canonicalize(PathBuf::from(
+        "./tests/data/v1-single-part-struct-stats-only/",
+    ))
+    .unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    // The table's checkpoint is at version 5, so version 4 replays only JSON commits.
+    let snapshot = Snapshot::builder_for(url)
+        .at_version(4)
+        .build(engine.as_ref())
+        .unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::all_struct())
+        .build()
+        .unwrap();
+
+    let mut file_count = 0;
+    for scan_metadata in scan
+        .scan_metadata(engine.as_ref())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    {
+        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
+            .unwrap()
+            .into();
+        let filtered = filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
+        let stats_parsed = get_column!(filtered, "stats_parsed", StructArray);
+        let num_records = get_column!(stats_parsed, NUM_RECORDS, Int64Array);
+
+        for row in 0..filtered.num_rows() {
+            assert!(!stats_parsed.is_null(row));
+            assert_eq!(num_records.value(row), 1);
+            file_count += 1;
+        }
+    }
+    assert_eq!(file_count, 4);
+}
+
+#[rstest]
+#[case::v1_partition(
+    "v1-multi-part-partitioned-struct-stats-only",
+    Pred::eq(col!("part"), lit(1i32)),
+    column_name!("add.partitionValues_parsed.part"),
+    ".checkpoint.",
+)]
+#[case::v2_sidecar(
+    "v2-parquet-sidecars-struct-stats-only",
+    Pred::gt(col!("id"), lit(2i64)),
+    column_name!("add.stats_parsed.maxValues.id"),
+    "_sidecars/",
+)]
+fn test_checkpoint_predicate_reaches_parquet_handler(
+    #[case] table: &str,
+    #[case] pred: Pred,
+    #[case] expected_ref: ColumnName,
+    #[case] expected_file_fragment: &str,
+) {
+    let path = std::fs::canonicalize(PathBuf::from(format!("./tests/data/{table}/"))).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let sync = Arc::new(SyncEngine::new());
+    let recorder = Arc::new(RecordingParquetHandler::new(sync.parquet_handler()));
+    let engine = DelegatingEngine::new(sync).with_parquet_handler(recorder.clone());
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    recorder.take_reads();
+
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(pred))
+        .build()
+        .unwrap();
+    for action in scan.replay_for_scan_metadata(&engine).unwrap().actions {
+        action.unwrap();
+    }
+
+    let reads = recorder.take_reads();
+    assert!(
+        reads.iter().any(|read| {
+            read.files
+                .iter()
+                .any(|file| file.contains(expected_file_fragment))
+                && read
+                    .predicate
+                    .as_ref()
+                    .is_some_and(|predicate| predicate.references().contains(&expected_ref))
+        }),
+        "expected {expected_ref} on a {expected_file_fragment} read, got {reads:#?}"
+    );
+}
+
 #[test]
 fn test_skip_stats_disables_data_skipping() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -1406,7 +1990,7 @@ fn test_skip_stats_disables_data_skipping() {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let predicate = Arc::new(Pred::gt(column_expr!("id"), Expr::literal(400i64)));
+    let predicate = Arc::new(Pred::gt(col!("id"), lit(400i64)));
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
@@ -1551,6 +2135,40 @@ fn test_scan_metadata_with_specific_stats_columns(#[case] stats: StatsOptions) {
     }
 }
 
+#[rstest]
+fn scan_builder_validates_predicate_and_stats_columns(
+    #[values(
+        (column_pred!("missing_predicate"), false),
+        (column_pred!("id"), true)
+    )]
+    predicate: (Pred, bool),
+    #[values(
+        (StatsOptions::struct_columns(vec![column_name!("missing_stats")]), false),
+        (StatsOptions::struct_columns(vec![column_name!("id")]), true)
+    )]
+    stats: (StatsOptions, bool),
+) {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = SyncEngine::new();
+    let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+    let (predicate, predicate_exists) = predicate;
+    let (stats, stats_columns_exist) = stats;
+    let result = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .with_stats(stats)
+        .build();
+
+    match (predicate_exists, stats_columns_exist) {
+        (true, true) => {
+            result.expect("valid predicate and stats columns");
+        }
+        (false, _) => assert_result_error_with_message(result, "missing_predicate"),
+        (true, false) => assert_result_error_with_message(result, "missing_stats"),
+    }
+}
+
 /// Test that [`StructStats::Columns`] with multiple specific columns returns stats for all of them.
 #[test]
 fn test_scan_metadata_with_multiple_stats_columns() {
@@ -1623,8 +2241,7 @@ fn test_scan_metadata_with_multiple_stats_columns() {
     }
 }
 
-/// Test that [`StructStats::Columns`] with a nonexistent column name produces empty stats for
-/// that column.
+/// Test that [`StructStats::Columns`] rejects nonexistent columns.
 #[test]
 fn test_scan_metadata_with_nonexistent_stats_columns() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
@@ -1632,43 +2249,15 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
-    let scan = snapshot
+    let result = snapshot
         .scan_builder()
         .with_stats(StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
         })
-        .build()
-        .unwrap();
+        .build();
 
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    assert!(
-        !scan_metadata_results.is_empty(),
-        "Should have scan metadata"
-    );
-
-    for scan_metadata in scan_metadata_results {
-        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-            .unwrap()
-            .into();
-        let filtered_batch =
-            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-
-        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-
-        // Should have numRecords but no minValues/maxValues/nullCount
-        // (or they exist but are empty structs)
-        assert!(
-            stats_parsed.column_by_name(NUM_RECORDS).is_some(),
-            "Should still have numRecords"
-        );
-    }
+    assert_result_error_with_message(result, "Could not resolve column 'nonexistent_column'");
 }
 
 /// A [`ParquetHandler`] that returns an empty iterator for every `read_parquet_files` call.
@@ -1698,28 +2287,6 @@ impl ParquetHandler for EmptyParquetHandler {
     }
 }
 
-/// An [`Engine`] that delegates everything to a [`SyncEngine`] except `parquet_handler`, which
-/// returns [`EmptyParquetHandler`].
-struct EmptyParquetEngine(Arc<SyncEngine>);
-
-impl Engine for EmptyParquetEngine {
-    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.0.evaluation_handler()
-    }
-
-    fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.0.json_handler()
-    }
-
-    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        Arc::new(EmptyParquetHandler)
-    }
-
-    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        self.0.storage_handler()
-    }
-}
-
 /// When a file's Add action stats report `numRecords > 0` and the parquet handler returns an empty
 /// iterator, `execute` must surface an error rather than silently producing no rows.
 #[test]
@@ -1727,7 +2294,10 @@ fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
     let path =
         std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+    );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
@@ -1748,7 +2318,10 @@ fn execute_errors_when_parquet_returns_empty_for_file_with_positive_stats() {
 fn execute_does_not_error_when_parquet_returns_empty_and_stats_absent() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-cdf/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(EmptyParquetEngine(Arc::new(SyncEngine::new())));
+    let engine = Arc::new(
+        DelegatingEngine::new(Arc::new(SyncEngine::new()))
+            .with_parquet_handler(Arc::new(EmptyParquetHandler)),
+    );
 
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
@@ -1769,10 +2342,12 @@ mod scan_metadata_completed_tests {
 
     use rstest::rstest;
 
+    use super::ScanBuilder;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+    use crate::expressions::{col, lit, Expression as Expr, Predicate as Pred};
     use crate::metrics::MetricEvent;
-    use crate::utils::test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+    use crate::utils::FoldWithOption as _;
     use crate::Snapshot;
 
     fn run_scan(
@@ -1790,14 +2365,12 @@ mod scan_metadata_completed_tests {
         let engine = Arc::new(SyncEngine::new());
         let guard = install_thread_local_metrics_reporter(reporter.clone());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-        let mut builder = snapshot.scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        if let Some(id) = correlation_id {
-            builder = builder.with_correlation_id(id);
-        }
-        let scan = builder.build().unwrap();
+        let scan = snapshot
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .fold_with(correlation_id, ScanBuilder::with_correlation_id)
+            .build()
+            .unwrap();
         let results: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()
@@ -1818,7 +2391,7 @@ mod scan_metadata_completed_tests {
     #[case::basic_scan("./tests/data/parsed-stats/", None, 6, 6, 17236, 0, 0)]
     #[case::static_skip_all(
         "./tests/data/parsed-stats/",
-        Some(Arc::new(Pred::literal(false))),
+        Some(Arc::new(Pred::FALSE)),
         0,
         0,
         0,
@@ -1837,7 +2410,7 @@ mod scan_metadata_completed_tests {
     )]
     #[case::partition_filter(
         "./tests/data/basic_partitioned/",
-        Some(Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))),
+        Some(Arc::new(Expr::eq(col!("letter"), lit("a")))),
         2, 2, 1502, 0, 4
     )]
     fn test_scan_metrics(

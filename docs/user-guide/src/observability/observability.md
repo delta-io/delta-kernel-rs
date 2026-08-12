@@ -149,14 +149,14 @@ consumed. It provides detailed statistics about the log replay process:
 | `operation_id` | Unique ID for this scan, useful for correlation. |
 | `scan_type` | Which scan path produced the event (see below). |
 | `duration` | Wall-clock time from scan start to iterator exhaustion. |
-| `num_add_files_seen` | Add actions that entered deduplication. Excludes files already eliminated by data skipping. |
+| `num_add_files_seen` | Add files that entered deduplication. This normally excludes data-skipped files; parse-error fallback includes data-skipped files during retry. |
 | `num_active_add_files` | Add files that survived log replay. These are the files your connector reads. |
 | `num_remove_files_seen` | Remove actions encountered in commit files. |
 | `num_non_file_actions` | Non-file actions (protocol, metadata, etc.) seen during replay. |
 | `num_predicate_filtered` | Files eliminated by predicate evaluation (data skipping and partition pruning). |
 | `peak_hash_set_size` | Peak size of the internal deduplication set. Indicates memory pressure during log replay. |
-| `dedup_visitor_time_ms` | Milliseconds spent in the deduplication visitor. |
-| `predicate_eval_time_ms` | Milliseconds spent evaluating predicates. |
+| `dedup_visitor_time_ns` | Nanoseconds spent in the deduplication visitor. |
+| `predicate_eval_time_ns` | Nanoseconds spent evaluating predicates. |
 
 #### The ScanType enum
 

@@ -20,6 +20,7 @@ use crate::expressions::{col, Expression, ExpressionRef, UnaryExpressionOp};
 use crate::schema::{DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::table_properties::TableProperties;
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Error};
 
 pub(crate) const STATS_FIELD: &str = "stats";
@@ -159,17 +160,18 @@ pub(crate) fn build_checkpoint_read_schema(
                 "partitionValues_parsed field already exists in Add schema",
             ));
         }
-        let mut patch = SchemaStructPatchBuilder::new().insert_after(
-            STATS_FIELD,
-            StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
-        );
-        if let Some(pv_schema) = partition_schema {
-            patch = patch.insert_after(
-                PARTITION_VALUES_FIELD,
-                StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
-            );
-        }
-        patch.build(add_struct)
+        SchemaStructPatchBuilder::new()
+            .insert_after(
+                STATS_FIELD,
+                StructField::nullable(STATS_PARSED_FIELD, stats_schema.clone()),
+            )
+            .fold_with(partition_schema, |patch, pv_schema| {
+                patch.insert_after(
+                    PARTITION_VALUES_FIELD,
+                    StructField::nullable(PARTITION_VALUES_PARSED_FIELD, pv_schema.clone()),
+                )
+            })
+            .build(add_struct)
     })
 }
 
@@ -199,6 +201,11 @@ fn build_stats_parsed_expr(stats_schema: &SchemaRef) -> ExpressionRef {
 /// type (field names and data types) is determined by the output schema — `MAP_TO_STRUCT`
 /// itself carries no schema, so the expression evaluator uses the expected output type to
 /// parse each string value into the correct native type.
+///
+/// The fallback uses the same `MAP_TO_STRUCT` the scan applies, so an empty-string partition value
+/// (only ever a foreign `""`, since kernel serializes its own empty and null partition values to
+/// JSON null on write) reconstructs into the checkpoint identically to how the scan reconstructs it
+/// from a commit.
 ///
 /// Column paths are relative to the full batch, not the nested Add struct.
 fn build_partition_values_parsed_expr() -> ExpressionRef {
@@ -425,6 +432,25 @@ mod tests {
         assert!(
             is_replacement(inner, PARTITION_VALUES_PARSED_FIELD),
             "partitionValues_parsed should be replaced"
+        );
+    }
+
+    /// The checkpoint falls back to `MAP_TO_STRUCT` over `partitionValues` when no native
+    /// `partitionValues_parsed` column is present, so a checkpoint reconstructs the same typed
+    /// struct the scan reads and the two can never disagree on a value.
+    #[test]
+    fn build_partition_values_parsed_expr_falls_back_to_map_to_struct() {
+        let expr = build_partition_values_parsed_expr();
+        let Expression::Variadic(coalesce) = expr.as_ref() else {
+            panic!("expected a COALESCE expression");
+        };
+        let has_map_to_struct_fallback = coalesce
+            .exprs
+            .iter()
+            .any(|e| matches!(e, Expression::MapToStruct(_)));
+        assert!(
+            has_map_to_struct_fallback,
+            "checkpoint partitionValues_parsed must reconstruct via MAP_TO_STRUCT"
         );
     }
 

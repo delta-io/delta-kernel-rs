@@ -26,9 +26,9 @@ tables on local filesystems and cloud object stores.
 |---------|-------------|
 | `rustls` | TLS via `rustls`. Recommended for most users because it requires no native dependency. |
 | `native-tls` | TLS via your platform's native library (OpenSSL on Linux, Schannel on Windows, Secure Transport on macOS). |
-| `arrow` | Build against the latest supported Arrow version (currently 58). |
+| `arrow` | Build against the latest supported Arrow version (currently 59). |
+| `arrow-59` | Pin to Arrow 59 (with `parquet` 59 and `object_store` 0.13). |
 | `arrow-58` | Pin to Arrow 58 (with `parquet` 58 and `object_store` 0.13). |
-| `arrow-57` | Pin to Arrow 57 (with `parquet` 57 and `object_store` 0.12). |
 
 Pick exactly one of `rustls` or `native-tls`. Picking an `arrow-*` version on the default
 engine automatically activates the same version on `delta_kernel` (the two crates must agree).
@@ -40,7 +40,7 @@ engine automatically activates the same version on `delta_kernel` (the two crate
 | `arrow-conversion` | Convert between Kernel schema types and Arrow types (`TryIntoArrow`, `TryFromArrow`). |
 | `arrow-expression` | Evaluate Kernel expressions over Arrow data. |
 | `default-engine-base` | Shared Arrow modules used by the default engine. Pulled in automatically by `delta_kernel_default_engine`. |
-| `arrow-58` / `arrow-57` | Pin the Arrow version used by Kernel's arrow modules. |
+| `arrow-59` / `arrow-58` | Pin the Arrow version used by Kernel's arrow modules. |
 | `schema-diff` | Experimental schema diffing. |
 | `internal-api` | Expose additional APIs that aren't yet stabilized. Some examples in this guide need this. |
 | `prettyprint` | Arrow pretty-print helpers. Useful for debugging and examples. |

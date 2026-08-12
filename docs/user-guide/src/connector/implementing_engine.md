@@ -103,8 +103,9 @@ pub trait JsonHandler {
   columns match the `output_schema`. Missing fields should produce nulls for nullable columns.
 
 - **`read_json_files`**: Data must be returned in file order (same order as the `files` slice
-  argument), and rows within a file must be in source order. The predicate is an optional hint.  The
-  engine may ignore it.
+  argument), and rows within a file must be in source order. The predicate is an optional hint that
+  the engine may ignore. If applied, evaluate exact row values conservatively; unsupported
+  expressions and missing references remain unknown.
 
 - **`write_json_file`**: Must write newline-delimited JSON (one JSON object per line). Null
   columns should be omitted from the output to save space. The write must be atomic. If
@@ -158,6 +159,10 @@ must return a column of all nulls.
 **Ordering**: Like `JsonHandler`, data must be returned in file order, and rows within a
 file must be in source order.
 
+**Predicate hint**: If applied, the complete predicate may discard data only when conservative
+evaluation proves it cannot match. Footer min/max may be cast only when the cast preserves their
+bounds; unsupported expressions and missing references remain unknown.
+
 **Metadata columns**: The handler must support two virtual metadata columns that are not
 stored in the Parquet file but generated at read time:
 
@@ -174,6 +179,82 @@ file has field IDs (column mapping), they must be preserved in the returned sche
 
 The `DefaultEngine` uses the Apache Arrow Parquet reader/writer with support for column
 projection, predicate pushdown, metadata columns, and field-ID-based column matching.
+
+## Cancellation-aware reads
+
+When a caller attaches a `CancellationToken` to a scan (see
+[Cancelling a scan](../reading/scan_metadata.md#cancelling-a-scan)), Kernel threads it down to the
+`JsonHandler` and `ParquetHandler` reads through three optional methods:
+
+```rust,ignore
+fn read_json_files_with_cancellation(
+    &self,
+    files: &[FileMeta],
+    physical_schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+    cancellation_token: Option<CancellationTokenRef>,
+) -> DeltaResult<FileDataReadResultIterator>;
+
+fn read_parquet_files_with_cancellation(/* same shape as above */) -> DeltaResult<FileDataReadResultIterator>;
+
+fn read_parquet_footer_with_cancellation(
+    &self,
+    file: &FileMeta,
+    cancellation_token: Option<CancellationTokenRef>,
+) -> DeltaResult<ParquetFooter>;
+```
+
+You do not have to implement these. Each has a default that returns `Error::Cancelled` if the
+token is already cancelled and otherwise delegates to its plain counterpart. So an engine that
+never overrides them still reads correctly and still stops between batches (Kernel polls the token
+at every action-batch boundary on its own) — it just won't interrupt a read that is already in
+flight.
+
+Override them when a single file read can block long enough that waiting for it defeats the point
+of cancelling — a large checkpoint over slow storage, say. The `DefaultEngine` does this by racing
+each read against the token:
+
+```rust,ignore
+fn read_parquet_files_with_cancellation(
+    &self,
+    files: &[FileMeta],
+    physical_schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+    cancellation_token: Option<CancellationTokenRef>,
+) -> DeltaResult<FileDataReadResultIterator> {
+    // Kick off the async read as usual, then poll the read future and the token's
+    // `cancelled_future()` together. If cancellation wins the race, drop the in-flight
+    // work and yield `Err(Error::Cancelled)` as the iterator's terminal item.
+}
+```
+
+### The contract you must uphold
+
+- **Surface cancellation as `Error::Cancelled`, never as a short read.** A cancelled read must not
+  return fewer rows, an empty iterator, or a bare `None` — anything Kernel could mistake for a
+  complete result. Emit `Error::Cancelled` as the terminal item so a partial log replay can never
+  look like a finished one.
+- **Kernel already handles the pre-read check.** The default bodies fail fast on an
+  already-cancelled token before delegating, so an override can skip that and focus on interrupting
+  I/O once it has started.
+
+### The CancellationToken trait
+
+The token a caller supplies implements this trait:
+
+```rust,ignore
+pub trait CancellationToken: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+    fn cancelled_future(&self) -> CancelledFuture<'_>;
+}
+```
+
+Kernel and your engine only *consume* a token; the caller creates and fires it. `is_cancelled` is
+the cheap synchronous poll Kernel uses between batches. `cancelled_future` returns a future that
+resolves once the token fires — this is what an async engine selects against to wake a read that is
+blocked in I/O. Back it with your runtime's own notification primitive (for example, wrapping
+`tokio_util::sync::CancellationToken`); it cannot be synthesized from `is_cancelled` alone without
+busy-polling.
 
 ## EvaluationHandler
 
@@ -239,4 +320,3 @@ pub trait PredicateEvaluator {
 ### Default implementation
 
 The `DefaultEngine` uses Arrow compute kernels for expression evaluation.
-

@@ -111,9 +111,8 @@ use crate::action_reconciliation::{
     ActionReconciliationIterator, ActionReconciliationIteratorState, RetentionCalculator,
 };
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
-    CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    ADD_FIELD, CHECKPOINT_METADATA_NAME, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD,
+    REMOVE_FIELD, SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{
@@ -122,18 +121,23 @@ use crate::expressions::{
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::{self, ParsedLogPath};
-use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error, EvaluationHandlerExtension,
-    FileMeta, Version,
+    version_as_i64, DeltaResult, DeltaResultIteratorStatic, Engine, EngineData, Error,
+    EvaluationHandlerExtension, FileMeta, Version,
 };
 
+#[cfg(feature = "declarative-plans")]
+mod checkpoint_shape;
 mod checkpoint_transform;
 mod sidecar;
 
+#[cfg(feature = "declarative-plans")]
+#[allow(unused_imports)]
+pub(crate) use checkpoint_shape::{CheckpointShape, CheckpointType};
 use checkpoint_transform::{
     build_checkpoint_read_schema, build_checkpoint_transform, StatsTransformConfig,
 };
@@ -310,21 +314,21 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 /// Action fields shared by V1 and V2 checkpoint schemas.
-fn base_checkpoint_action_fields() -> Vec<StructField> {
-    vec![
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+fn base_checkpoint_action_fields() -> [&'static LazyLock<StructField>; 7] {
+    [
+        &ADD_FIELD,
+        &REMOVE_FIELD,
+        &METADATA_FIELD,
+        &PROTOCOL_FIELD,
+        &SET_TRANSACTION_FIELD,
+        &DOMAIN_METADATA_FIELD,
+        &SIDECAR_FIELD,
     ]
 }
 
 /// Schema for V1 checkpoints (without checkpointMetadata action)
 static CHECKPOINT_ACTIONS_SCHEMA_V1: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(StructType::new_unchecked(base_checkpoint_action_fields())));
+    lazy_schema_ref! { ..(base_checkpoint_action_fields()) };
 
 /// Schema for the checkpointMetadata field in V2 checkpoints.
 /// We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
@@ -337,11 +341,10 @@ fn checkpoint_metadata_field() -> StructField {
 }
 
 /// Schema for V2 checkpoints (includes checkpointMetadata action)
-static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields = base_checkpoint_action_fields();
-    fields.push(checkpoint_metadata_field());
-    Arc::new(StructType::new_unchecked(fields))
-});
+static CHECKPOINT_ACTIONS_SCHEMA_V2: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(base_checkpoint_action_fields()),
+    (checkpoint_metadata_field()),
+};
 
 /// Orchestrates the process of creating a checkpoint for a table.
 ///
@@ -380,14 +383,6 @@ impl RetentionCalculator for CheckpointWriter {
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef, engine: &dyn Engine) -> DeltaResult<Self> {
-        let version = i64::try_from(snapshot.version()).map_err(|e| {
-            Error::CheckpointWrite(format!(
-                "Failed to convert checkpoint version from u64 {} to i64: {}",
-                snapshot.version(),
-                e
-            ))
-        })?;
-
         // We disallow checkpointing if the Snapshot is not published. If we didn't, this could
         // create gaps in the version history, thereby breaking old readers.
         snapshot.log_segment().validate_published()?;
@@ -406,8 +401,8 @@ impl CheckpointWriter {
         )?;
 
         Ok(Self {
+            version: version_as_i64(snapshot.version())?,
             snapshot,
-            version,
             is_v2: schema_context.is_v2,
             read_schema,
             output_schema,

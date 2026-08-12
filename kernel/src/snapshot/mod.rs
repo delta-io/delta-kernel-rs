@@ -9,26 +9,29 @@ use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::set_transaction::{is_set_txn_expired, SetTransactionScanner};
+use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::{
     CheckpointSpec, CheckpointWriter, V2CheckpointConfig, DEFAULT_FILE_ACTIONS_PER_SIDECAR_HINT,
 };
-use crate::clustering::{parse_clustering_columns, CLUSTERING_DOMAIN_NAME};
+use crate::clustering::{parse_clustering_columns, ClusteringColumnInfo, CLUSTERING_DOMAIN_NAME};
 use crate::committer::{Committer, PublishMetadata};
 use crate::crc::{
-    try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileStats, SetTransactionState,
+    try_write_crc_file, Crc, CrcDelta, DomainMetadataState, FileSizeHistogram, FileStats,
+    SetTransactionState,
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
-use crate::metrics::SnapshotLoadMetricContext;
+use crate::metrics::{
+    emit_protocol_metadata_load, emit_protocol_metadata_load_failure, SnapshotLoadMetricContext,
+};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
-use crate::table_features::{physical_to_logical_column_name, ColumnMappingMode, TableFeature};
+use crate::table_features::{physical_to_logical_column_name_and_type, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::transaction::builder::alter_table::AlterTableTransactionBuilder;
 use crate::transaction::Transaction;
@@ -37,7 +40,9 @@ use crate::{DeltaResult, Engine, Error, LogCompactionWriter, Version};
 
 mod builder;
 mod incremental;
+mod snapshot_crc;
 pub use builder::{IncrementalReplay, SnapshotBuilder};
+use snapshot_crc::SnapshotCrc;
 
 /// A shared, thread-safe reference to a [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -70,13 +75,16 @@ pub struct Snapshot {
     span: tracing::Span,
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
-    /// CRC at this snapshot's version, eagerly resolved at construction time. `Some(crc)`
-    /// means `crc.version == self.version()` and the CRC can be queried at zero I/O. `None`
-    /// means no CRC was loadable (no CRC on disk at this version, or the read failed).
-    crc: Option<Arc<Crc>>,
+    /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
+    /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
+    /// zero-I/O) or [`Snapshot::base_crc`] (possibly stale). See [`SnapshotCrc`].
+    crc: SnapshotCrc,
+    /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
+    built_as_latest: bool,
 }
 
 impl PartialEq for Snapshot {
+    // Content equality: `built_as_latest` is best-effort build metadata, deliberately excluded.
     fn eq(&self, other: &Self) -> bool {
         self.log_segment == other.log_segment
             && self.table_configuration == other.table_configuration
@@ -100,6 +108,12 @@ impl std::fmt::Debug for Snapshot {
             .field("log_segment", &self.log_segment)
             .finish()
     }
+}
+
+/// Build a [`Error::ChecksumWriteUnsupported`] for a resolution root that could not yield a
+/// writable CRC. `reason` completes the sentence "Cannot resolve a CRC to write: ...".
+fn unresolved_crc(reason: &str) -> Error {
+    Error::ChecksumWriteUnsupported(format!("Cannot resolve a CRC to write: {reason}"))
 }
 
 impl Snapshot {
@@ -133,28 +147,30 @@ impl Snapshot {
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
     ) -> DeltaResult<Self> {
-        Self::new_with_crc(log_segment, table_configuration, None)
+        Self::new_with_crc(
+            log_segment,
+            table_configuration,
+            None,  /* crc */
+            false, /* built_as_latest */
+        )
     }
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
     ///
-    /// A `Some(crc)` must be at the table configuration's version; otherwise this returns an
-    /// internal error.
+    /// `built_as_latest` records whether the build confirmed this is the latest version
+    /// (best-effort). See [`Snapshot::built_as_latest`].
     pub(crate) fn new_with_crc(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
         crc: Option<Arc<Crc>>,
+        built_as_latest: bool,
     ) -> DeltaResult<Self> {
-        if let Some(crc) = crc.as_ref() {
-            require!(
-                crc.version == table_configuration.version(),
-                Error::internal_error(format!(
-                    "CRC version {} does not match snapshot version {}",
-                    crc.version,
-                    table_configuration.version()
-                ))
-            );
-        }
+        // Will perform version validations.
+        let crc = SnapshotCrc::try_new(
+            crc,
+            table_configuration.version(),
+            log_segment.checkpoint_version,
+        )?;
         let span = tracing::info_span!(
             parent: tracing::Span::none(),
             "snap",
@@ -167,6 +183,7 @@ impl Snapshot {
             log_segment,
             table_configuration,
             crc,
+            built_as_latest,
         })
     }
 
@@ -181,33 +198,34 @@ impl Snapshot {
         engine: &dyn Engine,
         metric_context: SnapshotLoadMetricContext,
         incremental_replay: IncrementalReplay,
+        built_as_latest: bool,
     ) -> DeltaResult<Self> {
+        let pm_start = std::time::Instant::now();
+
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.
         let base_crc = log_segment.read_latest_crc(engine);
-        let crc_at_version = log_segment.try_build_crc_within_budget(
-            engine,
-            base_crc.as_ref(),
-            incremental_replay,
-        )?;
+        let crc_at_version = log_segment
+            .try_build_crc_within_budget(engine, base_crc.as_ref(), incremental_replay)
+            .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?;
 
         // Step 2: P&M from that CRC, else log replay rooted at the base CRC, checkpoint, or
-        //         first commit.
-        // TODO(#2677): emit an `IncrementalCrcLoad` metric on the CRC branch; the
-        //              `ProtocolMetadataLoaded` span only fires on the replay branch below.
-        let (metadata, protocol) = match crc_at_version.as_deref() {
-            Some(c) => (c.metadata.clone(), c.protocol.clone()),
-            None => {
-                log_segment.read_protocol_metadata(engine, base_crc.as_ref(), metric_context)?
-            }
+        //         first commit. The replay reports its own source (seeded vs full).
+        let (metadata, protocol, source) = match &crc_at_version {
+            Some((crc, source)) => (crc.metadata.clone(), crc.protocol.clone(), *source),
+            None => log_segment
+                .read_protocol_metadata(engine, base_crc.as_ref())
+                .inspect_err(|_| emit_protocol_metadata_load_failure(&metric_context))?,
         };
+        emit_protocol_metadata_load(&metric_context, source, pm_start.elapsed());
 
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
 
         tracing::Span::current().record("version", table_configuration.version());
 
-        Self::new_with_crc(log_segment, table_configuration, crc_at_version)
+        let crc = crc_at_version.map(|(crc, _)| crc).or(base_crc);
+        Self::new_with_crc(log_segment, table_configuration, crc, built_as_latest)
     }
 
     /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
@@ -218,8 +236,8 @@ impl Snapshot {
     /// The `crc_delta` captures the CRC-relevant changes from the committed transaction
     /// (file stats, domain metadata, ICT, etc.). If this snapshot had a CRC at its version,
     /// the delta is applied to produce a precomputed in-memory CRC for the new version,
-    /// avoiding re-reading metadata from storage. If no CRC was available, the new snapshot
-    /// has no CRC either. CREATE TABLE handles CRC construction separately in
+    /// avoiding re-reading metadata from storage. A stale base is carried forward unchanged;
+    /// no CRC stays no CRC. CREATE TABLE handles CRC construction separately in
     /// `Transaction::into_committed`.
     pub(crate) fn new_post_commit(
         &self,
@@ -253,12 +271,22 @@ impl Snapshot {
 
         let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
-        let new_crc = self
-            .crc
-            .as_deref()
-            .map(|base| Arc::new(base.clone().apply(crc_delta, new_version)));
+        // `crc_delta` covers what the transaction committed, so it advances an at-version CRC;
+        // a stale base is carried forward unadvanced.
+        let new_crc = match self.crc_at_version() {
+            Some(base) => Some(Arc::new(
+                base.as_ref().clone().apply(crc_delta, new_version),
+            )),
+            None => self.base_crc().cloned(),
+        };
 
-        Snapshot::new_with_crc(new_log_segment, new_table_configuration, new_crc)
+        // A successful commit means the post-commit snapshot is the latest version.
+        Snapshot::new_with_crc(
+            new_log_segment,
+            new_table_configuration,
+            new_crc,
+            true, /* built_as_latest */
+        )
     }
 
     // ============================================================================
@@ -271,13 +299,18 @@ impl Snapshot {
         &self.log_segment
     }
 
-    /// Returns the CRC for this snapshot, if one is resolved.
-    ///
-    /// When `Some(crc)`, `crc.version == self.version()` and queries backed by the CRC hit
-    /// cache at zero I/O.
+    /// The CRC iff it sits exactly at this snapshot's version. When `Some`, queries backed by the
+    /// CRC hit cache at zero I/O. Returns `None` when no CRC was resolved or the resolved CRC is
+    /// stale.
     #[internal_api]
-    pub(crate) fn crc(&self) -> Option<&Arc<Crc>> {
-        self.crc.as_ref()
+    pub(crate) fn crc_at_version(&self) -> Option<&Arc<Crc>> {
+        self.crc.at_version()
+    }
+
+    /// The held CRC regardless of version, for reuse that does not require an at-version CRC
+    /// (e.g. checksum writes). Prefer [`Self::crc_at_version`] for authoritative queries.
+    fn base_crc(&self) -> Option<&Arc<Crc>> {
+        self.crc.base()
     }
 
     pub fn table_root(&self) -> &Url {
@@ -287,6 +320,20 @@ impl Snapshot {
     /// Version of this `Snapshot` in the table.
     pub fn version(&self) -> Version {
         self.table_configuration().version()
+    }
+
+    /// Whether this snapshot was at the latest table version when it was built.
+    ///
+    /// This is best-effort: `true` when the build knows this was the newest version. That holds for
+    /// a build (fresh or incremental) with no time-travel version, a build (fresh or incremental)
+    /// at the catalog's ratified latest version, and a post-commit snapshot. It is not a
+    /// liveness guarantee: another writer may commit a newer version afterward, so a `true`
+    /// snapshot can already be stale.
+    ///
+    /// Version-preserving derivations ([`Self::checkpoint`], [`Self::write_checksum`],
+    /// [`Self::publish`]) do not change this flag: they carry it over from the source snapshot.
+    pub fn is_built_as_latest(&self) -> bool {
+        self.built_as_latest
     }
 
     /// Table [`Schema`] at this `Snapshot`s version.
@@ -389,7 +436,9 @@ impl Snapshot {
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
     /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
-    /// Uses the CRC fast path when available, otherwise falls back to log replay.
+    /// Serves from an at-version CRC when it has the app_id (or authoritatively lacks it); else
+    /// roots a tail-only scan in a stale but `Complete` CRC, skipping the checkpoint; else full log
+    /// replay.
     ///
     /// Reports metrics: `SetTransactionLoadSuccess` or `SetTransactionLoadFailure`.
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
@@ -415,22 +464,20 @@ impl Snapshot {
             calculate_transaction_expiration_timestamp(self.table_properties())?;
 
         // Fast path: serve from CRC if available at this version.
-        if let Some(crc) = self.crc.as_deref() {
+        if let Some(crc) = self.crc_at_version() {
             match &crc.set_transaction_state {
                 SetTransactionState::Complete(map) => {
                     // Complete is authoritative: a miss means the app_id has no transaction.
                     let version = map
                         .get(application_id)
-                        .filter(|txn| !is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                        .map(|txn| txn.version);
+                        .and_then(|txn| txn.non_expired_version(expiration_timestamp));
                     record_metric(true, version.is_some());
                     return Ok(version);
                 }
                 SetTransactionState::Partial(map) => {
                     // Hit is authoritative; miss falls through to log replay below.
                     if let Some(txn) = map.get(application_id) {
-                        let version = (!is_set_txn_expired(expiration_timestamp, txn.last_updated))
-                            .then_some(txn.version);
+                        let version = txn.non_expired_version(expiration_timestamp);
                         record_metric(true, version.is_some());
                         return Ok(version);
                     }
@@ -438,15 +485,35 @@ impl Snapshot {
             }
         }
 
-        // Fallback: full log replay.
-        let txn = SetTransactionScanner::get_one(
-            self.log_segment(),
-            application_id,
-            engine,
-            expiration_timestamp,
-        )?;
-        record_metric(false, txn.is_some());
-        Ok(txn.map(|t| t.version))
+        // A stale but authoritative (`Complete`) CRC roots a tail-only scan over the commits after
+        // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
+        // `setTransactions` field) has no authoritative transaction set, so it cannot root the
+        // scan and falls through to the full replay below.
+        if let Some(base) = self.base_crc() {
+            if let SetTransactionState::Complete(base_active) = &base.set_transaction_state {
+                let txn = SetTransactionScanner::get_one_rooted_in_crc(
+                    self.log_segment(),
+                    application_id,
+                    base_active,
+                    base.version,
+                    engine,
+                )?;
+                let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
+                // TODO: report a distinct metric source here. A rooted tail scan is neither a
+                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+                //       (cache / crc-rooted / full-replay) would let metrics measure it.
+                record_metric(false, version.is_some());
+                return Ok(version);
+            }
+        }
+
+        // Fallback: full log replay. Scan for the newest txn and apply expiration to it, like the
+        // CRC paths above.
+        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let version = txn.and_then(|txn| txn.non_expired_version(expiration_timestamp));
+        record_metric(false, version.is_some());
+        Ok(version)
     }
 
     /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
@@ -467,15 +534,16 @@ impl Snapshot {
         self.get_domain_metadata_internal(domain, engine)
     }
 
-    /// Get the logical clustering columns for this snapshot, if clustering is enabled.
+    /// Get per-clustering-column descriptors for this snapshot, if clustering is enabled.
     ///
-    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
-    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
-    /// clustering metadata is malformed.
+    /// Returns `Ok(Some(infos))` when the ClusteredTable feature is enabled and the
+    /// `delta.clustering` domain has a current entry (`infos` may be empty if the entry lists
+    /// none), `Ok(None)` when the feature is absent or the domain has no current entry, or an
+    /// error if the clustering metadata is malformed. Descriptors are returned in the order the
+    /// columns appear in the domain.
     ///
-    /// The columns are returned as logical [`ColumnName`]s. When column mapping is enabled,
-    /// this converts the physical names stored in domain metadata back to logical names using
-    /// the table schema.
+    /// Each `ClusteringColumnInfo` carries the physical reference (as stored in the domain), the
+    /// logical reference resolved against the table schema, and the column's data type.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     ///
@@ -483,39 +551,40 @@ impl Snapshot {
     ///
     /// Returns an error if the clustering domain metadata is malformed, or if a physical
     /// column name cannot be resolved to a logical name in the schema.
-    ///
-    /// [`ColumnName`]: crate::expressions::ColumnName
-    #[allow(unused)]
     #[internal_api]
-    pub(crate) fn get_logical_clustering_columns(
+    pub(crate) fn get_clustering_column_infos(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<Vec<ColumnName>>> {
-        let physical_columns = match self.get_physical_clustering_columns(engine)? {
-            Some(cols) => cols,
-            None => return Ok(None),
+    ) -> DeltaResult<Option<Vec<ClusteringColumnInfo>>> {
+        let Some(physical_columns) = self.get_physical_clustering_columns(engine)? else {
+            return Ok(None);
         };
         let column_mapping_mode = self.table_configuration.column_mapping_mode();
-        if column_mapping_mode == ColumnMappingMode::None {
-            // No column mapping: physical = logical
-            return Ok(Some(physical_columns));
-        }
-        // Convert physical column names to logical names by walking the schema
         let logical_schema = self.table_configuration.logical_schema();
-        let logical_columns = physical_columns
-            .iter()
+        let infos = physical_columns
+            .into_iter()
             .map(|physical_col| {
-                physical_to_logical_column_name(&logical_schema, physical_col, column_mapping_mode)
+                let (logical_col, data_type) = physical_to_logical_column_name_and_type(
+                    &logical_schema,
+                    &physical_col,
+                    column_mapping_mode,
+                )?;
+                Ok(ClusteringColumnInfo {
+                    physical_column: physical_col,
+                    logical_column: logical_col,
+                    data_type,
+                })
             })
             .collect::<DeltaResult<Vec<_>>>()?;
-        Ok(Some(logical_columns))
+        Ok(Some(infos))
     }
 
     /// Get the clustering columns for this snapshot, if the table has clustering enabled.
     ///
-    /// Returns `Ok(Some(columns))` if the ClusteredTable feature is enabled and clustering
-    /// columns are defined, `Ok(None)` if clustering is not enabled, or an error if the
-    /// clustering metadata is malformed.
+    /// Returns `Ok(Some(columns))` when the ClusteredTable feature is enabled and the
+    /// `delta.clustering` domain has a current entry (`columns` may be empty if the entry lists
+    /// none), `Ok(None)` when the feature is absent or the domain has no current entry, or an
+    /// error if the clustering metadata is malformed.
     ///
     /// The columns are returned as physical column names, respecting the column mapping mode.
     /// Note that this method performs log replay (fetches and processes metadata from storage).
@@ -524,6 +593,21 @@ impl Snapshot {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<Vec<ColumnName>>> {
+        match self.get_clustering_domain_metadata(engine)? {
+            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the raw JSON configuration of the `delta.clustering` domain.
+    ///
+    /// Returns `Ok(None)` when the `ClusteredTable` feature is absent on the protocol, or when
+    /// the domain has no current entry. The JSON has the shape
+    /// `{"clusteringColumns":[["col1"],["addr","city"], ...]}` with physical column names.
+    pub(crate) fn get_clustering_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
         if !self
             .table_configuration
             .protocol()
@@ -531,14 +615,12 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        match self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)? {
-            Some(config) => Ok(Some(parse_clustering_columns(&config)?)),
-            None => Ok(None),
-        }
+        self.get_domain_metadata_internal(CLUSTERING_DOMAIN_NAME, engine)
     }
 
     /// Load domain metadata: if Complete in the CRC, answer from the cache; else if every
-    /// requested domain is in a Partial cache, also answer from the cache; else full log
+    /// requested domain is in a Partial cache, also answer from the cache; else if a stale Complete
+    /// CRC is held, scan only the commits after it and reconcile against its map; else full log
     /// replay. `domains == None` means load all.
     ///
     /// Reports metrics: `DomainMetadataLoadSuccess` or `DomainMetadataLoadFailure`.
@@ -562,7 +644,7 @@ impl Snapshot {
         }
 
         // Fast path: serve from CRC if it tracks domain metadata at this version.
-        if let Some(crc) = self.crc.as_deref() {
+        if let Some(crc) = self.crc_at_version() {
             match &crc.domain_metadata_state {
                 DomainMetadataState::Complete(map) => {
                     let hits: DomainMetadataMap = match domains {
@@ -598,6 +680,27 @@ impl Snapshot {
                 }
             }
         }
+        // A stale but authoritative (`Complete`) CRC roots a tail-only scan over the commits after
+        // it, skipping the checkpoint. A stale `Partial` CRC (one whose file lacked the
+        // `domainMetadata` field) has no authoritative active-domain set, so it cannot root the
+        // scan and falls through to the full replay below.
+        if let Some(base) = self.base_crc() {
+            if let DomainMetadataState::Complete(base_active) = &base.domain_metadata_state {
+                let rooted = self.log_segment().scan_domain_metadatas_rooted_in_crc(
+                    base.version,
+                    base_active,
+                    domains,
+                    engine,
+                )?;
+                // TODO: report a distinct metric source here. A rooted tail scan is neither a
+                //       cache hit nor a full replay, yet `from_cache = false` buckets it with
+                //       full replay, hiding the checkpoint-skipping win. A 3-variant source enum
+                //       (cache / crc-rooted / full-replay) would let metrics measure it.
+                record_metric(false, rooted.len());
+                return Ok(rooted);
+            }
+        }
+
         // Fallback: scan the log_segment from scratch.
         // TODO: a Partial cache already covers the commits read during snapshot load. A
         //       miss search could skip that range and only scan the older commits, then
@@ -641,10 +744,12 @@ impl Snapshot {
             .collect())
     }
 
-    /// Returns file-level statistics, or `None` if this snapshot has no CRC, or its CRC does
-    /// not have `Complete` file stats. Performs no I/O (the CRC is resolved at construction).
+    /// Returns file-level statistics, or `None` if this snapshot has no CRC at its version (none
+    /// resolved, or the resolved CRC is stale), or its CRC does not have `Complete` file stats.
+    /// Performs no I/O.
     pub fn get_file_stats_if_present(&self) -> Option<FileStats> {
-        self.crc.as_ref().and_then(|crc| crc.file_stats().cloned())
+        self.crc_at_version()
+            .and_then(|crc| crc.file_stats().cloned())
     }
 
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
@@ -685,7 +790,7 @@ impl Snapshot {
         }
 
         // Fast path: serve ICT from CRC if available at this version.
-        if let Some(crc) = self.crc.as_deref() {
+        if let Some(crc) = self.crc_at_version() {
             match crc.in_commit_timestamp_opt {
                 Some(ict) => return Ok(Some(ict)),
                 None => {
@@ -838,9 +943,9 @@ impl Snapshot {
     /// Writes a version checksum (CRC) file for this snapshot. Writers should call this after
     /// every commit because checksums enable faster snapshot loading and table state validation.
     ///
-    /// Currently only supports writing from a post-commit snapshot that has pre-computed CRC
-    /// information in memory (i.e. the snapshot returned by
-    /// [`CommittedTransaction::post_commit_snapshot`]).
+    /// The CRC is resolved best-effort from the newest available root: an in-memory CRC at this
+    /// version, a stale on-disk CRC advanced to this version, a checkpoint advanced to this
+    /// version, or the full commit history.
     ///
     /// Returns a tuple of [`ChecksumWriteResult`] and a [`SnapshotRef`]. On
     /// [`ChecksumWriteResult::Written`], the returned snapshot has the CRC file recorded in
@@ -849,15 +954,14 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// - [`Error::ChecksumWriteUnsupported`] if no in-memory CRC is available at this snapshot's
-    ///   version (e.g. a snapshot loaded from disk that has no CRC file), if the CRC's
-    ///   `file_stats_state` is `Indeterminate` (a non-incremental operation like ANALYZE STATS was
-    ///   encountered, or a file action had a missing size; recoverable with a full state
+    /// - [`Error::ChecksumWriteUnsupported`] if no CRC can be resolved for this version, if the
+    ///   resolved CRC's `file_stats_state` is `Indeterminate` (a non-incremental operation like
+    ///   ANALYZE STATS, or a file action with a missing size; recoverable with a full state
     ///   reconstruction in the future), or if `delta.enableInCommitTimestamps` is `true` but
     ///   `inCommitTimestampOpt` is absent.
+    /// - The underlying read error if in-commit timestamps are enabled but the timestamp cannot be
+    ///   read from the commit file.
     /// - I/O errors from the engine's storage handler if the write fails.
-    ///
-    /// [`CommittedTransaction::post_commit_snapshot`]: crate::transaction::CommittedTransaction::post_commit_snapshot
     #[instrument(parent = &self.span, name = "snap.write_checksum", skip_all, err)]
     pub fn write_checksum(
         self: &SnapshotRef,
@@ -878,22 +982,19 @@ impl Snapshot {
             return Ok((ChecksumWriteResult::AlreadyExists, Arc::clone(self)));
         }
 
-        let crc = self.crc.as_deref().ok_or_else(|| {
-            Error::ChecksumWriteUnsupported(
-                "No in-memory CRC available at this snapshot version.".to_string(),
-            )
-        })?;
+        let crc = self.resolve_crc_for_write(engine)?;
 
         let crc_path = ParsedLogPath::new_crc(self.table_root(), self.version())?;
 
-        match try_write_crc_file(engine, &crc_path.location, crc) {
+        match try_write_crc_file(engine, &crc_path.location, &crc) {
             Ok(()) => {
                 info!("Wrote CRC file at {}", crc_path.location);
                 let new_log_segment = self.log_segment.try_new_with_crc_file(crc_path)?;
                 let new_snapshot = Arc::new(Snapshot::new_with_crc(
                     new_log_segment,
                     self.table_configuration().clone(),
-                    self.crc.clone(),
+                    Some(crc),
+                    self.built_as_latest,
                 )?);
                 Ok((ChecksumWriteResult::Written, new_snapshot))
             }
@@ -906,6 +1007,81 @@ impl Snapshot {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Resolve the CRC to write for this snapshot's version.
+    ///
+    /// Tries the newest available root, stopping at the first that applies:
+    /// 1. The in-memory CRC, used as-is. E.g. a snapshot at N that did incremental CRC replay from
+    ///    a CRC at N-5, or a post-commit snapshot at N+1 built from a CRC at N (on disk or
+    ///    computed).
+    /// 2. A stale on-disk CRC, advanced over the tail commits via reverse replay.
+    /// 3. A checkpoint, advanced over the tail commits via reverse replay.
+    /// 4. A full reverse replay of the commit history.
+    ///
+    /// Returns [`Error::ChecksumWriteUnsupported`] when a root is reached but cannot yield a
+    /// writable CRC (missing protocol or metadata, or a non-incremental tail that dooms file
+    /// stats).
+    ///
+    /// The `root` span field records which root resolved the CRC.
+    #[instrument(parent = &self.span, name = "snap.resolve_crc_for_write", skip_all, err, fields(root))]
+    fn resolve_crc_for_write(&self, engine: &dyn Engine) -> DeltaResult<Arc<Crc>> {
+        let span = tracing::Span::current();
+        // Case 1: an in-memory CRC at this version is ready to write as-is.
+        if let Some(crc) = self.crc_at_version() {
+            span.record("root", "in_memory");
+            return Ok(crc.clone());
+        }
+
+        let end = self.version();
+        let log_segment = &self.log_segment;
+
+        // Case 2: a stale base CRC, older than this version. Advance the retained base over the
+        // tail commits (a held base is always at or above the checkpoint, so a tail exists).
+        if let Some(base) = self.base_crc() {
+            span.record("root", "stale_crc");
+            let crc = log_segment.build_crc_from_base(engine, base)?;
+            return Ok(Arc::new(crc));
+        }
+
+        // Case 3: no CRC, but a checkpoint to root at.
+        if let Some(checkpoint_version) = log_segment.checkpoint_version {
+            span.record("root", "checkpoint");
+            if checkpoint_version == end {
+                // A checkpoint carries no ICT (it has no commitInfo). Since there's no tail delta
+                // to carry it either, we defer to `get_in_commit_timestamp`, which reads the commit
+                // at the checkpoint version and returns None when ICT is disabled, or errors when
+                // it is enabled but unreadable.
+                let mut crc = log_segment
+                    .build_crc_from_checkpoint(engine)?
+                    .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
+                crc.in_commit_timestamp_opt = self.get_in_commit_timestamp(engine)?;
+                return Ok(Arc::new(crc));
+            }
+            // Replay the tail commits first: a non-incremental tail dooms file stats no matter
+            // what the checkpoint holds, so skip the larger checkpoint read in that case.
+            let delta = log_segment.build_crc_delta_from_base(
+                engine,
+                checkpoint_version,
+                Some(FileSizeHistogram::create_default()),
+            )?;
+            require!(
+                delta.is_incremental_safe,
+                unresolved_crc("commits after the checkpoint are not incremental-safe")
+            );
+            let base = log_segment
+                .build_crc_from_checkpoint(engine)?
+                .ok_or_else(|| unresolved_crc("checkpoint is missing protocol or metadata"))?;
+            // The tail delta carries v_end's ICT, which `apply` sets on the result.
+            return Ok(Arc::new(base.apply(delta, end)));
+        }
+
+        // Case 4: neither CRC nor checkpoint, so reverse-replay the full commit history.
+        span.record("root", "version_zero");
+        let crc = log_segment
+            .build_crc_from_version_zero(engine)?
+            .ok_or_else(|| unresolved_crc("commit history is missing protocol or metadata"))?;
+        Ok(Arc::new(crc))
     }
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
@@ -1030,12 +1206,15 @@ impl Snapshot {
         let new_log_segment = self
             .log_segment
             .try_new_with_checkpoint(checkpoint_log_path)?;
+        // Carry only an at-version CRC forward: the checkpoint drops the commits below it, so a
+        // stale base could no longer be advanced over them.
         Ok((
             CheckpointWriteResult::Written,
             Arc::new(Snapshot::new_with_crc(
                 new_log_segment,
                 self.table_configuration().clone(),
-                self.crc.clone(),
+                self.crc_at_version().cloned(),
+                self.built_as_latest,
             )?),
         ))
     }
@@ -1104,7 +1283,8 @@ impl Snapshot {
         Ok(Arc::new(Snapshot::new_with_crc(
             self.log_segment().new_as_published()?,
             self.table_configuration().clone(),
-            self.crc.clone(),
+            self.base_crc().cloned(),
+            self.built_as_latest,
         )?))
     }
 }
@@ -1154,13 +1334,14 @@ mod tests {
     use crate::object_store::ObjectStoreExt as _;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructField, StructType};
     use crate::table_features::{
         TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
-    use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::utils::FoldWithOption as _;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -1267,7 +1448,12 @@ mod tests {
         let log_segment =
             LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
 
-        Snapshot::new_with_crc(log_segment, table_cfg, None)
+        Snapshot::new_with_crc(
+            log_segment,
+            table_cfg,
+            None,  /* crc */
+            false, /* built_as_latest */
+        )
     }
 
     #[test]
@@ -1324,6 +1510,7 @@ mod tests {
 
     fn valid_last_checkpoint() -> (Vec<u8>, LastCheckpointHint) {
         let checkpoint = LastCheckpointHint {
+            v2_checkpoint: None,
             version: 1,
             size: 8,
             parts: None,
@@ -1888,11 +2075,7 @@ mod tests {
             .to_string();
         let engine = SyncEngine::new();
 
-        let schema = Arc::new(StructType::try_new(vec![StructField::new(
-            "id",
-            DataType::INTEGER,
-            true,
-        )])?);
+        let schema = schema_ref! { nullable "id": INTEGER };
 
         let mut create_table_builder = create_table(&table_path, schema, "Test/1.0");
         if ict_enabled {
@@ -2035,6 +2218,47 @@ mod tests {
         assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
     }
 
+    // A post-commit snapshot built from a parent holding a stale base (not an at-version CRC)
+    // keeps that base rather than dropping it: the single-commit delta can't advance it, but
+    // retaining it lets a later write reuse the parsed CRC.
+    #[test]
+    fn test_new_post_commit_from_stale_base_keeps_base() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+
+        // Rebuild the v1 snapshot so it holds a stale CRC@0 (base only, not at-version).
+        let built = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let stale_crc = Arc::new(Crc {
+            version: 0,
+            ..Default::default()
+        });
+        let parent = Snapshot::new_with_crc(
+            built.log_segment().clone(),
+            built.table_configuration().clone(),
+            Some(stale_crc),
+            false, /* built_as_latest */
+        )
+        .unwrap();
+        assert!(parent.crc_at_version().is_none());
+        assert_eq!(parent.base_crc().map(|c| c.version), Some(0));
+
+        let commit = ParsedLogPath::create_parsed_published_commit(&url, 2);
+        let post = parent.new_post_commit(commit, CrcDelta::default()).unwrap();
+
+        assert_eq!(post.version(), 2);
+        assert!(post.crc_at_version().is_none());
+        assert_eq!(
+            post.base_crc().map(|c| c.version),
+            Some(0),
+            "the stale base must be carried forward, not dropped"
+        );
+    }
+
     #[test]
     fn test_get_protocol_derived_properties() {
         let path =
@@ -2097,22 +2321,35 @@ mod tests {
         assert_eq!(config.get("myapp.setting"), Some(&"value".to_string()));
     }
 
+    /// `physical_differs` records whether column mapping is expected to rename the column: with
+    /// mapping on, the domain stores a generated identifier, so only the logical name is
+    /// predictable and the physical one must merely differ from it.
     #[rstest::rstest]
-    #[case::no_clustering(None, None, None)]
-    #[case::clustered_no_column_mapping(
-        Some(vec!["region"]),
-        None,
-        Some(vec![ColumnName::new(["region"])])
-    )]
+    #[case::no_clustering(None, None, None, false)]
+    #[case::clustered_no_column_mapping(Some(vec![vec!["region"]]), None, Some(vec!["region"]), false)]
     #[case::clustered_with_column_mapping(
-        Some(vec!["region"]),
+        Some(vec![vec!["region"]]),
         Some("name"),
-        Some(vec![ColumnName::new(["region"])])
+        Some(vec!["region"]),
+        true
     )]
-    fn test_get_logical_clustering_columns(
-        #[case] clustering_cols: Option<Vec<&str>>,
+    #[case::nested_no_column_mapping(
+        Some(vec![vec!["address", "city"]]),
+        None,
+        Some(vec!["address", "city"]),
+        false
+    )]
+    #[case::nested_with_column_mapping(
+        Some(vec![vec!["address", "city"]]),
+        Some("name"),
+        Some(vec!["address", "city"]),
+        true
+    )]
+    fn test_get_clustering_column_infos(
+        #[case] clustering_cols: Option<Vec<Vec<&str>>>,
         #[case] column_mapping_mode: Option<&str>,
-        #[case] expected: Option<Vec<ColumnName>>,
+        #[case] expected_logical: Option<Vec<&str>>,
+        #[case] physical_differs: bool,
     ) {
         use crate::transaction::create_table::create_table;
         use crate::transaction::data_layout::DataLayout;
@@ -2121,19 +2358,30 @@ mod tests {
         let engine = SyncEngine::new_with_store(storage);
         let schema = Arc::new(
             crate::schema::StructType::try_new(vec![
-                crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
-                crate::schema::StructField::new("region", crate::schema::DataType::STRING, true),
+                crate::schema::StructField::nullable("id", DataType::INTEGER),
+                crate::schema::StructField::nullable("region", DataType::STRING),
+                crate::schema::StructField::nullable(
+                    "address",
+                    crate::schema::StructType::try_new(vec![
+                        crate::schema::StructField::nullable("city", DataType::STRING),
+                        crate::schema::StructField::nullable("zip", DataType::INTEGER),
+                    ])
+                    .unwrap(),
+                ),
             ])
             .unwrap(),
         );
-        let mut builder = create_table("memory:///", schema, "test");
-        if let Some(cols) = &clustering_cols {
-            builder = builder.with_data_layout(DataLayout::clustered(cols.clone()));
-        }
-        if let Some(mode) = column_mapping_mode {
-            builder = builder.with_table_properties([("delta.columnMapping.mode", mode)]);
-        }
-        let _ = builder
+        let _ = create_table("memory:///", schema, "test")
+            .fold_with(clustering_cols.as_ref(), |builder, cols| {
+                let columns = cols
+                    .iter()
+                    .map(|path| ColumnName::new(path.iter().copied()))
+                    .collect();
+                builder.with_data_layout(DataLayout::Clustered { columns })
+            })
+            .fold_with(column_mapping_mode, |builder, mode| {
+                builder.with_table_properties([("delta.columnMapping.mode", mode)])
+            })
             .build(
                 &engine,
                 Box::new(crate::committer::FileSystemCommitter::new()),
@@ -2142,8 +2390,33 @@ mod tests {
             .commit(&engine)
             .unwrap();
         let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
-        let result = snapshot.get_logical_clustering_columns(&engine).unwrap();
-        assert_eq!(result, expected);
+        let result = snapshot.get_clustering_column_infos(&engine).unwrap();
+
+        match expected_logical {
+            None => assert_eq!(result, None),
+            Some(logical) => {
+                let infos = result.expect("clustering infos should be present");
+                assert_eq!(infos.len(), 1);
+                let info = &infos[0];
+                assert_eq!(
+                    info.logical_column,
+                    ColumnName::new(logical.iter().copied())
+                );
+                assert_eq!(info.data_type, DataType::STRING);
+                assert_eq!(info.physical_column.path().len(), logical.len());
+                if physical_differs {
+                    assert_ne!(info.physical_column, info.logical_column);
+                    for part in info.physical_column.path() {
+                        assert!(
+                            part.starts_with("col-"),
+                            "physical path segment '{part}' should be a column-mapping id"
+                        );
+                    }
+                } else {
+                    assert_eq!(info.physical_column, info.logical_column);
+                }
+            }
+        }
     }
 
     // === estimated_owned_heap_size ===

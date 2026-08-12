@@ -3,13 +3,12 @@
 
 use std::sync::Arc;
 
-use delta_kernel::engine::arrow_expression::ArrowEvaluationHandler;
 use delta_kernel::engine::plans::PlanBasedEngine;
-use delta_kernel::{Engine, EvaluationHandler, PlanExecutor};
+use delta_kernel::{Engine, PlanExecutor};
 
 use crate::handle::Handle;
 use crate::plans::executor::{CExecuteOpFn, FfiPlanExecutor, SharedPlanExecutor};
-use crate::{engine_to_handle, AllocateErrorFn, NullableCvoid, SharedExternEngine};
+use crate::{engine_to_handle, AllocateErrorFn, NullableCvoid, OptionalValue, SharedExternEngine};
 
 pub mod executor;
 pub mod iter;
@@ -43,53 +42,141 @@ pub unsafe extern "C" fn free_plan_executor(executor: Handle<SharedPlanExecutor>
     executor.drop_handle();
 }
 
-/// Construct a [`PlanBasedEngine`] from the given [`SharedPlanExecutor`].
+/// Construct a [`PlanBasedEngine`] backed by `plan_executor`, optionally delegating operations not
+/// yet implemented on the plan-execution path to `fallback_engine`.
 ///
-/// This method consumes the [`SharedPlanExecutor`] handle, which should be freed when the engine
-/// is dropped via `free_engine` (caller responsibility).
+/// This method consumes the [`SharedPlanExecutor`] handle. It does NOT consume `fallback_engine`:
+/// the caller retains ownership of the fallback engine handle and must free it separately via
+/// `free_engine`. The returned plan-based engine clones the handlers it needs from the fallback,
+/// so it remains valid independently of when the caller frees its fallback handle. When
+/// `fallback_engine` is [`OptionalValue::None`], unimplemented operations return an unsupported
+/// error.
 ///
 /// # Safety
 ///
-/// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`] and
-/// a valid [`AllocateErrorFn`].
+/// Caller must pass a valid [`SharedPlanExecutor`] handle obtained from [`get_plan_executor`] and a
+/// valid [`AllocateErrorFn`]. When `fallback_engine` is [`OptionalValue::Some`], it must contain a
+/// valid [`SharedExternEngine`] handle.
 #[no_mangle]
 pub unsafe extern "C" fn get_plan_based_engine(
     plan_executor: Handle<SharedPlanExecutor>,
+    fallback_engine: OptionalValue<Handle<SharedExternEngine>>,
     allocate_error: AllocateErrorFn,
 ) -> Handle<SharedExternEngine> {
     let executor: Arc<dyn PlanExecutor> = unsafe { plan_executor.into_inner() };
-    let evaluation_handler: Arc<dyn EvaluationHandler> = Arc::new(ArrowEvaluationHandler);
-    let engine: Arc<dyn Engine> = Arc::new(PlanBasedEngine::new(evaluation_handler, executor));
+    let fallback = match fallback_engine {
+        OptionalValue::Some(engine) => Some(unsafe { engine.as_ref() }.engine()),
+        OptionalValue::None => None,
+    };
+    let engine: Arc<dyn Engine> = Arc::new(PlanBasedEngine::new(fallback, executor));
     engine_to_handle(engine, allocate_error)
 }
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::arrow::array::{Array, RecordBatch, StringArray};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::engine_data::FilteredEngineData;
+    use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel_default_engine::DefaultEngineBuilder;
+    use url::Url;
+
     use super::*;
     use crate::error::EngineExecResult;
     use crate::ffi_test_utils::allocate_err;
     use crate::free_engine;
     use crate::plans::result::CPlanResult;
 
-    #[test]
-    fn get_plan_based_engine_returns_plan_based_engine() {
-        extern "C" fn unreachable_callback(
-            _context: NullableCvoid,
-            _plan_proto: crate::KernelBytesSlice,
-            _out: *mut EngineExecResult<CPlanResult>,
-        ) {
-            unreachable!("callback should not run -- this test only constructs the engine");
-        }
+    extern "C" fn unreachable_callback(
+        _context: NullableCvoid,
+        _plan_proto: crate::KernelBytesSlice,
+        _out: *mut EngineExecResult<CPlanResult>,
+    ) {
+        unreachable!("callback should not run -- this test only constructs the engine");
+    }
 
-        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
-        let engine_handle = unsafe { get_plan_based_engine(executor, allocate_err) };
-
-        // Confirm we got back a real `PlanBasedEngine`, not e.g. an accidental DefaultEngine.
+    /// Assert that the given engine handle wraps a `PlanBasedEngine` (not e.g. a DefaultEngine).
+    fn assert_is_plan_based_engine(engine_handle: &Handle<SharedExternEngine>) {
         let extern_engine = unsafe { engine_handle.as_ref() };
         let engine = extern_engine.engine();
         assert!(
             engine.any_ref().downcast_ref::<PlanBasedEngine>().is_some(),
             "engine handle must wrap a PlanBasedEngine",
+        );
+    }
+
+    #[test]
+    fn plan_based_engine_works_after_fallback_handle_is_freed() {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+
+        // The caller retains ownership of the fallback engine handle. `shallow_copy` mimics C
+        // passing the pointer by value, so we can still free our own handle afterward.
+        let fallback = DefaultEngineBuilder::new(Arc::new(InMemory::new())).build();
+        let fallback_handle = engine_to_handle(Arc::new(fallback), allocate_err);
+
+        let engine_handle = unsafe {
+            get_plan_based_engine(
+                executor,
+                OptionalValue::Some(fallback_handle.shallow_copy()),
+                allocate_err,
+            )
+        };
+
+        assert_is_plan_based_engine(&engine_handle);
+
+        unsafe { free_engine(fallback_handle) };
+
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(StringArray::from(vec!["one"])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let data = Box::new(ArrowEngineData::new(batch));
+        let location = Url::parse("memory:///table/_delta_log/00000000000000000001.json").unwrap();
+        unsafe { engine_handle.as_ref() }
+            .engine()
+            .json_handler()
+            .write_json_file(
+                &location,
+                Box::new(std::iter::once(Ok(
+                    FilteredEngineData::with_all_rows_selected(data),
+                ))),
+                false,
+            )
+            .expect("plan-based engine retains its fallback json handler");
+
+        unsafe { free_engine(engine_handle) };
+    }
+
+    #[test]
+    fn get_plan_based_engine_without_fallback_returns_plan_based_engine() {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+
+        let engine_handle =
+            unsafe { get_plan_based_engine(executor, OptionalValue::None, allocate_err) };
+
+        assert_is_plan_based_engine(&engine_handle);
+
+        unsafe { free_engine(engine_handle) };
+    }
+
+    /// Without a fallback, an operation the plan-execution path does not implement reports that
+    /// rather than delegating.
+    #[test]
+    fn without_fallback_unimplemented_operations_are_unsupported() {
+        let executor = unsafe { get_plan_executor(None, unreachable_callback) };
+        let engine_handle =
+            unsafe { get_plan_based_engine(executor, OptionalValue::None, allocate_err) };
+
+        let engine = unsafe { engine_handle.as_ref() }.engine();
+        let location = Url::parse("memory:///table/_delta_log/00000000000000000001.json").unwrap();
+        let err = engine
+            .json_handler()
+            .write_json_file(&location, Box::new(std::iter::empty()), false)
+            .expect_err("write_json_file has no plan-execution path and no fallback");
+        assert!(
+            matches!(err, delta_kernel::Error::Unsupported(_)),
+            "expected an unsupported error, got: {err:?}",
         );
 
         unsafe { free_engine(engine_handle) };

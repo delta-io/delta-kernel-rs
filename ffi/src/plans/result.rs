@@ -1,15 +1,17 @@
 //! FFI types for mimicking the kernel's `PlanResult` enum.
 
 use super::iter::{CBytesIterator, CEngineDataIterator, CFileMetaIterator};
-use crate::scan::EngineSchema;
+use crate::handle::Handle;
+use crate::ExclusiveRustBytes;
 
 /// C-compatible equivalent of the kernel's `ParquetFooter` struct.
 ///
-/// The schema is delivered as an [`EngineSchema`] - an opaque engine-owned schema which will be
-/// materialized on the kernel-side via vistor pattern.
+/// The schema is delivered as a proto-serialized `delta.kernel.schema.StructType` message. The
+/// engine should call [`allocate_kernel_bytes`](crate::allocate_kernel_bytes) to copy those bytes
+/// into a kernel-owned [`ExclusiveRustBytes`] handle that can then be embedded into this struct.
 #[repr(C)]
 pub struct CParquetFooter {
-    pub schema: EngineSchema,
+    pub schema_proto: Handle<ExclusiveRustBytes>,
 }
 
 /// C-compatible equivalent of the kernel's `PlanResult` enum.

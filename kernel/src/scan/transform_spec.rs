@@ -10,9 +10,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{
-    col, lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar,
-};
+use crate::expressions::{lit, Expression, ExpressionRef, ExpressionStructPatchBuilder, Scalar};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
@@ -144,8 +142,8 @@ pub(crate) fn get_transform_expr(
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
                 let expr = Arc::new(Expression::coalesce([
-                    col!(field_name),
-                    lit(base_row_id) + col!(row_index_field_name),
+                    Expression::column([field_name]),
+                    lit(base_row_id) + Expression::column([row_index_field_name]),
                 ]));
                 patch.replace(field_name.clone(), expr)
             }
@@ -176,7 +174,7 @@ pub(crate) fn get_transform_expr(
                     apply_insert_after(
                         patch.drop(physical_name),
                         insert_after,
-                        Arc::new(col!(physical_name)),
+                        Arc::new(Expression::column([physical_name])),
                     )
                 } else {
                     // Column doesn't exist physically - treat as partition column
@@ -208,12 +206,19 @@ fn apply_insert_after(
     }
 }
 
-/// Parse a partition value from the raw string representation
+/// Parse a partition value from the raw string representation.
+///
+/// An empty string casts via [`PrimitiveType::empty_string_partition_cast`].
+///
+/// [`PrimitiveType::empty_string_partition_cast`]: crate::schema::PrimitiveType::empty_string_partition_cast
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
     match (raw, data_type.as_primitive_opt()) {
+        (Some(v), Some(primitive)) if v.is_empty() => Ok(primitive
+            .empty_string_partition_cast()
+            .unwrap_or_else(|| Scalar::Null(data_type.clone()))),
         (Some(v), Some(primitive)) => primitive.parse_scalar(v),
         (Some(_), None) => Err(Error::generic(format!(
             "Unexpected partition column type: {data_type:?}"
@@ -227,9 +232,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::expressions::BinaryExpressionOp;
+    use crate::expressions::{col, BinaryExpressionOp};
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     // Tests for parse_partition_value function
     #[test]
@@ -333,6 +338,25 @@ mod tests {
     fn test_parse_partition_value_raw_null() {
         let result = parse_partition_value_raw(None, &DataType::STRING).unwrap();
         assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_parse_partition_value_raw_empty_string_cast_semantics() {
+        // An empty string casts to itself for string and to empty bytes for binary, and to null
+        // for every other type. A literal empty string only reaches this path from a foreign
+        // writer, since kernel serializes its own empty and null partition values to JSON null.
+        let empty = String::new();
+
+        let string_value = parse_partition_value_raw(Some(&empty), &DataType::STRING).unwrap();
+        assert_eq!(string_value, Scalar::String(String::new()));
+
+        let binary_value = parse_partition_value_raw(Some(&empty), &DataType::BINARY).unwrap();
+        assert_eq!(binary_value, Scalar::Binary(Vec::new()));
+
+        let int_value =
+            parse_partition_value_raw(Some(&empty), &DataType::Primitive(PrimitiveType::Integer))
+                .unwrap();
+        assert!(int_value.is_null());
     }
 
     #[test]
@@ -603,12 +627,8 @@ mod tests {
         assert!(!row_id_patch.keep_input);
 
         let expected_expr = Arc::new(Expression::coalesce([
-            Expression::column(["row_id_col"]),
-            Expression::binary(
-                BinaryExpressionOp::Plus,
-                Expression::literal(4i64),
-                Expression::column(["row_index_col"]),
-            ),
+            col!("row_id_col"),
+            Expression::binary(BinaryExpressionOp::Plus, lit(4i64), col!("row_index_col")),
         ]));
         let expr = &row_id_patch.insertions[0];
         assert_eq!(expr, &expected_expr);

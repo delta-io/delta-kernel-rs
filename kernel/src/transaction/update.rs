@@ -18,7 +18,7 @@ use tracing::instrument;
 
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::{get_log_add_schema, NUM_RECORDS, TIGHT_BOUNDS};
+use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::committer::Committer;
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData,
@@ -33,7 +33,9 @@ use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{
+    iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
+};
 use crate::utils::current_time_ms;
 use crate::{DataType, DeltaResult, Engine, Expression};
 
@@ -76,6 +78,12 @@ impl Transaction {
 
         let effective_table_config = read_snapshot.table_configuration().clone();
 
+        // Surface IcebergCompatV3 interoperability risks without rejecting tables based on
+        // kernel parser limitations.
+        if effective_table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+            iceberg_compat_v3_column_defaults_validation(&effective_table_config)?;
+        }
+
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
@@ -95,9 +103,11 @@ impl Transaction {
             system_domain_metadata_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
+            column_defaults_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
+            num_dv_updates: 0,
             physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
@@ -288,26 +298,13 @@ impl Transaction {
             visitor.new_entries.clear();
             visitor.matched_file_indexes.clear();
             visitor.visit_rows_of(&scan_file)?;
-            let (data, mut selection_vector) = scan_file.into_parts();
+            let (data, _) = scan_file.into_parts();
 
             // Update selection vector to keep only files that matched DV descriptors.
             // This ensures we only generate remove/add actions for files being updated.
-            let mut current_matched_index = 0;
-            for (i, selected) in selection_vector.iter_mut().enumerate() {
-                if current_matched_index < visitor.matched_file_indexes.len() {
-                    if visitor.matched_file_indexes[current_matched_index] != i {
-                        *selected = false;
-                    } else {
-                        // `matched_file_indexes` is populated from a FilteredRowVisitor, so every
-                        // matched row was selected in the original scan metadata.
-                        current_matched_index += 1;
-                        matched_dv_files += 1;
-                    }
-                } else {
-                    // Deselect any files after the last matched file
-                    *selected = false;
-                }
-            }
+            let selection_vector =
+                selection_vector_for_matches(data.len(), &visitor.matched_file_indexes);
+            matched_dv_files += visitor.matched_file_indexes.len();
 
             // Append two temporary columns to the scan data: the new DV descriptor and the
             // rewritten stats (with `tightBounds: false`).
@@ -335,6 +332,7 @@ impl Transaction {
         }
 
         self.dv_matched_files.extend(matched_files);
+        self.num_dv_updates += matched_dv_files;
         Ok(())
     }
 
@@ -353,6 +351,20 @@ impl Transaction {
         }
         Ok(())
     }
+}
+
+fn selection_vector_for_matches(num_rows: usize, matched_file_indexes: &[usize]) -> Vec<bool> {
+    let mut next_match = 0;
+    (0..num_rows)
+        .map(|row_index| {
+            if matched_file_indexes.get(next_match) == Some(&row_index) {
+                next_match += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -410,7 +422,7 @@ fn nullable_restored_add_schema() -> &'static SchemaRef {
 /// Schema for add actions that is nullable for use in transforms as as a workaround to avoid issues
 /// with null values in required fields that aren't selected.
 static NULLABLE_ADD_LOG_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| schema_with_all_fields_nullable(get_log_add_schema()).into());
+    LazyLock::new(|| schema_with_all_fields_nullable(&LOG_ADD_SCHEMA).into());
 
 /// Returns the schema for nullable restored add actions with dataChange field.
 /// This schema extends the nullable restored add schema with a dataChange boolean field

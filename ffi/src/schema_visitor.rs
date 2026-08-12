@@ -308,6 +308,42 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
         .into_extern_result(&allocate_error)
 }
 
+/// Visit an interval year-month field. Values store signed month counts.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_interval_year_month(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::IntervalYearMonth, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit an interval day-time field. Values store signed microsecond durations.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_interval_day_time(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::IntervalDayTime, nullable)
+        .into_extern_result(&allocate_error)
+}
+
 #[cfg(feature = "nanosecond-timestamps")]
 /// Visit a timestamp_nanos field. Similar to timestamp but nanosecond resolution.
 ///
@@ -795,6 +831,8 @@ mod tests {
         //   col_timestamp_ntz: timestamp_ntz,
         //   col_timestamp_nanos: timestamp_nanos,
         //   col_timestamp_nanos_ntz: timestamp_nanos_ntz,
+        //   col_interval_year_month: interval year to month,
+        //   col_interval_day_time: interval day to second,
         //   col_decimal: decimal(10,2),
         //   col_array: array<string>,
         //   col_map: map<string, long>,
@@ -823,6 +861,10 @@ mod tests {
         #[cfg(feature = "nanosecond-timestamps")]
         let col_timestamp_nanos_ntz =
             visit_field!(timestamp_nanos_ntz, state, "col_timestamp_nanos_ntz", false);
+        let col_interval_year_month =
+            visit_field!(interval_year_month, state, "col_interval_year_month", false);
+        let col_interval_day_time =
+            visit_field!(interval_day_time, state, "col_interval_day_time", false);
         let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
 
         // Create array<string>
@@ -871,6 +913,8 @@ mod tests {
             col_timestamp_nanos,
             #[cfg(feature = "nanosecond-timestamps")]
             col_timestamp_nanos_ntz,
+            col_interval_year_month,
+            col_interval_day_time,
             col_decimal,
             col_array,
             col_map,
@@ -911,6 +955,8 @@ mod tests {
             ("col_timestamp_nanos", PrimitiveType::TimestampNanos),
             #[cfg(feature = "nanosecond-timestamps")]
             ("col_timestamp_nanos_ntz", PrimitiveType::TimestampNanosNtz),
+            ("col_interval_year_month", PrimitiveType::IntervalYearMonth),
+            ("col_interval_day_time", PrimitiveType::IntervalDayTime),
         ];
 
         for (index, (expected_name, expected_type)) in

@@ -12,21 +12,24 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use delta_kernel::actions::{Metadata, Protocol};
+use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::history_manager::{
     first_version_after as kernel_first_version_after,
     get_earliest_commit as kernel_get_earliest_commit,
     latest_version_as_of as kernel_latest_version_as_of, CommitAt, HistoryCommitType,
 };
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::schema::Schema;
-use delta_kernel::snapshot::{Snapshot, SnapshotRef};
-use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
+use delta_kernel::snapshot::{CheckpointWriteResult, Snapshot, SnapshotRef};
+use delta_kernel::{DeltaResult, Engine, EngineData, FileStats, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 #[cfg(feature = "default-engine-base")]
 use {
     delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor,
-    std::collections::HashMap,
+    std::collections::HashMap, std::num::NonZero,
 };
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -44,12 +47,16 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod alloc_stats;
+
 pub mod commit_range;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
+#[cfg(feature = "default-engine-base")]
+pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
@@ -60,6 +67,7 @@ pub mod expressions;
 pub mod ffi_metrics;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
+pub mod incremental_scan;
 pub mod log_path;
 #[cfg(feature = "declarative-plans")]
 pub mod plans;
@@ -72,6 +80,7 @@ mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
 pub mod test_ffi;
 pub mod transaction;
+use transaction::MutableCommitter;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
@@ -162,7 +171,7 @@ impl KernelStringSlice {
     }
 }
 
-/// A kernel-owned slice of raw bytes, intended for arg-passing from kernel to engine.
+/// A non-owned slice of raw bytes, intended for arg-passing between kernel and engine.
 ///
 /// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
 /// must not be retained beyond the foreign function call it was passed into.
@@ -312,6 +321,33 @@ fn allocate_kernel_string_impl(
     Ok(Box::new(s).into())
 }
 
+/// A kernel-allocated type representing an owned byte buffer. This can be obtained by
+/// calling [`allocate_kernel_bytes`] with a [`KernelBytesSlice`]. Kernel takes ownership of the
+/// handle when it consumes the bytes and the engine must not use the handle afterwards.
+#[cfg(feature = "declarative-plans")]
+#[handle_descriptor(target=Vec<u8>, mutable=true, sized=true)]
+pub struct ExclusiveRustBytes;
+
+/// Allow engines to create an opaque pointer to [`ExclusiveRustBytes`] by copying the provided
+/// `bytes` into kernel-owned memory.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid [`KernelBytesSlice`] whose pointer references at least
+/// `len` readable bytes. The slice only needs to remain valid until after this call returns.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn allocate_kernel_bytes(
+    bytes: KernelBytesSlice,
+) -> Handle<ExclusiveRustBytes> {
+    let copied = if bytes.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec()
+    };
+    Box::new(copied).into()
+}
+
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
 // directly. It can only be created by converting `From<Vec<bool>>`.
 mod private {
@@ -333,6 +369,58 @@ mod private {
         ptr: NonNull<u64>,
         len: usize,
     }
+
+    /// An owned byte buffer allocated by the kernel. Any time the engine receives a
+    /// `KernelOwnedBytes` as a return value from a kernel method, the engine owns the buffer and
+    /// must free it by calling [super::free_kernel_bytes] exactly once.
+    #[cfg(feature = "declarative-plans")]
+    #[repr(C)]
+    pub struct KernelOwnedBytes {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl KernelOwnedBytes {
+        /// Converts this buffer back into a `Vec<u8>`.
+        ///
+        /// # Safety
+        ///
+        /// The buffer must have been originally created `From<Vec<u8>>`, and must not have already
+        /// been consumed by a previous call to this method.
+        pub unsafe fn into_vec(self) -> Vec<u8> {
+            if self.len == 0 {
+                Default::default()
+            } else {
+                unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len) }
+            }
+        }
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    impl From<Vec<u8>> for KernelOwnedBytes {
+        fn from(val: Vec<u8>) -> Self {
+            let len = val.len();
+            let boxed = val.into_boxed_slice();
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            let ptr = unsafe { NonNull::new_unchecked(leaked_ptr) };
+            KernelOwnedBytes { ptr, len }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The engine assumes ownership of the buffer memory when kernel passes it a
+    /// [KernelOwnedBytes], but must only free it by calling [super::free_kernel_bytes]. Since the
+    /// global allocator is threadsafe, it doesn't matter which engine thread invokes that method.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Send for KernelOwnedBytes {}
+    /// # Safety
+    ///
+    /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
+    #[cfg(feature = "declarative-plans")]
+    unsafe impl Sync for KernelOwnedBytes {}
 
     impl KernelBoolSlice {
         /// Creates an empty slice.
@@ -441,6 +529,8 @@ mod private {
         }
     }
 }
+#[cfg(feature = "declarative-plans")]
+pub use private::KernelOwnedBytes;
 pub use private::{KernelBoolSlice, KernelRowIndexArray};
 
 /// # Safety
@@ -458,6 +548,17 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 #[no_mangle]
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
+}
+
+/// Free a [`KernelOwnedBytes`] buffer obtained from kernel.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid buffer, and must not use it again afterwards.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_bytes(bytes: KernelOwnedBytes) {
+    let _ = unsafe { bytes.into_vec() };
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void
@@ -541,19 +642,50 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
     delta_kernel::try_parse_uri(path)
 }
 
-/// A builder that allows setting options on the `Engine` before actually building it
+/// How [`EngineBuilder`] resolves an [`ObjectStore`](delta_kernel::object_store::ObjectStore) at
+/// build time.
+#[cfg(feature = "default-engine-base")]
+#[derive(Default)]
+pub(crate) enum ObjectStoreBackend {
+    /// `url` and [`set_builder_option`] keys are passed to [`store_from_url_opts`].
+    #[default]
+    UrlScheme,
+    /// REST file API; configured via [`set_builder_rest_object_store`].
+    Rest(Box<rest_engine::RestBuilderState>),
+}
+
+/// A builder that allows setting options on the `Engine` before actually building it.
+///
+/// For a normal object store backend, `url` is the table storage location (`s3://…`, `file://…`).
+/// For REST, call [`set_builder_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
+/// and set `url` to the REST service base URL; see [`rest_engine`] for TLS and auth options.
 #[cfg(feature = "default-engine-base")]
 pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
     options: HashMap<String, String>,
+    object_store_backend: ObjectStoreBackend,
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
+    /// Read-path I/O concurrency config for the JSON and Parquet handlers. `None` fields fall back
+    /// to the engine's defaults.
+    io_config: IoConcurrencyConfig,
 }
 
 #[cfg(feature = "default-engine-base")]
-struct MultithreadedExecutorConfig {
+#[derive(Default, Clone)]
+pub(crate) struct IoConcurrencyConfig {
+    /// Maximum number of files read concurrently (file-level readahead depth). `None` uses the
+    /// engine default.
+    buffer_size: Option<NonZero<usize>>,
+    /// Maximum number of rows per yielded batch. `None` uses the engine default.
+    batch_size: Option<NonZero<usize>>,
+}
+
+#[cfg(feature = "default-engine-base")]
+#[derive(Clone)]
+pub(crate) struct MultithreadedExecutorConfig {
     /// Number of worker threads for the tokio runtime. `None` uses Tokio's default.
     worker_threads: Option<usize>,
     /// Maximum number of threads for blocking operations. `None` uses Tokio's default.
@@ -592,7 +724,9 @@ fn get_engine_builder_impl(
         url: url?,
         allocate_fn,
         options: HashMap::default(),
+        object_store_backend: ObjectStoreBackend::default(),
         multithreaded_executor_config: None,
+        io_config: IoConcurrencyConfig::default(),
     });
     Ok(Box::into_raw(builder))
 }
@@ -650,6 +784,75 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
     });
 }
 
+/// Configure read-path I/O concurrency for the engine's JSON and Parquet handlers.
+///
+/// These control the `read_*_files` paths used during log replay and scans. Returned data ordering
+/// is preserved regardless of these values.
+///
+/// # Parameters
+/// - `builder`: The engine builder to configure.
+/// - `buffer_size`: Maximum number of files read concurrently (file-level readahead depth). Higher
+///   values overlap more object-store requests to hide latency, at the cost of more in-flight
+///   memory. Pass 0 to use the engine default.
+/// - `batch_size`: Maximum number of rows per yielded batch. Pass 0 to use the engine default.
+///   Overall read memory usage is roughly proportional to `buffer_size * batch_size`.
+///
+/// # Safety
+///
+/// Caller must pass a valid EngineBuilder pointer.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_with_io_concurrency(
+    builder: &mut EngineBuilder,
+    buffer_size: usize,
+    batch_size: usize,
+) {
+    // `NonZero::new` maps 0 -> `None`, which the engine reads as "use the default".
+    builder.io_config = IoConcurrencyConfig {
+        buffer_size: NonZero::new(buffer_size),
+        batch_size: NonZero::new(batch_size),
+    };
+}
+
+/// Select a REST-backed object store. See [`rest_engine`] for setup, option keys, and callbacks.
+///
+/// # Safety
+///
+/// Caller must pass a valid builder pointer and a non-null `endpoint_config`. When `callback` is
+/// non-null, `context` must remain valid for the engine lifetime and the callback must be safe to
+/// invoke from any thread concurrently (see [`rest_engine::CAuthHeaderCallback`]).
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_rest_object_store(
+    builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
+    callback: Option<rest_engine::CAuthHeaderCallback>,
+    context: NullableCvoid,
+) -> ExternResult<bool> {
+    set_builder_rest_object_store_impl(builder, endpoint_config, callback, context)
+        .into_extern_result(&builder.allocate_fn)
+}
+
+#[cfg(feature = "default-engine-base")]
+fn set_builder_rest_object_store_impl(
+    builder: &mut EngineBuilder,
+    endpoint_config: *const rest_engine::CRestEndpointConfig,
+    callback: Option<rest_engine::CAuthHeaderCallback>,
+    context: NullableCvoid,
+) -> DeltaResult<bool> {
+    // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
+    let endpoint_config = unsafe { endpoint_config.as_ref() }
+        .ok_or_else(|| delta_kernel::Error::generic("null CRestEndpointConfig pointer"))?;
+    builder.object_store_backend =
+        ObjectStoreBackend::Rest(Box::new(rest_engine::rest_builder_state_from_ffi(
+            endpoint_config,
+            callback,
+            context,
+            builder.allocate_fn,
+        )?));
+    Ok(true)
+}
+
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
@@ -667,7 +870,9 @@ pub unsafe extern "C" fn builder_build(
     get_default_engine_impl(
         builder_box.url,
         builder_box.options,
+        builder_box.object_store_backend,
         builder_box.multithreaded_executor_config,
+        builder_box.io_config,
         builder_box.allocate_fn,
     )
     .into_extern_result(&builder_box.allocate_fn)
@@ -692,7 +897,14 @@ fn get_default_default_engine_impl(
     url: DeltaResult<Url>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(url?, Default::default(), None, allocate_error)
+    get_default_engine_impl(
+        url?,
+        Default::default(),
+        ObjectStoreBackend::default(),
+        None,
+        IoConcurrencyConfig::default(),
+        allocate_error,
+    )
 }
 
 /// Safety
@@ -718,26 +930,59 @@ fn engine_to_handle(
 fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
+    object_store_backend: ObjectStoreBackend,
     executor_config: Option<MultithreadedExecutorConfig>,
+    io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
+
+    let store = match object_store_backend {
+        ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
+        ObjectStoreBackend::Rest(rest) => {
+            rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
+        }
+    };
+    build_engine_from_store(store, executor_config, io_config, allocate_error)
+}
+
+/// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
+/// tuning. Shared by the URL-scheme and REST engine builder paths.
+#[cfg(feature = "default-engine-base")]
+pub(crate) fn build_engine_from_store(
+    store: Arc<dyn ObjectStore>,
+    executor_config: Option<MultithreadedExecutorConfig>,
+    io_config: IoConcurrencyConfig,
+    allocate_error: AllocateErrorFn,
+) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::DefaultEngineBuilder;
 
-    let store = store_from_url_opts(&url, options)?;
+    // The builder is generic over the executor type, so apply the shared I/O config via a generic
+    // helper to both branches without naming the concrete builder type.
+    fn apply_io_config<E>(
+        builder: DefaultEngineBuilder<E>,
+        io_config: &IoConcurrencyConfig,
+    ) -> DefaultEngineBuilder<E> {
+        let builder = match io_config.buffer_size {
+            Some(buffer_size) => builder.with_buffer_size(buffer_size),
+            None => builder,
+        };
+        match io_config.batch_size {
+            Some(batch_size) => builder.with_batch_size(batch_size),
+            None => builder,
+        }
+    }
 
     let engine: Arc<dyn Engine> = if let Some(config) = executor_config {
         let executor = TokioMultiThreadExecutor::new_owned_runtime(
             config.worker_threads,
             config.max_blocking_threads,
         )?;
-        Arc::new(
-            DefaultEngineBuilder::new(store)
-                .with_task_executor(Arc::new(executor))
-                .build(),
-        )
+        let builder = DefaultEngineBuilder::new(store).with_task_executor(Arc::new(executor));
+        Arc::new(apply_io_config(builder, &io_config).build())
     } else {
-        Arc::new(DefaultEngineBuilder::new(store).build())
+        let builder = apply_io_config(DefaultEngineBuilder::new(store), &io_config);
+        Arc::new(builder.build())
     };
 
     Ok(engine_to_handle(engine, allocate_error))
@@ -757,6 +1002,76 @@ pub struct SharedSchema;
 
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
+
+/// Outcome of a checkpoint write performed via [`checkpoint_snapshot`].
+///
+/// `Written` indicates the kernel wrote a new checkpoint at this version and returns an
+/// updated snapshot whose log segment reflects the new checkpoint. `AlreadyExists` indicates
+/// a checkpoint at this version was already present (either pre-existed or was written by a
+/// concurrent writer) and returns the original snapshot unchanged.
+///
+/// Both variants carry an owned `Handle<SharedSnapshot>` that the caller must release via
+/// [`free_snapshot`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum FfiCheckpointWriteResult {
+    Written(Handle<SharedSnapshot>),
+    AlreadyExists(Handle<SharedSnapshot>),
+}
+
+impl FfiCheckpointWriteResult {
+    fn from_kernel(result: CheckpointWriteResult, snapshot: SnapshotRef) -> Self {
+        match result {
+            CheckpointWriteResult::Written => Self::Written(snapshot.into()),
+            CheckpointWriteResult::AlreadyExists => Self::AlreadyExists(snapshot.into()),
+        }
+    }
+}
+
+/// Checkpoint write configuration for [`checkpoint_snapshot`]. Mirrors the kernel's
+/// [`CheckpointSpec`] and [`V2CheckpointConfig`] across the C ABI; see those types for the
+/// authoritative semantics and constraints.
+///
+/// Pass `Option<&FfiCheckpointSpec>::None` to [`checkpoint_snapshot`] to let the kernel
+/// auto-pick V1 or V2 based on the table's protocol features.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum FfiCheckpointSpec {
+    /// See [`CheckpointSpec::V1`].
+    V1,
+    /// See [`V2CheckpointConfig::NoSidecar`].
+    V2NoSidecar,
+    /// See [`V2CheckpointConfig::WithSidecar`].
+    V2WithSidecar {
+        /// See [`V2CheckpointConfig::WithSidecar`]. `None` selects the kernel default hint.
+        file_actions_per_sidecar_hint: OptionalValue<usize>,
+    },
+}
+
+impl FfiCheckpointSpec {
+    fn to_kernel(&self) -> CheckpointSpec {
+        match self {
+            FfiCheckpointSpec::V1 => CheckpointSpec::V1,
+            FfiCheckpointSpec::V2NoSidecar => CheckpointSpec::V2(V2CheckpointConfig::NoSidecar),
+            FfiCheckpointSpec::V2WithSidecar {
+                file_actions_per_sidecar_hint,
+            } => {
+                // Forward the hint verbatim (including `Some(0)`) so the kernel applies the same
+                // validation as a native `V2CheckpointConfig::WithSidecar`; `None` => kernel
+                // default.
+                let file_actions_per_sidecar_hint = match file_actions_per_sidecar_hint {
+                    OptionalValue::Some(hint) => Some(*hint),
+                    OptionalValue::None => None,
+                };
+                CheckpointSpec::V2(V2CheckpointConfig::WithSidecar {
+                    file_actions_per_sidecar_hint,
+                })
+            }
+        }
+    }
+}
 
 #[handle_descriptor(target=Protocol, mutable=false, sized=true)]
 pub struct SharedProtocol;
@@ -961,32 +1276,65 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     snapshot.drop_handle();
 }
 
-/// Perform a full checkpoint of the specified snapshot using the supplied engine.
+/// Perform a checkpoint write on the given snapshot. Mirrors the kernel's
+/// [`delta_kernel::snapshot::Snapshot::checkpoint`] API across the C ABI.
 ///
-/// This writes the checkpoint parquet file and the `_last_checkpoint` file.
-// TODO: Expose the updated snapshot via a new FFI function that returns a snapshot handle.
+/// Pass `Option<&FfiCheckpointSpec>::None` to let the kernel auto-pick V1 or V2 based on the
+/// table's protocol features and emit an inline checkpoint with no sidecars. Pass `Some(&spec)`
+/// to force a specific shape; see [`FfiCheckpointSpec`] for the available options.
+///
+/// Returns [`FfiCheckpointWriteResult::Written`] with the post-checkpoint snapshot (whose log
+/// segment records the new checkpoint), or [`FfiCheckpointWriteResult::AlreadyExists`] with the
+/// original snapshot when a checkpoint at this version was already present. In both branches the
+/// caller owns the returned snapshot handle and must release it via [`free_snapshot`].
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles.
+/// Caller is responsible for passing valid handles. The `spec` pointer, if non-null, must point
+/// to a valid `FfiCheckpointSpec` for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<bool> {
+    spec: Option<&FfiCheckpointSpec>,
+) -> ExternResult<FfiCheckpointWriteResult> {
     let engine_ref = unsafe { engine.as_ref() };
-    let snapshot = unsafe { snapshot.clone_as_arc() };
-    snapshot_checkpoint_impl(snapshot, engine_ref).into_extern_result(&engine_ref)
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let kernel_spec = spec.map(|s| s.to_kernel());
+    snapshot_ref
+        .checkpoint(engine_ref.engine().as_ref(), kernel_spec.as_ref())
+        .map(|(result, updated)| FfiCheckpointWriteResult::from_kernel(result, updated))
+        .into_extern_result(&engine_ref)
 }
 
-fn snapshot_checkpoint_impl(
-    snapshot: Arc<Snapshot>,
-    extern_engine: &dyn ExternEngine,
-) -> DeltaResult<bool> {
-    let (_result, _updated) = snapshot.checkpoint(extern_engine.engine().as_ref(), None)?;
-    // We ignore the CheckpointWriteResult because both Written and AlreadyExists are non-error
-    // outcomes at the FFI layer.
-    Ok(true)
+/// Publish unpublished catalog commits on a catalog-managed snapshot.
+///
+/// No-op (still returns a caller-owned snapshot handle at the same version) when there is
+/// nothing to publish. Errors when unpublished commits exist but the table is not
+/// catalog-managed or the committer is not a catalog committer.
+///
+/// Caller owns the returned handle ([`free_snapshot`]). The input snapshot is borrowed; the
+/// committer is consumed (do not free). The returned snapshot carries the published watermark
+/// used by subsequent catalog commits -- use it for the next `transaction_with_committer` /
+/// checkpoint.
+///
+/// # Safety
+///
+/// Caller must pass valid snapshot, committer, and engine handles. The committer handle is
+/// consumed and must not be used or freed afterward.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_publish_with_committer(
+    snapshot: Handle<SharedSnapshot>,
+    committer: Handle<MutableCommitter>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot_ref: SnapshotRef = unsafe { snapshot.clone_as_arc() };
+    let committer = unsafe { committer.into_inner() };
+    snapshot_ref
+        .publish(engine_ref.engine().as_ref(), committer.as_ref())
+        .map(|updated| updated.into())
+        .into_extern_result(&engine_ref)
 }
 
 /// Get the version of the specified snapshot
@@ -1022,6 +1370,49 @@ pub unsafe extern "C" fn snapshot_timestamp(
     snapshot
         .get_timestamp(engine_ref.engine().as_ref())
         .into_extern_result(&engine_ref)
+}
+
+/// File-level statistics for a snapshot, sourced from the snapshot's CRC.
+///
+/// Pass-by-value mirror of the scalar fields of kernel's [`FileStats`].
+// TODO: expose kernel's `FileStats` file-size histogram once it has a C-ABI-friendly
+// representation. It is a variable-length structure, so it needs a different accessor shape.
+#[derive(Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiFileStats {
+    /// Number of active `Add` file actions in this table version.
+    pub num_files: i64,
+    /// Total size of the table in bytes (sum of all active `Add` file sizes).
+    pub table_size_bytes: i64,
+}
+
+impl From<FileStats> for FfiFileStats {
+    fn from(stats: FileStats) -> Self {
+        Self {
+            num_files: stats.num_files(),
+            table_size_bytes: stats.table_size_bytes(),
+        }
+    }
+}
+
+/// Get the file-level statistics ([`FfiFileStats`]) for this snapshot from its CRC.
+///
+/// Returns [`OptionalValue::None`] when no CRC is resolved at this version (none on disk, a read
+/// failure, or the nearest on-disk CRC is stale), or its CRC does not carry complete file stats.
+/// Performs no I/O.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_file_stats(
+    snapshot: Handle<SharedSnapshot>,
+) -> OptionalValue<FfiFileStats> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .get_file_stats_if_present()
+        .map(FfiFileStats::from)
+        .into()
 }
 
 /// Selects which commit type to return for the history_manager query. FFI-safe mirror of
@@ -1213,7 +1604,10 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot.table_configuration().partition_columns().len()
+    snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -1226,7 +1620,10 @@ pub unsafe extern "C" fn get_partition_columns(
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
     // NOTE: Clippy doesn't like it, but we need to_vec+into_iter to decouple lifetimes
-    let partition_columns = snapshot.table_configuration().partition_columns().to_vec();
+    let partition_columns = snapshot
+        .table_configuration()
+        .logical_partition_columns()
+        .to_vec();
     let iter: Box<StringIter> = Box::new(partition_columns.into_iter());
     iter.into()
 }
@@ -1505,7 +1902,7 @@ mod tests {
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::ObjectStoreExt as _;
+    use delta_kernel::object_store::{DynObjectStore, ObjectStore as _, ObjectStoreExt as _};
     use delta_kernel::schema::StructType;
     use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel_default_engine::DefaultEngineBuilder;
@@ -1682,6 +2079,48 @@ mod tests {
 
         unsafe { free_snapshot(snapshot1) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_file_stats_present() -> Result<(), Box<dyn std::error::Error>> {
+        // The crc-full fixture has a CRC at version 0 with complete file stats.
+        let table_path = std::fs::canonicalize("../kernel/tests/data/crc-full/")?;
+        let table_root = Url::from_directory_path(&table_path)
+            .map_err(|()| delta_kernel::Error::generic("invalid table path"))?
+            .to_string();
+
+        let engine = get_default_engine(&table_root);
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+
+        assert_eq!(
+            unsafe { snapshot_file_stats(snapshot.shallow_copy()) },
+            OptionalValue::Some(FfiFileStats {
+                num_files: 10,
+                table_size_bytes: 5259
+            }),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_file_stats_absent_without_crc() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // A metadata-only table has no CRC, so file stats are absent.
+        let table_root = "memory:///test_file_stats_no_crc/";
+        let (_storage, engine, snapshot) = make_engine_and_v0_snapshot(table_root).await?;
+
+        assert_eq!(
+            unsafe { snapshot_file_stats(snapshot.shallow_copy()) },
+            OptionalValue::None
+        );
+
+        unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
     }
@@ -2009,78 +2448,368 @@ mod tests {
         Ok(())
     }
 
-    // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_snapshot_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+    // V2 protocol + metadata declaring the `v2Checkpoint` reader+writer feature.
+    //
+    // Two columns (id INT, val STRING), no partitions, no extra table properties. Used by every
+    // test below that needs sidecar emission or a V2 checkpoint to succeed.
+    const V2_CHECKPOINT_PROTOCOL_AND_METADATA: &str = concat!(
+        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["v2Checkpoint"],"writerFeatures":["v2Checkpoint"]}}"#,
+        "\n",
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#,
+    );
+
+    /// Seed a table at version 0 from [`test_utils::METADATA`] (protocol + metadata, plus its
+    /// leading `commitInfo` which the checkpoint writer ignores), then append `num_add_actions`
+    /// single-add commits at versions 1..=num_add_actions.
+    async fn seed_v1_table(
+        storage: &DynObjectStore,
+        table_root: &str,
+        num_add_actions: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        add_commit(
+            table_root,
+            storage,
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        for i in 0..num_add_actions {
+            add_commit(
+                table_root,
+                storage,
+                (i + 1) as u64,
+                actions_to_string(vec![TestAction::Add(format!("file{i}.parquet"))]),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Like `seed_v1_table` but uses [`V2_CHECKPOINT_PROTOCOL_AND_METADATA`] so the
+    /// table declares the `v2Checkpoint` reader+writer feature.
+    async fn seed_v2_table(
+        storage: &InMemory,
+        table_root: &str,
+        num_add_actions: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        add_commit(
+            table_root,
+            storage,
+            0,
+            V2_CHECKPOINT_PROTOCOL_AND_METADATA.to_string(),
+        )
+        .await?;
+        for i in 0..num_add_actions {
+            add_commit(
+                table_root,
+                storage,
+                (i + 1) as u64,
+                actions_to_string_with_metadata(
+                    vec![TestAction::Add(format!("file{i}.parquet"))],
+                    V2_CHECKPOINT_PROTOCOL_AND_METADATA,
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Count the entries in a given object_store prefix.
+    async fn count_objects_with_prefix(storage: &InMemory, prefix: &str) -> usize {
+        let prefix_path = Path::from(prefix);
+        storage
+            .list_with_delimiter(Some(&prefix_path))
+            .await
+            .expect("list_with_delimiter should succeed")
+            .objects
+            .len()
+    }
+
+    /// Extract the `Handle<SharedSnapshot>` from the `Written` variant; panics on
+    /// `AlreadyExists`. Caller owns the returned handle and must `free_snapshot` it.
+    fn unwrap_written(result: FfiCheckpointWriteResult) -> Handle<SharedSnapshot> {
+        match result {
+            FfiCheckpointWriteResult::Written(snap) => snap,
+            FfiCheckpointWriteResult::AlreadyExists(_) => {
+                panic!("expected Written, got AlreadyExists")
+            }
+        }
+    }
+
+    /// Common setup for the checkpoint tests: seed an in-memory table (V1 or V2) with
+    /// `num_add_actions` single-add commits, then build a `DefaultEngine` and a latest-version
+    /// snapshot.
+    ///
+    /// The engine is wired to a multi-threaded task executor on purpose: `Snapshot::checkpoint`
+    /// drives nested `block_on` calls that would deadlock on the default single-threaded
+    /// background executor.
+    ///
+    /// Returns the backing `storage` (for post-checkpoint assertions) plus the owned `engine`
+    /// and `snapshot` handles; the caller must `free_snapshot` and `free_engine` them.
+    async fn setup_checkpoint_test(
+        is_v2: bool,
+        num_add_actions: usize,
+    ) -> Result<
+        (
+            Arc<InMemory>,
+            Handle<SharedExternEngine>,
+            Handle<SharedSnapshot>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         let storage = Arc::new(InMemory::new());
         let table_root = "memory:///";
-
-        // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
-        // add/remove commits.
-        let protocol_and_metadata = METADATA
-            .lines()
-            .skip(1) // skip commitInfo
-            .collect::<Vec<_>>()
-            .join("\n");
-        add_commit(table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            1,
-            actions_to_string(vec![
-                TestAction::Add("file1.parquet".into()),
-                TestAction::Add("file2.parquet".into()),
-            ]),
-        )
-        .await?;
-        add_commit(
-            table_root,
-            storage.as_ref(),
-            2,
-            actions_to_string(vec![
-                TestAction::Add("file3.parquet".into()),
-                TestAction::Remove("file1.parquet".into()),
-            ]),
-        )
-        .await?;
+        if is_v2 {
+            seed_v2_table(storage.as_ref(), table_root, num_add_actions).await?;
+        } else {
+            seed_v1_table(storage.as_ref(), table_root, num_add_actions).await?;
+        }
 
         let executor = Arc::new(TokioMultiThreadExecutor::new(
             tokio::runtime::Handle::current(),
         ));
-        let engine = DefaultEngineBuilder::new(storage.clone())
-            .with_task_executor(executor)
-            .build();
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
-
+        let engine = engine_to_handle(
+            Arc::new(
+                DefaultEngineBuilder::new(storage.clone())
+                    .with_task_executor(executor)
+                    .build(),
+            ),
+            allocate_err,
+        );
         let snapshot =
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        Ok((storage, engine, snapshot))
+    }
 
-        let did_checkpoint = unsafe {
+    // Checkpoint sidecar shape is driven by (table kind, spec). Each case writes a checkpoint and
+    // asserts the resulting `_delta_log/_sidecars/` object count.
+    //
+    // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    #[rstest]
+    // non-V2 table, spec = None => kernel auto-picks V1, inline, no sidecars.
+    #[case::none_spec_v1(false, 2, None, 0)]
+    // V2 table, explicit no-sidecar => V2 manifest with file actions inline.
+    #[case::v2_no_sidecar(true, 2, Some(FfiCheckpointSpec::V2NoSidecar), 0)]
+    // V2 table, default hint (50k) => 3 actions fit in a single sidecar.
+    #[case::v2_default_hint(
+        true,
+        3,
+        Some(FfiCheckpointSpec::V2WithSidecar {
+            file_actions_per_sidecar_hint: OptionalValue::None,
+        }),
+        1
+    )]
+    // V2 table, hint=2 over 8 actions => ceil(8/2)=4 sidecars.
+    #[case::v2_hint_2(
+        true,
+        8,
+        Some(FfiCheckpointSpec::V2WithSidecar {
+            file_actions_per_sidecar_hint: OptionalValue::Some(2),
+        }),
+        4
+    )]
+    // Skipped under Miri: writes checkpoint parquet (minutes of safe work under the interpreter).
+    // Its unsafe (checkpoint_snapshot) is unconditional in `spec`, so the Some(V2WithSidecar) path
+    // adds no unsafe over test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error (runs
+    // under Miri); the checkpoint/free handles are covered by test_setting_multithread_executor.
+    // Sidecar-shape is safe kernel logic. Runs (all cases) under normal cargo test / nextest.
+    //
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_snapshot_sidecar_shape(
+        #[case] is_v2: bool,
+        #[case] num_add_actions: usize,
+        #[case] spec: Option<FfiCheckpointSpec>,
+        #[case] expected_sidecars: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (storage, engine, snapshot) = setup_checkpoint_test(is_v2, num_add_actions).await?;
+
+        let result = unsafe {
             ok_or_panic(checkpoint_snapshot(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
+                spec.as_ref(),
             ))
         };
-        assert!(did_checkpoint);
+        let written_snap = unwrap_written(result);
 
-        // Verify `_last_checkpoint` exists and looks sane.
+        let sidecar_count =
+            count_objects_with_prefix(storage.as_ref(), "_delta_log/_sidecars/").await;
+        assert_eq!(sidecar_count, expected_sidecars);
+
+        unsafe { free_snapshot(written_snap) }
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // A zero sidecar hint is invalid: the kernel requires `file_actions_per_sidecar_hint > 0`,
+    // surfaced through the FFI as `CheckpointWriteError`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_snapshot_v2_with_sidecars_zero_hint_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_storage, engine, snapshot) = setup_checkpoint_test(true, 3).await?;
+
+        let spec = FfiCheckpointSpec::V2WithSidecar {
+            file_actions_per_sidecar_hint: OptionalValue::Some(0),
+        };
+        let extern_result = unsafe {
+            checkpoint_snapshot(snapshot.shallow_copy(), engine.shallow_copy(), Some(&spec))
+        };
+        assert_extern_result_error_with_message(
+            extern_result,
+            KernelError::CheckpointWriteError,
+            Some("Error writing checkpoint: file_actions_per_sidecar_hint must be greater than 0"),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Checkpoint on V1 table with V2 spec => `KernelError::CheckpointWriteError`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_snapshot_v2_on_non_v2_table_returns_checkpoint_write_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_storage, engine, snapshot) = setup_checkpoint_test(false, 1).await?;
+
+        let spec = FfiCheckpointSpec::V2NoSidecar;
+        let extern_result = unsafe {
+            checkpoint_snapshot(snapshot.shallow_copy(), engine.shallow_copy(), Some(&spec))
+        };
+        assert_extern_result_error_with_message(
+            extern_result,
+            KernelError::CheckpointWriteError,
+            Some("Error writing checkpoint: CheckpointSpec::V2 requires the v2Checkpoint table feature to be supported"),
+        );
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Calling `checkpoint_snapshot` twice on the SAME (stale) input snapshot returns `Written`
+    // both times. The `AlreadyExists` short-circuit keys off the snapshot's own log segment
+    // (`checkpoint_version == end_version`), which never updates for the original handle, and the
+    // parquet writer silently overwrites on disk -- so neither call can observe `AlreadyExists`.
+    // Each returned snapshot reports the input version. (The `AlreadyExists` path is covered by
+    // `test_checkpoint_snapshot_written_snapshot_is_usable`, which chains the snapshot returned by
+    // the first checkpoint.)
+    //
+    // NOTE: Snapshot::checkpoint requires a multi-threaded tokio task executor to avoid deadlocks.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. AlreadyExists/overwrite is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_snapshot_second_call_returns_consistent_snapshot(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
+        let input_version = unsafe { version(snapshot.shallow_copy()) };
+
+        // First call on the original snapshot: writes the checkpoint => `Written`.
+        let first_snap = unsafe {
+            unwrap_written(ok_or_panic(checkpoint_snapshot(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                None,
+            )))
+        };
+        let first_version = unsafe { version(first_snap.shallow_copy()) };
+        assert_eq!(first_version, input_version);
+        unsafe { free_snapshot(first_snap) };
+
+        // Second call on the same (stale) input snapshot: overwrites => `Written` again.
+        let second_snap = unsafe {
+            unwrap_written(ok_or_panic(checkpoint_snapshot(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                None,
+            )))
+        };
+        let second_version = unsafe { version(second_snap.shallow_copy()) };
+        assert_eq!(second_version, input_version);
+        unsafe { free_snapshot(second_snap) };
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // The `Written` snapshot is usable downstream: `version` matches input, and a chained
+    // `checkpoint_snapshot` returns `AlreadyExists` (same table version). Also validates the
+    // `_delta_log/_last_checkpoint` content (version, numOfAddFiles, size, sizeInBytes), which
+    // `test_checkpoint_snapshot_sidecar_shape` doesn't cover.
+    // Skipped under Miri: writes checkpoint parquet (minutes under the interpreter). Its unsafe FFI
+    // (checkpoint_snapshot, free_snapshot) is covered by test_setting_multithread_executor, and
+    // version()/SharedSnapshot::as_ref by test_snapshot. _last_checkpoint content is safe kernel
+    // logic. Runs under normal cargo test / nextest.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in the anchor.
+    #[cfg_attr(
+        miri,
+        ignore = "writes checkpoint parquet (no unique unsafe); minutes under Miri"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_checkpoint_snapshot_written_snapshot_is_usable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (storage, engine, snapshot) = setup_checkpoint_test(false, 2).await?;
+        let input_version = unsafe { version(snapshot.shallow_copy()) };
+
+        let result = unsafe {
+            ok_or_panic(checkpoint_snapshot(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                None,
+            ))
+        };
+        let written_snap = unwrap_written(result);
+
+        // (a) version() on the returned snapshot matches the input version.
+        let returned_version = unsafe { version(written_snap.shallow_copy()) };
+        assert_eq!(returned_version, input_version);
+
+        // (b) `_last_checkpoint` exists and describes the checkpoint we just wrote.
         let last_checkpoint = storage
             .get(&Path::from("_delta_log/_last_checkpoint"))
             .await?;
-        let last_checkpoint_bytes = last_checkpoint.bytes().await?;
-        let v: Value = serde_json::from_slice(last_checkpoint_bytes.as_ref())?;
+        let v: Value = serde_json::from_slice(last_checkpoint.bytes().await?.as_ref())?;
         assert_eq!(v["version"].as_u64(), Some(2));
-        // Here file1 was removed, so only file2 and
-        // file3 remain.
+        // 2 adds at versions 1..=2, no removes => 2 live add files.
         assert_eq!(v["numOfAddFiles"].as_u64(), Some(2));
-        // size = 1 protocol + 1 metadata + 2 live adds
+        // size = 1 protocol + 1 metadata + 2 live adds.
         assert_eq!(v["size"].as_u64(), Some(4));
-
-        // Cross-check checkpoint file size against `_last_checkpoint.sizeInBytes`.
+        // Cross-check the checkpoint parquet file size against `_last_checkpoint.sizeInBytes`.
         let checkpoint_path = Path::from("_delta_log/00000000000000000002.checkpoint.parquet");
         let checkpoint_size = storage.head(&checkpoint_path).await?.size;
         assert_eq!(v["sizeInBytes"].as_u64(), Some(checkpoint_size));
 
+        // (c) chain a second checkpoint_snapshot(returned_snap, engine, None) =>
+        // AlreadyExists.
+        let chained = unsafe {
+            ok_or_panic(checkpoint_snapshot(
+                written_snap.shallow_copy(),
+                engine.shallow_copy(),
+                None,
+            ))
+        };
+        match chained {
+            FfiCheckpointWriteResult::AlreadyExists(snap) => unsafe { free_snapshot(snap) },
+            FfiCheckpointWriteResult::Written(_) => panic!("expected AlreadyExists"),
+        }
+
+        unsafe { free_snapshot(written_snap) }
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
@@ -2089,6 +2818,11 @@ mod tests {
     // Test checkpoint using FFI engine builder APIs with multithreaded executor.
     // NOTE: We made this a sync test to simulate the expected case: C code calling FFI APIs to
     // build engine without existing tokio runtime.
+    //
+    // Miri anchor for checkpoint FFI: covers the success-path checkpoint_snapshot -> Written
+    // handle -> free_snapshot that the skipped checkpoint tests share, and uniquely covers
+    // set_builder_with_multithreaded_executor (no other test calls it). Skipping it drops that
+    // coverage under Miri.
     #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_setting_multithread_executor() -> Result<(), Box<dyn std::error::Error>> {
@@ -2102,41 +2836,11 @@ mod tests {
             .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
         let storage = Arc::new(LocalFileSystem::new());
 
-        // Create a minimal table history: initial metadata+protocol (no commitInfo), then some
-        // add/remove commits.
-        let protocol_and_metadata = METADATA
-            .lines()
-            .skip(1) // skip commitInfo
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Use a temporary runtime for async setup, then drop it before FFI calls
+        // Use a temporary runtime for async setup, then drop it before the FFI calls so the engine
+        // built below drives all async work through its own (FFI-configured) executor.
         {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
-                add_commit(
-                    &table_root,
-                    storage.as_ref(),
-                    1,
-                    actions_to_string(vec![
-                        TestAction::Add("file1.parquet".into()),
-                        TestAction::Add("file2.parquet".into()),
-                    ]),
-                )
-                .await?;
-                add_commit(
-                    &table_root,
-                    storage.as_ref(),
-                    2,
-                    actions_to_string(vec![
-                        TestAction::Add("file3.parquet".into()),
-                        TestAction::Remove("file1.parquet".into()),
-                    ]),
-                )
-                .await?;
-                Ok::<_, Box<dyn std::error::Error>>(())
-            })?;
+            rt.block_on(seed_v1_table(storage.as_ref(), table_root, 2))?;
         } // runtime dropped here, before FFI calls
 
         // Build engine using FFI APIs
@@ -2153,12 +2857,87 @@ mod tests {
             unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
 
         let did_checkpoint = unsafe {
-            ok_or_panic(checkpoint_snapshot(
+            match ok_or_panic(checkpoint_snapshot(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
-            ))
+                None,
+            )) {
+                FfiCheckpointWriteResult::Written(snap) => {
+                    free_snapshot(snap);
+                    true
+                }
+                FfiCheckpointWriteResult::AlreadyExists(snap) => {
+                    free_snapshot(snap);
+                    true
+                }
+            }
         };
         assert!(did_checkpoint);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    // Test building an engine via the FFI builder with custom read-path I/O concurrency, then
+    // exercising the read path (snapshot) to confirm the configured engine works.
+    #[cfg(feature = "default-engine-base")]
+    #[rstest]
+    #[case(4, 8)]
+    #[case(0, 0)]
+    fn test_setting_io_concurrency(
+        #[case] buffer_size: usize,
+        #[case] batch_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use delta_kernel::object_store::local::LocalFileSystem;
+        use tempfile::tempdir;
+
+        let tmp_dir = tempdir()?;
+        let tmp_path = tmp_dir.path();
+        let table_root = tmp_path
+            .to_str()
+            .ok_or_else(|| delta_kernel::Error::generic("Invalid path"))?;
+        let storage = Arc::new(LocalFileSystem::new());
+
+        let protocol_and_metadata = METADATA
+            .lines()
+            .skip(1) // skip commitInfo
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                add_commit(&table_root, storage.as_ref(), 0, protocol_and_metadata).await?;
+                add_commit(
+                    &table_root,
+                    storage.as_ref(),
+                    1,
+                    actions_to_string(vec![
+                        TestAction::Add("file1.parquet".into()),
+                        TestAction::Add("file2.parquet".into()),
+                    ]),
+                )
+                .await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
+
+        let builder = unsafe {
+            ok_or_panic(get_engine_builder(
+                kernel_string_slice!(table_root),
+                allocate_err,
+            ))
+        };
+        unsafe {
+            set_builder_with_io_concurrency(builder.as_mut().unwrap(), buffer_size, batch_size)
+        };
+        let engine = unsafe { ok_or_panic(builder_build(builder)) };
+
+        let snapshot =
+            unsafe { build_snapshot(kernel_string_slice!(table_root), engine.shallow_copy()) };
+        let version = unsafe { version(snapshot.shallow_copy()) };
+        assert_eq!(version, 1);
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
@@ -2285,9 +3064,9 @@ mod tests {
             invalid_snapshot,
             KernelError::GenericError,
             Some(concat!(
-                "Generic delta kernel error: Staged commits in log_tail require ",
-                "max_catalog_version to be set. Use with_max_catalog_version() ",
-                "when providing staged commits."
+                "Max catalog version error: Max catalog version is required when providing ",
+                "staged commits in the log tail. ",
+                "Use with_max_catalog_version()."
             )),
         );
 

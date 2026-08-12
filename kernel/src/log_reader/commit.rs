@@ -2,6 +2,7 @@
 
 use itertools::Itertools;
 
+use crate::cancellation::CancellationTokenRef;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
@@ -19,15 +20,22 @@ impl CommitReader {
     /// - `engine`: Engine for reading files
     /// - `log_segment`: The log segment to process
     /// - `schema`: The schema to read the json files
+    /// - `cancellation_token`: Optional token so a cancelled request can stop the commit read
     pub(crate) fn try_new(
         engine: &dyn Engine,
         log_segment: &LogSegment,
         schema: SchemaRef,
+        cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let commit_files = log_segment.find_commit_cover();
         let actions = engine
             .json_handler()
-            .read_json_files(&commit_files, schema, None)?
+            .read_json_files_with_cancellation(
+                &commit_files,
+                schema,
+                None,
+                cancellation_token.cloned(),
+            )?
             .map_ok(|batch| ActionsBatch::new(batch, true));
 
         Ok(Self {
@@ -54,7 +62,7 @@ mod tests {
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::scan::COMMIT_READ_SCHEMA;
-    use crate::utils::test_utils::load_test_table;
+    use crate::unit_test_utils::load_test_table;
 
     #[test]
     fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,7 +70,7 @@ mod tests {
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
         let schema = COMMIT_READ_SCHEMA.clone();
-        let commit_phase = CommitReader::try_new(engine.as_ref(), &log_segment, schema)?;
+        let commit_phase = CommitReader::try_new(engine.as_ref(), &log_segment, schema, None)?;
 
         let mut file_paths = vec![];
         for result in commit_phase {

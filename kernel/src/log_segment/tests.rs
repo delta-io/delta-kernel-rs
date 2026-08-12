@@ -10,16 +10,17 @@ use url::Url;
 use super::*;
 use crate::actions::visitors::{AddVisitor, SidecarVisitor};
 use crate::actions::{
-    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, DOMAIN_METADATA_NAME,
-    MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME, SIDECAR_NAME,
+    get_all_actions_schema, get_commit_schema, Add, Remove, Sidecar, ADD_NAME, COMMIT_INFO_NAME,
+    LOG_METADATA_SCHEMA, MAX_VALUES, METADATA_NAME, MIN_VALUES, NUM_RECORDS, REMOVE_NAME,
+    SIDECAR_NAME,
 };
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::ColumnName;
-use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointHintSummary};
+use crate::engine::test_delegating::DelegatingEngine;
+use crate::expressions::{col, ColumnName};
+use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::log_segment_files::LogSegmentFiles;
@@ -27,18 +28,26 @@ use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::ArrowWriter;
+use crate::path::tests::multipart_checkpoint_name;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
-    add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
-    sidecar_batch_with_given_paths_and_sizes,
+    add_batch_simple, add_batch_with_remove, adds_only_batch, remove_only_batch,
+    sidecar_batch_with_given_paths, sidecar_batch_with_given_paths_and_sizes,
 };
-use crate::schema::{DataType, StructField, StructType};
-use crate::utils::test_utils::{
-    assert_batch_matches, assert_result_error_with_message, string_array_to_engine_data, Action,
+use crate::scan::{
+    CHECKPOINT_READ_SCHEMA, CHECKPOINT_READ_SCHEMA_NO_JSON_STATS, COMMIT_READ_SCHEMA,
+};
+use crate::schema::{
+    schema, schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType,
+};
+use crate::unit_test_utils::{
+    assert_batch_matches, assert_result_error_with_message, create_log_path,
+    create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, EngineData, Expression, FileMeta, JsonHandler, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
+    JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    StorageHandler,
 };
 
 /// Processes sidecar files for the given checkpoint batch.
@@ -78,9 +87,8 @@ fn process_sidecars(
 // get an ObjectStore path for a checkpoint file, based on version, part number, and total number of
 // parts
 fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u32) -> Path {
-    let path =
-        format!("_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet");
-    Path::from(path.as_str())
+    let name = multipart_checkpoint_name(version, part_num, num_parts);
+    Path::from(format!("_delta_log/{name}").as_str())
 }
 
 // Utility method to build a log using a list of log paths and an optional checkpoint hint. The
@@ -137,17 +145,7 @@ async fn write_parquet_to_store(
     path: String,
     data: Box<dyn EngineData>,
 ) -> DeltaResult<()> {
-    let batch = ArrowEngineData::try_from_engine_data(data)?;
-    let record_batch = batch.record_batch();
-
-    let mut buffer = vec![];
-    let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
-    writer.write(record_batch)?;
-    writer.close()?;
-
-    store.put(&Path::from(path), buffer.into()).await?;
-
-    Ok(())
+    write_multi_row_group_parquet_to_store(store, vec![data], &path).await
 }
 
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
@@ -159,6 +157,101 @@ pub(crate) async fn add_checkpoint_to_store(
 ) -> DeltaResult<()> {
     let path = format!("_delta_log/{filename}");
     write_parquet_to_store(store, path, data).await
+}
+
+/// Writes a Parquet file with one row group per batch. All batches must share the same Arrow
+/// schema.
+async fn write_multi_row_group_parquet_to_store(
+    store: &Arc<InMemory>,
+    row_groups: Vec<Box<dyn EngineData>>,
+    path: &str,
+) -> DeltaResult<()> {
+    let batches = row_groups
+        .into_iter()
+        .map(ArrowEngineData::try_from_engine_data)
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let schema = batches
+        .first()
+        .ok_or_else(|| Error::internal_error("at least one row group is required"))?
+        .record_batch()
+        .schema();
+
+    let mut buffer = vec![];
+    let mut writer = ArrowWriter::try_new(&mut buffer, schema, None)?;
+    for batch in &batches {
+        writer.write(batch.record_batch())?;
+        writer.flush()?;
+    }
+    writer.close()?;
+
+    store.put(&Path::from(path), buffer.into()).await?;
+    Ok(())
+}
+
+/// Returns the materialized row count and sorted paths of all materialized Add actions.
+fn collect_materialized_adds(
+    actions: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+) -> DeltaResult<(usize, Vec<String>)> {
+    let mut rows = 0;
+    let mut add_paths: Vec<String> = Vec::new();
+    for batch in actions {
+        let batch = batch?.actions;
+        rows += batch.len();
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(&*batch)?;
+        add_paths.extend(visitor.adds.into_iter().map(|add| add.path));
+    }
+    add_paths.sort();
+    Ok((rows, add_paths))
+}
+
+fn collect_projected_adds(
+    log_segment: &LogSegment,
+    engine: &dyn Engine,
+) -> DeltaResult<(usize, Vec<String>)> {
+    let actions = log_segment
+        .read_actions_with_projected_checkpoint_actions(
+            engine,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
+            None,
+            None,
+            None,
+            None, // cancellation_token
+        )?
+        .actions;
+    collect_materialized_adds(actions)
+}
+
+struct IgnorePredicateParquetHandler(Arc<dyn ParquetHandler>);
+
+impl ParquetHandler for IgnorePredicateParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.0.read_parquet_files(files, physical_schema, None)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: Url,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> DeltaResult<()> {
+        self.0.write_parquet_file(location, data)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.0.read_parquet_footer(file)
+    }
+}
+
+fn ignore_predicate_engine(sync_engine: &Arc<SyncEngine>) -> DelegatingEngine {
+    DelegatingEngine::new(sync_engine.clone()).with_parquet_handler(Arc::new(
+        IgnorePredicateParquetHandler(sync_engine.parquet_handler()),
+    ))
 }
 
 /// Writes all actions to a _delta_log/_sidecars file in the store and return the [`FileMeta`].
@@ -198,20 +291,6 @@ async fn write_json_to_store(
         .await?;
 
     Ok(())
-}
-
-fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
-    create_log_path_with_size(path, 0)
-}
-
-fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
-    ParsedLogPath::try_from(FileMeta {
-        location: Url::parse(path).expect("Invalid file URL"),
-        last_modified: 0,
-        size,
-    })
-    .unwrap()
-    .unwrap()
 }
 
 /// Builds a staged-commit log path (`ParsedLogPath`) for each version: a
@@ -308,6 +387,7 @@ async fn build_snapshot_with_uuid_checkpoint_json() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_uuid_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(1),
@@ -403,6 +483,7 @@ async fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_out_of_date_last_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -449,6 +530,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_correct_last_multipart_checkpoint() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
@@ -500,6 +582,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
 #[tokio::test]
 async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: Some(3),
@@ -543,12 +626,22 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     )
 }
 
+/// v5 holds three complete checkpoints (classic, 2-part, 3-part), so the 3-part one always wins.
+/// The hint's `parts` decides only whether the hint describes that winner.
+#[rstest]
+#[case::hint_names_winner(Some(3), true)]
+#[case::hint_names_losing_multipart(Some(2), false)]
+#[case::hint_names_losing_classic(None, false)]
 #[tokio::test]
-async fn build_snapshot_with_bad_checkpoint_hint_fails() {
+async fn build_snapshot_applies_checkpoint_hint_iff_it_names_the_selected_checkpoint(
+    #[case] hint_parts: Option<usize>,
+    #[case] expect_hint_applies: bool,
+) {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
-        parts: Some(1),
+        parts: hint_parts,
         size_in_bytes: None,
         num_of_add_files: None,
         checkpoint_schema: None,
@@ -565,8 +658,12 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
             delta_path_for_version(3, "checkpoint.parquet"),
             delta_path_for_version(3, "json"),
             delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
             delta_path_for_multipart_checkpoint(5, 1, 2),
             delta_path_for_multipart_checkpoint(5, 2, 2),
+            delta_path_for_multipart_checkpoint(5, 1, 3),
+            delta_path_for_multipart_checkpoint(5, 2, 3),
+            delta_path_for_multipart_checkpoint(5, 3, 3),
             delta_path_for_version(5, "json"),
             delta_path_for_version(6, "json"),
             delta_path_for_version(7, "json"),
@@ -581,12 +678,38 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
         vec![], // log_tail
         Some(checkpoint_metadata),
         None,
-    );
-    assert_result_error_with_message(
-        log_segment,
-        "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
-        it has 2",
     )
+    .unwrap();
+
+    assert_eq!(log_segment.checkpoint_version, Some(5));
+    assert_eq!(log_segment.end_version, 7);
+    let checkpoint_filenames = log_segment
+        .listed
+        .checkpoint_parts
+        .iter()
+        .map(|p| p.filename.as_str())
+        .collect_vec();
+    assert_eq!(
+        checkpoint_filenames,
+        vec![
+            "00000000000000000005.checkpoint.0000000001.0000000003.parquet",
+            "00000000000000000005.checkpoint.0000000002.0000000003.parquet",
+            "00000000000000000005.checkpoint.0000000003.0000000003.parquet",
+        ]
+    );
+
+    // The hint is always retained; describing some other checkpoint only makes its fields
+    // untrustworthy, and readers fall back to the checkpoint footer.
+    assert!(log_segment.last_checkpoint_metadata.is_some());
+    assert_eq!(log_segment.checkpoint_hint().is_some(), expect_hint_applies);
+
+    let commit_versions = log_segment
+        .listed
+        .ascending_commit_files
+        .iter()
+        .map(|c| c.version)
+        .collect_vec();
+    assert_eq!(commit_versions, vec![6, 7]);
 }
 
 #[tokio::test]
@@ -639,6 +762,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
     // Snapshot should be made of the most recent complete checkpoint and the commit files that
     // follow it.
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -750,6 +874,7 @@ async fn build_snapshot_without_checkpoints() {
 #[tokio::test]
 async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 5,
         size: 10,
         parts: None,
@@ -798,6 +923,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
 #[tokio::test]
 async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
     let checkpoint_metadata = LastCheckpointHint {
+        v2_checkpoint: None,
         version: 3,
         size: 10,
         parts: None,
@@ -840,6 +966,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
 #[rstest::rstest]
 #[case::no_hint(None)]
 #[case::stale_hint(Some(LastCheckpointHint {
+    v2_checkpoint: None,
     version: 10, // stale: 10 > end_version 5, so it is discarded
     size: 10,
     parts: None,
@@ -1158,11 +1285,8 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     );
 
     // Filter out sidecar files that do not contain remove actions
-    let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-        Some(Arc::new(
-            Expression::column([REMOVE_NAME, "path"]).is_not_null(),
-        ))
-    });
+    let remove_predicate: LazyLock<Option<PredicateRef>> =
+        LazyLock::new(|| Some(Arc::new(col!(REMOVE_NAME, "path").is_not_null())));
 
     let mut iter = process_sidecars(
         engine.parquet_handler(),
@@ -1198,7 +1322,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_commit_schema().project(&[METADATA_NAME])?;
+    let v2_checkpoint_read_schema = LOG_METADATA_SCHEMA.clone();
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -1216,6 +1340,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1268,7 +1393,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
-    let v2_checkpoint_read_schema = get_commit_schema().project(&[ADD_NAME])?;
+    let v2_checkpoint_read_schema = CHECKPOINT_READ_SCHEMA.clone();
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {
@@ -1289,6 +1414,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1354,6 +1480,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1365,6 +1492,215 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+#[rstest]
+#[case::all_remove_part_skipped(vec![remove_only_batch(get_commit_schema().clone()) as _], 0, &[])]
+// The single row group holds a live Add, so the whole batch is kept: all 4 rows are materialized
+// (`add_batch_with_remove` = 1 remove + 2 adds + 1 metadata).
+#[case::mixed_add_remove_part_kept(
+    vec![add_batch_with_remove(get_commit_schema().clone()) as _],
+    4,
+    &[
+        "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
+        "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet",
+    ],
+)]
+#[case::all_remove_group_skipped_adjacent_add_group_kept(
+    vec![
+        remove_only_batch(get_commit_schema().clone()) as _,
+        adds_only_batch(get_commit_schema().clone()) as _,
+    ],
+    2,
+    &[
+        "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
+        "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c002.snappy.parquet",
+    ],
+)]
+#[tokio::test]
+async fn test_scan_checkpoint_read_handles_all_remove_row_groups(
+    #[case] row_groups: Vec<Box<dyn EngineData>>,
+    #[case] expected_rows_after_pruning: usize,
+    #[case] expected_add_paths: &[&str],
+    #[values(false, true)] ignore_predicate: bool,
+) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+    let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
+    let engine: &dyn Engine = if ignore_predicate {
+        &ignore_predicate_engine
+    } else {
+        sync_engine.as_ref()
+    };
+
+    let checkpoint_name = "00000000000000000001.checkpoint.parquet";
+    // Real checkpoints store removes with the full file-action schema; the add column is null.
+    let total_rows: usize = row_groups.iter().map(|batch| batch.len()).sum();
+    write_multi_row_group_parquet_to_store(
+        &store,
+        row_groups,
+        &format!("_delta_log/{checkpoint_name}"),
+    )
+    .await?;
+
+    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    // The projected checkpoint read derives `add.path IS NOT NULL`. Engines may use it to skip
+    // all-remove row groups or ignore it and return extra rows; both paths must surface the same
+    // Adds.
+    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, engine)?;
+    let expected_materialized_rows = if ignore_predicate {
+        total_rows
+    } else {
+        expected_rows_after_pruning
+    };
+    assert_eq!(materialized_rows, expected_materialized_rows);
+
+    let mut expected: Vec<String> = expected_add_paths.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        add_paths, expected,
+        "predicate handling must surface every live Add and no others"
+    );
+
+    Ok(())
+}
+
+/// `SyncJsonHandler` ignores the checkpoint predicate, so replay must tolerate the returned remove
+/// row while still surfacing the live Add.
+#[tokio::test]
+async fn test_scan_checkpoint_read_tolerates_unfiltered_json_rows() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let checkpoint_name =
+        "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json";
+    write_json_to_store(
+        &store,
+        vec![
+            Action::Remove(Remove {
+                path: "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+        ],
+        checkpoint_name,
+    )
+    .await?;
+
+    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, &engine)?;
+    assert_eq!(
+        materialized_rows, 2,
+        "SyncJsonHandler should return the unfiltered checkpoint rows"
+    );
+    assert_eq!(
+        add_paths,
+        vec!["part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string()],
+    );
+
+    Ok(())
+}
+
+#[rstest]
+#[case::row_group_skipping(false, 2)]
+#[case::predicate_ignored(true, 5)]
+#[tokio::test]
+async fn test_scan_checkpoint_read_handles_all_remove_sidecar_row_groups(
+    #[case] ignore_predicate: bool,
+    #[case] expected_materialized_rows: usize,
+) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let sync_engine = Arc::new(SyncEngine::new_with_store(store.clone()));
+    let ignore_predicate_engine = ignore_predicate_engine(&sync_engine);
+    let engine: &dyn Engine = if ignore_predicate {
+        &ignore_predicate_engine
+    } else {
+        sync_engine.as_ref()
+    };
+
+    let sidecar_name = "sidecarfile.parquet";
+    write_multi_row_group_parquet_to_store(
+        &store,
+        vec![
+            remove_only_batch(get_commit_schema().clone()) as _,
+            adds_only_batch(get_commit_schema().clone()) as _,
+        ],
+        &format!("_delta_log/_sidecars/{sidecar_name}"),
+    )
+    .await?;
+    let sidecar_size = get_file_size(&store, &format!("_delta_log/_sidecars/{sidecar_name}")).await;
+
+    let checkpoint_name = "00000000000000000001.checkpoint.parquet";
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![(sidecar_name, sidecar_size)],
+            get_all_actions_schema().clone(),
+        ),
+        checkpoint_name,
+    )
+    .await?;
+    let checkpoint_file = log_root.join(checkpoint_name)?.to_string();
+    let checkpoint_size = get_file_size(&store, &format!("_delta_log/{checkpoint_name}")).await;
+
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+
+    // Sidecar discovery reads the manifest without a predicate, so pruning its null-`add.path`
+    // rows from the projected action stream cannot hide sidecar references.
+    let (materialized_rows, add_paths) = collect_projected_adds(&log_segment, engine)?;
+    assert_eq!(
+        materialized_rows, expected_materialized_rows,
+        "materialized rows must reflect whether the engine applies the predicate"
+    );
+
+    assert_eq!(
+        add_paths,
+        vec![
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet".to_string(),
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c002.snappy.parquet".to_string(),
+        ],
+        "the kept sidecar row group must surface every live Add and no others"
+    );
 
     Ok(())
 }
@@ -1407,6 +1743,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1441,7 +1778,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     // Write sidecars first so we can get their actual sizes
     let sidecar1_size = add_sidecar_to_store(
         &store,
-        add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_simple(COMMIT_READ_SCHEMA.clone()),
         "sidecarfile1.parquet",
     )
     .await?
@@ -1449,7 +1786,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
     let sidecar2_size = add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_with_remove(COMMIT_READ_SCHEMA.clone()),
         "sidecarfile2.parquet",
     )
     .await?
@@ -1499,6 +1836,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -2127,6 +2465,78 @@ fn test_validate_listed_log_file_out_of_order_commit_files() {
 }
 
 #[test]
+fn test_try_new_crc_at_end_version_is_ok() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )),
+            latest_crc_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.crc"
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_try_new_crc_newer_than_end_version_is_err() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.json",
+            )),
+            latest_crc_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000003.crc"
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
+fn test_try_new_crc_older_than_checkpoint_is_err() {
+    let log_root = Url::parse("file:///_delta_log/").unwrap();
+    assert!(LogSegment::try_new(
+        LogSegmentFiles {
+            ascending_commit_files: vec![create_log_path(
+                "file:///_delta_log/00000000000000000004.json",
+            )],
+            latest_commit_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000004.json",
+            )),
+            checkpoint_parts: vec![create_log_path(
+                "file:///_delta_log/00000000000000000003.checkpoint.parquet",
+            )],
+            latest_crc_file: Some(create_log_path(
+                "file:///_delta_log/00000000000000000002.crc"
+            )),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )
+    .is_err());
+}
+
+#[test]
 fn test_validate_listed_log_file_checkpoint_parts_contains_non_checkpoint() {
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
@@ -2186,7 +2596,7 @@ fn test_validate_listed_log_file_single_multipart_checkpoint_num_parts_mismatch(
 
 #[test]
 fn test_validate_listed_log_file_multiple_single_part_checkpoints() {
-    // Two SinglePartCheckpoints at the same version: n=2 but neither is a MultiPartCheckpoint
+    // Two ClassicCheckpoints at the same version: n=2 but neither is a MultiPartCheckpoint
     let log_root = Url::parse("file:///_delta_log/").unwrap();
     assert!(LogSegment::try_new(
         LogSegmentFiles {
@@ -2469,7 +2879,7 @@ async fn test_latest_commit_file_field_is_captured() {
         log_root.clone(),
         vec![],
         None,
-        SnapshotLoadMetricContext::default(),
+        SnapshotLoadMetricContext::for_test(),
     )
     .unwrap();
 
@@ -2502,7 +2912,7 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
         log_root.clone(),
         vec![],
         None,
-        SnapshotLoadMetricContext::default(),
+        SnapshotLoadMetricContext::for_test(),
     )
     .unwrap();
 
@@ -2529,7 +2939,7 @@ async fn test_latest_commit_file_with_no_commits() {
         log_root.clone(),
         vec![],
         None,
-        SnapshotLoadMetricContext::default(),
+        SnapshotLoadMetricContext::for_test(),
     )
     .unwrap();
 
@@ -2559,7 +2969,7 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
         log_root.clone(),
         vec![],
         None,
-        SnapshotLoadMetricContext::default(),
+        SnapshotLoadMetricContext::for_test(),
     )
     .unwrap();
 
@@ -2591,7 +3001,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
         log_root.clone(),
         vec![],
         None,
-        SnapshotLoadMetricContext::default(),
+        SnapshotLoadMetricContext::for_test(),
     )
     .unwrap();
 
@@ -2656,51 +3066,38 @@ fn test_log_segment_contiguous_commit_files() {
     );
 }
 
-/// Test that last_checkpoint_metadata from _last_checkpoint hint is properly propagated to
-/// LogSegment
-#[tokio::test]
-async fn test_checkpoint_schema_propagation_from_hint() {
-    use crate::schema::{StructField, StructType};
-
-    // Create a sample schema that would be in _last_checkpoint
-    let sample_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", StructType::new_unchecked([])),
-        StructField::nullable("remove", StructType::new_unchecked([])),
-    ]));
-
-    let checkpoint_metadata = LastCheckpointHint {
-        version: 5,
-        size: 10,
-        parts: Some(1),
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: Some(sample_schema.clone()),
-        checksum: None,
-        tags: None,
-    };
-
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(5, "checkpoint.parquet"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(6, "json"),
-        ],
-        Some(&checkpoint_metadata),
-    )
-    .await;
-
-    let log_segment = LogSegment::for_snapshot_impl(
-        storage.as_ref(),
+/// `checkpoint_sidecars()` distinguishes "the matched hint lists zero sidecars" (`Some(&[])`) from
+/// "no applicable hint / no sidecar info" (`None`) -- the empty-vs-absent contract the accessor's
+/// doc promises. Real V2 fixtures only carry non-empty sidecar lists, so this synthetic case is the
+/// only place it is exercised.
+#[test]
+fn checkpoint_sidecars_distinguishes_empty_from_absent() -> DeltaResult<()> {
+    let (_store, log_root) = new_in_memory_store();
+    let selected = "00000000000000000001.checkpoint.11111111-1111-1111-1111-111111111111.parquet";
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let commit = create_log_path(log_root.join("00000000000000000002.json")?.as_str());
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, 1)],
+            ascending_commit_files: vec![commit.clone()],
+            latest_commit_file: Some(commit),
+            ..Default::default()
+        },
         log_root,
-        vec![], // log_tail
-        Some(checkpoint_metadata),
         None,
-    )
-    .unwrap();
+        Some(LastCheckpointHint {
+            version: 1,
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: selected.to_string(),
+                sidecar_files: Some(vec![]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )?;
 
-    assert_eq!(log_segment.last_checkpoint_version(), Some(5));
-    assert_eq!(log_segment.checkpoint_schema().unwrap(), sample_schema);
+    assert_eq!(log_segment.checkpoint_hint_sidecars(), Some(&vec![]));
+    Ok(())
 }
 
 /// Checkpoint schema resolution uses the `_last_checkpoint` schema only when the hint's version
@@ -2718,7 +3115,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     let engine = SyncEngine::new_with_store(store.clone());
 
     // Build a checkpoint with an initial v1 schema
-    let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    let v1_schema = COMMIT_READ_SCHEMA.clone();
     add_checkpoint_to_store(
         &store,
         add_batch_simple(v1_schema.clone()),
@@ -2730,10 +3127,9 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     let checkpoint_file = log_root.join(checkpoint_rel)?.to_string();
     let cp_size = get_file_size(&store, &format!("_delta_log/{checkpoint_rel}")).await;
 
-    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "metadata",
-        StructType::new_unchecked([]),
-    )]));
+    let hint_schema: SchemaRef = schema_ref! {
+        nullable "metadata": {},
+    };
 
     // Build a commit that uses v1 checkpoint and a hint that describes a different schema
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
@@ -2747,9 +3143,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
         },
         log_root,
         None,
-        Some(LastCheckpointHintSummary {
+        Some(LastCheckpointHint {
             version: hint_version,
-            schema: Some(hint_schema.clone()),
+            checkpoint_schema: Some(hint_schema.clone()),
+            ..Default::default()
         }),
     )?;
 
@@ -2757,17 +3154,20 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     assert_eq!(log_segment.checkpoint_version, Some(1));
     assert_eq!(log_segment.end_version, 2);
     if expect_hint_schema_used {
-        assert_eq!(log_segment.checkpoint_schema().as_ref(), Some(&hint_schema));
+        assert_eq!(
+            log_segment.checkpoint_hint_schema().as_ref(),
+            Some(&hint_schema)
+        );
     } else {
         assert!(
-            log_segment.checkpoint_schema().is_none(),
+            log_segment.checkpoint_hint_schema().is_none(),
             "hint should not have been returned since version does not match checkpoint_version"
         );
     }
 
     // Verify that get_file_actions_schema_and_sidecars returns appropriate schema based on hint
     // version
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
     let schema = schema.expect("V1 checkpoint should yield a file actions schema");
     if expect_hint_schema_used {
         assert_eq!(schema, hint_schema, "should use hint when versions match");
@@ -2779,6 +3179,74 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint(
     }
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
+    Ok(())
+}
+
+/// For a V2 (UUID-named) parquet checkpoint, `get_file_actions_schema_and_sidecars` uses the
+/// `_last_checkpoint` hint schema only when the hint names the selected checkpoint; a hint that
+/// names a different same-version V2 checkpoint is ignored and the footer is read instead.
+#[rstest]
+#[case::identity_matches(true)]
+#[case::identity_mismatch(false)]
+#[tokio::test]
+async fn test_get_file_actions_schema_v2_identity_filter(
+    #[case] identity_matches: bool,
+) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+
+    let selected = "00000000000000000001.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet";
+    let other = "00000000000000000001.checkpoint.016ae953-37a9-438e-8683-9a9a4a79a395.parquet";
+
+    // Schema actually written to the selected (leaf, no-sidecar) V2 checkpoint footer.
+    let footer_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    add_checkpoint_to_store(&store, add_batch_simple(footer_schema.clone()), selected).await?;
+    let checkpoint_file = log_root.join(selected)?.to_string();
+    let cp_size = get_file_size(&store, &format!("_delta_log/{selected}")).await;
+
+    // A distinct hint schema so we can tell whether the hint or the footer was used.
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
+        "metadata",
+        StructType::new_unchecked([]),
+    )]));
+    let hint_name = if identity_matches { selected } else { other };
+
+    let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
+    let commit_v2 = create_log_path(&commit_v2_path);
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, cp_size)],
+            ascending_commit_files: vec![commit_v2.clone()],
+            latest_commit_file: Some(commit_v2),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        Some(LastCheckpointHint {
+            version: 1,
+            checkpoint_schema: Some(hint_schema.clone()),
+            v2_checkpoint: Some(LastCheckpointV2 {
+                path: hint_name.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )?;
+
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
+    let schema = schema.expect("leaf V2 checkpoint should yield a file actions schema");
+    if identity_matches {
+        assert_eq!(
+            schema, hint_schema,
+            "matching hint identity -> use hint schema"
+        );
+    } else {
+        assert_eq!(
+            schema, footer_schema,
+            "mismatched hint identity -> read footer schema, not the stale hint"
+        );
+    }
+    assert!(sidecars.is_empty(), "leaf V2 checkpoint has no sidecars");
     Ok(())
 }
 
@@ -2795,27 +3263,19 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
     // Build a V1 checkpoint schema with stats_parsed containing an integer column.
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(
-            MIN_VALUES,
-            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
-        ),
-        StructField::nullable(
-            MAX_VALUES,
-            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]),
-        ),
-    ]);
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-    let remove_schema =
-        StructType::new_unchecked([StructField::nullable("path", DataType::STRING)]);
-    let v1_schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, add_schema),
-        StructField::nullable(REMOVE_NAME, remove_schema),
-    ]));
+    let v1_schema = schema_ref! {
+        nullable (ADD_NAME): {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                nullable (MIN_VALUES): { nullable "id": LONG },
+                nullable (MAX_VALUES): { nullable "id": LONG },
+            },
+        },
+        nullable (REMOVE_NAME): {
+            nullable "path": STRING,
+        },
+    };
 
     add_checkpoint_to_store(
         &store,
@@ -2846,13 +3306,15 @@ async fn test_get_file_actions_schema_multi_part_v1(#[case] use_hint: bool) -> D
         },
         log_root,
         None,
-        use_hint.then(|| LastCheckpointHintSummary {
+        use_hint.then(|| LastCheckpointHint {
             version: 1,
-            schema: Some(v1_schema.clone()),
+            parts: Some(2),
+            checkpoint_schema: Some(v1_schema.clone()),
+            ..Default::default()
         }),
     )?;
 
-    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine, None)?;
     let schema = schema.expect("Multi-part V1 should return file actions schema");
 
     // Verify stats_parsed is detectable in the returned schema.
@@ -2979,42 +3441,149 @@ async fn test_max_published_version_checkpoint_only() {
 
 // Helper to create a checkpoint schema with stats_parsed for testing
 fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(
-            MIN_VALUES,
-            StructType::new_unchecked(min_values_fields.clone()),
-        ),
-        StructField::nullable(MAX_VALUES, StructType::new_unchecked(min_values_fields)),
-    ]);
+    schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                nullable (MIN_VALUES): { ..(min_values_fields.clone()) },
+                nullable (MAX_VALUES): { ..(min_values_fields) },
+            },
+        },
+    }
+}
 
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+fn create_checkpoint_file_schema_with_stats_parsed(
+    min_values_fields: Vec<StructField>,
+    include_json_stats: bool,
+) -> DeltaResult<SchemaRef> {
+    let stats_parsed = StructField::nullable(
+        "stats_parsed",
+        schema! {
+            nullable (NUM_RECORDS): LONG,
+            nullable (MIN_VALUES): { ..(min_values_fields.clone()) },
+            nullable (MAX_VALUES): { ..(min_values_fields) },
+        },
+    );
+    let patch = SchemaStructPatchBuilder::new().append_at(["add"], stats_parsed);
+    let patch = if include_json_stats {
+        patch
+    } else {
+        patch.drop_at(["add"], "stats")
+    };
+    Ok(Arc::new(patch.build(get_commit_schema().as_ref())?))
 }
 
 // Helper to create a stats_schema with proper structure (numRecords, minValues, maxValues)
 fn create_stats_schema(column_fields: Vec<StructField>) -> StructType {
-    StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        StructField::nullable(MIN_VALUES, StructType::new_unchecked(column_fields.clone())),
-        StructField::nullable(MAX_VALUES, StructType::new_unchecked(column_fields)),
-    ])
+    schema! {
+        nullable (NUM_RECORDS): LONG,
+        nullable (MIN_VALUES): { ..(column_fields.clone()) },
+        nullable (MAX_VALUES): { ..(column_fields) },
+    }
 }
 
 // Helper to create a checkpoint schema without stats_parsed
 fn create_checkpoint_schema_without_stats_parsed() -> StructType {
-    use crate::schema::StructType;
+    schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats": STRING,
+        },
+    }
+}
 
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats", DataType::STRING),
-    ]);
+#[rstest]
+#[case::missing_with_json(false, true, false, true)]
+#[case::partial_with_json(true, true, true, false)]
+#[case::partial_without_json(true, false, true, false)]
+#[tokio::test]
+async fn test_checkpoint_stream_resolves_stats_projection(
+    #[case] include_parsed_stats: bool,
+    #[case] include_json_stats: bool,
+    #[case] expect_parsed_stats: bool,
+    #[case] expect_json_stats: bool,
+) -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = SyncEngine::new_with_store(store.clone());
+    let checkpoint_schema = if include_parsed_stats {
+        create_checkpoint_file_schema_with_stats_parsed(
+            vec![StructField::nullable("other", DataType::LONG)],
+            include_json_stats,
+        )?
+    } else {
+        get_commit_schema().clone()
+    };
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(checkpoint_schema),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
 
-    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+    let checkpoint_file = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+    let log_segment = LogSegment::try_new(
+        LogSegmentFiles {
+            checkpoint_parts: vec![create_log_path_with_size(&checkpoint_file, checkpoint_size)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
+            ..Default::default()
+        },
+        log_root,
+        None,
+        None,
+    )?;
+    let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::LONG)]);
+
+    let checkpoint_result = log_segment.create_checkpoint_stream(
+        &engine,
+        CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
+        None, // meta_predicate
+        Some(&stats_schema),
+        None, // partition_schema
+        None, // cancellation_token
+    )?;
+
+    assert_eq!(
+        checkpoint_result.checkpoint_info.has_stats_parsed,
+        expect_parsed_stats
+    );
+    let add_field = checkpoint_result
+        .checkpoint_info
+        .checkpoint_read_schema
+        .field("add")
+        .expect("checkpoint read schema must contain add");
+    let DataType::Struct(add) = add_field.data_type() else {
+        panic!("checkpoint add field must be a struct");
+    };
+    assert_eq!(add.field("stats").is_some(), expect_json_stats);
+    assert_eq!(add.field("stats_parsed").is_some(), expect_parsed_stats);
+
+    let read_schema = checkpoint_result
+        .checkpoint_info
+        .checkpoint_read_schema
+        .clone();
+    let mut actions = checkpoint_result.actions;
+    let batch = actions
+        .next()
+        .expect("checkpoint stream must yield one batch")?;
+    assert!(!batch.is_log_batch);
+    assert_eq!(
+        batch.actions.has_field(&ColumnName::new(["add", "stats"])),
+        expect_json_stats,
+        "checkpoint batch JSON stats projection must match the resolved schema"
+    );
+    if include_json_stats {
+        assert_batch_matches(batch.actions, add_batch_simple(read_schema));
+    } else {
+        assert!(!batch.actions.is_empty());
+    }
+    assert!(actions.next().is_none());
+
+    Ok(())
 }
 
 #[test]
@@ -3143,17 +3712,15 @@ fn test_schema_has_compatible_stats_parsed_multiple_columns() {
 #[test]
 fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
     // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        // No minValues or maxValues fields
-    ]);
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+    let checkpoint_schema = schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                // No minValues or maxValues fields
+            },
+        },
+    };
 
     let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
 
@@ -3167,19 +3734,17 @@ fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
 #[test]
 fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
-    let stats_parsed = StructType::new_unchecked([
-        StructField::nullable(NUM_RECORDS, DataType::LONG),
-        // minValues is a primitive type instead of a Struct
-        StructField::nullable(MIN_VALUES, DataType::STRING),
-        StructField::nullable(MAX_VALUES, DataType::STRING),
-    ]);
-
-    let add_schema = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable("stats_parsed", stats_parsed),
-    ]);
-
-    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+    let checkpoint_schema = schema! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "stats_parsed": {
+                nullable (NUM_RECORDS): LONG,
+                // minValues/maxValues are primitives instead of Structs
+                nullable (MIN_VALUES): STRING,
+                nullable (MAX_VALUES): STRING,
+            },
+        },
+    };
 
     let stats_schema = create_stats_schema(vec![StructField::nullable("id", DataType::INTEGER)]);
 
@@ -3520,40 +4085,24 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     let engine = SyncEngine::new_with_store(store.clone());
 
     // Build a schema that includes add.partitionValues_parsed.id: integer
-    let partition_parsed_struct =
-        StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
-    let add_struct = StructType::new_unchecked([
-        StructField::nullable("path", DataType::STRING),
-        StructField::nullable(
-            "partitionValues",
-            crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::nullable("partitionValues_parsed", partition_parsed_struct),
-        StructField::nullable("size", DataType::LONG),
-        StructField::nullable("modificationTime", DataType::LONG),
-        StructField::nullable("dataChange", DataType::BOOLEAN),
-    ]);
-    let metadata_struct = StructType::new_unchecked([
-        StructField::nullable("id", DataType::STRING),
-        StructField::nullable(
-            "format",
-            StructType::new_unchecked([StructField::nullable("provider", DataType::STRING)]),
-        ),
-        StructField::nullable("schemaString", DataType::STRING),
-        StructField::nullable(
-            "partitionColumns",
-            crate::schema::ArrayType::new(DataType::STRING, false),
-        ),
-        StructField::nullable(
-            "configuration",
-            crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::nullable("createdTime", DataType::LONG),
-    ]);
-    let checkpoint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("add", add_struct),
-        StructField::nullable("metaData", metadata_struct),
-    ]));
+    let checkpoint_schema: SchemaRef = schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable "partitionValues_parsed": { nullable "id": INTEGER },
+            nullable "size": LONG,
+            nullable "modificationTime": LONG,
+            nullable "dataChange": BOOLEAN,
+        },
+        nullable "metaData": {
+            nullable "id": STRING,
+            nullable "format": { nullable "provider": STRING },
+            nullable "schemaString": STRING,
+            nullable "partitionColumns": [ not_null STRING ],
+            nullable "configuration": { STRING => nullable STRING },
+            nullable "createdTime": LONG,
+        },
+    };
 
     add_checkpoint_to_store(
         &store,
@@ -3603,6 +4152,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
+        None, // cancellation_token
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -3668,6 +4218,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
+        None, // cancellation_token
     )?;
 
     // Verify it's false
@@ -4006,7 +4557,7 @@ async fn test_try_new_with_checkpoint(
     );
     assert!(result.listed.ascending_commit_files.is_empty());
     assert!(result.listed.ascending_compaction_files.is_empty());
-    assert!(result.last_checkpoint_hint_summary().is_none());
+    assert!(result.last_checkpoint_metadata.is_none());
     assert_eq!(
         result.listed.latest_crc_file.as_ref().map(|c| c.version),
         expected_crc_version
@@ -4221,68 +4772,81 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 
 #[rstest::rstest]
 #[case::empty_schema(StructType::new_unchecked([]), None)]
-#[case::metadata_field(
-    StructType::new_unchecked([StructField::nullable(
-        METADATA_NAME,
-        StructType::new_unchecked([]),
-    )]),
+#[case::add_field(
+    schema! { nullable (ADD_NAME): {} },
     Some(Arc::new(
-        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
+        col!(ADD_NAME, "path").is_not_null(),
     )),
 )]
-#[case::protocol_field(
-    StructType::new_unchecked([StructField::nullable(
-        PROTOCOL_NAME,
-        StructType::new_unchecked([]),
-    )]),
+#[case::remove_field(
+    schema! { nullable (REMOVE_NAME): {} },
     Some(Arc::new(
-        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
+        col!(REMOVE_NAME, "path").is_not_null(),
     )),
 )]
-#[case::txn_field(
-    StructType::new_unchecked([StructField::nullable(
-        SET_TRANSACTION_NAME,
-        StructType::new_unchecked([]),
-    )]),
-    Some(Arc::new(
-        Expression::column(ColumnName::new([SET_TRANSACTION_NAME, "appId"])).is_not_null(),
-    )),
-)]
-#[case::domain_metadata_field(
-    StructType::new_unchecked([StructField::nullable(
-        DOMAIN_METADATA_NAME,
-        StructType::new_unchecked([]),
-    )]),
-    Some(Arc::new(
-        Expression::column(ColumnName::new([DOMAIN_METADATA_NAME, "domain"])).is_not_null(),
-    )),
-)]
-#[case::unknown_field_returns_none(
-    StructType::new_unchecked([StructField::nullable(ADD_NAME, StructType::new_unchecked([]))]),
+#[case::action_without_required_leaf_returns_none(
+    schema! { nullable (COMMIT_INFO_NAME): {} },
     None,
 )]
-#[case::multiple_known_fields(
+#[case::add_and_remove_fields(
     StructType::new_unchecked([
-        StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
-        StructField::nullable(PROTOCOL_NAME, StructType::new_unchecked([])),
+        StructField::nullable(ADD_NAME, StructType::new_unchecked([])),
+        StructField::nullable(REMOVE_NAME, StructType::new_unchecked([])),
     ]),
     Some(Arc::new(Predicate::or(
-        Expression::column(ColumnName::new([METADATA_NAME, "id"])).is_not_null(),
-        Expression::column(ColumnName::new([PROTOCOL_NAME, "minReaderVersion"])).is_not_null(),
+        col!(ADD_NAME, "path").is_not_null(),
+        col!(REMOVE_NAME, "path").is_not_null(),
     ))),
+)]
+#[case::witness_and_witnessless_field_returns_none(
+    StructType::new_unchecked([
+        StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
+        StructField::nullable(COMMIT_INFO_NAME, StructType::new_unchecked([])),
+    ]),
+    None,
 )]
 #[case::known_and_unknown_field_returns_none(
     StructType::new_unchecked([
-        StructField::nullable(METADATA_NAME, StructType::new_unchecked([])),
         StructField::nullable(ADD_NAME, StructType::new_unchecked([])),
+        StructField::nullable("futureAction", StructType::new_unchecked([])),
     ]),
     None,
 )]
-fn test_schema_to_is_not_null_predicate(
+fn test_checkpoint_action_projection_predicate(
     #[case] schema: StructType,
     #[case] expected: Option<PredicateRef>,
 ) {
-    assert_eq!(schema_to_is_not_null_predicate(&schema), expected);
+    assert_eq!(checkpoint_action_projection_predicate(&schema), expected);
+}
+
+#[rstest]
+#[case::neither(false, false)]
+#[case::projection_only(true, false)]
+#[case::metadata_only(false, true)]
+#[case::both(true, true)]
+fn test_combine_checkpoint_predicates(
+    #[case] include_projection: bool,
+    #[case] include_metadata: bool,
+) {
+    let projection = Arc::new(col!(ADD_NAME, "path").is_not_null());
+    let metadata = Arc::new(col!(ADD_NAME, "size").is_not_null());
+    let expected = match (include_projection, include_metadata) {
+        (false, false) => None,
+        (true, false) => Some(projection.clone()),
+        (false, true) => Some(metadata.clone()),
+        (true, true) => Some(Arc::new(Predicate::and(
+            (*projection).clone(),
+            (*metadata).clone(),
+        ))),
+    };
+
+    assert_eq!(
+        combine_checkpoint_predicates(
+            include_projection.then_some(projection),
+            include_metadata.then_some(metadata),
+        ),
+        expected,
+    );
 }
 
 /// Verify that `read_actions` correctly handles null values in map fields across all

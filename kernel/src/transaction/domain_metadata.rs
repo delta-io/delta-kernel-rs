@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::{EngineDataResultIterator, Transaction};
-use crate::actions::{get_log_domain_metadata_schema, DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::error::Error;
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;
@@ -222,7 +222,7 @@ impl<S> Transaction<S> {
             .chain(removal_actions)
             .collect();
 
-        let schema = get_log_domain_metadata_schema().clone();
+        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
 
         let dm_actions_iter: Vec<_> = dm_actions_vec
             .iter()

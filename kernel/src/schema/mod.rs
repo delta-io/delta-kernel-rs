@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -11,6 +12,8 @@ use delta_kernel_derive::internal_api;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "geo-type-in-dev")]
+use strum::{Display as StrumDisplay, EnumString};
 use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
@@ -18,15 +21,15 @@ pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::{
     validate_and_extract_column_mapping_annotations, validate_column_mapping_id, ColumnMappingMode,
+    StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::{CollectInto, DeltaResult, Error};
 
-#[cfg(feature = "column-defaults-in-dev")]
-mod column_default;
-#[cfg(feature = "column-defaults-in-dev")]
+pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
+pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -39,8 +42,146 @@ pub(crate) mod validation;
 pub(crate) mod variant_utils;
 pub(crate) mod void_utils;
 
+/// Prefix of the error message the schema deserializers emit for an unsupported type.
+const UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX: &str = "Unsupported Delta table type";
+
+/// Builds the serde custom error for a Delta type the kernel does not support. Pairs with
+/// [`is_unsupported_delta_type_error`] for detecting whether a serde error is this kind.
+fn unsupported_delta_type_error<E: serde::de::Error>(name: &str) -> E {
+    E::custom(format!("{UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX}: '{name}'"))
+}
+
+/// Returns `true` if `error` is the "unsupported Delta type" failure produced by
+/// `unsupported_delta_type_error`.
+pub(crate) fn is_unsupported_delta_type_error(error: &serde_json::Error) -> bool {
+    error.is_data()
+        && error
+            .to_string()
+            .starts_with(UNSUPPORTED_DELTA_TYPE_ERROR_PREFIX)
+}
+
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
+
+/// Sugar for `LazyLock::new(|| `[`schema_ref!`](schema_ref)` { ... })`, yielding a lazy
+/// [`SchemaRef`].
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::lazy_schema_ref;
+/// Builds a [`StructType`] from a JSON-shaped description that freely mixes literal structure
+/// with interpolated runtime values, in the spirit of [`serde_json::json!`].
+///
+/// # Grammar
+///
+/// ```text
+/// body  := (entry ',')* entry?                 // 0+ comma-separated entries, optional trailing comma
+/// entry := nullability name ':' type           // possibly nullable struct field
+///        | '(' EXPR ')'                        // interpolate one StructField
+///        | '..' '(' EXPR ')'                   // splice an `impl IntoIterator<Item = StructField>`
+/// nullability := 'nullable' | 'not_null'
+/// name  := STR_LITERAL
+///        | IDENT
+///        | '(' EXPR ')'                        // interpolate an `impl Into<String>`
+/// type  := '[' nullability type ']'            // array with possibly-nullable elements
+///        | '{' body '}'                        // nested struct
+///        | '{' type '=>' nullability type '}'  // map with possibly-nullable values
+///        | '(' EXPR ')'                        // interpolate an `impl Into<DataType>`
+///        | IDENT                               // interpolate `DataType::<IDENT>`
+/// ```
+///
+/// # Examples
+///
+/// ```
+/// # use delta_kernel::schema::{schema, DataType, StructField, StructType};
+/// let s = schema! {
+///     not_null "id": LONG,
+///     nullable "name": STRING,
+///     not_null "address": {
+///         nullable "city": STRING,
+///         nullable "zip": STRING,
+///     },
+///     nullable "tags": [ not_null STRING ],            // nullable array with non-null elements
+///     not_null "props": { STRING => nullable STRING }, // non-nullable map with nullable values
+/// };
+/// assert_eq!(s.field("id").unwrap().data_type(), &DataType::LONG);
+/// ```
+///
+/// Runtime values interpolate through the expression forms:
+///
+/// ```
+/// # use delta_kernel::schema::{schema, DataType, StructField};
+/// let data_type = DataType::LONG;
+/// let first = StructField::not_null("y", DataType::INTEGER);
+/// let rest = vec![StructField::nullable("z", DataType::STRING)];
+/// let i = 42;
+/// let s = schema! {
+///     not_null (format!("col_{i}")): (data_type),
+///     (first),
+///     ..(rest),
+/// };
+/// assert_eq!(s.fields().count(), 3);
+/// ```
+///
+/// Field structure is author-controlled, so this builds via [`StructType::new_unchecked`] (no
+/// runtime validation). Statically-detectable duplicate field names -- repeated string
+/// literals or repeated identifiers within the same struct -- are rejected at compile time.
+/// Literals are compared case-insensitively, matching Delta's case-insensitive column-name
+/// rule:
+///
+/// ```compile_fail
+/// # use delta_kernel::schema::schema;
+/// const NAME: &str = "foo";
+/// let s = schema! {
+///     not_null "id": LONG,
+///     nullable "ID": STRING, // duplicate of "id" (case-insensitive) -- compile error
+///     nullable NAME: LONG,
+///     not_null NAME: STRING, // NAME used twice -- compile error
+/// };
+/// ```
+///
+/// Prefer [`try_schema`] when field names are interpolated runtime values that might collide.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::schema;
+/// Sugar for `Arc::new(`[`schema!`](schema)` { ... })`, yielding a [`SchemaRef`]. Convenient
+/// for the `LazyLock<SchemaRef>` statics that pervade the action and stats schemas.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::schema_ref;
+/// Like [`schema`], but validates field names at every level of the schema (each struct,
+/// including nested ones, is built via [`StructType::try_new`] and yields
+/// [`DeltaResult<StructType>`]. Use when field names are runtime values that could duplicate
+/// in ways the macro cannot see.
+#[internal_api]
+#[doc(inline)]
+pub(crate) use delta_kernel_derive::try_schema;
+
+/// Converts field interpolation inputs in [`schema!`] and [`try_schema!`] to [`StructField`].
+#[internal_api]
+pub(crate) trait ToSchemaField {
+    fn to_schema_field(self) -> StructField;
+}
+
+impl ToSchemaField for StructField {
+    fn to_schema_field(self) -> StructField {
+        self
+    }
+}
+
+impl ToSchemaField for &StructField {
+    fn to_schema_field(self) -> StructField {
+        self.clone()
+    }
+}
+
+impl<T> ToSchemaField for &T
+where
+    T: Deref<Target = StructField>,
+{
+    fn to_schema_field(self) -> StructField {
+        self.deref().clone()
+    }
+}
 
 /// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are schema
 /// fields, lowered into an output [`StructType`] directly from an input schema via
@@ -395,6 +536,29 @@ impl StructField {
         }
     }
 
+    /// Returns this field's column default, parsed from its `CURRENT_DEFAULT`
+    /// ([`ColumnMetadataKey::CurrentDefault`]) metadata, if present.
+    ///
+    /// - `Ok(None)` -- no `CURRENT_DEFAULT` metadata.
+    /// - `Ok(Some(_))` -- present as a [`MetadataValue::String`] and accepted by [`ColumnDefault`].
+    /// - `Err(_)` -- either not a [`MetadataValue::String`] (corrupt: the protocol defines
+    ///   `CURRENT_DEFAULT` as a SQL string, the only form the kernel writes), or rejected by
+    ///   [`ColumnDefault`] (a non-NULL default on a Variant column, which the protocol forbids).
+    pub fn column_default(&self) -> DeltaResult<Option<ColumnDefault<'_>>> {
+        let raw_sql = match self.get_config_value(&ColumnMetadataKey::CurrentDefault) {
+            None => return Ok(None),
+            Some(MetadataValue::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(Error::schema(format!(
+                    "Field '{}' has a non-string `{}` annotation: {other}",
+                    self.name,
+                    ColumnMetadataKey::CurrentDefault.as_ref(),
+                )))
+            }
+        };
+        ColumnDefault::new(raw_sql, &self.data_type).map(Some)
+    }
+
     /// Validates and extracts pre-existing column-mapping annotations on this field, returning
     /// the parsed `id` and `physical_name` borrowed from the field's metadata. Returning the
     /// parsed values lets the column-mapping assignment dispatch match on
@@ -483,8 +647,8 @@ impl StructField {
     /// metadata if present, otherwise returns the logical name.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_configuration::TableConfiguration::try_new`], to ensure that annotations are
-    /// always and only present when column mapping mode is enabled.
+    /// [`crate::table_configuration::TableConfiguration::try_new`]. In `None` mode a stale
+    /// annotation may still be present (it is ignored, and the logical name is returned).
     #[internal_api]
     pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
         match column_mapping_mode {
@@ -552,15 +716,6 @@ impl StructField {
         &self.metadata
     }
 
-    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
-    /// expensive for large metadata
-    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
-        self.metadata
-            .iter()
-            .map(|(key, val)| (key.clone(), val.to_string()))
-            .collect()
-    }
-
     /// Applies physical name and field ID mappings to this field.
     ///
     /// This function sets the field ID for the physical [`StructField`] only if the
@@ -576,8 +731,11 @@ impl StructField {
     /// Otherwise, the field's logical name is used.
     ///
     /// Returns an error if a field has invalid or inconsistent column mapping annotations (e.g.
-    /// missing when column mapping is enabled, present when disabled, or wrong type), or if a
-    /// metadata column is encountered (metadata columns should not participate in column mapping).
+    /// missing or wrong-typed when column mapping is enabled), or if a metadata column is
+    /// encountered (metadata columns should not participate in column mapping). When column
+    /// mapping is disabled, a stale annotation is tolerated (resolved by logical name and dropped
+    /// from the physical metadata); CREATE / ALTER reject it via a separate strict validation pass
+    /// instead.
     ///
     /// [`read_parquet_files`]: crate::ParquetHandler::read_parquet_files
     #[internal_api]
@@ -601,8 +759,8 @@ impl StructField {
     /// NOTE: Must not be called on metadata columns, which are not subject to column mapping.
     ///
     /// NOTE: Caller affirms that `self` was already validated by
-    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`], to ensure that
-    /// annotations are always and only present when column mapping mode is enabled.
+    /// [`crate::table_features::validate_and_extract_column_mapping_annotations`]. In `None` mode a
+    /// stale annotation may be present; this drops the column-mapping keys regardless.
     fn logical_to_physical_metadata(
         &self,
         column_mapping_mode: ColumnMappingMode,
@@ -889,6 +1047,12 @@ impl StructType {
         let mut field = None;
         self.visit_fields_of_path(col, |f| field = Some(f))?;
         field.ok_or_else(|| Error::generic("Empty path"))
+    }
+
+    /// Checks whether this schema contains the field at the given column path.
+    pub fn contains_col(&self, col: impl CollectInto<ColumnName>) -> bool {
+        let col = col.collect_into();
+        self.field_at(&col).is_ok()
     }
 
     /// Visits all fields along the given column path.
@@ -1629,6 +1793,138 @@ fn default_true() -> bool {
     true
 }
 
+/// Validates that a CRS (Coordinate Reference System) identifier is in `AUTHORITY:CODE` form,
+/// e.g. `"EPSG:4326"` or `"OGC:CRS84"`: a non-empty authority and code separated by a single
+/// colon, no comma, and no surrounding whitespace. Validating the value against the full set of
+/// recognized CRSes is future work.
+#[cfg(feature = "geo-type-in-dev")]
+fn validate_crs(crs: &str) -> DeltaResult<()> {
+    require!(
+        crs == crs.trim(),
+        Error::invalid_geo_params(format!(
+            "CRS '{crs}' must not have leading or trailing whitespace"
+        ))
+    );
+    require!(
+        !crs.contains(','),
+        Error::invalid_geo_params(format!("CRS '{crs}' must not contain a comma"))
+    );
+
+    let [authority, code] = crs.split(':').collect::<Vec<_>>()[..] else {
+        return Err(Error::invalid_geo_params(format!(
+            "CRS '{crs}' must be in 'AUTHORITY:CODE' format"
+        )));
+    };
+
+    require!(
+        !authority.is_empty(),
+        Error::invalid_geo_params(format!(
+            "CRS '{crs}' must have an authority before the colon"
+        ))
+    );
+    require!(
+        !code.is_empty(),
+        Error::invalid_geo_params(format!("CRS '{crs}' must have a code after the colon"))
+    );
+    Ok(())
+}
+
+/// Algorithm used to interpolate edges between two vertices of a geography path.
+#[cfg(feature = "geo-type-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, EnumString, StrumDisplay)]
+#[strum(ascii_case_insensitive)]
+pub enum EdgeInterpolationAlgorithm {
+    /// Edges are interpolated as geodesics on a sphere.
+    #[strum(serialize = "spherical")]
+    Spherical,
+
+    /// Vincenty's formulae for geodesics on an ellipsoid.
+    #[strum(serialize = "vincenty")]
+    Vincenty,
+
+    /// Thomas's approximation for geodesics on an ellipsoid.
+    #[strum(serialize = "thomas")]
+    Thomas,
+
+    /// Andoyer's approximation for geodesics on an ellipsoid.
+    #[strum(serialize = "andoyer")]
+    Andoyer,
+
+    /// Karney's algorithm for geodesics on an ellipsoid.
+    #[strum(serialize = "karney")]
+    Karney,
+}
+
+/// A geometry column type with an associated coordinate reference system (CRS).
+///
+/// Serializes as `geometry(<crs>)`, e.g. `geometry(EPSG:4326)`.
+#[cfg(feature = "geo-type-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeometryType {
+    crs: String,
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl GeometryType {
+    /// Constructs a GeometryType from the given CRS, or returns an error if the CRS is
+    /// not in AUTHORITY:CODE form.
+    pub fn try_new(crs: &str) -> DeltaResult<Self> {
+        validate_crs(crs)?;
+        Ok(Self {
+            crs: crs.to_string(),
+        })
+    }
+
+    pub fn crs(&self) -> &str {
+        &self.crs
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl Display for GeometryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geometry({})", self.crs)
+    }
+}
+
+/// Geography column type with an associated CRS and edge interpolation algorithm.
+///
+/// Serializes as `geography(<crs>, <algorithm>)`, e.g. `geography(EPSG:4326, spherical)`.
+#[cfg(feature = "geo-type-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GeographyType {
+    crs: String,
+    algorithm: EdgeInterpolationAlgorithm,
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl GeographyType {
+    /// Constructs a GeographyType from the given CRS and edge interpolation algorithm, or
+    /// returns an error if the CRS is not in AUTHORITY:CODE form.
+    pub fn try_new(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> DeltaResult<Self> {
+        validate_crs(crs)?;
+        Ok(Self {
+            crs: crs.to_string(),
+            algorithm,
+        })
+    }
+
+    pub fn crs(&self) -> &str {
+        &self.crs
+    }
+
+    pub fn algorithm(&self) -> &EdgeInterpolationAlgorithm {
+        &self.algorithm
+    }
+}
+
+#[cfg(feature = "geo-type-in-dev")]
+impl Display for GeographyType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "geography({}, {})", self.crs, self.algorithm)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DecimalType {
     precision: u8,
@@ -1707,11 +2003,25 @@ pub enum PrimitiveType {
     IntervalDayTime,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
+    /// Geometry column with an associated coordinate reference system (CRS).
+    #[cfg(feature = "geo-type-in-dev")]
+    #[serde(serialize_with = "serialize_geotype", untagged)]
+    Geometry(Box<GeometryType>),
+    /// Geography column with an associated CRS and edge interpolation algorithm.
+    #[cfg(feature = "geo-type-in-dev")]
+    #[serde(serialize_with = "serialize_geotype", untagged)]
+    Geography(Box<GeographyType>),
 }
 
 impl PrimitiveType {
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(DecimalType::try_new(precision, scale)?.into())
+    }
+
+    /// Returns whether this is one of the ANSI interval primitive types.
+    #[internal_api]
+    pub(crate) fn is_interval(&self) -> bool {
+        matches!(self, Self::IntervalYearMonth | Self::IntervalDayTime)
     }
 
     /// Returns `true` if this primitive type can be widened to the `target` type.
@@ -1781,6 +2091,14 @@ fn serialize_decimal<S: serde::Serializer>(
     serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
+#[cfg(feature = "geo-type-in-dev")]
+fn serialize_geotype<T: std::fmt::Display, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&value.to_string())
+}
+
 fn serialize_variant<S: serde::Serializer>(
     _: &StructType,
     serializer: S,
@@ -1788,23 +2106,58 @@ fn serialize_variant<S: serde::Serializer>(
     serializer.serialize_str("variant")
 }
 
-fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
-    match s {
-        "interval year" | "interval month" | "interval year to month" => {
-            Some(PrimitiveType::IntervalYearMonth)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntervalField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntervalFieldRange {
+    pub(crate) start: IntervalField,
+    pub(crate) end: IntervalField,
+}
+
+impl IntervalFieldRange {
+    fn primitive_type(self) -> PrimitiveType {
+        match self.start {
+            IntervalField::Year | IntervalField::Month => PrimitiveType::IntervalYearMonth,
+            IntervalField::Day
+            | IntervalField::Hour
+            | IntervalField::Minute
+            | IntervalField::Second => PrimitiveType::IntervalDayTime,
         }
-        "interval day"
-        | "interval hour"
-        | "interval minute"
-        | "interval second"
-        | "interval day to hour"
-        | "interval day to minute"
-        | "interval day to second"
-        | "interval hour to minute"
-        | "interval hour to second"
-        | "interval minute to second" => Some(PrimitiveType::IntervalDayTime),
-        _ => None,
     }
+}
+
+pub(crate) fn parse_interval_type(s: &str) -> Option<IntervalFieldRange> {
+    use IntervalField::*;
+
+    let (start, end) = match s {
+        "interval year" => (Year, Year),
+        "interval month" => (Month, Month),
+        "interval year to month" => (Year, Month),
+        "interval day" => (Day, Day),
+        "interval hour" => (Hour, Hour),
+        "interval minute" => (Minute, Minute),
+        "interval second" => (Second, Second),
+        "interval day to hour" => (Day, Hour),
+        "interval day to minute" => (Day, Minute),
+        "interval day to second" => (Day, Second),
+        "interval hour to minute" => (Hour, Minute),
+        "interval hour to second" => (Hour, Second),
+        "interval minute to second" => (Minute, Second),
+        _ => return None,
+    };
+    Some(IntervalFieldRange { start, end })
+}
+
+fn normalize_interval_type(s: &str) -> Option<PrimitiveType> {
+    parse_interval_type(s).map(IntervalFieldRange::primitive_type)
 }
 
 // Custom Deserialize to provide clear error messages for unsupported types.
@@ -1836,9 +2189,9 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "timestamp_nanos_ntz" => Ok(PrimitiveType::TimestampNanosNtz),
             "void" => Ok(PrimitiveType::Void),
             // Accept canonical and narrowed interval spellings
-            s if s.starts_with("interval ") => normalize_interval_type(s).ok_or_else(|| {
-                serde::de::Error::custom(format!("Unsupported Delta table type: '{s}'"))
-            }),
+            s if s.starts_with("interval ") => {
+                normalize_interval_type(s).ok_or_else(|| unsupported_delta_type_error(s))
+            }
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1866,9 +2219,37 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
                     .map(PrimitiveType::Decimal)
                     .map_err(serde::de::Error::custom)
             }
-            unsupported => Err(serde::de::Error::custom(format!(
-                "Unsupported Delta table type: '{unsupported}'"
-            ))),
+            #[cfg(feature = "geo-type-in-dev")]
+            geo_str if geo_str.starts_with("geometry(") && geo_str.ends_with(')') => {
+                let crs = &geo_str["geometry(".len()..geo_str.len() - 1];
+                GeometryType::try_new(crs.trim())
+                    .map(Box::new)
+                    .map(PrimitiveType::Geometry)
+                    .map_err(serde::de::Error::custom)
+            }
+            #[cfg(feature = "geo-type-in-dev")]
+            geo_str if geo_str.starts_with("geography(") && geo_str.ends_with(')') => {
+                let inner = &geo_str["geography(".len()..geo_str.len() - 1];
+                // Kernel accepts only the canonical serialized form that every writer emits:
+                //   geography(<crs>, <algorithm>)
+                // TODO(#2949): reevaluate whether accepting padded input like
+                // geography(  EPSG:4326 ,  vincenty  ) is desired.
+                match inner.split_once(',') {
+                    Some((crs, algo_str)) => {
+                        let algorithm: EdgeInterpolationAlgorithm =
+                            algo_str.trim().parse().map_err(serde::de::Error::custom)?;
+                        GeographyType::try_new(crs.trim(), algorithm)
+                            .map(Box::new)
+                            .map(PrimitiveType::Geography)
+                            .map_err(serde::de::Error::custom)
+                    }
+                    None => Err(serde::de::Error::custom(format!(
+                        "Invalid geography type '{geo_str}': expected \
+                         'geography(<crs>, <algorithm>)'"
+                    ))),
+                }
+            }
+            unsupported => Err(unsupported_delta_type_error(unsupported)),
         }
     }
 }
@@ -1898,6 +2279,10 @@ impl Display for PrimitiveType {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
             PrimitiveType::Void => write!(f, "void"),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geometry(t) => write!(f, "{t}"),
+            #[cfg(feature = "geo-type-in-dev")]
+            PrimitiveType::Geography(t) => write!(f, "{t}"),
         }
     }
 }
@@ -1929,6 +2314,30 @@ impl From<DecimalType> for PrimitiveType {
 impl From<DecimalType> for DataType {
     fn from(dtype: DecimalType) -> Self {
         PrimitiveType::from(dtype).into()
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeometryType> for PrimitiveType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::Geometry(Box::new(gtype))
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeometryType> for DataType {
+    fn from(gtype: GeometryType) -> Self {
+        PrimitiveType::from(gtype).into()
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeographyType> for PrimitiveType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::Geography(Box::new(gtype))
+    }
+}
+#[cfg(feature = "geo-type-in-dev")]
+impl From<GeographyType> for DataType {
+    fn from(gtype: GeographyType) -> Self {
+        PrimitiveType::from(gtype).into()
     }
 }
 impl From<PrimitiveType> for DataType {
@@ -2002,7 +2411,7 @@ impl<'de> serde::Deserialize<'de> for DataType {
                     "map" => MapType::deserialize(value)
                         .map(DataType::from)
                         .map_err(|e| Error::custom(e.to_string())),
-                    _ => Err(Error::custom(format!("Unknown complex type: '{type_str}'"))),
+                    _ => Err(unsupported_delta_type_error(type_str)),
                 };
             }
         }
@@ -2181,6 +2590,29 @@ impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
     }
 }
 
+/// What a [`MakePhysical`] walk does with each field. The two modes bundle the physical-rewrite
+/// behavior with the matching treatment of a stale `delta.columnMapping.*` annotation left over on
+/// a mapping-disabled table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MakePhysicalMode {
+    /// Rewrite each field to its physical name + metadata (the read/build path). A stale
+    /// annotation in `None` mode is tolerated: resolved by logical name and dropped from the
+    /// physical metadata.
+    Rewrite,
+    /// Validate annotations only, without rewriting (the strict write-path check). A stale
+    /// annotation in `None` mode is rejected.
+    ValidateStrict,
+}
+
+impl MakePhysicalMode {
+    fn stale_annotation_policy(self) -> StaleAnnotationPolicy {
+        match self {
+            Self::Rewrite => StaleAnnotationPolicy::Ignore,
+            Self::ValidateStrict => StaleAnnotationPolicy::Reject,
+        }
+    }
+}
+
 pub(crate) struct MakePhysical<'a> {
     column_mapping_mode: ColumnMappingMode,
     /// Logical path of current field's parent, used for error messages.
@@ -2193,9 +2625,9 @@ pub(crate) struct MakePhysical<'a> {
     /// fields. Only structs introduce siblings; arrays/maps don't push frames since their
     /// elements / keys / values are anonymous.
     sibling_names_stack: Vec<HashMap<&'a str, &'a str>>,
-    /// When `true`, skips the physical-name + metadata rewrite, only validates the column
-    /// mapping annotations.
-    validation_only: bool,
+    /// Whether this walk rewrites fields to physical form or only validates (see
+    /// [`MakePhysicalMode`]).
+    mode: MakePhysicalMode,
 }
 impl<'a> MakePhysical<'a> {
     fn new(column_mapping_mode: ColumnMappingMode) -> Self {
@@ -2204,17 +2636,18 @@ impl<'a> MakePhysical<'a> {
             logical_path: vec![],
             seen_ids: HashMap::new(),
             sibling_names_stack: vec![],
-            validation_only: false,
+            mode: MakePhysicalMode::Rewrite,
         }
     }
 
-    /// Walks `schema` and validates its column-mapping annotations.
+    /// Walks `schema` and validates its column-mapping annotations, rejecting stale annotations
+    /// left over on a column-mapping-disabled table.
     pub(crate) fn validate_schema_column_mapping(
         mode: ColumnMappingMode,
         schema: &'a StructType,
     ) -> DeltaResult<()> {
         let mut walker = Self {
-            validation_only: true,
+            mode: MakePhysicalMode::ValidateStrict,
             ..Self::new(mode)
         };
         walker.transform_struct(schema).map(|_| ())
@@ -2257,6 +2690,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
         let (physical_name, _id) = validate_and_extract_column_mapping_annotations(
             field,
             self.column_mapping_mode,
+            self.mode.stale_annotation_policy(),
             &self.logical_path,
             Some(&mut self.seen_ids),
             self.sibling_names_stack.last_mut(),
@@ -2268,7 +2702,7 @@ impl<'a> SchemaTransform<'a> for MakePhysical<'a> {
 
         self.transform_inner(field.name(), |this| {
             let field = this.recurse_into_struct_field(field)?;
-            if this.validation_only {
+            if this.mode == MakePhysicalMode::ValidateStrict {
                 return Ok(field);
             }
             let metadata = field.logical_to_physical_metadata(this.column_mapping_mode);
@@ -2291,10 +2725,131 @@ mod tests {
 
     use super::*;
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
         test_deep_nested_schema_missing_leaf_cm,
     };
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn geography(crs: &str, algorithm: EdgeInterpolationAlgorithm) -> PrimitiveType {
+        PrimitiveType::Geography(Box::new(GeographyType::try_new(crs, algorithm).unwrap()))
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    fn geo_field_json(type_str: &str) -> String {
+        format!(r#"{{"name":"g","type":"{type_str}","nullable":true,"metadata":{{}}}}"#)
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(
+        "geometry(EPSG:4326)",
+        PrimitiveType::Geometry(Box::new(GeometryType::try_new("EPSG:4326").unwrap())),
+        "geometry(EPSG:4326)"
+    )]
+    #[case(
+        "geography(EPSG:4326, spherical)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        "geography(EPSG:4326, spherical)"
+    )]
+    #[case(
+        "geography(EPSG:4326, vincenty)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty),
+        "geography(EPSG:4326, vincenty)"
+    )]
+    #[case(
+        "geography(EPSG:4326, thomas)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Thomas),
+        "geography(EPSG:4326, thomas)"
+    )]
+    #[case(
+        "geography(EPSG:4326, andoyer)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Andoyer),
+        "geography(EPSG:4326, andoyer)"
+    )]
+    #[case(
+        "geography(EPSG:4326, karney)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
+        "geography(EPSG:4326, karney)"
+    )]
+    #[case(
+        "geography( EPSG:4326 , karney  )",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Karney),
+        "geography(EPSG:4326, karney)"
+    )]
+    #[case(
+        "geography(EPSG:4326, SPHERICAL)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        "geography(EPSG:4326, spherical)"
+    )]
+    #[case(
+        "geography(EPSG:4326, Vincenty)",
+        geography("EPSG:4326", EdgeInterpolationAlgorithm::Vincenty),
+        "geography(EPSG:4326, vincenty)"
+    )]
+    fn test_geo_round_trip(
+        #[case] type_str: &str,
+        #[case] expected: PrimitiveType,
+        #[case] canonical: &str,
+    ) {
+        let field: StructField = serde_json::from_str(&geo_field_json(type_str)).unwrap();
+        assert_eq!(field.data_type, DataType::Primitive(expected));
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(json_str, geo_field_json(canonical));
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case("geography(EPSG:4326, unknown_algo)", "Matching variant not found")]
+    #[case("geography(EPSG:4326,)", "Matching variant not found")]
+    #[case("geometry(EPSG:4326", "Unsupported Delta table type")]
+    #[case("geographyz", "Unsupported Delta table type")]
+    #[case("geometry", "Unsupported Delta table type")]
+    #[case("geography", "Unsupported Delta table type")]
+    #[case("geometry()", "must be in 'AUTHORITY:CODE' format")]
+    #[case("geography(, vincenty)", "must be in 'AUTHORITY:CODE' format")]
+    #[case("geography(EPSG:4326)", "expected 'geography(<crs>, <algorithm>)'")]
+    #[case("geography(vincenty)", "expected 'geography(<crs>, <algorithm>)'")]
+    #[case("geography(EPSG:4326, vincenty, karney)", "Matching variant not found")]
+    fn test_invalid_geo_format(#[case] invalid_type: &str, #[case] expected_error: &str) {
+        let result: Result<StructField, _> = serde_json::from_str(&geo_field_json(invalid_type));
+        let err = result.expect_err(&format!("expected '{invalid_type}' to be rejected"));
+        assert!(
+            err.to_string().contains(expected_error),
+            "Expected error containing '{expected_error}', got: {err}"
+        );
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    fn test_geo_try_new_rejects_invalid_crs(
+        #[values(
+            "foo",
+            "authority:",
+            ":",
+            "",
+            ":CRS84",
+            " EPSG:4326",
+            "EPSG:4326 ",
+            " EPSG:4326 ",
+            "EPSG:4326:extra",
+            "a:b:c",
+            "EPSG:1,2"
+        )]
+        crs: &str,
+    ) {
+        let geometry_err =
+            GeometryType::try_new(crs).expect_err(&format!("expected '{crs}' to be rejected"));
+        let geography_err = GeographyType::try_new(crs, EdgeInterpolationAlgorithm::Spherical)
+            .expect_err(&format!("expected '{crs}' to be rejected"));
+        for err in [geometry_err, geography_err] {
+            assert!(
+                err.to_string().contains("CRS"),
+                "expected CRS error for '{crs}', got: {err}"
+            );
+        }
+    }
 
     fn example_schema_metadata() -> &'static str {
         r#"
@@ -2707,10 +3262,40 @@ mod tests {
     }
 
     #[test]
-    fn test_make_physical_rejects_annotated_fields_when_column_mapping_disabled() {
+    fn test_make_physical_tolerates_stale_annotations_when_column_mapping_disabled() {
+        // A table can carry `delta.columnMapping.*` annotations after mapping was enabled and then
+        // disabled. They are inert while mapping is off, so `make_physical` (the read path)
+        // tolerates them: the field keeps its logical name and the CM keys are dropped from the
+        // physical metadata, leaving a schema indistinguishable from a table that never had them.
         let data = example_schema_metadata();
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert!(field.make_physical(ColumnMappingMode::None).is_err());
+        let physical = field.make_physical(ColumnMappingMode::None).unwrap();
+
+        assert_eq!(physical.name, "e");
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!physical
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
+        // Non-column-mapping metadata is untouched.
+        assert!(physical.metadata.contains_key("delta.identity.start"));
+
+        // The nested leaf `d` is likewise tolerated: logical name kept, CM keys dropped.
+        let DataType::Array(atype) = &physical.data_type else {
+            panic!("Expected an Array");
+        };
+        let DataType::Struct(stype) = atype.element_type() else {
+            panic!("Expected a Struct");
+        };
+        let leaf = stype.fields().next().unwrap();
+        assert_eq!(leaf.name, "d");
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref()));
+        assert!(!leaf
+            .metadata
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref()));
     }
 
     #[test]
@@ -4051,6 +4636,81 @@ mod tests {
             ColumnMetadataKey::CurrentDefault.as_ref(),
             "CURRENT_DEFAULT"
         );
+    }
+
+    mod column_default_method {
+        use super::*;
+        use crate::schema::column_default::field_with_default;
+
+        #[test]
+        fn returns_none_when_no_current_default() {
+            let field = StructField::nullable("c", DataType::INTEGER);
+            assert_eq!(field.column_default().unwrap(), None);
+        }
+
+        #[test]
+        fn errors_when_current_default_is_not_a_string() {
+            let field = StructField::nullable("c", DataType::INTEGER).add_metadata([(
+                ColumnMetadataKey::CurrentDefault.as_ref().to_string(),
+                MetadataValue::Number(42),
+            )]);
+            let err = field
+                .column_default()
+                .expect_err("a non-string CURRENT_DEFAULT must error")
+                .to_string();
+            assert!(err.contains("non-string"), "got: {err}");
+        }
+
+        #[rstest]
+        #[case::parsable_literal(DataType::INTEGER, "42", true)]
+        #[case::null_primitive(DataType::INTEGER, "NULL", true)]
+        #[case::unparsable_function_call(DataType::TIMESTAMP, "current_timestamp()", false)]
+        #[case::unparsable_type_mismatch(DataType::TIMESTAMP, "0.18", false)]
+        fn exposes_default_for_primitive(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+            #[case] parsable: bool,
+        ) {
+            let field = field_with_default("c", data_type.clone(), raw_sql);
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            assert_eq!(column_default.raw_sql(), raw_sql);
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap().is_some(), parsable);
+        }
+
+        #[rstest]
+        #[case::array(DataType::from(ArrayType::new(DataType::INTEGER, true)), "ARRAY(1)")]
+        #[case::map(
+            DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true)),
+            "MAP('a', 1)"
+        )]
+        fn non_null_default_on_container_is_tolerated(
+            #[case] data_type: DataType,
+            #[case] raw_sql: &str,
+        ) {
+            let field = field_with_default("c", data_type.clone(), raw_sql);
+            let column_default = field
+                .column_default()
+                .unwrap()
+                .expect("default must be present");
+            // Kernel cannot parse a non-primitive default, so it surfaces via raw SQL.
+            assert_eq!(column_default.raw_sql(), raw_sql);
+            assert_eq!(column_default.data_type(), &data_type);
+            assert_eq!(column_default.to_scalar().unwrap(), None);
+        }
+
+        #[test]
+        fn non_null_default_on_variant_errors() {
+            let field = field_with_default("v", DataType::unshredded_variant(), "1");
+            let err = field
+                .column_default()
+                .expect_err("a non-NULL default on a Variant column must error")
+                .to_string();
+            assert!(err.contains("Variant"), "got: {err}");
+        }
     }
 
     /// Schema: { a: { b: { c: double } } } — supports walks at depths 1, 2, and 3.

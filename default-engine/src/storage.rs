@@ -108,7 +108,6 @@ where
     Ok(Arc::new(store))
 }
 
-#[cfg(any(not(feature = "arrow-57"), feature = "arrow-58"))]
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

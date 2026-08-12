@@ -71,6 +71,10 @@ jobs:
           components: rustfmt
       - name: format
         run: cargo +nightly fmt -- --check
+      # Separate workspace; the root fmt above does not reach it. See datafusion-executor/Cargo.toml.
+      - name: format datafusion-executor
+        working-directory: datafusion-executor
+        run: cargo +nightly fmt -- --check
 
   msrv:
     runs-on: ubuntu-latest
@@ -188,9 +192,9 @@ jobs:
       - name: lint without default features - packages which don't depend on kernel with features enabled
         run: cargo clippy --locked --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel declarative-plans feature-only build
-        run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans
+        run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans,vendored-protoc
       - name: lint kernel declarative-plans feature-only build
-        run: cargo clippy --locked -p delta_kernel --no-default-features --features declarative-plans --tests -- -D warnings
+        run: cargo clippy --locked -p delta_kernel --no-default-features --features declarative-plans,vendored-protoc --tests -- -D warnings
       - name: check kernel builds with default-engine-native-tls
         run: cargo build --locked -p feature_tests --features default-engine-native-tls
       - name: test native-tls backend has no crypto provider conflict
@@ -199,7 +203,14 @@ jobs:
         run: cargo build --locked -p feature_tests --features default-engine-rustls
       - name: test rustls TLS backend feature-tests
         run: cargo test --locked -p feature_tests --features default-engine-rustls
+  # Runs the test suite under two feature configurations, one per matrix leg, so they build and
+  # run in parallel: `all-features` is the full workspace suite; `no-declarative-plans` runs
+  # kernel + acceptance with every kernel feature except declarative-plans, to exercise the
+  # cfg(not(feature = "declarative-plans")) paths and the feature-off build. The job `name`
+  # keeps the all-features leg reporting as `test (<os>)` so it stays the same required status
+  # check, and the cache `key` keeps each configuration's target dir in its own cache entry.
   test:
+    name: test (${{ matrix.os }}${{ matrix.config == 'no-declarative-plans' && ', no-decl' || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -207,6 +218,9 @@ jobs:
           - macOS-latest
           - ubuntu-latest
           - windows-latest
+        config:
+          - all-features
+          - no-declarative-plans
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
@@ -223,21 +237,29 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
+          key: ${{ matrix.config }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
-      - name: test
-        run: cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
-      - name: doc tests
-        run: cargo test --locked --workspace --all-features --doc
-      - name: trybuild tests
-        if: steps.filter.outputs.ffi == 'true'
-        run: cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
-      - name: metrics deadlock test
+      - name: all-features tests
+        if: matrix.config == 'all-features'
         shell: bash
+        env:
+          FFI_CHANGED: ${{ steps.filter.outputs.ffi }}
         run: |
+          cargo nextest run --locked --workspace --all-features -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+          cargo test --locked --workspace --all-features --doc
+          if [ "$FFI_CHANGED" = "true" ]; then
+            cargo test --locked --package delta_kernel_ffi --features internal-api -- invalid_handle_code
+          fi
           output=$(cargo run --profile test --example metrics-tester)
           grep -q 'invalid_field' <<< "$output"
           grep -q 'Invalid uuid' <<< "$output"
+      - name: no-declarative-plans tests
+        if: matrix.config == 'no-declarative-plans'
+        shell: bash
+        run: |
+          cargo nextest run --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,default-engine-base -E 'not test(read_table_version_hdfs) and not test(invalid_handle_code)'
+          cargo test --locked -p delta_kernel -p acceptance --no-default-features --features internal-api,prettyprint,test-utils,integration-test,arrow,arrow-conversion,arrow-expression,schema-diff,check-constraints-in-dev,adaptive-metadata-in-dev,default-engine-base --doc
 
   # Fails red on trybuild drift, but kept out of required checks so it never blocks a merge.
   invalid-handle-code:
@@ -372,6 +394,14 @@ jobs:
           cmake ..
           make
           make test
+      - name: build and run checkpoint-table test
+        run: |
+          pushd ffi/examples/checkpoint-table
+          mkdir build
+          pushd build
+          cmake ..
+          make
+          make test
   miri:
     name: "Miri (shard ${{ matrix.partition }}/3)"
     runs-on: ubuntu-latest
@@ -391,9 +421,12 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
       - name: Test with Miri
+        # -Zmiri-provenance-gc=1000000 runs Miri's pointer-provenance garbage collector every 1M
+        # basic blocks instead of the default 10k, reducing GC pauses. It only changes GC
+        # frequency, so it does not weaken undefined-behavior or data-race detection.
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans --partition slice:${{ matrix.partition }}/3
+          MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-provenance-gc=1000000" cargo miri nextest run --locked --features default-engine-rustls,delta-kernel-unity-catalog,declarative-plans,vendored-protoc --partition slice:${{ matrix.partition }}/3
 
   coverage:
     runs-on: ubuntu-latest
@@ -420,3 +453,34 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Separate workspace; the --workspace jobs above never touch it. See datafusion-executor/Cargo.toml.
+  datafusion-executor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install minimal stable with clippy
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          cache: false
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: datafusion-executor
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@98ec31d284eb962f41c14065e9391a955aa810cf # nextest
+      - name: build and lint with clippy
+        working-directory: datafusion-executor
+        run: cargo clippy --locked --benches --tests --all-features -- -D warnings
+      - name: build docs
+        working-directory: datafusion-executor
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
+      - name: test
+        working-directory: datafusion-executor
+        run: cargo nextest run --locked --all-features
+      - name: doc tests
+        working-directory: datafusion-executor
+        run: cargo test --locked --all-features --doc

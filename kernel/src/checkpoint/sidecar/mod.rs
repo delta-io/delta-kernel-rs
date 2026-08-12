@@ -218,7 +218,7 @@ impl SidecarSplitter {
                 checkpoint_data_schema
                     .fields()
                     .filter(|f| f.name != ADD_NAME && f.name != REMOVE_NAME)
-                    .map(|f| Predicate::is_not_null(col!(f.name.as_str()))),
+                    .map(|f| Expression::column([&f.name]).is_not_null()),
             );
             eval_handler.new_predicate_evaluator(checkpoint_data_schema, Arc::new(predicate))?
         };

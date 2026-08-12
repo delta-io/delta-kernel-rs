@@ -2,7 +2,7 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef,
+    BinaryExpression, BinaryPredicate, CastExpression, ColumnName, Expression, ExpressionRef,
     ExpressionStructPatch, JunctionPredicate, MapToStructExpression, OpaqueExpression,
     OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression, UnaryPredicate,
     VariadicExpression,
@@ -139,6 +139,12 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_map_to_struct(expr)
     }
 
+    /// Called for each cast expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_cast`].
+    fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
+        self.recurse_into_expr_cast(expr)
+    }
+
     /// Called for the child of each predicate expression encountered during the
     /// traversal. The provided implementation just forwards to [`Self::recurse_into_expr_pred`].
     fn transform_expr_pred(&mut self, pred: &'a Predicate) -> Self::Output<Predicate> {
@@ -262,6 +268,10 @@ pub trait ExpressionTransform<'a> {
                 let child = self.transform_expr_map_to_struct(m);
                 map_owned_or_else(expr, child, Expression::MapToStruct)
             }
+            Expression::Cast(c) => {
+                let child = self.transform_expr_cast(c);
+                map_owned_or_else(expr, child, Expression::Cast)
+            }
             Expression::Unknown(u) => {
                 let child = self.transform_expr_unknown(u);
                 map_owned_or_else(expr, child, Expression::Unknown)
@@ -335,6 +345,12 @@ pub trait ExpressionTransform<'a> {
     ) -> Self::Output<MapToStructExpression> {
         let nested = self.transform_expr(&expr.map_expr);
         map_owned_or_else(expr, nested, MapToStructExpression::new)
+    }
+
+    /// Recursively transforms the child expression of a cast expression (unary).
+    fn recurse_into_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
+        let f = |child| CastExpression::new(child, expr.target.clone());
+        map_owned_or_else(expr, self.transform_expr(&expr.expr), f)
     }
 
     /// Recursively transforms the children of an opaque expression (variadic).
@@ -494,6 +510,10 @@ impl ExpressionDepthChecker {
 impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
     transform_output_type!(|'a, T| DeltaResult<()>);
 
+    fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> DeltaResult<()> {
+        self.depth_limited(Self::recurse_into_expr_cast, expr)
+    }
+
     fn transform_expr_struct(&mut self, fields: &'a [ExpressionRef]) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
     }
@@ -543,7 +563,7 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        column_expr, column_pred, Expression, Expression as Expr, OpaqueExpressionOp,
+        col, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
         OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
         ScalarExpressionEvaluator, VariadicExpression,
     };
@@ -624,10 +644,7 @@ mod tests {
     #[test]
     fn test_transform_expr_variadic_noop() {
         // Test default no-op behavior - should return Cow::Borrowed
-        let variadic_expr = VariadicExpression::new(
-            Coalesce,
-            vec![Expr::literal(1), column_expr!("x"), Expr::literal("test")],
-        );
+        let variadic_expr = VariadicExpression::new(Coalesce, vec![lit(1), col!("x"), lit("test")]);
 
         let mut transform = NoopTransform;
         let result = transform.transform_expr_variadic(&variadic_expr);
@@ -655,12 +672,7 @@ mod tests {
         // Test transformation of child expressions - should return Cow::Owned
         let variadic_expr = VariadicExpression::new(
             Coalesce,
-            vec![
-                Expr::literal(1),
-                column_expr!("old_col"),
-                column_expr!("unchanged_col"),
-                Expr::literal("test"),
-            ],
+            vec![lit(1), col!("old_col"), col!("unchanged_col"), lit("test")],
         );
 
         let result = ColumnReplacer.transform_expr_variadic(&variadic_expr);
@@ -702,15 +714,8 @@ mod tests {
             }
         }
 
-        let variadic_expr = VariadicExpression::new(
-            Coalesce,
-            vec![
-                Expr::literal(1),
-                column_expr!("x"),
-                Expr::literal("test"),
-                column_expr!("y"),
-            ],
-        );
+        let variadic_expr =
+            VariadicExpression::new(Coalesce, vec![lit(1), col!("x"), lit("test"), col!("y")]);
 
         let mut transform = LiteralRemover;
         let result = transform.transform_expr_variadic(&variadic_expr);
@@ -754,10 +759,7 @@ mod tests {
             }
         }
 
-        let variadic_expr = VariadicExpression::new(
-            Coalesce,
-            vec![Expr::literal(1), column_expr!("x"), Expr::literal("test")],
-        );
+        let variadic_expr = VariadicExpression::new(Coalesce, vec![lit(1), col!("x"), lit("test")]);
 
         let mut transform = RemoveAll;
         let result = transform.transform_expr_variadic(&variadic_expr);
@@ -795,12 +797,12 @@ mod tests {
         let variadic_expr = VariadicExpression::new(
             Coalesce,
             vec![
-                Expr::literal(1),             // Will be removed
-                column_expr!("unchanged"),    // Will stay unchanged
-                Expr::literal(5),             // Will be transformed to 10
-                Expr::literal("remove"),      // Will be removed
-                column_expr!("transform_me"), // Will be transformed
-                Expr::literal("keep"),        // Will stay unchanged
+                lit(1),               // Will be removed
+                col!("unchanged"),    // Will stay unchanged
+                lit(5),               // Will be transformed to 10
+                lit("remove"),        // Will be removed
+                col!("transform_me"), // Will be transformed
+                lit("keep"),          // Will stay unchanged
             ],
         );
 
@@ -843,8 +845,7 @@ mod tests {
     #[test]
     fn test_transform_expr_parse_json_noop() {
         // Test default no-op behavior - should return Cow::Borrowed
-        let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("json_col"), test_output_schema());
+        let parse_json_expr = ParseJsonExpression::new(col!("json_col"), test_output_schema());
 
         let mut transform = NoopTransform;
         let result = transform.transform_expr_parse_json(&parse_json_expr);
@@ -858,8 +859,7 @@ mod tests {
     #[test]
     fn test_transform_expr_parse_json_child_transformation() {
         // Test transformation of child expression - should return Cow::Owned
-        let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("old_col"), test_output_schema());
+        let parse_json_expr = ParseJsonExpression::new(col!("old_col"), test_output_schema());
 
         let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
 
@@ -880,8 +880,7 @@ mod tests {
     #[test]
     fn test_transform_expr_parse_json_child_unchanged() {
         // Test when child column doesn't match replacement criteria - should return Cow::Borrowed
-        let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("unchanged_col"), test_output_schema());
+        let parse_json_expr = ParseJsonExpression::new(col!("unchanged_col"), test_output_schema());
 
         let result = ColumnReplacer.transform_expr_parse_json(&parse_json_expr);
 
@@ -904,8 +903,7 @@ mod tests {
             }
         }
 
-        let parse_json_expr =
-            ParseJsonExpression::new(column_expr!("json_col"), test_output_schema());
+        let parse_json_expr = ParseJsonExpression::new(col!("json_col"), test_output_schema());
 
         let mut transform = ColumnRemover;
         let result = transform.transform_expr_parse_json(&parse_json_expr);
@@ -931,7 +929,7 @@ mod tests {
         }
 
         // ParseJson with a binary expression as child: column + 5
-        let child_expr = column_expr!("x") + Expr::literal(5);
+        let child_expr = col!("x") + lit(5);
         let parse_json_expr = ParseJsonExpression::new(child_expr, test_output_schema());
 
         let mut transform = LiteralDoubler;
@@ -958,34 +956,25 @@ mod tests {
             Pred::and_from([
                 Pred::opaque(
                     OpaqueTestOp("opaque".to_string()),
-                    vec![
-                        Expr::literal(10) + column_expr!("x"),
-                        Expr::unknown("unknown") - column_expr!("b"),
-                    ],
+                    vec![lit(10) + col!("x"), Expr::unknown("unknown") - col!("b")],
                 ),
-                Pred::literal(true),
-                Pred::not(Pred::literal(true)),
+                Pred::TRUE,
+                Pred::not(Pred::TRUE),
             ]),
             Pred::and_from([
-                Pred::is_null(column_expr!("b")),
-                Pred::gt(Expr::literal(10), column_expr!("x")),
+                Pred::is_null(col!("b")),
+                Pred::gt(lit(10), col!("x")),
                 Pred::or(
                     Pred::gt(
-                        Expr::literal(5)
-                            + Expr::opaque(
-                                OpaqueTestOp("inscrutable".to_string()),
-                                vec![Expr::literal(10)],
-                            ),
-                        Expr::literal(20),
+                        lit(5)
+                            + Expr::opaque(OpaqueTestOp("inscrutable".to_string()), vec![lit(10)]),
+                        lit(20),
                     ),
                     column_pred!("y"),
                 ),
                 Pred::unknown("mystery"),
             ]),
-            Pred::eq(
-                Expr::literal(42),
-                Expr::struct_from([Expr::literal(10), column_expr!("b")]),
-            ),
+            Pred::eq(lit(42), Expr::struct_from([lit(10), col!("b")])),
         ]);
 
         // Verify the default/no-op transform, since we have this nice complex expression handy.
@@ -1103,6 +1092,16 @@ mod tests {
     }
 
     #[test]
+    fn test_depth_checker_counts_cast_expressions() {
+        let expr = Expr::cast(Expr::cast(col!("x"), DataType::INTEGER), DataType::LONG);
+
+        assert_eq!(
+            ExpressionDepthChecker::check_expr_with_call_count(&expr, 0),
+            (1, 2)
+        );
+    }
+
+    #[test]
     fn transform_junction_to_single_child_unwraps() {
         // A transform that removes one child from AND(a, b) should produce the surviving
         // predicate directly, not a degenerate single-element junction AND(a).
@@ -1115,7 +1114,7 @@ mod tests {
             }
         }
 
-        let pred = Pred::and(column_pred!("x"), Pred::literal(true));
+        let pred = Pred::and(column_pred!("x"), Pred::TRUE);
         let mut transform = LiteralRemover;
         let result = transform.transform_pred(&pred);
         let result = result.map(Cow::into_owned);

@@ -384,18 +384,47 @@ mod apply_schema_validation_tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::array::{Int32Array, RecordBatch, StructArray};
+    use crate::arrow::array::{ArrayRef, BinaryArray, Int32Array, RecordBatch, StructArray};
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
+    use crate::arrow::compute::cast;
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::schema::{ColumnMetadataKey, DataType, MetadataValue, StructField, StructType};
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         array_in_map_arrow_data_without_field_ids, array_in_map_kernel_schema,
         array_in_map_with_field_ids, assert_result_error_with_message,
         collect_arrow_field_metadata, complex_nested_with_field_ids,
     };
+
+    #[rstest]
+    fn apply_schema_accepts_any_binary_representation_for_variant(
+        #[values(
+            ArrowDataType::Binary,
+            ArrowDataType::LargeBinary,
+            ArrowDataType::BinaryView
+        )]
+        binary_type: ArrowDataType,
+    ) {
+        let metadata = cast(
+            &BinaryArray::from(vec![&[0x01, 0x00, 0x00][..]]),
+            &binary_type,
+        )
+        .unwrap();
+        let value = cast(&BinaryArray::from(vec![&[0x0C, 0x01][..]]), &binary_type).unwrap();
+        let fields: Fields = vec![
+            ArrowField::new("metadata", binary_type.clone(), false),
+            ArrowField::new("value", binary_type, false),
+        ]
+        .into();
+        let variant: ArrayRef =
+            Arc::new(StructArray::try_new(fields, vec![metadata, value], None).unwrap());
+
+        let result = apply_schema_to(&variant, &DataType::unshredded_variant()).unwrap();
+
+        assert_eq!(result.data_type(), variant.data_type());
+    }
 
     #[test]
     fn test_apply_schema_basic_functionality() {

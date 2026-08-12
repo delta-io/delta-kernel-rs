@@ -12,6 +12,52 @@
 //!   produces an output [`StructType`] directly from an input schema.
 //! * [`ProjectionStructPatchBuilder`] pairs each output field with the expression that produces it
 //!   and lowers both at once to a matched ([`SchemaRef`], `[ExpressionRef`]) pair.
+//!
+//! # Worked example
+//!
+//! Every builder call names one edit relative to an input field:
+//!
+//! ```ignore
+//! builder
+//!     .prepend(first)
+//!     .insert_after("a", x)
+//!     .replace("b", bb)
+//!     .drop("c")
+//!     .append(last)
+//! ```
+//!
+//! Applied to `{ a, b, c }`, walking the input fields in order:
+//!
+//! ```text
+//! input field:   (none)     a              b          c        (none)
+//! edit:          prepend    keep +after    replace    drop     append
+//! emits:         first      a, x           bb         nothing  last
+//!
+//! output:        { first, a, x, bb, last }
+//! ```
+//!
+//! Field `a` is untouched and passes through in place, which is what makes the patch cost
+//! `O(edits)` rather than `O(struct width)`. The `_at` variants (e.g.
+//! [`insert_after_at`](StructPatchBuilder::insert_after_at)) apply the same edits to a nested
+//! struct named by path.
+//!
+//! # Flattening to a dense projection
+//!
+//! An engine whose projection operator takes one expression per output column has to expand the
+//! patch, which is the walk the example above traces. Emit
+//! [`prepended_fields`](ExpressionStructPatch::prepended_fields), then visit the input struct's
+//! fields in order: look each one up in
+//! [`field_patches`](ExpressionStructPatch::field_patches), emit the field itself when the entry is
+//! absent or sets [`keep_input`](ExpressionFieldPatch::keep_input), and emit that entry's
+//! [`insertions`](ExpressionFieldPatch::insertions) after it. An entry that keeps nothing and
+//! inserts nothing drops the field. Finish with
+//! [`appended_fields`](ExpressionStructPatch::appended_fields). A nested patch arrives as an
+//! [`Expression::StructPatch`] insertion, so the same walk recurses with that patch's
+//! [`input_path`](ExpressionStructPatch::input_path) as the struct to expand against.
+//!
+//! [`ProjectionStructPatchBuilder`] hands back the flattened schema already, so a caller building
+//! both halves can pair its dense field list with the expressions this walk produces rather than
+//! deriving the field names again.
 
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
@@ -20,7 +66,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::expressions::{ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::utils::CollectInto;
+use crate::utils::{CollectInto, FoldWithOption as _};
 use crate::{DeltaResult, Error};
 
 // === Raw expression patch ===
@@ -703,6 +749,11 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
         }
     }
 
+    /// Returns the schema this projection patch is applied to.
+    pub fn input_schema(&self) -> &StructType {
+        self.input_schema
+    }
+
     // === Drops (no emitted field/expression) ===
 
     /// Records a field drop. The dropped field is omitted from both the output schema and the
@@ -873,10 +924,7 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
 /// Joins an optional input prefix with a field name into a (possibly nested) input column path.
 fn join_prefix(prefix: Option<&ColumnName>, name: &str) -> ColumnName {
     let leaf = ColumnName::new([name]);
-    match prefix {
-        Some(prefix) => prefix.join(&leaf),
-        None => leaf,
-    }
+    leaf.fold_with(prefix, |leaf, prefix| prefix.join(&leaf))
 }
 
 #[cfg(test)]
@@ -890,7 +938,7 @@ mod tests {
     };
     use crate::schema::{DataType, SchemaStructPatchBuilder, StructField, StructType};
     use crate::struct_patch::ProjectionStructPatchBuilder;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     fn projection_patch(expr: &ExpressionRef) -> &ExpressionStructPatch {
         let Expr::StructPatch(patch) = expr.as_ref() else {

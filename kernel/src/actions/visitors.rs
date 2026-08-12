@@ -8,7 +8,6 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 
 use super::deletion_vector::DeletionVectorDescriptor;
-use super::set_transaction::is_set_txn_expired;
 use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_segment::DomainMetadataMap;
@@ -308,18 +307,14 @@ pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 pub(crate) struct SetTransactionVisitor {
     pub(crate) set_transactions: SetTransactionMap,
     pub(crate) application_id: Option<String>,
-    /// Minimum timestamp for transaction retention. Transactions with last_updated
-    /// older than or equal to this timestamp will be filtered out. None means no filtering.
-    expiration_timestamp: Option<i64>,
 }
 
 impl SetTransactionVisitor {
     /// Create a new visitor. When application_id is set then bookkeeping is only for that id only
-    pub(crate) fn new(application_id: Option<String>, expiration_timestamp: Option<i64>) -> Self {
+    pub(crate) fn new(application_id: Option<String>) -> Self {
         SetTransactionVisitor {
             set_transactions: HashMap::default(),
             application_id,
-            expiration_timestamp,
         }
     }
 
@@ -364,9 +359,6 @@ impl RowVisitor for SetTransactionVisitor {
                     .is_none_or(|requested| requested.eq(&app_id))
                 {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
-                    if is_set_txn_expired(self.expiration_timestamp, txn.last_updated) {
-                        continue;
-                    }
                     if !self.set_transactions.contains_key(&txn.app_id) {
                         self.set_transactions.insert(txn.app_id.clone(), txn);
                     }
@@ -479,10 +471,15 @@ impl DomainMetadataVisitor {
             .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
     }
 
-    pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
-        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to
-        // filter
-        self.domain_metadatas.retain(|_, dm| !dm.removed);
+    pub(crate) fn into_domain_metadatas(self) -> DomainMetadataMap {
+        let mut domain_metadatas = self.domain_metadatas;
+        domain_metadatas.retain(|_, dm| !dm.removed);
+        domain_metadatas
+    }
+
+    /// The newest-wins domain-metadata map, retaining tombstones (`removed == true`).
+    /// [`Self::into_domain_metadatas`] returns the same map with tombstones stripped.
+    pub(crate) fn into_domain_metadatas_including_tombstones(self) -> DomainMetadataMap {
         self.domain_metadatas
     }
 }
@@ -703,7 +700,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{action_batch, parse_json_batch};
+    use crate::unit_test_utils::{action_batch, parse_json_batch};
     use crate::Engine;
 
     #[test]

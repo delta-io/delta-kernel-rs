@@ -171,6 +171,8 @@ mod tests {
             dv_info: DvInfo::default(),
             remove_dv: None,
             size: None,
+            base_row_id: None,
+            default_row_commit_version: None,
         }
     }
 
@@ -388,6 +390,8 @@ mod tests {
             dv_info: DvInfo::default(),
             remove_dv: None,
             size: None,
+            base_row_id: None,
+            default_row_commit_version: None,
         };
 
         // Create a simple schema without CDF metadata columns

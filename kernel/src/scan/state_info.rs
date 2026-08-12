@@ -84,7 +84,7 @@ fn validate_metadata_columns<'a>(
     table_configuration: &'a TableConfiguration,
 ) -> DeltaResult<MetadataInfo<'a>> {
     let mut metadata_info = MetadataInfo::default();
-    let partition_columns = table_configuration.partition_columns();
+    let partition_columns = table_configuration.logical_partition_columns();
     for metadata_column in logical_schema.metadata_columns() {
         // Ensure we don't have a metadata column with same name as a partition column
         if partition_columns.contains(metadata_column.name()) {
@@ -137,23 +137,14 @@ fn build_data_skipping_schemas(
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     table_configuration: &TableConfiguration,
-    table_partition_schema: Option<SchemaRef>,
 ) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
-    // Filter partition schema to only predicate-referenced columns. The DataSkippingFilter
-    // only needs partition columns that appear in the predicate, and the transform output
-    // should not include unused partition columns.
-    let predicate_partition_schema = match (&table_partition_schema, physical_predicate) {
-        (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
-            // Partition values extracted from the string map via MapToStruct are always
-            // nullable (map lookup can return null), so we force all partition fields nullable.
-            ref_schema
-                .with_fields_filtered_nonempty(|f| tps.field(f.name()).is_some())?
-                .map(|partition_schema| {
-                    let nullable_fields = partition_schema
-                        .fields()
-                        .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
-                    Arc::new(StructType::new_unchecked(nullable_fields))
-                })
+    // Narrow the table's typed partition schema to the columns the predicate references. The
+    // DataSkippingFilter only needs partition columns that appear in the predicate, and the
+    // shared helper forces every field nullable (MapToStruct can yield null for a missing key).
+    let predicate_partition_schema = match physical_predicate {
+        PhysicalPredicate::Some(pred, _ref_schema) => {
+            let refs: Vec<ColumnName> = pred.references().into_iter().cloned().collect();
+            table_configuration.predicate_partition_schema(&refs)
         }
         _ => None,
     };
@@ -255,7 +246,7 @@ impl StateInfo {
         partition_values: &PartitionValuesOptions,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let partition_columns = table_configuration.partition_columns();
+        let partition_columns = table_configuration.logical_partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_read_schema.num_fields());
         let mut transform_spec = Vec::with_capacity(logical_read_schema.num_fields());
@@ -419,14 +410,14 @@ impl StateInfo {
             &physical_predicate,
             &predicate_column_names,
             table_configuration,
-            table_partition_schema.clone(),
         )?;
 
         // When the engine requested the typed struct, emit all partition columns rather than
         // the predicate-narrowed subset. The data skipping filter only references the columns
         // its predicate needs, so the superset is safe for pruning too. All fields are forced
         // nullable: MapToStruct can yield null even for a non-nullable column (a missing key, or
-        // the protocol's empty-string-is-null rule), and a non-nullable field would then error.
+        // an empty string cast to a non-string/binary type), and a non-nullable field would then
+        // error.
         let physical_partition_schema = if partition_values.parsed_struct {
             table_partition_schema.map(|tps| {
                 let nullable_fields = tps
@@ -487,10 +478,10 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::actions::{Metadata, Protocol, MAX_VALUES, MIN_VALUES};
-    use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
-    use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::expressions::{col, column_name, lit, Predicate as Pred};
+    use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::unit_test_utils::assert_result_error_with_message;
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
@@ -754,7 +745,7 @@ pub(crate) mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
         let state_info = get_state_info(
             schema.clone(),
@@ -813,12 +804,23 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Builds a nullable [`StructField`] carrying column-mapping id + physical name metadata.
+    fn cm_field(name: &str, id: i64, physical_name: &str, ty: impl Into<DataType>) -> StructField {
+        StructField::nullable(name, ty).with_metadata([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::Number(id),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                MetadataValue::String(physical_name.into()),
+            ),
+        ])
+    }
+
     #[test]
     fn request_row_ids() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
@@ -852,11 +854,8 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids_conflicting_row_index_col_name() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "row_indexes_for_row_id_0", /* this will conflict with the first generated name for
-                                         * row indexes */
-            DataType::STRING,
-        )]));
+        // "row_indexes_for_row_id_0" conflicts with the first generated name for row indexes
+        let schema = schema_ref! { nullable "row_indexes_for_row_id_0": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
@@ -890,10 +889,7 @@ pub(crate) mod tests {
 
     #[test]
     fn request_row_ids_and_indexes() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         let state_info = get_state_info(
             schema.clone(),
@@ -930,10 +926,7 @@ pub(crate) mod tests {
 
     #[test]
     fn invalid_rowtracking_config() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! { nullable "id": STRING };
 
         // Row IDs requested but row tracking not enabled → error
         let res = get_state_info(
@@ -984,10 +977,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let read_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]));
+        let read_schema = schema_ref! { nullable "id": STRING };
         let read_schema = Arc::new(
             read_schema
                 .add_metadata_column("part_col", MetadataColumnSpec::RowId)
@@ -1010,22 +1000,7 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_read_field() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "id",
-            DataType::STRING,
-        )
-        .with_metadata(HashMap::<String, MetadataValue>::from([
-            (
-                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                1.into(),
-            ),
-            (
-                ColumnMetadataKey::ColumnMappingPhysicalName
-                    .as_ref()
-                    .to_string(),
-                "other".into(),
-            ),
-        ]))]));
+        let schema = schema_ref! { (cm_field("id", 1, "other", DataType::STRING)) };
         let res = get_state_info(
             schema.clone(),
             vec![],
@@ -1047,7 +1022,7 @@ pub(crate) mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1082,7 +1057,7 @@ pub(crate) mod tests {
             StructField::nullable("extra", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("extra").gt(Expr::literal(5i64)));
+        let predicate = Arc::new(col!("extra").gt(lit(5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1171,46 +1146,13 @@ pub(crate) mod tests {
         // Verify that physical_partition_schema uses physical column names when column
         // mapping is enabled. The logical partition column "date" has physical name
         // "col-date-phys", and the schema should reflect the physical name.
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING).with_metadata(HashMap::from([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                    MetadataValue::Number(1),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName
-                        .as_ref()
-                        .to_string(),
-                    MetadataValue::String("col-id-phys".to_string()),
-                ),
-            ])),
-            StructField::nullable("date", DataType::DATE).with_metadata(HashMap::from([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                    MetadataValue::Number(2),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName
-                        .as_ref()
-                        .to_string(),
-                    MetadataValue::String("col-date-phys".to_string()),
-                ),
-            ])),
-            StructField::nullable("value", DataType::LONG).with_metadata(HashMap::from([
-                (
-                    ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
-                    MetadataValue::Number(3),
-                ),
-                (
-                    ColumnMetadataKey::ColumnMappingPhysicalName
-                        .as_ref()
-                        .to_string(),
-                    MetadataValue::String("col-value-phys".to_string()),
-                ),
-            ])),
-        ]));
+        let schema = schema_ref! {
+            (cm_field("id", 1, "col-id-phys", DataType::STRING)),
+            (cm_field("date", 2, "col-date-phys", DataType::DATE)),
+            (cm_field("value", 3, "col-value-phys", DataType::LONG)),
+        };
 
-        let predicate = Arc::new(column_expr!("date").lt(Expr::literal(100i32)));
+        let predicate = Arc::new(col!("date").lt(lit(100i32)));
 
         let state_info = get_state_info(
             schema,
@@ -1307,46 +1249,17 @@ pub(crate) mod tests {
 
     #[test]
     fn stats_columns_with_column_mapping_uses_physical_names() {
-        let field_a: StructField = serde_json::from_value(serde_json::json!({
-            "name": "col_a",
-            "type": "long",
-            "nullable": true,
-            "metadata": {
-                "delta.columnMapping.id": 1,
-                "delta.columnMapping.physicalName": "phys_a"
-            }
-        }))
-        .unwrap();
-
-        let field_b: StructField = serde_json::from_value(serde_json::json!({
-            "name": "col_b",
-            "type": "long",
-            "nullable": true,
-            "metadata": {
-                "delta.columnMapping.id": 2,
-                "delta.columnMapping.physicalName": "phys_b"
-            }
-        }))
-        .unwrap();
-
-        let field_c: StructField = serde_json::from_value(serde_json::json!({
-            "name": "col_c",
-            "type": "long",
-            "nullable": true,
-            "metadata": {
-                "delta.columnMapping.id": 3,
-                "delta.columnMapping.physicalName": "phys_c"
-            }
-        }))
-        .unwrap();
-
-        let schema = Arc::new(StructType::new_unchecked(vec![field_a, field_b, field_c]));
+        let schema = schema_ref! {
+            (cm_field("col_a", 1, "phys_a", DataType::LONG)),
+            (cm_field("col_b", 2, "phys_b", DataType::LONG)),
+            (cm_field("col_c", 3, "phys_c", DataType::LONG)),
+        };
         let mut props = HashMap::new();
         props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
 
         // Request col_a via stats_columns (logical), and reference col_b via predicate (logical).
         // Both must be translated to physical names in the output stats schema.
-        let predicate = Arc::new(column_expr!("col_b").gt(Expr::literal(5i64)));
+        let predicate = Arc::new(col!("col_b").gt(lit(5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1455,7 +1368,7 @@ pub(crate) mod tests {
     #[test]
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
-        let predicate = Arc::new(column_expr!("c4").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("c4").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1482,8 +1395,8 @@ pub(crate) mod tests {
     fn predicate_on_mixed_indexed_and_past_cap_keeps_indexed_only() {
         let schema = flat_long_schema(5);
         let predicate = Arc::new(Pred::and(
-            column_expr!("c0").gt(Expr::literal(10i64)),
-            column_expr!("c4").gt(Expr::literal(10i64)),
+            col!("c0").gt(lit(10i64)),
+            col!("c4").gt(lit(10i64)),
         ));
         let state_info = get_state_info(
             schema,
@@ -1533,7 +1446,7 @@ pub(crate) mod tests {
             ),
         ]));
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
-        let predicate = Arc::new(column_expr!("s.c").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1592,8 +1505,8 @@ pub(crate) mod tests {
             ),
         ]));
         let predicate = Arc::new(Pred::and(
-            column_expr!("s.c").gt(Expr::literal(10i64)),
-            column_expr!("s.d").gt(Expr::literal(10i64)),
+            col!("s.c").gt(lit(10i64)),
+            col!("s.d").gt(lit(10i64)),
         ));
         let state_info = get_state_info(
             schema,

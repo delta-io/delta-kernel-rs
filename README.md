@@ -28,6 +28,11 @@ Delta-kernel-rs is split into a few different crates:
 - derive-macros: A crate for our [derive-macros] to live in
 - ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
+- unity-catalog-delta-client-api: Transport-agnostic client traits and wire models for the Unity
+  Catalog Delta Tables API
+- unity-catalog-delta-rest-client: REST/HTTP client for the Unity Catalog Delta Tables API
+- delta-kernel-unity-catalog: Unity Catalog integration for the kernel, providing a catalog
+  `Committer` and helpers for catalog-managed tables
 
 ## Building
 By default we build only the `kernel` and `acceptance` crates, which will also build `derive-macros`
@@ -54,11 +59,11 @@ built with [Arrow] and [Tokio].
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.25.0"
+delta_kernel = "0.26.0"
 
 # or pull in the default Arrow/Tokio engine alongside the kernel
-delta_kernel = "0.25.0"
-delta_kernel_default_engine = { version = "0.25.0", features = ["rustls"] }
+delta_kernel = "0.26.0"
+delta_kernel_default_engine = { version = "0.26.0", features = ["rustls"] }
 ```
 
 ### Feature flags
@@ -68,8 +73,8 @@ delta_kernel_default_engine = { version = "0.25.0", features = ["rustls"] }
 | ------------- | ------------- |
 | `rustls`      | Use the rustls TLS backend for HTTPS object stores  |
 | `native-tls`  | Use the native-tls TLS backend for HTTPS object stores  |
-| `arrow-57`    | Build against arrow 57 (see Arrow versioning below) |
 | `arrow-58`    | Build against arrow 58 (see Arrow versioning below) |
+| `arrow-59`    | Build against arrow 59 (see Arrow versioning below) |
 
 The `delta_kernel` crate itself exposes a few additional flags:
 
@@ -95,12 +100,12 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-57`: Use arrow version 57
 - `arrow-58`: Use arrow version 58
+- `arrow-59`: Use arrow version 59
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
-  specify it directly with `arrow-N`, e.g. `arrow-57`.
+  specify it directly with `arrow-N`, e.g. `arrow-58`.
 
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of

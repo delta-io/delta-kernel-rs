@@ -11,10 +11,10 @@ use delta_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{column_expr, ColumnName};
+use delta_kernel::expressions::{col, lit, ColumnName};
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::table_features::{get_any_level_column_physical_name, ColumnMappingMode};
-use delta_kernel::{Expression as Expr, Predicate as Pred, Snapshot};
+use delta_kernel::{Predicate as Pred, Snapshot};
 use test_utils::{
     create_table_and_load_snapshot, read_actions_from_commit, test_table_setup,
     test_table_setup_mt, write_batch_to_table,
@@ -233,7 +233,7 @@ async fn test_write_stats_for_complex_type_columns(
     // Data skipping should skip file 1 entirely and return only file 2's rows.
     let scan = scan_snapshot
         .scan_builder()
-        .with_predicate(Arc::new(Pred::gt(column_expr!("id"), Expr::literal(5_i64))))
+        .with_predicate(Arc::new(Pred::gt(col!("id"), lit(5_i64))))
         .build()?;
     let batches: Vec<RecordBatch> = scan
         .execute(engine.clone())?

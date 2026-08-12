@@ -32,12 +32,16 @@ use crate::expressions::ColumnName;
 use crate::schema::StructField;
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{Operation, TableFeature};
+use crate::table_features::{
+    schema_has_column_mapping_metadata, strip_stray_column_mapping_metadata, ColumnMappingMode,
+    Operation, TableFeature,
+};
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Error};
 
 /// Initial state: `build()` is not yet available (at least one operation is required).
@@ -67,11 +71,12 @@ mod sealed {
 ///
 /// Uses a type-state pattern (`S`) to enforce at compile time:
 /// - At least one schema operation must be queued before `build()` is callable.
-/// - Only operations valid for the current state can be chained. This will disallow incompatibel
+/// - Only operations valid for the current state can be chained. This will disallow incompatible
 ///   chaining.
 pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
+    correlation_id: Option<Arc<str>>,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
@@ -88,8 +93,16 @@ impl<S> AlterTableTransactionBuilder<S> {
         AlterTableTransactionBuilder {
             snapshot: self.snapshot,
             operations: self.operations,
+            correlation_id: self.correlation_id,
             _state: PhantomData,
         }
+    }
+
+    /// Attach an opaque, caller-supplied correlation id for joining the alter-table commit's metric
+    /// events to the caller's own request or operation id. An empty id is treated as unset.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
     }
 }
 
@@ -99,6 +112,7 @@ impl AlterTableTransactionBuilder<Ready> {
         AlterTableTransactionBuilder {
             snapshot,
             operations: Vec::new(),
+            correlation_id: None,
             _state: PhantomData,
         }
     }
@@ -141,6 +155,8 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///
     /// # Errors
     ///
+    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which ALTER TABLE does not
+    ///   yet support
     /// - Any individual operation fails validation (see per-method errors above)
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a
@@ -158,6 +174,12 @@ impl AlterTableTransactionBuilder<Modifying> {
                 "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
             ));
         }
+        // TODO(#2630): Support ALTER TABLE on tables with column defaults.
+        if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
+            return Err(Error::unsupported(
+                "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
+            ));
+        }
         // Rejects writes to tables kernel can't safely commit to: writer version out of
         // kernel's supported range, unsupported writer features, or schemas with SQL-expression
         // invariants. Runs on the pre-alter snapshot; future ALTER variants that change the
@@ -167,6 +189,12 @@ impl AlterTableTransactionBuilder<Modifying> {
         let schema = Arc::unwrap_or_clone(table_config.logical_schema());
         let column_mapping_mode = table_config.column_mapping_mode();
         let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+        // Whether the pre-alter schema already carried column-mapping metadata -- the only fact the
+        // strip below needs from it. Captured as a bool (not a clone) before
+        // `apply_schema_operations` consumes `schema` by value. Short-circuits outside
+        // `None` mode, where no strip fires.
+        let current_has_cm = column_mapping_mode == ColumnMappingMode::None
+            && schema_has_column_mapping_metadata(&schema);
         let SchemaEvolutionResult {
             schema: evolved_schema,
             new_max_column_id,
@@ -177,14 +205,24 @@ impl AlterTableTransactionBuilder<Modifying> {
             current_max_column_id,
         )?;
 
-        let mut evolved_metadata = table_config
+        // Only in `None` mode: if this ALTER introduced column-mapping annotations into a table
+        // that was clean before it, strip them; residual annotations already present on the
+        // table are left in place (see `strip_stray_column_mapping_metadata`).
+        let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+            strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
+                .map_or(evolved_schema, Arc::new)
+        } else {
+            evolved_schema
+        };
+
+        let evolved_metadata = table_config
             .metadata()
             .clone()
-            .with_schema(evolved_schema.clone())?;
-        if let Some(id) = new_max_column_id {
-            evolved_metadata = evolved_metadata
-                .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string());
-        }
+            .with_schema(evolved_schema.clone())?
+            .fold_with(new_max_column_id, |evolved_metadata, id| {
+                evolved_metadata
+                    .with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+            });
 
         // Validates the evolved metadata against the protocol.
         let evolved_table_config = TableConfiguration::try_new_with_schema(
@@ -193,6 +231,11 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_schema,
         )?;
 
-        AlterTableTransaction::try_new_alter_table(self.snapshot, evolved_table_config, committer)
+        AlterTableTransaction::try_new_alter_table(
+            self.snapshot,
+            evolved_table_config,
+            committer,
+            self.correlation_id,
+        )
     }
 }

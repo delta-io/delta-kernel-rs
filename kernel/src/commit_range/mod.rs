@@ -54,13 +54,12 @@ pub use builder::{CommitOrdering, CommitRangeBuilder};
 use url::Url;
 
 use crate::actions::{
-    Add, Cdc, CheckpointMetadata, CommitInfo, DomainMetadata, Metadata, Protocol, Remove,
-    SetTransaction, Sidecar, ADD_NAME, CDC_NAME, CHECKPOINT_METADATA_NAME, COMMIT_INFO_NAME,
-    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
-    SIDECAR_NAME,
+    Metadata, Protocol, ADD_FIELD, CDC_FIELD, CHECKPOINT_METADATA_FIELD, COMMIT_INFO_FIELD,
+    DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD, SET_TRANSACTION_FIELD,
+    SIDECAR_FIELD,
 };
 use crate::path::ParsedLogPath;
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::Operation;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -252,22 +251,16 @@ impl Iterator for CommitActionsIterator {
 /// Build the nullable [`StructField`] that represents this action kind in the read schema.
 fn action_to_field(action: &DeltaAction) -> StructField {
     match action {
-        DeltaAction::Add => StructField::nullable(ADD_NAME, Add::to_schema()),
-        DeltaAction::Remove => StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        DeltaAction::Metadata => StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        DeltaAction::Protocol => StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        DeltaAction::CommitInfo => StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
-        DeltaAction::Cdc => StructField::nullable(CDC_NAME, Cdc::to_schema()),
-        DeltaAction::DomainMetadata => {
-            StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema())
-        }
-        DeltaAction::SetTxn => {
-            StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema())
-        }
-        DeltaAction::CheckpointMetadata => {
-            StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
-        }
-        DeltaAction::Sidecar => StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        DeltaAction::Add => ADD_FIELD.clone(),
+        DeltaAction::Remove => REMOVE_FIELD.clone(),
+        DeltaAction::Metadata => METADATA_FIELD.clone(),
+        DeltaAction::Protocol => PROTOCOL_FIELD.clone(),
+        DeltaAction::CommitInfo => COMMIT_INFO_FIELD.clone(),
+        DeltaAction::Cdc => CDC_FIELD.clone(),
+        DeltaAction::DomainMetadata => DOMAIN_METADATA_FIELD.clone(),
+        DeltaAction::SetTxn => SET_TRANSACTION_FIELD.clone(),
+        DeltaAction::CheckpointMetadata => CHECKPOINT_METADATA_FIELD.clone(),
+        DeltaAction::Sidecar => SIDECAR_FIELD.clone(),
     }
 }
 
@@ -281,6 +274,7 @@ mod tests {
 
     use super::*;
     use crate::actions::visitors::{AddVisitor, RemoveVisitor};
+    use crate::actions::{Add, Remove};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::RowVisitor;

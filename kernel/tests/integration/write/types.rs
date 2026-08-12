@@ -169,7 +169,74 @@ async fn test_append_timestamp(
         .as_bool()
         .unwrap());
 
+    let stats: serde_json::Value =
+        serde_json::from_str(parsed_commits[1]["add"]["stats"].as_str().unwrap())?;
+    assert_eq!(stats["minValues"]["ts_ntz"], "0001-01-01T00:00:00.000");
+    assert_eq!(stats["maxValues"]["ts_ntz"], "9999-12-31T23:59:59.999");
+
     // Verify the data can be read back correctly
+    test_read(&ArrowEngineData::new(data), &table_url, engine)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_append_timestamp_stats_are_millisecond_truncated(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "ts",
+        DataType::TIMESTAMP,
+    )])?);
+
+    let (store, engine, table_location) = engine_store_setup("test_table_timestamp_stats", None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    let mut txn = test_utils::load_and_begin_transaction(table_url.clone(), &engine)?
+        .with_engine_info("default engine");
+
+    // Spans [.298677, .307735]; a conforming writer floors the stats to [.298, .307].
+    let timestamp_values = vec![1_783_007_755_298_677i64, 1_783_007_755_307_735i64];
+    let data = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(timestamp_values).with_timezone("UTC"),
+        )],
+    )?;
+
+    let engine = Arc::new(engine);
+    let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
+    let add_files_metadata = engine
+        .write_parquet(&ArrowEngineData::new(data.clone()), write_context.as_ref())
+        .await?;
+    txn.add_files(add_files_metadata);
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    let commit1 = store
+        .get(&Path::from(
+            "/test_table_timestamp_stats/_delta_log/00000000000000000001.json",
+        ))
+        .await?;
+    let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+
+    let stats: serde_json::Value =
+        serde_json::from_str(parsed_commits[1]["add"]["stats"].as_str().unwrap())?;
+    assert_eq!(stats["minValues"]["ts"], "2026-07-02T15:55:55.298Z");
+    assert_eq!(stats["maxValues"]["ts"], "2026-07-02T15:55:55.307Z");
+
+    // Kernel must be able to parse the stats it just wrote.
     test_read(&ArrowEngineData::new(data), &table_url, engine)?;
 
     Ok(())

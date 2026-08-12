@@ -384,6 +384,24 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     wrap_expression(state, Expression::literal(Scalar::TimestampNtz(value)))
 }
 
+/// Visit an interval year-month literal (signed month count).
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_interval_year_month(
+    state: &mut KernelExpressionVisitorState,
+    value: i32,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::IntervalYearMonth(value)))
+}
+
+/// Visit an interval day-time literal (signed microsecond count).
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_interval_day_time(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::IntervalDayTime(value)))
+}
+
 /// visit a binary literal expression
 ///
 /// # Safety
@@ -432,10 +450,10 @@ fn visit_expression_literal_decimal_impl(
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
 ///
-/// Primitive types use fixed discriminants 0-11. Decimal uses 12 and requires additional
-/// precision/scale parameters. Non-primitive types (struct, array, map, variant) use the
-/// [`NonPrimitive`](Self::NonPrimitive) sentinel -- these cannot be reconstructed from a type
-/// tag alone.
+/// Most primitive types use fixed discriminants 0-14. Decimal uses 12 and requires additional
+/// precision/scale parameters. Non-primitive types (struct, array, map, variant) and the `void`
+/// primitive use the [`NonPrimitive`](Self::NonPrimitive) sentinel because they cannot be
+/// reconstructed from a type tag alone.
 ///
 /// NOTE: These values are part of the FFI contract. Changing existing discriminants is a breaking
 /// change.
@@ -471,15 +489,20 @@ pub(crate) enum NullTypeTag {
     /// WARNING: This variant MUST remain `= 12`. It is the only tag with special handling
     /// (precision/scale parameters), and C consumers key on the value `12` directly.
     Decimal = 12,
+    /// Null of type `interval year to month` (signed month count).
+    IntervalYearMonth = 13,
+    /// Null of type `interval day to second` (signed microsecond duration).
+    IntervalDayTime = 14,
     // Deliberately not feature gated, so timestamp_nanos number allocations are there even
     // if the feature is disabled.
     /// EXPERIMENTAL. Null of type `timestamp_nanos` (nanoseconds since epoch, UTC-adjusted).
-    TimestampNanos = 13,
+    TimestampNanos = 15,
     /// EXPERIMENTAL. Null of type `timestamp_nanos_ntz` (nanoseconds since epoch, no timezone).
-    TimestampNanosNtz = 14,
-    /// Sentinel for non-primitive null types (struct, array, map, variant). Emitted by the
-    /// kernel-to-engine visitor when the null's type is not a primitive. Engines that receive
-    /// this tag should use opaque expressions or a schema visitor to obtain full type details.
+    TimestampNanosNtz = 16,
+    /// Sentinel for non-primitive null types (struct, array, map, variant) and void. Emitted by
+    /// the kernel-to-engine visitor when the null's type cannot be reconstructed from a compact
+    /// tag. Engines that receive this tag should use opaque expressions or a schema visitor to
+    /// obtain full type details.
     ///
     /// Passing this tag to [`visit_expression_literal_null`] returns an error because the
     /// original complex type cannot be reconstructed from a tag alone.
@@ -504,8 +527,10 @@ impl TryFrom<u8> for NullTypeTag {
             10 => Ok(Self::Timestamp),
             11 => Ok(Self::TimestampNtz),
             12 => Ok(Self::Decimal),
-            13 => Ok(Self::TimestampNanos),
-            14 => Ok(Self::TimestampNanosNtz),
+            13 => Ok(Self::IntervalYearMonth),
+            14 => Ok(Self::IntervalDayTime),
+            15 => Ok(Self::TimestampNanos),
+            16 => Ok(Self::TimestampNanosNtz),
             255 => Ok(Self::NonPrimitive),
             other => Err(delta_kernel::Error::generic(format!(
                 "Unrecognized null type tag: {other}"
@@ -532,16 +557,14 @@ impl NullTypeTag {
                 PrimitiveType::String => (Self::String, 0, 0),
                 PrimitiveType::Binary => (Self::Binary, 0, 0),
                 PrimitiveType::Date => (Self::Date, 0, 0),
+                PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
+                PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
                 #[cfg(feature = "nanosecond-timestamps")]
                 PrimitiveType::TimestampNanos => (Self::TimestampNanos, 0, 0),
                 #[cfg(feature = "nanosecond-timestamps")]
                 PrimitiveType::TimestampNanosNtz => (Self::TimestampNanosNtz, 0, 0),
-                PrimitiveType::Timestamp => (Self::Timestamp, 0, 0),
-                PrimitiveType::TimestampNtz => (Self::TimestampNtz, 0, 0),
-                PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
-                    // No FFI null tag for intervals; the sentinel avoids a new discriminant
-                    (Self::NonPrimitive, 0, 0)
-                }
+                PrimitiveType::IntervalYearMonth => (Self::IntervalYearMonth, 0, 0),
+                PrimitiveType::IntervalDayTime => (Self::IntervalDayTime, 0, 0),
                 PrimitiveType::Decimal(dt) => (Self::Decimal, dt.precision(), dt.scale()),
                 // Void has no dedicated FFI tag. The current predicate-construction path is
                 // not expected to produce a void-typed literal null; if one ever reaches this
@@ -549,6 +572,13 @@ impl NullTypeTag {
                 // case, so this arm is a defensive fallback rather than part of the normal
                 // void-column path.
                 PrimitiveType::Void => (Self::NonPrimitive, 0, 0),
+                // A geometry/geography's coordinate reference system string doesn't fit the
+                // (tag, u8, u8) payload, so map to the NonPrimitive sentinel. See #2949 for
+                // real geo FFI support.
+                #[cfg(feature = "geo-type-in-dev")]
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
+                    (Self::NonPrimitive, 0, 0)
+                }
             },
             _ => (Self::NonPrimitive, 0, 0),
         }
@@ -574,6 +604,8 @@ impl NullTypeTag {
             Self::String => Ok(DataType::STRING),
             Self::Binary => Ok(DataType::BINARY),
             Self::Date => Ok(DataType::DATE),
+            Self::Timestamp => Ok(DataType::TIMESTAMP),
+            Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
             #[cfg(not(feature = "nanosecond-timestamps"))]
             Self::TimestampNanos => Err(delta_kernel::Error::generic(
                 "`nanosecond-timestamps` Cargo feature not enabled",
@@ -586,8 +618,8 @@ impl NullTypeTag {
             )),
             #[cfg(feature = "nanosecond-timestamps")]
             Self::TimestampNanosNtz => Ok(DataType::TIMESTAMP_NANOS_NTZ),
-            Self::Timestamp => Ok(DataType::TIMESTAMP),
-            Self::TimestampNtz => Ok(DataType::TIMESTAMP_NTZ),
+            Self::IntervalYearMonth => Ok(DataType::INTERVAL_YEAR_MONTH),
+            Self::IntervalDayTime => Ok(DataType::INTERVAL_DAY_TIME),
             Self::Decimal => Ok(DataType::Primitive(PrimitiveType::decimal(
                 precision, scale,
             )?)),
@@ -798,7 +830,7 @@ fn visit_predicate_opaque_impl(
         return Ok(0);
     }
     tracing::info!("opaque predicate `{name}`: no eval callbacks; kernel will not prune on it");
-    Ok(wrap_predicate(state, Predicate::null_literal()))
+    Ok(wrap_predicate(state, Predicate::NULL))
 }
 
 /// Build an opaque predicate over `FfiOpaquePredicateOp(name, callbacks)` and
@@ -854,7 +886,7 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::{col, lit, Expression, Scalar};
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
@@ -877,6 +909,8 @@ mod tests {
     #[case(DataType::DATE, NullTypeTag::Date, 0, 0)]
     #[case(DataType::TIMESTAMP, NullTypeTag::Timestamp, 0, 0)]
     #[case(DataType::TIMESTAMP_NTZ, NullTypeTag::TimestampNtz, 0, 0)]
+    #[case(DataType::INTERVAL_YEAR_MONTH, NullTypeTag::IntervalYearMonth, 0, 0)]
+    #[case(DataType::INTERVAL_DAY_TIME, NullTypeTag::IntervalDayTime, 0, 0)]
     fn from_data_type_primitive(
         #[case] dt: DataType,
         #[case] expected_tag: NullTypeTag,
@@ -944,6 +978,8 @@ mod tests {
     #[case(NullTypeTag::Date, DataType::DATE)]
     #[case(NullTypeTag::Timestamp, DataType::TIMESTAMP)]
     #[case(NullTypeTag::TimestampNtz, DataType::TIMESTAMP_NTZ)]
+    #[case(NullTypeTag::IntervalYearMonth, DataType::INTERVAL_YEAR_MONTH)]
+    #[case(NullTypeTag::IntervalDayTime, DataType::INTERVAL_DAY_TIME)]
     fn to_data_type_primitive(#[case] tag: NullTypeTag, #[case] expected: DataType) {
         assert_eq!(tag.to_data_type(0, 0).unwrap(), expected);
     }
@@ -990,8 +1026,10 @@ mod tests {
     #[case(10, NullTypeTag::Timestamp)]
     #[case(11, NullTypeTag::TimestampNtz)]
     #[case(12, NullTypeTag::Decimal)]
-    #[case(13, NullTypeTag::TimestampNanos)]
-    #[case(14, NullTypeTag::TimestampNanosNtz)]
+    #[case(13, NullTypeTag::IntervalYearMonth)]
+    #[case(14, NullTypeTag::IntervalDayTime)]
+    #[case(15, NullTypeTag::TimestampNanos)]
+    #[case(16, NullTypeTag::TimestampNanosNtz)]
     #[case(255, NullTypeTag::NonPrimitive)]
     fn try_from_u8_valid(#[case] value: u8, #[case] expected: NullTypeTag) {
         assert_eq!(NullTypeTag::try_from(value).unwrap(), expected);
@@ -1050,6 +1088,8 @@ mod tests {
     #[case(DataType::DATE)]
     #[case(DataType::TIMESTAMP)]
     #[case(DataType::TIMESTAMP_NTZ)]
+    #[case(DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::INTERVAL_DAY_TIME)]
     fn null_type_round_trips_through_tag_encoding(#[case] data_type: DataType) {
         let (tag, precision, scale) = NullTypeTag::from_data_type(&data_type);
         let mut state = KernelExpressionVisitorState::default();
@@ -1069,6 +1109,30 @@ mod tests {
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, Expression::literal(Scalar::Null(dt)));
+    }
+
+    #[rstest]
+    #[case(Scalar::IntervalYearMonth(17))]
+    #[case(Scalar::IntervalDayTime(1_234_567))]
+    #[case(Scalar::IntervalYearMonth(-13))]
+    #[case(Scalar::IntervalYearMonth(i32::MIN))]
+    #[case(Scalar::IntervalYearMonth(i32::MAX))]
+    #[case(Scalar::IntervalDayTime(-86_400_000_000))]
+    #[case(Scalar::IntervalDayTime(i64::MIN))]
+    #[case(Scalar::IntervalDayTime(i64::MAX))]
+    fn interval_literal_visitors_build_interval_scalars(#[case] expected: Scalar) {
+        let mut state = KernelExpressionVisitorState::default();
+        let id = match expected {
+            Scalar::IntervalYearMonth(value) => {
+                visit_expression_literal_interval_year_month(&mut state, value)
+            }
+            Scalar::IntervalDayTime(value) => {
+                visit_expression_literal_interval_day_time(&mut state, value)
+            }
+            _ => unreachable!(),
+        };
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(expr, Expression::literal(expected));
     }
 
     // ============================================================================
@@ -1137,7 +1201,7 @@ mod tests {
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
         // No eval callbacks => NULL boolean literal, which abstains everywhere (even under NOT).
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
         // Children are drained from the visitor state even though they're discarded.
         assert!(state.inflight_ids.is_empty());
     }
@@ -1177,7 +1241,7 @@ mod tests {
         let id = ok_or_panic(result);
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
     }
 
     /// Drives `visit_predicate_opaque_with_eval` end to end: pass the callbacks struct by value,
@@ -1352,8 +1416,8 @@ mod tests {
 
         // Build the predicate through the FFI symbol, then extract the kernel `Predicate`.
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {
@@ -1481,8 +1545,8 @@ mod tests {
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {

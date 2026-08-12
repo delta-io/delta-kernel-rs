@@ -31,6 +31,8 @@ the caller's memory space.
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
 - `src/ffi_metrics.rs` -- `repr(C)` mirror of kernel `MetricEvent` types (`#[cfg(feature = "tracing")]`)
+- `src/alloc_stats.rs` -- `peak_alloc` global allocator and native-heap FFI getters
+  (`alloc-tracking`)
 
 ## Read Flow
 
@@ -49,19 +51,58 @@ Snapshot builder API (`ffi/src/lib.rs`):
 
 The caller owns the returned builder handle and must call either `snapshot_builder_build` or `free_snapshot_builder`.
 
+Snapshot accessors (`ffi/src/lib.rs`) read a built `SharedSnapshot` without I/O -- e.g. `version`,
+`snapshot_timestamp`, and `snapshot_file_stats`, which returns `OptionalValue<FfiFileStats>` (scalar
+`num_files` / `table_size_bytes` from the CRC; `None` when the snapshot has no CRC, or its CRC lacks
+complete file stats).
+
+Domain-metadata reads live in `ffi/src/domain_metadata.rs`: `get_domain_metadata` /
+`visit_domain_metadata` for user domains, and `visit_clustering_columns`, which reports one
+descriptor per clustering column -- logical name, physical name (what per-file stats are keyed on),
+and a type tag -- without exposing the guarded `delta.*` domain JSON directly. It returns
+`OptionalValue<usize>`: `None` means not clustered, `Some(0)` means clustered on no columns. The
+type tag reuses the `visit_expression_literal_null` encoding, with 255 for types that don't fit a
+compact tag (struct, array, map, variant, void, and geometry/geography).
+
 ## Commit Range Flow
 
-A `CommitRange` describes a contiguous commits of table. Build one
-via the commit range builder (`ffi/src/commit_range.rs`):
+A `CommitRange` describes a contiguous range of a table's commits. Build one via the commit range
+builder (`ffi/src/commit_range.rs`):
 
 ```
 commit_range_builder_for(path, start_version, engine)
   -> commit_range_builder_set_end_version(builder, end_version)  // optional; else latest version
   -> commit_range_builder_build(builder)                         // -> SharedCommitRange, always consume builder
+  -> commit_range_commits(range, engine, actions, actions_len)   // -> SharedCommitActionsIterator
+       // or commit_range_commits_with_snapshot(range, engine, start_snapshot, actions, actions_len)
+  -> commit_range_commits_next(iter, ctx, visitor)               // visitor receives a SharedCommitAction
+       // in the visitor: commit_action_version / commit_action_timestamp
+       //                  commit_action_get_actions(action, engine) -> ExclusiveFileReadResultIterator
+       //                    -> read_result_next(...) -> free_read_result_iter(...)
 ```
 
 The caller owns the builder and must call either `commit_range_builder_build` or
-`free_commit_range_builder`. Release the range with `free_commit_range`.
+`free_commit_range_builder`. Release the range with `free_commit_range` and the commits iterator
+with `free_commit_actions_iter`. Each `SharedCommitAction` handed to the visitor must be released
+with `free_commit_action`.
+
+## Incremental Scan Flow
+
+An incremental scan streams the file-action diff between a base version and a target snapshot
+(`ffi/src/incremental_scan.rs`):
+
+```
+snapshot_incremental_scan_builder(snapshot, base_version, engine)
+  -> incremental_scan_builder_with_predicate(builder, engine, predicate)  // optional; prunes live Adds
+  -> incremental_scan_builder_build(builder)      // -> OptionalValue<stream>; None => full-scan fallback
+  -> incremental_scan_stream_next_arrow(stream)*  // optional: pull live-Add batches as Arrow
+  -> incremental_scan_stream_into_summary(stream) // live-Add / Remove key sets; consumes the stream
+```
+
+The module-level docs in `incremental_scan.rs` are the source of truth for the error contract
+(any `next_arrow` error kills the stream), the `OptionalValue::None` full-scan-fallback signal,
+the pass-through-field version caveat (kernel issue #2552), and handle release. The Arrow batch
+reuses `ScanMetadataArrowResult` with null `transforms`.
 
 ## Write Flow
 
@@ -76,6 +117,26 @@ get_default_engine() -> transaction() -> with_engine_info() -> with_operation() 
 ```
 
 `commit()` and `create_table_commit()` return a `Handle<ExclusiveCommittedTransaction>` that the caller can read via `committed_transaction_version` and `committed_transaction_post_commit_snapshot`, then must release with `free_committed_transaction`. The post-commit snapshot, when present, is a separate `SharedSnapshot` handle that must be freed with `free_snapshot`.
+
+Write context: `get_unpartitioned_write_context` covers unpartitioned tables. For partitioned tables, build a `PartitionValueMap` (`partition_value_map_new` + the typed `partition_value_map_insert_*` functions, one entry per partition column keyed by logical name) and pass it to `get_partitioned_write_context` (consumes the map). Then use `get_write_dir` for the partition's target directory (Hive-style prefix or random prefix), `visit_partition_values` to read the physical `partitionValues` to record in each Add action, and `resolve_file_path` to turn a written file's URL into its relative `add.path`. The `create_table_*` variants apply the same flow to a create-table transaction whose partition columns were declared with `create_table_builder_with_partition_columns`.
+
+Catalog-managed publish flow (after a catalog committer stages commits):
+
+```
+committed_transaction_post_commit_snapshot()
+  -> snapshot_publish_with_committer(snapshot, committer, engine)
+     // borrows snapshot; consumes committer (do not free)
+  -> use returned snapshot for subsequent transaction_with_committer / checkpoint
+     // mint a fresh get_uc_committer for that transaction -- it also consumes
+  -> free_snapshot (returned snapshot) when done
+  -> free_snapshot (post-commit input snapshot)
+```
+
+`snapshot_publish_with_committer` mirrors kernel `Snapshot::publish`: it copies ratified staged
+commits into `_delta_log/` via the catalog committer's `publish()` implementation. The input
+snapshot is borrowed; the committer is consumed (do not free). The caller owns the returned
+snapshot handle. The returned snapshot carries the published watermark (`max_published_version`)
+needed for the next catalog commit; do not continue from the pre-publish post-commit snapshot.
 
 Deletion vector update flow:
 
@@ -127,7 +188,53 @@ cargo build -p delta_kernel_ffi --release
 Feature flags:
 - `default-engine-rustls` (default)
 - `default-engine-native-tls`
-- `arrow` (default; currently maps to `arrow-58`)
-- `arrow-58`, `arrow-57`
+- `arrow` (default; currently maps to `arrow-59`)
+- `arrow-59`, `arrow-58`
 - `delta-kernel-unity-catalog`
 - `tracing`
+- `alloc-tracking` -- installs `peak_alloc` as the tracking global allocator; enables meaningful
+  `*_native_bytes` / `alloc_tracking_enabled` getters (cdylib only; conflicts with
+  another `#[global_allocator]` if linked as an rlib)
+
+## Testing under Miri
+
+CI runs this crate's tests under Miri (the `miri` job in `build.yml`) to catch undefined
+behavior in the `unsafe` FFI boundary: raw-pointer reads/writes, `unsafe impl Send/Sync`,
+`Handle` conversions (`as_ref` / `clone_as_arc` / `into_inner`), and `free_*`. Miri is a MIR
+interpreter, so it runs 10x-100x slower than native and is billed by the interpreted
+instruction, not wall-clock work.
+
+The consequence: a test is expensive under Miri in proportion to how much *code it executes*,
+not how much it asserts. Tests that construct heavyweight but **safe** machinery -- a
+reqwest/rustls client (crypto init), a multi-threaded tokio runtime, an Arrow/parquet write --
+cost minutes under the interpreter while exercising none of our `unsafe`. That time buys no
+UB detection.
+
+Guidance for adding or triaging FFI tests:
+
+- **Keep under Miri** any test that executes `unsafe` whose correctness Miri can check. This is
+  the reason the job exists; do not skip these for speed.
+- **Never add new `unsafe` to a Miri-ignored test.** An ignored test is invisible to Miri, so
+  `unsafe` introduced in one is never checked for undefined behavior, and nothing in CI reports
+  the gap. When a change needs new `unsafe` in an ignored test, either exercise that `unsafe`
+  from a test that runs under Miri, or un-skip the test.
+- **`#[cfg_attr(miri, ignore)]` is legitimate for two reasons, and only these two:**
+  1. Miri cannot run it (e.g. an unsupported foreign function). Before accepting this, check
+     whether the blocker is avoidable: local-filesystem storage reaches `std::fs::hard_link`
+     (`linkat`), which Miri rejects, but in-memory storage does not. Prefer an in-memory store.
+  2. The test executes no `unsafe`, OR only `unsafe` that a kept test already covers, AND it is
+     expensive under Miri. Skip only with the coverage argument; skipping for cost alone drops
+     UB coverage.
+- When you skip under reason 2, **prove the coverage is preserved**: the kept tests' set of
+  `unsafe` FFI functions must be a superset of the skipped test's. Name the covering test in the
+  `ignore` reason or a nearby comment so a future reader can re-check it.
+- Miri's leak check also flags handles a test itself forgot to free. Triage before assuming a bug
+  in the code under test: a missing `free_*` in the test is a test fix, while an unjoined
+  background thread at teardown can be an artifact of how the test ends.
+- Prefer picking the **cheapest** test that crosses a given `unsafe` path over keeping several
+  that cross the same path with more safe work each.
+- `rest_engine` and the checkpoint tests in `lib.rs` document worked examples of this split.
+- `-Zmiri-provenance-gc=1000000` on the Miri step is a pure speed knob (GC frequency) and does
+  not weaken detection. Do NOT add `-Zmiri-disable-stacked-borrows`, `-disable-validation`,
+  `-disable-data-race-detector`, or `-Zmiri-preemption-rate=0`: the first three are unsound, and
+  the last reduces data-race schedule exploration.

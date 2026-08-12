@@ -1,5 +1,6 @@
 //! This module holds functionality for managing transactions.
 mod deletion_vector;
+mod partition_value;
 mod transaction_id;
 mod write_context;
 
@@ -15,8 +16,19 @@ use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{CommitResult, CommittedTransaction, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
+pub use partition_value::{
+    free_partition_value_map, partition_value_map_insert_binary, partition_value_map_insert_bool,
+    partition_value_map_insert_byte, partition_value_map_insert_date,
+    partition_value_map_insert_decimal, partition_value_map_insert_double,
+    partition_value_map_insert_float, partition_value_map_insert_int,
+    partition_value_map_insert_long, partition_value_map_insert_null,
+    partition_value_map_insert_short, partition_value_map_insert_string,
+    partition_value_map_insert_timestamp, partition_value_map_insert_timestamp_ntz,
+    partition_value_map_new, ExclusivePartitionValueMap,
+};
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -476,10 +488,101 @@ pub unsafe extern "C" fn committed_transaction_post_commit_snapshot(
 #[handle_descriptor(target=CreateTableTransactionBuilder, mutable=true, sized=true)]
 pub struct ExclusiveCreateTableBuilder;
 
-// TODO: Add `create_table_builder_with_data_layout` FFI function to support partitioned and
-// clustered table creation. The kernel's
-// `CreateTableTransactionBuilder::with_data_layout(DataLayout)` supports this but is not yet
-// exposed through FFI.
+/// Collect `num_columns` column-name string slices into owned `String`s.
+///
+/// Returns an empty `Vec` when `num_columns == 0` without dereferencing `columns`, so a null
+/// pointer is sound in the empty case. Returns `Err` if any slice is not valid UTF-8.
+///
+/// # Safety
+///
+/// When `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid
+/// [`KernelStringSlice`] values whose backing bytes are readable for the duration of the call.
+unsafe fn collect_create_table_columns(
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+) -> DeltaResult<Vec<String>> {
+    if num_columns == 0 {
+        return Ok(Vec::new());
+    }
+    let slices = unsafe { std::slice::from_raw_parts(columns, num_columns) };
+    slices
+        .iter()
+        .map(|slice| {
+            unsafe { TryFromStringSlice::try_from_slice(slice) }.map(|s: &str| s.to_string())
+        })
+        .collect()
+}
+
+/// Set a clustered data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// clustering column names (in order). Clustering and partitioning are mutually exclusive; the
+/// last data-layout call wins. Column validation (existence, stats-eligible types, duplicates)
+/// happens later at [`create_table_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// Only top-level columns are supported through this entry point (each slice is one column name);
+/// nested clustering columns must be set on the Rust builder directly.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_with_clustering_columns(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::clustered))
+        .into_extern_result(&engine)
+}
+
+/// Set a partitioned data layout on a [`CreateTableTransactionBuilder`] from an array of top-level
+/// partition column names (in order). Clustering and partitioning are mutually exclusive; the last
+/// data-layout call wins. Column validation (existence, primitive types, subset of schema) happens
+/// later at [`create_table_builder_build`].
+///
+/// This consumes the builder handle and returns a new one. The caller MUST replace their handle
+/// pointer with the returned handle. On error, the old builder handle is consumed and gone --
+/// do not free or reuse it. There is no new handle to free either.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid builder handle and a valid `engine`. When
+/// `num_columns > 0`, `columns` must point to `num_columns` contiguous, valid `KernelStringSlice`
+/// values whose backing bytes are readable for the duration of the call; `columns` may be null
+/// when `num_columns == 0`. CONSUMES the builder handle unconditionally (even on error).
+#[no_mangle]
+pub unsafe extern "C" fn create_table_builder_with_partition_columns(
+    builder: Handle<ExclusiveCreateTableBuilder>,
+    columns: *const KernelStringSlice,
+    num_columns: usize,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveCreateTableBuilder>> {
+    let engine = unsafe { engine.as_ref() };
+    let builder = unsafe { *builder.into_inner() };
+    let columns = unsafe { collect_create_table_columns(columns, num_columns) };
+    create_table_builder_with_data_layout_impl(builder, columns.map(DataLayout::partitioned))
+        .into_extern_result(&engine)
+}
+
+/// Shared lowering for the data-layout FFI entry points, extracted from the `unsafe extern`
+/// wrappers so it can be unit-tested. `layout` is a `DeltaResult` so a column-parse failure
+/// short-circuits here, dropping the already-consumed builder rather than producing a layout.
+fn create_table_builder_with_data_layout_impl(
+    builder: CreateTableTransactionBuilder,
+    layout: DeltaResult<DataLayout>,
+) -> DeltaResult<Handle<ExclusiveCreateTableBuilder>> {
+    Ok(Box::new(builder.with_data_layout(layout?)).into())
+}
 
 /// Create a new [`CreateTableTransactionBuilder`] for creating a Delta table at the given path.
 ///
@@ -689,25 +792,29 @@ mod tests {
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, SchemaRef, StructField,
+        StructType,
     };
     use delta_kernel::table_features::TableFeature;
     use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::error::KernelError;
     use delta_kernel_ffi::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, build_snapshot,
-        ok_or_panic, recover_error, recover_string,
+        engine_handle_for_store, ok_or_panic, recover_error, recover_string,
     };
     use delta_kernel_ffi::tests::get_default_engine;
     use itertools::Itertools;
     use rstest::rstest;
     use serde_json::{json, Deserializer};
     use tempfile::tempdir;
+    use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+    use test_utils::delta_kernel_default_engine::DefaultEngine;
     use test_utils::{set_json_value, setup_test_tables, test_read};
     use write_context::{
         create_table_get_unpartitioned_write_context, free_write_context, get_logical_to_physical,
-        get_physical_write_schema, get_unpartitioned_write_context, get_write_path,
-        get_write_schema, SharedWriteContext,
+        get_partitioned_write_context, get_physical_write_schema, get_unpartitioned_write_context,
+        get_write_dir, get_write_path, get_write_schema, resolve_file_path, visit_partition_values,
+        SharedWriteContext,
     };
 
     use super::*;
@@ -718,9 +825,37 @@ mod tests {
     };
     use crate::{
         free_engine, free_schema, free_snapshot, kernel_string_slice, logical_schema, version,
+        KernelStringSlice, NullableCvoid, OptionalValue,
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    type LocalTestTables = Vec<(
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<DynObjectStore>,
+        &'static str,
+    )>;
+
+    /// Create v1.1 and v3.7 test tables on the local filesystem under a fresh temp directory.
+    ///
+    /// Keep the returned [`tempfile::TempDir`] alive for the duration of the test.
+    async fn setup_local_test_tables(
+        schema: SchemaRef,
+        partition_columns: &[&str],
+        table_base_name: &str,
+    ) -> Result<(tempfile::TempDir, LocalTestTables), Box<dyn std::error::Error>> {
+        let tmp_test_dir = tempdir()?;
+        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        let tables = setup_test_tables(
+            schema,
+            partition_columns,
+            Some(&tmp_dir_url),
+            table_base_name,
+        )
+        .await?;
+        Ok((tmp_test_dir, tables))
+    }
 
     /// Reads the committed version from a [`Handle<ExclusiveCommittedTransaction>`] and
     /// frees the handle.
@@ -802,29 +937,55 @@ mod tests {
         create_file_metadata(file_path, file_size_bytes, num_rows, metadata_schema)
     }
 
+    /// Write `batch` as parquet into `store` at `file_path` and return its Add-action metadata.
+    ///
+    /// The store-based counterpart to [`write_parquet_file`], for tests that must avoid
+    /// `std::fs` so they can run under Miri.
+    async fn put_parquet_file(
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
+        file_path: &str,
+        batch: &RecordBatch,
+        metadata_schema: ArrowSchema,
+    ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        let props = WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))?;
+        writer.write(batch)?;
+        let res = writer.close()?;
+
+        let file_size_bytes = buf.len() as u64;
+        let url = table_url.join(file_path)?;
+        let path = Path::from_url_path(url.path())?;
+        store.put(&path, buf.into()).await?;
+
+        create_file_metadata(
+            file_path,
+            file_size_bytes,
+            res.file_metadata().num_rows(),
+            metadata_schema,
+        )
+    }
+
     #[tokio::test]
-    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    // Keeps local storage: `canonicalize` on the FFI-returned write path has no in-memory
+    // equivalent.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in a test that
+    // runs under Miri.
+    #[cfg_attr(
+        miri,
+        ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
+    )]
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(StructType::try_new(vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("string", DataType::STRING),
         ])?);
 
-        // Create a temporary local directory for use during this test
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-
         // TODO: test with partitions
-        let partition_columns = vec![];
-
-        for (table_url, _engine, store, _table_name) in setup_test_tables(
-            schema,
-            &partition_columns,
-            Some(&tmp_dir_local_url),
-            "test_table",
-        )
-        .await?
-        {
+        let (_tmp_test_dir, tables) = setup_local_test_tables(schema, &[], "test_table").await?;
+        for (table_url, _engine, store, _table_name) in tables {
             let table_path = table_url.to_file_path().unwrap();
             let table_path_str = table_path.to_str().unwrap();
             let engine = get_default_engine(table_path_str);
@@ -974,6 +1135,394 @@ mod tests {
         Ok(())
     }
 
+    /// Callback for [`visit_partition_values`] that collects each entry into a
+    /// `Vec<(key, value, is_null)>` passed via the engine context pointer.
+    extern "C" fn collect_partition_value(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+        is_null: bool,
+    ) {
+        let collected =
+            unsafe { &mut *(engine_context.unwrap().as_ptr() as *mut Vec<(String, String, bool)>) };
+        let key = unsafe { String::try_from_slice(&key) }.unwrap();
+        let value = unsafe { String::try_from_slice(&value) }.unwrap();
+        collected.push((key, value, is_null));
+    }
+
+    #[tokio::test]
+    // Keeps local storage: the test creates the Hive partition directory on disk, which an object
+    // store does not have.
+    // DO NOT ADD NEW `unsafe` HERE (unsafe not already run by a Miri test): Miri never runs this
+    // test, so unsafe unique to it goes unchecked for undefined behavior. Put it in a test that
+    // runs under Miri.
+    #[cfg_attr(
+        miri,
+        ignore = "local-filesystem commit calls `linkat`, unsupported under Miri"
+    )]
+    async fn test_partitioned_append() -> Result<(), Box<dyn std::error::Error>> {
+        // Partition column `part` is listed last in the schema; the physical write schema must
+        // exclude it (CM=none, partition columns are not materialized).
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("string", DataType::STRING),
+            StructField::nullable("part", DataType::INTEGER),
+        ])?);
+
+        let (_tmp_test_dir, tables) =
+            setup_local_test_tables(schema, &["part"], "test_partitioned_table").await?;
+        for (table_url, _engine, store, _table_name) in tables {
+            let table_path = table_url.to_file_path().unwrap();
+            let table_path_str = table_path.to_str().unwrap();
+            let engine = get_default_engine(table_path_str);
+
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
+            });
+            unsafe { set_data_change(txn.shallow_copy(), true) };
+            let engine_info = "default_engine";
+            let txn = unsafe {
+                ok_or_panic(with_engine_info(
+                    txn,
+                    kernel_string_slice!(engine_info),
+                    engine.shallow_copy(),
+                ))
+            };
+            let operation = "WRITE";
+            let txn = unsafe {
+                ok_or_panic(with_operation(
+                    txn,
+                    kernel_string_slice!(operation),
+                    engine.shallow_copy(),
+                ))
+            };
+
+            // Build the partition values map: part = 100.
+            let part_name = "part";
+            let partition_values = partition_value_map_new();
+            let inserted = ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(part_name),
+                    100,
+                    engine.shallow_copy(),
+                )
+            });
+            assert!(inserted);
+
+            let write_context = ok_or_panic(unsafe {
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
+            });
+
+            // Physical write schema excludes the partition column.
+            let write_schema = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
+            let write_schema_ref = unsafe { write_schema.as_ref() };
+            assert_eq!(write_schema_ref.num_fields(), 2);
+            assert_eq!(write_schema_ref.field_at_index(0).unwrap().name, "number");
+            assert_eq!(write_schema_ref.field_at_index(1).unwrap().name, "string");
+
+            // The write directory carries the Hive-style partition prefix.
+            let write_dir_str = recover_string(
+                unsafe { get_write_dir(write_context.shallow_copy(), allocate_str) }.unwrap(),
+            );
+            let write_dir_url = Url::parse(&write_dir_str)?;
+            assert!(
+                write_dir_url.path().ends_with("part=100/"),
+                "unexpected write dir: {write_dir_str}"
+            );
+
+            // The serialized partition values surface the physical name and value.
+            let mut collected: Vec<(String, String, bool)> = Vec::new();
+            let ctx = std::ptr::NonNull::new(
+                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
+            );
+            unsafe {
+                visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
+            };
+            assert_eq!(
+                collected,
+                vec![("part".to_string(), "100".to_string(), false)]
+            );
+
+            // Write the parquet data (partition column excluded) into the partition directory.
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "number",
+                    Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                ),
+                (
+                    "string",
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let dir_path = write_dir_url.to_file_path().unwrap();
+            std::fs::create_dir_all(&dir_path)?;
+            let file_name = "my_file.parquet";
+            let file_fs_path = dir_path.join(file_name);
+            let parquet_file = std::fs::File::create(&file_fs_path)?;
+            let mut writer = ArrowWriter::try_new(
+                parquet_file,
+                batch.schema(),
+                Some(WriterProperties::builder().build()),
+            )?;
+            writer.write(&batch)?;
+            let parquet_meta = writer.close()?;
+            let num_rows = parquet_meta.file_metadata().num_rows();
+            let size = std::fs::metadata(&file_fs_path)?.len();
+
+            // Resolve the relative add.path from the absolute file URL.
+            let file_url = write_dir_url.join(file_name)?;
+            let file_url_str = file_url.as_str();
+            let add_path = recover_string(
+                ok_or_panic(unsafe {
+                    resolve_file_path(
+                        write_context.shallow_copy(),
+                        kernel_string_slice!(file_url_str),
+                        allocate_str,
+                        engine.shallow_copy(),
+                    )
+                })
+                .unwrap(),
+            );
+            assert_eq!(add_path, "part=100/my_file.parquet");
+
+            // Build the add metadata with the populated partitionValues.
+            let metadata_json = format!(
+                r#"{{"path":"{add_path}", "partitionValues": {{"part":"100"}}, "size": {size}, "modificationTime": 0, "stats": {{"numRecords": {num_rows}}}}}"#,
+            );
+            let metadata_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() }
+                .as_ref()
+                .try_into_arrow()?;
+            let file_info = create_arrow_ffi_from_json(metadata_schema, &metadata_json)?;
+            let file_info_engine_data = ok_or_panic(unsafe {
+                get_engine_data(file_info.array, &file_info.schema, allocate_err)
+            });
+            unsafe { add_files(txn.shallow_copy(), file_info_engine_data) };
+
+            let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+            unsafe { free_committed_transaction(committed) };
+
+            // The commit's add action records the partition values and Hive-style path.
+            let commit1_url = table_url
+                .join("_delta_log/00000000000000000001.json")
+                .unwrap();
+            let commit1 = store
+                .get(&Path::from_url_path(commit1_url.path()).unwrap())
+                .await?;
+            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+            let add = &parsed_commits[1]["add"];
+            assert_eq!(add["path"], json!("part=100/my_file.parquet"));
+            assert_eq!(add["partitionValues"], json!({ "part": "100" }));
+
+            // The read reconstructs the partition column for every row.
+            let expected = RecordBatch::try_from_iter(vec![
+                (
+                    "number",
+                    Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                ),
+                (
+                    "string",
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                ),
+                (
+                    "part",
+                    Arc::new(Int32Array::from(vec![100, 100, 100])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let expected_engine_data = ArrowEngineData::from(expected);
+            test_read(&expected_engine_data, &table_url, unsafe {
+                engine.as_ref().engine()
+            })?;
+
+            unsafe { free_schema(write_schema) };
+            unsafe { free_write_context(write_context) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_write_context_rejects_unpartitioned_table(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+            "number",
+            DataType::INTEGER,
+        )])?);
+        let tables = setup_test_tables(schema, &[], None, "test_unpartitioned").await?;
+
+        for (table_url, _engine, store, _table_name) in tables {
+            let table_url_str = table_url.as_str();
+            let engine = engine_handle_for_store(store);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+            });
+
+            // Supplying partition values for a non-partitioned table is an error, and the call
+            // still consumes the map handle.
+            let partition_values = partition_value_map_new();
+            let name = "nope";
+            let _ = ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(name),
+                    1,
+                    engine.shallow_copy(),
+                )
+            });
+            let result = unsafe {
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
+            };
+            let err = match result {
+                ExternResult::Err(e) => unsafe { recover_error(e) },
+                ExternResult::Ok(_) => panic!("expected error for unpartitioned table"),
+            };
+            assert!(
+                err.message.contains("not partitioned"),
+                "unexpected error: {}",
+                err.message
+            );
+            unsafe { free_transaction(txn) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_visit_partition_values_surfaces_null() -> Result<(), Box<dyn std::error::Error>> {
+        // A null partition value must surface across the visitor as `is_null = true` with an
+        // empty value slice (the documented C contract).
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("part", DataType::INTEGER),
+        ])?);
+        let tables = setup_test_tables(schema, &["part"], None, "test_null_partition").await?;
+
+        for (table_url, _engine, store, _table_name) in tables {
+            let table_url_str = table_url.as_str();
+            let engine = engine_handle_for_store(store);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+            });
+
+            let partition_values = partition_value_map_new();
+            let part_name = "part";
+            // NullTypeTag::Integer == 3.
+            let _ = ok_or_panic(unsafe {
+                partition_value::partition_value_map_insert_null(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(part_name),
+                    crate::expressions::kernel_visitor::NullTypeTag::Integer as u8,
+                    0,
+                    0,
+                    engine.shallow_copy(),
+                )
+            });
+            let write_context = ok_or_panic(unsafe {
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
+            });
+
+            let mut collected: Vec<(String, String, bool)> = Vec::new();
+            let ctx = std::ptr::NonNull::new(
+                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
+            );
+            unsafe {
+                visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
+            };
+            assert_eq!(collected, vec![("part".to_string(), String::new(), true)]);
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_visit_partition_values_is_sorted_by_key() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Multiple partition columns must be visited in deterministic (sorted) key order,
+        // regardless of insertion order or the underlying HashMap layout.
+        let schema = Arc::new(StructType::try_new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("region", DataType::STRING),
+            StructField::nullable("year", DataType::INTEGER),
+        ])?);
+        let tables =
+            setup_test_tables(schema, &["year", "region"], None, "test_multi_partition").await?;
+
+        for (table_url, _engine, store, _table_name) in tables {
+            let table_url_str = table_url.as_str();
+            let engine = engine_handle_for_store(store);
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_url_str), engine.shallow_copy())
+            });
+
+            let partition_values = partition_value_map_new();
+            // Insert in a different order than the expected sorted output.
+            let year = "year";
+            let _ = ok_or_panic(unsafe {
+                partition_value_map_insert_int(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(year),
+                    2024,
+                    engine.shallow_copy(),
+                )
+            });
+            let region = "region";
+            let region_val = "US";
+            let _ = ok_or_panic(unsafe {
+                partition_value_map_insert_string(
+                    partition_values.shallow_copy(),
+                    kernel_string_slice!(region),
+                    kernel_string_slice!(region_val),
+                    engine.shallow_copy(),
+                )
+            });
+            let write_context = ok_or_panic(unsafe {
+                get_partitioned_write_context(
+                    txn.shallow_copy(),
+                    partition_values,
+                    engine.shallow_copy(),
+                )
+            });
+
+            let mut collected: Vec<(String, String, bool)> = Vec::new();
+            let ctx = std::ptr::NonNull::new(
+                &mut collected as *mut Vec<(String, String, bool)> as *mut std::ffi::c_void,
+            );
+            unsafe {
+                visit_partition_values(write_context.shallow_copy(), ctx, collect_partition_value)
+            };
+            let keys: Vec<&str> = collected.iter().map(|(k, _, _)| k.as_str()).collect();
+            assert_eq!(keys, vec!["region", "year"]);
+
+            unsafe { free_write_context(write_context) };
+            unsafe { free_transaction(txn) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
+    }
+
     /// Read the commit log at `version` and return the `domainMetadata` action JSON.
     async fn read_domain_metadata_action(
         store: &DynObjectStore,
@@ -1000,16 +1549,11 @@ mod tests {
     /// Create a table with the `domainMetadata` writer feature enabled and return the table
     /// URL, object store, and FFI engine handle.
     async fn setup_domain_metadata_table(
-        dir_url: &Url,
         name: &str,
     ) -> Result<(Url, Arc<DynObjectStore>, Handle<SharedExternEngine>), Box<dyn std::error::Error>>
     {
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
-        let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup(name, Some(dir_url));
+        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
+        let (store, _test_engine, table_location) = test_utils::engine_store_setup(name, None);
         let table_url = test_utils::create_table(
             store.clone(),
             table_location,
@@ -1020,21 +1564,14 @@ mod tests {
             vec!["domainMetadata"],
         )
         .await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
-        let engine = get_default_engine(table_path_str);
+        let engine = engine_handle_for_store(Arc::clone(&store));
         Ok((table_url, store, engine))
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_add_and_remove() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-        let (table_url, store, engine) =
-            setup_domain_metadata_table(&tmp_dir_url, "test_dm").await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
+        let (table_url, store, engine) = setup_domain_metadata_table("test_dm").await?;
+        let table_path_str = table_url.as_str();
 
         // === Transaction 1: add domain metadata ===
         let txn = ok_or_panic(unsafe {
@@ -1086,15 +1623,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_system_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-        let (table_url, _store, engine) =
-            setup_domain_metadata_table(&tmp_dir_url, "test_dm_sys").await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_sys").await?;
+        let table_path_str = table_url.as_str();
 
         // with_domain_metadata succeeds (validation is lazy), but commit should fail
         let txn = ok_or_panic(unsafe {
@@ -1125,15 +1657,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_duplicate_domain_rejected_at_commit(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-        let (table_url, _store, engine) =
-            setup_domain_metadata_table(&tmp_dir_url, "test_dm_dup").await?;
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
+        let (table_url, _store, engine) = setup_domain_metadata_table("test_dm_dup").await?;
+        let table_path_str = table_url.as_str();
 
         // Adding the same domain twice should cause commit to fail
         let txn = ok_or_panic(unsafe {
@@ -1173,17 +1700,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_domain_metadata_rejected_without_feature(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp_test_dir = tempdir()?;
         let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
 
         // Create a table WITHOUT the domainMetadata writer feature (v1/v1 protocol)
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
+        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
         let (store, _test_engine, table_location) =
             test_utils::engine_store_setup("test_dm_no_feature", Some(&tmp_dir_url));
         let table_url = test_utils::create_table(
@@ -1229,7 +1752,6 @@ mod tests {
 
     #[cfg(feature = "delta-kernel-unity-catalog")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg_attr(miri, ignore)]
     async fn test_transaction_with_uc_committer() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel_ffi::{
             get_snapshot_builder, snapshot_builder_build, snapshot_builder_set_max_catalog_version,
@@ -1241,7 +1763,7 @@ mod tests {
         use crate::delta_kernel_unity_catalog::{
             free_uc_commit_client, get_uc_commit_client, get_uc_committer, CommitRequest,
         };
-        use crate::{Handle, NullableCvoid, OptionalValue};
+        use crate::{snapshot_publish_with_committer, Handle, NullableCvoid, OptionalValue};
 
         #[no_mangle]
         extern "C" fn test_uc_commit(
@@ -1252,9 +1774,8 @@ mod tests {
             context.commit_called = true;
 
             let table_id = unsafe { String::try_from_slice(&request.table_id).unwrap() };
-            let table_uri = unsafe { String::try_from_slice(&request.table_uri).unwrap() };
 
-            context.last_commit_request = Some((table_id.clone(), table_uri.clone()));
+            context.last_commit_table_id = Some(table_id.clone());
 
             // Capture the staged commit file name if present
             if let OptionalValue::Some(commit_info) = request.commit_info {
@@ -1270,12 +1791,9 @@ mod tests {
             StructField::nullable("string", DataType::STRING),
         ]));
 
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
-
         // Create a catalog-managed table so UCCommitter (a catalog committer) is allowed.
         let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup("test_uc_table", Some(&tmp_dir_local_url));
+            test_utils::engine_store_setup("test_uc_table", None);
         let table_url = test_utils::create_table(
             store.clone(),
             table_location,
@@ -1288,9 +1806,8 @@ mod tests {
         .await?;
 
         {
-            let table_path = table_url.to_file_path().unwrap();
-            let table_path_str = table_path.to_str().unwrap();
-            let engine = get_default_engine(table_path_str);
+            let table_path_str = table_url.as_str();
+            let engine = engine_handle_for_store(Arc::clone(&store));
 
             let snapshot = unsafe {
                 let mut ptr = ok_or_panic(get_snapshot_builder(
@@ -1305,16 +1822,26 @@ mod tests {
 
             let uc_client = unsafe { get_uc_commit_client(context, test_uc_commit) };
             let table_id = "test_id";
+            let catalog = "test_catalog";
+            let schema = "test_schema";
+            let table_name = "test_table";
             let uc_committer = unsafe {
                 ok_or_panic(get_uc_committer(
                     uc_client.shallow_copy(),
                     kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
                     allocate_err,
                 ))
             };
 
             let txn = ok_or_panic(unsafe {
-                transaction_with_committer(snapshot, engine.shallow_copy(), uc_committer)
+                transaction_with_committer(
+                    snapshot.shallow_copy(),
+                    engine.shallow_copy(),
+                    uc_committer,
+                )
             });
             unsafe { set_data_change(txn.shallow_copy(), false) };
 
@@ -1353,12 +1880,14 @@ mod tests {
                     .as_ref()
                     .add_files_schema()
             };
-            let file_info = write_parquet_file(
-                table_path_str,
+            let file_info = put_parquet_file(
+                &store,
+                &table_url,
                 "uc_test_file.parquet",
                 &batch,
                 parquet_schema.as_ref().try_into_arrow()?,
-            )?;
+            )
+            .await?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(file_info.array, &file_info.schema, allocate_err)
@@ -1370,6 +1899,85 @@ mod tests {
 
             // UC committer returns success from our mock callback
             let committed = ok_or_panic(commit_result);
+            let post_commit_snapshot =
+                match unsafe { committed_transaction_post_commit_snapshot(&committed) } {
+                    OptionalValue::Some(snapshot) => snapshot,
+                    OptionalValue::None => {
+                        panic!("UC commit should produce a post-commit snapshot")
+                    }
+                };
+            assert_eq!(unsafe { version(post_commit_snapshot.shallow_copy()) }, 1);
+
+            let publish_committer = unsafe {
+                ok_or_panic(get_uc_committer(
+                    uc_client.shallow_copy(),
+                    kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
+                    allocate_err,
+                ))
+            };
+            let published_snapshot = ok_or_panic(unsafe {
+                snapshot_publish_with_committer(
+                    post_commit_snapshot.shallow_copy(),
+                    publish_committer,
+                    engine.shallow_copy(),
+                )
+            });
+            assert_eq!(unsafe { version(published_snapshot.shallow_copy()) }, 1);
+            assert!(
+                !std::ptr::eq(unsafe { post_commit_snapshot.as_ref() }, unsafe {
+                    published_snapshot.as_ref()
+                },),
+                "first publish should return a new snapshot carrying published state"
+            );
+
+            let published_commit_url = table_url
+                .join("_delta_log/00000000000000000001.json")
+                .unwrap();
+            let published_commit = store
+                .get(&Path::from_url_path(published_commit_url.path()).unwrap())
+                .await?;
+            let published_content = published_commit.bytes().await?;
+            let published_actions: Vec<_> = Deserializer::from_slice(&published_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+            assert!(
+                published_actions.iter().any(|a| a.get("add").is_some()),
+                "Published commit should contain the add action"
+            );
+
+            // Second publish is a no-op when all staged commits are already published.
+            // Publish consumes the committer, so mint a fresh one for the second call.
+            let republish_committer = unsafe {
+                ok_or_panic(get_uc_committer(
+                    uc_client.shallow_copy(),
+                    kernel_string_slice!(table_id),
+                    kernel_string_slice!(catalog),
+                    kernel_string_slice!(schema),
+                    kernel_string_slice!(table_name),
+                    allocate_err,
+                ))
+            };
+            let republished_snapshot = ok_or_panic(unsafe {
+                snapshot_publish_with_committer(
+                    published_snapshot.shallow_copy(),
+                    republish_committer,
+                    engine.shallow_copy(),
+                )
+            });
+            assert!(
+                std::ptr::eq(unsafe { published_snapshot.as_ref() }, unsafe {
+                    republished_snapshot.as_ref()
+                },),
+                "second publish should short-circuit and return the same snapshot"
+            );
+
+            unsafe { free_snapshot(republished_snapshot) };
+            unsafe { free_snapshot(published_snapshot) };
+            unsafe { free_snapshot(post_commit_snapshot) };
+            unsafe { free_snapshot(snapshot) };
             unsafe { free_committed_transaction(committed) };
 
             let context = recover_test_context(context).unwrap();
@@ -1381,7 +1989,7 @@ mod tests {
 
             {
                 // scope so we don't hold mutex across the await lower down
-                let (last_table_id, _) = context.last_commit_request.unwrap();
+                let last_table_id = context.last_commit_table_id.unwrap();
                 assert_eq!(
                     last_table_id, "test_id",
                     "Table ID should match the one passed to UCCommitter"
@@ -1505,15 +2113,16 @@ mod tests {
     /// fields. Returns `(table_path, engine_handle, builder_handle)`. The caller is responsible
     /// for freeing/consuming the engine and builder handles.
     fn create_table_builder(
-        tmp_dir: &tempfile::TempDir,
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
         fields: Vec<StructField>,
     ) -> (
         String,
         Handle<SharedExternEngine>,
         Handle<ExclusiveCreateTableBuilder>,
     ) {
-        let table_path = tmp_dir.path().to_str().unwrap().to_string();
-        let engine = get_default_engine(&table_path);
+        let table_path = table_url.to_string();
+        let engine = engine_handle_for_store(Arc::clone(store));
         let engine_info = "test-engine/1.0";
         let schema_arg = EngineSchema {
             schema: &fields as *const Vec<StructField> as *mut c_void,
@@ -1545,11 +2154,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_basic() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("name", DataType::STRING),
@@ -1578,14 +2188,230 @@ mod tests {
         Ok(())
     }
 
+    /// Reads the v0 commit file (`_delta_log/00..00.json`) of a freshly created table.
+    async fn read_v0_commit(store: &Arc<DynObjectStore>, table_url: &Url) -> String {
+        let path = table_url
+            .join("_delta_log/00000000000000000000.json")
+            .expect("valid commit url");
+        let path = Path::from_url_path(path.path()).expect("valid object store path");
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("v0 commit file should exist")
+            .bytes()
+            .await
+            .expect("v0 commit body");
+        String::from_utf8(bytes.to_vec()).expect("v0 commit is utf-8")
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_clustering_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
+        let (_table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        let col = "id";
+        let columns = [kernel_string_slice!(col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        // A clustered create records the `delta.clustering` domain metadata (listing the
+        // clustering columns, JSON-escaped inside the configuration string) and adds the
+        // `clustering` writer feature to the protocol.
+        let log = read_v0_commit(&store, &table_url).await;
+        assert!(
+            log.contains("delta.clustering"),
+            "missing clustering domain metadata: {log}"
+        );
+        assert!(
+            log.contains("clusteringColumns") && log.contains(r#"[[\"id\"]]"#),
+            "missing clustering columns: {log}"
+        );
+        assert!(
+            log.contains(r#""clustering""#),
+            "missing clustering writer feature: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
+        // Partitioning requires at least one non-partition column, so partition on `date`
+        // while keeping `id` as data.
+        let (_table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("date", DataType::STRING),
+            ],
+        );
+
+        let col = "date";
+        let columns = [kernel_string_slice!(col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_partition_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        // A partitioned create records the partition columns in the table metadata.
+        let log = read_v0_commit(&store, &table_url).await;
+        assert!(
+            log.contains(r#""partitionColumns":["date"]"#),
+            "missing partitionColumns in metadata: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_multiple_clustering_columns(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
+        let (_table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("name", DataType::STRING),
+            ],
+        );
+
+        // Two columns: order must be preserved in the serialized clustering domain metadata.
+        let c0 = "id";
+        let c1 = "name";
+        let columns = [kernel_string_slice!(c0), kernel_string_slice!(c1)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                columns.as_ptr(),
+                columns.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let log = read_v0_commit(&store, &table_url).await;
+        assert!(
+            log.contains(r#"[[\"id\"],[\"name\"]]"#),
+            "clustering column order not preserved: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_data_layout_last_call_wins() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
+        let (_table_path, engine, builder) = create_table_builder(
+            &store,
+            &table_url,
+            vec![
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::nullable("date", DataType::STRING),
+            ],
+        );
+
+        // Set clustering, then partition: the layouts are mutually exclusive and the last call
+        // wins, so the committed table must be partitioned with no clustering domain metadata.
+        let c_col = "id";
+        let c_cols = [kernel_string_slice!(c_col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_clustering_columns(
+                builder,
+                c_cols.as_ptr(),
+                c_cols.len(),
+                engine.shallow_copy(),
+            )
+        });
+        let p_col = "date";
+        let p_cols = [kernel_string_slice!(p_col)];
+        let builder = ok_or_panic(unsafe {
+            create_table_builder_with_partition_columns(
+                builder,
+                p_cols.as_ptr(),
+                p_cols.len(),
+                engine.shallow_copy(),
+            )
+        });
+        build_and_commit(builder, &engine);
+
+        let log = read_v0_commit(&store, &table_url).await;
+        assert!(
+            log.contains(r#""partitionColumns":["date"]"#),
+            "partition layout should win: {log}"
+        );
+        assert!(
+            !log.contains("delta.clustering"),
+            "stale clustering layout leaked: {log}"
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_create_table_columns_empty_is_null_safe() {
+        // num_columns == 0 must short-circuit before from_raw_parts, so a null pointer is sound.
+        let columns = unsafe { collect_create_table_columns(std::ptr::null(), 0) };
+        assert_eq!(columns.unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_with_data_layout_impl_propagates_column_error() {
+        // A column-collection error must short-circuit the shared lowering and drop the consumed
+        // builder, never producing a layout or a dangling handle.
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
+        let (_table_path, engine, builder_handle) = create_table_builder(
+            &store,
+            &table_url,
+            vec![StructField::nullable("id", DataType::INTEGER)],
+        );
+        let builder = unsafe { *builder_handle.into_inner() };
+        let layout: DeltaResult<DataLayout> = Err(delta_kernel::Error::generic("bad column"));
+        let result = create_table_builder_with_data_layout_impl(builder, layout);
+        assert!(result.is_err());
+        unsafe { free_engine(engine) };
+    }
+
     /// CREATE TABLE: the committed transaction must expose a post-commit snapshot at version 0
     /// without re-listing the log.
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_post_commit_snapshot_create_table() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
 
@@ -1613,11 +2439,11 @@ mod tests {
     /// just-committed version. Also verifies that calling the accessor a second time yields an
     /// independent handle (Arc clone).
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_post_commit_snapshot_existing_table() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_post_commit_existing", None);
         // create_table_with_one_file commits v0 (create) and v1 (file add).
-        let (table_path, engine) = create_table_with_one_file(&tmp_dir)?;
+        let (table_path, engine) = create_table_with_one_file(&store, &table_url).await?;
 
         // Blind no-op commit on top of v1 -> v2.
         let txn = ok_or_panic(unsafe {
@@ -1667,11 +2493,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_create_table_with_properties() {
-        let tmp_dir = tempdir().unwrap();
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
 
@@ -1727,7 +2554,8 @@ mod tests {
     /// Builds a create-table transaction and its unpartitioned write context, optionally
     /// enabling column mapping. Returns handles the caller must free.
     fn cm_table_write_context(
-        tmp_dir: &tempfile::TempDir,
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
         cm_mode: Option<&str>,
     ) -> (
         Handle<SharedExternEngine>,
@@ -1735,7 +2563,8 @@ mod tests {
         Handle<SharedWriteContext>,
     ) {
         let (_table_path, engine, mut builder) = create_table_builder(
-            tmp_dir,
+            store,
+            table_url,
             vec![
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::nullable("name", DataType::STRING),
@@ -1764,10 +2593,10 @@ mod tests {
     #[case::no_column_mapping(None)]
     #[case::name_mode(Some("name"))]
     #[case::id_mode(Some("id"))]
-    #[cfg_attr(miri, ignore)]
     fn test_write_context_accessors(#[case] cm_mode: Option<&str>) {
-        let tmp_dir = tempdir().unwrap();
-        let (engine, txn, write_context) = cm_table_write_context(&tmp_dir, cm_mode);
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
+        let (engine, txn, write_context) = cm_table_write_context(&store, &table_url, cm_mode);
 
         let logical = unsafe { get_write_schema(write_context.shallow_copy()) };
         let physical = unsafe { get_physical_write_schema(write_context.shallow_copy()) };
@@ -1832,20 +2661,22 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_already_exists() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
 
         // Create the table first time -- should succeed
         let (_table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         build_and_commit(builder, &engine);
 
         // Try to create the same table again -- build should error (table already exists)
         let (_, engine2, builder2) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let result = unsafe { create_table_builder_build(builder2, engine2.shallow_copy()) };
@@ -1872,9 +2703,7 @@ mod tests {
 
     #[test]
     fn test_free_create_table_builder() {
-        let schema = Arc::new(
-            StructType::try_new(vec![StructField::nullable("id", DataType::INTEGER)]).unwrap(),
-        );
+        let schema = schema_ref! { nullable "id": INTEGER };
         let builder =
             delta_kernel::transaction::create_table::create_table("memory:///test", schema, "test");
         let handle: Handle<ExclusiveCreateTableBuilder> = Box::new(builder).into();
@@ -1883,13 +2712,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_build_with_empty_schema_succeeds(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         // CREATE TABLE with no columns is permitted by the Delta protocol; users may
         // populate the schema later via ALTER TABLE ADD COLUMN.
-        let (_table_path, engine, builder) = create_table_builder(&tmp_dir, vec![]);
+        let (_table_path, engine, builder) = create_table_builder(&store, &table_url, vec![]);
 
         let txn =
             ok_or_panic(unsafe { create_table_builder_build(builder, engine.shallow_copy()) });
@@ -1900,11 +2729,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_create_table_with_custom_committer() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_create_table", None);
         let (table_path, engine, builder) = create_table_builder(
-            &tmp_dir,
+            &store,
+            &table_url,
             vec![StructField::nullable("id", DataType::INTEGER)],
         );
         let table_path_str = table_path.as_str();
@@ -1937,16 +2767,17 @@ mod tests {
 
     /// Helper: create a table, write one parquet file, and return (table_path, engine_handle).
     /// The caller is responsible for freeing the engine handle.
-    fn create_table_with_one_file(
-        tmp_dir: &tempfile::TempDir,
+    async fn create_table_with_one_file(
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
     ) -> Result<(String, Handle<SharedExternEngine>), Box<dyn std::error::Error>> {
-        let table_path = tmp_dir.path().to_str().unwrap();
+        let table_path = table_url.as_str();
         let fields = vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ];
 
-        let engine = get_default_engine(table_path);
+        let engine = engine_handle_for_store(Arc::clone(store));
 
         // Create the table
         let engine_info = "test-engine/1.0";
@@ -1989,12 +2820,14 @@ mod tests {
         });
 
         let parquet_schema = unsafe { txn.shallow_copy().as_ref().add_files_schema() };
-        let file_info = write_parquet_file(
-            table_path,
+        let file_info = put_parquet_file(
+            store,
+            table_url,
             "file1.parquet",
             &batch,
             parquet_schema.as_ref().try_into_arrow()?,
-        )?;
+        )
+        .await?;
         let file_info_engine_data = ok_or_panic(unsafe {
             get_engine_data(
                 file_info.array,
@@ -2040,8 +2873,9 @@ mod tests {
     /// return the components needed for remove_files tests. Caller must free the engine handle
     /// (and txn if not committed).
     #[allow(clippy::type_complexity)]
-    fn setup_remove_files_test(
-        tmp_dir: &tempfile::TempDir,
+    async fn setup_remove_files_test(
+        store: &Arc<DynObjectStore>,
+        table_url: &Url,
     ) -> Result<
         (
             Box<dyn delta_kernel::EngineData>,
@@ -2053,7 +2887,7 @@ mod tests {
         ),
         Box<dyn std::error::Error>,
     > {
-        let (table_path, engine) = create_table_with_one_file(tmp_dir)?;
+        let (table_path, engine) = create_table_with_one_file(store, table_url).await?;
         let table_path_str = table_path.as_str();
 
         let kernel_engine = unsafe { engine.as_ref() }.engine();
@@ -2087,11 +2921,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_remove_files_with_null_sv_commits_and_removes_all(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tmp_dir = tempdir()?;
-        let (data, sv, txn, engine, kernel_engine, table_path) = setup_remove_files_test(&tmp_dir)?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_remove_files", None);
+        let (data, sv, txn, engine, kernel_engine, table_path) =
+            setup_remove_files_test(&store, &table_url).await?;
         let data_handle: Handle<ExclusiveEngineData> = data.into();
 
         // Pass the original SV as u8 values
@@ -2138,7 +2973,6 @@ mod tests {
 
     /// End-to-end FFI round trip for connector-authored deletion vector updates.
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_dv_update_round_trip_via_ffi() -> Result<(), Box<dyn std::error::Error>> {
         use delta_kernel::actions::deletion_vector_writer::{
             KernelDeletionVector, StreamingDeletionVectorWriter,
@@ -2149,19 +2983,13 @@ mod tests {
             dv_descriptor_map_insert, dv_descriptor_map_new, dv_descriptor_new,
             transaction_update_deletion_vectors, KernelDvStorageType,
         };
-        use test_utils::{create_default_engine, record_batch_to_bytes};
-
-        let tmp_test_dir = tempdir()?;
-        let tmp_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+        use test_utils::record_batch_to_bytes;
 
         // Build a DV-enabled table; create_table sets delta.enableDeletionVectors for the
         // writer feature.
-        let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-            "id",
-            DataType::INTEGER,
-        )])?);
+        let schema = Arc::new(try_schema! { nullable "id": INTEGER }?);
         let (store, _test_engine, table_location) =
-            test_utils::engine_store_setup("test_dv_ffi", Some(&tmp_dir_url));
+            test_utils::engine_store_setup("test_dv_ffi", None);
         let table_url = test_utils::create_table(
             store.clone(),
             table_location.clone(),
@@ -2190,7 +3018,11 @@ mod tests {
             .await?;
 
         // Add the file via a kernel transaction so the table has something to scan.
-        let kernel_engine: Arc<dyn delta_kernel::Engine> = create_default_engine(&table_url)?;
+        // Build the kernel engine over the seeded store: `create_default_engine` resolves a fresh
+        // store from the URL, which for `memory://` would not see this table.
+        let kernel_engine: Arc<dyn delta_kernel::Engine> = Arc::new(
+            delta_kernel_default_engine::DefaultEngineBuilder::new(Arc::clone(&store)).build(),
+        );
         let snapshot = delta_kernel::snapshot::Snapshot::builder_for(table_url.clone())
             .build(kernel_engine.as_ref())?;
         let mut add_txn = snapshot
@@ -2222,9 +3054,8 @@ mod tests {
             .await?;
 
         // === FFI surface under test ===
-        let table_path = table_url.to_file_path().unwrap();
-        let table_path_str = table_path.to_str().unwrap();
-        let engine = get_default_engine(table_path_str);
+        let table_path_str = table_url.as_str();
+        let engine = engine_handle_for_store(Arc::clone(&store));
         let txn = ok_or_panic(unsafe {
             transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
         });
@@ -2310,16 +3141,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn test_remove_files_with_non_empty_sv_exercises_from_raw_parts(
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Exercises the from_raw_parts code path in the remove_files FFI wrapper by passing
         // a non-null selection vector pointer with non-zero length. The null-SV test always
         // passes a null pointer because scan_metadata for a single-file table returns an
         // empty selection vector.
-        let tmp_dir = tempdir()?;
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_remove_files_sv", None);
         let (data, _sv, txn, engine, _kernel_engine, _table_path) =
-            setup_remove_files_test(&tmp_dir)?;
+            setup_remove_files_test(&store, &table_url).await?;
         let num_rows = data.len();
         assert!(num_rows > 0);
         let data_handle: Handle<ExclusiveEngineData> = data.into();

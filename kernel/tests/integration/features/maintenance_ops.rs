@@ -1,9 +1,7 @@
 //! Integration tests for table maintenance operations (checkpoint, checksum).
 
-use std::sync::Arc;
-
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::schema_ref;
 use delta_kernel::snapshot::{CheckpointWriteResult, ChecksumWriteResult};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -19,10 +17,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
 ) -> DeltaResult<()> {
     // ===== GIVEN =====
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine");
     if v2_checkpoint {
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);
@@ -79,10 +74,7 @@ async fn test_checkpoint_and_checksum_return_updated_snapshots(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_already_exists(#[case] v2_checkpoint: bool) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "id",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "id": INTEGER };
     let mut builder = create_table(&table_path, schema, "test_engine");
     if v2_checkpoint {
         builder = builder.with_table_properties([("delta.feature.v2Checkpoint", "supported")]);

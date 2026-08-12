@@ -5,7 +5,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{DvInfo, ScanFile};
-use delta_kernel::scan::{Scan, ScanBuilder, ScanMetadata};
+use delta_kernel::scan::{PartitionValuesOptions, Scan, ScanBuilder, ScanMetadata, StatsOptions};
+use delta_kernel::schema::MetadataValue;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, DeltaResultIteratorStatic, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -40,6 +41,57 @@ type ScanMetadataIter = DeltaResultIteratorStatic<ScanMetadata>;
 /// and produces a [`SharedScan`]) or [`free_scan_builder`] (which drops it without building).
 #[handle_descriptor(target=ScanBuilder, mutable=true, sized=true)]
 pub struct ExclusiveScanBuilder;
+
+/// Configuration for the stats output requested from scan metadata.
+///
+/// The default behavior is `JsonOnly`.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum FfiStatsOptions {
+    /// Emit JSON stats only.
+    JsonOnly,
+    /// Emit all indexed struct stats without synthesizing JSON stats.
+    AllStruct,
+    /// Emit both JSON stats and all indexed struct stats.
+    All,
+    /// Emit no stats and disable kernel data skipping.
+    None,
+    // TODO: Expose StructColumns variant (matching `StatsOptions::struct_columns`)
+}
+
+impl From<FfiStatsOptions> for StatsOptions {
+    fn from(options: FfiStatsOptions) -> Self {
+        match options {
+            FfiStatsOptions::JsonOnly => Self::json_only(),
+            FfiStatsOptions::AllStruct => Self::all_struct(),
+            FfiStatsOptions::All => Self::all(),
+            FfiStatsOptions::None => Self::none(),
+        }
+    }
+}
+
+/// Configuration for the partition-value output requested from scan metadata.
+///
+/// The default behavior is `StringMapOnly`.
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum FfiPartitionValuesOptions {
+    /// Emit only the raw string map.
+    StringMapOnly,
+    /// Also emit the typed `partitionValues_parsed` struct.
+    WithStruct,
+}
+
+impl From<FfiPartitionValuesOptions> for PartitionValuesOptions {
+    fn from(options: FfiPartitionValuesOptions) -> Self {
+        match options {
+            FfiPartitionValuesOptions::StringMapOnly => Self::string_map_only(),
+            FfiPartitionValuesOptions::WithStruct => Self::with_struct(),
+        }
+    }
+}
 
 /// A predicate that can be used to skip data when scanning.
 ///
@@ -142,23 +194,33 @@ pub unsafe extern "C" fn scan(
     scan_impl(snapshot, predicate, schema).into_extern_result(&engine.as_ref())
 }
 
-/// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
+/// Decode an [`EnginePredicate`] into a kernel [`Predicate`] by running the engine's visitor.
 ///
-/// Returns an error if the engine's visitor fails to produce a valid predicate (i.e. returns
-/// an invalid expression ID). A `None` result from the visitor indicates the engine-side
-/// predicate construction failed, which would silently produce a full-table scan if ignored.
-fn apply_predicate(
-    builder: ScanBuilder,
+/// Returns an error if the visitor fails to produce a valid predicate (i.e. returns an invalid
+/// expression ID). A `None` result from the visitor indicates the engine-side predicate
+/// construction failed, which would silently widen to a full scan if ignored.
+pub(crate) fn decode_engine_predicate(
     predicate: &mut EnginePredicate,
-) -> DeltaResult<ScanBuilder> {
+) -> DeltaResult<delta_kernel::Predicate> {
     let mut visitor_state = KernelExpressionVisitorState::default();
     let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-    let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
+    unwrap_kernel_predicate(&mut visitor_state, pred_id).ok_or_else(|| {
         delta_kernel::Error::generic(
             "engine predicate visitor returned an invalid expression ID; \
              predicate could not be decoded",
         )
-    })?;
+    })
+}
+
+/// Decode an [`EnginePredicate`] and apply it to a [`ScanBuilder`].
+///
+/// Returns an error if the engine's visitor fails to produce a valid predicate; see
+/// [`decode_engine_predicate`].
+fn apply_predicate(
+    builder: ScanBuilder,
+    predicate: &mut EnginePredicate,
+) -> DeltaResult<ScanBuilder> {
+    let predicate = decode_engine_predicate(predicate)?;
     debug!("Got predicate: {:#?}", predicate);
     Ok(builder.with_predicate(Some(Arc::new(predicate))))
 }
@@ -263,6 +325,42 @@ fn scan_builder_with_schema_impl(
     Ok(Box::new(apply_schema(*builder, schema)?).into())
 }
 
+/// Configure how stats are included in the resulting scan metadata.
+///
+/// Consumes the `builder` handle and returns a new handle with `options` applied. The caller must
+/// replace its builder handle with the returned handle. The old handle must not be reused or
+/// freed. Calls replace the previous stats options.
+///
+/// # Safety
+///
+/// `builder` must be a valid handle that has not been consumed or freed.
+#[no_mangle]
+pub unsafe extern "C" fn scan_builder_with_stats(
+    builder: Handle<ExclusiveScanBuilder>,
+    options: FfiStatsOptions,
+) -> Handle<ExclusiveScanBuilder> {
+    let builder = unsafe { builder.into_inner() };
+    Box::new(builder.with_stats(options.into())).into()
+}
+
+/// Configure how partition values are included in the resulting scan metadata.
+///
+/// Consumes the `builder` handle and returns a new handle with `options` applied. The caller must
+/// replace its builder handle with the returned handle. The old handle must not be reused or
+/// freed. Calls replace the previous partition-value options.
+///
+/// # Safety
+///
+/// `builder` must be a valid handle that has not been consumed or freed.
+#[no_mangle]
+pub unsafe extern "C" fn scan_builder_with_partition_values(
+    builder: Handle<ExclusiveScanBuilder>,
+    options: FfiPartitionValuesOptions,
+) -> Handle<ExclusiveScanBuilder> {
+    let builder = unsafe { builder.into_inner() };
+    Box::new(builder.with_partition_values(options.into())).into()
+}
+
 /// Consume an [`ExclusiveScanBuilder`] and produce a [`SharedScan`].
 ///
 /// The `builder` handle is consumed and must not be used afterward. On error, the builder is
@@ -333,6 +431,48 @@ pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle
 pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.physical_schema().clone().into()
+}
+
+/// Build the declarative metadata-scan [`Plan`](delta_kernel::plans::ir::plan::Plan) for a scan and
+/// return it as proto-serialized [`Operation`](delta_kernel::Operation) bytes.
+///
+/// On success, returns an [`OptionalValue`]:
+/// - [`OptionalValue::Some`] wraps a [`KernelOwnedBytes`](crate::KernelOwnedBytes) buffer holding
+///   the proto-serialized `delta.kernel.operation.Operation` message (a `QueryPlan`). The engine
+///   owns the buffer and must free it with [`free_kernel_bytes`](crate::free_kernel_bytes).
+/// - [`OptionalValue::None`] means there is no plan to execute because the scan's predicate
+///   statically skips all files.
+///
+/// # Safety
+///
+/// Caller must pass a valid [`SharedScan`] handle and a valid [`SharedExternEngine`] handle. This
+/// function borrows but does not consume either handle; the caller retains ownership of both.
+#[cfg(feature = "declarative-plans")]
+#[no_mangle]
+pub unsafe extern "C" fn scan_declarative_metadata_plan(
+    scan: Handle<SharedScan>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<OptionalValue<crate::KernelOwnedBytes>> {
+    let scan = unsafe { scan.as_ref() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let inner_engine = extern_engine.engine();
+    scan_declarative_metadata_plan_impl(scan, inner_engine.as_ref())
+        .into_extern_result(&extern_engine)
+}
+
+#[cfg(feature = "declarative-plans")]
+fn scan_declarative_metadata_plan_impl(
+    scan: &Scan,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<OptionalValue<crate::KernelOwnedBytes>> {
+    let plan = scan.declarative_metadata_scan_plan(engine)?;
+    Ok(plan
+        .map(|plan| {
+            delta_kernel::Operation::QueryPlan(plan)
+                .to_proto_bytes()
+                .into()
+        })
+        .into())
 }
 
 // Intentionally opaque to the engine.
@@ -563,6 +703,112 @@ pub unsafe extern "C" fn visit_string_map(
     }
 }
 
+// === Typed field metadata ===
+
+/// The type of a [`MetadataValue`] carried across the FFI boundary. Each value is delivered as a
+/// string (via `Display`); this tag tells the engine how to interpret it: a signed 64-bit integer,
+/// a plain string, a boolean value, or arbitrary JSON text.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CMetadataValueKind {
+    MetadataNumber = 0,
+    MetadataString = 1,
+    MetadataBoolean = 2,
+    MetadataJson = 3,
+}
+
+impl From<&MetadataValue> for CMetadataValueKind {
+    fn from(val: &MetadataValue) -> Self {
+        match val {
+            MetadataValue::Number(_) => CMetadataValueKind::MetadataNumber,
+            MetadataValue::String(_) => CMetadataValueKind::MetadataString,
+            MetadataValue::Boolean(_) => CMetadataValueKind::MetadataBoolean,
+            MetadataValue::Other(_) => CMetadataValueKind::MetadataJson,
+        }
+    }
+}
+
+/// A field-metadata map that preserves each value's [`MetadataValue`] type. Used for schema field
+/// metadata, where the kernel knows each value's type; the engine recovers that type via
+/// [`CMetadataValueKind`] rather than inferring it from the key name.
+#[derive(Default)]
+pub struct CMetadataMap {
+    values: HashMap<String, MetadataValue>,
+}
+
+impl From<HashMap<String, MetadataValue>> for CMetadataMap {
+    fn from(values: HashMap<String, MetadataValue>) -> Self {
+        Self { values }
+    }
+}
+
+/// Probe a [`CMetadataMap`] for a single key. If the key is present, kernel calls `allocate_fn`
+/// with its value rendered to a string, writes the value's [`CMetadataValueKind`] to `kind_out`
+/// (unless `kind_out` is null), and returns the pointer `allocate_fn` produced. If the key is
+/// absent, returns NULL and leaves `kind_out` untouched.
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CMetadataMap`] pointer, [`KernelStringSlice`],
+/// and (when non-null) a valid `kind_out` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn get_from_metadata_map(
+    map: &CMetadataMap,
+    key: KernelStringSlice,
+    kind_out: *mut CMetadataValueKind,
+    allocate_fn: AllocateStringFn,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<NullableCvoid> {
+    let engine = unsafe { engine.as_ref() };
+    get_from_metadata_map_impl(map, key, kind_out, allocate_fn).into_extern_result(&engine)
+}
+fn get_from_metadata_map_impl(
+    map: &CMetadataMap,
+    key: KernelStringSlice,
+    kind_out: *mut CMetadataValueKind,
+    allocate_fn: AllocateStringFn,
+) -> DeltaResult<NullableCvoid> {
+    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
+    let Some(val) = map.values.get(string_key) else {
+        return Ok(None);
+    };
+    if !kind_out.is_null() {
+        unsafe { *kind_out = CMetadataValueKind::from(val) };
+    }
+    let value = val.to_string();
+    Ok(allocate_fn(kernel_string_slice!(value)))
+}
+
+/// Visit all entries in a [`CMetadataMap`]. The callback is invoked once per entry with the key,
+/// the value's [`CMetadataValueKind`], and the value rendered to a string. The engine uses the
+/// kind to parse the string back into a typed value.
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CMetadataMap`] pointer and callback.
+#[no_mangle]
+pub unsafe extern "C" fn visit_metadata_map(
+    map: &CMetadataMap,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        kind: CMetadataValueKind,
+        value: KernelStringSlice,
+    ),
+) {
+    for (key, val) in &map.values {
+        let kind = CMetadataValueKind::from(val);
+        let value = val.to_string();
+        visitor(
+            engine_context,
+            kernel_string_slice!(key),
+            kind,
+            kernel_string_slice!(value),
+        );
+    }
+}
+
 /// Transformation expressions that need to be applied to each row `i` in ScanMetadata. You can use
 /// [`get_transform_for_row`] to get the transform for a particular row. If that returns an
 /// associated expression, it _must_ be applied to the data read from the file specified by the
@@ -574,6 +820,17 @@ pub unsafe extern "C" fn visit_string_map(
 /// `CTransforms`. The callback will be invoked with the correct transform for you.
 pub struct CTransforms {
     transforms: Vec<Option<ExpressionRef>>,
+}
+
+impl CTransforms {
+    /// A [`CTransforms`] carrying no per-row transforms, so [`get_transform_for_row`] returns
+    /// `NULL` for every row. Used by scan paths (e.g. incremental scan) that never rewrite rows.
+    #[cfg(feature = "default-engine-base")]
+    pub(crate) fn empty() -> Self {
+        Self {
+            transforms: Vec::new(),
+        }
+    }
 }
 
 #[no_mangle]
@@ -1100,13 +1357,18 @@ mod scan_metadata_arrow_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use delta_kernel::arrow::array::ffi::from_ffi;
-    use delta_kernel::arrow::array::{RecordBatch, StructArray};
+    use delta_kernel::arrow::array::{
+        Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
+    use rstest::rstest;
     use test_utils::{actions_to_string, TestAction};
 
     use super::{
         free_scan, free_scan_metadata_arrow_result, free_scan_metadata_iter, get_transform_for_row,
-        scan_builder, scan_builder_build, scan_metadata_iter_init, scan_metadata_next_arrow_impl,
-        CTransforms, ScanMetadataArrowResult, SharedScan, SharedScanMetadataIterator,
+        scan_builder, scan_builder_build, scan_builder_with_partition_values,
+        scan_builder_with_stats, scan_metadata_iter_init, scan_metadata_next_arrow_impl,
+        CTransforms, FfiPartitionValuesOptions, FfiStatsOptions, ScanMetadataArrowResult,
+        SharedScan, SharedScanMetadataIterator,
     };
     use crate::engine_data::ArrowFFIData;
     use crate::ffi_test_utils::{ok_or_panic, setup_snapshot};
@@ -1148,6 +1410,16 @@ mod scan_metadata_arrow_tests {
         let batch: RecordBatch = StructArray::from(array_data).into();
         let sv = selection_vector.into_vec();
         (batch, sv, Box::from_raw(transforms))
+    }
+
+    fn only_selected_row(selection_vector: &[bool]) -> usize {
+        let selected_rows = selection_vector
+            .iter()
+            .enumerate()
+            .filter_map(|(index, selected)| selected.then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(selected_rows.len(), 1);
+        selected_rows[0]
     }
 
     #[tokio::test]
@@ -1202,10 +1474,177 @@ mod scan_metadata_arrow_tests {
         assert!(batch_schema.field_with_name("stats").is_ok());
         assert!(batch_schema.field_with_name("deletionVector").is_ok());
         assert!(batch_schema.field_with_name("fileConstantValues").is_ok());
+        assert!(batch_schema.field_with_name("stats_parsed").is_err());
+        assert!(batch_schema
+            .field_with_name("partitionValues_parsed")
+            .is_err());
 
         // Selection vector length matches batch rows; exactly 1 row selected (the add file)
         assert_eq!(sv.len(), batch.num_rows());
         assert_eq!(sv.iter().filter(|&&v| v).count(), 1);
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[rstest]
+    #[case::json_only(FfiStatsOptions::JsonOnly, false, true)]
+    #[case::all_struct(FfiStatsOptions::AllStruct, true, true)]
+    #[case::all(FfiStatsOptions::All, true, true)]
+    #[case::none(FfiStatsOptions::None, false, false)]
+    #[tokio::test]
+    async fn stats_options_control_arrow_metadata(
+        #[case] options: FfiStatsOptions,
+        #[case] expect_parsed: bool,
+        #[case] expect_json: bool,
+    ) {
+        let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add("file1.parquet".into()),
+        ]))
+        .await
+        .unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { scan_builder_with_stats(builder, options) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let iter = unsafe {
+            ok_or_panic(scan_metadata_iter_init(
+                engine.shallow_copy(),
+                scan.shallow_copy(),
+            ))
+        };
+
+        let ptr = scan_metadata_next_arrow_impl(unsafe { iter.as_ref() }).unwrap();
+        assert!(!ptr.is_null());
+        let (batch, selection_vector, _transforms) = unsafe { import_arrow_result(ptr) };
+        let row = only_selected_row(&selection_vector);
+
+        // Verify schema columns match SCAN_ROW_SCHEMA.
+        let schema = batch.schema();
+        assert!(schema.field_with_name("stats").is_ok());
+        assert_eq!(
+            schema.field_with_name("stats_parsed").is_ok(),
+            expect_parsed
+        );
+
+        // Verify stats JSON is present if requested.
+        let stats_json = batch
+            .column_by_name("stats")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(!stats_json.is_null(row), expect_json);
+
+        // Verify stats_parsed is present if requested.
+        let stats = batch.column_by_name("stats_parsed");
+        assert_eq!(stats.is_some(), expect_parsed);
+        if let Some(stats) = stats {
+            let stats = stats.as_any().downcast_ref::<StructArray>().unwrap();
+            assert!(!stats.is_null(row));
+
+            let num_records = stats
+                .column_by_name("numRecords")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let min_values = stats
+                .column_by_name("minValues")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let max_values = stats
+                .column_by_name("maxValues")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let min_id = min_values
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let max_id = max_values
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+
+            assert_eq!(num_records.value(row), 2);
+            assert_eq!(min_id.value(row), 1);
+            assert_eq!(max_id.value(row), 3);
+        }
+
+        unsafe {
+            free_scan_metadata_iter(iter);
+            free_scan(scan);
+            free_snapshot(snapshot);
+            free_engine(engine);
+        }
+    }
+
+    #[rstest]
+    #[case::string_map_only(FfiPartitionValuesOptions::StringMapOnly, false)]
+    #[case::with_struct(FfiPartitionValuesOptions::WithStruct, true)]
+    #[tokio::test]
+    async fn partition_values_options_control_arrow_metadata(
+        #[case] options: FfiPartitionValuesOptions,
+        #[case] expect_parsed: bool,
+    ) {
+        let actions = format!(
+            "{}\n{}",
+            test_utils::METADATA_WITH_PARTITION_COLS,
+            r#"{"add":{"path":"val=a/file1.parquet","partitionValues":{"val":"a"},"size":262,"modificationTime":1587968586000,"dataChange":true}}"#
+        );
+        let (engine, snapshot) = setup_snapshot(actions).await.unwrap();
+        let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+        let builder = unsafe { scan_builder_with_partition_values(builder, options) };
+        let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+        let iter = unsafe {
+            ok_or_panic(scan_metadata_iter_init(
+                engine.shallow_copy(),
+                scan.shallow_copy(),
+            ))
+        };
+
+        let ptr = scan_metadata_next_arrow_impl(unsafe { iter.as_ref() }).unwrap();
+        assert!(!ptr.is_null());
+        let (batch, selection_vector, _transforms) = unsafe { import_arrow_result(ptr) };
+        let row = only_selected_row(&selection_vector);
+
+        // Verify schema columns match SCAN_ROW_SCHEMA.
+        let schema = batch.schema();
+        assert!(schema.field_with_name("fileConstantValues").is_ok());
+        assert_eq!(
+            schema.field_with_name("partitionValues_parsed").is_ok(),
+            expect_parsed
+        );
+
+        // Verify partitionValues_parsed is present if requested.
+        let partition_values = batch.column_by_name("partitionValues_parsed");
+        assert_eq!(partition_values.is_some(), expect_parsed);
+        if let Some(partition_values) = partition_values {
+            let partition_values = partition_values
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert!(!partition_values.is_null(row));
+            let val = partition_values
+                .column_by_name("val")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(val.value(row), "a");
+        }
 
         unsafe {
             free_scan_metadata_iter(iter);
@@ -1383,5 +1822,208 @@ mod tests {
         }
         let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
         assert_eq!(test_map, final_map);
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    mod declarative_metadata_plan {
+        use std::ffi::c_void;
+
+        use delta_kernel::plans::proto::operation as proto_op;
+        use prost::Message as _;
+        use test_utils::{actions_to_string, TestAction};
+
+        use super::super::{
+            free_scan, scan_builder, scan_builder_build, scan_builder_with_predicate,
+            scan_declarative_metadata_plan, EnginePredicate,
+        };
+        use crate::error::EngineExecResult;
+        use crate::expressions::kernel_visitor::{
+            visit_expression_literal_bool, KernelExpressionVisitorState,
+        };
+        use crate::ffi_test_utils::{allocate_err, ok_or_panic, setup_snapshot};
+        use crate::handle::Handle;
+        use crate::plans::result::CPlanResult;
+        use crate::plans::{get_plan_based_engine, get_plan_executor};
+        use crate::{
+            free_engine, free_snapshot, KernelBytesSlice, NullableCvoid, OptionalValue,
+            SharedExternEngine,
+        };
+
+        extern "C" fn visit_false(
+            _predicate: *mut c_void,
+            state: &mut KernelExpressionVisitorState,
+        ) -> usize {
+            visit_expression_literal_bool(state, false)
+        }
+
+        extern "C" fn unreachable_executor(
+            _context: NullableCvoid,
+            _plan_proto: KernelBytesSlice,
+            _out: *mut EngineExecResult<CPlanResult>,
+        ) {
+            unreachable!("plan executor does not run: these tables have no checkpoint");
+        }
+
+        /// Wrap a fallback engine in a `PlanBasedEngine` so it exposes a `PlanExecutor`.
+        unsafe fn plan_based_engine(
+            fallback: &Handle<SharedExternEngine>,
+        ) -> Handle<SharedExternEngine> {
+            let executor = unsafe { get_plan_executor(None, unreachable_executor) };
+            unsafe {
+                get_plan_based_engine(
+                    executor,
+                    OptionalValue::Some(fallback.shallow_copy()),
+                    allocate_err,
+                )
+            }
+        }
+
+        #[tokio::test]
+        async fn returns_query_plan_bytes() {
+            let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+                TestAction::Metadata,
+                TestAction::Add("part-1.parquet".to_string()),
+            ]))
+            .await
+            .unwrap();
+
+            let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+            let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+            let plan_engine = unsafe { plan_based_engine(&engine) };
+
+            let result = unsafe {
+                scan_declarative_metadata_plan(scan.shallow_copy(), plan_engine.shallow_copy())
+            };
+            let bytes = match ok_or_panic(result) {
+                OptionalValue::Some(bytes) => unsafe { bytes.into_vec() },
+                OptionalValue::None => panic!("expected a plan for a scan with no static skip"),
+            };
+
+            let op = proto_op::Operation::decode(bytes.as_slice()).expect("decode succeeds");
+            assert!(
+                matches!(op.op, Some(proto_op::operation::Op::QueryPlan(_))),
+                "expected a QueryPlan operation",
+            );
+
+            unsafe { free_scan(scan) };
+            unsafe { free_snapshot(snapshot) };
+            unsafe { free_engine(plan_engine) };
+            unsafe { free_engine(engine) };
+        }
+
+        #[tokio::test]
+        async fn returns_none_when_statically_skipped() {
+            let (engine, snapshot) = setup_snapshot(actions_to_string(vec![
+                TestAction::Metadata,
+                TestAction::Add("part-1.parquet".to_string()),
+            ]))
+            .await
+            .unwrap();
+
+            let builder = unsafe { scan_builder(snapshot.shallow_copy()) };
+            let mut predicate = EnginePredicate {
+                predicate: std::ptr::null_mut(),
+                visitor: visit_false,
+            };
+            let builder = unsafe {
+                ok_or_panic(scan_builder_with_predicate(
+                    builder,
+                    engine.shallow_copy(),
+                    &mut predicate,
+                ))
+            };
+            let scan = unsafe { ok_or_panic(scan_builder_build(builder, engine.shallow_copy())) };
+            let plan_engine = unsafe { plan_based_engine(&engine) };
+
+            let result = unsafe {
+                scan_declarative_metadata_plan(scan.shallow_copy(), plan_engine.shallow_copy())
+            };
+            assert!(
+                matches!(ok_or_panic(result), OptionalValue::None),
+                "expected None for a statically-skipped scan",
+            );
+
+            unsafe { free_scan(scan) };
+            unsafe { free_snapshot(snapshot) };
+            unsafe { free_engine(plan_engine) };
+            unsafe { free_engine(engine) };
+        }
+    }
+
+    extern "C" fn visit_metadata_entry(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        kind: super::CMetadataValueKind,
+        value: KernelStringSlice,
+    ) {
+        let map_ptr: *mut HashMap<String, (super::CMetadataValueKind, String)> =
+            engine_context.unwrap().as_ptr().cast();
+        let key = unsafe { String::try_from_slice(&key).unwrap() };
+        let value = unsafe { String::try_from_slice(&value).unwrap() };
+        unsafe {
+            (*map_ptr).insert(key, (kind, value));
+        }
+    }
+
+    #[test]
+    fn visit_metadata_map_maps_kind_and_renders_each_variant() {
+        use delta_kernel::schema::MetadataValue;
+
+        use super::CMetadataValueKind::*;
+
+        // `Number` is i64-only, so a JSON number with a fractional part lands in `Other` -- cover
+        // both so the "parse as i64" contract for `MetadataNumber` stays honest.
+        let test_map = HashMap::from([
+            ("num".to_string(), MetadataValue::Number(-7)),
+            ("str".to_string(), MetadataValue::String("hi".into())),
+            ("bool".to_string(), MetadataValue::Boolean(true)),
+            (
+                "obj".to_string(),
+                MetadataValue::Other(serde_json::json!({"a": 1})),
+            ),
+            (
+                "float".to_string(),
+                MetadataValue::Other(serde_json::json!(1.5)),
+            ),
+        ]);
+        let cmap: super::CMetadataMap = test_map.into();
+
+        let ctx: Box<HashMap<String, (super::CMetadataValueKind, String)>> = Box::default();
+        let ctx_ptr = Box::into_raw(ctx);
+        unsafe {
+            let ptr = NonNull::new_unchecked(ctx_ptr.cast());
+            super::visit_metadata_map(&cmap, Some(ptr), visit_metadata_entry);
+        }
+        let out = *unsafe { Box::from_raw(ctx_ptr) };
+
+        assert_eq!(out["num"], (MetadataNumber, "-7".to_string()));
+        assert_eq!(out["str"], (MetadataString, "hi".to_string()));
+        assert_eq!(out["bool"], (MetadataBoolean, "true".to_string()));
+        assert_eq!(out["obj"], (MetadataJson, "{\"a\":1}".to_string()));
+        assert_eq!(out["float"], (MetadataJson, "1.5".to_string()));
+    }
+
+    #[test]
+    fn visit_metadata_map_empty_never_invokes_callback() {
+        let cmap = super::CMetadataMap::default();
+        let ctx: Box<HashMap<String, (super::CMetadataValueKind, String)>> = Box::default();
+        let ctx_ptr = Box::into_raw(ctx);
+        unsafe {
+            let ptr = NonNull::new_unchecked(ctx_ptr.cast());
+            super::visit_metadata_map(&cmap, Some(ptr), visit_metadata_entry);
+        }
+        let out = *unsafe { Box::from_raw(ctx_ptr) };
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn metadata_value_kind_discriminants_are_stable() {
+        // These integers are the FFI ABI contract -- C consumers switch on them. Reordering the
+        // enum silently renumbers, so pin them here.
+        use super::CMetadataValueKind::*;
+        assert_eq!(MetadataNumber as i32, 0);
+        assert_eq!(MetadataString as i32, 1);
+        assert_eq!(MetadataBoolean as i32, 2);
+        assert_eq!(MetadataJson as i32, 3);
     }
 }

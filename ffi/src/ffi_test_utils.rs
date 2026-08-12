@@ -81,6 +81,18 @@ pub(crate) unsafe fn build_snapshot(
     ok_or_panic(snapshot_builder_build(builder))
 }
 
+/// Wrap an already-seeded object store in an engine handle. Caller must free it.
+///
+/// Needed because `get_default_engine` resolves the store from the URL, so a `memory://` path
+/// builds a fresh (empty) `InMemory` rather than the seeded one.
+#[cfg(test)]
+pub(crate) fn engine_handle_for_store(
+    store: Arc<delta_kernel::object_store::DynObjectStore>,
+) -> crate::handle::Handle<SharedExternEngine> {
+    let engine = DefaultEngineBuilder::new(store).build();
+    engine_to_handle(Arc::new(engine), allocate_err)
+}
+
 /// Create an in-memory engine and snapshot from the given commit data. Returns
 /// `(engine_handle, snapshot_handle)` -- the caller must free both when done.
 #[cfg(test)]
@@ -118,6 +130,20 @@ pub(crate) fn assert_extern_result_error_with_message<T>(
         }
         _ => panic!("Expected error of type '{expected_etype:?}' and message '{opt_message:?}'"),
     }
+}
+
+/// Assert that `timestamp` (milliseconds since the Unix epoch) was written within the last day.
+#[cfg(test)]
+pub(crate) fn assert_timestamp_is_recent(timestamp: i64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let one_day_ms = 24 * 60 * 60 * 1000;
+    assert!(
+        (now_ms - one_day_ms..=now_ms).contains(&timestamp),
+        "commit timestamp {timestamp} not within one day of now {now_ms}"
+    );
 }
 
 #[cfg(test)]

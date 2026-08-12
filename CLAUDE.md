@@ -14,6 +14,9 @@ version range (`incremental_scan`).
 
 ## Build & Test Commands
 
+> **`datafusion_executor` is a separate workspace,** so the `--workspace` commands below do NOT
+> touch it. Build/test it on its own -- see `datafusion-executor/CLAUDE.md`.
+
 ```bash
 # Build
 cargo build --workspace --all-features
@@ -48,19 +51,19 @@ cargo +nightly fmt \
 
 ### Crate Names for `-p` Flag
 
-| Crate                                    | Directory                                  | Description                                             |
-|------------------------------------------|--------------------------------------------|---------------------------------------------------------|
-| `delta_kernel`                           | `kernel/`                                  | Core library                                            |
-| `delta_kernel_default_engine`            | `default-engine/`                          | Default Arrow/Tokio `Engine` implementation             |
-| `delta_kernel_ffi`                       | `ffi/`                                     | C/C++ FFI bindings                                      |
-| `delta_kernel_derive`                    | `derive-macros/`                           | Proc macros                                             |
-| `acceptance`                             | `acceptance/`                              | Acceptance tests (DAT)                                  |
-| `test_utils`                             | `test-utils/`                              | Shared test utilities                                   |
-| `delta_kernel_workloads`                 | `workloads/`                               | Shared workload spec types + SQL predicate parser       |
-| `feature_tests`                          | `feature-tests/`                           | Feature flag tests                                      |
-| `delta-kernel-unity-catalog`             | `delta-kernel-unity-catalog/`              | Unity Catalog integration (UCKernelClient, UCCommitter) |
-| `unity-catalog-delta-client-api`         | `unity-catalog-delta-client-api/`          | Unity Catalog client traits and shared models           |
-| `unity-catalog-delta-rest-client`        | `unity-catalog-delta-rest-client/`         | Unity Catalog REST client                               |
+| Crate                                | Directory                             | Description                                                              |
+|--------------------------------------|---------------------------------------|--------------------------------------------------------------------------|
+| `delta_kernel`                       | `kernel/`                             | Core library                                                             |
+| `delta_kernel_default_engine`        | `default-engine/`                     | Default Arrow/Tokio `Engine` implementation                              |
+| `delta_kernel_ffi`                   | `ffi/`                                | C/C++ FFI bindings                                                       |
+| `delta_kernel_derive`                | `derive-macros/`                      | Proc macros                                                              |
+| `acceptance`                         | `acceptance/`                         | Acceptance tests (DAT)                                                   |
+| `test_utils`                         | `test-utils/`                         | Shared test utilities                                                    |
+| `delta_kernel_workloads`             | `workloads/`                          | Shared workload spec types + SQL predicate parser                        |
+| `feature_tests`                      | `feature-tests/`                      | Feature flag tests                                                       |
+| `delta-kernel-unity-catalog`         | `delta-kernel-unity-catalog/`         | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
+| `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Transport-agnostic UC client traits + wire models                        |
+| `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP client for the Unity Catalog Delta Tables API                  |
 
 ### Feature Flags
 
@@ -74,10 +77,14 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
 - `arrow-conversion`, `arrow-expression` -- Arrow interop (auto-enabled by `default-engine-base`)
 - `prettyprint` -- enables Arrow pretty-print helpers (primarily test/example oriented)
 - `clustered-table` -- clustered table write support (experimental)
-- `column-defaults-in-dev` -- column defaults support (experimental, in development). Gates
-  `KernelSupport::Supported` for the `allowColumnDefaults` writer feature (writes to tables
-  listing this feature are blocked with the cargo feature off), and also gates the `ColumnDefault`
-  carrier type and the SQL literal parser (`parse_sql`).
+- `adaptive-metadata-in-dev` -- adaptiveMetadata (Iceberg V4 adaptive metadata tree) support
+  (experimental, in development). Gates `KernelSupport::Supported` for the
+  `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
+  with the cargo feature off).
+- `geo-type-in-dev` -- geospatial type support (geometry and geography columns) (experimental,
+  in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
+  cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
+  but writes are still blocked.
 - `internal-api` -- unstable APIs like `parallel_scan_metadata`. Items are marked with the
   `#[internal_api]` proc macro attribute.
 - `declarative-plans` -- experimental declarative-plan IR (`kernel/src/plans/`) and the prost
@@ -112,6 +119,21 @@ directly -- ALWAYS use the visitor pattern (`visit_rows` with typed `GetData` ac
 - **Integration tests** exercise only public APIs end-to-end. See `kernel/tests/README.md`
   for a catalog of available test tables (schema, protocol, features, and which tests use
   them). Consult it before creating new test data to avoid duplication.
+- **Consider `TestTableBuilder` (`test_utils::table_builder`) to build the table under test.**
+  Unlike `create_table`, which produces an empty table (just `00.json`) with a given set of
+  features and data layout, the builder *builds up* a multi-version table: data files written
+  across many commits, plus checkpoints, CRC files, a stale/missing `_last_checkpoint` hint, or
+  post-cleanup logs. So when a test needs a populated table history in a specific state, the
+  builder is often a good fit, composing `LogState`, `FeatureSet`, `DataLayoutConfig`, and
+  `TableConfig` through the real kernel write path so the table is protocol-correct by
+  construction. Load a snapshot at any `VersionTarget` with the `build_snapshot!` macro. For
+  coverage across many table states, the `default_sweep` cross-product template
+  (`LogState x FeatureSet x (DataLayoutConfig, TableConfig) x VersionTarget` -- data layout and
+  table config are bundled into one axis to avoid a cartesian explosion), or a per-axis template
+  with your own `#[values]`, can help; see
+  `kernel/tests/integration/cross_product/mod.rs`. Drop to lower-level setup like
+  `test_table_setup` (or hand-rolled `add_commit` / `LocalMockTable`) only when necessary --
+  e.g. for states the builder cannot express, such as corrupt or malformed logs.
 - Consider how the feature interacts with Delta table features (see Protocol TLDR below).
 - Consider write paths: normal commits, checkpointing, CRC files, log compaction files.
 - Consider read paths: loading a snapshot from scratch at latest version, at a specific
@@ -181,9 +203,15 @@ This list is non-exhaustive -- when in doubt, browse the source files directly
 
 **Table creation in tests**
 
+- `test_utils::table_builder::TestTableBuilder` (and the `test_table(...)` shorthand) -- worth
+  considering for a table in a specific state: composes `LogState`, `FeatureSet`,
+  `DataLayoutConfig`, and `TableConfig` through the real write path. Pair with the
+  `build_snapshot!` macro and, for broad coverage, the `default_sweep` template. See the Testing
+  section above.
 - Prefer the kernel `create_table` builder
-  (`delta_kernel::transaction::create_table::create_table`). It exercises the same path
-  connectors use and auto-derives the protocol from the schema and feature flags.
+  (`delta_kernel::transaction::create_table::create_table`) when you need a single bespoke
+  table rather than the builder's composed states. It exercises the same path connectors use
+  and auto-derives the protocol from the schema and feature flags.
 - `test_utils::create_table` (a JSON helper that hand-rolls protocol + metadata) is older
   but still needed when the kernel builder cannot enable a particular feature combination.
 
@@ -236,14 +264,13 @@ is the source of truth. Key concepts:
 
 **Table features**:
 
-- Writer: `appendOnly`, `invariants`, `checkConstraints`, `generatedColumns`,
-  `allowColumnDefaults`, `changeDataFeed`, `identityColumns`, `rowTracking`,
-  `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`,
-  `clustering`, `inCommitTimestamp`
-- Reader + writer: `catalogManaged`, `catalogOwned-preview`, `columnMapping`,
-  `deletionVectors`, `timestampNtz`, `v2Checkpoint`, `vacuumProtocolCheck`,
-  `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
-  `typeWidening`, `timestampNanos`
+- Writer: `allowColumnDefaults`, `appendOnly`, `changeDataFeed`, `checkConstraints`,
+  `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
+  `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`, `rowTracking`
+- Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
+  `columnMapping`, `deletionVectors`, `geospatial`, `timestampNanos`, `timestampNtz`,
+  `typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`, `variantShredding`,
+  `variantShredding-preview`, `variantType`, `variantType-preview`
 
 Keep this list updated when new protocol features are added to kernel.
 
@@ -260,9 +287,10 @@ Keep this list updated when new protocol features are added to kernel.
   any tracing macro inside a `tracing_subscriber::Layer` callback (`on_event`, `on_record`,
   `on_close`) while holding a span's `extensions_mut()` write lock will re-enter the layer
   and deadlock on the same lock. In `on_new_span`, no extension lock is held during
-  `attrs.record()`, so direct `warn!()` is safe there. In `on_event` and `on_record`, store
-  warnings in a `pending_warnings: Vec<String>` field on the visitor, take them out after
-  the extensions block closes, and emit via `warn!()` only then. See
+  `attrs.record()`, so direct `warn!()` is safe there. In `on_record`, store warnings in a
+  `pending_warnings: Vec<String>` field on the visitor, take them out after the extensions
+  block closes, and emit via `warn!()` only then. (`on_event`'s visitor does no
+  warning-eligible work, so it may run under the lock directly.) See
   `kernel/src/metrics/reporter.rs` for the canonical pattern.
 
 ## Code Style
@@ -291,12 +319,24 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
 - Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
-  `Expression::literal(...)` when building expressions inline. `col!` has two forms: a single
-  string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
-  same as `column_expr!`); one or more comma-separated args build a column with each segment taken
-  verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
+  `Expression::literal(...)` when building expressions inline. `col!` uses the same
+  compile-time segment rules as `column_name!` (string literals split on `.`; constants are
+  single simple segments). Use `Expression::column([...])` for runtime or non-simple names.
+  (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
+- Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
+  `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
+  interpolated fields might collide. For Delta log action schemas, reuse the canonical
+  `*_FIELD` and `LOG_*_SCHEMA` statics from `actions` instead of re-declaring
+  `StructField::nullable(ACTION_NAME, Action::to_schema())` or projecting from
+  `get_commit_schema()`. Prefer `StructType::try_new` or schema builder/patch APIs for complex
+  data-dependent schema manipulation.
 - NEVER panic in production code -- use errors instead. Panicking
   (including `unwrap()`, `expect()`, `panic!()`, `unreachable!()`, etc) is acceptable in test code only.
+- Order a file so the most important APIs and impls come first; put private helper functions
+  toward the bottom. Within that, order by visibility: `pub` first, then `pub(crate)`, then
+  private. A reader scanning top to bottom should hit the public surface before the private
+  plumbing. (Order-sensitive items like `macro_rules!` used within the file are exempt -- they
+  must precede their use.)
 
 ## Comment & Doc Style
 

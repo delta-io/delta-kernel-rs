@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::deletion_vector_writer::{
+    KernelDeletionVector, StreamingDeletionVectorWriter,
+};
 use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -17,18 +21,21 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction, WriteContext};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
-use test_utils::{begin_transaction, create_add_files_metadata, create_table, engine_store_setup};
+use test_utils::{
+    begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
+    load_and_begin_transaction,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -415,6 +422,28 @@ pub async fn create_dv_table_with_files(
     Ok((store, engine, table_url, paths))
 }
 
+/// Build a `path -> descriptor` map assigning each file a distinct synthetic DV descriptor.
+pub fn sequential_dv_descriptors(
+    file_paths: &[String],
+) -> HashMap<String, DeletionVectorDescriptor> {
+    file_paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            (
+                path.clone(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: format!("dv_file_{idx}.bin"),
+                    offset: Some(idx as i32 * 10),
+                    size_in_bytes: 40 + idx as i32,
+                    cardinality: idx as i64 + 1,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Extracts scan files from a snapshot for use in deletion vector updates.
 pub fn get_scan_files(
     snapshot: Arc<Snapshot>,
@@ -427,4 +456,34 @@ pub fn get_scan_files(
         .into_iter()
         .map(|sm| sm.scan_files)
         .collect())
+}
+
+/// Serialize a deletion vector, write it to the object store, and return its descriptor.
+pub async fn write_deletion_vector_to_store(
+    store: &Arc<dyn ObjectStore>,
+    write_context: &WriteContext,
+    dv: KernelDeletionVector,
+    prefix: &str,
+) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {
+    let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
+    let dv_object_path = Path::parse(dv_path.absolute_path()?.path())?;
+
+    let mut dv_buffer = Vec::new();
+    let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_buffer);
+    let dv_write_result = dv_writer.write_deletion_vector(dv)?;
+    dv_writer.finalize()?;
+
+    ObjectStoreExt::put(store, &dv_object_path, dv_buffer.into()).await?;
+
+    Ok(dv_write_result.to_descriptor(&dv_path))
+}
+
+/// Begin a transaction set up for deletion vector updates.
+pub fn create_dv_update_transaction(
+    table_url: &Url,
+    engine: &dyn Engine,
+) -> Result<Transaction, Box<dyn std::error::Error>> {
+    Ok(load_and_begin_transaction(table_url.clone(), engine)?
+        .with_engine_info("test engine")
+        .with_operation("DELETE".to_string()))
 }

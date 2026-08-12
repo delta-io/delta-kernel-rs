@@ -77,14 +77,13 @@
 //! - **Log Compaction**: Aggregates only a specific range of commit files
 //! - Both use similar action reconciliation logic but serve different use cases
 
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
-    DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
-    SIDECAR_NAME,
+    ADD_FIELD, DOMAIN_METADATA_FIELD, METADATA_FIELD, PROTOCOL_FIELD, REMOVE_FIELD,
+    SET_TRANSACTION_FIELD, SIDECAR_FIELD,
 };
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, SchemaRef};
 
 mod writer;
 
@@ -95,14 +94,12 @@ mod tests;
 
 /// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
-static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable(ADD_NAME, Add::to_schema()),
-        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
-        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-    ]))
-});
+static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&SIDECAR_FIELD),
+};

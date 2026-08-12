@@ -25,7 +25,7 @@ use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::schema::{DataType, StructField, StructType};
-use crate::utils::test_utils::Action;
+use crate::unit_test_utils::Action;
 use crate::{DeltaResult, Engine, EngineData, Snapshot};
 
 struct CheckpointParts {
