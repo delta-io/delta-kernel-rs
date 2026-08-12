@@ -12,7 +12,7 @@ use crate::partition::hive::{build_partition_path, uri_encode_path};
 use crate::partition::serialization::serialize_partition_value;
 use crate::partition::validation::validate_partition_values;
 use crate::schema::void_utils::add_void_stripping;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DataType, DeltaResult, Error, Expression};
@@ -27,6 +27,7 @@ use crate::{DataType, DeltaResult, Error, Expression};
 pub struct WriteState {
     pub(super) table_root: Url,
     pub(super) full_logical_schema: SchemaRef,
+    pub(super) logical_schema: SchemaRef,
     pub(super) physical_schema: SchemaRef,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
@@ -90,7 +91,7 @@ impl WriteState {
 
         Ok(BoundWriteContext {
             shared: Arc::new(self.clone()),
-            logical_schema: self.logical_schema_without_partition_columns(),
+            logical_schema: self.logical_schema.clone(),
             logical_to_physical,
             physical_partition_values: serialized,
         })
@@ -107,7 +108,7 @@ impl WriteState {
         let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
         Ok(BoundWriteContext {
             shared: Arc::new(self.clone()),
-            logical_schema: self.logical_schema_without_partition_columns(),
+            logical_schema: self.logical_schema.clone(),
             logical_to_physical,
             physical_partition_values: HashMap::new(),
         })
@@ -131,23 +132,6 @@ impl WriteState {
     /// Returns an error if the bytes do not contain a valid serialized write state.
     pub fn decode(bytes: &[u8]) -> DeltaResult<Self> {
         Ok(serde_json::from_slice(bytes)?)
-    }
-
-    fn logical_schema_without_partition_columns(&self) -> SchemaRef {
-        if self.logical_partition_columns.is_empty() {
-            return self.full_logical_schema.clone();
-        }
-        let partition_columns: HashSet<&str> = self
-            .logical_partition_columns
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let fields = self
-            .full_logical_schema
-            .fields()
-            .filter(|field| !partition_columns.contains(field.name().as_str()))
-            .cloned();
-        Arc::new(StructType::new_unchecked(fields))
     }
 
     fn generate_logical_to_physical(
@@ -452,7 +436,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::{lit, Expression};
-    use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue, StructField};
+    use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue, StructField, StructType};
 
     fn make_write_context(
         cm_mode: ColumnMappingMode,
@@ -465,6 +449,7 @@ mod tests {
         let shared = Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: schema.clone(),
+            logical_schema: schema.clone(),
             physical_schema: schema.clone(),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
@@ -805,6 +790,7 @@ mod tests {
         WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: Arc::new(StructType::new_unchecked([year, value])),
+            logical_schema: schema_ref! { nullable "value": INTEGER },
             physical_schema: schema_ref! { nullable "value": INTEGER },
             column_mapping_mode,
             stats_columns: vec![ColumnName::new(["value"])],
@@ -835,10 +821,9 @@ mod tests {
             random_prefix_length,
         );
         let encoded = original.encode().unwrap();
-        assert!(!String::from_utf8(encoded.clone())
-            .unwrap()
-            .contains("\"logical_schema\""));
         let decoded = WriteState::decode(&encoded).unwrap();
+        assert_eq!(decoded.full_logical_schema, original.full_logical_schema);
+        assert_eq!(decoded.logical_schema, original.logical_schema);
 
         let values = || HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
         let original_context = original.partitioned_write_context(values()).unwrap();

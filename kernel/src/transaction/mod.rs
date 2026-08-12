@@ -1084,6 +1084,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
         Ok(WriteState {
             table_root: table_config.table_root().clone(),
             full_logical_schema: table_config.logical_schema(),
+            logical_schema: table_config.logical_schema_without_partition_columns(),
             physical_schema: table_config.physical_write_schema(),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
