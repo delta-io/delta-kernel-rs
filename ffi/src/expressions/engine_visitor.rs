@@ -872,6 +872,8 @@ mod tests {
             visit_literal_bool: ignore_bool,
             visit_literal_timestamp: ignore_i64,
             visit_literal_timestamp_ntz: ignore_i64,
+            visit_literal_timestamp_nanos: ignore_i64,
+            visit_literal_timestamp_nanos_ntz: ignore_i64,
             visit_literal_date: ignore_i32,
             visit_literal_interval_year_month,
             visit_literal_interval_day_time,

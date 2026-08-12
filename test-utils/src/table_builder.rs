@@ -1568,8 +1568,10 @@ fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayR
         }
         #[cfg(feature = "nanosecond-timestamps")]
         ArrowDataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            // Needs a sub-millisecond component like the microsecond case to test truncation.
+            // Also includes a sub-microsecond component.
             let values: Vec<i64> = (0..rows)
-                .map(|i| (18 + base + i as i32) as i64 * 86_400_000_000_000)
+                .map(|i| (18 + base + i as i32) as i64 * 86_400_000_000_000 + 298_677_123)
                 .collect();
             let array = TimestampNanosecondArray::from(values);
             match tz {

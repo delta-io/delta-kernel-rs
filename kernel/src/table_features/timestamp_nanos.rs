@@ -50,7 +50,7 @@ mod tests {
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_schema_feature_validation;
+    use crate::unit_test_utils::assert_schema_feature_validation;
 
     #[rstest::rstest]
     #[case::nanos(PrimitiveType::TimestampNanos)]

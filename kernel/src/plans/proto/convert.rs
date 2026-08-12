@@ -641,9 +641,13 @@ impl From<&PrimitiveType> for proto_schema::PrimitiveType {
             PrimitiveType::Timestamp => PrimitiveTypeKind::Simple(Simple::Timestamp as i32),
             PrimitiveType::TimestampNtz => PrimitiveTypeKind::Simple(Simple::TimestampNtz as i32),
             #[cfg(feature = "nanosecond-timestamps")]
-            PrimitiveType::TimestampNanos => PrimitiveTypeKind::Simple(Simple::TimestampNanos as i32),
+            PrimitiveType::TimestampNanos => {
+                PrimitiveTypeKind::Simple(Simple::TimestampNanos as i32)
+            }
             #[cfg(feature = "nanosecond-timestamps")]
-            PrimitiveType::TimestampNanosNtz => PrimitiveTypeKind::Simple(Simple::TimestampNanosNtz as i32),
+            PrimitiveType::TimestampNanosNtz => {
+                PrimitiveTypeKind::Simple(Simple::TimestampNanosNtz as i32)
+            }
             PrimitiveType::Decimal(decimal) => PrimitiveTypeKind::Decimal((*decimal).into()),
             #[cfg(feature = "geo-type-in-dev")]
             PrimitiveType::Geometry(geometry) => {
@@ -843,6 +847,18 @@ impl TryFrom<proto_schema::PrimitiveType> for PrimitiveType {
                     Simple::Void => PrimitiveType::Void,
                     Simple::IntervalYearMonth => PrimitiveType::IntervalYearMonth,
                     Simple::IntervalDayTime => PrimitiveType::IntervalDayTime,
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    Simple::TimestampNanos => PrimitiveType::TimestampNanos,
+                    #[cfg(feature = "nanosecond-timestamps")]
+                    Simple::TimestampNanosNtz => PrimitiveType::TimestampNanosNtz,
+                    // The proto enum always carries the nanos variants, but these can only be
+                    // decoded when the nanosecond-timestamps feature is enabled.
+                    #[cfg(not(feature = "nanosecond-timestamps"))]
+                    Simple::TimestampNanos | Simple::TimestampNanosNtz => {
+                        return Err(Error::schema(
+                            "timestamp_nanos types require the 'nanosecond-timestamps' feature",
+                        ))
+                    }
                     Simple::Unspecified => {
                         return Err(Error::schema("SimplePrimitiveType is unspecified"))
                     }

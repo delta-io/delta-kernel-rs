@@ -49,6 +49,8 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         "test_table_timestamp_ntz",
         vec!["timestampNtz"],
         Arc::new(TimestampMicrosecondArray::from(timestamp_values)),
+        "0001-01-01T00:00:00.000",
+        "9999-12-31T23:59:59.999",
     )
     .await
 }
@@ -71,6 +73,8 @@ async fn test_append_timestamp_nanos() -> Result<(), Box<dyn std::error::Error>>
         "test_table_timestamp_nanos",
         vec!["timestampNanos", "timestampNtz"],
         Arc::new(TimestampNanosecondArray::from(timestamp_values).with_timezone("UTC")),
+        "1677-09-21T00:12:43.145Z",
+        "2262-04-11T23:47:16.854Z",
     )
     .await
 }
@@ -93,6 +97,8 @@ async fn test_append_timestamp_nanos_ntz() -> Result<(), Box<dyn std::error::Err
         "test_table_timestamp_nanos_ntz",
         vec!["timestampNanos", "timestampNtz"],
         Arc::new(TimestampNanosecondArray::from(timestamp_values)),
+        "1677-09-21T00:12:43.145",
+        "2262-04-11T23:47:16.854",
     )
     .await
 }
@@ -103,6 +109,8 @@ async fn test_append_timestamp(
     path: &str,
     features: Vec<&str>,
     timestamp_values: ArrayRef,
+    expected_min_stat: &str,
+    expected_max_stat: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
@@ -171,8 +179,8 @@ async fn test_append_timestamp(
 
     let stats: serde_json::Value =
         serde_json::from_str(parsed_commits[1]["add"]["stats"].as_str().unwrap())?;
-    assert_eq!(stats["minValues"]["ts_ntz"], "0001-01-01T00:00:00.000");
-    assert_eq!(stats["maxValues"]["ts_ntz"], "9999-12-31T23:59:59.999");
+    assert_eq!(stats["minValues"][col], expected_min_stat);
+    assert_eq!(stats["maxValues"][col], expected_max_stat);
 
     // Verify the data can be read back correctly
     test_read(&ArrowEngineData::new(data), &table_url, engine)?;

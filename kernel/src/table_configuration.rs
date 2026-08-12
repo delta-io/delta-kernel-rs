@@ -26,10 +26,10 @@ use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
     schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
 };
-#[cfg(feature = "nanosecond-timestamps")]
-use crate::table_features::validate_timestamp_nanos_feature_support;
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
+#[cfg(feature = "nanosecond-timestamps")]
+use crate::table_features::validate_timestamp_nanos_feature_support;
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,

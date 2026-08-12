@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(15)]
+    #[case(17)]
     #[case(42)]
     #[case(254)]
     fn try_from_u8_invalid(#[case] value: u8) {
@@ -1062,7 +1062,7 @@ mod tests {
     #[test]
     fn visit_null_unrecognized_tag_returns_error() {
         let mut state = KernelExpressionVisitorState::default();
-        assert!(visit_expression_literal_null_impl(&mut state, 15, 0, 0).is_err());
+        assert!(visit_expression_literal_null_impl(&mut state, 17, 0, 0).is_err());
     }
 
     #[test]

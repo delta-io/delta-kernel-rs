@@ -509,6 +509,10 @@ mod tests {
     visit_simple_type!(visit_date, "date");
     visit_simple_type!(visit_timestamp, "timestamp");
     visit_simple_type!(visit_timestamp_ntz, "timestamp_ntz");
+    #[cfg(feature = "nanosecond-timestamps")]
+    visit_simple_type!(visit_timestamp_nanos, "timestamp_nanos");
+    #[cfg(feature = "nanosecond-timestamps")]
+    visit_simple_type!(visit_timestamp_nanos_ntz, "timestamp_nanos_ntz");
     visit_simple_type!(visit_interval_year_month, "interval year to month");
     visit_simple_type!(visit_interval_day_time, "interval day to second");
     visit_simple_type!(visit_void, "void");
@@ -534,6 +538,10 @@ mod tests {
             visit_date,
             visit_timestamp,
             visit_timestamp_ntz,
+            #[cfg(feature = "nanosecond-timestamps")]
+            visit_timestamp_nanos,
+            #[cfg(feature = "nanosecond-timestamps")]
+            visit_timestamp_nanos_ntz,
             visit_interval_year_month,
             visit_interval_day_time,
             visit_void,
