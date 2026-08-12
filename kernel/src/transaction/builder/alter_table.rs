@@ -128,7 +128,10 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
-        self.operations.push(SchemaOperation::AddColumn { field });
+        self.operations.push(SchemaOperation::AddColumn {
+            path: vec![],
+            field,
+        });
         self.transition()
     }
 
@@ -145,7 +148,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         field: StructField,
     ) -> AlterTableTransactionBuilder<Modifying> {
         self.operations
-            .push(SchemaOperation::AddColumnAt { path, field });
+            .push(SchemaOperation::AddColumn { path, field });
         self.transition()
     }
 

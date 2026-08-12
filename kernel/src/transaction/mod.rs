@@ -2149,6 +2149,7 @@ mod tests {
             .contains("fresh_column"));
 
         let txn = txn.with_schema_changes(vec![SchemaOperation::AddColumn {
+            path: vec![],
             field: StructField::nullable("fresh_column", DataType::INTEGER),
         }])?;
 
