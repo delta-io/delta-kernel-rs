@@ -23,9 +23,12 @@ use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
 /// One segment in a path to a nested schema field.
-#[internal_api]
+/// This kernel also uses ColumnName as a path to a nested field,
+/// however this has the limitation of not concretely identifying
+/// recursion into arrays and maps (MapKey, MapValue).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
 pub(crate) enum PathSegment {
     Field(String),
     ArrayElement,
@@ -83,8 +86,8 @@ fn to_path_segments(path: &[String]) -> Vec<PathSegment> {
         .collect::<Vec<_>>()
 }
 
-// Resolves `path` to a struct and calls `modifier` on it. Field names are matched
-// case-insensitively; explicit segments select array elements and map keys or values.
+/// Resolves `path` to a struct and calls `modifier` on it. Field names are matched
+/// case-insensitively; can recurse into arrays and maps via explicit `PathSegment`s.
 fn modify_field_at_path(
     data_type: &mut DataType,
     path: &[PathSegment],
@@ -173,8 +176,37 @@ pub(crate) fn apply_schema_operations(
 
     for op in operations {
         let mut root = DataType::from(schema);
-        let add_column = match op {
-            SchemaOperation::AddColumn { path, field } => Some((path, field)),
+        match op {
+            SchemaOperation::AddColumn { path, field } => {
+                if field.is_metadata_column() {
+                    return Err(Error::schema(format!(
+                        "Cannot add column '{}': metadata columns are not allowed in a table schema",
+                        field.name()
+                    )));
+                }
+                if !matches!(field.data_type, DataType::Primitive(_)) {
+                    StructType::ensure_no_metadata_columns_in_field(&field)?;
+                }
+                if !field.is_nullable() {
+                    return Err(Error::schema(format!(
+                        "Cannot add non-nullable column '{}'. Added columns must be nullable \
+                         because existing data files do not contain this column.",
+                        field.name()
+                    )));
+                }
+                let field = if cm_enabled {
+                    let id = max_id.as_mut().ok_or_else(|| {
+                        Error::invalid_protocol(
+                            "Column mapping is enabled but delta.columnMapping.maxColumnId \
+                             is not set in table properties",
+                        )
+                    })?;
+                    try_assign_flat_column_mapping_info(&field, id)?
+                } else {
+                    field
+                };
+                modify_field_at_path(&mut root, &path, |parent| add_field(parent, field))?;
+            }
             SchemaOperation::SetNullable { column } => {
                 let (leaf, parent) = column
                     .path()
@@ -187,39 +219,7 @@ pub(crate) fn apply_schema_operations(
                 .map_err(|e| {
                     Error::generic(format!("Cannot set nullable on column '{column}': {e}"))
                 })?;
-                None
             }
-        };
-
-        if let Some((path, field)) = add_column {
-            if field.is_metadata_column() {
-                return Err(Error::schema(format!(
-                    "Cannot add column '{}': metadata columns are not allowed in a table schema",
-                    field.name()
-                )));
-            }
-            if !matches!(field.data_type, DataType::Primitive(_)) {
-                StructType::ensure_no_metadata_columns_in_field(&field)?;
-            }
-            if !field.is_nullable() {
-                return Err(Error::schema(format!(
-                    "Cannot add non-nullable column '{}'. Added columns must be nullable \
-                     because existing data files do not contain this column.",
-                    field.name()
-                )));
-            }
-            let field = if cm_enabled {
-                let id = max_id.as_mut().ok_or_else(|| {
-                    Error::invalid_protocol(
-                        "Column mapping is enabled but delta.columnMapping.maxColumnId \
-                         is not set in table properties",
-                    )
-                })?;
-                try_assign_flat_column_mapping_info(&field, id)?
-            } else {
-                field
-            };
-            modify_field_at_path(&mut root, &path, |parent| add_field(parent, field))?;
         }
 
         let DataType::Struct(updated_schema) = root else {

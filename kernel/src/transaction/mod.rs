@@ -71,7 +71,8 @@ pub(crate) mod alter_table;
 pub use alter_table::AlterTableTransaction;
 mod commit_info;
 mod domain_metadata;
-pub use crate::schema::changes::{PathSegment, SchemaOperation};
+#[internal_api]
+pub(crate) use crate::schema::changes::{PathSegment, SchemaOperation};
 #[cfg(feature = "internal-api")]
 pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]

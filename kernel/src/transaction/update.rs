@@ -145,7 +145,10 @@ impl Transaction {
     /// empty, data files have already been staged, or an operation produces a schema that is
     /// invalid for the table protocol.
     #[internal_api]
-    pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> DeltaResult<Self> {
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: Vec<SchemaOperation>,
+    ) -> DeltaResult<Self> {
         if self
             .effective_table_config
             .is_feature_enabled(&TableFeature::IcebergCompatV3)

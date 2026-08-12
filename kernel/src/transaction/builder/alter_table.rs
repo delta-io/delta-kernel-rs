@@ -28,6 +28,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
+
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
 use crate::schema::changes::{
@@ -135,7 +136,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         });
         self.transition()
     }
-    
+
     /// Change a column's nullability from NOT NULL to nullable. If the column is already
     /// nullable, the op is a no-op but still generates a commit.
     ///
@@ -145,7 +146,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
             .push(SchemaOperation::SetNullable { column });
         self.transition()
     }
-    
+
     /// Add a new column at an explicit schema path.
     ///
     /// `path` identifies the struct that will contain `field`. An empty path targets the table's
@@ -163,7 +164,6 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
             .push(SchemaOperation::AddColumn { path, field });
         self.transition()
     }
-
 }
 
 impl AlterTableTransactionBuilder<Modifying> {

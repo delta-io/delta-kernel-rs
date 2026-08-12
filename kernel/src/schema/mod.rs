@@ -24,8 +24,8 @@ use crate::table_features::{
     StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::require;
-use crate::{CollectInto, DeltaResult, Error};
+use crate::utils::{require, CollectInto};
+use crate::{DeltaResult, Error};
 
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
