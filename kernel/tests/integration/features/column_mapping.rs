@@ -98,8 +98,19 @@ fn field_names(snapshot: &Snapshot) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Feature-support matrix at reader version 3.
+//
+// For a ReaderWriter feature, `is_feature_supported` is `reader_supported && writer_supported`.
 // ColumnMapping is a legacy ReaderWriter feature (min reader version 2), so at reader version 3 the
 // reader half is always satisfied by the version and support collapses to writer-list membership.
+// The reader-only row never reaches this function: `Protocol::try_new` rejects it during load.
+//
+//   reader list        writer list        supported   note
+//   [columnMapping]     [columnMapping]    true        conformant, unchanged
+//   []                  [columnMapping]    true        orphaned, the fix
+//   []                  [appendOnly]       false       absent from both, invariant held
+// ---------------------------------------------------------------------------
 #[rstest]
 #[case::both_lists(&["columnMapping"], &["columnMapping"], true)]
 #[case::orphaned_writer_only(&[], &["columnMapping"], true)]
