@@ -13,18 +13,22 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::logical_expr::{
-    col as df_col, lit as df_lit, EmptyRelation, Expr as DFExpr, Filter as DFFilter,
-    LogicalPlan as DFLogicalPlan, LogicalPlanBuilder,
+    col as df_col, lit as df_lit, EmptyRelation, Expr as DFExpr, ExprSchemable,
+    Filter as DFFilter,
+    LogicalPlan as DFLogicalPlan, LogicalPlanBuilder, Projection as DFProjection,
 };
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
-use delta_kernel::expressions::Scalar as KernelScalar;
+use delta_kernel::expressions::{Expression as KernelExpression, Scalar as KernelScalar};
 use delta_kernel::plans::ir::nodes::{
-    Filter as KernelFilter, Operator as KernelOperator, Values as KernelValues,
+    Filter as KernelFilter, Operator as KernelOperator, Project as KernelProject,
+    Values as KernelValues,
 };
 use delta_kernel::schema::StructType;
+use delta_kernel::DeltaResult;
 
+use crate::expression::{struct_null_when_not, to_df_struct_columns};
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
@@ -50,18 +54,56 @@ pub(crate) fn lower_operator(
             };
             lower_values(values)
         }
+        KernelOperator::Project(project) => {
+            let [input] = inputs else {
+                return Err(input_count_error(1));
+            };
+            lower_project(project, input)
+        }
         KernelOperator::Filter(filter) => {
             let [input] = inputs else {
                 return Err(input_count_error(1));
             };
             lower_filter(filter, input)
         }
-        // TODO: lower the remaining operators (scans, Project/Load/Aggregate, SemiJoin, UnionAll),
-        // each in its own change.
+        // TODO: lower the remaining operators (scans, Load/Aggregate, SemiJoin, UnionAll), each
+        // in its own change.
         _ => Err(DataFusionError::NotImplemented(format!(
             "lowering operator {op} to a DataFusion LogicalPlan"
         ))),
     }
+}
+
+/// Lowers a [`Project`](KernelProject) to a single DataFusion projection.
+///
+/// A kernel Project holds a struct expression and its declared output schema, while DataFusion
+/// expects a flat expression list. Each struct field is therefore lowered, cast to its declared
+/// type, and aliased with its declared name before the declared output schema is attached to the
+/// DataFusion projection.
+///
+/// # Errors
+/// Returns an error if the Project expression is not a `Struct`/`StructPatch`, lowering a field or
+/// its nullability guard fails, or DataFusion cannot cast a field to its declared type.
+fn lower_project(
+    project: &KernelProject,
+    input: &Arc<DFLogicalPlan>,
+) -> Result<DFLogicalPlan, DataFusionError> {
+    let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
+    let arrow_schema: ArrowSchema = project.schema.as_ref().try_into_arrow()?;
+    let df_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
+    let columns = project_output_columns(&project.expr, &input_schema, project.schema.as_ref())
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let exprs: Result<Vec<DFExpr>, DataFusionError> = columns
+        .into_iter()
+        .zip(project.schema.fields())
+        .map(|((name, expr), field)| {
+            let target = field.data_type().try_into_arrow()?;
+            let expr = expr.cast_to(&target, input.schema())?.alias(name);
+            Ok(expr)
+        })
+        .collect();
+    let projection = DFProjection::try_new_with_schema(exprs?, Arc::clone(input), df_schema)?;
+    Ok(DFLogicalPlan::Projection(projection))
 }
 
 /// Lowers a [`Filter`](KernelFilter) node into a DataFusion [`Filter`](DFFilter) logical plan over
@@ -123,13 +165,35 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
     row.iter().map(lower_literal).collect()
 }
 
+/// Flattens a [`KernelProject`]'s struct output and applies its row-level null guard to every
+/// output column.
+fn project_output_columns(
+    expr: &KernelExpression,
+    input_schema: &StructType,
+    output_type: &StructType,
+) -> DeltaResult<Vec<(String, DFExpr)>> {
+    let (columns, null_guard) = to_df_struct_columns(expr, input_schema, output_type)?;
+    let Some(guard) = null_guard else {
+        return Ok(columns);
+    };
+    let guarded = columns
+        .into_iter()
+        .map(|(name, value)| (name, struct_null_when_not(guard.clone(), value)))
+        .collect();
+    Ok(guarded)
+}
+
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::ScalarValue as DFScalarValue;
+    use datafusion::logical_expr::{col as df_col, Case};
     use datafusion::prelude::SessionContext;
     use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
     use delta_kernel::expressions::{
         col, lit, ArrayData as KernelArrayData, BinaryPredicateOp as KernelBinaryPredicateOp,
+        Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
         JunctionPredicateOp as KernelJunctionPredicateOp, MapData as KernelMapData,
         Predicate as KernelPredicate, StructData as KernelStructData,
     };
@@ -517,6 +581,454 @@ mod tests {
             err.to_string()
                 .contains(&format!("filter expects 1 input(s), but received {actual}")),
             "{err}"
+        );
+    }
+
+    // === Project ===
+
+    fn empty_schema() -> StructType {
+        let fields: Vec<StructField> = Vec::new();
+        StructType::try_new(fields).unwrap()
+    }
+
+    /// The field names DataFusion reports for `plan`'s output columns.
+    fn output_names(plan: &DFLogicalPlan) -> Vec<&String> {
+        plan.schema().fields().iter().map(|f| f.name()).collect()
+    }
+
+    /// The Arrow types DataFusion reports for `plan`'s output columns.
+    fn output_types(plan: &DFLogicalPlan) -> Vec<ArrowDataType> {
+        let fields = plan.schema().fields();
+        fields.iter().map(|f| f.data_type().clone()).collect()
+    }
+
+    /// Lowers a Project over `parent`.
+    fn lower_project_expr(
+        expr: KernelExpr,
+        schema: StructType,
+        parent: &Arc<DFLogicalPlan>,
+    ) -> Result<DFLogicalPlan, DataFusionError> {
+        lower_operator(
+            &KernelOperator::Project(KernelProject {
+                expr: expr.into(),
+                schema: Arc::new(schema),
+            }),
+            std::slice::from_ref(parent),
+        )
+    }
+
+    #[rstest]
+    #[case::missing(0)]
+    #[case::extra(2)]
+    fn project_rejects_wrong_parent_count(#[case] actual: usize) {
+        let parent = input_with_schema(test_schema());
+        let parents = vec![parent; actual];
+        let op = KernelOperator::Project(KernelProject {
+            expr: KernelExpr::struct_from([col!("a")]).into(),
+            schema: Arc::new(
+                StructType::try_new([StructField::nullable("a", DataType::LONG)]).unwrap(),
+            ),
+        });
+        let err = lower_operator(&op, &parents).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "project expects 1 input(s), but received {actual}"
+            )),
+            "{err}"
+        );
+    }
+
+    #[rstest]
+    #[case::flat(
+        KernelExpr::struct_from([col!("b"), col!("a")]),
+        StructType::try_new([
+            StructField::nullable("renamed_b", DataType::STRING),
+            StructField::nullable("renamed_a", DataType::LONG),
+        ]).unwrap(),
+        vec!["renamed_b", "renamed_a"]
+    )]
+    #[case::nested(
+        KernelExpr::struct_from([KernelExpr::struct_from([col!("a")])]),
+        StructType::try_new([StructField::nullable(
+            "nested",
+            StructType::try_new([StructField::nullable("leaf", DataType::LONG)]).unwrap(),
+        )]).unwrap(),
+        vec!["nested"]
+    )]
+    fn project_lowers_single_projection_with_declared_schema(
+        #[case] expr: KernelExpr,
+        #[case] output: StructType,
+        #[case] expected_names: Vec<&str>,
+    ) {
+        let expected_arrow: ArrowSchema = (&output).try_into_arrow().unwrap();
+        let expected_types: Vec<ArrowDataType> = expected_arrow
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect();
+        let parent = input_with_schema(test_schema());
+        let lowered = lower_project_expr(expr, output, &parent).unwrap();
+
+        assert_eq!(output_names(&lowered), expected_names);
+        assert_eq!(output_types(&lowered), expected_types);
+        let DFLogicalPlan::Projection(projection) = &lowered else {
+            panic!("expected Projection, got {lowered:?}");
+        };
+        assert!(Arc::ptr_eq(&projection.input, &parent));
+        assert_eq!(projection.expr.len(), expected_names.len());
+        assert!(matches!(
+            projection.input.as_ref(),
+            DFLogicalPlan::EmptyRelation(_)
+        ));
+    }
+
+    #[rstest]
+    #[case::replace(
+        ExpressionStructPatchBuilder::new()
+            .replace("a", KernelExpr::literal(7i64))
+            .build()
+            .unwrap(),
+        StructType::try_new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::STRING),
+        ]).unwrap(),
+        vec!["a", "b"]
+    )]
+    #[case::drop(
+        ExpressionStructPatchBuilder::new().drop("a").build().unwrap(),
+        StructType::try_new([
+            StructField::nullable("b", DataType::STRING),
+        ]).unwrap(),
+        vec!["b"]
+    )]
+    #[case::inject(
+        ExpressionStructPatchBuilder::new()
+            .append(KernelExpr::literal(7i64))
+            .build()
+            .unwrap(),
+        StructType::try_new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::STRING),
+            StructField::nullable("injected", DataType::LONG),
+        ]).unwrap(),
+        vec!["a", "b", "injected"]
+    )]
+    fn project_lowers_struct_patch(
+        #[case] patch: ExpressionStructPatch,
+        #[case] output: StructType,
+        #[case] expected_names: Vec<&str>,
+    ) {
+        let parent = input_with_schema(test_schema());
+        let expr = KernelExpr::struct_patch(patch).unwrap();
+        let lowered = lower_project_expr(expr, output, &parent).unwrap();
+        assert_eq!(output_names(&lowered), expected_names);
+    }
+
+    #[test]
+    fn project_schema_and_predicate_are_available_to_a_downstream_filter() {
+        let parent = input_with_schema(test_schema());
+        let output =
+            StructType::try_new([StructField::nullable("projected", DataType::LONG)]).unwrap();
+        let projected = Arc::new(
+            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap(),
+        );
+        let filter = KernelFilter {
+            predicate: KernelPredicate::is_null(col!("projected")).into(),
+        };
+        let filtered = lower_operator(
+            &KernelOperator::Filter(filter),
+            std::slice::from_ref(&projected),
+        )
+        .unwrap();
+        let DFLogicalPlan::Filter(filter) = &filtered else {
+            panic!("expected Filter, got {filtered:?}");
+        };
+        assert_eq!(filter.predicate, df_col("projected").is_null());
+        assert!(Arc::ptr_eq(&filter.input, &projected));
+        assert_eq!(filtered.schema(), projected.schema());
+    }
+
+    /// A boolean nullability guard masks each output column individually (`CASE WHEN guard THEN
+    /// value ELSE NULL`), the per-field equivalent of nulling the whole struct.
+    #[test]
+    fn project_with_boolean_nullability_guard_masks_each_column() {
+        let input = StructType::try_new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("flag", DataType::BOOLEAN),
+        ])
+        .unwrap();
+        let parent = input_with_schema(input);
+        let output = StructType::try_new([StructField::nullable("out", DataType::LONG)]).unwrap();
+        let expr = KernelExpr::struct_with_nullability_from([col!("a")], col!("flag"));
+        let lowered = lower_project_expr(expr, output, &parent).unwrap();
+
+        assert_eq!(output_names(&lowered), ["out"]);
+        assert_eq!(output_types(&lowered), [ArrowDataType::Int64]);
+        let DFLogicalPlan::Projection(projection) = &lowered else {
+            panic!("expected Projection, got {lowered:?}");
+        };
+        let expected = DFExpr::Case(Case::new(
+            None,
+            vec![(Box::new(df_col("flag")), Box::new(df_col("a")))],
+            Some(Box::new(df_lit(DFScalarValue::Null))),
+        ))
+        .alias("out");
+        assert_eq!(projection.expr, [expected]);
+    }
+
+    #[test]
+    fn zero_field_project_lowers_to_empty_projection() {
+        let parent = input_with_schema(test_schema());
+        let lowered = lower_project_expr(
+            KernelExpr::struct_from([] as [KernelExpr; 0]),
+            empty_schema(),
+            &parent,
+        )
+        .unwrap();
+        assert!(lowered.schema().fields().is_empty());
+        let DFLogicalPlan::Projection(project) = &lowered else {
+            panic!("expected Projection");
+        };
+        assert!(project.expr.is_empty());
+    }
+
+    #[rstest]
+    #[case::unknown(KernelExpr::unknown("engine_expr"), "must be a Struct or StructPatch")]
+    #[case::non_struct(KernelExpr::literal(1i64), "must be a Struct or StructPatch")]
+    #[case::unresolved_nullability(
+        KernelExpr::struct_with_nullability_from(
+            [] as [KernelExpr; 0],
+            col!("missing")
+        ),
+        "missing"
+    )]
+    #[case::malformed_patch(
+        KernelExpr::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
+        "produced more fields"
+    )]
+    fn zero_field_project_rejects_invalid_expression(
+        #[case] expr: KernelExpr,
+        #[case] expected_message: &str,
+    ) {
+        let parent = input_with_schema(test_schema());
+        let err = lower_project_expr(expr, empty_schema(), &parent).unwrap_err();
+        assert!(err.to_string().contains(expected_message), "{err}");
+    }
+
+    #[test]
+    fn project_rejects_uncastable_output_type() {
+        let parent = input_with_schema(test_schema());
+        let output =
+            StructType::try_new([StructField::nullable("a", DataType::unshredded_variant())])
+                .unwrap();
+        let err =
+            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(&err, DataFusionError::Plan(_)), "{message}");
+        assert!(
+            message.contains("Cannot automatically convert"),
+            "{message}"
+        );
+    }
+
+    #[rstest]
+    #[case::primitive(
+        StructType::try_new([
+            StructField::nullable("a", DataType::INTEGER),
+        ]).unwrap(),
+        KernelExpr::struct_from([col!("a")]),
+        StructType::try_new([
+            StructField::nullable("a", DataType::LONG),
+        ]).unwrap()
+    )]
+    #[case::nested(
+        StructType::try_new([
+            StructField::nullable(
+                "nested",
+                StructType::try_new([
+                    StructField::nullable("leaf", DataType::INTEGER),
+                ]).unwrap(),
+            ),
+        ]).unwrap(),
+        KernelExpr::struct_from([col!("nested")]),
+        StructType::try_new([
+            StructField::nullable(
+                "nested",
+                StructType::try_new([
+                    StructField::nullable("leaf", DataType::LONG),
+                ]).unwrap(),
+            ),
+        ]).unwrap()
+    )]
+    fn project_casts_output_to_declared_type(
+        #[case] input: StructType,
+        #[case] expr: KernelExpr,
+        #[case] output: StructType,
+    ) {
+        let expected: ArrowSchema = (&output).try_into_arrow().unwrap();
+        let expected_types: Vec<ArrowDataType> = expected
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect();
+        let parent = input_with_schema(input);
+        let lowered = lower_project_expr(expr, output, &parent).unwrap();
+        assert_eq!(output_types(&lowered), expected_types);
+    }
+
+    #[tokio::test]
+    async fn project_executes_integer_to_long_cast() {
+        let input = StructType::try_new([StructField::nullable("a", DataType::INTEGER)]).unwrap();
+        let parent =
+            Arc::new(lower_values_node(input, vec![vec![KernelScalar::Integer(7)]]).unwrap());
+        let output = StructType::try_new([StructField::nullable("a", DataType::LONG)]).unwrap();
+        let lowered =
+            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap();
+
+        let batches = execute(lowered).await.unwrap();
+        assert_batches_eq!(&["+---+", "| a |", "+---+", "| 7 |", "+---+",], &batches);
+        assert_eq!(
+            batches[0].schema().field(0).data_type(),
+            &ArrowDataType::Int64
+        );
+    }
+
+    #[tokio::test]
+    async fn project_rejects_invalid_cast_value_during_execution() {
+        let input = StructType::try_new([StructField::nullable("a", DataType::STRING)]).unwrap();
+        let parent = Arc::new(
+            lower_values_node(input, vec![vec![KernelScalar::String("abc".into())]]).unwrap(),
+        );
+        let output = StructType::try_new([StructField::nullable("a", DataType::INTEGER)]).unwrap();
+        let lowered =
+            lower_project_expr(KernelExpr::struct_from([col!("a")]), output, &parent).unwrap();
+
+        let err = execute(lowered).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Cannot cast string 'abc' to value of Int32 type"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_executes_nested_integer_to_long_cast() {
+        let input_nested =
+            StructType::try_new([StructField::nullable("leaf", DataType::INTEGER)]).unwrap();
+        let input =
+            StructType::try_new([StructField::nullable("nested", input_nested.clone())]).unwrap();
+        let nested = KernelScalar::Struct(
+            KernelStructData::try_new(
+                input_nested.fields().cloned().collect(),
+                vec![KernelScalar::Integer(7)],
+            )
+            .unwrap(),
+        );
+        let parent = Arc::new(lower_values_node(input, vec![vec![nested]]).unwrap());
+        let output_nested =
+            StructType::try_new([StructField::nullable("leaf", DataType::LONG)]).unwrap();
+        let output = StructType::try_new([StructField::nullable("nested", output_nested)]).unwrap();
+        let lowered =
+            lower_project_expr(KernelExpr::struct_from([col!("nested")]), output, &parent).unwrap();
+
+        let batches = execute(lowered).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+-----------+",
+                "| nested    |",
+                "+-----------+",
+                "| {leaf: 7} |",
+                "+-----------+",
+            ],
+            &batches
+        );
+        let schema = batches[0].schema();
+        let ArrowDataType::Struct(fields) = schema.field(0).data_type() else {
+            panic!("expected nested struct");
+        };
+        assert_eq!(fields[0].data_type(), &ArrowDataType::Int64);
+    }
+
+    #[test]
+    fn project_normalizes_kernel_compatible_arrow_representations() {
+        let expected = StructType::try_new([
+            StructField::nullable("string", DataType::STRING),
+            StructField::nullable("array", ArrayType::new(DataType::LONG, true)),
+            StructField::nullable(
+                "map",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+        ])
+        .unwrap();
+        let map_entries = ArrowDataType::Struct(
+            vec![
+                Arc::new(ArrowField::new("key", ArrowDataType::Utf8View, false)),
+                Arc::new(ArrowField::new("value", ArrowDataType::Utf8View, true)),
+            ]
+            .into(),
+        );
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("string", ArrowDataType::Utf8View, true),
+            ArrowField::new(
+                "array",
+                ArrowDataType::LargeList(Arc::new(ArrowField::new(
+                    "element",
+                    ArrowDataType::Int64,
+                    true,
+                ))),
+                true,
+            ),
+            ArrowField::new(
+                "map",
+                ArrowDataType::Map(
+                    Arc::new(ArrowField::new("entries", map_entries, false)),
+                    false,
+                ),
+                true,
+            ),
+        ]);
+        let empty = EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(DFSchema::try_from(arrow_schema).unwrap()),
+        };
+        let parent = Arc::new(DFLogicalPlan::EmptyRelation(empty));
+        let output: ArrowSchema = (&expected).try_into_arrow().unwrap();
+        let expected_types: Vec<ArrowDataType> = output
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect();
+        let expr = KernelExpr::struct_from([col!("string"), col!("array"), col!("map")]);
+
+        let lowered = lower_project_expr(expr, expected, &parent).unwrap();
+        assert_eq!(output_types(&lowered), expected_types);
+    }
+
+    #[rstest]
+    #[case::interval(DataType::INTERVAL_YEAR_MONTH)]
+    #[case::variant(DataType::unshredded_variant())]
+    fn project_preserves_kernel_physical_type(#[case] data_type: DataType) {
+        let schema = StructType::try_new([StructField::nullable("a", data_type)]).unwrap();
+        let expected: ArrowSchema = (&schema).try_into_arrow().unwrap();
+        let expected_type = expected.field(0).data_type().clone();
+        let parent = input_with_schema(schema.clone());
+        let lowered =
+            lower_project_expr(KernelExpr::struct_from([col!("a")]), schema, &parent).unwrap();
+        assert_eq!(output_types(&lowered), [expected_type]);
+    }
+
+    /// Errors from converting a Project's child expression propagate to the caller.
+    #[test]
+    fn project_propagates_expression_conversion_error() {
+        let parent = input_with_schema(test_schema());
+        let output = StructType::try_new([StructField::nullable("a", DataType::LONG)]).unwrap();
+        let expr = KernelExpr::struct_from([KernelExpr::unknown("engine_expr")]);
+        let err = lower_project_expr(expr, output, &parent).unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(&err, DataFusionError::External(_)), "{message}");
+        assert!(
+            message.contains(r#"cannot convert Unknown expression "engine_expr""#),
+            "{message}"
         );
     }
 }
