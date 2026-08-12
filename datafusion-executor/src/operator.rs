@@ -83,6 +83,8 @@ pub(crate) fn lower_operator(
     }
 }
 
+/// Lowers a [`Filter`](KernelFilter) node into a DataFusion [`Filter`](DFFilter) logical plan over
+/// its parent.
 fn lower_filter(
     filter: &KernelFilter,
     parent: &LoweredNode,
