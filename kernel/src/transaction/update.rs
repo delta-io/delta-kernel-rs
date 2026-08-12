@@ -95,6 +95,8 @@ impl Transaction {
             committer,
             operation: None,
             engine_info: None,
+            operation_parameters: HashMap::new(),
+            operation_metrics: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],

@@ -851,10 +851,13 @@ pub(crate) struct CommitInfo {
     /// - The CommitInfo action must always be the first one in a commit.
     pub(crate) in_commit_timestamp: Option<i64>,
     /// An arbitrary string that identifies the operation associated with this commit. This is
-    /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
+    /// specified by the engine. Read: optional, write: required (that is, kernel always writes).
     pub(crate) operation: Option<String>,
     /// Map of arbitrary string key-value pairs that provide additional information about the
-    /// operation. This is specified by the engine. For now this is always empty on write.
+    /// operation. This is specified by the engine via
+    /// [`Transaction::with_operation_parameters`](crate::transaction::Transaction::with_operation_parameters)
+    /// or the equivalent create-table / alter-table builder method.
+    /// Defaults to an empty map when unset.
     pub(crate) operation_parameters: Option<HashMap<String, String>>,
     /// The version of the delta_kernel crate used to write this commit. The kernel will always
     /// write this field, but it is optional since many tables will not have this field (i.e. any
@@ -862,6 +865,12 @@ pub(crate) struct CommitInfo {
     pub(crate) kernel_version: Option<String>,
     /// Whether this commit is a blind append.
     pub(crate) is_blind_append: Option<bool>,
+    /// Optional map of stringified operation metrics (e.g. `numFiles`, `numOutputRows`). Specified
+    /// by the engine via
+    /// [`Transaction::with_operation_metrics`](crate::transaction::Transaction::with_operation_metrics)
+    /// or the equivalent create-table / alter-table builder method.
+    /// When unset, this field is written as null.
+    pub(crate) operation_metrics: Option<HashMap<String, String>>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
@@ -883,6 +892,7 @@ impl CommitInfo {
             operation_parameters: Some(HashMap::new()),
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             is_blind_append: is_blind_append.then_some(true),
+            operation_metrics: None,
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
@@ -1814,6 +1824,10 @@ mod tests {
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::nullable("isBlindAppend", DataType::BOOLEAN),
+                StructField::nullable(
+                    "operationMetrics",
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                ),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
             ]),
@@ -2129,6 +2143,10 @@ mod tests {
         let mut map_builder = create_string_map_builder(false);
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
+        // null operationMetrics (append(false)), vs the empty-but-present map above
+        let mut metrics_builder = create_string_map_builder(false);
+        metrics_builder.append(false).unwrap();
+        let operation_metrics = Arc::new(metrics_builder.finish());
 
         let expected = RecordBatch::try_new(
             record_batch.schema(),
@@ -2139,6 +2157,7 @@ mod tests {
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(BooleanArray::from(vec![None::<bool>])),
+                operation_metrics,
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
             ],

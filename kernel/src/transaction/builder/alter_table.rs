@@ -24,6 +24,7 @@
 //! snapshot.alter_table().build(engine, committer)?;  // compile error
 //! ```
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ use crate::table_features::{
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
+use crate::transaction::collect_string_map;
 use crate::transaction::schema_evolution::{
     apply_schema_operations, SchemaEvolutionResult, SchemaOperation,
 };
@@ -77,6 +79,8 @@ pub struct AlterTableTransactionBuilder<S = Ready> {
     snapshot: SnapshotRef,
     operations: Vec<SchemaOperation>,
     correlation_id: Option<Arc<str>>,
+    operation_parameters: HashMap<String, String>,
+    operation_metrics: Option<HashMap<String, String>>,
     // PhantomData marker for builder state (Ready or Modifying).
     // Zero-sized; only affects which methods are available at compile time.
     _state: PhantomData<S>,
@@ -94,6 +98,8 @@ impl<S> AlterTableTransactionBuilder<S> {
             snapshot: self.snapshot,
             operations: self.operations,
             correlation_id: self.correlation_id,
+            operation_parameters: self.operation_parameters,
+            operation_metrics: self.operation_metrics,
             _state: PhantomData,
         }
     }
@@ -102,6 +108,32 @@ impl<S> AlterTableTransactionBuilder<S> {
     /// events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Set `CommitInfo.operationParameters` for the alter-table commit.
+    ///
+    /// See [`crate::transaction::Transaction::with_operation_parameters`].
+    pub fn with_operation_parameters<I, K, V>(mut self, operation_parameters: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_parameters = collect_string_map(operation_parameters);
+        self
+    }
+
+    /// Set `CommitInfo.operationMetrics` for the alter-table commit.
+    ///
+    /// See [`crate::transaction::Transaction::with_operation_metrics`].
+    pub fn with_operation_metrics<I, K, V>(mut self, operation_metrics: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_metrics = Some(collect_string_map(operation_metrics));
         self
     }
 }
@@ -113,6 +145,8 @@ impl AlterTableTransactionBuilder<Ready> {
             snapshot,
             operations: Vec::new(),
             correlation_id: None,
+            operation_parameters: HashMap::new(),
+            operation_metrics: None,
             _state: PhantomData,
         }
     }
@@ -237,5 +271,10 @@ impl AlterTableTransactionBuilder<Modifying> {
             committer,
             self.correlation_id,
         )
+        .map(|mut txn| {
+            txn.operation_parameters = self.operation_parameters;
+            txn.operation_metrics = self.operation_metrics;
+            txn
+        })
     }
 }

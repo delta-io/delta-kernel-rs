@@ -6,6 +6,7 @@
 
 #![allow(unreachable_pub)]
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -59,6 +60,8 @@ impl AlterTableTransaction {
             committer,
             operation: Some("ALTER TABLE".to_string()),
             engine_info: None,
+            operation_parameters: HashMap::new(),
+            operation_metrics: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],

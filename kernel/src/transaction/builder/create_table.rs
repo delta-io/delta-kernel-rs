@@ -44,7 +44,7 @@ use crate::table_properties::{
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
-use crate::transaction::Transaction;
+use crate::transaction::{collect_string_map, Transaction};
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
@@ -726,6 +726,8 @@ pub struct CreateTableTransactionBuilder {
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
     correlation_id: Option<Arc<str>>,
+    operation_parameters: HashMap<String, String>,
+    operation_metrics: Option<HashMap<String, String>>,
 }
 
 impl CreateTableTransactionBuilder {
@@ -741,6 +743,8 @@ impl CreateTableTransactionBuilder {
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
             correlation_id: None,
+            operation_parameters: HashMap::new(),
+            operation_metrics: None,
         }
     }
 
@@ -832,6 +836,32 @@ impl CreateTableTransactionBuilder {
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
         self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
+        self
+    }
+
+    /// Set `CommitInfo.operationParameters` for the create-table commit.
+    ///
+    /// See [`Transaction::with_operation_parameters`].
+    pub fn with_operation_parameters<I, K, V>(mut self, operation_parameters: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_parameters = collect_string_map(operation_parameters);
+        self
+    }
+
+    /// Set `CommitInfo.operationMetrics` for the create-table commit.
+    ///
+    /// See [`Transaction::with_operation_metrics`].
+    pub fn with_operation_metrics<I, K, V>(mut self, operation_metrics: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_metrics = Some(collect_string_map(operation_metrics));
         self
     }
 
@@ -958,14 +988,17 @@ impl CreateTableTransactionBuilder {
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
 
         // Create Transaction<CreateTable> with the effective table configuration
-        Transaction::try_new_create_table(
+        let mut txn = Transaction::try_new_create_table(
             table_configuration,
             self.engine_info,
             committer,
             data_layout_result.system_domain_metadata,
             data_layout_result.clustering_columns,
             self.correlation_id,
-        )
+        )?;
+        txn.operation_parameters = self.operation_parameters;
+        txn.operation_metrics = self.operation_metrics;
+        Ok(txn)
     }
 }
 

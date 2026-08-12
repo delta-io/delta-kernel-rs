@@ -25,7 +25,10 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
 use serde_json::Value;
-use test_utils::{assert_result_error_with_message, test_table_setup, test_table_setup_mt};
+use test_utils::{
+    assert_result_error_with_message, read_actions_from_commit, test_table_setup,
+    test_table_setup_mt,
+};
 
 /// Helper to create a simple two-column schema for tests.
 /// Shared with sub-modules.
@@ -44,6 +47,31 @@ pub(crate) fn partition_test_schema() -> DeltaResult<Arc<StructType>> {
         StructField::nullable("date", DataType::DATE),
         StructField::nullable("value", DataType::STRING),
     ])?))
+}
+
+/// Engine-supplied operationParameters/operationMetrics set on the create-table builder are
+/// written to the version-0 commit's CommitInfo.
+#[tokio::test]
+async fn test_create_table_writes_operation_parameters_and_metrics() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let schema = simple_schema()?;
+
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_operation_parameters([("mode", "Create"), ("description", "events")])
+        .with_operation_metrics([("numFiles", "0")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let commit_infos =
+        read_actions_from_commit(&table_url, 0, "commitInfo").expect("failed to read commit");
+    let ci = &commit_infos[0];
+    assert_eq!(
+        ci["operationParameters"],
+        serde_json::json!({"mode": "Create", "description": "events"})
+    );
+    assert_eq!(ci["operationMetrics"], serde_json::json!({"numFiles": "0"}));
+    Ok(())
 }
 
 #[tokio::test]

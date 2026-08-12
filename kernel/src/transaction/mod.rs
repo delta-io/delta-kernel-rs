@@ -218,6 +218,10 @@ pub struct Transaction<S = ExistingTable> {
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
+    // Engine-provided CommitInfo.operationParameters. Always written (empty map when unset)
+    operation_parameters: HashMap<String, String>,
+    // Engine-provided CommitInfo.operationMetrics. Written as null when unset, hence Option.
+    operation_metrics: Option<HashMap<String, String>>,
     engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
@@ -443,13 +447,15 @@ impl<S> Transaction<S> {
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let kernel_commit_info = CommitInfo::new(
+        let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
         );
+        kernel_commit_info.operation_parameters = Some(self.operation_parameters.clone());
+        kernel_commit_info.operation_metrics = self.operation_metrics.clone();
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions based on emit flags
@@ -616,6 +622,36 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Set `CommitInfo.operationParameters` for this transaction.
+    ///
+    /// Values should already be stringified the way table history expects (for example
+    /// `mode` -> `"Append"`, `partitionBy` -> `"[\"date\"]"`). Kernel writes this map as-is and
+    /// does not interpret or validate keys.
+    pub fn with_operation_parameters<I, K, V>(mut self, operation_parameters: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_parameters = collect_string_map(operation_parameters);
+        self
+    }
+
+    /// Set `CommitInfo.operationMetrics` for this transaction.
+    ///
+    /// Values should already be stringified (for example `numFiles` -> `"1"`). Kernel writes this
+    /// map as-is and does not interpret or validate keys. When unset, `operationMetrics` is written
+    /// as null; an explicitly empty map is written as `{}`.
+    pub fn with_operation_metrics<I, K, V>(mut self, operation_metrics: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.operation_metrics = Some(collect_string_map(operation_metrics));
+        self
+    }
+
     /// Attach an opaque, caller-supplied correlation id for joining this transaction's commit
     /// metric events to the caller's own request or operation id. An empty id is treated as unset.
     /// When unset, behavior is unchanged.
@@ -634,6 +670,7 @@ impl<S> Transaction<S> {
     /// - operationParameters
     /// - kernelVersion
     /// - isBlindAppend
+    /// - operationMetrics
     /// - engineInfo
     /// - txnId
     pub fn with_commit_info(
@@ -1813,6 +1850,20 @@ pub struct RetryableTransaction<S = ExistingTable> {
     pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
     pub error: Error,
+}
+
+/// Collect stringifiable key/value pairs into a `CommitInfo` string map. Shared by the
+/// `with_operation_parameters`/`with_operation_metrics` setters on `Transaction` and its builders.
+pub(crate) fn collect_string_map<I, K, V>(pairs: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    pairs
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3087,6 +3138,48 @@ mod tests {
                 retryable.error
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_retryable_transaction_preserves_operation_maps() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let mut txn = snapshot
+            .transaction(Box::new(IoErrorCommitter), engine.as_ref())?
+            .with_operation_parameters([("mode", "Append")])
+            .with_operation_metrics([("numFiles", "1")]);
+        add_dummy_file(&mut txn);
+
+        let CommitResult::RetryableTransaction(retryable) = txn.commit(engine.as_ref())? else {
+            panic!("expected RetryableTransaction from IoErrorCommitter");
+        };
+
+        assert_eq!(
+            retryable.transaction.operation_parameters,
+            HashMap::from([("mode".to_string(), "Append".to_string())]),
+            "operationParameters must survive a retryable commit failure"
+        );
+        assert_eq!(
+            retryable.transaction.operation_metrics,
+            Some(HashMap::from([("numFiles".to_string(), "1".to_string())])),
+            "operationMetrics must survive a retryable commit failure"
+        );
+        Ok(())
+    }
+
+    /// The with_operation_* setters replace the whole map (last call wins) and dedup duplicate
+    /// input keys (last value wins) via the shared collect_string_map helper.
+    #[test]
+    fn test_with_operation_parameters_replaces_and_dedups() -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
+            .with_operation_parameters([("a", "1"), ("a", "2")]) // duplicate key -> last wins
+            .with_operation_parameters([("b", "3")]); // second call -> replaces
+        assert_eq!(
+            txn.operation_parameters,
+            HashMap::from([("b".to_string(), "3".to_string())])
+        );
         Ok(())
     }
 

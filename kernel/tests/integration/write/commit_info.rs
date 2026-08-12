@@ -111,12 +111,50 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Engine-supplied `operationParameters` and `operationMetrics`, set through the public transaction
+/// builder methods, are written to the commit's CommitInfo with their exact key/value entries.
+#[tokio::test]
+async fn test_commit_info_with_operation_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let schema = get_simple_int_schema();
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema, &[], None, "test_table").await?
+    {
+        let txn = load_and_begin_transaction(table_url.clone(), &engine)?
+            .with_operation("WRITE".to_string())
+            .with_operation_parameters([("mode", "Append"), ("partitionBy", "[]")])
+            .with_operation_metrics([("numFiles", "1"), ("numOutputRows", "10")]);
+
+        let _ = txn.commit(&engine)?;
+
+        let commit = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let parsed: serde_json::Value = serde_json::from_slice(&commit.bytes().await?)?;
+        let ci = &parsed["commitInfo"];
+
+        assert_eq!(
+            ci["operationParameters"],
+            json!({"mode": "Append", "partitionBy": "[]"})
+        );
+        assert_eq!(
+            ci["operationMetrics"],
+            json!({"numFiles": "1", "numOutputRows": "10"})
+        );
+    }
+    Ok(())
+}
+
 /// Verifies that when `engine_commit_info` is provided (the `Some` branch of `build_commit_info`):
 /// - The written JSON is correctly wrapped in a top-level `"commitInfo"` key.
 /// - Engine-only fields (not in `CommitInfo::to_schema()`) pass through to the log unchanged.
 /// - Fields that overlap with kernel-managed CommitInfo fields are overridden by kernel values,
-/// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`) are
-///   present with correct values.
+/// - All kernel-managed fields (`timestamp`, `kernelVersion`, `txnId`, `operationParameters`,
+///   `operationMetrics`) are present with correct values.
 #[tokio::test]
 async fn test_commit_info_with_engine_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();

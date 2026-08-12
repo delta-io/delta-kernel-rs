@@ -20,8 +20,8 @@ use delta_kernel::DeltaResult;
 use rstest::rstest;
 use test_utils::{
     add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
-    create_table_and_load_snapshot, engine_store_setup, test_table_setup, test_table_setup_mt,
-    write_batch_to_table,
+    create_table_and_load_snapshot, engine_store_setup, read_actions_from_commit, test_table_setup,
+    test_table_setup_mt, write_batch_to_table,
 };
 
 fn simple_schema() -> SchemaRef {
@@ -53,6 +53,39 @@ fn max_column_id(snap: &Snapshot) -> Option<i64> {
 // ============================================================================
 // Add column tests
 // ============================================================================
+
+/// Engine-supplied operationParameters/operationMetrics set on the alter-table builder are
+/// written to the alter commit's CommitInfo.
+#[tokio::test]
+async fn alter_table_writes_operation_parameters_and_metrics(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let snapshot =
+        create_table_and_load_snapshot(&table_path, simple_schema(), engine.as_ref(), &[])?;
+
+    snapshot
+        .alter_table()
+        .with_operation_parameters([("columnsAdded", "1")])
+        .with_operation_metrics([("numAddedColumns", "1")])
+        .add_column(StructField::nullable("added", DataType::STRING))
+        .build(engine.as_ref(), committer())?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+    let commit_infos =
+        read_actions_from_commit(&table_url, 1, "commitInfo").expect("failed to read commit");
+    let ci = &commit_infos[0];
+    assert_eq!(
+        ci["operationParameters"],
+        serde_json::json!({"columnsAdded": "1"})
+    );
+    assert_eq!(
+        ci["operationMetrics"],
+        serde_json::json!({"numAddedColumns": "1"})
+    );
+    Ok(())
+}
 
 /// End-to-end lifecycle: write, ALTER to add columns, scan, write populated rows, scan again.
 /// Each column is added in its own alter commit with a checkpoint after, exercising

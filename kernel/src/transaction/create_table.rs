@@ -31,6 +31,7 @@
 // and for tests. Also allow dead_code since these are used by integration tests.
 #![allow(unreachable_pub, dead_code)]
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -162,6 +163,8 @@ impl CreateTableTransaction {
             committer,
             operation: Some("CREATE TABLE".to_string()),
             engine_info: Some(engine_info),
+            operation_parameters: HashMap::new(),
+            operation_metrics: None,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],

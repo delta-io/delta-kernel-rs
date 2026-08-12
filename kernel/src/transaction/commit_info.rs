@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::Transaction;
@@ -14,7 +15,18 @@ use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, Into
 fn commit_info_literal_exprs(
     commit_info: CommitInfo,
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
-    let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let map_literal =
+        |map: Option<HashMap<String, String>>, map_type: MapType| -> Result<ExpressionRef, Error> {
+            Ok(Arc::new(Expression::literal(match map {
+                Some(map) => Scalar::Map(MapData::try_new(
+                    map_type,
+                    map.into_iter()
+                        .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
+                )?),
+                None => Scalar::null(map_type),
+            })))
+        };
     let literal_exprs = vec![
         (
             "timestamp",
@@ -30,16 +42,7 @@ fn commit_info_literal_exprs(
         ),
         (
             "operationParameters",
-            Arc::new(Expression::literal(
-                match commit_info.operation_parameters {
-                    Some(map) => Scalar::Map(MapData::try_new(
-                        op_params_map_type,
-                        map.into_iter()
-                            .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
-                    )?),
-                    None => Scalar::null(op_params_map_type),
-                },
-            )),
+            map_literal(commit_info.operation_parameters, string_map_type.clone())?,
         ),
         (
             "kernelVersion",
@@ -48,6 +51,10 @@ fn commit_info_literal_exprs(
         (
             "isBlindAppend",
             Arc::new(Expression::literal(commit_info.is_blind_append)),
+        ),
+        (
+            "operationMetrics",
+            map_literal(commit_info.operation_metrics, string_map_type)?,
         ),
         (
             "engineInfo",
@@ -121,6 +128,7 @@ impl<S> Transaction<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::actions::CommitInfo;
@@ -217,6 +225,24 @@ mod tests {
             .value(0)
     }
 
+    /// Helper: pull a named string->string map column into a `HashMap` for content assertions.
+    fn get_map_entries(s: &StructArray, col: &str) -> HashMap<String, String> {
+        let entries = get_map(s, col);
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("map keys are strings");
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("map values are strings");
+        (0..entries.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect()
+    }
+
     /// Helper: pull a non-null boolean value from a named column in a StructArray.
     fn get_bool(s: &StructArray, col: &str) -> bool {
         s.column_by_name(col)
@@ -256,6 +282,64 @@ mod tests {
         assert_eq!(get_str(ci, "operation"), "WRITE");
         assert!(!get_str(ci, "kernelVersion").is_empty());
         assert!(!get_str(ci, "txnId").is_empty());
+        assert!(
+            ci.column_by_name("operationMetrics")
+                .expect("operationMetrics field")
+                .is_null(0),
+            "operationMetrics should be null when unset"
+        );
+        Ok(())
+    }
+
+    /// Kernel CommitInfo carries engine-provided operationParameters / operationMetrics.
+    #[test]
+    fn test_build_commit_info_with_operation_maps() -> DeltaResult<()> {
+        let (engine, txn) = make_txn(None)?;
+        let mut commit_info = make_kernel_commit_info();
+        commit_info.operation_parameters = Some(HashMap::from([
+            ("mode".to_string(), "Append".to_string()),
+            ("partitionBy".to_string(), "[]".to_string()),
+        ]));
+        commit_info.operation_metrics = Some(HashMap::from([
+            ("numFiles".to_string(), "1".to_string()),
+            ("numOutputRows".to_string(), "10".to_string()),
+        ]));
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), commit_info)?,
+        )?;
+        let ci = commit_info_struct(&result);
+
+        // Assert exact entries so a crossed or swapped map is caught.
+        let params = get_map_entries(ci, "operationParameters");
+        assert_eq!(params.get("mode").map(String::as_str), Some("Append"));
+        assert_eq!(params.get("partitionBy").map(String::as_str), Some("[]"));
+        let metrics = get_map_entries(ci, "operationMetrics");
+        assert_eq!(metrics.get("numFiles").map(String::as_str), Some("1"));
+        assert_eq!(metrics.get("numOutputRows").map(String::as_str), Some("10"));
+        Ok(())
+    }
+
+    /// An explicitly empty operationMetrics map is written as `{}` (present, empty), distinct from
+    /// the null written when the map is left unset.
+    #[test]
+    fn test_build_commit_info_empty_metrics_is_empty_map_not_null() -> DeltaResult<()> {
+        let (engine, txn) = make_txn(None)?;
+        let mut commit_info = make_kernel_commit_info();
+        commit_info.operation_metrics = Some(HashMap::new());
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), commit_info)?,
+        )?;
+        let ci = commit_info_struct(&result);
+
+        assert!(
+            !ci.column_by_name("operationMetrics")
+                .expect("operationMetrics field")
+                .is_null(0),
+            "an explicit empty map must be written as a non-null map"
+        );
+        assert_eq!(get_map(ci, "operationMetrics").len(), 0);
         Ok(())
     }
 
@@ -280,7 +364,7 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All CommitInfo fields are appended -- total = 2 engine + 8 CommitInfo.
+        // All CommitInfo fields are appended -- total = 2 engine + kernel CommitInfo fields.
         assert_eq!(
             commit_info.num_columns(),
             2 + CommitInfo::to_schema().fields().count()
@@ -314,6 +398,12 @@ mod tests {
         map_builder.append(true).unwrap();
         let stale_op_params = Arc::new(map_builder.finish()) as ArrayRef;
 
+        let mut metrics_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        metrics_builder.keys().append_value("stale_metric");
+        metrics_builder.values().append_value("0");
+        metrics_builder.append(true).unwrap();
+        let stale_op_metrics = Arc::new(metrics_builder.finish()) as ArrayRef;
+
         let (data, schema) = make_engine_commit_info(
             vec![
                 ArrowField::new("timestamp", ArrowDataType::Int64, true),
@@ -326,6 +416,11 @@ mod tests {
                 ),
                 ArrowField::new("kernelVersion", ArrowDataType::Utf8, true),
                 ArrowField::new("isBlindAppend", ArrowDataType::Boolean, true),
+                ArrowField::new(
+                    "operationMetrics",
+                    stale_op_metrics.data_type().clone(),
+                    true,
+                ),
                 ArrowField::new("engineInfo", ArrowDataType::Utf8, true),
                 ArrowField::new("txnId", ArrowDataType::Utf8, true),
             ],
@@ -336,6 +431,7 @@ mod tests {
                 stale_op_params,
                 Arc::new(StringArray::from(vec!["v0.0.0"])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
+                stale_op_metrics,
                 Arc::new(StringArray::from(vec!["stale_engine"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_txn"])) as ArrayRef,
             ],
@@ -347,18 +443,88 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All 8 CommitInfo fields are present in the engine schema -- no fields appended.
-        assert_eq!(commit_info.num_columns(), 8);
+        // All CommitInfo fields are present in the engine schema -- no fields appended.
+        assert_eq!(
+            commit_info.num_columns(),
+            CommitInfo::to_schema().fields().count()
+        );
 
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
         assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
+        assert!(
+            commit_info
+                .column_by_name("operationMetrics")
+                .expect("operationMetrics field")
+                .is_null(0),
+            "stale engine operationMetrics must be overridden by kernel's null"
+        );
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
         assert_eq!(get_str(commit_info, "engineInfo"), "test_engine/1.0");
         assert!(!get_bool(commit_info, "isBlindAppend"));
 
+        Ok(())
+    }
+
+    /// Non-empty kernel operationParameters/operationMetrics replace stale engine-supplied values
+    /// in the engine_commit_info branch -- exercises content fidelity of the replace path, not just
+    /// the empty/null override covered by `test_build_commit_info_full_overlap`.
+    #[test]
+    fn test_build_commit_info_nonempty_maps_override_stale_engine() -> DeltaResult<()> {
+        let mut params_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        params_builder.keys().append_value("stale_key");
+        params_builder.values().append_value("stale_value");
+        params_builder.append(true).unwrap();
+        let stale_op_params = Arc::new(params_builder.finish()) as ArrayRef;
+
+        let mut metrics_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        metrics_builder.keys().append_value("stale_metric");
+        metrics_builder.values().append_value("0");
+        metrics_builder.append(true).unwrap();
+        let stale_op_metrics = Arc::new(metrics_builder.finish()) as ArrayRef;
+
+        let (data, schema) = make_engine_commit_info(
+            vec![
+                ArrowField::new(
+                    "operationParameters",
+                    stale_op_params.data_type().clone(),
+                    true,
+                ),
+                ArrowField::new(
+                    "operationMetrics",
+                    stale_op_metrics.data_type().clone(),
+                    true,
+                ),
+            ],
+            vec![stale_op_params, stale_op_metrics],
+        );
+        let (engine, txn) = make_txn(Some((data, schema)))?;
+
+        let mut commit_info = make_kernel_commit_info();
+        commit_info.operation_parameters =
+            Some(HashMap::from([("mode".to_string(), "Append".to_string())]));
+        commit_info.operation_metrics =
+            Some(HashMap::from([("numFiles".to_string(), "3".to_string())]));
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), commit_info)?,
+        )?;
+        let ci = commit_info_struct(&result);
+
+        let params = get_map_entries(ci, "operationParameters");
+        assert_eq!(params.get("mode").map(String::as_str), Some("Append"));
+        assert!(
+            !params.contains_key("stale_key"),
+            "kernel value must replace the stale engine operationParameters"
+        );
+        let metrics = get_map_entries(ci, "operationMetrics");
+        assert_eq!(metrics.get("numFiles").map(String::as_str), Some("3"));
+        assert!(
+            !metrics.contains_key("stale_metric"),
+            "kernel value must replace the stale engine operationMetrics"
+        );
         Ok(())
     }
 
