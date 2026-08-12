@@ -30,6 +30,7 @@ use crate::{CollectInto, DeltaResult, Error};
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
+pub(crate) mod changes;
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;

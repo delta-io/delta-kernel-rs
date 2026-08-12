@@ -16,7 +16,6 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
-use super::schema_evolution::{evolve_table_config, SchemaOperation};
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
@@ -32,6 +31,7 @@ use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
+use crate::schema::changes::{evolve_table_config, SchemaOperation};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
@@ -144,7 +144,8 @@ impl Transaction {
     /// Returns an error if the table enables an unsupported schema-evolution feature, `changes` is
     /// empty, data files have already been staged, or an operation produces a schema that is
     /// invalid for the table protocol.
-    pub fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> DeltaResult<Self> {
+    #[internal_api]
+    pub(crate) fn with_schema_changes(mut self, changes: Vec<SchemaOperation>) -> DeltaResult<Self> {
         if self
             .effective_table_config
             .is_feature_enabled(&TableFeature::IcebergCompatV3)
