@@ -41,7 +41,7 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
-    apply_schema_operations, PathSegment, SchemaEvolutionResult, SchemaOperation,
+    apply_schema_operations, SchemaEvolutionResult, SchemaOperation, SchemaPathSegment,
 };
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Error};
@@ -125,8 +125,10 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
-    /// `field` and any of its nested fields must not carry `delta.columnMapping.id` or
-    /// `delta.columnMapping.physicalName` annotations.
+    ///
+    /// With column mapping enabled, existing IDs and physical names are preserved and missing
+    /// annotations are assigned. In `None` mode, introduced annotations are stripped only when
+    /// the pre-ALTER schema had no column-mapping metadata.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
@@ -157,11 +159,15 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// must not be a metadata column, and must not collide case-insensitively with a sibling in the
     /// target struct. The path must resolve to a struct.
     ///
+    /// With column mapping enabled, existing IDs and physical names are preserved and missing
+    /// annotations are assigned. In `None` mode, introduced annotations are stripped only when
+    /// the pre-ALTER schema had no column-mapping metadata.
+    ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     #[internal_api]
     pub(crate) fn add_column_at(
         mut self,
-        path: Vec<PathSegment>,
+        path: Vec<SchemaPathSegment>,
         field: StructField,
     ) -> AlterTableTransactionBuilder<Modifying> {
         self.operations
