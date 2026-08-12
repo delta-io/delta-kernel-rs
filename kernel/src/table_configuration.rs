@@ -271,6 +271,17 @@ impl TableConfiguration {
             Error::unsupported("Upgrading an existing table to catalog-managed is not supported")
         );
 
+        // Adding protocol support would immediately activate ICT, but this generic path cannot
+        // emit the required enablement metadata or first in-commit timestamp.
+        require!(
+            feature != &TableFeature::InCommitTimestamp
+                || self.table_properties().enable_in_commit_timestamps != Some(true),
+            Error::unsupported(
+                "Adding 'inCommitTimestamp' to an existing table with \
+                 'delta.enableInCommitTimestamps=true' is not supported"
+            )
+        );
+
         match feature.feature_type() {
             FeatureType::WriterOnly => self.check_feature_support(feature, Operation::Write),
             FeatureType::ReaderWriter => {

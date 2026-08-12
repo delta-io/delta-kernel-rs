@@ -894,7 +894,8 @@ impl Snapshot {
     }
 
     /// Creates a builder for altering this table's protocol or metadata. Currently supports
-    /// adding selected table features and schema change operations.
+    /// schema change operations. Selected table-feature additions are experimental and available
+    /// only with the `internal-api` feature.
     ///
     /// The returned builder allows chaining operations before building an
     /// [`AlterTableTransaction`] that can be committed.

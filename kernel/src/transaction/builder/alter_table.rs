@@ -9,8 +9,8 @@
 //!   operation is required).
 //! - [`Modifying`]: After a schema operation. More schema ops can be chained, and `build()` is
 //!   available.
-//! - [`AddingFeatures`]: After a table feature operation. More features can be added, and
-//!   `build()` is available.
+//! - [`AddingFeatures`]: After a table feature operation. More features can be added, and `build()`
+//!   is available.
 //!
 //! # Transitions
 //!
@@ -306,7 +306,16 @@ impl AlterTableTransactionBuilder<AddingFeatures> {
         committer: Box<dyn Committer>,
     ) -> DeltaResult<AlterTableTransaction> {
         let table_config = self.snapshot.table_configuration();
-        let requested_features = self.table_features;
+        let requested_features: Vec<_> = self
+            .table_features
+            .into_iter()
+            .filter(|feature| !table_config.is_feature_supported(feature))
+            .collect();
+        if requested_features.is_empty() {
+            return Err(Error::invalid_protocol(
+                "All requested table features are already supported by the current protocol",
+            ));
+        }
         let evolved_protocol = protocol_with_added_features(
             table_config.protocol(),
             requested_features.iter().cloned(),

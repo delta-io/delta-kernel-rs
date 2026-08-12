@@ -12,7 +12,7 @@ use delta_kernel::schema::{
     ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, SchemaRef, StructField,
     StructType,
 };
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::{ChecksumWriteResult, Snapshot};
 use delta_kernel::table_features::{ColumnMappingMode, Operation, TableFeature};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -49,11 +49,19 @@ fn read_commit_actions(table_path: &str, version: u64) -> Vec<serde_json::Value>
 }
 
 fn feature_only_table_json(reader_version: i32, writer_version: i32) -> String {
+    feature_only_table_json_with_configuration(reader_version, writer_version, "{}")
+}
+
+fn feature_only_table_json_with_configuration(
+    reader_version: i32,
+    writer_version: i32,
+    configuration: &str,
+) -> String {
     let schema = serde_json::to_string(&simple_schema()).unwrap();
     let schema = serde_json::to_string(&schema).unwrap();
     format!(
         r#"{{"protocol":{{"minReaderVersion":{reader_version},"minWriterVersion":{writer_version}}}}}
-{{"metaData":{{"id":"feature-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":{schema},"partitionColumns":[],"configuration":{{}},"createdTime":1700000000000}}}}
+{{"metaData":{{"id":"feature-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":{schema},"partitionColumns":[],"configuration":{configuration},"createdTime":1700000000000}}}}
 "#
     )
 }
@@ -79,6 +87,14 @@ async fn add_writer_only_feature_commits_only_protocol_and_preserves_schema_alte
     .await
     .map_err(|error| delta_kernel::Error::generic(error.to_string()))?;
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+    let (checksum_result, snapshot) = Arc::new(snapshot).write_checksum(&engine)?;
+    assert_eq!(checksum_result, ChecksumWriteResult::Written);
+
+    let initial_stats = snapshot
+        .get_file_stats_if_present()
+        .expect("version 0 checksum should contain complete file statistics");
+    assert_eq!(initial_stats.num_files(), 0);
+    assert_eq!(initial_stats.table_size_bytes(), 0);
 
     let committed = snapshot
         .clone()
@@ -94,6 +110,15 @@ async fn add_writer_only_feature_commits_only_protocol_and_preserves_schema_alte
         .post_commit_snapshot()
         .expect("feature commit should return a post-commit snapshot");
     assert_eq!(post_commit.version(), 1);
+    let post_commit_stats = post_commit
+        .get_file_stats_if_present()
+        .expect("protocol-only commit should preserve complete file statistics");
+    assert_eq!(post_commit_stats.num_files(), 0);
+    assert_eq!(post_commit_stats.table_size_bytes(), 0);
+
+    let (checksum_result, _) = post_commit.write_checksum(&engine)?;
+    assert_eq!(checksum_result, ChecksumWriteResult::Written);
+
     let protocol = post_commit.table_configuration().protocol();
     assert_eq!(protocol.min_reader_version(), 1);
     assert!(protocol.reader_features().is_none());
@@ -142,6 +167,43 @@ async fn add_writer_only_feature_commits_only_protocol_and_preserves_schema_alte
     assert!(!schema_actions
         .iter()
         .any(|action| action.get("protocol").is_some()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_in_commit_timestamp_rejects_activation_without_commit() -> DeltaResult<()> {
+    let (store, engine, table_url) = engine_store_setup("feature_ict_activation", None);
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        0,
+        feature_only_table_json_with_configuration(
+            1,
+            1,
+            r#"{"delta.enableInCommitTimestamps":"true"}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+    let error = snapshot
+        .alter_table()
+        .add_table_feature(TableFeature::InCommitTimestamp)
+        .with_allow_protocol_versions_increase(true)
+        .build(&engine, committer())
+        .expect_err("generic feature addition must not activate in-commit timestamps");
+
+    assert!(error
+        .to_string()
+        .contains("delta.enableInCommitTimestamps=true"));
+
+    let reloaded = Snapshot::builder_for(table_url).build(&engine)?;
+    assert_eq!(reloaded.version(), 0);
+    assert!(!reloaded
+        .table_configuration()
+        .is_feature_supported(&TableFeature::InCommitTimestamp));
 
     Ok(())
 }
@@ -361,6 +423,78 @@ async fn add_table_feature_bypasses_general_write_gate_for_legacy_protocols(
         .unwrap()
         .table_configuration()
         .is_feature_supported(&TableFeature::DomainMetadata));
+    Ok(())
+}
+
+#[rstest]
+#[case::append_only(1, 2, TableFeature::AppendOnly)]
+#[case::column_mapping(2, 5, TableFeature::ColumnMapping)]
+#[tokio::test]
+async fn add_legacy_supported_feature_fails_without_protocol_upgrade(
+    #[case] reader_version: i32,
+    #[case] writer_version: i32,
+    #[case] feature: TableFeature,
+) -> DeltaResult<()> {
+    let (store, engine, table_url) = engine_store_setup("feature_already_supported", None);
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        0,
+        feature_only_table_json(reader_version, writer_version),
+    )
+    .await
+    .unwrap();
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+    let error = snapshot
+        .clone()
+        .alter_table()
+        .add_table_feature(feature)
+        .build(&engine, committer())
+        .expect_err("already-supported feature must not produce an ALTER transaction");
+
+    assert!(error.to_string().contains("already supported"));
+    let reloaded = Snapshot::builder_for(table_url).build(&engine)?;
+    assert_eq!(reloaded.version(), 0);
+    assert_eq!(
+        reloaded.table_configuration().protocol(),
+        snapshot.table_configuration().protocol()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_new_feature_ignores_unsupported_legacy_implied_feature() -> DeltaResult<()> {
+    let (store, engine, table_url) = engine_store_setup("feature_mixed_legacy", None);
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        0,
+        feature_only_table_json(1, 2),
+    )
+    .await
+    .unwrap();
+    let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
+
+    let committed = snapshot
+        .alter_table()
+        .add_table_feature(TableFeature::Invariants)
+        .add_table_feature(TableFeature::DomainMetadata)
+        .with_allow_protocol_versions_increase(true)
+        .build(&engine, committer())?
+        .commit(&engine)?
+        .unwrap_committed();
+
+    let protocol = committed
+        .post_commit_snapshot()
+        .unwrap()
+        .table_configuration()
+        .protocol();
+    assert_eq!(protocol.min_reader_version(), 1);
+    assert_eq!(protocol.min_writer_version(), 7);
+    assert!(protocol
+        .writer_features()
+        .is_some_and(|features| features.contains(&TableFeature::DomainMetadata)));
     Ok(())
 }
 
