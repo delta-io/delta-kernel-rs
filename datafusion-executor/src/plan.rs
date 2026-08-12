@@ -62,13 +62,19 @@ pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionE
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
-    use delta_kernel::expressions::{col, Predicate as KernelPredicate, Scalar as KernelScalar};
-    use delta_kernel::plans::ir::nodes::Values as KernelValues;
+    use delta_kernel::expressions::{
+        col, Expression as KernelExpr, Predicate as KernelPredicate, Scalar as KernelScalar,
+    };
+    use delta_kernel::plans::ir::nodes::{
+        Filter as KernelFilter, Project as KernelProject, Values as KernelValues,
+    };
     use delta_kernel::plans::ir::plan::PlanNode as KernelPlanNode;
-    use delta_kernel::schema::{schema, DataType, StructType};
+    use delta_kernel::schema::{schema, DataType, StructField, StructType};
     use delta_kernel::PlanBuilder;
     use rstest::rstest;
 
@@ -147,5 +153,38 @@ mod tests {
         .unwrap();
         let batches = execute(&plan).await.unwrap();
         assert_batches_eq!(&["+---+", "| a |", "+---+", "|   |", "+---+"], &batches);
+    }
+
+    #[tokio::test]
+    async fn values_project_filter_composes_through_declared_project_schema() {
+        let project_schema = Arc::new(
+            StructType::try_new([StructField::nullable("projected", DataType::LONG)]).unwrap(),
+        );
+        let project = KernelProject {
+            expr: KernelExpr::struct_from([col!("a")]).into(),
+            schema: project_schema,
+        };
+        let filter = KernelFilter {
+            predicate: KernelPredicate::is_not_null(col!("projected")).into(),
+        };
+        let plan = KernelPlan {
+            nodes: vec![
+                values_node(vec![vec![1i64.into()]]),
+                KernelPlanNode::new(project, vec![0]),
+                KernelPlanNode::new(filter, vec![1]),
+            ],
+        };
+
+        let batches = execute(&plan).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+-----------+",
+                "| projected |",
+                "+-----------+",
+                "| 1         |",
+                "+-----------+",
+            ],
+            &batches
+        );
     }
 }
