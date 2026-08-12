@@ -716,21 +716,39 @@ mod tests {
     }
 
     #[test]
-    fn ordered_scan_sources_set_ordered_flag() -> DeltaResult<()> {
-        let parquet =
-            PlanBuilder::scan_parquet_ordered([test_file("file:///a.parquet")], &[], id_schema())?
-                .build()?;
-        let json = PlanBuilder::scan_json_ordered([test_file("file:///a.json")], &[], id_schema())?
-            .build()?;
+    fn scan_sources_set_ordered_flag() -> DeltaResult<()> {
+        let scans = [
+            (
+                PlanBuilder::scan_parquet([test_file("file:///a.parquet")], &[], id_schema())?,
+                false,
+            ),
+            (
+                PlanBuilder::scan_json([test_file("file:///a.json")], &[], id_schema())?,
+                false,
+            ),
+            (
+                PlanBuilder::scan_parquet_ordered(
+                    [test_file("file:///a.parquet")],
+                    &[],
+                    id_schema(),
+                )?,
+                true,
+            ),
+            (
+                PlanBuilder::scan_json_ordered([test_file("file:///a.json")], &[], id_schema())?,
+                true,
+            ),
+        ];
 
-        let Operator::ScanParquet(parquet) = &parquet.nodes[0].op else {
-            panic!("expected ScanParquet");
-        };
-        let Operator::ScanJson(json) = &json.nodes[0].op else {
-            panic!("expected ScanJson");
-        };
-        assert!(parquet.ordered_scan);
-        assert!(json.ordered_scan);
+        for (scan, expected) in scans {
+            let plan = scan.build()?;
+            let actual = match &plan.nodes[0].op {
+                Operator::ScanParquet(scan) => scan.ordered_scan,
+                Operator::ScanJson(scan) => scan.ordered_scan,
+                op => panic!("expected scan, got {op}"),
+            };
+            assert_eq!(actual, expected);
+        }
         Ok(())
     }
 

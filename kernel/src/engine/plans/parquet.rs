@@ -84,7 +84,6 @@ mod tests {
     use tempfile::tempdir;
     use url::Url;
 
-    use super::super::assert_batches_sorted_eq;
     use super::PlanBasedParquetHandler;
     use crate::arrow::array::{Array, Int64Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
@@ -220,18 +219,26 @@ mod tests {
                     .into()
             })
             .collect();
-        assert_batches_sorted_eq(
-            &[
-                "+-------+",
-                "| value |",
-                "+-------+",
-                "| 1     |",
-                "| 2     |",
-                "| 3     |",
-                "| 4     |",
-                "+-------+",
-            ],
-            &batches,
+        let batch_values: Vec<Vec<i64>> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(batch_values.iter().all(|values| {
+            !values.is_empty()
+                && (values.iter().all(|value| *value <= 2)
+                    || values.iter().all(|value| *value >= 3))
+        }));
+        assert_eq!(
+            batch_values.into_iter().flatten().collect::<Vec<_>>(),
+            vec![3, 4, 1, 2]
         );
     }
 

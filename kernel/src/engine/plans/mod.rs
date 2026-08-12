@@ -16,27 +16,6 @@ pub mod json;
 pub mod parquet;
 pub mod storage;
 
-#[cfg(test)]
-use crate::arrow::array::RecordBatch;
-
-#[cfg(test)]
-pub(crate) fn assert_batches_sorted_eq(expected: &[&str], actual: &[RecordBatch]) {
-    fn sorted_lines(mut lines: Vec<String>) -> Vec<String> {
-        if lines.len() > 3 {
-            let end = lines.len() - 1;
-            lines[2..end].sort_unstable();
-        }
-        lines
-    }
-
-    let actual = crate::arrow::util::pretty::pretty_format_batches(actual)
-        .unwrap()
-        .to_string();
-    let expected = expected.iter().map(|line| (*line).to_owned()).collect();
-    let actual = actual.trim().lines().map(str::to_owned).collect();
-    assert_eq!(sorted_lines(expected), sorted_lines(actual));
-}
-
 use json::PlanBasedJsonHandler;
 use parquet::PlanBasedParquetHandler;
 use storage::PlanBasedStorageHandler;

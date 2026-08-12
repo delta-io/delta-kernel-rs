@@ -82,13 +82,12 @@ mod tests {
     // TODO(#2618): Refactor and share a test suite with sync engine tests.
 
     use std::io::Write as _;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use rstest::rstest;
     use tempfile::{tempdir, NamedTempFile};
     use url::Url;
 
-    use super::super::assert_batches_sorted_eq;
     use super::PlanBasedJsonHandler;
     use crate::arrow::array::{Array, Int32Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
@@ -96,11 +95,33 @@ mod tests {
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
+    use crate::plans::ir::nodes::Operator;
     use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::{
         DeltaResult, Engine as _, EngineData, FileDataReadResultIterator, FileMeta,
-        JsonHandler as _, ParquetHandler as _,
+        JsonHandler as _, Operation, ParquetHandler as _, PlanExecutor, PlanResult,
     };
+
+    #[derive(Default)]
+    struct RecordingPlanExecutor {
+        scans: Mutex<Vec<(&'static str, bool)>>,
+    }
+
+    impl PlanExecutor for RecordingPlanExecutor {
+        fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+            let Operation::QueryPlan(plan) = op else {
+                panic!("expected query plan");
+            };
+            assert_eq!(plan.nodes.len(), 1);
+            let scan = match &plan.nodes[0].op {
+                Operator::ScanJson(scan) => ("json", scan.ordered_scan),
+                Operator::ScanParquet(scan) => ("parquet", scan.ordered_scan),
+                op => panic!("expected scan, got {op}"),
+            };
+            self.scans.lock().unwrap().push(scan);
+            Ok(PlanResult::Data(Box::new(std::iter::empty())))
+        }
+    }
 
     fn make_handler() -> PlanBasedJsonHandler {
         PlanBasedJsonHandler::new(
@@ -197,11 +218,54 @@ mod tests {
                     .into()
             })
             .collect();
-        assert_batches_sorted_eq(
-            &[
-                "+---+", "| x |", "+---+", "| 1 |", "| 2 |", "| 3 |", "| 4 |", "+---+",
-            ],
-            &batches,
+        let batch_values: Vec<Vec<i32>> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(batch_values.iter().all(|values| {
+            !values.is_empty()
+                && (values.iter().all(|value| *value <= 2)
+                    || values.iter().all(|value| *value >= 3))
+        }));
+        assert_eq!(
+            batch_values.into_iter().flatten().collect::<Vec<_>>(),
+            vec![3, 4, 1, 2]
+        );
+    }
+
+    #[test]
+    fn plan_based_handlers_request_ordered_scans() {
+        let executor = Arc::new(RecordingPlanExecutor::default());
+        let fallback = SyncEngine::new();
+        let json = PlanBasedJsonHandler::new(executor.clone(), fallback.json_handler());
+        let parquet = PlanBasedParquetHandler::new(executor.clone(), fallback.parquet_handler());
+        let file = FileMeta {
+            location: Url::parse("file:///data").unwrap(),
+            last_modified: 0,
+            size: 0,
+        };
+
+        drop(
+            json.read_json_files(std::slice::from_ref(&file), test_schema(), None)
+                .unwrap(),
+        );
+        drop(
+            parquet
+                .read_parquet_files(&[file], test_schema(), None)
+                .unwrap(),
+        );
+
+        assert_eq!(
+            *executor.scans.lock().unwrap(),
+            vec![("json", true), ("parquet", true)]
         );
     }
 
