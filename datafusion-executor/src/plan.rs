@@ -15,7 +15,7 @@ use datafusion::common::DataFusionError;
 use datafusion::logical_expr::LogicalPlan as DFLogicalPlan;
 use delta_kernel::plans::ir::plan::Plan as KernelPlan;
 
-use crate::operator::{lower_operator, LoweredNode};
+use crate::operator::lower_operator;
 
 /// Lowers a kernel [`Plan`](KernelPlan) into the equivalent DataFusion
 /// [`LogicalPlan`](DFLogicalPlan), returning the plan rooted at the kernel plan's terminal node.
@@ -26,7 +26,7 @@ pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionE
     // A node is identified by its index, and `nodes` is topologically ordered: every input index is
     // strictly less than the node's own, so a single forward pass leaves each node's inputs already
     // lowered by the time it is reached.
-    let mut lowered: Vec<LoweredNode> = Vec::with_capacity(plan.nodes.len());
+    let mut lowered: Vec<Arc<DFLogicalPlan>> = Vec::with_capacity(plan.nodes.len());
     for (node_index, node) in plan.nodes.iter().enumerate() {
         let op = &node.op;
         let available = lowered.len();
@@ -43,17 +43,17 @@ pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionE
                 let Some(parent) = lowered.get(parent_index) else {
                     return Err(invalid_parent(parent_index));
                 };
-                Ok(parent)
+                Ok(Arc::clone(parent))
             })
             .collect();
         let parents = parents?;
-        lowered.push(lower_operator(op, &parents)?);
+        lowered.push(Arc::new(lower_operator(op, &parents)?));
     }
 
     // The terminal node is the last one: no other node consumes it, and its rows are the plan's
     // output.
     match lowered.pop() {
-        Some(terminal) => Ok(Arc::unwrap_or_clone(terminal.plan)),
+        Some(terminal) => Ok(Arc::unwrap_or_clone(terminal)),
         None => Err(DataFusionError::Plan(
             "cannot lower a plan with no nodes".to_string(),
         )),
