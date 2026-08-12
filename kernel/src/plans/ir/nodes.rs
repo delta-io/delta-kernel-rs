@@ -25,6 +25,10 @@ use crate::{DeltaResult, Error, FileMeta};
 /// An operator that reshapes its rows (a source, projection, aggregation, or file scan) carries a
 /// caller-declared `schema` field holding its output schema. The rest emit rows they were given, so
 /// they inherit an input's schema; each payload's docs name which input.
+///
+/// Operators downstream of an ordered scan must preserve its row-order and file-boundary
+/// guarantees through the plan result. Errors are outside the ordering guarantee and may be
+/// returned eagerly.
 #[derive(Debug, Clone, Display)]
 #[strum(serialize_all = "snake_case")]
 pub enum Operator {
@@ -103,8 +107,9 @@ impl From<FileMeta> for ScanFile {
 ///
 /// When `ordered_scan` is false, output row order is unspecified: the engine is free to read
 /// `files` in any order, in parallel, and to interleave rows from different files. When it is true,
-/// output follows the input file order, preserves row order within each file, and does not merge
-/// batches across file boundaries.
+/// output follows the input file order and preserves row order within each file. A file may produce
+/// zero, one, or multiple batches, and each batch contains rows from at most one file. Downstream
+/// operators must preserve these guarantees. Errors may be returned eagerly.
 ///
 /// # Column resolution
 ///
@@ -199,8 +204,9 @@ pub struct ScanParquet {
 /// non-nullable fields.
 ///
 /// When `ordered_scan` is false, output row order is unspecified. When it is true, output follows
-/// the input file order, preserves row order within each file, and does not merge batches across
-/// file boundaries.
+/// the input file order and preserves row order within each file. A file may produce zero, one, or
+/// multiple batches, and each batch contains rows from at most one file. Downstream operators must
+/// preserve these guarantees. Errors may be returned eagerly.
 ///
 /// # File-constant columns
 ///

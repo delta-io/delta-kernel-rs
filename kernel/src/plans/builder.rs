@@ -106,13 +106,14 @@ impl PlanBuilder {
         }
     }
 
-    /// A Parquet scan source over `files` producing rows matching `schema`.
+    /// An unordered Parquet scan source over `files` producing rows matching `schema`.
     ///
     /// `file_constant_columns` names the per-file-constant output columns (see [`ScanParquet`]);
     /// pass `&[]` when there are none. An empty `files` yields the absent relation.
     ///
     /// Produces an error when any file's constant count differs from `file_constant_columns`'s
     /// length, or a `file_constant_columns` entry is absent from `schema`.
+    /// Use [`Self::scan_parquet_ordered`] when ordering and file boundaries are required.
     pub fn scan_parquet(
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
@@ -130,7 +131,8 @@ impl PlanBuilder {
     /// An ordered Parquet scan source over `files` producing rows matching `schema`.
     ///
     /// The resulting scan preserves the input file order, row order within each file, and file
-    /// boundaries in its output batches.
+    /// boundaries in its output batches. Empty-input behavior and validation errors match
+    /// [`Self::scan_parquet`].
     pub fn scan_parquet_ordered(
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
@@ -145,8 +147,9 @@ impl PlanBuilder {
         )
     }
 
-    /// A newline-delimited JSON scan source over `files` producing rows matching `schema`. See
-    /// [`ScanJson`]. Exhibits same behaviour as [`Self::scan_parquet`].
+    /// An unordered newline-delimited JSON scan source over `files` producing rows matching
+    /// `schema`. See [`ScanJson`]. Exhibits the same behavior as [`Self::scan_parquet`]. Use
+    /// [`Self::scan_json_ordered`] when ordering and file boundaries are required.
     pub fn scan_json(
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],
@@ -159,7 +162,8 @@ impl PlanBuilder {
     /// `schema`.
     ///
     /// The resulting scan preserves the input file order, row order within each file, and file
-    /// boundaries in its output batches.
+    /// boundaries in its output batches. Empty-input behavior and validation errors match
+    /// [`Self::scan_json`].
     pub fn scan_json_ordered(
         files: impl IntoIterator<Item = impl Into<ScanFile>>,
         file_constant_columns: &[&str],

@@ -84,6 +84,7 @@ mod tests {
     use tempfile::tempdir;
     use url::Url;
 
+    use super::super::assert_ordered_file_batches;
     use super::PlanBasedParquetHandler;
     use crate::arrow::array::{Array, Int64Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
@@ -231,15 +232,7 @@ mod tests {
                     .to_vec()
             })
             .collect();
-        assert!(batch_values.iter().all(|values| {
-            !values.is_empty()
-                && (values.iter().all(|value| *value <= 2)
-                    || values.iter().all(|value| *value >= 3))
-        }));
-        assert_eq!(
-            batch_values.into_iter().flatten().collect::<Vec<_>>(),
-            vec![3, 4, 1, 2]
-        );
+        assert_ordered_file_batches(batch_values);
     }
 
     /// No files -> an absent plan -> a zero-row result (no rows, no error).
