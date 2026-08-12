@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
-use datafusion::common::{Column, DataFusionError};
+use datafusion::common::{Column as DFColumn, DataFusionError};
 use datafusion::logical_expr::{
     lit, EmptyRelation, Expr as DFExpr, Filter as DFFilter, LogicalPlan as DFLogicalPlan,
     LogicalPlanBuilder,
@@ -121,7 +121,7 @@ fn lower_values(values: &KernelValues) -> Result<LoweredNode, DataFusionError> {
         values.rows.iter().map(|row| lower_row(row)).collect();
     // The builder assigns column1, column2, ...; restore the names declared by the kernel schema.
     let field_aliases = df_schema.fields().iter().enumerate().map(|(index, field)| {
-        DFExpr::Column(Column::from_name(format!("column{}", index + 1))).alias(field.name())
+        DFExpr::Column(DFColumn::from_name(format!("column{}", index + 1))).alias(field.name())
     });
     let plan = LogicalPlanBuilder::values_with_schema(rows?, &df_schema)?
         .project(field_aliases)?
@@ -355,9 +355,9 @@ mod tests {
     #[rstest]
     #[case::too_few(vec![vec![1i64.into()]], "got 1 values in row 0 but expected 2")]
     #[case::too_many(
-            vec![vec![1i64.into(), "x".into(), true.into()]],
-            "got 3 values in row 0 but expected 2"
-        )]
+        vec![vec![1i64.into(), "x".into(), true.into()]],
+        "got 3 values in row 0 but expected 2"
+    )]
     fn values_reject_rows_with_the_wrong_width(
         #[case] rows: Vec<Vec<KernelScalar>>,
         #[case] expected: &str,
@@ -379,6 +379,21 @@ mod tests {
     }
 
     // === Filter ===
+
+    #[test]
+    fn filter_wraps_its_parent_and_inherits_kernel_schema() {
+        let parent = parent_with_schema(test_schema());
+        let filter = KernelFilter {
+            predicate: KernelPredicate::is_null(col!("a")).into(),
+        };
+        let lowered = lower_operator(&KernelOperator::Filter(filter), &[&parent]).unwrap();
+
+        assert!(Arc::ptr_eq(&lowered.schema, &parent.schema));
+        let DFLogicalPlan::Filter(filter) = lowered.plan.as_ref() else {
+            panic!("expected Filter, got {:?}", lowered.plan);
+        };
+        assert!(Arc::ptr_eq(&filter.input, &parent.plan));
+    }
 
     async fn execute_filter(
         rows: Vec<Vec<KernelScalar>>,
