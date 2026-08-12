@@ -107,19 +107,45 @@ impl Engine for PlanBasedEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use tempfile::tempdir;
     use url::Url;
 
-    use super::PlanBasedEngine;
+    use super::{PlanBasedEngine, PlanBasedJsonHandler, PlanBasedParquetHandler};
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::engine::sync::plan::SyncPlanExecutor;
     use crate::engine::sync::SyncEngine;
     use crate::engine_data::FilteredEngineData;
-    use crate::{Engine as _, EngineData, Error};
+    use crate::plans::ir::nodes::Operator;
+    use crate::schema::{DataType, StructField, StructType};
+    use crate::{
+        DeltaResult, Engine as _, EngineData, Error, FileMeta, JsonHandler as _, Operation,
+        ParquetHandler as _, PlanExecutor, PlanResult,
+    };
+
+    #[derive(Default)]
+    struct RecordingPlanExecutor {
+        scans: Mutex<Vec<(&'static str, bool)>>,
+    }
+
+    impl PlanExecutor for RecordingPlanExecutor {
+        fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
+            let Operation::QueryPlan(plan) = op else {
+                panic!("expected query plan");
+            };
+            assert_eq!(plan.nodes.len(), 1);
+            let scan = match &plan.nodes[0].op {
+                Operator::ScanJson(scan) => ("json", scan.ordered_scan),
+                Operator::ScanParquet(scan) => ("parquet", scan.ordered_scan),
+                op => panic!("expected scan, got {op}"),
+            };
+            self.scans.lock().unwrap().push(scan);
+            Ok(PlanResult::Data(Box::new(std::iter::empty())))
+        }
+    }
 
     fn plan_engine(fallback: Option<Arc<dyn crate::Engine>>) -> PlanBasedEngine {
         PlanBasedEngine::new(fallback, Arc::new(SyncPlanExecutor::default()))
@@ -215,50 +241,14 @@ mod tests {
             .expect_err("no fallback is configured");
         assert!(matches!(parquet_err, Error::Unsupported(_)));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use url::Url;
-
-    use super::{PlanBasedJsonHandler, PlanBasedParquetHandler};
-    use crate::engine::sync::SyncEngine;
-    use crate::plans::ir::nodes::Operator;
-    use crate::schema::{DataType, StructField, StructType};
-    use crate::{
-        DeltaResult, Engine as _, FileMeta, JsonHandler as _, Operation, ParquetHandler as _,
-        PlanExecutor, PlanResult,
-    };
-
-    #[derive(Default)]
-    struct RecordingPlanExecutor {
-        scans: Mutex<Vec<(&'static str, bool)>>,
-    }
-
-    impl PlanExecutor for RecordingPlanExecutor {
-        fn execute_op(&self, op: Operation) -> DeltaResult<PlanResult> {
-            let Operation::QueryPlan(plan) = op else {
-                panic!("expected query plan");
-            };
-            assert_eq!(plan.nodes.len(), 1);
-            let scan = match &plan.nodes[0].op {
-                Operator::ScanJson(scan) => ("json", scan.ordered_scan),
-                Operator::ScanParquet(scan) => ("parquet", scan.ordered_scan),
-                op => panic!("expected scan, got {op}"),
-            };
-            self.scans.lock().unwrap().push(scan);
-            Ok(PlanResult::Data(Box::new(std::iter::empty())))
-        }
-    }
 
     #[test]
     fn plan_based_handlers_request_ordered_scans() {
         let executor = Arc::new(RecordingPlanExecutor::default());
         let fallback = SyncEngine::new();
-        let json = PlanBasedJsonHandler::new(executor.clone(), fallback.json_handler());
-        let parquet = PlanBasedParquetHandler::new(executor.clone(), fallback.parquet_handler());
+        let json = PlanBasedJsonHandler::new(executor.clone(), Some(fallback.json_handler()));
+        let parquet =
+            PlanBasedParquetHandler::new(executor.clone(), Some(fallback.parquet_handler()));
         let file = FileMeta {
             location: Url::parse("file:///data").unwrap(),
             last_modified: 0,

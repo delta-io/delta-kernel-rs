@@ -152,6 +152,7 @@ impl SyncPlanExecutor {
         results: &[Vec<RecordBatch>],
     ) -> DeltaResult<Vec<RecordBatch>> {
         let PlanNode { op, inputs } = node;
+        // `eval_scan` preserves scan order by default, so `ordered_scan` is intentionally ignored.
         match op {
             Operator::ScanJson(ScanJson {
                 files,

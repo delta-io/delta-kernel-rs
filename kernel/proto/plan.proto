@@ -35,8 +35,7 @@ message ScanParquetNode {
   repeated string file_constant_columns = 2;
   delta.kernel.schema.StructType schema = 3;
   // True preserves input-file and per-file row order, with each batch containing rows from at
-  // most one file. False, including the proto3 default, provides no order or file-boundary
-  // guarantee.
+  // most one file.
   bool ordered_scan = 4;
 }
 
@@ -45,8 +44,7 @@ message ScanJsonNode {
   repeated string file_constant_columns = 2;
   delta.kernel.schema.StructType schema = 3;
   // True preserves input-file and per-file row order, with each batch containing rows from at
-  // most one file. False, including the proto3 default, provides no order or file-boundary
-  // guarantee.
+  // most one file.
   bool ordered_scan = 4;
 }
 
