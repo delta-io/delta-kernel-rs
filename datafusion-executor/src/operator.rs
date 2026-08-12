@@ -13,10 +13,10 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
-use datafusion::common::DataFusionError;
+use datafusion::common::{Column, DataFusionError};
 use datafusion::logical_expr::{
     lit, EmptyRelation, Expr as DFExpr, Filter as DFFilter, LogicalPlan as DFLogicalPlan,
-    Values as DFValues,
+    LogicalPlanBuilder,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::Scalar as KernelScalar;
@@ -30,10 +30,8 @@ use crate::scalar::to_df_scalar;
 
 /// One lowered relation and the kernel schema used to resolve its downstream expressions.
 ///
-/// DataFusion input edges share immutable plans through [`Arc`], so retaining the same handle here
-/// lets downstream operators reuse a parent without cloning its plan node. The kernel schema
-/// remains authoritative for expression lowering because converting DataFusion's inferred Arrow
-/// schema back would lose kernel-specific type semantics.
+/// The kernel schema remains authoritative for expression lowering because converting
+/// DataFusion's inferred Arrow schema back would lose kernel-specific type semantics.
 #[derive(Debug)]
 pub(crate) struct LoweredNode {
     pub(crate) plan: Arc<DFLogicalPlan>,
@@ -100,6 +98,10 @@ fn lower_filter(
 ///
 /// An empty `rows` is the uninhabited relation over `schema`, which DataFusion spells as an
 /// `EmptyRelation` rather than a `Values`.
+///
+/// DataFusion's [`LogicalPlanBuilder::values_with_schema`] automatically inserts a cast whenever
+/// [`can_cast_types`](datafusion::arrow::compute::can_cast_types) accepts a type mismatch. Since
+/// this still conforms to Kernel's schema, it is accepted functionality.
 fn lower_values(values: &KernelValues) -> Result<LoweredNode, DataFusionError> {
     let arrow_schema: ArrowSchema = values.schema.as_ref().try_into_arrow()?;
     let df_schema = Arc::new(arrow_schema.try_into()?);
@@ -115,11 +117,13 @@ fn lower_values(values: &KernelValues) -> Result<LoweredNode, DataFusionError> {
 
     let rows: Result<Vec<Vec<DFExpr>>, DataFusionError> =
         values.rows.iter().map(|row| lower_row(row)).collect();
-    let lowered = DFValues {
-        schema: df_schema,
-        values: rows?,
-    };
-    let plan = DFLogicalPlan::Values(lowered);
+    // The builder assigns column1, column2, ...; restore the names declared by the kernel schema.
+    let field_aliases = df_schema.fields().iter().enumerate().map(|(index, field)| {
+        DFExpr::Column(Column::from_name(format!("column{}", index + 1))).alias(field.name())
+    });
+    let plan = LogicalPlanBuilder::values_with_schema(rows?, &df_schema)?
+        .project(field_aliases)?
+        .build()?;
     Ok(LoweredNode::new(plan, Arc::clone(&values.schema)))
 }
 
@@ -138,10 +142,14 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::datatypes::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
-    use datafusion::common::ScalarValue as DFScalarValue;
-    use delta_kernel::expressions::{col, Predicate as KernelPredicate};
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::assert_batches_eq;
+    use datafusion::prelude::SessionContext;
+    use delta_kernel::expressions::{
+        col, ArrayData as KernelArrayData, MapData as KernelMapData, Predicate as KernelPredicate,
+        StructData as KernelStructData,
+    };
+    use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
     use super::*;
@@ -157,26 +165,72 @@ mod tests {
         .unwrap()
     }
 
-    /// Lowers a `Values` over [`test_schema`] holding `rows`.
-    fn lower_rows(rows: Vec<Vec<KernelScalar>>) -> Result<Arc<DFLogicalPlan>, DataFusionError> {
-        let values = KernelValues::new(test_schema(), rows);
+    fn lower_rows(
+        schema: StructType,
+        rows: Vec<Vec<KernelScalar>>,
+    ) -> Result<Arc<DFLogicalPlan>, DataFusionError> {
+        let values = KernelValues::new(schema, rows);
         Ok(lower_operator(&KernelOperator::Values(values), &[])?.plan)
     }
 
-    /// The field names DataFusion reports for `plan`'s output columns.
-    fn output_names(plan: &DFLogicalPlan) -> Vec<&String> {
-        plan.schema().fields().iter().map(|f| f.name()).collect()
+    async fn execute_rows(
+        schema: StructType,
+        rows: Vec<Vec<KernelScalar>>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let plan = Arc::unwrap_or_clone(lower_rows(schema, rows)?);
+        SessionContext::new()
+            .execute_logical_plan(plan)
+            .await?
+            .collect()
+            .await
     }
 
-    /// The Arrow types DataFusion reports for `plan`'s output columns.
-    fn output_types(plan: &DFLogicalPlan) -> Vec<ArrowDataType> {
-        let fields = plan.schema().fields();
-        fields.iter().map(|f| f.data_type().clone()).collect()
+    fn schema_for_row(names: &[&str], row: &[KernelScalar]) -> StructType {
+        StructType::try_new(
+            names
+                .iter()
+                .zip(row)
+                .map(|(name, scalar)| StructField::nullable(*name, scalar.data_type())),
+        )
+        .unwrap()
     }
 
-    /// The Arrow type kernel maps a timestamp to, in `tz`'s zone (`None` for `TIMESTAMP_NTZ`).
-    fn timestamp_type(tz: Option<Arc<str>>) -> ArrowDataType {
-        ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, tz)
+    fn nested_scalars() -> Vec<KernelScalar> {
+        let struct_fields = vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::STRING),
+        ];
+        let struct_scalar = KernelScalar::Struct(
+            KernelStructData::try_new(
+                struct_fields,
+                vec![KernelScalar::Integer(1), KernelScalar::String("x".into())],
+            )
+            .unwrap(),
+        );
+        let array_scalar = KernelScalar::Array(
+            KernelArrayData::try_new(
+                ArrayType::new(DataType::INTEGER, true),
+                [
+                    KernelScalar::Integer(1),
+                    KernelScalar::null(DataType::INTEGER),
+                ],
+            )
+            .unwrap(),
+        );
+        let map_scalar = KernelScalar::Map(
+            KernelMapData::try_new(
+                MapType::new(DataType::STRING, DataType::INTEGER, true),
+                [
+                    (KernelScalar::String("x".into()), KernelScalar::Integer(1)),
+                    (
+                        KernelScalar::String("y".into()),
+                        KernelScalar::null(DataType::INTEGER),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        vec![struct_scalar, array_scalar, map_scalar]
     }
 
     /// An empty parent relation with `schema`.
@@ -190,92 +244,149 @@ mod tests {
 
     // === Tests ===
 
-    #[rstest]
-    #[case::single_row(
-        vec![vec![1i64.into(), "x".into()]],
-        vec![vec![lit(1i64), lit("x")]]
-    )]
-    #[case::multiple_rows(
-        vec![vec![1i64.into(), "x".into()], vec![2i64.into(), "y".into()]],
-        vec![vec![lit(1i64), lit("x")], vec![lit(2i64), lit("y")]]
-    )]
-    fn values_lowers_to_literal_rows(
-        #[case] rows: Vec<Vec<KernelScalar>>,
-        #[case] expected: Vec<Vec<DFExpr>>,
-    ) -> Result<(), DataFusionError> {
-        let plan = lower_rows(rows)?;
-        let DFLogicalPlan::Values(values) = plan.as_ref() else {
-            panic!("expected Values, got {plan:?}");
-        };
-        assert_eq!(values.values, expected);
-        assert_eq!(output_names(&plan), ["a", "b"]);
-        Ok(())
+    #[tokio::test]
+    async fn values_execute_multiple_rows_with_declared_names() {
+        let batches = execute_rows(
+            test_schema(),
+            vec![vec![1i64.into(), "x".into()], vec![2i64.into(), "y".into()]],
+        )
+        .await
+        .unwrap();
+        assert_batches_eq!(
+            &[
+                "+---+---+",
+                "| a | b |",
+                "+---+---+",
+                "| 1 | x |",
+                "| 2 | y |",
+                "+---+---+",
+            ],
+            &batches
+        );
     }
 
     /// Kernel's absent relation builds to an empty `Values`, so this shape is reachable from any
     /// empty file set and must not be mistaken for a malformed plan.
     #[test]
     fn empty_values_lowers_to_empty_relation() {
-        let plan = lower_rows(vec![]).unwrap();
+        let plan = lower_rows(test_schema(), vec![]).unwrap();
         let DFLogicalPlan::EmptyRelation(empty) = plan.as_ref() else {
             panic!("expected EmptyRelation, got {plan:?}");
         };
         assert!(!empty.produce_one_row);
         assert_eq!(
-            output_names(&plan),
+            plan.schema()
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect::<Vec<_>>(),
             ["a", "b"],
             "schema survives an empty relation"
         );
     }
 
-    /// Each literal is lowered as-is, with no cast to its declared field type: a kernel `Scalar`
-    /// and the field it fills derive their Arrow types from the same kernel `DataType`, so a
-    /// well-formed node already agrees. This asserts that agreement holds across the types
-    /// whose Arrow mapping carries extra parameters, where a silent cast would be easiest to
-    /// miss.
-    #[rstest]
-    #[case::long(
-        1i64.into(),
-        DFScalarValue::Int64(Some(1)),
-        ArrowDataType::Int64
-    )]
-    #[case::timestamp(
-        KernelScalar::Timestamp(1),
-        DFScalarValue::TimestampMicrosecond(Some(1), Some("UTC".into())),
-        timestamp_type(Some("UTC".into()))
-    )]
-    #[case::timestamp_ntz(
-        KernelScalar::TimestampNtz(1),
-        DFScalarValue::TimestampMicrosecond(Some(1), None),
-        timestamp_type(None)
-    )]
-    #[case::date(
-        KernelScalar::Date(1),
-        DFScalarValue::Date32(Some(1)),
-        ArrowDataType::Date32
-    )]
-    fn literal_type_matches_its_declared_field_without_casting(
-        #[case] scalar: KernelScalar,
-        #[case] expected_literal: DFScalarValue,
-        #[case] expected_type: ArrowDataType,
-    ) {
-        let schema = StructType::try_new([StructField::nullable("a", scalar.data_type())]).unwrap();
-        let values = KernelValues::new(schema, vec![vec![scalar]]);
-        let plan = lower_operator(&KernelOperator::Values(values), &[])
-            .unwrap()
-            .plan;
+    #[tokio::test]
+    async fn values_execute_all_supported_numeric_types() {
+        let row = vec![
+            KernelScalar::Byte(1),
+            KernelScalar::Short(2),
+            KernelScalar::Integer(3),
+            KernelScalar::Long(4),
+            KernelScalar::Float(1.25),
+            KernelScalar::Double(2.5),
+            KernelScalar::decimal(12345, 7, 2).unwrap(),
+        ];
+        let schema = schema_for_row(
+            &[
+                "byte", "short", "integer", "long", "float", "double", "decimal",
+            ],
+            &row,
+        );
+        let batches = execute_rows(schema, vec![row]).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+------+-------+---------+------+-------+--------+---------+",
+                "| byte | short | integer | long | float | double | decimal |",
+                "+------+-------+---------+------+-------+--------+---------+",
+                "| 1    | 2     | 3       | 4    | 1.25  | 2.5    | 123.45  |",
+                "+------+-------+---------+------+-------+--------+---------+",
+            ],
+            &batches
+        );
+    }
 
-        // The schema's declared type and the literal's own type must agree: a `Values` node whose
-        // schema disagrees with its literals reports a type the node does not produce.
-        assert_eq!(output_types(&plan), std::slice::from_ref(&expected_type));
-        let DFLogicalPlan::Values(lowered) = plan.as_ref() else {
-            panic!("expected Values, got {plan:?}");
-        };
-        let DFExpr::Literal(literal, _) = &lowered.values[0][0] else {
-            panic!("expected a bare literal, got {:?}", lowered.values[0][0]);
-        };
-        assert_eq!(literal, &expected_literal);
-        assert_eq!(literal.data_type(), expected_type);
+    #[tokio::test]
+    async fn values_execute_string_boolean_binary_and_null_types() {
+        let row = vec![
+            KernelScalar::String("hello".into()),
+            KernelScalar::Boolean(true),
+            KernelScalar::Binary(vec![0x01, 0x02]),
+            KernelScalar::null(DataType::INTEGER),
+        ];
+        let schema = schema_for_row(&["string", "boolean", "binary", "null"], &row);
+        let batches = execute_rows(schema, vec![row]).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+--------+---------+--------+------+",
+                "| string | boolean | binary | null |",
+                "+--------+---------+--------+------+",
+                "| hello  | true    | 0102   |      |",
+                "+--------+---------+--------+------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn values_execute_timestamp_timestamp_ntz_and_date_types() {
+        let row = vec![
+            KernelScalar::Timestamp(1_000_000),
+            KernelScalar::TimestampNtz(1_000_000),
+            KernelScalar::Date(1),
+        ];
+        let schema = schema_for_row(&["timestamp", "timestamp_ntz", "date"], &row);
+        let batches = execute_rows(schema, vec![row]).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+----------------------+---------------------+------------+",
+                "| timestamp            | timestamp_ntz       | date       |",
+                "+----------------------+---------------------+------------+",
+                "| 1970-01-01T00:00:01Z | 1970-01-01T00:00:01 | 1970-01-02 |",
+                "+----------------------+---------------------+------------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn values_execute_array_map_and_struct_types() {
+        let row = nested_scalars();
+        let schema = schema_for_row(&["struct", "array", "map"], &row);
+        let batches = execute_rows(schema, vec![row]).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+--------------+-------+-------------+",
+                "| struct       | array | map         |",
+                "+--------------+-------+-------------+",
+                "| {a: 1, b: x} | [1, ] | {x: 1, y: } |",
+                "+--------------+-------+-------------+",
+            ],
+            &batches
+        );
+    }
+
+    #[rstest]
+    #[case::too_few(vec![vec![1i64.into()]], "got 1 values in row 0 but expected 2")]
+    #[case::too_many(
+        vec![vec![1i64.into(), "x".into(), true.into()]],
+        "got 3 values in row 0 but expected 2"
+    )]
+    fn values_reject_rows_with_the_wrong_width(
+        #[case] rows: Vec<Vec<KernelScalar>>,
+        #[case] expected: &str,
+    ) {
+        let err = lower_rows(test_schema(), rows).unwrap_err();
+        assert!(err.to_string().contains(expected), "{err}");
     }
 
     #[test]

@@ -62,7 +62,9 @@ pub(crate) fn to_df_plan(plan: &KernelPlan) -> Result<DFLogicalPlan, DataFusionE
 
 #[cfg(test)]
 mod tests {
-    use datafusion::logical_expr::lit;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::assert_batches_eq;
+    use datafusion::prelude::SessionContext;
     use delta_kernel::expressions::{col, Predicate as KernelPredicate, Scalar as KernelScalar};
     use delta_kernel::plans::ir::nodes::{Filter as KernelFilter, Values as KernelValues};
     use delta_kernel::plans::ir::plan::PlanNode as KernelPlanNode;
@@ -83,6 +85,14 @@ mod tests {
         KernelPlanNode::new(KernelValues::new(test_schema(), rows), vec![])
     }
 
+    async fn execute(plan: &KernelPlan) -> Result<Vec<RecordBatch>, DataFusionError> {
+        SessionContext::new()
+            .execute_logical_plan(to_df_plan(plan)?)
+            .await?
+            .collect()
+            .await
+    }
+
     // === Tests ===
 
     #[test]
@@ -91,8 +101,8 @@ mod tests {
         assert!(err.to_string().contains("no nodes"), "{err}");
     }
 
-    #[test]
-    fn terminal_node_is_the_plans_output() -> Result<(), DataFusionError> {
+    #[tokio::test]
+    async fn terminal_node_is_the_plans_output() {
         // Two independent sources; the last node is the terminal one, so its rows are the output.
         let plan = KernelPlan {
             nodes: vec![
@@ -100,18 +110,11 @@ mod tests {
                 values_node(vec![vec![2i64.into()], vec![3i64.into()]]),
             ],
         };
-        let lowered = to_df_plan(&plan)?;
-        let DFLogicalPlan::Values(values) = &lowered else {
-            panic!("expected Values, got {lowered:?}");
-        };
-        // The rows are the terminal node's 2 and 3, not the first node's 1.
-        let rows = format!("{:?}", values.values);
-        assert!(
-            rows.contains("Int64(2)") && rows.contains("Int64(3)"),
-            "{rows}"
+        let batches = execute(&plan).await.unwrap();
+        assert_batches_eq!(
+            &["+---+", "| a |", "+---+", "| 2 |", "| 3 |", "+---+"],
+            &batches
         );
-        assert!(!rows.contains("Int64(1)"), "{rows}");
-        Ok(())
     }
 
     #[rstest]
@@ -131,25 +134,19 @@ mod tests {
         assert!(message.contains("0 prior node(s)"), "{message}");
     }
 
-    #[test]
-    fn filter_uses_its_declared_parent_index() {
+    #[tokio::test]
+    async fn filter_uses_its_declared_parent_index() {
         let filter = KernelFilter {
             predicate: KernelPredicate::is_null(col!("a")).into(),
         };
         let plan = KernelPlan {
             nodes: vec![
-                values_node(vec![vec![1i64.into()]]),
+                values_node(vec![vec![KernelScalar::null(DataType::LONG)]]),
                 values_node(vec![vec![2i64.into()]]),
                 KernelPlanNode::new(filter, vec![0]),
             ],
         };
-        let lowered = to_df_plan(&plan).unwrap();
-        let DFLogicalPlan::Filter(filter) = lowered else {
-            panic!("expected Filter");
-        };
-        let DFLogicalPlan::Values(values) = filter.input.as_ref() else {
-            panic!("expected Values parent");
-        };
-        assert_eq!(values.values, [vec![lit(1i64)]]);
+        let batches = execute(&plan).await.unwrap();
+        assert_batches_eq!(&["+---+", "| a |", "+---+", "|   |", "+---+"], &batches);
     }
 }
