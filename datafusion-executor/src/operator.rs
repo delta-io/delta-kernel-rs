@@ -14,19 +14,24 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::common::{DFSchema, DataFusionError};
+use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
+use datafusion::functions_aggregate::first_last::first_value_udaf;
 use datafusion::logical_expr::{
-    col as df_col, lit as df_lit, EmptyRelation, Expr as DFExpr, ExprSchemable, Filter as DFFilter,
-    LogicalPlan as DFLogicalPlan, LogicalPlanBuilder, Projection as DFProjection,
+    col as df_col, lit as df_lit, Aggregate as DFAggregate, EmptyRelation, Expr as DFExpr,
+    ExprFunctionExt, ExprSchemable, Filter as DFFilter, LogicalPlan as DFLogicalPlan,
+    LogicalPlanBuilder, Projection as DFProjection,
 };
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
-use delta_kernel::expressions::Scalar as KernelScalar;
+use delta_kernel::expressions::{
+    ColumnName as KernelColumnName, Expression as KernelExpression, Scalar as KernelScalar,
+};
 use delta_kernel::plans::ir::nodes::{
-    Filter as KernelFilter, Operator as KernelOperator, Project as KernelProject,
-    Values as KernelValues,
+    Agg as KernelAgg, Aggregate as KernelAggregate, Filter as KernelFilter,
+    Operator as KernelOperator, Project as KernelProject, Values as KernelValues,
 };
 use delta_kernel::schema::StructType;
 
-use crate::expression::to_df_struct_columns;
+use crate::expression::{to_df_expr, to_df_struct_columns};
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
@@ -64,8 +69,14 @@ pub(crate) fn lower_operator(
             };
             lower_filter(filter, input)
         }
-        // TODO: lower the remaining operators (scans, Load/Aggregate, SemiJoin, UnionAll), each
-        // in its own change.
+        KernelOperator::Aggregate(aggregate) => {
+            let [input] = inputs else {
+                return Err(input_count_error(1));
+            };
+            lower_aggregate(aggregate, input)
+        }
+        // TODO: lower the remaining operators (scans, Load, SemiJoin, UnionAll), each in its own
+        // change.
         _ => Err(DataFusionError::NotImplemented(format!(
             "lowering operator {op} to a DataFusion LogicalPlan"
         ))),
@@ -103,6 +114,123 @@ fn lower_project(
         .collect();
     let projection = DFProjection::try_new_with_schema(exprs?, Arc::clone(input), df_schema)?;
     Ok(DFLogicalPlan::Projection(projection))
+}
+
+/// Lowers an [`Aggregate`](KernelAggregate) to a DataFusion aggregate over its parent.
+fn lower_aggregate(
+    aggregate: &KernelAggregate,
+    input: &Arc<DFLogicalPlan>,
+) -> Result<DFLogicalPlan, DataFusionError> {
+    let input_schema: StructType = input.schema().as_arrow().try_into_kernel()?;
+    let output_fields: Vec<_> = aggregate.schema.fields().collect();
+    let expected_field_count = aggregate.group_by.len() + aggregate.aggs.len();
+    if output_fields.len() != expected_field_count {
+        return Err(DataFusionError::Plan(format!(
+            "Aggregate declares {} group key(s) and {} aggregate expression(s), but its output \
+             schema has {} fields",
+            aggregate.group_by.len(),
+            aggregate.aggs.len(),
+            output_fields.len()
+        )));
+    }
+
+    if expected_field_count == 0 {
+        let arrow_schema: ArrowSchema = aggregate.schema.as_ref().try_into_arrow()?;
+        let empty = EmptyRelation {
+            produce_one_row: true,
+            schema: Arc::new(arrow_schema.try_into()?),
+        };
+        return Ok(DFLogicalPlan::EmptyRelation(empty));
+    }
+
+    let (group_fields, aggregate_fields) = output_fields.split_at(aggregate.group_by.len());
+    let group_exprs: Result<Vec<_>, DataFusionError> = aggregate
+        .group_by
+        .iter()
+        .zip(group_fields)
+        .map(|(column, field)| {
+            let expr = column_to_df_expr(column, &input_schema)?;
+            let target = field.data_type().try_into_arrow()?;
+            let expr = expr
+                .cast_to(&target, input.schema())?
+                .alias(field.name().clone());
+            Ok(expr)
+        })
+        .collect();
+    let aggregate_exprs: Result<Vec<_>, DataFusionError> = aggregate
+        .aggs
+        .iter()
+        .zip(aggregate_fields)
+        .map(|(agg, field)| {
+            let expr = lower_agg(agg, &input_schema)?;
+            let target = field.data_type().try_into_arrow()?;
+            let expr = expr
+                .cast_to(&target, input.schema())?
+                .alias(field.name().clone());
+            Ok(expr)
+        })
+        .collect();
+
+    let arrow_schema: ArrowSchema = aggregate.schema.as_ref().try_into_arrow()?;
+    let df_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
+    let df_aggregate = DFAggregate::try_new_with_schema(
+        Arc::clone(input),
+        group_exprs?,
+        aggregate_exprs?,
+        df_schema,
+    )?;
+    Ok(DFLogicalPlan::Aggregate(df_aggregate))
+}
+
+fn lower_agg(agg: &KernelAgg, input_schema: &StructType) -> Result<DFExpr, DataFusionError> {
+    match agg {
+        KernelAgg::Min(value) => Ok(min(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::Max(value) => Ok(max(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::Sum(value) => Ok(sum(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::Count(value) => Ok(count(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::CountStar => Ok(count(df_lit(1))),
+        KernelAgg::MinNonNullBy(operands) => lower_non_null_by(
+            &operands.value,
+            &operands.null_sentinel,
+            &operands.key,
+            input_schema,
+            true,
+        ),
+        KernelAgg::MaxNonNullBy(operands) => lower_non_null_by(
+            &operands.value,
+            &operands.null_sentinel,
+            &operands.key,
+            input_schema,
+            false,
+        ),
+    }
+}
+
+fn lower_non_null_by(
+    value: &KernelColumnName,
+    null_sentinel: &KernelColumnName,
+    key: &KernelColumnName,
+    input_schema: &StructType,
+    ascending: bool,
+) -> Result<DFExpr, DataFusionError> {
+    let value = column_to_df_expr(value, input_schema)?;
+    let null_sentinel = column_to_df_expr(null_sentinel, input_schema)?;
+    let key = column_to_df_expr(key, input_schema)?;
+    let filter = null_sentinel.is_not_null().and(key.clone().is_not_null());
+    let first_value = first_value_udaf().call(vec![value]);
+    first_value
+        .order_by(vec![key.sort(ascending, false)])
+        .filter(filter)
+        .build()
+}
+
+fn column_to_df_expr(
+    column: &KernelColumnName,
+    input_schema: &StructType,
+) -> Result<DFExpr, DataFusionError> {
+    let column = KernelExpression::Column(column.clone());
+    to_df_expr(&column, input_schema, None)
+        .map_err(|error| DataFusionError::External(Box::new(error)))
 }
 
 /// Lowers a [`Filter`](KernelFilter) node into a DataFusion [`Filter`](DFFilter) logical plan over
@@ -166,6 +294,7 @@ fn lower_row(row: &[KernelScalar]) -> Result<Vec<DFExpr>, DataFusionError> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::array::Array;
     use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue as DFScalarValue;
@@ -173,7 +302,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
     use delta_kernel::expressions::{
-        col, lit as kernel_lit, null_lit, ArrayData as KernelArrayData,
+        col, column_name, lit as kernel_lit, null_lit, ArrayData as KernelArrayData,
         BinaryPredicateOp as KernelBinaryPredicateOp, Expression as KernelExpr, ExpressionRef,
         ExpressionStructPatchBuilder, JunctionPredicateOp as KernelJunctionPredicateOp,
         MapData as KernelMapData, Predicate as KernelPredicate, StructData as KernelStructData,
@@ -215,6 +344,27 @@ mod tests {
     /// An empty input relation with `schema`.
     fn input_with_schema(schema: StructType) -> Arc<DFLogicalPlan> {
         Arc::new(lower_values_node(schema, vec![]).unwrap())
+    }
+
+    fn empty_schema() -> StructType {
+        let fields: Vec<StructField> = Vec::new();
+        StructType::try_new(fields).unwrap()
+    }
+
+    fn output_names(plan: &DFLogicalPlan) -> Vec<&String> {
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect()
+    }
+
+    fn output_types(plan: &DFLogicalPlan) -> Vec<ArrowDataType> {
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect()
     }
 
     // === Values ===
@@ -581,22 +731,6 @@ mod tests {
     }
 
     // === Project ===
-
-    fn empty_schema() -> StructType {
-        let fields: Vec<StructField> = Vec::new();
-        StructType::try_new(fields).unwrap()
-    }
-
-    /// The field names DataFusion reports for `plan`'s output columns.
-    fn output_names(plan: &DFLogicalPlan) -> Vec<&String> {
-        plan.schema().fields().iter().map(|f| f.name()).collect()
-    }
-
-    /// The Arrow types DataFusion reports for `plan`'s output columns.
-    fn output_types(plan: &DFLogicalPlan) -> Vec<ArrowDataType> {
-        let fields = plan.schema().fields();
-        fields.iter().map(|f| f.data_type().clone()).collect()
-    }
 
     /// Lowers a Project over `parent`.
     fn lower_project_expr(
@@ -1277,6 +1411,352 @@ mod tests {
         assert!(
             message.contains(r#"cannot convert Unknown expression "engine_expr""#),
             "{message}"
+        );
+    }
+
+    // === Aggregate ===
+
+    fn aggregate_input_schema() -> StructType {
+        StructType::try_new([
+            StructField::nullable("group", DataType::STRING),
+            StructField::nullable("value", DataType::STRING),
+            StructField::nullable("key", DataType::LONG),
+        ])
+        .unwrap()
+    }
+
+    fn test_aggregate() -> KernelAggregate {
+        KernelAggregate::ungrouped(Arc::new(aggregate_input_schema()))
+            .max(column_name!("value"))
+            .build()
+            .unwrap()
+    }
+
+    #[rstest]
+    #[case::missing(0)]
+    #[case::extra(2)]
+    fn aggregate_rejects_wrong_input_count(#[case] actual: usize) {
+        let input = input_with_schema(aggregate_input_schema());
+        let inputs = vec![input; actual];
+        let op = KernelOperator::Aggregate(test_aggregate());
+        let err = lower_operator(&op, &inputs).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!(
+                "aggregate expects 1 input(s), but received {actual}"
+            )),
+            "{err}"
+        );
+    }
+
+    #[rstest]
+    #[case::min(KernelAgg::min(column_name!("value")), "min", None)]
+    #[case::max(KernelAgg::max(column_name!("value")), "max", None)]
+    #[case::min_non_null_by(
+        KernelAgg::min_non_null_by(
+            column_name!("value"),
+            column_name!("value"),
+            column_name!("key")
+        ),
+        "first_value",
+        Some(true)
+    )]
+    #[case::max_non_null_by(
+        KernelAgg::max_non_null_by(
+            column_name!("value"),
+            column_name!("value"),
+            column_name!("key")
+        ),
+        "first_value",
+        Some(false)
+    )]
+    fn aggregate_lowers_function_with_declared_schema(
+        #[case] agg: KernelAgg,
+        #[case] expected_function: &str,
+        #[case] expected_ascending: Option<bool>,
+        #[values(false, true)] grouped: bool,
+    ) {
+        let parent = input_with_schema(aggregate_input_schema());
+        let group_by = grouped.then(|| column_name!("group"));
+        let aggregate = KernelAggregate::group_by(Arc::new(aggregate_input_schema()), group_by)
+            .aggregate_as(agg, "result")
+            .build()
+            .unwrap();
+        let lowered = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
+
+        let expected_names = if grouped {
+            vec!["group", "result"]
+        } else {
+            vec!["result"]
+        };
+        assert_eq!(output_names(&lowered), expected_names);
+        let DFLogicalPlan::Aggregate(aggregate) = &lowered else {
+            panic!("expected Aggregate, got {lowered:?}");
+        };
+        assert!(Arc::ptr_eq(&aggregate.input, &parent));
+        let expected_group: Vec<_> = grouped
+            .then(|| df_col("group").alias("group"))
+            .into_iter()
+            .collect();
+        assert_eq!(aggregate.group_expr, expected_group);
+
+        let [DFExpr::Alias(alias)] = aggregate.aggr_expr.as_slice() else {
+            panic!("expected one aliased aggregate expression");
+        };
+        assert_eq!(alias.name, "result");
+        let DFExpr::AggregateFunction(function) = alias.expr.as_ref() else {
+            panic!("expected aggregate function, got {:?}", alias.expr);
+        };
+        assert_eq!(function.func.name(), expected_function);
+        assert_eq!(function.params.args, [df_col("value")]);
+
+        let Some(ascending) = expected_ascending else {
+            assert!(function.params.order_by.is_empty());
+            assert!(function.params.filter.is_none());
+            return;
+        };
+        assert_eq!(
+            function.params.order_by,
+            [df_col("key").sort(ascending, false)]
+        );
+        let expected_filter = df_col("value")
+            .is_not_null()
+            .and(df_col("key").is_not_null());
+        assert_eq!(function.params.filter.as_deref(), Some(&expected_filter));
+    }
+
+    #[tokio::test]
+    async fn aggregate_casts_output_to_declared_type() {
+        let input =
+            StructType::try_new([StructField::nullable("value", DataType::INTEGER)]).unwrap();
+        let parent =
+            Arc::new(lower_values_node(input, vec![vec![KernelScalar::Integer(7)]]).unwrap());
+        let aggregate = KernelAggregate {
+            group_by: vec![],
+            aggs: vec![KernelAgg::max(column_name!("value"))],
+            schema: Arc::new(
+                StructType::try_new([StructField::nullable("result", DataType::LONG)]).unwrap(),
+            ),
+        };
+
+        let lowered = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
+        assert_eq!(output_types(&lowered), [ArrowDataType::Int64]);
+        let batches = execute(lowered).await.unwrap();
+        assert_batches_eq!(
+            &[
+                "+--------+",
+                "| result |",
+                "+--------+",
+                "| 7      |",
+                "+--------+"
+            ],
+            &batches
+        );
+    }
+
+    #[test]
+    fn empty_global_aggregate_lowers_to_one_row_relation() {
+        let parent = input_with_schema(test_schema());
+        let aggregate = KernelAggregate {
+            group_by: vec![],
+            aggs: vec![],
+            schema: Arc::new(empty_schema()),
+        };
+        let lowered = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
+
+        let DFLogicalPlan::EmptyRelation(empty) = &lowered else {
+            panic!("expected EmptyRelation, got {lowered:?}");
+        };
+        assert!(empty.produce_one_row);
+        assert!(empty.schema.fields().is_empty());
+    }
+
+    #[test]
+    fn aggregate_rejects_output_schema_with_wrong_field_count() {
+        let parent = input_with_schema(aggregate_input_schema());
+        let aggregate = KernelAggregate {
+            group_by: vec![column_name!("group")],
+            aggs: vec![KernelAgg::max(column_name!("value"))],
+            schema: Arc::new(
+                StructType::try_new([StructField::nullable("group", DataType::STRING)]).unwrap(),
+            ),
+        };
+        let err = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("output schema has 1 fields"),
+            "{err}"
+        );
+    }
+
+    /// Mixed-value input; the other cases contain only NULLs or no rows:
+    ///
+    /// ```text
+    /// value
+    /// ------
+    /// banana
+    /// cherry
+    /// NULL
+    /// apple
+    /// ```
+    #[rstest]
+    #[case::mixed_values(
+        vec![
+            vec!["banana".into()],
+            vec!["cherry".into()],
+            vec![KernelScalar::Null(DataType::STRING)],
+            vec!["apple".into()],
+        ],
+        Some("apple"),
+        Some("cherry")
+    )]
+    #[case::all_null(
+        vec![
+            vec![KernelScalar::Null(DataType::STRING)],
+            vec![KernelScalar::Null(DataType::STRING)],
+        ],
+        None,
+        None
+    )]
+    #[case::no_rows(vec![], None, None)]
+    #[tokio::test]
+    async fn aggregate_executes_min_and_max_over_nullable_or_empty_values(
+        #[case] rows: Vec<Vec<KernelScalar>>,
+        #[case] expected_min: Option<&str>,
+        #[case] expected_max: Option<&str>,
+    ) {
+        let input_schema = Arc::new(
+            StructType::try_new([StructField::nullable("value", DataType::STRING)]).unwrap(),
+        );
+        let parent = Arc::new(lower_values_node(input_schema.as_ref().clone(), rows).unwrap());
+        let aggregate = KernelAggregate::ungrouped(input_schema)
+            .aggregate_as(KernelAgg::min(column_name!("value")), "min_value")
+            .aggregate_as(KernelAgg::max(column_name!("value")), "max_value")
+            .build()
+            .unwrap();
+
+        let lowered = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
+        let batches = execute(lowered).await.unwrap();
+        let expected_row = format!(
+            "| {:<9} | {:<9} |",
+            expected_min.unwrap_or_default(),
+            expected_max.unwrap_or_default()
+        );
+        assert_batches_eq!(
+            &[
+                "+-----------+-----------+",
+                "| min_value | max_value |",
+                "+-----------+-----------+",
+                expected_row.as_str(),
+                "+-----------+-----------+",
+            ],
+            &batches
+        );
+        assert_eq!(batches[0].column(0).is_null(0), expected_min.is_none());
+        assert_eq!(batches[0].column(1).is_null(0), expected_max.is_none());
+    }
+
+    /// Input:
+    ///
+    /// ```text
+    /// group   | value  | key
+    /// --------+--------+-----
+    /// valid   | NULL   | 0
+    /// valid   | min    | 1
+    /// valid   | max    | 3
+    /// valid   | NULL   | 4
+    /// valid   | no-key | NULL
+    /// invalid | NULL   | 1
+    /// invalid | no-key | NULL
+    /// ```
+    #[tokio::test]
+    async fn aggregate_non_null_by_ignores_rows_unless_value_and_key_are_both_non_null() {
+        let rows = vec![
+            vec![
+                "valid".into(),
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Long(0),
+            ],
+            vec!["valid".into(), "min".into(), KernelScalar::Long(1)],
+            vec!["valid".into(), "max".into(), KernelScalar::Long(3)],
+            vec![
+                "valid".into(),
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Long(4),
+            ],
+            vec![
+                "valid".into(),
+                "no-key".into(),
+                KernelScalar::Null(DataType::LONG),
+            ],
+            vec![
+                "invalid".into(),
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Long(1),
+            ],
+            vec![
+                "invalid".into(),
+                "no-key".into(),
+                KernelScalar::Null(DataType::LONG),
+            ],
+        ];
+        let input_schema = Arc::new(aggregate_input_schema());
+        let parent = Arc::new(lower_values_node(input_schema.as_ref().clone(), rows).unwrap());
+        let aggregate =
+            KernelAggregate::group_by(Arc::clone(&input_schema), [column_name!("group")])
+                .aggregate_as(
+                    KernelAgg::min_non_null_by(
+                        column_name!("value"),
+                        column_name!("value"),
+                        column_name!("key"),
+                    ),
+                    "min_value",
+                )
+                .aggregate_as(
+                    KernelAgg::max_non_null_by(
+                        column_name!("value"),
+                        column_name!("value"),
+                        column_name!("key"),
+                    ),
+                    "max_value",
+                )
+                .build()
+                .unwrap();
+
+        let lowered = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
+        let batches = execute(lowered).await.unwrap();
+        assert_batches_sorted_eq!(
+            &[
+                "+---------+-----------+-----------+",
+                "| group   | min_value | max_value |",
+                "+---------+-----------+-----------+",
+                "| invalid |           |           |",
+                "| valid   | min       | max       |",
+                "+---------+-----------+-----------+",
+            ],
+            &batches
         );
     }
 }
