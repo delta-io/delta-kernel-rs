@@ -146,8 +146,9 @@ mod tests {
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
     use delta_kernel::expressions::{
-        col, ArrayData as KernelArrayData, MapData as KernelMapData, Predicate as KernelPredicate,
-        StructData as KernelStructData,
+        col, ArrayData as KernelArrayData, BinaryPredicateOp as KernelBinaryPredicateOp,
+        JunctionPredicateOp as KernelJunctionPredicateOp, MapData as KernelMapData,
+        Predicate as KernelPredicate, StructData as KernelStructData,
     };
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
@@ -165,24 +166,35 @@ mod tests {
         .unwrap()
     }
 
-    fn lower_rows(
+    fn lower_values_node(
         schema: StructType,
         rows: Vec<Vec<KernelScalar>>,
-    ) -> Result<Arc<DFLogicalPlan>, DataFusionError> {
+    ) -> Result<LoweredNode, DataFusionError> {
         let values = KernelValues::new(schema, rows);
-        Ok(lower_operator(&KernelOperator::Values(values), &[])?.plan)
+        lower_operator(&KernelOperator::Values(values), &[])
     }
 
-    async fn execute_rows(
-        schema: StructType,
-        rows: Vec<Vec<KernelScalar>>,
-    ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let plan = Arc::unwrap_or_clone(lower_rows(schema, rows)?);
+    async fn execute(lowered: LoweredNode) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let plan = Arc::unwrap_or_clone(lowered.plan);
         SessionContext::new()
             .execute_logical_plan(plan)
             .await?
             .collect()
             .await
+    }
+
+    /// An empty parent relation with `schema`.
+    fn parent_with_schema(schema: StructType) -> LoweredNode {
+        lower_values_node(schema, vec![]).unwrap()
+    }
+
+    // === Values ===
+
+    async fn execute_rows(
+        schema: StructType,
+        rows: Vec<Vec<KernelScalar>>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        execute(lower_values_node(schema, rows)?).await
     }
 
     fn schema_for_row(names: &[&str], row: &[KernelScalar]) -> StructType {
@@ -233,43 +245,11 @@ mod tests {
         vec![struct_scalar, array_scalar, map_scalar]
     }
 
-    /// An empty parent relation with `schema`.
-    fn parent_with_schema(schema: StructType) -> LoweredNode {
-        lower_operator(
-            &KernelOperator::Values(KernelValues::new(schema, vec![])),
-            &[],
-        )
-        .unwrap()
-    }
-
-    // === Tests ===
-
-    #[tokio::test]
-    async fn values_execute_multiple_rows_with_declared_names() {
-        let batches = execute_rows(
-            test_schema(),
-            vec![vec![1i64.into(), "x".into()], vec![2i64.into(), "y".into()]],
-        )
-        .await
-        .unwrap();
-        assert_batches_eq!(
-            &[
-                "+---+---+",
-                "| a | b |",
-                "+---+---+",
-                "| 1 | x |",
-                "| 2 | y |",
-                "+---+---+",
-            ],
-            &batches
-        );
-    }
-
-    /// Kernel's absent relation builds to an empty `Values`, so this shape is reachable from any
-    /// empty file set and must not be mistaken for a malformed plan.
+    /// Kernel's absent relation builds to an empty [`KernelValues`], so this shape is reachable
+    /// from any empty file set and must not be mistaken for a malformed plan.
     #[test]
     fn empty_values_lowers_to_empty_relation() {
-        let plan = lower_rows(test_schema(), vec![]).unwrap();
+        let plan = lower_values_node(test_schema(), vec![]).unwrap().plan;
         let DFLogicalPlan::EmptyRelation(empty) = plan.as_ref() else {
             panic!("expected EmptyRelation, got {plan:?}");
         };
@@ -285,9 +265,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn values_execute_all_supported_numeric_types() {
-        let row = vec![
+    #[rstest]
+    #[case::multiple_rows(
+        &["a", "b"],
+        vec![vec![1i64.into(), "x".into()], vec![2i64.into(), "y".into()]],
+        &[
+            "+---+---+",
+            "| a | b |",
+            "+---+---+",
+            "| 1 | x |",
+            "| 2 | y |",
+            "+---+---+",
+        ]
+    )]
+    #[case::numeric(
+        &["byte", "short", "integer", "long", "float", "double", "decimal"],
+        vec![vec![
             KernelScalar::Byte(1),
             KernelScalar::Short(2),
             KernelScalar::Integer(3),
@@ -295,146 +288,200 @@ mod tests {
             KernelScalar::Float(1.25),
             KernelScalar::Double(2.5),
             KernelScalar::decimal(12345, 7, 2).unwrap(),
-        ];
-        let schema = schema_for_row(
-            &[
-                "byte", "short", "integer", "long", "float", "double", "decimal",
-            ],
-            &row,
-        );
-        let batches = execute_rows(schema, vec![row]).await.unwrap();
-        assert_batches_eq!(
-            &[
-                "+------+-------+---------+------+-------+--------+---------+",
-                "| byte | short | integer | long | float | double | decimal |",
-                "+------+-------+---------+------+-------+--------+---------+",
-                "| 1    | 2     | 3       | 4    | 1.25  | 2.5    | 123.45  |",
-                "+------+-------+---------+------+-------+--------+---------+",
-            ],
-            &batches
-        );
-    }
-
-    #[tokio::test]
-    async fn values_execute_string_boolean_binary_and_null_types() {
-        let row = vec![
+        ]],
+        &[
+            "+------+-------+---------+------+-------+--------+---------+",
+            "| byte | short | integer | long | float | double | decimal |",
+            "+------+-------+---------+------+-------+--------+---------+",
+            "| 1    | 2     | 3       | 4    | 1.25  | 2.5    | 123.45  |",
+            "+------+-------+---------+------+-------+--------+---------+",
+        ]
+    )]
+    #[case::string_boolean_binary_and_null(
+        &["string", "boolean", "binary", "null"],
+        vec![vec![
             KernelScalar::String("hello".into()),
             KernelScalar::Boolean(true),
             KernelScalar::Binary(vec![0x01, 0x02]),
             KernelScalar::null(DataType::INTEGER),
-        ];
-        let schema = schema_for_row(&["string", "boolean", "binary", "null"], &row);
-        let batches = execute_rows(schema, vec![row]).await.unwrap();
-        assert_batches_eq!(
-            &[
-                "+--------+---------+--------+------+",
-                "| string | boolean | binary | null |",
-                "+--------+---------+--------+------+",
-                "| hello  | true    | 0102   |      |",
-                "+--------+---------+--------+------+",
-            ],
-            &batches
-        );
-    }
-
-    #[tokio::test]
-    async fn values_execute_timestamp_timestamp_ntz_and_date_types() {
-        let row = vec![
+        ]],
+        &[
+            "+--------+---------+--------+------+",
+            "| string | boolean | binary | null |",
+            "+--------+---------+--------+------+",
+            "| hello  | true    | 0102   |      |",
+            "+--------+---------+--------+------+",
+        ]
+    )]
+    #[case::timestamp_timestamp_ntz_and_date(
+        &["timestamp", "timestamp_ntz", "date"],
+        vec![vec![
             KernelScalar::Timestamp(1_000_000),
             KernelScalar::TimestampNtz(1_000_000),
             KernelScalar::Date(1),
-        ];
-        let schema = schema_for_row(&["timestamp", "timestamp_ntz", "date"], &row);
-        let batches = execute_rows(schema, vec![row]).await.unwrap();
-        assert_batches_eq!(
-            &[
-                "+----------------------+---------------------+------------+",
-                "| timestamp            | timestamp_ntz       | date       |",
-                "+----------------------+---------------------+------------+",
-                "| 1970-01-01T00:00:01Z | 1970-01-01T00:00:01 | 1970-01-02 |",
-                "+----------------------+---------------------+------------+",
-            ],
-            &batches
-        );
-    }
-
+        ]],
+        &[
+            "+----------------------+---------------------+------------+",
+            "| timestamp            | timestamp_ntz       | date       |",
+            "+----------------------+---------------------+------------+",
+            "| 1970-01-01T00:00:01Z | 1970-01-01T00:00:01 | 1970-01-02 |",
+            "+----------------------+---------------------+------------+",
+        ]
+    )]
+    #[case::array_map_and_struct(
+        &["struct", "array", "map"],
+        vec![nested_scalars()],
+        &[
+            "+--------------+-------+-------------+",
+            "| struct       | array | map         |",
+            "+--------------+-------+-------------+",
+            "| {a: 1, b: x} | [1, ] | {x: 1, y: } |",
+            "+--------------+-------+-------------+",
+        ]
+    )]
     #[tokio::test]
-    async fn values_execute_array_map_and_struct_types() {
-        let row = nested_scalars();
-        let schema = schema_for_row(&["struct", "array", "map"], &row);
-        let batches = execute_rows(schema, vec![row]).await.unwrap();
-        assert_batches_eq!(
-            &[
-                "+--------------+-------+-------------+",
-                "| struct       | array | map         |",
-                "+--------------+-------+-------------+",
-                "| {a: 1, b: x} | [1, ] | {x: 1, y: } |",
-                "+--------------+-------+-------------+",
-            ],
-            &batches
-        );
+    async fn values_execute_rows(
+        #[case] names: &[&str],
+        #[case] rows: Vec<Vec<KernelScalar>>,
+        #[case] expected: &[&str],
+    ) {
+        let schema = schema_for_row(names, &rows[0]);
+        let batches = execute_rows(schema, rows).await.unwrap();
+        assert_batches_eq!(expected, &batches);
     }
 
     #[rstest]
     #[case::too_few(vec![vec![1i64.into()]], "got 1 values in row 0 but expected 2")]
     #[case::too_many(
-        vec![vec![1i64.into(), "x".into(), true.into()]],
-        "got 3 values in row 0 but expected 2"
-    )]
+            vec![vec![1i64.into(), "x".into(), true.into()]],
+            "got 3 values in row 0 but expected 2"
+        )]
     fn values_reject_rows_with_the_wrong_width(
         #[case] rows: Vec<Vec<KernelScalar>>,
         #[case] expected: &str,
     ) {
-        let err = lower_rows(test_schema(), rows).unwrap_err();
+        let err = lower_values_node(test_schema(), rows).unwrap_err();
         assert!(err.to_string().contains(expected), "{err}");
     }
 
     #[test]
-    fn filter_wraps_its_parent_and_inherits_kernel_schema() {
+    fn values_reject_a_parent() {
         let parent = parent_with_schema(test_schema());
-        let filter = KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
-        };
-        let lowered = lower_operator(&KernelOperator::Filter(filter), &[&parent]).unwrap();
+        let op = KernelOperator::Values(KernelValues::new(test_schema(), vec![]));
+        let err = lower_operator(&op, &[&parent]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Values expects 0 parent(s), but received 1"),
+            "{err}"
+        );
+    }
 
-        assert!(Arc::ptr_eq(&lowered.schema, &parent.schema));
-        let DFLogicalPlan::Filter(filter) = lowered.plan.as_ref() else {
-            panic!("expected Filter, got {:?}", lowered.plan);
+    // === Filter ===
+
+    async fn execute_filter(
+        rows: Vec<Vec<KernelScalar>>,
+        predicate: KernelPredicate,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let parent = lower_values_node(test_schema(), rows)?;
+        let filter = KernelFilter {
+            predicate: predicate.into(),
         };
-        assert!(Arc::ptr_eq(&filter.input, &parent.plan));
+        execute(lower_operator(&KernelOperator::Filter(filter), &[&parent])?).await
+    }
+
+    fn comparison_rows() -> Vec<Vec<KernelScalar>> {
+        vec![
+            vec![1i64.into(), "x".into()],
+            vec![5i64.into(), "y".into()],
+            vec![9i64.into(), "z".into()],
+        ]
+    }
+
+    fn assert_comparison_rows(expected_rows: &[(i64, &str)], batches: &[RecordBatch]) {
+        const BORDER: &str = "+---+---+";
+        const HEADER: &str = "| a | b |";
+        let mut expected = vec![BORDER.to_owned(), HEADER.to_owned(), BORDER.to_owned()];
+        expected.extend(expected_rows.iter().map(|(a, b)| format!("| {a} | {b} |")));
+        expected.push(BORDER.to_owned());
+        let expected = expected.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_batches_eq!(&expected, batches);
+    }
+
+    #[tokio::test]
+    async fn filter_executes_is_null_predicate() {
+        let batches = execute_filter(
+            vec![
+                vec![KernelScalar::null(DataType::LONG), "kept".into()],
+                vec![1i64.into(), "removed".into()],
+            ],
+            KernelPredicate::is_null(col!("a")),
+        )
+        .await
+        .unwrap();
+
+        assert_batches_eq!(
+            &[
+                "+---+------+",
+                "| a | b    |",
+                "+---+------+",
+                "|   | kept |",
+                "+---+------+",
+            ],
+            &batches
+        );
     }
 
     #[rstest]
-    #[case::values(
-        KernelOperator::Values(KernelValues::new(test_schema(), vec![])),
-        0,
-        1
-    )]
-    #[case::filter_missing(
-        KernelOperator::Filter(KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
-        }),
-        1,
-        0
-    )]
-    #[case::filter_extra(
-        KernelOperator::Filter(KernelFilter {
-            predicate: KernelPredicate::is_null(col!("a")).into(),
-        }),
-        1,
-        2
-    )]
-    fn operator_rejects_wrong_parent_count(
-        #[case] op: KernelOperator,
-        #[case] expected: usize,
-        #[case] actual: usize,
+    #[case::equal(KernelBinaryPredicateOp::Equal, &[(5, "y")])]
+    #[case::less_than(KernelBinaryPredicateOp::LessThan, &[(1, "x")])]
+    #[case::greater_than(KernelBinaryPredicateOp::GreaterThan, &[(9, "z")])]
+    #[case::distinct(KernelBinaryPredicateOp::Distinct, &[(1, "x"), (9, "z")])]
+    #[tokio::test]
+    async fn filter_executes_binary_predicate(
+        #[case] op: KernelBinaryPredicateOp,
+        #[case] expected: &[(i64, &str)],
     ) {
+        let predicate = KernelPredicate::binary(op, col!("a"), KernelScalar::Long(5));
+        let batches = execute_filter(comparison_rows(), predicate).await.unwrap();
+        assert_comparison_rows(expected, &batches);
+    }
+
+    #[rstest]
+    #[case::and(KernelJunctionPredicateOp::And, &[(5, "y")])]
+    #[case::or(KernelJunctionPredicateOp::Or, &[(1, "x"), (9, "z")])]
+    #[tokio::test]
+    async fn filter_executes_junction_predicate(
+        #[case] op: KernelJunctionPredicateOp,
+        #[case] expected: &[(i64, &str)],
+    ) {
+        let predicates = match op {
+            KernelJunctionPredicateOp::And => [
+                KernelPredicate::gt(col!("a"), KernelScalar::Long(1)),
+                KernelPredicate::lt(col!("a"), KernelScalar::Long(9)),
+            ],
+            KernelJunctionPredicateOp::Or => [
+                KernelPredicate::lt(col!("a"), KernelScalar::Long(5)),
+                KernelPredicate::gt(col!("a"), KernelScalar::Long(5)),
+            ],
+        };
+        let predicate = KernelPredicate::junction(op, predicates);
+        let batches = execute_filter(comparison_rows(), predicate).await.unwrap();
+        assert_comparison_rows(expected, &batches);
+    }
+
+    #[rstest]
+    #[case::missing(0)]
+    #[case::extra(2)]
+    fn filter_rejects_wrong_parent_count(#[case] actual: usize) {
         let parent = parent_with_schema(test_schema());
         let parents = vec![&parent; actual];
+        let op = KernelOperator::Filter(KernelFilter {
+            predicate: KernelPredicate::is_null(col!("a")).into(),
+        });
         let err = lower_operator(&op, &parents).unwrap_err();
         assert!(
             err.to_string().contains(&format!(
-                "{op} expects {expected} parent(s), but received {actual}"
+                "Filter expects 1 parent(s), but received {actual}"
             )),
             "{err}"
         );
