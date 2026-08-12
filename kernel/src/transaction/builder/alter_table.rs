@@ -152,6 +152,12 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// `path` identifies the struct that will contain `field`. An empty path targets the table's
     /// root schema; path segments may traverse nested structs, array elements, map keys, and map
     /// values.
+    ///
+    /// The added field must be nullable (existing data files lack the column and will read NULL),
+    /// must not be a metadata column, and must not collide case-insensitively with a sibling in the
+    /// target struct. The path must resolve to a struct.
+    ///
+    /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     #[internal_api]
     pub(crate) fn add_column_at(
         mut self,

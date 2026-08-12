@@ -15,13 +15,37 @@ use crate::table_features::{
 use crate::DeltaResult;
 
 /// A schema path segment distinguishing struct fields, array elements, map keys, and map values.
+///
+/// # Examples
+///
+/// 1. In this schema:
+/// ```text
+/// { id: INT, addresses: ARRAY<STRUCT<street: STRING, number: INT>> }
+/// ```
+/// the `street` field corresponds to:
+/// ```text
+/// [PathSegment::Field("addresses"), PathSegment::ArrayElement, PathSegment::Field("street")]
+/// ```
+///
+/// 2. In this schema:
+/// ```text
+/// { labels_by_range: MAP<STRUCT<start: INT, end: INT>, STRING> }
+/// ```
+/// the `start` field corresponds to:
+/// ```text
+/// [PathSegment::Field("labels_by_range"), PathSegment::MapKey, PathSegment::Field("start")]
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum PathSegment {
+    /// Selects a named field from a struct.
     Field(String),
+    /// Descends into an array's element type.
     ArrayElement,
+    /// Descends into a map's key type.
     MapKey,
+    /// Descends into a map's value type.
     MapValue,
 }
 
@@ -34,10 +58,11 @@ pub(crate) enum SchemaOperation {
     /// The path identifies the struct that will contain `field`. An empty path adds `field` to the
     /// table's root schema.
     AddColumn {
+        /// Path to the receiving struct; an empty path selects the root schema.
         path: Vec<PathSegment>,
+        /// The nullable, non-metadata field to add.
         field: StructField,
     },
-
     /// Change a column's nullability from NOT NULL to nullable.
     SetNullable { column: ColumnName },
 }
@@ -496,6 +521,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn add_nested_column_with_column_mapping_assigns_id() {
+        let ops = vec![SchemaOperation::AddColumn {
+            path: vec![PathSegment::Field("address".to_string())],
+            field: StructField::nullable("country", DataType::STRING),
+        }];
+        let result =
+            apply_schema_operations(nested_schema(), ops, ColumnMappingMode::Name, Some(5))
+                .unwrap();
+        let country = result
+            .schema
+            .field_at_path(&["address".to_string(), "country".to_string()]);
+        assert_eq!(get_cm_id(country), 6);
+        assert!(get_physical_name(country).starts_with("col-"));
+        assert_eq!(result.new_max_column_id, Some(6));
+    }
+
+    #[test]
+    fn add_nested_column_rejects_duplicate_sibling() {
+        let ops = vec![SchemaOperation::AddColumn {
+            path: vec![PathSegment::Field("address".to_string())],
+            field: StructField::nullable("city", DataType::STRING),
+        }];
+        let err = apply_schema_operations(nested_schema(), ops, ColumnMappingMode::None, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected duplicate-sibling rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_column_at_rejects_mismatched_path_segment() {
+        let ops = vec![SchemaOperation::AddColumn {
+            path: vec![
+                PathSegment::Field("address".to_string()),
+                PathSegment::ArrayElement,
+            ],
+            field: StructField::nullable("x", DataType::STRING),
+        }];
+        let err = apply_schema_operations(nested_schema(), ops, ColumnMappingMode::None, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "expected path-segment mismatch, got: {err}"
+        );
+    }
+
     // === apply_schema_operations: SetNullable tests ===
 
     fn deeply_nested_required_schema() -> StructType {
@@ -575,6 +648,61 @@ mod tests {
         assert_eq!(result.schema.fields().count(), 3);
         assert!(result.schema.field("email").is_some());
         assert!(result.schema.field("id").unwrap().is_nullable());
+    }
+
+    /// Second op adds a child under a struct created by the first op.
+    #[test]
+    fn sequential_add_struct_then_nested_child() {
+        let parent = StructField::nullable("parent", struct_with_existing_field());
+        let ops = vec![
+            SchemaOperation::AddColumn {
+                path: vec![],
+                field: parent,
+            },
+            SchemaOperation::AddColumn {
+                path: vec![PathSegment::Field("parent".to_string())],
+                field: StructField::nullable("child", DataType::INTEGER),
+            },
+        ];
+        let result =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None).unwrap();
+        let parent = result.schema.field("parent").unwrap();
+        let DataType::Struct(s) = parent.data_type() else {
+            panic!("Expected Struct, got: {:?}", parent.data_type());
+        };
+        assert!(s.field("existing").is_some());
+        assert_eq!(
+            s.field("child"),
+            Some(&StructField::nullable("child", DataType::INTEGER))
+        );
+    }
+
+    /// Same dependent sequence under column mapping: max ID advances across both ops.
+    #[test]
+    fn sequential_add_struct_then_nested_child_with_column_mapping() {
+        let parent = StructField::nullable("parent", struct_with_existing_field());
+        let ops = vec![
+            SchemaOperation::AddColumn {
+                path: vec![],
+                field: parent,
+            },
+            SchemaOperation::AddColumn {
+                path: vec![PathSegment::Field("parent".to_string())],
+                field: StructField::nullable("child", DataType::INTEGER),
+            },
+        ];
+        // parent struct + existing leaf (op1) + child (op2) => three new IDs after max 10.
+        let result =
+            apply_schema_operations(simple_schema(), ops, ColumnMappingMode::Name, Some(10))
+                .unwrap();
+        let parent = result.schema.field("parent").unwrap();
+        let DataType::Struct(s) = parent.data_type() else {
+            panic!("Expected Struct, got: {:?}", parent.data_type());
+        };
+        let child = s.field("child").expect("child added by second op");
+        assert_eq!(get_cm_id(child), 13);
+        assert!(get_physical_name(child).starts_with("col-"));
+        assert_eq!(result.new_max_column_id, Some(13));
     }
 
     #[test]
