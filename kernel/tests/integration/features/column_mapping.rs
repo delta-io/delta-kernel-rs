@@ -98,19 +98,8 @@ fn field_names(snapshot: &Snapshot) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Feature-support matrix at reader version 3.
-//
-// For a ReaderWriter feature, `is_feature_supported` is `reader_supported && writer_supported`.
 // ColumnMapping is a legacy ReaderWriter feature (min reader version 2), so at reader version 3 the
 // reader half is always satisfied by the version and support collapses to writer-list membership.
-// The reader-only row never reaches this function: `Protocol::try_new` rejects it during load.
-//
-//   reader list        writer list        supported   note
-//   [columnMapping]     [columnMapping]    true        conformant, unchanged
-//   []                  [columnMapping]    true        orphaned, the fix
-//   []                  [appendOnly]       false       absent from both, invariant held
-// ---------------------------------------------------------------------------
 #[rstest]
 #[case::both_lists(&["columnMapping"], &["columnMapping"], true)]
 #[case::orphaned_writer_only(&[], &["columnMapping"], true)]
@@ -233,7 +222,16 @@ async fn orphaned_column_mapping_resolves_data_columns(
     // Scan output is addressed by logical names ...
     assert_eq!(batch.schema().field(0).name(), ID_LOGICAL);
     assert_eq!(batch.schema().field(1).name(), PAYLOAD_LOGICAL);
-    // ... and carries the real values, so the mode-specific column resolution fired.
+    // ... and carries the real values for every column, so the mode-specific column resolution
+    // fired. Assert `id` too: a broken physical mapping for it would otherwise surface as nulls
+    // with the test still green.
+    let id = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("id column is an int32 array");
+    assert_eq!(id.value(0), 1);
+    assert_eq!(id.value(1), 2);
     let payload = batch
         .column(1)
         .as_any()

@@ -552,7 +552,10 @@ impl IntoEngineData for Metadata {
 #[derive(
     Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
 )]
-#[serde(rename_all = "camelCase")]
+// Deserialization routes through `ProtocolWire` so that every serde ingress (e.g. CRC files)
+// is validated by `try_new`, matching the JSON-replay path. Without this a CRC file could
+// materialize a malformed feature shape that log replay would reject.
+#[serde(rename_all = "camelCase", try_from = "ProtocolWire")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
@@ -571,6 +574,30 @@ pub(crate) struct Protocol {
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
     writer_features: Option<Vec<TableFeature>>,
+}
+
+/// Unchecked wire mirror of [`Protocol`], used only as the serde deserialization input for
+/// `Protocol` so that all deserialization funnels through [`Protocol::try_new`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtocolWire {
+    min_reader_version: i32,
+    min_writer_version: i32,
+    reader_features: Option<Vec<TableFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
+}
+
+impl TryFrom<ProtocolWire> for Protocol {
+    type Error = Error;
+
+    fn try_from(wire: ProtocolWire) -> DeltaResult<Self> {
+        Protocol::try_new(
+            wire.min_reader_version,
+            wire.min_writer_version,
+            wire.reader_features,
+            wire.writer_features,
+        )
+    }
 }
 
 /// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
@@ -693,26 +720,24 @@ impl Protocol {
                 // Unknown features are treated as potentially Writer-only for forward
                 // compatibility.
                 //
-                // ColumnMapping is the exception. An upgrade to (3, 7) can leave it in
-                // writerFeatures while readerFeatures ends up empty, and the table still reads
-                // correctly because the mode comes from writerFeatures rather than the reader list.
-                // delta-spark accepts that shape, so we accept it too and only warn.
-                // The strict reading (PROTOCOL.md: "Reader Version 3 with the columnMapping table
-                // feature listed as supported") would resolve logical names against physical-named
-                // data and return nulls, so it is the wrong behavior here.
+                // Accept the legacy writer-list-only shape for delta-spark compatibility: an
+                // upgrade to (3, 7) can leave ColumnMapping in writerFeatures with an empty
+                // readerFeatures, and the table still reads correctly because the mode comes from
+                // writerFeatures. Rejecting it would break existing production tables.
+                //
+                // Validate the whole writer list before warning: a non-legacy orphan rejects the
+                // protocol outright, so we must not emit an acceptance warning for a legacy orphan
+                // seen earlier in the list only to fail on a later one.
+                let mut legacy_orphans = Vec::new();
                 for feature in writer_features.iter() {
-                    let orphaned_reader_writer_feature =
-                        matches!(feature.feature_type(), FeatureType::ReaderWriter)
-                            && !reader_features.contains(feature);
+                    let orphaned_reader_writer_feature = feature.feature_type()
+                        == FeatureType::ReaderWriter
+                        && !reader_features.contains(feature);
                     if !orphaned_reader_writer_feature {
                         continue;
                     }
                     if LEGACY_READER_FEATURES.contains(feature) {
-                        warn!(
-                            "ReaderWriter feature {feature:?} is listed in writerFeatures but \
-                             missing from readerFeatures at minReaderVersion={min_reader_version}; \
-                             treating it as reader-enabled (malformed protocol)"
-                        );
+                        legacy_orphans.push(feature);
                     } else {
                         return Err(Error::invalid_protocol(format!(
                             "Writer features must be Writer-only or also listed in reader features, \
@@ -724,6 +749,14 @@ impl Protocol {
                              minWriterVersion={min_writer_version})"
                         )));
                     }
+                }
+                // Reached only once the whole writer list is known valid.
+                for feature in legacy_orphans {
+                    warn!(
+                        "ReaderWriter feature {feature:?} is listed in writerFeatures but \
+                         missing from readerFeatures at minReaderVersion={min_reader_version}; \
+                         treating it as reader-enabled (malformed protocol)"
+                    );
                 }
                 Ok(())
             }

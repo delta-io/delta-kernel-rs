@@ -1710,30 +1710,27 @@ mod test {
 
     #[test]
     fn test_is_feature_supported_orphaned_column_mapping() {
-        // A (3, 7) table with ColumnMapping in writerFeatures but missing from readerFeatures. The
-        // mock helper places a ReaderWriter feature on both lists, so build the protocol directly
-        // to get the orphaned shape.
-        let schema = schema_ref! { nullable "value": INTEGER };
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([] as [TableFeature; 0]),
-            Some([TableFeature::ColumnMapping]),
-        )
-        .unwrap();
-        let config =
-            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0)
-                .unwrap();
-
+        // A (3, 7) table with ColumnMapping in writerFeatures but missing from readerFeatures.
         // ColumnMapping is a legacy ReaderWriter feature whose minimum reader version (2) is met by
         // reader version 3, so it counts as reader-supported even though it is absent from
         // readerFeatures. It is in writerFeatures, so it is writer-supported too.
+        let config = create_mock_table_config_with_cm(
+            &[],
+            Some(ColumnMappingMode::Name),
+            &TableFeature::EMPTY_LIST,
+            &[TableFeature::ColumnMapping],
+        );
         assert!(config.is_feature_supported(&TableFeature::ColumnMapping));
 
-        // A non-legacy ReaderWriter feature in the same position stays unsupported: no legacy
-        // reader version to fall back on, and it is missing from readerFeatures.
-        assert!(!config.is_feature_supported(&TableFeature::DeletionVectors));
+        // A non-legacy ReaderWriter feature in the same writer-only position has no legacy reader
+        // version to fall back on, so the protocol is rejected outright rather than tolerated.
+        assert!(Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(TableFeature::EMPTY_LIST),
+            Some(vec![TableFeature::DeletionVectors]),
+        )
+        .is_err());
 
         // The conformant shape (ColumnMapping in both lists) is still reported supported: the
         // legacy-version fallback does not perturb the normal reader_features membership path.
