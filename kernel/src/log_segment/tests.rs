@@ -19,7 +19,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::ColumnName;
+use crate::expressions::{col, ColumnName};
 use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -45,8 +45,8 @@ use crate::unit_test_utils::{
     create_log_path_with_size, string_array_to_engine_data, Action,
 };
 use crate::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Expression, FileDataReadResultIterator,
-    FileMeta, JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
+    DeltaResult, DeltaResultIteratorStatic, EngineData, FileDataReadResultIterator, FileMeta,
+    JsonHandler, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
     StorageHandler,
 };
 
@@ -1285,11 +1285,8 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     );
 
     // Filter out sidecar files that do not contain remove actions
-    let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
-        Some(Arc::new(
-            Expression::column([REMOVE_NAME, "path"]).is_not_null(),
-        ))
-    });
+    let remove_predicate: LazyLock<Option<PredicateRef>> =
+        LazyLock::new(|| Some(Arc::new(col!(REMOVE_NAME, "path").is_not_null())));
 
     let mut iter = process_sidecars(
         engine.parquet_handler(),
@@ -4778,13 +4775,13 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
 #[case::add_field(
     schema! { nullable (ADD_NAME): {} },
     Some(Arc::new(
-        Expression::column(ColumnName::new([ADD_NAME, "path"])).is_not_null(),
+        col!(ADD_NAME, "path").is_not_null(),
     )),
 )]
 #[case::remove_field(
     schema! { nullable (REMOVE_NAME): {} },
     Some(Arc::new(
-        Expression::column(ColumnName::new([REMOVE_NAME, "path"])).is_not_null(),
+        col!(REMOVE_NAME, "path").is_not_null(),
     )),
 )]
 #[case::action_without_required_leaf_returns_none(
@@ -4797,8 +4794,8 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
         StructField::nullable(REMOVE_NAME, StructType::new_unchecked([])),
     ]),
     Some(Arc::new(Predicate::or(
-        Expression::column(ColumnName::new([ADD_NAME, "path"])).is_not_null(),
-        Expression::column(ColumnName::new([REMOVE_NAME, "path"])).is_not_null(),
+        col!(ADD_NAME, "path").is_not_null(),
+        col!(REMOVE_NAME, "path").is_not_null(),
     ))),
 )]
 #[case::witness_and_witnessless_field_returns_none(
@@ -4831,9 +4828,8 @@ fn test_combine_checkpoint_predicates(
     #[case] include_projection: bool,
     #[case] include_metadata: bool,
 ) {
-    let projection =
-        Arc::new(Expression::column(ColumnName::new([ADD_NAME, "path"])).is_not_null());
-    let metadata = Arc::new(Expression::column(ColumnName::new([ADD_NAME, "size"])).is_not_null());
+    let projection = Arc::new(col!(ADD_NAME, "path").is_not_null());
+    let metadata = Arc::new(col!(ADD_NAME, "size").is_not_null());
     let expected = match (include_projection, include_metadata) {
         (false, false) => None,
         (true, false) => Some(projection.clone()),

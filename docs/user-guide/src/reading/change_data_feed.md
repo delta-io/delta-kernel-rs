@@ -92,7 +92,7 @@ project columns with `with_schema` and filter rows with `with_predicate`.
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::expressions::{column_expr, Scalar};
+# use delta_kernel::expressions::{col, lit};
 # use delta_kernel::table_changes::TableChanges;
 # use delta_kernel::{DeltaResult, Predicate};
 # fn example() -> DeltaResult<()> {
@@ -106,7 +106,7 @@ let schema = table_changes
     .project(&["name", "age", "_change_type", "_commit_version"])?;
 
 // 2. Build a predicate on table columns
-let predicate = Arc::new(Predicate::gt(column_expr!("age"), Scalar::from(25)));
+let predicate = Arc::new(Predicate::gt(col!("age"), lit(25)));
 
 // 3. Build and execute the scan
 let scan = table_changes

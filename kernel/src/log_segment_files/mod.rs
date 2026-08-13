@@ -598,8 +598,23 @@ impl LogSegmentFiles {
         )?;
 
         let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-            // Kernel should not compensate for corrupt tables, so we fail if we can't find a
-            // checkpoint
+            // The hint names a checkpoint that no longer exists, and because the listing started
+            // at the hinted version, no checkpoint exists at or after it either. The log was
+            // modified out of band: the checkpoint was deleted without clearing the hint, or the
+            // table was dropped and recreated at the same path.
+            //
+            // Kernel fails rather than retrying the listing from version 0, because that recovery
+            // is unsound. Listing only checks that the commits it finds are contiguous, not that
+            // they start at version 0, so two distinct kinds of damage survive as a plausible but
+            // wrong snapshot instead of an error:
+            //   - A deleted log prefix leaves a contiguous suffix with no checkpoint. If commits
+            //     0-40 and the checkpoint are removed but 41.. remain, listing from version 0
+            //     replays 41 as if it were the start of history, dropping every action before it.
+            //   - A recreated table yields a segment mixing files from two different tables. A
+            //     table with a checkpoint at commit 3 is dropped and recreated at the same path;
+            //     the drop leaves commits 0-2 behind, the new table writes its own 0, 1, 2, ...,
+            //     and listing from version 0 sees one contiguous sequence whose low versions belong
+            //     to two different tables and replays it as a single history.
             return Err(Error::invalid_checkpoint(
                 "Had a _last_checkpoint hint but didn't find any checkpoints",
             ));
