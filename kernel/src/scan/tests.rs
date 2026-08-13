@@ -2014,53 +2014,26 @@ fn test_default_stats_options_no_struct_output() {
     }
 }
 
-/// Test the internal selected-column configuration with JSON synthesis enabled.
-#[test]
-fn scan_metadata_with_specific_stats_columns_and_json() {
-    let stats = StatsOptions {
-        synthesize_json: true,
-        struct_stats: StructStats::Columns(vec![column_name!("id")]),
-    };
-    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
-    let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(SyncEngine::new());
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-
-    let scan = snapshot.scan_builder().with_stats(stats).build().unwrap();
-
-    let scan_metadata_results: Vec<_> = scan
-        .scan_metadata(engine.as_ref())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    assert!(
-        !scan_metadata_results.is_empty(),
-        "Should have scan metadata"
-    );
-
-    for scan_metadata in scan_metadata_results {
-        let (underlying_data, selection_vector) = scan_metadata.scan_files.into_parts();
-        let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
-            .unwrap()
-            .into();
-        let filtered_batch =
-            filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
-
-        let stats_parsed = get_column!(filtered_batch, "stats_parsed", StructArray);
-        let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
-        let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
-        let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
-
-        assert_eq!(field_names(min_values), vec!["id"]);
-        assert_eq!(field_names(max_values), vec!["id"]);
-        assert_eq!(field_names(null_count), vec!["id"]);
-    }
-}
-
 #[rstest]
 #[case::id_without_predicate(
-    vec![column_name!("id")],
+    StatsOptions::struct_columns(vec![column_name!("id")]),
+    &["id"],
+    None,
+    "id",
+    &[
+        ("1", "100"),
+        ("101", "200"),
+        ("201", "300"),
+        ("301", "400"),
+        ("401", "500"),
+        ("501", "600"),
+    ],
+)]
+#[case::id_with_json_without_predicate(
+    StatsOptions {
+        synthesize_json: true,
+        struct_stats: StructStats::Columns(vec![column_name!("id")]),
+    },
     &["id"],
     None,
     "id",
@@ -2074,36 +2047,36 @@ fn scan_metadata_with_specific_stats_columns_and_json() {
     ],
 )]
 #[case::id_predicate_requested(
-    vec![column_name!("id")],
+    StatsOptions::struct_columns(vec![column_name!("id")]),
     &["id"],
     Some(col!("id").gt(lit(400i64))),
     "id",
     &[("401", "500"), ("501", "600")],
 )]
 #[case::id_predicate_not_requested(
-    vec![column_name!("name")],
-    &["name"],
+    StatsOptions::struct_columns(vec![column_name!("name")]),
+    &["id", "name"],
     Some(col!("id").gt(lit(400i64))),
     "name",
     &[("name_401", "name_500"), ("name_501", "name_600")],
 )]
 #[case::salary_predicate_with_multiple_requested_columns(
-    vec![column_name!("id"), column_name!("name")],
-    &["id", "name"],
+    StatsOptions::struct_columns(vec![column_name!("id"), column_name!("name")]),
+    &["id", "name", "salary"],
     Some(col!("salary").le(lit(70_000i64))),
     "id",
     &[("1", "100"), ("101", "200")],
 )]
-#[case::predicate_selects_no_files(
-    vec![column_name!("salary")],
-    &["salary"],
-    Some(col!("id").gt(lit(600i64))),
+#[case::salary_requested_with_different_predicate_column(
+    StatsOptions::struct_columns(vec![column_name!("salary")]),
+    &["id", "salary"],
+    Some(col!("id").gt(lit(500i64))),
     "salary",
-    &[],
+    &[("100100", "110000")],
 )]
 fn scan_metadata_struct_columns_returns_expected_stats(
-    #[case] stats_columns: Vec<ColumnName>,
-    #[case] requested_names: &[&str],
+    #[case] stats: StatsOptions,
+    #[case] expected_stat_fields: &[&str],
     #[case] predicate: Option<Pred>,
     #[case] probe_column: &str,
     #[case] expected_min_max: &[(&str, &str)],
@@ -2112,17 +2085,18 @@ fn scan_metadata_struct_columns_returns_expected_stats(
     let url = Url::from_directory_path(path).unwrap();
     let engine = Arc::new(SyncEngine::new());
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
-    let expect_exact_stats_projection = predicate.is_none();
     let predicate = predicate.map(|predicate| Arc::new(predicate) as PredicateRef);
     let scan = snapshot
         .scan_builder()
         .with_predicate(predicate)
-        .with_stats(StatsOptions::struct_columns(stats_columns))
+        .with_stats(stats)
         .build()
         .unwrap();
 
     let mut actual_min_max = Vec::new();
+    let mut batch_count = 0;
     for scan_metadata in scan.scan_metadata(engine.as_ref()).unwrap() {
+        batch_count += 1;
         let (underlying_data, selection_vector) = scan_metadata.unwrap().scan_files.into_parts();
         let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
             .unwrap()
@@ -2131,25 +2105,9 @@ fn scan_metadata_struct_columns_returns_expected_stats(
         let min_values = get_column!(stats_parsed, MIN_VALUES, StructArray);
         let max_values = get_column!(stats_parsed, MAX_VALUES, StructArray);
         let null_count = get_column!(stats_parsed, NULL_COUNT, StructArray);
-        if expect_exact_stats_projection {
-            assert_eq!(field_names(min_values), requested_names);
-            assert_eq!(field_names(max_values), requested_names);
-            assert_eq!(field_names(null_count), requested_names);
-        }
-        for requested in requested_names {
-            assert!(
-                min_values.column_by_name(requested).is_some(),
-                "minValues.{requested}"
-            );
-            assert!(
-                max_values.column_by_name(requested).is_some(),
-                "maxValues.{requested}"
-            );
-            assert!(
-                null_count.column_by_name(requested).is_some(),
-                "nullCount.{requested}"
-            );
-        }
+        assert_eq!(field_names(min_values), expected_stat_fields);
+        assert_eq!(field_names(max_values), expected_stat_fields);
+        assert_eq!(field_names(null_count), expected_stat_fields);
 
         let filtered = filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
         let stats_parsed = get_column!(filtered, STATS_PARSED, StructArray);
@@ -2168,6 +2126,7 @@ fn scan_metadata_struct_columns_returns_expected_stats(
         }
     }
 
+    assert!(batch_count > 0);
     actual_min_max.sort_unstable();
     let mut expected_min_max: Vec<_> = expected_min_max
         .iter()
@@ -2175,6 +2134,22 @@ fn scan_metadata_struct_columns_returns_expected_stats(
         .collect();
     expected_min_max.sort_unstable();
     assert_eq!(actual_min_max, expected_min_max);
+}
+
+#[test]
+fn scan_metadata_struct_columns_fully_pruning_predicate_yields_no_batches() {
+    let path = fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/")).unwrap();
+    let url = Url::from_directory_path(path).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(col!("id").gt(lit(600i64))))
+        .with_stats(StatsOptions::struct_columns(vec![column_name!("salary")]))
+        .build()
+        .unwrap();
+
+    assert_eq!(scan.scan_metadata(engine.as_ref()).unwrap().count(), 0);
 }
 
 #[rstest]
