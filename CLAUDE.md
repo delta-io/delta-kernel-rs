@@ -268,7 +268,7 @@ is the source of truth. Key concepts:
   `clustering`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`, `icebergCompatV2`,
   `icebergCompatV3`, `identityColumns`, `inCommitTimestamp`, `invariants`, `rowTracking`
 - Reader + writer: `adaptiveMetadata-preview`, `catalogManaged`, `catalogOwned-preview`,
-  `columnMapping`, `deletionVectors`, `geospatial`, `timestampNtz`,
+  `columnMapping`, `deletionVectors`, `geospatial`, `timestampNanos`, `timestampNtz`,
   `typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`, `variantShredding`,
   `variantShredding-preview`, `variantType`, `variantType-preview`
 

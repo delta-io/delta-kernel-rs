@@ -79,6 +79,9 @@ test-ffi = []
 # (geometry/geography) type support. TODO(#2949): remove once full geo support ships.
 geo-type-in-dev = ["delta_kernel/geo-type-in-dev"]
 
+# Experimental feature flag gating nanosecond timestamps.
+nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps", "test_utils/nanosecond-timestamps"]
+
 # Tracking global allocator for process-wide native live/peak bytes, readable via the
 # `*_native_bytes` FFI getters. Off by default. Only enable when building the cdylib:
 # this crate is also an rlib, so `#[global_allocator]` applies to any Rust binary that
