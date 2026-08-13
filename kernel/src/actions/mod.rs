@@ -552,10 +552,10 @@ impl IntoEngineData for Metadata {
 #[derive(
     Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
 )]
-// Deserialization routes through `ProtocolWire` so that every serde ingress (e.g. CRC files)
-// is validated by `try_new`, matching the JSON-replay path. Without this a CRC file could
+// Deserialization routes through `UnvalidatedProtocol` so that every serde ingress (e.g. CRC
+// files) is validated by `try_new`, matching the JSON-replay path. Without this a CRC file could
 // materialize a malformed feature shape that log replay would reject.
-#[serde(rename_all = "camelCase", try_from = "ProtocolWire")]
+#[serde(rename_all = "camelCase", try_from = "UnvalidatedProtocol")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
@@ -576,26 +576,28 @@ pub(crate) struct Protocol {
     writer_features: Option<Vec<TableFeature>>,
 }
 
-/// Unchecked wire mirror of [`Protocol`], used only as the serde deserialization input for
-/// `Protocol` so that all deserialization funnels through [`Protocol::try_new`].
+/// Unvalidated deserialization mirror of [`Protocol`]: the raw field-for-field shape serde reads
+/// before validation. Deserialize-only (never serialized); `Protocol`'s `#[serde(try_from)]`
+/// converts it via [`Protocol::try_new`] so all deserialization funnels through the checked
+/// constructor.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProtocolWire {
+struct UnvalidatedProtocol {
     min_reader_version: i32,
     min_writer_version: i32,
     reader_features: Option<Vec<TableFeature>>,
     writer_features: Option<Vec<TableFeature>>,
 }
 
-impl TryFrom<ProtocolWire> for Protocol {
+impl TryFrom<UnvalidatedProtocol> for Protocol {
     type Error = Error;
 
-    fn try_from(wire: ProtocolWire) -> DeltaResult<Self> {
+    fn try_from(protocol: UnvalidatedProtocol) -> DeltaResult<Self> {
         Protocol::try_new(
-            wire.min_reader_version,
-            wire.min_writer_version,
-            wire.reader_features,
-            wire.writer_features,
+            protocol.min_reader_version,
+            protocol.min_writer_version,
+            protocol.reader_features,
+            protocol.writer_features,
         )
     }
 }
