@@ -38,6 +38,7 @@ pub enum Operator {
     Filter(Filter),
     DynamicScan(DynamicScan),
     Aggregate(Aggregate),
+    PrefixSum(PrefixSum),
 
     // === Binary operators (2 inputs) =========================================
     SemiJoin(SemiJoin),
@@ -66,6 +67,7 @@ impl_from_payload_for_operator!(
     Filter,
     DynamicScan,
     Aggregate,
+    PrefixSum,
     SemiJoin,
     UnionAll,
 );
@@ -996,6 +998,98 @@ impl TryFrom<AggregateBuilder> for Aggregate {
     }
 }
 
+/// Exclusive prefix sum of one LONG input column, appended as a new output column with the same
+/// nullability as the input. All other input columns pass through unchanged.
+///
+/// # Semantics
+///
+/// The output for row `i` is `SUM(input[0..i])`, or `0` for `i=0`. NULL inputs do not contribute
+/// and produce NULL outputs for their respective rows. Zero-valued inputs are valid but produce
+/// duplicate outputs (because they do not increase the value of the sum). Input rows are consumed
+/// exactly once in any order and output rows can be produced in any order.
+///
+/// # Output schema
+///
+/// `schema` is the input schema with one appended LONG column named `output`. That column's
+/// nullability matches the resolved `input` field (NULL inputs produce NULL outputs).
+///
+/// # Example
+///
+/// ```text
+/// PrefixSum { input: numRecords, output: offset, schema: { path, numRecords, offset } }
+/// ```
+///
+/// One valid output (encounter order):
+///
+/// ```text
+/// path | numRecords | offset
+/// -----+------------+-------
+///  a   |         10 |      0
+///  b   |       NULL |   NULL
+///  c   |          0 |     10
+///  d   |          0 |     10
+///  e   |          5 |     10
+///  f   |         20 |     15
+/// ```
+/// This produces the ranges `[0..10, 10..10, 10..10, 10..15, 15..35]`.
+///
+/// Another valid output (input and output rows both permuted):
+///
+/// ```text
+/// path | numRecords | offset
+/// -----+------------+-------
+///  b   |       NULL |   NULL
+///  f   |         20 |     0
+///  a   |         10 |     25
+///  d   |          0 |     20
+///  c   |          0 |     25
+///  e   |          5 |     20
+/// ```
+/// This produces the ranges `[0..20, 20..20, 20..25, 25..25, 25..35]`.
+#[derive(Debug, Clone)]
+pub struct PrefixSum {
+    /// LONG column to accumulate. May be nested (e.g. `stats.numRecords`).
+    pub input: ColumnName,
+    /// Name of the new top-level LONG column holding exclusive prefixes.
+    pub output: String,
+    /// Input schema with [`Self::output`] appended.
+    pub schema: SchemaRef,
+}
+
+impl PrefixSum {
+    /// Builds a [`PrefixSum`] that appends exclusive prefixes of `input` as `output`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `input` is absent from `input_schema`, is not LONG, or if appending
+    /// `output` would duplicate a top-level field name (case-insensitive).
+    pub fn try_new(
+        input_schema: &StructType,
+        input: impl Into<ColumnName>,
+        output: impl Into<String>,
+    ) -> DeltaResult<Self> {
+        let input = input.into();
+        let output = output.into();
+        let field = input_schema.field_at(&input)?;
+        if field.data_type() != &DataType::LONG {
+            return Err(Error::generic(format!(
+                "prefix sum: input `{input}` must be LONG, got {}",
+                field.data_type()
+            )));
+        }
+        let schema = Arc::new(input_schema.add([StructField::new(
+            output.clone(),
+            DataType::LONG,
+            field.nullable,
+        )])?);
+        Ok(Self {
+            input,
+            output,
+            schema,
+        })
+    }
+}
+
 /// Performs a semi join between two inputs, `inputs.len() == 2`, the child
 /// nodes are `[probe, build]` in this order. It emits a subset of probe rows;
 /// the build side acts as a filter and never contributes columns. This is
@@ -1228,5 +1322,50 @@ mod tests {
             )
             .build();
         assert_result_error_with_message(result, "missing");
+    }
+
+    #[test]
+    fn prefix_sum_appends_long_output_matching_input_nullability() {
+        let input = schema(&[("path", false), ("numRecords", true)]);
+        let prefix =
+            PrefixSum::try_new(input.as_ref(), column_name!("numRecords"), "offset").unwrap();
+        let names: Vec<&str> = prefix.schema.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["path", "numRecords", "offset"]);
+        let offset = prefix.schema.field("offset").unwrap();
+        assert_eq!(offset.data_type(), &DataType::LONG);
+        assert!(offset.nullable);
+        assert_eq!(prefix.output, "offset");
+        assert_eq!(prefix.input, column_name!("numRecords"));
+    }
+
+    #[test]
+    fn prefix_sum_non_nullable_input_yields_non_nullable_output() {
+        let input = schema(&[("n", false)]);
+        let prefix = PrefixSum::try_new(input.as_ref(), column_name!("n"), "off").unwrap();
+        assert!(!prefix.schema.field("off").unwrap().nullable);
+    }
+
+    #[test]
+    fn prefix_sum_rejects_non_long_input() {
+        let input = Arc::new(StructType::new_unchecked([StructField::not_null(
+            "s",
+            DataType::STRING,
+        )]));
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("s"), "off");
+        assert_result_error_with_message(result, "must be LONG");
+    }
+
+    #[test]
+    fn prefix_sum_rejects_missing_input_column() {
+        let input = schema(&[("n", true)]);
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("missing"), "off");
+        assert_result_error_with_message(result, "missing");
+    }
+
+    #[test]
+    fn prefix_sum_rejects_duplicate_output_name() {
+        let input = schema(&[("n", true)]);
+        let result = PrefixSum::try_new(input.as_ref(), column_name!("n"), "n");
+        assert_result_error_with_message(result, "Duplicate field name");
     }
 }

@@ -38,10 +38,38 @@ mod storage;
 mod aggs;
 
 #[cfg(feature = "declarative-plans")]
+mod prefix_sum;
+
+#[cfg(feature = "declarative-plans")]
 pub(crate) mod plan;
 
 #[cfg(feature = "declarative-plans")]
 use plan::SyncPlanExecutor;
+
+#[cfg(feature = "declarative-plans")]
+use crate::arrow::array::{Array as _, Int64Array, RecordBatch};
+#[cfg(feature = "declarative-plans")]
+use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
+#[cfg(feature = "declarative-plans")]
+use crate::expressions::ColumnName;
+
+/// Extracts `name` from `batch` as a LONG column.
+///
+/// # Errors
+///
+/// Returns an error if the column is missing or is not LONG.
+#[cfg(feature = "declarative-plans")]
+fn extract_long_column<'a>(
+    batch: &'a RecordBatch,
+    name: &ColumnName,
+) -> DeltaResult<&'a Int64Array> {
+    let array = extract_column_ref(batch, name)?;
+    array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+        Error::unsupported(format!(
+            "SyncPlanExecutor operand `{name}` has non-LONG type"
+        ))
+    })
+}
 
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
 pub(crate) struct SyncEngine {

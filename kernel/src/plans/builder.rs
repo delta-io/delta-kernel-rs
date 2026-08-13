@@ -40,8 +40,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::ir::nodes::{
-    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, ScanFile,
-    ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
+    Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, PrefixSum, Project,
+    ScanFile, ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
 use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
@@ -384,6 +384,42 @@ impl PlanBuilder {
     ) -> DeltaResult<Self> {
         let builder = Aggregate::ungrouped(Arc::clone(self.schema()));
         self.aggregate(aggs(builder))
+    }
+
+    /// Append exclusive prefixes of `input` as a new LONG column named `output`. See [`PrefixSum`].
+    ///
+    /// Over an absent input the result stays absent (with the prefix-sum output schema).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`PrefixSum::try_new`].
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::expressions::column_name;
+    /// # use delta_kernel::schema::{DataType, StructField, StructType};
+    /// let schema = Arc::new(StructType::try_new([
+    ///     StructField::not_null("path", DataType::STRING),
+    ///     StructField::not_null("numRecords", DataType::LONG),
+    /// ])?);
+    /// let plan = PlanBuilder::values(
+    ///     schema,
+    ///     vec![vec!["a".into(), 10i64.into()], vec!["b".into(), 5i64.into()]],
+    /// )?
+    /// .prefix_sum(column_name!("numRecords"), "offset")?
+    /// .build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
+    pub fn prefix_sum(
+        self,
+        input: impl Into<ColumnName>,
+        output: impl Into<String>,
+    ) -> DeltaResult<Self> {
+        let prefix_sum = PrefixSum::try_new(self.schema(), input, output)?;
+        let schema = Arc::clone(&prefix_sum.schema);
+        Ok(self.unary_op_or_absent(schema, prefix_sum))
     }
 
     /// Semi join: emit the `self` (probe) rows that have a match in `build` on the join keys.
@@ -840,6 +876,7 @@ mod tests {
     })]
     #[case::grouped_aggregate(absent_src().aggregate(
         Aggregate::group_by(part_schema(), [column_name!("id")]).max(column_name!("part"))))]
+    #[case::prefix_sum(absent_over(x_schema()).prefix_sum(column_name!("x"), "offset"))]
     #[case::semi_join_absent_build(
         vals(id_schema()).semi_join(absent_src(), [column_name!("id")], [column_name!("id")]))]
     #[case::semi_join_absent_probe(
@@ -962,6 +999,27 @@ mod tests {
             panic!("expected Aggregate");
         };
         assert!(node.group_by.is_empty());
+        Ok(())
+    }
+
+    /// `prefix_sum` appends the exclusive-prefix column and records a unary PrefixSum node.
+    #[test]
+    fn prefix_sum_appends_output_column() -> DeltaResult<()> {
+        let plan = vals(x_schema()).prefix_sum(column_name!("x"), "offset")?;
+        let schema = plan.schema();
+        assert_eq!(
+            schema
+                .fields()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["x", "offset"]
+        );
+        let built = assert_plan(plan, &[(&[], "values"), (&[0], "prefix_sum")]);
+        let Operator::PrefixSum(node) = &built.nodes[1].op else {
+            panic!("expected PrefixSum");
+        };
+        assert_eq!(node.input, column_name!("x"));
+        assert_eq!(node.output, "offset");
         Ok(())
     }
 
@@ -1241,6 +1299,12 @@ mod tests {
         || vals(id_schema()).aggregate(Aggregate::group_by(id_schema(), Vec::<ColumnName>::new()).max(column_name!("nope"))))]
     #[case::aggregate_unknown_group_by("not found in schema",
         || vals(id_schema()).aggregate(Aggregate::group_by(id_schema(), [column_name!("nope")]).max(column_name!("id"))))]
+    #[case::prefix_sum_unknown_input("not found in schema",
+        || vals(x_schema()).prefix_sum(column_name!("nope"), "offset"))]
+    #[case::prefix_sum_non_long("must be LONG",
+        || vals(id_schema()).prefix_sum(column_name!("id"), "offset"))]
+    #[case::prefix_sum_duplicate_output("Duplicate field name",
+        || vals(x_schema()).prefix_sum(column_name!("x"), "x"))]
     // union
     #[case::union_schema_disagrees("differing",
         || PlanBuilder::union_all([vals(id_schema()), vals(x_schema())]))]

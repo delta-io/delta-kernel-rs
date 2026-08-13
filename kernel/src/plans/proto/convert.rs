@@ -18,8 +18,8 @@ use crate::expressions::{
     UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
-    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
-    ScanParquet, SemiJoin, Values,
+    Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, ScanFile,
+    ScanJson, ScanParquet, SemiJoin, Values,
 };
 use crate::plans::ir::plan::{Plan, PlanNode};
 use crate::plans::{IoOperation, Operation};
@@ -149,6 +149,7 @@ impl From<&Operator> for proto_plan::Operator {
             Operator::Filter(n) => Op::Filter(n.into()),
             Operator::DynamicScan(n) => Op::DynamicScan(n.into()),
             Operator::Aggregate(n) => Op::Aggregate(n.into()),
+            Operator::PrefixSum(n) => Op::PrefixSum(n.into()),
             Operator::SemiJoin(n) => Op::SemiJoin(n.into()),
             Operator::UnionAll(_) => Op::UnionAll(proto_plan::UnionAllNode {}),
         };
@@ -284,6 +285,16 @@ impl From<&SemiJoin> for proto_plan::SemiJoinNode {
             inverted: node.inverted,
             probe_keys: convert_vec(&node.probe_keys),
             build_keys: convert_vec(&node.build_keys),
+        }
+    }
+}
+
+impl From<&PrefixSum> for proto_plan::PrefixSumNode {
+    fn from(node: &PrefixSum) -> Self {
+        proto_plan::PrefixSumNode {
+            input: Some((&node.input).into()),
+            output: node.output.clone(),
+            schema: Some(node.schema.as_ref().into()),
         }
     }
 }
@@ -988,8 +999,8 @@ mod tests {
         IndirectDataSkippingPredicateEvaluator,
     };
     use crate::plans::ir::nodes::{
-        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
-        ScanParquet, SemiJoin, UnionAll, Values,
+        Agg, Aggregate, DynamicScan, FileType, Filter, Operator, PrefixSum, Project, ScanFile,
+        ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
     };
     use crate::plans::ir::plan::{Plan, PlanNode};
     use crate::plans::proto::{
@@ -1333,6 +1344,14 @@ mod tests {
         Operator::SemiJoin(SemiJoin { inverted: false, probe_keys: vec![], build_keys: vec![] }),
         "semi_join"
     )]
+    #[case(
+        Operator::PrefixSum(PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        }),
+        "prefix_sum"
+    )]
     #[case(Operator::UnionAll(UnionAll), "union_all")]
     fn from_operator(#[case] op: Operator, #[case] expected: &str) {
         use proto_plan::operator::Op;
@@ -1345,6 +1364,7 @@ mod tests {
             Op::DynamicScan(_) => "dynamic_scan",
             Op::Aggregate(_) => "aggregate",
             Op::SemiJoin(_) => "semi_join",
+            Op::PrefixSum(_) => "prefix_sum",
             Op::UnionAll(_) => "union_all",
         };
         assert_eq!(kind, expected);
@@ -1505,6 +1525,19 @@ mod tests {
         assert_eq!(proto.group_by.len(), 1);
         assert_eq!(proto.aggs.len(), 1);
         assert!(proto.aggs[0].func.is_some());
+        assert!(proto.schema.is_some());
+    }
+
+    #[test]
+    fn from_prefix_sum() {
+        let node = PrefixSum {
+            input: ColumnName::new(["n"]),
+            output: "offset".to_string(),
+            schema: sample_schema(),
+        };
+        let proto = proto_plan::PrefixSumNode::from(&node);
+        assert_eq!(proto.input.expect("input").path, ["n"]);
+        assert_eq!(proto.output, "offset");
         assert!(proto.schema.is_some());
     }
 

@@ -133,6 +133,12 @@ message SemiJoinNode {
   repeated delta.kernel.expressions.ColumnName build_keys = 3;
 }
 
+message PrefixSumNode {
+  delta.kernel.expressions.ColumnName input = 1;
+  string output = 2;
+  delta.kernel.schema.StructType schema = 3;
+}
+
 // ============================================================================
 // Operator
 // ============================================================================
@@ -150,6 +156,7 @@ message Operator {
     DynamicScanNode dynamic_scan = 7;
     AggregateNode aggregate = 8;
     SemiJoinNode semi_join = 9;
+    PrefixSumNode prefix_sum = 10;
   }
 }
 

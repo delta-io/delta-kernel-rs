@@ -178,7 +178,7 @@ impl BoundAggregate for LongAccumulatorAgg {
 
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> DeltaResult<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(LongAccumulatorUpdater {
-            values: extract_long_column(batch, &self.value)?,
+            values: super::extract_long_column(batch, &self.value)?,
             op: self.op,
         }))
     }
@@ -310,7 +310,7 @@ impl BoundAggregate for NonNullByAgg {
     fn prepare<'a>(&'a self, batch: &'a RecordBatch) -> DeltaResult<Box<dyn AggUpdater + 'a>> {
         Ok(Box::new(NonNullByUpdater {
             null_sentinels: extract_column_ref(batch, &self.null_sentinel)?,
-            keys: extract_long_column(batch, &self.key)?,
+            keys: super::extract_long_column(batch, &self.key)?,
             comparison: self.comparison,
         }))
     }
@@ -351,18 +351,6 @@ impl AggUpdater for NonNullByUpdater<'_> {
         }
         Ok(())
     }
-}
-
-fn extract_long_column<'a>(
-    batch: &'a RecordBatch,
-    name: &ColumnName,
-) -> DeltaResult<&'a Int64Array> {
-    let array = extract_column_ref(batch, name)?;
-    array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        Error::unsupported(format!(
-            "SyncPlanExecutor aggregate operand `{name}` has non-LONG type"
-        ))
-    })
 }
 
 fn downcast_state<T: 'static>(state: &dyn Any) -> DeltaResult<&T> {
