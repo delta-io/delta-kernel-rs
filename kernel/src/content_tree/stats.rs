@@ -141,14 +141,6 @@ fn get_field_id(field: &StructField) -> Option<i32> {
     }
 }
 
-/// Wraps `inner` with the same container type (Struct or Variant) as `original`.
-fn wrap_struct_or_variant(original: &DataType, inner: StructType) -> DataType {
-    match original {
-        DataType::Variant(_) => DataType::Variant(Box::new(inner)),
-        _ => DataType::Struct(Box::new(inner)),
-    }
-}
-
 /// Builds a single column's stats struct, with each stat sub-field's ID an offset from
 /// `base_field_id`:
 /// - offset 1/2: `lower_bound` / `upper_bound` (typed as `bounds_type`)
@@ -159,7 +151,7 @@ fn wrap_struct_or_variant(original: &DataType, inner: StructType) -> DataType {
 /// - offset 7: `avg_value_size_in_bytes` (int) - for string/binary `bounds_type`, or any variant
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
-/// the variant's inner `value` type for variants.
+/// an unshredded variant type for variant columns.
 fn build_stats_struct(
     base_field_id: i32,
     bounds_type: &DataType,
@@ -227,8 +219,9 @@ fn build_stats_struct(
 ///
 /// Each primitive/variant column becomes a nested stats struct (see [`build_stats_struct`]);
 /// struct columns recurse; array/map columns and columns whose stats struct would be empty are
-/// dropped. Uses a fallible filtering carrier so that a missing field ID aborts (error) while an
-/// out-of-range field ID or empty stats struct drops the column.
+/// dropped. Uses a fallible filtering carrier: a missing field ID or an (as-yet unimplemented)
+/// geospatial column aborts with an error, while an out-of-range field ID or empty stats struct
+/// drops the column.
 struct StatsSchemaTransform;
 
 impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
@@ -258,36 +251,42 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
 
         // Build the stats data type for this column; `None` means "drop this column".
         let stats_data_type = match field.data_type() {
-            DataType::Primitive(_) => Some(wrap_struct_or_variant(
+            // Geospatial stats generation is not implemented yet. Error (rather than silently
+            // dropping the column) so this is not forgotten once geospatial support lands; the arm
+            // is reachable only with the `geo-type-in-dev` feature enabled.
+            // TODO: emit proper stats for geospatial columns.
+            #[cfg(feature = "geo-type-in-dev")]
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                return Err(Error::unsupported(format!(
+                    "AMT stats schema generation is not yet implemented for geospatial column \
+                     '{}' (type {})",
+                    field.name(),
+                    field.data_type(),
+                )));
+            }
+            DataType::Primitive(_) => Some(DataType::from(build_stats_struct(
+                base_stats_id,
                 field.data_type(),
-                build_stats_struct(base_stats_id, field.data_type(), field.is_nullable(), false),
-            )),
-            DataType::Variant(inner) => match inner.field(VARIANT_VALUE_FIELD_NAME) {
-                // Variant inner fields carry no field IDs of their own, so we cannot recurse
-                // through `transform_struct` (which requires them). The variant's base stats ID
-                // covers the whole variant and we only track stats for the inner `value` field,
-                // built by hand here. `null_value_count` keys off the variant column's own
-                // nullability -- a NULL variant is a column-level SQL null, independent of the
-                // physical `value` encoding column's nullability.
-                Some(value_field) => {
-                    let value_stats = build_stats_struct(
-                        base_stats_id,
-                        value_field.data_type(),
-                        field.is_nullable(),
-                        true,
-                    );
-                    let variant_stats = StructType::new_unchecked([StructField::nullable(
-                        VARIANT_VALUE_FIELD_NAME,
-                        DataType::Struct(Box::new(value_stats)),
-                    )]);
-                    Some(wrap_struct_or_variant(field.data_type(), variant_stats))
-                }
-                None => None,
-            },
+                field.is_nullable(),
+                false,
+            ))),
+            // A variant's inner fields carry no field IDs, so we cannot recurse through
+            // `transform_struct`. The base stats ID covers the whole variant; stats are tracked
+            // only when it has a `value` field (else drop), with the bounds recorded as unshredded
+            // variants. `null_value_count` keys off the variant column's own nullability -- a NULL
+            // variant is a column-level SQL null, independent of the physical encoding.
+            DataType::Variant(inner) => inner.field(VARIANT_VALUE_FIELD_NAME).map(|_| {
+                DataType::from(build_stats_struct(
+                    base_stats_id,
+                    &DataType::unshredded_variant(),
+                    field.is_nullable(),
+                    true,
+                ))
+            }),
             // `None` (every nested column dropped) => drop this struct column too.
             DataType::Struct(inner) => self
                 .transform_struct(inner)?
-                .map(|stats| wrap_struct_or_variant(field.data_type(), stats.into_owned())),
+                .map(|stats| DataType::from(stats.into_owned())),
             // Array/map element/key/value nodes carry no field-id context, so they have no stats.
             DataType::Array(_) | DataType::Map(_) => None,
         };
@@ -317,8 +316,9 @@ impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
 /// A column is omitted when: it is an array/map column; its stats struct would be empty (e.g. a
 /// struct of only array/map fields, or a variant lacking a `value` field); or its field ID is
 /// outside the supported stats range (e.g. reserved metadata columns like `_file`/`_pos`, or data
-/// field IDs above the reserved range), which are skipped with a warning. Returns an error only if
-/// a field is missing its field-id metadata entirely.
+/// field IDs above the reserved range), which are skipped with a warning. Returns an error if a
+/// field is missing its field-id metadata entirely, or if it is an (as-yet unimplemented)
+/// geospatial column.
 pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType> {
     // `Ok(None)` means every column was dropped, yielding an empty stats schema.
     match StatsSchemaTransform.transform_struct(table_struct)? {
@@ -333,6 +333,8 @@ mod tests {
 
     use super::*;
     use crate::schema::{ArrayType, MapType};
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
 
     #[rstest]
     #[case(0, 10_000)]
@@ -368,8 +370,10 @@ mod tests {
     }
 
     /// Asserts every stats sub-field of `stats_struct` carries the expected offset from `base_id`,
-    /// gated on the same nullability/type rules used to build the struct.
+    /// gated on the same nullability/type rules used to build the struct. Variants omit
+    /// `tight_bounds` and always carry the size stat.
     fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
+        let is_variant = matches!(field.data_type(), DataType::Variant(_));
         assert_eq!(
             get_field_id(stats_struct.field(VALUE_COUNT).unwrap()),
             Some(base_id + STATS_OFFSET_VALUE_COUNT)
@@ -386,7 +390,10 @@ mod tests {
                 Some(base_id + STATS_OFFSET_NAN_VALUE_COUNT)
             );
         }
-        if field.data_type() == &DataType::STRING || field.data_type() == &DataType::BINARY {
+        if is_variant
+            || field.data_type() == &DataType::STRING
+            || field.data_type() == &DataType::BINARY
+        {
             assert_eq!(
                 get_field_id(stats_struct.field(AVG_VALUE_SIZE_IN_BYTES).unwrap()),
                 Some(base_id + STATS_OFFSET_AVG_VALUE_SIZE_IN_BYTES)
@@ -400,10 +407,12 @@ mod tests {
             get_field_id(stats_struct.field(UPPER_BOUND).unwrap()),
             Some(base_id + STATS_OFFSET_UPPER_BOUND)
         );
-        assert_eq!(
-            get_field_id(stats_struct.field(TIGHT_BOUNDS).unwrap()),
-            Some(base_id + STATS_OFFSET_TIGHT_BOUNDS)
-        );
+        if !is_variant {
+            assert_eq!(
+                get_field_id(stats_struct.field(TIGHT_BOUNDS).unwrap()),
+                Some(base_id + STATS_OFFSET_TIGHT_BOUNDS)
+            );
+        }
     }
 
     /// `expected_count`: lower/upper/tight/value (4) + null_value_count (if nullable) +
@@ -585,95 +594,81 @@ mod tests {
         assert!(c_stats.field(LOWER_BOUND).is_some());
     }
 
-    /// Returns the inner stats struct of a variant column's `value` sub-field.
-    fn variant_value_stats(stats: &StructType, name: &str) -> StructType {
-        let field = stats.field(name).expect("variant column should exist");
-        let variant = match field.data_type() {
-            DataType::Variant(s) => s.as_ref(),
-            other => panic!("expected Variant stats, got {other:?}"),
-        };
-        assert!(variant.field("metadata").is_none(), "metadata excluded");
-        let value = variant.field("value").expect("value should have stats");
-        match value.data_type() {
-            DataType::Struct(s) => s.as_ref().clone(),
-            other => panic!("expected Struct for value stats, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn stats_schema_variant_column() {
-        let schema = StructType::new_unchecked([field_with_id(
-            "v",
-            DataType::unshredded_variant(),
-            false,
-            3,
-        )]);
-
-        let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        let value_inner = variant_value_stats(&stats, "v");
-
-        assert!(value_inner.field(VALUE_COUNT).is_some());
-        assert!(value_inner.field(LOWER_BOUND).is_some());
-        assert!(value_inner.field(UPPER_BOUND).is_some());
-        // Variants exclude tight_bounds and always include the size stat.
-        assert!(value_inner.field(TIGHT_BOUNDS).is_none());
-        assert!(value_inner.field(AVG_VALUE_SIZE_IN_BYTES).is_some());
-    }
-
-    #[test]
-    fn stats_schema_variant_with_extra_fields_tracks_only_value() {
-        // Shredded variant: metadata + value + typed_value. Only "value" gets stats.
-        let variant_inner = [
+    /// Both unshredded and shredded variant inputs produce the same ordinary stats struct: the
+    /// bounds are recorded as unshredded variants, `tight_bounds` is excluded, and the size stat is
+    /// present. Only the presence of a `value` inner field matters; extra inner fields (e.g. a
+    /// shredded `typed_value`) are ignored.
+    #[rstest]
+    #[case::unshredded(DataType::unshredded_variant())]
+    #[case::shredded(
+        DataType::variant_type([
             StructField::not_null("metadata", DataType::BINARY),
             StructField::not_null("value", DataType::BINARY),
             StructField::nullable("typed_value", DataType::INTEGER),
-        ];
-        let variant_type = DataType::variant_type(variant_inner).expect("variant type");
-        let schema = StructType::new_unchecked([field_with_id("v", variant_type, false, 3)]);
+        ])
+        .expect("variant type")
+    )]
+    fn stats_schema_variant_column(#[case] variant_type: DataType) {
+        let field = field_with_id("v", variant_type, false, 3);
+        let schema = StructType::new_unchecked([field.clone()]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        let v_field = stats.field("v").expect("v should exist");
-        let v_variant = match v_field.data_type() {
-            DataType::Variant(s) => s.as_ref(),
-            other => panic!("expected Variant stats, got {other:?}"),
-        };
-        assert!(v_variant.field("metadata").is_none());
-        assert!(v_variant.field("typed_value").is_none());
-        assert!(v_variant.field("value").is_some());
+        // The stats container is an ordinary struct carrying the base stats ID (10_600 for id 3).
+        let stats_field = stats.field("v").expect("variant column should exist");
+        assert!(matches!(stats_field.data_type(), DataType::Struct(_)));
+        assert_eq!(get_field_id(stats_field), Some(10_600));
+
+        let v_stats = field_stats_struct_for(&field, &stats);
+        // Bounds are recorded as unshredded variants (metadata + value), not the physical encoding.
+        assert_eq!(
+            v_stats.field(LOWER_BOUND).unwrap().data_type(),
+            &DataType::unshredded_variant()
+        );
+        assert_eq!(
+            v_stats.field(UPPER_BOUND).unwrap().data_type(),
+            &DataType::unshredded_variant()
+        );
+        // Variants exclude tight_bounds and always include the size stat.
+        assert!(v_stats.field(TIGHT_BOUNDS).is_none());
+        assert!(v_stats.field(AVG_VALUE_SIZE_IN_BYTES).is_some());
+        assert_stats_field_ids(&v_stats, 10_600, &field);
     }
 
     #[test]
     fn stats_schema_variant_nested_in_struct() {
+        let data = field_with_id("data", DataType::unshredded_variant(), false, 6);
         let inner = StructType::new_unchecked([
             field_with_id("id", DataType::LONG, false, 5),
-            field_with_id("data", DataType::unshredded_variant(), false, 6),
+            data.clone(),
         ]);
         let schema = StructType::new_unchecked([field_with_id("record", inner.into(), false, 3)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         let record_struct = field_stats_struct_for(stats.field("record").unwrap(), &stats);
         assert!(record_struct.field("id").is_some());
-        let _ = variant_value_stats(&record_struct, "data");
+        // The nested variant column becomes an ordinary stats struct with unshredded-variant
+        // bounds.
+        let data_stats = field_stats_struct_for(&data, &record_struct);
+        assert_eq!(
+            data_stats.field(LOWER_BOUND).unwrap().data_type(),
+            &DataType::unshredded_variant()
+        );
     }
 
     #[test]
     fn stats_schema_nullable_variant_gets_null_value_count() {
         // A nullable variant column must record null_value_count even though the inner `value`
         // field of an unshredded variant is not_null -- null tracking follows the column.
-        let schema = StructType::new_unchecked([field_with_id(
-            "v",
-            DataType::unshredded_variant(),
-            true,
-            3,
-        )]);
+        let field = field_with_id("v", DataType::unshredded_variant(), true, 3);
+        let schema = StructType::new_unchecked([field.clone()]);
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        let value_inner = variant_value_stats(&stats, "v");
-        assert!(value_inner.field(NULL_VALUE_COUNT).is_some());
+        let v_stats = field_stats_struct_for(&field, &stats);
+        assert!(v_stats.field(NULL_VALUE_COUNT).is_some());
     }
 
     #[test]
     fn stats_schema_variant_without_value_field_is_omitted() {
-        // A variant whose inner struct has no `value` field yields an empty stats struct -> drop.
+        // A variant whose inner struct has no `value` field has no stats to track -> drop.
         let variant = DataType::Variant(Box::new(StructType::new_unchecked([
             StructField::not_null("metadata", DataType::BINARY),
         ])));
@@ -681,6 +676,23 @@ mod tests {
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         assert!(stats.field("v").is_none());
         assert_eq!(stats.fields().count(), 0);
+    }
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case::geometry(DataType::from(GeometryType::try_new("EPSG:4326").expect("valid crs")))]
+    #[case::geography(DataType::from(
+        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).expect("valid crs")
+    ))]
+    fn stats_schema_geospatial_column_errors(#[case] geo_type: DataType) {
+        // Geospatial stats generation is not implemented yet: a geo column errors rather than being
+        // silently dropped, so it is not forgotten once support lands.
+        let schema = StructType::new_unchecked([field_with_id("g", geo_type, true, 1)]);
+        let err = stats_schema(&schema).expect_err("geospatial columns are not yet supported");
+        assert!(
+            err.to_string().contains("geospatial"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
