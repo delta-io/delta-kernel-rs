@@ -1,12 +1,16 @@
 //! Stats manipulation utilities for Adaptive Metadata Tree (AMT).
 //!
 //! The AMT stores statistics as shredded columns within parquet files. Stats are stored
-//! in a column-major format (each column has an associated struct with fields representing
+//! in a column-major format (each leaf column has an associated struct with fields representing
 //! min, max, etc).
 //!
+//! The layout is flat: each primitive/variant *leaf* of the table schema -- however deeply nested
+//! inside structs -- contributes one stats struct stored as a direct child of `content_stats`,
+//! keyed by the leaf's base stats field ID: data leaves at `10_000 + 200 * field_id`, and the
+//! supported reserved-metadata leaves (`_row_id`, `_last_updated_sequence_number`) into
+//! `[9_000, 10_000)` (see [`field_id_to_statistics_base`]).
+//!
 //! As with all fields in Iceberg, statistics are projected by field ID.
-
-use std::borrow::Cow;
 
 use tracing::warn;
 
@@ -14,6 +18,7 @@ use crate::content_tree::{
     AVG_VALUE_SIZE_IN_BYTES, LOWER_BOUND, NAN_VALUE_COUNT, NULL_VALUE_COUNT, TIGHT_BOUNDS,
     UPPER_BOUND, VALUE_COUNT,
 };
+use crate::expressions::ColumnName;
 use crate::schema::{
     ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
 };
@@ -215,116 +220,162 @@ fn build_stats_struct(
     StructType::new_unchecked(fields)
 }
 
-/// A [`SchemaTransform`] that rewrites a table schema into its AMT stats schema.
+/// Builds the flat stats field for a non-struct leaf, or `None` when the leaf carries no stats:
+/// an array/map column, a variant lacking a `value` inner field, or a field ID outside the
+/// supported stats range (skipped with a warning). The returned field is named by the leaf's full
+/// dotted path (`path`, whose last segment is the leaf itself) and keyed at the leaf's base stats
+/// field ID (see [`build_stats_struct`] for the sub-fields).
 ///
-/// Each primitive/variant column becomes a nested stats struct (see [`build_stats_struct`]);
-/// struct columns recurse; array/map columns and columns whose stats struct would be empty are
-/// dropped. Uses a fallible filtering carrier: a missing field ID or an (as-yet unimplemented)
-/// geospatial column aborts with an error, while an out-of-range field ID or empty stats struct
-/// drops the column.
-struct StatsSchemaTransform;
+/// `nullable` is the leaf's *effective* nullability -- its own, or inherited from any nullable
+/// struct ancestor -- and drives whether a `null_value_count` sub-field is emitted: a leaf under a
+/// nullable ancestor can be physically null even when declared not-null.
+///
+/// Errors if the leaf is missing its field-id metadata, or is an (as-yet unimplemented) geospatial
+/// column.
+fn leaf_stats_field(
+    field: &StructField,
+    path: &[String],
+    nullable: bool,
+) -> DeltaResult<Option<StructField>> {
+    // Only leaves carry a field ID that matters for stats (missing => error). The spec limits which
+    // fields may carry stats, so a field ID outside the supported range is expected for some
+    // reserved metadata columns; skip (warn) rather than error in that case.
+    let field_id = get_field_id(field).ok_or_else(|| {
+        Error::generic(format!(
+            "Field '{}' is missing field ID! metadata: {:#?}",
+            field.name(),
+            field.metadata()
+        ))
+    })?;
+    let Some(base_stats_id) = field_id_to_statistics_base(field_id) else {
+        warn!(
+            "Skipping stats for field '{}' (field_id={field_id}): outside supported stats range",
+            field.name(),
+        );
+        return Ok(None);
+    };
 
-impl<'a> SchemaTransform<'a> for StatsSchemaTransform {
-    transform_output_type!(|'a, T| Result<Option<Cow<'a, T>>, Error>);
-
-    fn transform_struct_field(
-        &mut self,
-        field: &'a StructField,
-    ) -> Result<Option<Cow<'a, StructField>>, Error> {
-        // A field ID is required for every field (missing => error). The spec limits which fields
-        // may carry stats, so a field ID outside the supported range is expected for some reserved
-        // metadata columns; skip (warn) rather than error in that case.
-        let field_id = get_field_id(field).ok_or_else(|| {
-            Error::generic(format!(
-                "Field '{}' is missing field ID! metadata: {:#?}",
+    let stats_struct = match field.data_type() {
+        // Geospatial stats generation is not implemented yet. Error (rather than silently dropping
+        // the column) so this is not forgotten once geospatial support lands; the arm is reachable
+        // only with the `geo-type-in-dev` feature enabled.
+        // TODO: emit proper stats for geospatial columns.
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+            return Err(Error::unsupported(format!(
+                "AMT stats schema generation is not yet implemented for geospatial column \
+                 '{}' (type {})",
                 field.name(),
-                field.metadata()
-            ))
-        })?;
-        let Some(base_stats_id) = field_id_to_statistics_base(field_id) else {
-            warn!(
-                "Skipping stats for field '{}' (field_id={field_id}): outside supported stats range",
-                field.name(),
-            );
-            return Ok(None);
-        };
-
-        // Build the stats data type for this column; `None` means "drop this column".
-        let stats_data_type = match field.data_type() {
-            // Geospatial stats generation is not implemented yet. Error (rather than silently
-            // dropping the column) so this is not forgotten once geospatial support lands; the arm
-            // is reachable only with the `geo-type-in-dev` feature enabled.
-            // TODO: emit proper stats for geospatial columns.
-            #[cfg(feature = "geo-type-in-dev")]
-            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
-                return Err(Error::unsupported(format!(
-                    "AMT stats schema generation is not yet implemented for geospatial column \
-                     '{}' (type {})",
-                    field.name(),
-                    field.data_type(),
-                )));
-            }
-            DataType::Primitive(_) => Some(DataType::from(build_stats_struct(
-                base_stats_id,
                 field.data_type(),
-                field.is_nullable(),
-                false,
-            ))),
-            // A variant's inner fields carry no field IDs, so we cannot recurse through
-            // `transform_struct`. The base stats ID covers the whole variant; stats are tracked
-            // only when it has a `value` field (else drop), with the bounds recorded as unshredded
-            // variants. `null_value_count` keys off the variant column's own nullability -- a NULL
-            // variant is a column-level SQL null, independent of the physical encoding.
-            DataType::Variant(inner) => inner.field(VARIANT_VALUE_FIELD_NAME).map(|_| {
-                DataType::from(build_stats_struct(
-                    base_stats_id,
-                    &DataType::unshredded_variant(),
-                    field.is_nullable(),
-                    true,
-                ))
-            }),
-            // `None` (every nested column dropped) => drop this struct column too.
-            DataType::Struct(inner) => self
-                .transform_struct(inner)?
-                .map(|stats| DataType::from(stats.into_owned())),
-            // Array/map element/key/value nodes carry no field-id context, so they have no stats.
-            DataType::Array(_) | DataType::Map(_) => None,
-        };
+            )));
+        }
+        DataType::Primitive(_) => {
+            build_stats_struct(base_stats_id, field.data_type(), nullable, false)
+        }
+        // A variant's inner fields carry no field IDs; the base stats ID covers the whole variant.
+        // Stats are tracked only when it has a `value` field, with the bounds recorded as
+        // unshredded variants. `null_value_count` follows the leaf's effective `nullable` -- a NULL
+        // variant is a column-level SQL null, independent of the physical encoding.
+        DataType::Variant(inner) if inner.field(VARIANT_VALUE_FIELD_NAME).is_some() => {
+            build_stats_struct(
+                base_stats_id,
+                &DataType::unshredded_variant(),
+                nullable,
+                true,
+            )
+        }
+        // A variant without a `value` field, and array/map columns, carry no leaf stats. (Structs
+        // are descended into by the collector and never reach here.)
+        _ => return Ok(None),
+    };
 
-        let Some(stats_data_type) = stats_data_type else {
-            return Ok(None);
-        };
+    // Keyed by the base stats field ID, not the source column's field ID, and without its logical
+    // (column-mapping) metadata.
+    let name = ColumnName::new(path).to_string();
+    Ok(Some(field_with_id(
+        &name,
+        stats_struct.into(),
+        true,
+        base_stats_id,
+    )))
+}
 
-        // The stats group field is a fresh physical field: it uses the base stats field ID (e.g.
-        // 10_200 for field_id 1), not the original column field ID, and carries no logical
-        // (column-mapping) metadata from the source column.
-        let stats_field = field_with_id(field.name(), stats_data_type, true, base_stats_id);
-        Ok(Some(Cow::Owned(stats_field)))
+/// A [`SchemaTransform`] that collects the flat AMT `content_stats` schema by visiting every leaf
+/// of a table schema.
+///
+/// Each primitive/variant leaf appends one stats struct field (see [`leaf_stats_field`]) to
+/// [`Self::fields`], named by the leaf's full dotted path and keyed at its own base stats field ID.
+/// Struct columns are descended into and get no entry of their own -- their field IDs are never
+/// read (only leaves carry stats). Array/map columns, and variants lacking a `value` field, add
+/// nothing.
+///
+/// Uses the `Result<(), Error>` carrier: the rebuilt output is discarded, [`Self::fields`] is the
+/// real result, and an `Err` short-circuits the walk.
+struct StatsSchemaCollector {
+    /// Field names from the root to the current node; the last segment is the leaf being visited.
+    path: Vec<String>,
+    /// Accumulated flat stats fields, in schema order.
+    fields: Vec<StructField>,
+    /// Whether any struct ancestor on the current path is nullable. A leaf under a nullable struct
+    /// can be physically null (its ancestor is null) even if declared not-null, so it still needs
+    /// a `null_value_count`.
+    ancestor_nullable: bool,
+}
+
+impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
+    transform_output_type!(|'a, T| Result<(), Error>);
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Result<(), Error> {
+        self.path.push(field.name().to_string());
+        // Descend into structs; every other type is a leaf. On `Err` the walk aborts and `path` is
+        // discarded, so the skipped pop is harmless.
+        let result = if let DataType::Struct(_) = field.data_type() {
+            // A nullable struct makes every leaf beneath it physically nullable; restore on the way
+            // back up so siblings are unaffected.
+            let saved = self.ancestor_nullable;
+            self.ancestor_nullable |= field.is_nullable();
+            let result = self.recurse_into_struct_field(field);
+            self.ancestor_nullable = saved;
+            result
+        } else {
+            let nullable = field.is_nullable() || self.ancestor_nullable;
+            leaf_stats_field(field, &self.path, nullable).map(|stats| self.fields.extend(stats))
+        };
+        self.path.pop();
+        result
     }
 }
 
-/// Generates the AMT stats schema for the given table struct.
+/// Generates the AMT `content_stats` schema for the given table struct.
 ///
-/// Traverses the schema and produces a stats schema mirroring its structure: each primitive/variant
-/// column becomes a nested per-column stats struct (see [`build_stats_struct`] for its fields and
-/// field-id offsets), and struct columns recurse.
+/// Produces a *flat* stats schema: each primitive/variant leaf of `table_struct` -- however deeply
+/// nested inside structs -- becomes one direct child of the output struct, named by the leaf's full
+/// dotted path (e.g. `a.b`) and keyed at its base stats field ID (data leaves at
+/// `10_000 + 200 * leaf_field_id`, supported reserved-metadata leaves into `[9_000, 10_000)` via
+/// [`field_id_to_statistics_base`]; see [`build_stats_struct`]
+/// for its sub-fields). This matches the AMT layout, where every leaf's stats struct is a direct
+/// child of `content_stats` and the reader projects each leaf by field ID following that flat path.
 ///
-/// `table_struct` must be a physical schema carrying `parquet.field.id` metadata on each field (as
-/// produced by [`StructField::make_physical`]); logical schemas that annotate field IDs only under
-/// `delta.columnMapping.id` are not accepted.
+/// Struct columns are descended into and produce no stats entry of their own (their field IDs are
+/// never read). `table_struct` must be a physical schema carrying `parquet.field.id` metadata on
+/// each leaf (as produced by [`StructField::make_physical`]); logical schemas that annotate field
+/// IDs only under `delta.columnMapping.id` are not accepted.
 ///
-/// A column is omitted when: it is an array/map column; its stats struct would be empty (e.g. a
-/// struct of only array/map fields, or a variant lacking a `value` field); or its field ID is
-/// outside the supported stats range (e.g. reserved metadata columns like `_file`/`_pos`, or data
-/// field IDs above the reserved range), which are skipped with a warning. Returns an error if a
-/// field is missing its field-id metadata entirely, or if it is an (as-yet unimplemented)
-/// geospatial column.
+/// A leaf is omitted when it is an array/map column, a variant lacking a `value` field, or its
+/// field ID is outside the supported stats range (e.g. reserved metadata columns like
+/// `_file`/`_pos`, or data field IDs above the reserved range), which are skipped with a warning.
+/// Returns an error if a leaf is missing its field-id metadata entirely, or is an (as-yet
+/// unimplemented) geospatial column.
 pub(crate) fn stats_schema(table_struct: &StructType) -> DeltaResult<StructType> {
-    // `Ok(None)` means every column was dropped, yielding an empty stats schema.
-    match StatsSchemaTransform.transform_struct(table_struct)? {
-        Some(stats) => Ok(stats.into_owned()),
-        None => Ok(StructType::new_unchecked([])),
-    }
+    let mut collector = StatsSchemaCollector {
+        path: Vec::new(),
+        fields: Vec::new(),
+        ancestor_nullable: false,
+    };
+    collector.transform_struct(table_struct)?;
+    // `new_unchecked` skips name dedup; safe because `ColumnName`'s `Display` is lossless -- a leaf
+    // whose name contains a dot is backtick-escaped, so it never collides with a nested path.
+    Ok(StructType::new_unchecked(collector.fields))
 }
 
 #[cfg(test)]
@@ -360,25 +411,37 @@ mod tests {
         assert_eq!(field_id_to_statistics_base(field_id), None);
     }
 
-    /// Returns the stats struct for `field.name()` in `stats`, panicking if absent or not a struct.
-    fn field_stats_struct_for(field: &StructField, stats: &StructType) -> StructType {
-        let field_stats = stats.field(field.name()).expect("stats field should exist");
+    /// Returns the stats struct named `name` (the flat dotted output key) in `stats`, panicking if
+    /// absent or not a struct.
+    fn stats_struct_for_name(name: &str, stats: &StructType) -> StructType {
+        let field_stats = stats.field(name).expect("stats field should exist");
         match field_stats.data_type() {
             DataType::Struct(s) => s.as_ref().clone(),
             other => panic!("expected struct stats, got {other:?}"),
         }
     }
 
-    /// Asserts every stats sub-field of `stats_struct` carries the expected offset from `base_id`,
-    /// gated on the same nullability/type rules used to build the struct. Variants omit
+    /// Convenience for top-level leaves, whose flat output key equals `field.name()`.
+    fn field_stats_struct_for(field: &StructField, stats: &StructType) -> StructType {
+        stats_struct_for_name(field.name(), stats)
+    }
+
+    /// Asserts every stats sub-field of `stats_struct` carries the expected offset from `base_id`.
+    /// `expected_nullable` is the leaf's effective nullability (its own, or inherited from a
+    /// nullable ancestor); the `null_value_count` check is gated on it. Variants omit
     /// `tight_bounds` and always carry the size stat.
-    fn assert_stats_field_ids(stats_struct: &StructType, base_id: i32, field: &StructField) {
+    fn assert_stats_field_ids(
+        stats_struct: &StructType,
+        base_id: i32,
+        field: &StructField,
+        expected_nullable: bool,
+    ) {
         let is_variant = matches!(field.data_type(), DataType::Variant(_));
         assert_eq!(
             get_field_id(stats_struct.field(VALUE_COUNT).unwrap()),
             Some(base_id + STATS_OFFSET_VALUE_COUNT)
         );
-        if field.is_nullable() {
+        if expected_nullable {
             assert_eq!(
                 get_field_id(stats_struct.field(NULL_VALUE_COUNT).unwrap()),
                 Some(base_id + STATS_OFFSET_NULL_VALUE_COUNT)
@@ -457,7 +520,7 @@ mod tests {
         );
         // The stats group field itself carries the base stats ID, not the original field ID.
         assert_eq!(get_field_id(stats.field("c").unwrap()), Some(expected_base));
-        assert_stats_field_ids(&stats_struct, expected_base, &field);
+        assert_stats_field_ids(&stats_struct, expected_base, &field, nullable);
     }
 
     #[test]
@@ -502,25 +565,28 @@ mod tests {
 
     #[test]
     fn stats_schema_nested_struct() {
-        // { a: struct { b: int (non-null), c: double (nullable) } }
+        // { a: struct { b: int (non-null), c: double (nullable) } } -- flattens to `a.b`, `a.c`.
         let field_b = field_with_id("b", DataType::INTEGER, false, 2);
         let field_c = field_with_id("c", DataType::DOUBLE, true, 3);
         let inner = StructType::new_unchecked([field_b.clone(), field_c.clone()]);
         let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        assert_eq!(stats.fields().count(), 1);
+        // Flat layout: no `a` entry; leaves are direct children keyed by their own base IDs.
+        assert_eq!(stats.fields().count(), 2);
+        assert!(stats.field("a").is_none());
 
-        let a_stats = field_stats_struct_for(stats.field("a").unwrap(), &stats);
-        assert_eq!(a_stats.fields().count(), 2);
+        // `b` is declared not-null but inherits nullability from its nullable ancestor `a`, so it
+        // gains a null_value_count (5 sub-fields, not 4).
+        let b_stats = stats_struct_for_name("a.b", &stats);
+        assert_eq!(b_stats.fields().count(), 5);
+        assert_eq!(get_field_id(stats.field("a.b").unwrap()), Some(10_400));
+        assert_stats_field_ids(&b_stats, 10_400, &field_b, true);
 
-        let b_stats = field_stats_struct_for(&field_b, &a_stats);
-        assert_eq!(b_stats.fields().count(), 4); // fixed-length, non-null
-        assert_stats_field_ids(&b_stats, 10_400, &field_b);
-
-        let c_stats = field_stats_struct_for(&field_c, &a_stats);
+        let c_stats = stats_struct_for_name("a.c", &stats);
         assert_eq!(c_stats.fields().count(), 6); // null + nan count
-        assert_stats_field_ids(&c_stats, 10_600, &field_c);
+        assert_eq!(get_field_id(stats.field("a.c").unwrap()), Some(10_600));
+        assert_stats_field_ids(&c_stats, 10_600, &field_c, true);
     }
 
     #[rstest]
@@ -568,30 +634,34 @@ mod tests {
         let schema = StructType::new_unchecked([field_with_id("s", inner.into(), true, 1)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        // Only the primitive leaf 's.p' survives (flattened); the array field 's.a' is omitted.
         assert_eq!(stats.fields().count(), 1);
-        let s_stats = field_stats_struct_for(stats.field("s").unwrap(), &stats);
-        // Only the primitive leaf 'p' survives; the array field 'a' is omitted.
-        assert_eq!(s_stats.fields().count(), 1);
-        assert!(s_stats.field("p").is_some());
-        assert!(s_stats.field("a").is_none());
+        assert!(stats.field("s").is_none());
+        assert!(stats.field("s.p").is_some());
+        assert!(stats.field("s.a").is_none());
+        assert_eq!(get_field_id(stats.field("s.p").unwrap()), Some(10_400));
     }
 
     #[test]
     fn stats_schema_deeply_nested() {
-        // { a: struct { b: struct { c: int } } }
+        // { a: struct { b: struct { c: int } } } -- flattens to a single leaf `a.b.c`.
         let innermost =
             StructType::new_unchecked([field_with_id("c", DataType::INTEGER, false, 3)]);
         let middle = StructType::new_unchecked([field_with_id("b", innermost.into(), true, 2)]);
         let schema = StructType::new_unchecked([field_with_id("a", middle.into(), true, 1)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        let a_stats = field_stats_struct_for(stats.field("a").unwrap(), &stats);
-        let b_stats = field_stats_struct_for(a_stats.field("b").unwrap(), &a_stats);
-        let c_stats = field_stats_struct_for(b_stats.field("c").unwrap(), &b_stats);
+        assert_eq!(stats.fields().count(), 1);
+        assert!(stats.field("a").is_none());
+        assert!(stats.field("a.b").is_none());
 
-        assert_eq!(c_stats.fields().count(), 4); // non-nullable int
+        let c_stats = stats_struct_for_name("a.b.c", &stats);
+        // Not-null int, but nullable ancestors `a`/`b` add a null_value_count (5, not 4).
+        assert_eq!(c_stats.fields().count(), 5);
         assert!(c_stats.field(VALUE_COUNT).is_some());
         assert!(c_stats.field(LOWER_BOUND).is_some());
+        assert!(c_stats.field(NULL_VALUE_COUNT).is_some());
+        assert_eq!(get_field_id(stats.field("a.b.c").unwrap()), Some(10_600));
     }
 
     /// Both unshredded and shredded variant inputs produce the same ordinary stats struct: the
@@ -631,7 +701,7 @@ mod tests {
         // Variants exclude tight_bounds and always include the size stat.
         assert!(v_stats.field(TIGHT_BOUNDS).is_none());
         assert!(v_stats.field(AVG_VALUE_SIZE_IN_BYTES).is_some());
-        assert_stats_field_ids(&v_stats, 10_600, &field);
+        assert_stats_field_ids(&v_stats, 10_600, &field, field.is_nullable());
     }
 
     #[test]
@@ -644,15 +714,26 @@ mod tests {
         let schema = StructType::new_unchecked([field_with_id("record", inner.into(), false, 3)]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        let record_struct = field_stats_struct_for(stats.field("record").unwrap(), &stats);
-        assert!(record_struct.field("id").is_some());
+        // Flat layout: `record.id` and `record.data` are direct children keyed by their own IDs.
+        assert_eq!(stats.fields().count(), 2);
+        assert!(stats.field("record").is_none());
+        assert!(stats.field("record.id").is_some());
+        assert_eq!(
+            get_field_id(stats.field("record.id").unwrap()),
+            Some(11_000)
+        ); // 10_000+200*5
+
         // The nested variant column becomes an ordinary stats struct with unshredded-variant
         // bounds.
-        let data_stats = field_stats_struct_for(&data, &record_struct);
+        let data_stats = stats_struct_for_name("record.data", &stats);
         assert_eq!(
             data_stats.field(LOWER_BOUND).unwrap().data_type(),
             &DataType::unshredded_variant()
         );
+        assert_eq!(
+            get_field_id(stats.field("record.data").unwrap()),
+            Some(11_200)
+        ); // 10_000+200*6
     }
 
     #[test]
@@ -714,17 +795,43 @@ mod tests {
     #[case(MAX_DATA_FIELD_ID + 1)] // out of range
     #[case(-5)] // negative
     fn stats_schema_nested_out_of_range_child_is_dropped(#[case] bad_id: i32) {
-        // A child whose field ID is out of range (or negative) is warn-dropped, not an error; the
-        // parent keeps its surviving children.
+        // A leaf whose field ID is out of range (or negative) is warn-dropped, not an error; the
+        // surviving sibling leaf is still emitted (flattened as `a.keep`).
         let inner = StructType::new_unchecked([
             field_with_id("keep", DataType::INTEGER, false, 2),
             field_with_id("drop", DataType::INTEGER, false, bad_id),
         ]);
         let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
         let stats = stats_schema(&schema).expect("out-of-range child warn-drops, not errors");
-        let a_stats = field_stats_struct_for(stats.field("a").unwrap(), &stats);
-        assert!(a_stats.field("keep").is_some());
-        assert!(a_stats.field("drop").is_none());
+        assert_eq!(stats.fields().count(), 1);
+        assert!(stats.field("a.keep").is_some());
+        assert!(stats.field("a.drop").is_none());
+        assert_eq!(get_field_id(stats.field("a.keep").unwrap()), Some(10_400));
+    }
+
+    #[rstest]
+    #[case(MAX_DATA_FIELD_ID + 1)] // out of range
+    #[case(-5)] // negative
+    fn stats_schema_out_of_range_struct_ancestor_keeps_leaves(#[case] bad_id: i32) {
+        // A struct ancestor's own field ID is never read, so an out-of-range (or negative) struct
+        // ID must not suppress its valid in-range leaves.
+        let inner = StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]);
+        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, bad_id)]);
+        let stats = stats_schema(&schema).expect("struct ancestor id is irrelevant");
+        assert_eq!(stats.fields().count(), 1);
+        assert_eq!(get_field_id(stats.field("a.b").unwrap()), Some(10_400));
+    }
+
+    #[test]
+    fn stats_schema_struct_ancestor_missing_field_id_keeps_leaves() {
+        // A struct's own field ID is never read, so an ancestor missing its field ID entirely is
+        // tolerated -- only its leaves' IDs matter. Contrast with a LEAF missing its ID, which
+        // errors (see `stats_schema_nested_missing_field_id_errors`).
+        let inner = StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]);
+        let schema = StructType::new_unchecked([StructField::nullable("a", inner)]);
+        let stats = stats_schema(&schema).expect("struct ancestor missing id is tolerated");
+        assert_eq!(stats.fields().count(), 1);
+        assert_eq!(get_field_id(stats.field("a.b").unwrap()), Some(10_400));
     }
 
     #[test]
@@ -762,16 +869,148 @@ mod tests {
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
         // 3 data + 2 supported metadata; _file and _pos are skipped.
         assert_eq!(stats.fields().count(), 5);
-        assert_stats_field_ids(&field_stats_struct_for(&id, &stats), 10_000, &id);
-        assert_stats_field_ids(&field_stats_struct_for(&name, &stats), 10_200, &name);
-        assert_stats_field_ids(&field_stats_struct_for(&score, &stats), 10_400, &score);
+        assert_stats_field_ids(
+            &field_stats_struct_for(&id, &stats),
+            10_000,
+            &id,
+            id.is_nullable(),
+        );
+        assert_stats_field_ids(
+            &field_stats_struct_for(&name, &stats),
+            10_200,
+            &name,
+            name.is_nullable(),
+        );
+        assert_stats_field_ids(
+            &field_stats_struct_for(&score, &stats),
+            10_400,
+            &score,
+            score.is_nullable(),
+        );
         assert!(stats.field("_file").is_none());
         assert!(stats.field("_pos").is_none());
-        assert_stats_field_ids(&field_stats_struct_for(&row_id, &stats), 9_200, &row_id);
+        assert_stats_field_ids(
+            &field_stats_struct_for(&row_id, &stats),
+            9_200,
+            &row_id,
+            row_id.is_nullable(),
+        );
         assert_stats_field_ids(
             &field_stats_struct_for(&last_updated_seq_no, &stats),
             9_000,
             &last_updated_seq_no,
+            last_updated_seq_no.is_nullable(),
         );
+    }
+
+    #[test]
+    fn stats_schema_not_null_leaf_under_nullable_struct_gets_null_value_count() {
+        // A leaf declared not-null but nested under a nullable struct can still be physically null
+        // (when the enclosing struct is null), so it gets a null_value_count.
+        let inner = StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]);
+        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
+        let b_stats = stats_struct_for_name("a.b", &stats_schema(&schema).unwrap());
+        assert_eq!(b_stats.fields().count(), 5); // 4 base + null_value_count
+        assert!(b_stats.field(NULL_VALUE_COUNT).is_some());
+
+        // Contrast: the same not-null leaf under a NOT-NULL struct keeps no null_value_count.
+        let inner = StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]);
+        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), false, 1)]);
+        let b_stats = stats_struct_for_name("a.b", &stats_schema(&schema).unwrap());
+        assert_eq!(b_stats.fields().count(), 4);
+        assert!(b_stats.field(NULL_VALUE_COUNT).is_none());
+    }
+
+    #[test]
+    fn stats_schema_nullable_ancestor_applies_to_variant_leaf() {
+        // The effective-nullability rule applies to variant leaves too: a not-null variant under a
+        // nullable struct records a null_value_count.
+        let variant = field_with_id("v", DataType::unshredded_variant(), false, 2);
+        let inner = StructType::new_unchecked([variant]);
+        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
+        let v_stats = stats_struct_for_name("a.v", &stats_schema(&schema).unwrap());
+        assert!(v_stats.field(NULL_VALUE_COUNT).is_some());
+    }
+
+    #[test]
+    fn stats_schema_leaf_name_with_dot_is_escaped_and_does_not_collide() {
+        // A struct `a` with leaf `b` flattens to output key `a.b`. A sibling top-level leaf whose
+        // name literally contains a dot ("a.b") must NOT collide: `ColumnName` backtick-escapes the
+        // dotted name, keeping the two distinct under `new_unchecked` (which does not dedup).
+        let inner = StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]);
+        let dotted = field_with_id("a.b", DataType::INTEGER, false, 3);
+        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1), dotted]);
+
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        assert_eq!(stats.fields().count(), 2);
+        // The genuine nested path.
+        assert_eq!(get_field_id(stats.field("a.b").unwrap()), Some(10_400));
+        // The escaped top-level name. Assert via `ColumnName` rather than hardcoding the escape
+        // spelling, so the test tracks the naming contract, not a specific rendering.
+        let escaped = ColumnName::new(["a.b"]).to_string();
+        assert_ne!(
+            escaped, "a.b",
+            "a dotted leaf name must escape to avoid collision"
+        );
+        assert_eq!(get_field_id(stats.field(&escaped).unwrap()), Some(10_600));
+    }
+
+    #[test]
+    fn stats_schema_sibling_structs_preserve_order_and_path_prefixes() {
+        // Sibling structs must each prefix their own leaves (no path-stack leakage), and outputs
+        // must appear in schema order. `a`/`b` are deliberately not adjacent to `top0`/`top1`.
+        let a = field_with_id(
+            "a",
+            StructType::new_unchecked([
+                field_with_id("x", DataType::INTEGER, false, 10),
+                field_with_id("y", DataType::INTEGER, false, 11),
+            ])
+            .into(),
+            true,
+            1,
+        );
+        let b = field_with_id(
+            "b",
+            StructType::new_unchecked([field_with_id("z", DataType::INTEGER, false, 20)]).into(),
+            true,
+            2,
+        );
+        let schema = StructType::new_unchecked([
+            field_with_id("top0", DataType::INTEGER, false, 5),
+            a,
+            b,
+            field_with_id("top1", DataType::INTEGER, false, 6),
+        ]);
+
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        let names: Vec<_> = stats.fields().map(|f| f.name().to_string()).collect();
+        assert_eq!(names, ["top0", "a.x", "a.y", "b.z", "top1"]);
+        assert_eq!(
+            get_field_id(stats.field("a.y").unwrap()),
+            Some(10_000 + 200 * 11)
+        );
+        assert_eq!(
+            get_field_id(stats.field("b.z").unwrap()),
+            Some(10_000 + 200 * 20)
+        );
+    }
+
+    #[test]
+    fn stats_schema_nested_value_less_variant_dropped_sibling_kept() {
+        // A value-less variant nested inside a struct is dropped, while its surviving sibling is
+        // still emitted at its correct dotted path.
+        let no_value = DataType::Variant(Box::new(StructType::new_unchecked([
+            StructField::not_null("metadata", DataType::BINARY),
+        ])));
+        let inner = StructType::new_unchecked([
+            field_with_id("keep", DataType::LONG, false, 5),
+            field_with_id("v", no_value, false, 6),
+        ]);
+        let schema = StructType::new_unchecked([field_with_id("s", inner.into(), true, 1)]);
+
+        let stats = stats_schema(&schema).expect("stats_schema should succeed");
+        assert_eq!(stats.fields().count(), 1);
+        assert!(stats.field("s.keep").is_some());
+        assert!(stats.field("s.v").is_none());
     }
 }
