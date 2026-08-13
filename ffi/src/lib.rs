@@ -195,6 +195,41 @@ impl KernelBytesSlice {
     }
 }
 
+/// A non-owned slice of signed 64-bit integers intended for passing variable-length arrays from
+/// kernel to an engine callback.
+///
+/// The pointed-to data is valid only for the duration of the callback receiving this value. The
+/// callback must copy any values it needs to retain after returning.
+#[repr(C)]
+pub struct KernelI64Slice {
+    ptr: *const i64,
+    len: usize,
+}
+
+impl KernelI64Slice {
+    /// Creates a new integer slice from a source slice.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee that `source` remains valid for every use of the returned slice.
+    unsafe fn new_unsafe(source: &[i64]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
+            len: source.len(),
+        }
+    }
+
+    /// Converts this value into a borrowed Rust slice.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must still be valid and reference `len` initialized `i64` values.
+    #[cfg(test)]
+    unsafe fn as_ref(&self) -> &[i64] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 /// FFI-safe implementation for Rust's `Option<T>`
 #[derive(PartialEq, Debug)]
 #[repr(C)]
@@ -1374,9 +1409,8 @@ pub unsafe extern "C" fn snapshot_timestamp(
 
 /// File-level statistics for a snapshot, sourced from the snapshot's CRC.
 ///
-/// Pass-by-value mirror of the scalar fields of kernel's [`FileStats`].
-// TODO: expose kernel's `FileStats` file-size histogram once it has a C-ABI-friendly
-// representation. It is a variable-length structure, so it needs a different accessor shape.
+/// Pass-by-value mirror of the scalar fields of kernel's [`FileStats`]. The variable-length file
+/// size histogram is available through [`visit_file_size_histogram`].
 #[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiFileStats {
@@ -1413,6 +1447,60 @@ pub unsafe extern "C" fn snapshot_file_stats(
         .get_file_stats_if_present()
         .map(FfiFileStats::from)
         .into()
+}
+
+/// Callback invoked by [`visit_file_size_histogram`] when the snapshot's file stats include a
+/// file size histogram.
+///
+/// The three slices have equal lengths. Each index describes one histogram bin: the boundary is
+/// inclusive, and the next boundary is exclusive; the last bin has no upper bound. Every slice is
+/// valid only for the duration of this callback and must be copied before the callback returns if
+/// the values need to be retained.
+pub type FileSizeHistogramVisitor = extern "C" fn(
+    engine_context: NullableCvoid,
+    sorted_bin_boundaries: KernelI64Slice,
+    file_counts: KernelI64Slice,
+    total_bytes: KernelI64Slice,
+);
+
+/// Visit the file size histogram in this snapshot's CRC.
+///
+/// Invokes `visitor` once and returns `Some(num_bins)` when complete file stats and a histogram are
+/// present. Returns `None` without invoking `visitor` when the snapshot has no current CRC, the
+/// CRC's file stats are incomplete, or its complete file stats omit the optional histogram. This
+/// function performs no I/O.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle, an `engine_context` value suitable
+/// for the visitor (which may be null), and a valid `visitor` function pointer. The visitor must
+/// not retain the passed slices.
+#[no_mangle]
+pub unsafe extern "C" fn visit_file_size_histogram(
+    snapshot: Handle<SharedSnapshot>,
+    engine_context: NullableCvoid,
+    visitor: FileSizeHistogramVisitor,
+) -> OptionalValue<usize> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let Some(file_stats) = snapshot.get_file_stats_if_present() else {
+        return OptionalValue::None;
+    };
+    let Some(histogram) = file_stats.file_size_histogram() else {
+        return OptionalValue::None;
+    };
+
+    let sorted_bin_boundaries =
+        unsafe { KernelI64Slice::new_unsafe(histogram.sorted_bin_boundaries()) };
+    let file_counts = unsafe { KernelI64Slice::new_unsafe(histogram.file_counts()) };
+    let total_bytes = unsafe { KernelI64Slice::new_unsafe(histogram.total_bytes()) };
+    let num_bins = histogram.sorted_bin_boundaries().len();
+    visitor(
+        engine_context,
+        sorted_bin_boundaries,
+        file_counts,
+        total_bytes,
+    );
+    OptionalValue::Some(num_bins)
 }
 
 /// Selects which commit type to return for the history_manager query. FFI-safe mirror of
@@ -1899,6 +1987,7 @@ impl<T> Default for ReferenceSet<T> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ptr::NonNull;
 
     use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::object_store::path::Path;
@@ -1926,6 +2015,30 @@ mod tests {
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
         std::ptr::null_mut()
+    }
+
+    #[derive(Default)]
+    struct CollectedFileSizeHistogram {
+        visitor_called: bool,
+        sorted_bin_boundaries: Vec<i64>,
+        file_counts: Vec<i64>,
+        total_bytes: Vec<i64>,
+    }
+
+    extern "C" fn collect_file_size_histogram(
+        engine_context: NullableCvoid,
+        sorted_bin_boundaries: KernelI64Slice,
+        file_counts: KernelI64Slice,
+        total_bytes: KernelI64Slice,
+    ) {
+        let Some(engine_context) = engine_context else {
+            return;
+        };
+        let collected = unsafe { engine_context.cast::<CollectedFileSizeHistogram>().as_mut() };
+        collected.visitor_called = true;
+        collected.sorted_bin_boundaries = unsafe { sorted_bin_boundaries.as_ref() }.to_vec();
+        collected.file_counts = unsafe { file_counts.as_ref() }.to_vec();
+        collected.total_bytes = unsafe { total_bytes.as_ref() }.to_vec();
     }
 
     #[test]
@@ -2103,6 +2216,26 @@ mod tests {
             }),
         );
 
+        let mut histogram = CollectedFileSizeHistogram::default();
+        let engine_context = Some(NonNull::from(&mut histogram).cast());
+        assert_eq!(
+            unsafe {
+                visit_file_size_histogram(
+                    snapshot.shallow_copy(),
+                    engine_context,
+                    collect_file_size_histogram,
+                )
+            },
+            OptionalValue::Some(95),
+        );
+        assert!(histogram.visitor_called);
+        assert_eq!(histogram.sorted_bin_boundaries.len(), 95);
+        assert_eq!(histogram.file_counts.len(), 95);
+        assert_eq!(histogram.total_bytes.len(), 95);
+        assert_eq!(&histogram.sorted_bin_boundaries[..3], &[0, 8192, 16384]);
+        assert_eq!(histogram.file_counts.iter().sum::<i64>(), 10);
+        assert_eq!(histogram.total_bytes.iter().sum::<i64>(), 5259);
+
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
@@ -2119,6 +2252,21 @@ mod tests {
             unsafe { snapshot_file_stats(snapshot.shallow_copy()) },
             OptionalValue::None
         );
+
+        let mut histogram = CollectedFileSizeHistogram::default();
+        let engine_context = Some(NonNull::from(&mut histogram).cast());
+        assert_eq!(
+            unsafe {
+                visit_file_size_histogram(
+                    snapshot.shallow_copy(),
+                    engine_context,
+                    collect_file_size_histogram,
+                )
+            },
+            OptionalValue::None,
+        );
+        assert!(!histogram.visitor_called);
+        assert!(histogram.sorted_bin_boundaries.is_empty());
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
