@@ -801,7 +801,7 @@ impl_try_from_scalar!(
     (Struct, StructData),
 );
 
-/// Null becomes `None` when its typed null matches [`T::to_data_type`]; anything else must convert
+/// Null becomes `None` when its typed null matches `T::to_data_type`; anything else must convert
 /// to `T`.
 impl<T: TryFrom<Scalar, Error = Error> + ToDataType> TryFrom<Scalar> for Option<T> {
     type Error = Error;
