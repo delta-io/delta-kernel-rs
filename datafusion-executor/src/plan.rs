@@ -126,7 +126,7 @@ mod tests {
             KernelPlanNode::new(KernelValues::new(test_schema(), vec![]), vec![parent_index]);
         let err = to_df_plan(&KernelPlan { nodes: vec![node] }).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("node 0 (Values)"), "{message}");
+        assert!(message.contains("node 0 (values)"), "{message}");
         assert!(
             message.contains(&format!("references parent {parent_index}")),
             "{message}"

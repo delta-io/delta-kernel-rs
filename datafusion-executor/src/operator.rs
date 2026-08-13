@@ -351,7 +351,7 @@ mod tests {
         let err = lower_operator(&op, std::slice::from_ref(&parent)).unwrap_err();
         assert!(
             err.to_string()
-                .contains("Values expects 0 parent(s), but received 1"),
+                .contains("values expects 0 parent(s), but received 1"),
             "{err}"
         );
     }
@@ -484,7 +484,7 @@ mod tests {
         let err = lower_operator(&op, &parents).unwrap_err();
         assert!(
             err.to_string().contains(&format!(
-                "Filter expects 1 parent(s), but received {actual}"
+                "filter expects 1 parent(s), but received {actual}"
             )),
             "{err}"
         );
