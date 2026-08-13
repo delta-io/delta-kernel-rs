@@ -77,18 +77,13 @@ bool run_test_case(const TestCase* test) {
   return all_passed;
 }
 
-// Round-trips a multi-part column whose middle field ("b.c") contains a period, checking the
-// period is preserved as a single part. The reconstructed kernel column must match the reference
-// column built directly in Rust.
+// Round-trips a kernel multi-part column whose middle field ("b.c") contains a period, checking
+// the outbound and inbound visitors both preserve it as a single part.
 bool run_dotted_column_roundtrip_test() {
-  const char* parts[] = { "a", "b.c", "d" };
-  struct Column* column = make_column(parts, 3);
-  ExpressionItemList expr_list = { .len = 1, .list = malloc(sizeof(ExpressionItem)) };
-  expr_list.list[0] = (ExpressionItem){ .ref = column, .type = Column };
-
+  SharedExpression* original = get_testing_dotted_field_column();
+  ExpressionItemList expr_list = construct_expression(original);
   SharedExpression* reconstructed = convert_engine_to_kernel_expression(expr_list);
-  SharedExpression* reference = get_testing_dotted_field_column();
-  bool equal = expressions_are_equal(&reconstructed, &reference);
+  bool equal = expressions_are_equal(&reconstructed, &original);
 
   printf("=== Dotted-field Column Round-trip Test ===\n");
   if (equal) {
@@ -97,8 +92,8 @@ bool run_dotted_column_roundtrip_test() {
     printf("FAILURE: reconstructed column does NOT match [\"a\", \"b.c\", \"d\"]!\n");
   }
 
+  free_kernel_expression(original);
   free_kernel_expression(reconstructed);
-  free_kernel_expression(reference);
   free_expression_list(expr_list);
   return equal;
 }

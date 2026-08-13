@@ -287,7 +287,8 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       struct Column* column = ref.ref;
       printf("Column(");
       for (size_t i = 0; i < column->len; i++) {
-        printf("%s%s", i > 0 ? ", " : "", column->parts[i]);
+        printf("%s", i > 0 ? ", " : "");
+        fwrite(column->parts[i].ptr, sizeof(char), column->parts[i].len, stdout);
       }
       printf(")\n");
       break;

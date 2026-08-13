@@ -37,7 +37,7 @@ StructExpression
             Short(0)
   StructPatch
     input_path
-      Column(foo.bar.baz)
+      Column(foo, bar, baz)
     prepended_fields
       String(prepended)
     field_patches
@@ -87,7 +87,7 @@ StructExpression
   StructPatch
   StructPatch
     input_path
-      Column(empty.nested)
+      Column(empty, nested)
   Array
     Short(5)
     Short(0)

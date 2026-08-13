@@ -227,8 +227,8 @@ uintptr_t convert_engine_to_kernel_expression_item(
       struct Column* column = (struct Column*)item.ref;
       KernelStringSlice* parts = malloc(sizeof(KernelStringSlice) * column->len);
       for (size_t i = 0; i < column->len; i++) {
-        parts[i].ptr = column->parts[i];
-        parts[i].len = strlen(column->parts[i]);
+        parts[i].ptr = column->parts[i].ptr;
+        parts[i].len = column->parts[i].len;
       }
       ExternResultusize result = visit_expression_column(
           state, parts, column->len, allocate_error);

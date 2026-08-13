@@ -223,9 +223,13 @@ pub extern "C" fn visit_expression_unknown(
     name.map_or(0, |name| wrap_expression(state, Expression::Unknown(name)))
 }
 
+/// Builds a column from ordered field-name parts. Periods inside a part are preserved.
+///
+/// Returns an error for zero parts, empty parts, or invalid UTF-8.
+///
 /// # Safety
-/// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
-/// duration of this call. The field parts are copied out before this function returns.
+/// If `parts_len > 0`, `parts` must point to `parts_len` valid [`KernelStringSlice`] values.
+/// Every slice must remain valid for this call. The field parts are copied before returning.
 #[no_mangle]
 pub unsafe extern "C" fn visit_expression_column(
     state: &mut KernelExpressionVisitorState,
@@ -1120,23 +1124,25 @@ mod tests {
         };
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, Expression::column(["a", "b.c", "d"]));
-        let Expression::Column(name) = expr else {
-            panic!("expected a column expression, got {expr:?}");
-        };
-        let fields: Vec<&str> = name.path().iter().map(String::as_str).collect();
-        assert_eq!(fields, vec!["a", "b.c", "d"]);
     }
 
-    /// Invalid part lists are rejected at the boundary. Parts are raw bytes so the
-    /// invalid-UTF-8 case can share the same shape as the empty-string and no-parts cases:
-    /// - `no_parts`: a column must have at least one field part.
-    /// - `empty_part`: an empty field name is a caller bug (symmetric with `parts_len == 0`).
-    /// - `invalid_utf8`: a field name must be valid UTF-8, so `try_from_slice` fails.
     #[rstest]
-    #[case::no_parts(&[])]
-    #[case::empty_part(&[&b"a"[..], &b""[..], &b"d"[..]])]
-    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]])]
-    fn invalid_column_parts_are_rejected(#[case] raw_parts: &[&[u8]]) {
+    #[case::no_parts(
+        &[],
+        KernelError::GenericError,
+        Some("Generic delta kernel error: column must have at least one field part")
+    )]
+    #[case::empty_part(
+        &[&b"a"[..], &b""[..], &b"d"[..]],
+        KernelError::GenericError,
+        Some("Generic delta kernel error: column field part must not be empty")
+    )]
+    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]], KernelError::Utf8Error, None)]
+    fn invalid_column_parts_are_rejected(
+        #[case] raw_parts: &[&[u8]],
+        #[case] expected_error: KernelError,
+        #[case] expected_message: Option<&str>,
+    ) {
         let mut state = KernelExpressionVisitorState::default();
         let slices: Vec<KernelStringSlice> = raw_parts
             .iter()
@@ -1145,9 +1151,10 @@ mod tests {
                 len: bytes.len(),
             })
             .collect();
-        let result =
-            unsafe { visit_expression_column_impl(&mut state, slices.as_ptr(), slices.len()) };
-        assert!(result.is_err());
+        let result = unsafe {
+            visit_expression_column(&mut state, slices.as_ptr(), slices.len(), allocate_err)
+        };
+        assert_extern_result_error_with_message(result, expected_error, expected_message);
     }
 
     // ============================================================================
@@ -1236,7 +1243,10 @@ mod tests {
     // miri can validate the unsafe boundary, not just the `_impl` helpers above.
     // ============================================================================
 
-    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::error::KernelError;
+    use crate::ffi_test_utils::{
+        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+    };
     use crate::kernel_string_slice;
 
     #[test]

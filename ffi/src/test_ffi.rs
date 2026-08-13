@@ -264,7 +264,8 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
 /// checks it round-trips to this reference.
 ///
 /// # Safety
-/// The caller is responsible for freeing the returned memory.
+/// The caller must free the returned handle with
+/// [`crate::expressions::free_kernel_expression`].
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_dotted_field_column() -> Handle<SharedExpression> {
     Arc::new(Expr::column(["a", "b.c", "d"])).into()

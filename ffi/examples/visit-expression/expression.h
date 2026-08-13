@@ -121,8 +121,12 @@ struct Unknown {
 };
 // A column is a list of field-name parts. Keeping the parts structured (rather than a single
 // dotted string) lets a field name that itself contains a period survive the FFI round-trip.
+struct ColumnPart {
+  char* ptr;
+  size_t len;
+};
 struct Column {
-  char** parts;
+  struct ColumnPart* parts;
   size_t len;
 };
 struct MapToStructExpr {
@@ -474,25 +478,29 @@ DEFINE_UNARY(visit_expr_not, Not)
 /*************************************************************
  * Column Expression
  ************************************************************/
-void visit_expr_column(void* data, uintptr_t sibling_id_list, KernelStringSlice col_name) {
-  // The outbound (kernel -> engine) callback delivers the column as a single dotted string, so
-  // the example stores it as a one-part column.
+void visit_expr_column(void* data,
+                       uintptr_t sibling_id_list,
+                       const KernelStringSlice* parts,
+                       uintptr_t parts_len) {
   struct Column* column = malloc(sizeof(struct Column));
-  column->len = 1;
-  column->parts = malloc(sizeof(char*));
-  column->parts[0] = allocate_string(col_name);
+  column->len = parts_len;
+  column->parts = malloc(sizeof(struct ColumnPart) * parts_len);
+  for (size_t i = 0; i < parts_len; i++) {
+    column->parts[i].ptr = allocate_string(parts[i]);
+    column->parts[i].len = parts[i].len;
+  }
   put_expr_item(data, sibling_id_list, column, Column);
 }
 
 struct Column* make_column(const char* const* parts, size_t len) {
   struct Column* column = malloc(sizeof(struct Column));
   column->len = len;
-  column->parts = malloc(sizeof(char*) * len);
+  column->parts = malloc(sizeof(struct ColumnPart) * len);
   for (size_t i = 0; i < len; i++) {
     size_t part_len = strlen(parts[i]);
     char* copy = malloc(part_len + 1);
     memcpy(copy, parts[i], part_len + 1);
-    column->parts[i] = copy;
+    column->parts[i] = (struct ColumnPart){ .ptr = copy, .len = part_len };
   }
   return column;
 }
@@ -725,7 +733,7 @@ void free_expression_item(ExpressionItem ref) {
     case Column: {
       struct Column* column = ref.ref;
       for (size_t i = 0; i < column->len; i++) {
-        free(column->parts[i]);
+        free(column->parts[i].ptr);
       }
       free(column->parts);
       free(column);
