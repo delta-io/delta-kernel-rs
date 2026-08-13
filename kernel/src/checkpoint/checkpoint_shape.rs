@@ -10,12 +10,10 @@
 // No in-crate caller yet; following PRs will use this.
 #![allow(dead_code)]
 
-use std::sync::Arc;
-
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::{ADD_NAME, LEAF_CHECKPOINT_ACTIONS_SCHEMA, SIDECAR_NAME, STATS_PARSED};
+use crate::actions::{ADD_NAME, LEAF_CHECKPOINT_ACTIONS_SCHEMA, SIDECAR_NAME};
 use crate::engine_data::RowVisitor;
 use crate::log_segment::LogSegment;
 use crate::plans::ir::nodes::FileType;
@@ -211,14 +209,6 @@ impl CheckpointShape {
     /// Whether the checkpoint contains JSON-encoded stats.
     pub(crate) fn has_json_stats(&self) -> bool {
         self.add_field("stats").is_some()
-    }
-
-    /// Return the checkpoint's complete native parsed-stats schema.
-    pub(crate) fn stats_parsed_schema(&self) -> Option<SchemaRef> {
-        let DataType::Struct(stats) = self.add_field(STATS_PARSED)?.data_type() else {
-            return None;
-        };
-        Some(Arc::new(stats.as_ref().clone()))
     }
 
     /// Return `stats_schema` when the checkpoint has compatible parsed stats.

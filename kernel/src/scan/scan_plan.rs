@@ -572,14 +572,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             return self;
         }
 
-        let has_stats_parsed = self
-            .input_schema()
-            .contains_col([ADD_NAME, STATS_PARSED_NAME]);
-        let expr = if has_stats_parsed {
-            Expr::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed"))
-        } else {
-            Expr::null_literal(DataType::STRING)
-        };
+        let expr = Expr::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed"));
         self.insert_after_at(
             [ADD_NAME],
             DATA_CHANGE,
