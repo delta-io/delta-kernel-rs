@@ -865,9 +865,9 @@ impl TableConfiguration {
                 } else {
                     // Reader-supported if the feature is in reader_features, or it is a legacy
                     // ReaderWriter feature (only ColumnMapping) whose minimum reader version is
-                    // met. The second case handles a table upgraded to reader
-                    // version 3 that kept the feature in writerFeatures but
-                    // left it out of readerFeatures.
+                    // met. The second case stays compatible with tables a past delta-spark bug
+                    // created with ReaderWriter features in writerFeatures only, absent from
+                    // readerFeatures.
                     Self::has_feature(self.protocol.reader_features(), feature)
                         || feature.is_valid_for_legacy_reader(self.protocol.min_reader_version())
                 };

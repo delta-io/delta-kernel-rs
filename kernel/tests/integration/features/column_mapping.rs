@@ -1,11 +1,4 @@
-//! Reader-feature handling for column-mapping tables, focused on the "orphaned" protocol shape:
-//! reader version 3 with `columnMapping` in `writerFeatures` but absent from `readerFeatures`.
-//! The kernel still reads such a table, since column-mapping mode comes from `writerFeatures`, and
-//! resolves columns the way delta-spark does.
-//!
-//! The physical names below differ from the logical ones (as they would after a `RENAME COLUMN`),
-//! so a logical-name read and a physical-name read give different answers and the tests can tell
-//! which one ran.
+//! Integration tests for reading column-mapping tables.
 
 use std::collections::HashMap;
 use std::sync::Arc;

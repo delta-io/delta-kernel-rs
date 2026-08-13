@@ -722,10 +722,11 @@ impl Protocol {
                 // Unknown features are treated as potentially Writer-only for forward
                 // compatibility.
                 //
-                // Accept the legacy writer-list-only shape for delta-spark compatibility: an
-                // upgrade to (3, 7) can leave ColumnMapping in writerFeatures with an empty
-                // readerFeatures, and the table still reads correctly because the mode comes from
-                // writerFeatures. Rejecting it would break existing production tables.
+                // Accept the legacy writer-list-only shape for delta-spark compatibility: a
+                // past delta-spark bug produced (3, 7) tables with ColumnMapping in writerFeatures
+                // only and an empty readerFeatures. Such tables still read correctly because the
+                // mode comes from writerFeatures, and rejecting them would break existing
+                // production tables.
                 //
                 // Validate the whole writer list before warning: a non-legacy orphan rejects the
                 // protocol outright, so we must not emit an acceptance warning for a legacy orphan
