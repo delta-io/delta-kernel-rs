@@ -450,6 +450,20 @@ mod tests {
     #[case::float_to_double(DataType::FLOAT, DataType::DOUBLE)]
     #[case::timestamp_to_timestamp_ntz(DataType::TIMESTAMP, DataType::TIMESTAMP_NTZ)]
     #[case::timestamp_ntz_to_timestamp(DataType::TIMESTAMP_NTZ, DataType::TIMESTAMP)]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_nanos_to_timestamp_nanos_ntz(
+            DataType::TIMESTAMP_NANOS,
+            DataType::TIMESTAMP_NANOS_NTZ
+        )
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_nanos_ntz_to_timestamp_nanos(
+            DataType::TIMESTAMP_NANOS_NTZ,
+            DataType::TIMESTAMP_NANOS
+        )
+    )]
     fn primitive_type_widening(
         #[case] source: DataType,
         #[case] target: DataType,
@@ -468,6 +482,26 @@ mod tests {
     #[case::short_to_byte(DataType::SHORT, DataType::BYTE)]
     #[case::double_to_float(DataType::DOUBLE, DataType::FLOAT)]
     fn primitive_type_narrowing_is_rejected(
+        #[case] source: DataType,
+        #[case] target: DataType,
+        #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
+        mode: ComparisonMode,
+    ) {
+        assert!(matches!(
+            mode.can_read_as(&source, &target),
+            Err(Error::TypeMismatch)
+        ));
+    }
+
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[rstest]
+    #[case::timestamp_to_nanos(DataType::TIMESTAMP, DataType::TIMESTAMP_NANOS)]
+    #[case::nanos_to_timestamp(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP)]
+    #[case::timestamp_ntz_to_nanos_ntz(DataType::TIMESTAMP_NTZ, DataType::TIMESTAMP_NANOS_NTZ)]
+    #[case::nanos_ntz_to_timestamp_ntz(DataType::TIMESTAMP_NANOS_NTZ, DataType::TIMESTAMP_NTZ)]
+    #[case::timestamp_to_nanos_ntz(DataType::TIMESTAMP, DataType::TIMESTAMP_NANOS_NTZ)]
+    #[case::nanos_to_timestamp_ntz(DataType::TIMESTAMP_NANOS, DataType::TIMESTAMP_NTZ)]
+    fn timestamp_precision_change_is_rejected(
         #[case] source: DataType,
         #[case] target: DataType,
         #[values(ComparisonMode::AllowTypeWidening, ComparisonMode::ForbidTypeWidening)]
@@ -502,6 +536,37 @@ mod tests {
     #[case::short_to_integer(PrimitiveType::Short, PrimitiveType::Integer, true)]
     #[case::float_to_double(PrimitiveType::Float, PrimitiveType::Double, true)]
     #[case::timestamp_to_ntz(PrimitiveType::Timestamp, PrimitiveType::TimestampNtz, true)]
+    #[case::ntz_to_timestamp(PrimitiveType::TimestampNtz, PrimitiveType::Timestamp, true)]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_nanos_to_nanos_ntz(
+            PrimitiveType::TimestampNanos,
+            PrimitiveType::TimestampNanosNtz,
+            true
+        )
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_nanos_ntz_to_nanos(
+            PrimitiveType::TimestampNanosNtz,
+            PrimitiveType::TimestampNanos,
+            true
+        )
+    )]
+    // Timestamp precision changes are not compatible in either direction
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_to_nanos(PrimitiveType::Timestamp, PrimitiveType::TimestampNanos, false)
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::nanos_to_timestamp(PrimitiveType::TimestampNanos, PrimitiveType::Timestamp, false)
+    )]
+    // Long not reinterpretable as nanosecond timestamp
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::long_to_nanos(PrimitiveType::Long, PrimitiveType::TimestampNanos, false)
+    )]
     fn stats_type_compatibility(
         #[case] source: PrimitiveType,
         #[case] target: PrimitiveType,
