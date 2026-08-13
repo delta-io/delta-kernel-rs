@@ -313,7 +313,8 @@ mod tests {
     use crate::table_features::TableFeature;
 
     /// A minimal valid protocol for round-trip tests. `Protocol::default()` is `(0, 0)`, which
-    /// `try_new` (now on the deserialization path) rejects, so it cannot survive a round-trip.
+    /// `try_new` rejects, so a default protocol can't round-trip through serde (deserialization
+    /// validates via `try_new`).
     fn valid_protocol() -> Protocol {
         Protocol::try_new(1, 1, TableFeature::NO_LIST, TableFeature::NO_LIST).unwrap()
     }
@@ -698,9 +699,8 @@ mod tests {
 
     // ===== protocol validation on the CRC deserialization path =====
 
-    /// Minimal CRC JSON whose `protocol` is the supplied JSON fragment. Used to prove CRC
-    /// deserialization routes the protocol through `Protocol::try_new` instead of materializing
-    /// unchecked feature shapes.
+    /// Minimal CRC JSON whose `protocol` is the supplied fragment. Proves CRC deserialization
+    /// runs the protocol through `Protocol::try_new` instead of building an unchecked one.
     fn crc_json_with_protocol(protocol: &str) -> String {
         format!(
             r#"{{

@@ -552,9 +552,9 @@ impl IntoEngineData for Metadata {
 #[derive(
     Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
 )]
-// Deserialization routes through `ProtocolRaw` so that every serde ingress (e.g. CRC files) is
-// validated by `try_new`, matching the JSON-replay path. Without this a CRC file could
-// materialize a malformed feature shape that log replay would reject.
+// Deserialization goes through `ProtocolRaw` so every serde entry point (e.g. CRC files) is
+// validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
+// feature shape that log replay would reject.
 #[serde(rename_all = "camelCase", try_from = "ProtocolRaw")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -576,10 +576,9 @@ pub(crate) struct Protocol {
     writer_features: Option<Vec<TableFeature>>,
 }
 
-/// Unvalidated deserialization mirror of [`Protocol`]: the raw field-for-field shape serde reads
-/// before validation. Deserialize-only (never serialized); `Protocol`'s `#[serde(try_from)]`
-/// converts it via [`Protocol::try_new`] so all deserialization funnels through the checked
-/// constructor.
+/// Raw, unvalidated form of [`Protocol`] that serde reads before validation. Deserialize-only
+/// (never serialized): `Protocol`'s `#[serde(try_from)]` converts it via [`Protocol::try_new`],
+/// so every deserialization is validated.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProtocolRaw {
