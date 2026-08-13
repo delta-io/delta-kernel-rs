@@ -81,10 +81,11 @@ pub enum BinaryPredicateOp {
     /// value. `DISTINCT(1, 1)` and `DISTINCT(NULL, NULL)` are `false`; `DISTINCT(NULL, 1)` is
     /// `true`.
     Distinct,
-    /// SQL `left IN (elements)`: `true` when `left` equals one of the elements, and `false`
-    /// otherwise, including when `left` is NULL. `left` must be a literal, and the elements are
-    /// either a list-typed column or an [`Expression::Literal`] holding a [`Scalar::Array`], never
-    /// a list of expressions or a subquery:
+    /// SQL `left IN (elements)`: returns `false` when `left` is NULL. Otherwise, it returns `true`
+    /// when `left` equals any element and `false` when none match. NULL elements never match.
+    /// `left` must be a literal, and the elements are either a list-typed column or an
+    /// [`Expression::Literal`] holding a [`Scalar::Array`], never a list of expressions or a
+    /// subquery:
     ///
     /// ```sql
     /// 2 IN (1, 2, 3)         -- literal elements
