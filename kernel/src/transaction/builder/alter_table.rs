@@ -41,7 +41,7 @@ use crate::table_features::{
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::transaction::alter_table::AlterTableTransaction;
 use crate::transaction::schema_evolution::{
-    apply_schema_operations, SchemaEvolutionResult, SchemaOperation, SchemaPathSegment,
+    apply_schema_operations, SchemaPathSegment, SchemaEvolutionResult, SchemaOperation,
 };
 use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, Error};
@@ -125,6 +125,8 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
+    /// 
+    /// The field must not be a metadata column.
     ///
     /// With column mapping enabled, existing IDs and physical names are preserved and missing
     /// annotations are assigned. In `None` mode, introduced annotations are stripped only when
@@ -156,12 +158,11 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// values.
     ///
     /// The added field must be nullable (existing data files lack the column and will read NULL),
-    /// must not be a metadata column, and must not collide case-insensitively with a sibling in the
-    /// target struct. The path must resolve to a struct.
+    /// must not be a top-level metadata column and must not collide case-insensitively with a 
+    /// sibling in the target struct. The path must resolve to a struct.
     ///
     /// With column mapping enabled, existing IDs and physical names are preserved and missing
-    /// annotations are assigned. In `None` mode, introduced annotations are stripped only when
-    /// the pre-ALTER schema had no column-mapping metadata.
+    /// annotations are assigned.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     #[internal_api]

@@ -16,24 +16,25 @@ use crate::DeltaResult;
 
 /// A schema path segment distinguishing struct fields, array elements, map keys, and map values.
 ///
-/// # Examples
+/// Paths compose field names with typed container transitions. For schema
+/// `{ addresses: ARRAY<STRUCT<street: STRING>> }`, `street` is:
 ///
-/// 1. In this schema:
-/// ```text
-/// { id: INT, addresses: ARRAY<STRUCT<street: STRING, number: INT>> }
-/// ```
-/// the `street` field corresponds to:
-/// ```text
-/// [SchemaPathSegment::Field("addresses"), SchemaPathSegment::ArrayElement, SchemaPathSegment::Field("street")]
+/// ```rust,ignore
+/// [
+///     SchemaPathSegment::Field("addresses".to_string()),
+///     SchemaPathSegment::ArrayElement,
+///     SchemaPathSegment::Field("street".to_string()),
+/// ]
 /// ```
 ///
-/// 2. In this schema:
-/// ```text
-/// { labels_by_range: MAP<STRUCT<start: INT, end: INT>, STRING> }
-/// ```
-/// the `start` field corresponds to:
-/// ```text
-/// [SchemaPathSegment::Field("labels_by_range"), SchemaPathSegment::MapKey, SchemaPathSegment::Field("start")]
+/// For `{ labels_by_range: MAP<STRUCT<start: INT>, STRING> }`, `start` is:
+///
+/// ```rust,ignore
+/// [
+///     SchemaPathSegment::Field("labels_by_range".to_string()),
+///     SchemaPathSegment::MapKey,
+///     SchemaPathSegment::Field("start".to_string()),
+/// ]
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
