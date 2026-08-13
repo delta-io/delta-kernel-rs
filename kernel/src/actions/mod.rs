@@ -552,10 +552,10 @@ impl IntoEngineData for Metadata {
 #[derive(
     Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
 )]
-// Deserialization routes through `UnvalidatedProtocol` so that every serde ingress (e.g. CRC
-// files) is validated by `try_new`, matching the JSON-replay path. Without this a CRC file could
+// Deserialization routes through `ProtocolRaw` so that every serde ingress (e.g. CRC files) is
+// validated by `try_new`, matching the JSON-replay path. Without this a CRC file could
 // materialize a malformed feature shape that log replay would reject.
-#[serde(rename_all = "camelCase", try_from = "UnvalidatedProtocol")]
+#[serde(rename_all = "camelCase", try_from = "ProtocolRaw")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
@@ -582,17 +582,17 @@ pub(crate) struct Protocol {
 /// constructor.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UnvalidatedProtocol {
+struct ProtocolRaw {
     min_reader_version: i32,
     min_writer_version: i32,
     reader_features: Option<Vec<TableFeature>>,
     writer_features: Option<Vec<TableFeature>>,
 }
 
-impl TryFrom<UnvalidatedProtocol> for Protocol {
+impl TryFrom<ProtocolRaw> for Protocol {
     type Error = Error;
 
-    fn try_from(protocol: UnvalidatedProtocol) -> DeltaResult<Self> {
+    fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
         Protocol::try_new(
             protocol.min_reader_version,
             protocol.min_writer_version,
