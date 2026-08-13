@@ -1954,11 +1954,7 @@ mod tests {
         (literal, column_expr!("list"), batch)
     }
 
-    /// `IN` reports membership as a plain boolean and never yields NULL, identically across both
-    /// element sources (a literal array and a list column). Because membership uses logical (SQL)
-    /// equality -- under which NULL is incomparable to everything, including itself -- a NULL
-    /// needle matches nothing (answering `false`, not NULL), and a NULL element matches nothing,
-    /// not even a NULL needle.
+    /// NULL never matches because logical equality treats it as incomparable, including to itself.
     #[rstest]
     #[case::present(Some(2), &[Some(1), Some(2)], true)]
     #[case::absent(Some(9), &[Some(1), Some(2)], false)]
