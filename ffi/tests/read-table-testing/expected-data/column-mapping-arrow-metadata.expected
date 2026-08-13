@@ -1,0 +1,9 @@
+Reading table at ../../../../acceptance/tests/dat/out/reader_tests/generated/column_mapping/delta/
+version: 3
+
+Schema:
+├─ letter: string (column mapping id: 1)
+├─ new_int: long (column mapping id: 2)
+└─ date: date (column mapping id: 3)
+
+[No data]

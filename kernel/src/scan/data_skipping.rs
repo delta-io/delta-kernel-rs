@@ -9,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, column_name, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
+    col, column_name, lit, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
     JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
@@ -92,10 +92,10 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
 pub(crate) struct DataSkippingFilter {
     /// Evaluator that extracts file-level statistics from the input batch. The caller provides
     /// the expression at construction time, which determines where stats come from:
-    /// - Scan path: `column_expr!("stats_parsed")` reads the already-parsed struct from a
-    ///   transformed batch (where `add.*` fields are flattened to top-level columns).
-    /// - Table changes path: `Expression::parse_json(column_expr!("add.stats"), schema)` parses
-    ///   JSON from a raw action batch (where stats are nested under `add.stats`).
+    /// - Scan path: `col!("stats_parsed")` reads the already-parsed struct from a transformed
+    ///   batch (where `add.*` fields are flattened to top-level columns).
+    /// - Table changes path: `Expression::parse_json(col!("add.stats"), schema)` parses JSON from
+    ///   a raw action batch (where stats are nested under `add.stats`).
     stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
@@ -116,8 +116,8 @@ impl DataSkippingFilter {
     /// - `stats_schema`: The data stats schema (numRecords, nullCount, minValues, maxValues). Pass
     ///   `None` if no data stats are available.
     /// - `stats_expr`: Expression to extract data stats from the batch, producing output matching
-    ///   `stats_schema`. For example, `column_expr!("stats_parsed")` for pre-parsed stats, or
-    ///   `Expression::parse_json(column_expr!("add.stats"), stats_schema)` for JSON parsing.
+    ///   `stats_schema`. For example, `col!("stats_parsed")` for pre-parsed stats, or
+    ///   `Expression::parse_json(col!("add.stats"), stats_schema)` for JSON parsing.
     /// - `partition_schema`: Schema of typed partition columns referenced by the predicate
     ///   (physical names). Pass `None` if no partition columns are referenced.
     /// - `partition_expr`: Expression to extract partition values from the batch, producing output
@@ -148,7 +148,7 @@ impl DataSkippingFilter {
         metrics: Option<Arc<ScanMetrics>>,
     ) -> Option<Self> {
         static FILTER_PRED: LazyLock<PredicateRef> =
-            LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
+            LazyLock::new(|| Arc::new(col!("output").distinct(lit(false))));
         static FILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             Arc::new(StructType::new_unchecked([StructField::nullable(
                 "output",
@@ -272,11 +272,11 @@ impl DataSkippingFilter {
         // from the raw `add.partitionValues` string map, and identify Add rows by
         // `add.path IS NOT NULL` (raw batches keep the nested layout).
         let stats_expr = Arc::new(Expr::parse_json(
-            column_expr!("add.stats"),
+            col!("add.stats"),
             physical_stats_schema.clone(),
         ));
-        let partition_expr = Arc::new(Expr::map_to_struct(column_expr!("add.partitionValues")));
-        let is_add_expr = Arc::new(Pred::is_not_null(column_expr!("add.path")).into());
+        let partition_expr = Arc::new(Expr::map_to_struct(col!("add.partitionValues")));
+        let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
         Self::new(
             engine,
             Some(physical_predicate),
@@ -484,7 +484,7 @@ fn collect_junction_preds(
             Some(pred) => Some(pred),
             None => keep_null.then(|| {
                 keep_null = false;
-                Pred::null_literal()
+                Pred::NULL
             }),
         })
         .collect();
@@ -601,7 +601,7 @@ impl DataSkippingColumns<'_> {
     }
 
     fn rowcount_stat(&self) -> Expr {
-        column_expr!("stats_parsed", NUM_RECORDS)
+        col!("stats_parsed", NUM_RECORDS)
     }
 }
 

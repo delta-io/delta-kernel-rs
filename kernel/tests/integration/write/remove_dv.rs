@@ -7,18 +7,19 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::{Int32Array, RecordBatch};
 use delta_kernel::arrow::compute::concat_batches;
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::expressions::{column_expr, lit, ExpressionStructPatchBuilder, MapData, Scalar};
+use delta_kernel::expressions::{col, lit, ExpressionStructPatchBuilder, MapData, Scalar};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, StatsOptions};
 use delta_kernel::schema::{schema_ref, DataType, MapType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::CommitResult;
-use delta_kernel::{Engine, Expression as Expr, Predicate as Pred, Snapshot};
+use delta_kernel::{DeltaResult, Engine, Error, Expression as Expr, Predicate as Pred, Snapshot};
 use itertools::Itertools;
 use serde_json::Deserializer;
 use tempfile::tempdir;
@@ -33,6 +34,173 @@ use crate::common::write_utils::{
     create_dv_table_with_files, get_scan_files, get_simple_int_schema, sequential_dv_descriptors,
     set_table_properties, write_data_and_check_result_and_stats,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppendOnlyWrite {
+    Remove,
+    DeletionVectorUpdate,
+}
+
+#[rstest::rstest]
+#[case::no_data_change_all_selected(
+    false, /* data_change */
+    &[true, true, true], /* selection_vector */
+    None, /* expected_error */
+)]
+#[case::data_change_all_selected(
+    true, /* data_change */
+    &[true, true, true], /* selection_vector */
+    Some("Append-only tables cannot remove files"), /* expected_error */
+)]
+#[case::no_data_change_partially_selected(
+    false, /* data_change */
+    &[true, false, true], /* selection_vector */
+    None, /* expected_error */
+)]
+#[case::data_change_partially_selected(
+    true, /* data_change */
+    &[true, false, true], /* selection_vector */
+    Some("Append-only tables cannot remove files"), /* expected_error */
+)]
+#[case::data_change_none_selected(
+    true, /* data_change */
+    &[false, false, false], /* selection_vector */
+    None, /* expected_error */
+)]
+#[tokio::test]
+async fn append_only_enforces_data_change_for_file_actions(
+    #[values(AppendOnlyWrite::Remove, AppendOnlyWrite::DeletionVectorUpdate)]
+    operation: AppendOnlyWrite,
+    #[values(0, 1)] batch_index: usize,
+    #[case] data_change: bool,
+    #[case] selection_vector: &[bool],
+    #[case] expected_error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let table_url = Url::from_directory_path(&table_path).unwrap();
+    let schema = schema_ref! { nullable "number": INTEGER };
+
+    let snapshot = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([
+            ("delta.appendOnly", "true"),
+            ("delta.enableDeletionVectors", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_post_commit_snapshot();
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?.with_data_change(true);
+    let write_context = txn.unpartitioned_write_context()?;
+    let arrow_schema: Arc<ArrowSchema> =
+        Arc::new(write_context.physical_schema().as_ref().try_into_arrow()?);
+    for value in [1, 2, 3] {
+        let data = ArrowEngineData::new(RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![value]))],
+        )?);
+        txn.add_files(engine.write_parquet(&data, &write_context).await?);
+    }
+    let snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+    let staged_batches = (0..2)
+        .map(|index| {
+            let scan_files = selected_scan_file_batch(snapshot.clone(), engine.as_ref())?;
+            let (data, _) = scan_files.into_parts();
+            assert_eq!(data.len(), selection_vector.len());
+            let selection_vector = if index == batch_index {
+                selection_vector.to_vec()
+            } else {
+                vec![false; data.len()]
+            };
+            FilteredEngineData::try_new(data, selection_vector)
+        })
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let mut txn = begin_transaction(snapshot, engine.as_ref())?
+        .with_operation("DELETE".to_string())
+        .with_data_change(data_change);
+    // NOTE: The data_change=false cases do not preserve removed records in replacement AddFiles.
+    // This is not a valid rearrangement, we construct such commit only for testing.
+    let commit_result = match operation {
+        AppendOnlyWrite::Remove => {
+            for scan_files in staged_batches {
+                txn.remove_files(scan_files);
+            }
+            txn.commit(engine.as_ref())
+        }
+        AppendOnlyWrite::DeletionVectorUpdate => {
+            let add_actions = read_actions_from_commit(&table_url, 1, "add")?;
+            let dv_map = add_actions
+                .iter()
+                .zip(selection_vector)
+                .enumerate()
+                .filter(|(_, (_, selected))| **selected)
+                .map(|(index, (add, _))| {
+                    let path = add["path"]
+                        .as_str()
+                        .expect("add path should be present")
+                        .to_string();
+                    let dv = DeletionVectorDescriptor {
+                        storage_type: DeletionVectorStorageType::PersistedRelative,
+                        path_or_inline_dv: format!("dv-{index}.bin"),
+                        offset: Some(0),
+                        size_in_bytes: 1,
+                        cardinality: 1,
+                    };
+                    (path, dv)
+                })
+                .collect();
+            txn.update_deletion_vectors(dv_map, staged_batches.into_iter().map(Ok))?;
+            txn.commit(engine.as_ref())
+        }
+    };
+
+    if let Some(expected_error) = expected_error {
+        assert_result_error_with_message(commit_result, expected_error);
+    } else {
+        commit_result?.unwrap_committed();
+    }
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(
+        snapshot.version(),
+        if expected_error.is_some() { 1 } else { 2 }
+    );
+    let scan = snapshot.scan_builder().build()?;
+    let mut active_files = 0;
+    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
+        let scan_files = scan_metadata?.scan_files;
+        active_files += scan_files
+            .selection_vector()
+            .iter()
+            .filter(|selected| **selected)
+            .count()
+            + scan_files.data().len()
+            - scan_files.selection_vector().len();
+    }
+    let selected_files = selection_vector
+        .iter()
+        .filter(|selected| **selected)
+        .count();
+    let expected_active_files = match operation {
+        AppendOnlyWrite::Remove if expected_error.is_none() => 3 - selected_files,
+        AppendOnlyWrite::Remove | AppendOnlyWrite::DeletionVectorUpdate => 3,
+    };
+    assert_eq!(active_files, expected_active_files);
+
+    Ok(())
+}
+
+fn selected_scan_file_batch(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn Engine,
+) -> DeltaResult<FilteredEngineData> {
+    for scan_files in get_scan_files(snapshot, engine)? {
+        let data = scan_files.apply_selection_vector()?;
+        if !data.is_empty() {
+            return Ok(FilteredEngineData::with_all_rows_selected(data));
+        }
+    }
+    Err(Error::generic("expected at least one scan file"))
+}
 
 #[tokio::test]
 async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
@@ -1263,10 +1431,8 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
             .scan_builder()
             .with_stats(StatsOptions::all());
         if use_predicate {
-            scan_builder = scan_builder.with_predicate(Arc::new(Pred::gt(
-                column_expr!("number"),
-                Expr::literal(0_i32),
-            )));
+            scan_builder =
+                scan_builder.with_predicate(Arc::new(Pred::gt(col!("number"), lit(0_i32))));
         }
         let scan = scan_builder.build()?;
 
@@ -1328,11 +1494,11 @@ async fn test_remove_files_after_predicate_scan_includes_stats_parsed(
 #[rstest::rstest]
 #[case::no_predicate(None, &["usa", "japan"])]
 #[case::data_predicate(
-    Some(Pred::gt(column_expr!("id"), Expr::literal(0_i32))),
+    Some(Pred::gt(col!("id"), lit(0_i32))),
     &["usa", "japan"]
 )]
 #[case::partition_predicate(
-    Some(Pred::eq(column_expr!("country"), Expr::literal("usa".to_string()))),
+    Some(Pred::eq(col!("country"), lit("usa".to_string()))),
     &["usa"]
 )]
 #[tokio::test]
