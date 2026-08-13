@@ -134,16 +134,13 @@ impl Transaction {
         self
     }
 
-    /// Applies schema changes before data files are staged in this transaction.
-    ///
-    /// Changes are applied sequentially and the resulting table configuration is validated before
-    /// this method returns.
+    /// Applies schema changes in order before staging data-file actions.
     ///
     /// # Errors
     ///
-    /// Returns an error if the table enables an unsupported schema-evolution feature, `changes` is
-    /// empty, data files have already been staged, or an operation produces a schema that is
-    /// invalid for the table protocol.
+    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are enabled,
+    /// data-file actions have already been staged, or an operation is invalid for the current schema
+    /// or table configuration.
     #[internal_api]
     pub(crate) fn with_schema_changes(
         mut self,

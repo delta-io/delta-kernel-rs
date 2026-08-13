@@ -54,6 +54,18 @@ pub(crate) enum SchemaOperation {
     SetNullable { column: ColumnName },
 }
 
+impl SchemaOperation {
+    #[internal_api]
+    pub(crate) fn add_column(field: StructField, path: Vec<PathSegment>) -> SchemaOperation {
+        SchemaOperation::AddColumn { path, field }
+    }
+
+    #[internal_api]
+    pub(crate) fn set_nullable(column: ColumnName) -> SchemaOperation {
+        SchemaOperation::SetNullable { column }
+    }
+}
+
 fn add_field(parent: &mut StructType, field: StructField) -> DeltaResult<()> {
     let lowered = field.name().to_lowercase();
     if parent

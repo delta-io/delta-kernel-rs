@@ -213,7 +213,7 @@ pub struct Transaction<S = ExistingTable> {
     effective_table_config: TableConfiguration,
     // Whether to emit a Protocol action. True for CREATE TABLE and ALTER TABLE, false otherwise.
     should_emit_protocol: bool,
-    // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
+    // Whether to emit a Metadata action. True when creating or altering table metadata.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
     operation: Option<String>,
@@ -2132,6 +2132,13 @@ mod tests {
         Ok(())
     }
 
+    fn fresh_column_operation() -> SchemaOperation {
+        SchemaOperation::add_column(
+            StructField::nullable("fresh_column", DataType::INTEGER),
+            vec![],
+        )
+    }
+
     #[test]
     fn write_context_reflects_updated_effective_table_config(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2148,10 +2155,7 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
-        let txn = txn.with_schema_changes(vec![SchemaOperation::AddColumn {
-            path: vec![],
-            field: StructField::nullable("fresh_column", DataType::INTEGER),
-        }])?;
+        let txn = txn.with_schema_changes(vec![fresh_column_operation()])?;
 
         let updated_write_context = txn.unpartitioned_write_context()?;
         assert!(updated_write_context
@@ -2164,6 +2168,37 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn schema_changes_are_applied_once_and_persisted_on_commit() -> DeltaResult<()> {
+        let (engine, txn, _tempdir) = create_existing_table_txn()?;
+
+        let snapshot = txn
+            .with_schema_changes(vec![
+                fresh_column_operation(),
+                SchemaOperation::add_column(
+                    StructField::nullable("second_column", DataType::STRING),
+                    ColumnName::new(Vec::<String>::new()),
+                ),
+            ])?
+            .commit(engine.as_ref())?
+            .unwrap_post_commit_snapshot();
+
+        assert!(snapshot.schema().contains("fresh_column"));
+        assert!(snapshot.schema().contains("second_column"));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_changes_are_rejected_after_staging_data() -> DeltaResult<()> {
+        let (_engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        add_dummy_file(&mut txn);
+
+        let result = txn.with_schema_changes(vec![fresh_column_operation()]);
+
+        assert!(matches!(result, Err(Error::InvalidTransactionState(_))));
         Ok(())
     }
 
