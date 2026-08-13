@@ -4,6 +4,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -15,6 +16,7 @@ const DAT_EXISTS_FILE_CHECK: &str = "tests/dat/.done";
 const DAT_OUTPUT_FOLDER: &str = "tests/dat";
 const DAT_VERSION: &str = "0.0.3";
 const ACCEPTANCE_WORKLOADS_VERSION: &str = "0.0.4";
+const DOWNLOAD_ATTEMPTS: usize = 3;
 
 // SHA-256 of the release assets. Each download is otherwise trusted purely on TLS; verifying these
 // digests before extraction stops a tampered or MITM'd tarball from being unpacked to disk. Update
@@ -54,18 +56,34 @@ fn download_dat_files() -> Vec<u8> {
 }
 
 fn download_tarball(url: &str, expected_checksum: &str) -> Vec<u8> {
-    let response = build_agent().get(url).call().unwrap();
+    let agent = build_agent();
+    let mut attempt = 1;
 
+    loop {
+        match download(&agent, url) {
+            Ok(tarball_data) => {
+                verify_checksum(&tarball_data, expected_checksum);
+                return tarball_data;
+            }
+            Err(error) if attempt < DOWNLOAD_ATTEMPTS => {
+                eprintln!("Download attempt {attempt} failed: {error}. Retrying...");
+                std::thread::sleep(Duration::from_secs(1));
+                attempt += 1;
+            }
+            Err(error) => panic!("Failed to download {url}: {error}"),
+        }
+    }
+}
+
+fn download(agent: &Agent, url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let response = agent.get(url).call()?;
     let mut tarball_data: Vec<u8> = Vec::new();
     response
         .into_body()
         .as_reader()
-        .read_to_end(&mut tarball_data)
-        .unwrap();
+        .read_to_end(&mut tarball_data)?;
 
-    verify_checksum(&tarball_data, expected_checksum);
-
-    tarball_data
+    Ok(tarball_data)
 }
 
 /// Panic unless the SHA-256 of `data` equals `expected` (lowercase hex). Called before any
