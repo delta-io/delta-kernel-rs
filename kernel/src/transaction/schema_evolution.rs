@@ -2,15 +2,22 @@
 //! apply schema changes to produce an evolved schema.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
+
+use delta_kernel_derive::internal_api;
 
 use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
-    ColumnMappingMode,
+    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
+    validate_column_mapping_id, ColumnMappingMode,
 };
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
 /// A schema evolution operation to be applied to a table.
@@ -20,6 +27,7 @@ use crate::DeltaResult;
 /// have been applied.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
+#[internal_api]
 pub(crate) enum SchemaOperation {
     /// Add a column or nested field to the table schema.
     ///
@@ -31,8 +39,20 @@ pub(crate) enum SchemaOperation {
         /// The nullable, non-metadata field to add.
         field: StructField,
     },
-    /// Change a column's nullability from NOT NULL to nullable.
+    /// Change a column's nullability to nullable.
     SetNullable { column: ColumnName },
+}
+
+impl SchemaOperation {
+    #[internal_api]
+    pub(crate) fn add_column(field: StructField, path: ColumnName) -> SchemaOperation {
+        SchemaOperation::AddColumn { path, field }
+    }
+
+    #[internal_api]
+    pub(crate) fn set_nullable(column: ColumnName) -> SchemaOperation {
+        SchemaOperation::SetNullable { column }
+    }
 }
 
 fn add_field(parent: &mut StructType, field: StructField) -> DeltaResult<()> {
@@ -101,11 +121,11 @@ fn modify_field_at_path(
 
 /// The result of applying schema operations.
 #[derive(Debug)]
-pub(crate) struct SchemaEvolutionResult {
+pub(super) struct SchemaEvolutionResult {
     /// The evolved schema after all operations are applied.
-    pub schema: SchemaRef,
+    pub(super) schema: SchemaRef,
     /// The new `delta.columnMapping.maxColumnId`, if it increased.
-    pub new_max_column_id: Option<i64>,
+    pub(super) new_max_column_id: Option<i64>,
 }
 
 /// Applies schema operations sequentially, validating each operation against prior changes.
@@ -113,7 +133,7 @@ pub(crate) struct SchemaEvolutionResult {
 /// # Errors
 ///
 /// Returns an error if an operation or the resulting schema is invalid.
-pub(crate) fn apply_schema_operations(
+pub(super) fn apply_schema_operations(
     mut schema: StructType,
     operations: Vec<SchemaOperation>,
     column_mapping_mode: ColumnMappingMode,
@@ -214,6 +234,45 @@ pub(crate) fn apply_schema_operations(
         schema: schema.into(),
         new_max_column_id,
     })
+}
+
+/// Applies schema operations and returns a validated table configuration.
+///
+/// # Errors
+///
+/// Returns an error if an operation cannot be applied or the resulting configuration is invalid.
+pub(super) fn evolve_table_config(
+    table_config: &TableConfiguration,
+    operations: Vec<SchemaOperation>,
+) -> DeltaResult<TableConfiguration> {
+    let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+    let column_mapping_mode = table_config.column_mapping_mode();
+    let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+    let current_has_cm = column_mapping_mode == ColumnMappingMode::None
+        && schema_has_column_mapping_metadata(&schema);
+    let SchemaEvolutionResult {
+        schema: evolved_schema,
+        new_max_column_id,
+    } = apply_schema_operations(
+        schema,
+        operations,
+        column_mapping_mode,
+        current_max_column_id,
+    )?;
+    let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+        strip_stray_column_mapping_metadata(current_has_cm, &evolved_schema)
+            .map_or(evolved_schema, Arc::new)
+    } else {
+        evolved_schema
+    };
+    let evolved_metadata = table_config
+        .metadata()
+        .clone()
+        .with_schema(evolved_schema.clone())?
+        .fold_with(new_max_column_id, |metadata, id| {
+            metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+        });
+    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
 }
 
 #[cfg(test)]
