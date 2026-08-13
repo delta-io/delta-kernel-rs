@@ -31,12 +31,13 @@ use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
+use crate::schema::changes::{evolve_table_config, SchemaOperation};
 use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
 };
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, require};
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -131,6 +132,52 @@ impl Transaction {
     pub fn with_operation(mut self, operation: String) -> Self {
         self.operation = Some(operation);
         self
+    }
+
+    /// Applies schema changes before data files are staged in this transaction.
+    ///
+    /// Changes are applied sequentially and the resulting table configuration is validated before
+    /// this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table enables an unsupported schema-evolution feature, `changes` is
+    /// empty, data files have already been staged, or an operation produces a schema that is
+    /// invalid for the table protocol.
+    #[internal_api]
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: Vec<SchemaOperation>,
+    ) -> DeltaResult<Self> {
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergCompatV3)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
+            ));
+        }
+        require!(
+            !changes.is_empty(),
+            Error::generic("with_schema_changes requires at least one schema operation")
+        );
+        require!(
+            !self.has_data_file_actions(),
+            Error::invalid_transaction_state(
+                "with_schema_changes must be called before staging data files"
+            )
+        );
+        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.should_emit_metadata = true;
+        Ok(self)
     }
 
     /// Remove domain metadata from the Delta log.

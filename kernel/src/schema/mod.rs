@@ -24,12 +24,13 @@ use crate::table_features::{
     StaleAnnotationPolicy,
 };
 use crate::transforms::{transform_output_type, SchemaTransform};
-use crate::utils::require;
-use crate::{CollectInto, DeltaResult, Error};
+use crate::utils::{require, CollectInto};
+use crate::{DeltaResult, Error};
 
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
+pub(crate) mod changes;
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
