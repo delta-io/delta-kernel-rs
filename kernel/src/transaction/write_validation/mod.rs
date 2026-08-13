@@ -11,6 +11,9 @@
 //   `txn.dv_matched_files`
 
 mod addfile;
+mod row_tracking;
+
+pub(crate) use row_tracking::validate_row_tracking_rewrite;
 
 use crate::engine_data::{GetData, RowVisitor};
 use crate::expressions::ColumnName;

@@ -246,6 +246,9 @@ pub struct Transaction<S = ExistingTable> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
+    // Whether the connector asserted that an acknowledged rewrite materialized both stable
+    // row-tracking values for every replacement row.
+    row_tracking_preservation_acknowledged: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
@@ -358,8 +361,9 @@ impl<S> Transaction<S> {
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult<S>> {
         let commit_start = Instant::now();
 
-        // Some table features don't yet support removeFiles. Reject here.
-        if !self.remove_files_metadata.is_empty() {
+        if self.row_tracking_preservation_acknowledged {
+            self.validate_acknowledged_row_tracking_rewrite()?;
+        } else if !self.remove_files_metadata.is_empty() {
             self.effective_table_config
                 .validate_feature_support_for_remove()?;
         }
@@ -438,13 +442,19 @@ impl<S> Transaction<S> {
 
         // Step 2: Construct commit info with ICT if enabled
         let in_commit_timestamp = self.get_in_commit_timestamp(engine)?;
-        let kernel_commit_info = CommitInfo::new(
+        let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
             self.is_blind_append,
         );
+        if self.row_tracking_preservation_acknowledged {
+            kernel_commit_info.tags = Some(HashMap::from([(
+                "delta.rowTracking.preserved".to_string(),
+                "true".to_string(),
+            )]));
+        }
         let commit_info_action = self.generate_commit_info(engine, kernel_commit_info);
 
         // Step 3: Generate Protocol and Metadata actions based on emit flags
@@ -580,6 +590,38 @@ impl<S> Transaction<S> {
             "committer_duration_ns",
             committer_duration.as_nanos() as u64,
         );
+    }
+
+    fn validate_acknowledged_row_tracking_rewrite(&self) -> DeltaResult<()> {
+        let table_config = &self.effective_table_config;
+        require!(
+            table_config.table_properties().enable_row_tracking == Some(true)
+                && table_config.should_write_row_tracking(),
+            Error::unsupported(
+                "row-tracking preservation acknowledgement requires row tracking to be enabled \
+                 and not suspended"
+            )
+        );
+        require!(
+            !table_config.is_catalog_managed(),
+            Error::unsupported("row-tracking rewrites on catalog-managed tables")
+        );
+        require!(
+            !table_config.is_feature_enabled(&TableFeature::IcebergCompatV3),
+            Error::unsupported("row-tracking rewrites on icebergCompatV3 tables")
+        );
+        require!(
+            !self.data_change,
+            Error::generic("acknowledged row-tracking rewrites require dataChange=false")
+        );
+        require!(
+            self.dv_matched_files.is_empty(),
+            Error::unsupported("deletion-vector updates in acknowledged row-tracking rewrites")
+        );
+        write_validation::validate_row_tracking_rewrite(
+            &self.add_files_metadata,
+            &self.remove_files_metadata,
+        )
     }
 
     /// Set the data change flag.
@@ -943,6 +985,31 @@ impl<S> Transaction<S> {
 // =============================================================================
 // Data file methods -- only available on transaction types that support data files
 // =============================================================================
+impl Transaction<ExistingTable> {
+    /// Acknowledges connector responsibility for preserving stable row-tracking values.
+    ///
+    /// The connector must materialize every output row's stable row ID and stable row commit
+    /// version into the configured hidden Parquet fields, retaining their association through
+    /// partitioning, slicing, batching, and encoding. Commit requires enabled, unsuspended row
+    /// tracking and `dataChange=false`. Replacement Adds must exactly cover eligible source
+    /// Removes and satisfy all row-tracking metadata requirements. Deletion-vector updates,
+    /// catalog-managed tables, and `icebergCompatV3` are unsupported. Kernel validates the staged
+    /// Add and Remove structure but does not read the output Parquet files.
+    ///
+    /// This acknowledgement is unavailable for create-table transactions:
+    ///
+    /// ```compile_fail
+    /// use delta_kernel::transaction::{CreateTable, Transaction};
+    ///
+    /// fn acknowledge_create_table(txn: &mut Transaction<CreateTable>) {
+    ///     txn.ack_row_tracking_preservation();
+    /// }
+    /// ```
+    pub fn ack_row_tracking_preservation(&mut self) {
+        self.row_tracking_preservation_acknowledged = true;
+    }
+}
+
 impl<S: SupportsDataFiles> Transaction<S> {
     // TODO(#2499): Remove this API when Engine responsibilities encode column-default handling.
     /// Acknowledges that the connector applies column defaults before writing data files.
@@ -1112,12 +1179,30 @@ impl<S: SupportsDataFiles> Transaction<S> {
     fn shared_write_state(&self) -> DeltaResult<Arc<SharedWriteState>> {
         let table_config = &self.effective_table_config;
         let props = table_config.table_properties();
+        let (materialized_row_id_field, materialized_row_commit_version_field) = if table_config
+            .should_write_row_tracking()
+            && props.enable_row_tracking == Some(true)
+        {
+            let (row_id_name, row_commit_version_name) =
+                table_config.materialized_row_tracking_column_names()?;
+            (
+                Some(StructField::nullable(row_id_name, DataType::LONG)),
+                Some(StructField::nullable(
+                    row_commit_version_name,
+                    DataType::LONG,
+                )),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Arc::new(SharedWriteState {
             table_root: table_config.table_root().clone(),
             logical_schema: table_config.logical_schema_without_partition_columns(),
             physical_schema: table_config.physical_write_schema(),
             column_mapping_mode: table_config.column_mapping_mode(),
             stats_columns: self.stats_columns(),
+            materialized_row_id_field,
+            materialized_row_commit_version_field,
             logical_partition_columns: table_config.logical_partition_columns().to_vec(),
             randomize_file_prefixes: props.should_randomize_file_prefixes(),
             random_prefix_length: props.random_prefix_length(),

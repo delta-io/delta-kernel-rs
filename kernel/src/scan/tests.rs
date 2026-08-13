@@ -532,10 +532,11 @@ fn test_without_row_transforms_rejects_execute() {
     );
 }
 
-/// Row commit version metadata columns are unsupported by scans, so requesting one errors at
-/// build time regardless of `without_row_transforms`.
+/// Row commit version metadata columns require row tracking, regardless of row transforms.
 #[rstest]
-fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_transforms: bool) {
+fn test_scan_rejects_row_commit_version_when_row_tracking_disabled(
+    #[values(false, true)] without_row_transforms: bool,
+) {
     let (_engine, snapshot) = without_transforms_snapshot("./tests/data/basic_partitioned/");
     let schema = Arc::new(
         snapshot
@@ -549,10 +550,10 @@ fn test_scan_rejects_row_commit_version(#[values(false, true)] without_row_trans
     }
     let err = builder
         .build()
-        .expect_err("row commit version columns are unsupported by scans");
+        .expect_err("row commit version columns require row tracking");
     assert!(
         err.to_string()
-            .contains("Row commit versions not supported"),
+            .contains("Row commit versions are not enabled on this table"),
         "unexpected error: {err}"
     );
 }

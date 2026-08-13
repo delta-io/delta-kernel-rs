@@ -8,7 +8,7 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructField};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
@@ -25,6 +25,8 @@ pub(super) struct SharedWriteState {
     pub(super) physical_schema: SchemaRef,
     pub(super) column_mapping_mode: ColumnMappingMode,
     pub(super) stats_columns: Vec<ColumnName>,
+    pub(super) materialized_row_id_field: Option<StructField>,
+    pub(super) materialized_row_commit_version_field: Option<StructField>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
     /// Resolved value of the `delta.randomizeFilePrefixes` table property. When true,
@@ -46,8 +48,9 @@ pub(super) struct SharedWriteState {
 /// (serialized partition values with physical column names as keys). How you use a
 /// `WriteContext` depends on your engine:
 ///
-/// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet`, which handles
-///   everything (transform, write, partition metadata).
+/// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet` for ordinary writes
+///   or `DefaultEngine::write_parquet_preserving_row_tracking` for acknowledged row-tracking
+///   rewrites.
 /// - **Arrow-based custom engines**: write parquet yourself, then call `build_add_file_metadata`
 ///   with the resulting `DataFileMetadata` and this `WriteContext` to produce the Add action
 ///   `EngineData` for [`Transaction::add_files`].
@@ -188,6 +191,22 @@ impl WriteContext {
         &self.shared.stats_columns
     }
 
+    /// Returns the configured physical field that stores stable row IDs.
+    ///
+    /// Returns `None` when row tracking is not enabled for writes. Connectors preserving row
+    /// tracking during a rewrite must write a non-null value for every output row.
+    pub fn materialized_row_id_field(&self) -> Option<&StructField> {
+        self.shared.materialized_row_id_field.as_ref()
+    }
+
+    /// Returns the configured physical field that stores stable row commit versions.
+    ///
+    /// Returns `None` when row tracking is not enabled for writes. Connectors preserving row
+    /// tracking during a rewrite must write a non-null value for every output row.
+    pub fn materialized_row_commit_version_field(&self) -> Option<&StructField> {
+        self.shared.materialized_row_commit_version_field.as_ref()
+    }
+
     /// Returns the serialized partition values for this write context. Keys are physical
     /// column names; values are protocol-serialized strings (`None` = null).
     ///
@@ -315,6 +334,8 @@ mod tests {
             physical_schema: schema.clone(),
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
+            materialized_row_id_field: None,
+            materialized_row_commit_version_field: None,
             logical_partition_columns: partition_columns,
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)

@@ -3,32 +3,43 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 use delta_kernel::arrow::array::{Array, AsArray, Int32Array, Int64Array, StringArray};
-use delta_kernel::arrow::datatypes::{Int32Type, Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{
+    Field as ArrowField, Int32Type, Int64Type, Schema as ArrowSchema,
+};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt};
+use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Error, Snapshot};
 use itertools::Itertools;
 use rstest::rstest;
-use serde_json::{Deserializer, Value};
+use serde_json::{json, Deserializer, Value};
 use tempfile::{tempdir, TempDir};
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use test_utils::delta_kernel_default_engine::DefaultEngine;
 use test_utils::{
-    begin_transaction, collect_row_ids, create_default_engine_mt_executor, create_table,
-    engine_store_setup, load_and_begin_transaction, read_actions_from_commit, read_add_infos,
-    read_scan, test_read,
+    add_commit, begin_transaction, collect_row_ids, create_add_files_metadata,
+    create_default_engine_mt_executor, create_table, engine_store_setup,
+    load_and_begin_transaction, read_actions_from_commit, read_add_infos, read_scan,
+    record_batch_to_bytes, test_read,
 };
 use url::Url;
 
 use crate::common::write_utils::{
     create_dv_update_transaction, get_scan_files, write_deletion_vector_to_store,
 };
+
+const ROW_ID_METADATA_COLUMNS: &[(&str, MetadataColumnSpec)] =
+    &[("row_id", MetadataColumnSpec::RowId)];
+const STABLE_ROW_TRACKING_METADATA_COLUMNS: &[(&str, MetadataColumnSpec)] = &[
+    ("row_id", MetadataColumnSpec::RowId),
+    ("row_commit_version", MetadataColumnSpec::RowCommitVersion),
+];
 
 /// Helper function to create a simple table with row tracking enabled.
 async fn create_row_tracking_table(
@@ -858,18 +869,43 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Build a scan with `MetadataColumnSpec::RowId` appended to the snapshot schema and execute it.
-fn read_row_id_scan(
+fn read_metadata_scan(
     snapshot: Arc<Snapshot>,
     engine: Arc<dyn delta_kernel::Engine>,
+    metadata_columns: &[(&str, MetadataColumnSpec)],
 ) -> DeltaResult<Vec<RecordBatch>> {
-    let scan_schema = Arc::new(
-        snapshot
-            .schema()
-            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?,
-    );
+    let scan_schema = metadata_columns.iter().try_fold(
+        snapshot.schema().as_ref().clone(),
+        |schema, (name, spec)| schema.add_metadata_column(*name, *spec),
+    )?;
+    let scan_schema = Arc::new(scan_schema);
     let scan = snapshot.scan_builder().with_schema(scan_schema).build()?;
     read_scan(&scan, engine)
+}
+
+fn collect_number_to_stable_values(batches: &[RecordBatch]) -> HashMap<i32, (i64, i64)> {
+    let mut values = HashMap::new();
+    for batch in batches {
+        let numbers = batch
+            .column_by_name("number")
+            .expect("number column not found")
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name("row_id")
+            .expect("row_id column not found")
+            .as_primitive::<Int64Type>();
+        let row_commit_versions = batch
+            .column_by_name("row_commit_version")
+            .expect("row_commit_version column not found")
+            .as_primitive::<Int64Type>();
+        for index in 0..batch.num_rows() {
+            values.insert(
+                numbers.value(index),
+                (row_ids.value(index), row_commit_versions.value(index)),
+            );
+        }
+    }
+    values
 }
 
 /// Basic read: write one file with 3 rows, verify row IDs are sequential starting from 0.
@@ -886,12 +922,292 @@ async fn test_read_row_ids_basic() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let batches = read_row_id_scan(snapshot, engine)?;
+    let batches = read_metadata_scan(snapshot, engine, ROW_ID_METADATA_COLUMNS)?;
 
     let mut row_ids = collect_row_ids(&batches);
     row_ids.sort_unstable();
     assert_eq!(row_ids, vec![0, 1, 2], "Row IDs must be sequential from 0");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_read_stable_row_tracking_values_fall_back_to_add_defaults() -> DeltaResult<()> {
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, _store) =
+        setup_number_table(&tmp_dir, "test_read_stable_values_from_defaults").await?;
+    let data = generate_data(schema, [vec![int32_array(vec![10, 20, 30])]])?;
+    write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .unwrap_committed();
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let values = collect_number_to_stable_values(&read_metadata_scan(
+        snapshot,
+        engine,
+        STABLE_ROW_TRACKING_METADATA_COLUMNS,
+    )?);
+    assert_eq!(
+        values,
+        HashMap::from([(10, (0, 1)), (20, (1, 1)), (30, (2, 1))])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_materialized_stable_row_tracking_values_override_add_defaults() -> DeltaResult<()> {
+    let tmp_dir = tempdir()?;
+    let (_schema, table_url, engine, store) =
+        setup_number_table(&tmp_dir, "test_read_materialized_stable_values").await?;
+
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "number",
+            delta_kernel::arrow::datatypes::DataType::Int32,
+            true,
+        ),
+        ArrowField::new(
+            "some_dummy_column_name",
+            delta_kernel::arrow::datatypes::DataType::Int64,
+            true,
+        ),
+        ArrowField::new(
+            "another_dummy_column_name",
+            delta_kernel::arrow::datatypes::DataType::Int64,
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            int32_array(vec![10, 20, 30]),
+            int64_array(vec![7, 9, 11]),
+            int64_array(vec![3, 4, 5]),
+        ],
+    )?;
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let data_file_name = "materialized-row-tracking.parquet";
+    let data_file_url = table_url.join(data_file_name)?;
+    let data_file_path = Path::from_url_path(data_file_url.path())?;
+    store
+        .put(&data_file_path, parquet_bytes.clone().into())
+        .await?;
+
+    let stats = json!({"numRecords": 3}).to_string();
+    let actions = [
+        json!({
+            "add": {
+                "path": data_file_name,
+                "partitionValues": {},
+                "size": parquet_bytes.len(),
+                "modificationTime": 1,
+                "dataChange": true,
+                "stats": stats,
+                "baseRowId": 100,
+                "defaultRowCommitVersion": 1
+            }
+        }),
+        json!({
+            "domainMetadata": {
+                "domain": "delta.rowTracking",
+                "configuration": "{\"rowIdHighWaterMark\":102}",
+                "removed": false
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|action| action.to_string())
+    .join("\n");
+    add_commit(table_url.as_str(), store.as_ref(), 1, actions)
+        .await
+        .map_err(|error| Error::generic(error.to_string()))?;
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let values = collect_number_to_stable_values(&read_metadata_scan(
+        snapshot,
+        engine,
+        STABLE_ROW_TRACKING_METADATA_COLUMNS,
+    )?);
+    assert_eq!(
+        values,
+        HashMap::from([(10, (7, 3)), (20, (9, 4)), (30, (11, 5))])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_five_file_compaction_preserves_stable_row_tracking_values() -> DeltaResult<()> {
+    let tmp_dir = tempdir()?;
+    let (schema, table_url, engine, store) =
+        setup_number_table(&tmp_dir, "test_five_file_row_tracking_compaction").await?;
+
+    for source_file in 0..5 {
+        let first_number = source_file * 2 + 1;
+        let data = generate_data(
+            schema.clone(),
+            [vec![int32_array(vec![first_number, first_number + 1])]],
+        )?;
+        write_data_to_table(&table_url, engine.clone(), data)
+            .await?
+            .unwrap_committed();
+    }
+
+    let source_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let before = collect_number_to_stable_values(&read_metadata_scan(
+        source_snapshot.clone(),
+        engine.clone(),
+        STABLE_ROW_TRACKING_METADATA_COLUMNS,
+    )?);
+    assert_eq!(before.len(), 10);
+
+    let mut stable_rows = before
+        .iter()
+        .map(|(&number, &(row_id, row_commit_version))| (number, row_id, row_commit_version))
+        .collect::<Vec<_>>();
+    stable_rows.sort_unstable_by_key(|(number, _, _)| *number);
+
+    let mut txn =
+        load_and_begin_transaction(table_url.clone(), engine.as_ref())?.with_data_change(false);
+    let write_context = txn.unpartitioned_write_context()?;
+    let row_id_field = write_context
+        .materialized_row_id_field()
+        .expect("row tracking write context must expose its materialized row ID field")
+        .clone();
+    let row_commit_version_field = write_context
+        .materialized_row_commit_version_field()
+        .expect("row tracking write context must expose its materialized row commit version field")
+        .clone();
+    let replacement_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "number",
+            delta_kernel::arrow::datatypes::DataType::Int32,
+            true,
+        ),
+        (&row_id_field).try_into_arrow()?,
+        (&row_commit_version_field).try_into_arrow()?,
+    ]));
+    let replacement_batch = RecordBatch::try_new(
+        replacement_schema,
+        vec![
+            int32_array(stable_rows.iter().map(|(number, _, _)| *number).collect()),
+            int64_array(stable_rows.iter().map(|(_, row_id, _)| *row_id).collect()),
+            int64_array(
+                stable_rows
+                    .iter()
+                    .map(|(_, _, row_commit_version)| *row_commit_version)
+                    .collect(),
+            ),
+        ],
+    )?;
+    let replacement_bytes = record_batch_to_bytes(&replacement_batch);
+    let replacement_path = "compacted-row-tracking.parquet";
+    let replacement_url = table_url.join(replacement_path)?;
+    store
+        .put(
+            &Path::from_url_path(replacement_url.path())?,
+            replacement_bytes.clone().into(),
+        )
+        .await?;
+
+    let add_metadata = create_add_files_metadata(
+        txn.add_files_schema(),
+        vec![(
+            replacement_path,
+            replacement_bytes.len() as i64,
+            1,
+            Some(stable_rows.len() as i64),
+        )],
+    )
+    .map_err(|error| Error::generic(error.to_string()))?;
+    txn.add_files(add_metadata);
+    for source_files in get_scan_files(source_snapshot, engine.as_ref())? {
+        txn.remove_files(source_files);
+    }
+    txn.ack_row_tracking_preservation();
+    let post_compaction_snapshot = txn.commit(engine.as_ref())?.unwrap_post_commit_snapshot();
+
+    let after = collect_number_to_stable_values(&read_metadata_scan(
+        post_compaction_snapshot,
+        engine.clone(),
+        STABLE_ROW_TRACKING_METADATA_COLUMNS,
+    )?);
+    assert_eq!(after, before);
+
+    let replacement_file = std::fs::File::open(
+        replacement_url
+            .to_file_path()
+            .map_err(|_| Error::generic("replacement Parquet URL is not a local file"))?,
+    )?;
+    let written_batch = ParquetRecordBatchReaderBuilder::try_new(replacement_file)?
+        .build()?
+        .next()
+        .expect("replacement Parquet file must contain a record batch")?;
+    let written_row_ids = written_batch
+        .column_by_name(row_id_field.name())
+        .expect("replacement Parquet must contain the configured row ID column")
+        .as_primitive::<Int64Type>();
+    let written_row_commit_versions = written_batch
+        .column_by_name(row_commit_version_field.name())
+        .expect("replacement Parquet must contain the configured row commit version column")
+        .as_primitive::<Int64Type>();
+    assert_eq!(written_row_ids.null_count(), 0);
+    assert_eq!(written_row_commit_versions.null_count(), 0);
+
+    let adds = read_actions_from_commit(&table_url, 6, "add")
+        .map_err(|error| Error::generic(error.to_string()))?;
+    assert_eq!(adds.len(), 1);
+    assert_eq!(adds[0]["baseRowId"], 10);
+    assert_eq!(adds[0]["defaultRowCommitVersion"], 6);
+    assert_eq!(adds[0]["dataChange"], false);
+    let removes = read_actions_from_commit(&table_url, 6, "remove")
+        .map_err(|error| Error::generic(error.to_string()))?;
+    assert_eq!(removes.len(), 5);
+    assert!(removes.iter().all(|remove| remove["dataChange"] == false));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_context_exposes_configured_materialized_row_tracking_fields() -> DeltaResult<()>
+{
+    let tmp_dir = tempdir()?;
+    let schema = Arc::new(StructType::try_new([StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+    let (table_url, engine, _store) = create_row_tracking_table_with_features(
+        &tmp_dir,
+        "test_write_context_row_tracking_fields",
+        schema,
+        &["columnMapping"],
+        &[],
+    )
+    .await?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let txn = begin_transaction(snapshot, engine.as_ref())?;
+    let write_context = txn.unpartitioned_write_context()?;
+
+    let row_id_field = write_context
+        .materialized_row_id_field()
+        .expect("row ID field should be configured");
+    assert_eq!(row_id_field.name(), "some_dummy_column_name");
+    assert_eq!(row_id_field.data_type(), &DataType::LONG);
+    assert!(row_id_field.is_nullable());
+
+    let row_commit_version_field = write_context
+        .materialized_row_commit_version_field()
+        .expect("row commit version field should be configured");
+    assert_eq!(row_commit_version_field.name(), "another_dummy_column_name");
+    assert_eq!(row_commit_version_field.data_type(), &DataType::LONG);
+    assert!(row_commit_version_field.is_nullable());
+
+    assert!(!write_context
+        .physical_schema()
+        .contains(row_id_field.name()));
+    assert!(!write_context
+        .physical_schema()
+        .contains(row_commit_version_field.name()));
     Ok(())
 }
 
@@ -948,7 +1264,11 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
     // Snapshot the (value -> row_id) mapping before any deletion. value v sits at physical index
     // (v - 100), and with baseRowId 0 that is also its row ID.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let before = collect_number_to_row_id(&read_row_id_scan(snapshot.clone(), engine.clone())?);
+    let before = collect_number_to_row_id(&read_metadata_scan(
+        snapshot.clone(),
+        engine.clone(),
+        ROW_ID_METADATA_COLUMNS,
+    )?);
     assert_eq!(
         before,
         (100..110)
@@ -986,7 +1306,11 @@ async fn test_read_row_ids_stable_across_deletion_vector_update(
 
     // Every survivor keeps the exact row ID it had before.
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let after = collect_number_to_row_id(&read_row_id_scan(snapshot, engine.clone())?);
+    let after = collect_number_to_row_id(&read_metadata_scan(
+        snapshot,
+        engine.clone(),
+        ROW_ID_METADATA_COLUMNS,
+    )?);
 
     let expected_survivors: HashMap<i32, i64> = (100..110)
         .filter(|v| !deleted_indexes.contains(&((v - 100) as u64)))
@@ -1030,7 +1354,7 @@ async fn test_read_row_ids_multiple_files_one_commit() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let batches = read_row_id_scan(snapshot, engine)?;
+    let batches = read_metadata_scan(snapshot, engine, ROW_ID_METADATA_COLUMNS)?;
 
     let mut all_ids = collect_row_ids(&batches);
     all_ids.sort_unstable();
@@ -1079,7 +1403,7 @@ async fn test_read_row_ids_multiple_commits() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let batches = read_row_id_scan(snapshot, engine)?;
+    let batches = read_metadata_scan(snapshot, engine, ROW_ID_METADATA_COLUMNS)?;
 
     let mut all_ids = collect_row_ids(&batches);
     all_ids.sort_unstable();
@@ -1123,7 +1447,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
 
     // Fresh snapshot loaded from the checkpoint must return the same row IDs.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
-    let batches = read_row_id_scan(fresh_snapshot, mt_engine.clone())?;
+    let batches = read_metadata_scan(fresh_snapshot, mt_engine.clone(), ROW_ID_METADATA_COLUMNS)?;
 
     let mut ids_after_ckpt = collect_row_ids(&batches);
     ids_after_ckpt.sort_unstable();
@@ -1140,7 +1464,7 @@ async fn test_read_row_ids_after_checkpoint() -> DeltaResult<()> {
         .is_committed());
 
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(mt_engine.as_ref())?;
-    let batches2 = read_row_id_scan(snapshot2, mt_engine)?;
+    let batches2 = read_metadata_scan(snapshot2, mt_engine, ROW_ID_METADATA_COLUMNS)?;
 
     let mut all_ids = collect_row_ids(&batches2);
     all_ids.sort_unstable();
@@ -1282,7 +1606,7 @@ async fn test_read_row_ids_after_log_compaction() -> DeltaResult<()> {
     // Load a fresh snapshot -- it should read Protocol and Metadata and file list from the
     // compaction file.
     let fresh_snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let scan_batches = read_row_id_scan(fresh_snapshot, engine)?;
+    let scan_batches = read_metadata_scan(fresh_snapshot, engine, ROW_ID_METADATA_COLUMNS)?;
 
     let mut all_ids = collect_row_ids(&scan_batches);
     all_ids.sort_unstable();

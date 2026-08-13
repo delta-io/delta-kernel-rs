@@ -1,11 +1,63 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use super::Transaction;
 use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
-use crate::expressions::{MapData, Scalar};
-use crate::schema::{schema_ref, MapType, ToSchema};
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::expressions::{column_name, ColumnName, MapData, Scalar};
+use crate::schema::{schema_ref, ColumnNamesAndTypes, MapType, SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
-use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
+use crate::utils::require;
+use crate::{
+    DataType, DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData,
+};
+
+static COMMIT_INFO_TAGS_COLUMN: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+    (
+        vec![column_name!("tags")],
+        vec![MapType::new(DataType::STRING, DataType::STRING, false).into()],
+    )
+        .into()
+});
+
+#[derive(Default)]
+struct CommitInfoTagsVisitor {
+    tags: Option<HashMap<String, String>>,
+}
+
+impl RowVisitor for CommitInfoTagsVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        COMMIT_INFO_TAGS_COLUMN.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            row_count == 1 && getters.len() == 1,
+            Error::generic("engine CommitInfo must contain exactly one row")
+        );
+        self.tags = getters[0].get_opt(0, "tags")?;
+        Ok(())
+    }
+}
+
+fn merge_commit_info_tags(
+    engine_commit_info: &dyn EngineData,
+    engine_commit_info_schema: &SchemaRef,
+    kernel_tags: Option<HashMap<String, String>>,
+) -> DeltaResult<Option<HashMap<String, String>>> {
+    let Some(kernel_tags) = kernel_tags else {
+        return Ok(None);
+    };
+    if !engine_commit_info_schema.contains("tags") {
+        return Ok(Some(kernel_tags));
+    }
+
+    let mut visitor = CommitInfoTagsVisitor::default();
+    visitor.visit_rows_of(engine_commit_info)?;
+    let mut merged = visitor.tags.unwrap_or_default();
+    merged.extend(kernel_tags);
+    Ok(Some(merged))
+}
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -15,7 +67,8 @@ fn commit_info_literal_exprs(
     commit_info: CommitInfo,
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
     let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
-    let literal_exprs = vec![
+    let tags_present = commit_info.tags.is_some();
+    let mut literal_exprs = vec![
         (
             "timestamp",
             Arc::new(Expression::literal(commit_info.timestamp)),
@@ -55,7 +108,18 @@ fn commit_info_literal_exprs(
         ),
         ("txnId", Arc::new(Expression::literal(commit_info.txn_id))),
     ];
-    let expected_expr_len = CommitInfo::to_schema().fields().len();
+    if let Some(tags) = commit_info.tags {
+        let tags_map_type = MapType::new(DataType::STRING, DataType::STRING, false);
+        literal_exprs.push((
+            "tags",
+            Arc::new(Expression::literal(Scalar::Map(MapData::try_new(
+                tags_map_type,
+                tags.into_iter()
+                    .map(|(key, value)| (Scalar::String(key), Scalar::String(value))),
+            )?))),
+        ));
+    }
+    let expected_expr_len = CommitInfo::to_schema().fields().len() - usize::from(!tags_present);
     if literal_exprs.len() != expected_expr_len {
         return Err(Error::Generic(format!("expect the commit_info_literal_exprs return {expected_expr_len} expressions, but only get {} expressions. \
             If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())));
@@ -67,10 +131,15 @@ impl<S> Transaction<S> {
     pub(super) fn generate_commit_info(
         &self,
         engine: &dyn Engine,
-        kernel_commit_info: CommitInfo,
+        mut kernel_commit_info: CommitInfo,
     ) -> Result<Box<dyn EngineData>, Error> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
+                kernel_commit_info.tags = merge_commit_info_tags(
+                    engine_commit_info.as_ref(),
+                    engine_commit_info_schema,
+                    kernel_commit_info.tags.take(),
+                )?;
                 let kernel_schema = CommitInfo::to_schema();
 
                 // Step 1: Build literal expressions for each CommitInfo field.
@@ -121,6 +190,7 @@ impl<S> Transaction<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::actions::CommitInfo;
@@ -280,10 +350,10 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All CommitInfo fields are appended -- total = 2 engine + 8 CommitInfo.
+        // The absent optional tags field is not appended to an engine-supplied schema.
         assert_eq!(
             commit_info.num_columns(),
-            2 + CommitInfo::to_schema().fields().count()
+            2 + CommitInfo::to_schema().fields().count() - 1
         );
 
         // Engine fields are first and their values pass through unchanged.
@@ -304,7 +374,7 @@ mod tests {
         Ok(())
     }
 
-    /// engine schema contains every kernel's CommitInfo field.
+    /// engine schema contains every populated kernel CommitInfo field.
     /// All overlapping fields must be replaced by kernel values, no new fields added.
     #[test]
     fn test_build_commit_info_full_overlap() -> DeltaResult<()> {
@@ -347,7 +417,7 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All 8 CommitInfo fields are present in the engine schema -- no fields appended.
+        // Every populated CommitInfo field is present in the engine schema, so none are appended.
         assert_eq!(commit_info.num_columns(), 8);
 
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
@@ -398,11 +468,10 @@ mod tests {
         assert_eq!(ci.fields()[1].name(), "operation");
         assert_eq!(ci.fields()[2].name(), "myCustomField");
 
-        // Remaining CommitInfo fields (6 not in engine schema) are appended after myCustomField.
-        // Total = 3 engine fields + 6 kernel-only fields.
+        // Remaining populated CommitInfo fields are appended after myCustomField.
         assert_eq!(
             ci.num_columns(),
-            3 + CommitInfo::to_schema().fields().count() - 2
+            3 + CommitInfo::to_schema().fields().count() - 3
         );
         Ok(())
     }
@@ -471,14 +540,103 @@ mod tests {
         )?;
         let ci = commit_info_struct(&result);
 
-        // With no engine fields, the inner schema matches CommitInfo::to_schema().
+        // With no engine fields, every populated CommitInfo field is appended.
         let kernel_schema = CommitInfo::to_schema();
-        assert_eq!(ci.num_columns(), kernel_schema.fields().count());
+        let expected_fields: Vec<_> = kernel_schema
+            .fields()
+            .filter(|field| field.name() != "tags")
+            .collect();
+        assert_eq!(ci.num_columns(), expected_fields.len());
 
         // Column order matches CommitInfo schema field order.
-        for (i, field) in kernel_schema.fields().enumerate() {
+        for (i, field) in expected_fields.into_iter().enumerate() {
             assert_eq!(ci.fields()[i].name(), field.name());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_commit_info_appends_kernel_tags() -> DeltaResult<()> {
+        let (data, schema) = make_engine_commit_info(
+            vec![ArrowField::new("customApp", ArrowDataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["myApp"])) as ArrayRef],
+        );
+        let (engine, txn) = make_txn(Some((data, schema)))?;
+        let mut kernel_commit_info = make_kernel_commit_info();
+        kernel_commit_info.tags = Some(HashMap::from([(
+            "delta.rowTracking.preserved".to_string(),
+            "true".to_string(),
+        )]));
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), kernel_commit_info)?,
+        )?;
+        let commit_info = commit_info_struct(&result);
+        let tags = get_map(commit_info, "tags");
+        let keys = tags
+            .column_by_name("key")
+            .expect("tags key column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string tag keys");
+        let values = tags
+            .column_by_name("value")
+            .expect("tags value column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string tag values");
+        assert_eq!(keys.value(0), "delta.rowTracking.preserved");
+        assert_eq!(values.value(0), "true");
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_commit_info_merges_kernel_tags_with_engine_tags() -> DeltaResult<()> {
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        map_builder.keys().append_value("audit.lineage");
+        map_builder.values().append_value("retain-me");
+        map_builder
+            .keys()
+            .append_value("delta.rowTracking.preserved");
+        map_builder.values().append_value("false");
+        map_builder.append(true).unwrap();
+        let engine_tags = Arc::new(map_builder.finish()) as ArrayRef;
+        let (data, schema) = make_engine_commit_info(
+            vec![ArrowField::new(
+                "tags",
+                engine_tags.data_type().clone(),
+                true,
+            )],
+            vec![engine_tags],
+        );
+        let (engine, txn) = make_txn(Some((data, schema)))?;
+        let mut kernel_commit_info = make_kernel_commit_info();
+        kernel_commit_info.tags = Some(HashMap::from([(
+            "delta.rowTracking.preserved".to_string(),
+            "true".to_string(),
+        )]));
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.generate_commit_info(engine.as_ref(), kernel_commit_info)?,
+        )?;
+        let tags = get_map(commit_info_struct(&result), "tags");
+        let keys = tags
+            .column_by_name("key")
+            .expect("tags key column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string tag keys");
+        let values = tags
+            .column_by_name("value")
+            .expect("tags value column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string tag values");
+        let merged = (0..keys.len())
+            .map(|index| (keys.value(index), values.value(index)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(merged.get("audit.lineage"), Some(&"retain-me"));
+        assert_eq!(merged.get("delta.rowTracking.preserved"), Some(&"true"));
         Ok(())
     }
 }
