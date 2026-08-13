@@ -248,14 +248,12 @@ unsafe fn visit_expression_column_impl(
             "column must have at least one field part",
         ));
     }
-    // Each part is one column field name, used verbatim; a field name may therefore contain any
-    // character, including a period. Empty parts are rejected: an empty field name is a caller
-    // bug, kept symmetric with the parts_len == 0 guard.
+
     let slices = unsafe { std::slice::from_raw_parts(parts, parts_len) };
     let fields = slices
         .iter()
-        .map(|slice| unsafe { <&str>::try_from_slice(slice) })
-        .collect::<DeltaResult<Vec<&str>>>()?;
+        .map(|slice| unsafe { String::try_from_slice(slice) })
+        .collect::<DeltaResult<Vec<String>>>()?;
     if fields.iter().any(|field| field.is_empty()) {
         return Err(delta_kernel::Error::generic(
             "column field part must not be empty",
@@ -1106,10 +1104,6 @@ mod tests {
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, lit(expected));
     }
-
-    // ============================================================================
-    // visit_expression_column_impl (structured field parts)
-    // ============================================================================
 
     /// A field name containing a literal period must survive as a single field part.
     #[test]

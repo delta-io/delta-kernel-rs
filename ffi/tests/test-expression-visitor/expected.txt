@@ -266,10 +266,4 @@ And
 SUCCESS: Round-trip predicate matches original!
 
 === Dotted-field Column Round-trip Test ===
-Builds column ["a", "b.c", "d"] from structured parts and checks the field
-containing a period survives as a single part.
-
-Column(a, b.c, d)
-
-=== Dotted-field Column Round-trip Result ===
 SUCCESS: dotted field "b.c" survived as a single column part!

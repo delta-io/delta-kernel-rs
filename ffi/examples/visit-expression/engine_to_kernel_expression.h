@@ -114,7 +114,7 @@ uintptr_t convert_engine_to_kernel_binop(
       state, binop->exprs.list[0]);
   uintptr_t right = convert_engine_to_kernel_expression_item(
       state, binop->exprs.list[1]);
-  
+
   switch (binop->op) {
     case Add:
       return visit_expression_plus(state, left, right);
@@ -154,10 +154,10 @@ const void* convert_engine_to_kernel_next_fn(void* data) {
     // Return NULL to signal end of iteration
     return NULL;
   }
-  
+
   ExpressionItem item = iter_state->list->list[iter_state->current_index];
   iter_state->current_index++;
-  
+
   uintptr_t result = convert_engine_to_kernel_expression_item(iter_state->state, item);
   // Return the result as a pointer (cast uintptr_t to void*)
   return (const void*)result;
@@ -171,12 +171,12 @@ uintptr_t convert_engine_to_kernel_variadic(
     .current_index = 0,
     .state = state
   };
-  
+
   EngineIterator iterator = {
     .data = &iter_state,
     .get_next = convert_engine_to_kernel_next_fn
   };
-  
+
   switch (variadic->op) {
     case And:
       return visit_predicate_and(state, &iterator);
@@ -198,7 +198,7 @@ uintptr_t convert_engine_to_kernel_unary(
   assert(unary->sub_expr.len == 1);
   uintptr_t inner = convert_engine_to_kernel_expression_item(
       state, unary->sub_expr.list[0]);
-  
+
   switch (unary->type) {
     case Not:
       return visit_predicate_not(state, inner);
@@ -225,8 +225,6 @@ uintptr_t convert_engine_to_kernel_expression_item(
       return convert_engine_to_kernel_unary(state, (struct Unary*)item.ref);
     case Column: {
       struct Column* column = (struct Column*)item.ref;
-      // The kernel copies the parts out before visit_expression_column returns, so this
-      // array only needs to outlive the call.
       KernelStringSlice* parts = malloc(sizeof(KernelStringSlice) * column->len);
       for (size_t i = 0; i < column->len; i++) {
         parts[i].ptr = column->parts[i];
@@ -288,7 +286,7 @@ static inline uintptr_t expression_item_list_visitor(
  * Convert an engine expression to a kernel expression using the visitor
  * pattern. Returns a SharedExpression handle that must be freed with
  * free_kernel_expression.
- * 
+ *
  * This function uses the EngineExpression visitor pattern, completely
  * hiding KernelExpressionVisitorState management from the caller.
  */
@@ -298,10 +296,10 @@ SharedExpression* convert_engine_to_kernel_expression(
     .expression = (void*)&expr_list,
     .visitor = expression_item_list_visitor
   };
-  
+
   ExternResultHandleSharedExpression result = visit_engine_expression(
       &engine_expr, allocate_error);
-  
+
   if (result.tag == OkHandleSharedExpression) {
     return result.ok;
   } else {
@@ -325,7 +323,7 @@ static inline uintptr_t predicate_item_list_visitor(
  * Convert an engine predicate to a kernel predicate using the visitor
  * pattern. Returns a SharedPredicate handle that must be freed with
  * free_kernel_predicate.
- * 
+ *
  * This function uses the EnginePredicate visitor pattern, completely
  * hiding KernelExpressionVisitorState management from the caller.
  */
@@ -335,10 +333,10 @@ SharedPredicate* convert_engine_to_kernel_predicate(
     .predicate = (void*)&pred_list,
     .visitor = predicate_item_list_visitor
   };
-  
+
   ExternResultHandleSharedPredicate result = visit_engine_predicate(
       &engine_pred, allocate_error);
-  
+
   if (result.tag == OkHandleSharedPredicate) {
     return result.ok;
   } else {
@@ -348,4 +346,3 @@ SharedPredicate* convert_engine_to_kernel_predicate(
     abort();
   }
 }
-

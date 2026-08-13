@@ -81,22 +81,16 @@ bool run_test_case(const TestCase* test) {
 // period is preserved as a single part. The reconstructed kernel column must match the reference
 // column built directly in Rust.
 bool run_dotted_column_roundtrip_test() {
-  printf("=== Dotted-field Column Round-trip Test ===\n");
-  printf("Builds column [\"a\", \"b.c\", \"d\"] from structured parts and checks the field\n"
-         "containing a period survives as a single part.\n\n");
-
   const char* parts[] = { "a", "b.c", "d" };
   struct Column* column = make_column(parts, 3);
   ExpressionItemList expr_list = { .len = 1, .list = malloc(sizeof(ExpressionItem)) };
   expr_list.list[0] = (ExpressionItem){ .ref = column, .type = Column };
 
-  print_expression(expr_list);
-
   SharedExpression* reconstructed = convert_engine_to_kernel_expression(expr_list);
   SharedExpression* reference = get_testing_dotted_field_column();
   bool equal = expressions_are_equal(&reconstructed, &reference);
 
-  printf("\n=== Dotted-field Column Round-trip Result ===\n");
+  printf("=== Dotted-field Column Round-trip Test ===\n");
   if (equal) {
     printf("SUCCESS: dotted field \"b.c\" survived as a single column part!\n");
   } else {
