@@ -725,7 +725,7 @@ impl Protocol {
                 // past delta-spark bug produced (3, 7) tables with ColumnMapping in writerFeatures
                 // only and an empty readerFeatures. Such tables still read correctly because the
                 // mode comes from writerFeatures, and rejecting them would break existing
-                // production tables.
+                // production tables. See #3110 to tighten this once such tables are migrated.
                 //
                 // Validate the whole writer list before warning: a non-legacy orphan rejects the
                 // protocol outright, so we must not emit an acceptance warning for a legacy orphan
