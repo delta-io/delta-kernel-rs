@@ -1,4 +1,5 @@
-//! Schema evolution operations and validation.
+//! This module defines the [`SchemaOperation`] enum and functions that validate and
+//! apply schema changes to produce an evolved schema.
 
 use std::cmp::Ordering;
 
@@ -51,10 +52,14 @@ pub(crate) enum SchemaPathSegment {
 }
 
 /// A schema evolution operation to be applied to a table.
+///
+/// Operations are validated and applied in order during
+/// [`apply_schema_operations`]. Each operation sees the schema state after all prior operations
+/// have been applied.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub(crate) enum SchemaOperation {
-    /// Add a column at an explicit schema path.
+    /// Add a column or nested field to the table schema.
     ///
     /// The path identifies the struct that will contain `field`. An empty path adds `field` to the
     /// table's root schema.
@@ -88,7 +93,7 @@ fn set_field_nullable(field: &mut StructType, name: &str) -> DeltaResult<()> {
         .field_map_mut()
         .values_mut()
         .find(|field| field.name().to_lowercase() == name.to_lowercase())
-        .ok_or_else(|| Error::generic(format!("field '{}' does not exist", name)))?;
+        .ok_or_else(|| Error::schema(format!("field '{}' does not exist", name)))?;
     field.nullable = true;
     Ok(())
 }
@@ -109,8 +114,9 @@ fn modify_field_at_path(
     modifier: impl FnOnce(&mut StructType) -> DeltaResult<()>,
 ) -> DeltaResult<()> {
     let Some((segment, rest)) = path.split_first() else {
+        // `path` is empty, attempt to modify the current struct.
         let DataType::Struct(parent) = data_type else {
-            return Err(Error::generic("path target is not a struct"));
+            return Err(Error::schema("path target is not a struct"));
         };
         return modifier(parent);
     };
@@ -162,7 +168,11 @@ pub(crate) fn apply_schema_operations(
 ) -> DeltaResult<SchemaEvolutionResult> {
     let cm_enabled = column_mapping_mode != ColumnMappingMode::None;
 
-    // Reject an invalid persisted max column ID before allocating new IDs.
+    // Reject a persisted seed that already violates the protocol's 32-bit non-negative bound
+    // before it propagates into the allocator. A negative or above-i32::MAX seed almost
+    // certainly indicates a non-conforming writer; bail out rather than silently letting the
+    // allocator either trip the per-field validator on every preserved sibling or produce
+    // out-of-range fresh ids.
     if let Some(seed) = current_max_column_id {
         validate_column_mapping_id(seed).map_err(|e| {
             Error::invalid_protocol(format!(
@@ -198,6 +208,8 @@ pub(crate) fn apply_schema_operations(
                         field.name()
                     )));
                 }
+                // TODO: Reject caller-supplied column mapping IDs and physical names recursively.
+                // Preserving them can reuse a dropped column's historical identity.
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
                         Error::invalid_protocol(
@@ -775,12 +787,12 @@ mod tests {
     }
 
     fn field_with_id_only(name: &str, ty: DataType, id: i64) -> StructField {
-        let mut f = StructField::nullable(name, ty);
-        f.metadata.insert(
+        let mut field = StructField::nullable(name, ty);
+        field.metadata.insert(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
             MetadataValue::Number(id),
         );
-        f
+        field
     }
 
     #[rstest]
