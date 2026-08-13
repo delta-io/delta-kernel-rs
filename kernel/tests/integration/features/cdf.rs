@@ -6,7 +6,7 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::expressions::{column_expr, Expression as Expr, Predicate as Pred};
+use delta_kernel::expressions::{col, lit, Predicate as Pred};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
@@ -666,8 +666,7 @@ async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Err
     let engine = create_default_engine(&table_url)?;
     let table_changes = TableChanges::try_new(table_url.clone(), engine.as_ref(), 1, Some(1))?;
 
-    let predicate: PredicateRef =
-        Arc::new(Pred::gt(column_expr!("UserId"), Expr::literal(1000i64)));
+    let predicate: PredicateRef = Arc::new(Pred::gt(col!("UserId"), lit(1000i64)));
     let scan = table_changes
         .into_scan_builder()
         .with_predicate(predicate)

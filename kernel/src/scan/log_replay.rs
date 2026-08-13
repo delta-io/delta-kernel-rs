@@ -12,7 +12,7 @@ use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    column_expr, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
+    col, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
     PredicateRef, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
@@ -296,7 +296,7 @@ impl ScanLogReplayProcessor {
                 column_expr_ref!("partitionValues_parsed"),
                 // The transform flattens `add.*` to top-level columns, so `path` is non-null
                 // exactly for Add rows.
-                Arc::new(Predicate::is_not_null(column_expr!("path")).into()),
+                Arc::new(Predicate::is_not_null(col!("path")).into()),
                 output_schema.clone(),
                 &state_info.physical_stats_columns,
                 Some(metrics.clone()),
@@ -835,11 +835,8 @@ fn get_add_transform_expr(
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
         Arc::new(Expression::coalesce([
-            Expression::column(["add", "stats"]),
-            Expression::unary(
-                UnaryExpressionOp::ToJson,
-                Expression::column(["add", "stats_parsed"]),
-            ),
+            col!("add.stats"),
+            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
@@ -866,10 +863,10 @@ fn get_add_transform_expr(
     if let Some(stats_schema) = physical_stats_schema {
         let stats_parsed_expr = if has_stats_parsed {
             // Checkpoint has stats_parsed column - read directly
-            column_expr!("add.stats_parsed")
+            col!("add.stats_parsed")
         } else {
             // No stats_parsed available (JSON log files) - parse JSON
-            Expression::parse_json(column_expr!("add.stats"), stats_schema)
+            Expression::parse_json(col!("add.stats"), stats_schema)
         };
         fields.push(Arc::new(stats_parsed_expr));
     }
@@ -879,10 +876,10 @@ fn get_add_transform_expr(
     if partition_schema.is_some() {
         let pv_parsed_expr = if has_partition_values_parsed {
             // Checkpoint carries a native partitionValues_parsed column - read it directly.
-            column_expr!("add.partitionValues_parsed")
+            col!("add.partitionValues_parsed")
         } else {
             // No native column (JSON commit): reconstruct from the string map.
-            Expression::map_to_struct(column_expr!("add.partitionValues"))
+            Expression::map_to_struct(col!("add.partitionValues"))
         };
         fields.push(Arc::new(pv_parsed_expr));
     }
@@ -1159,7 +1156,7 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        BinaryExpressionOp, ColumnName, Expression, OpaquePredicateOp, Predicate, Scalar,
+        col, lit, BinaryExpressionOp, ColumnName, Expression, OpaquePredicateOp, Predicate, Scalar,
         ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
@@ -1422,11 +1419,11 @@ mod tests {
                 assert_eq!(row_id_patch.insertions.len(), 1);
                 let expr = &row_id_patch.insertions[0];
                 let expected_expr = Arc::new(Expr::coalesce([
-                    Expr::column(["row_id_col"]),
+                    col!("row_id_col"),
                     Expr::binary(
                         BinaryExpressionOp::Plus,
-                        Expr::literal(42i64),
-                        Expr::column(["row_indexes_for_row_id_0"]),
+                        lit(42i64),
+                        col!("row_indexes_for_row_id_0"),
                     ),
                 ]));
                 assert_eq!(expr, &expected_expr);
@@ -1498,10 +1495,7 @@ mod tests {
             StructField::new("id", DataType::INTEGER, true),
             StructField::new("value", DataType::STRING, true),
         ]));
-        let predicate = Arc::new(crate::expressions::Predicate::eq(
-            Expr::column(["id"]),
-            Expr::literal(10i32),
-        ));
+        let predicate = Arc::new(crate::expressions::Predicate::eq(col!("id"), lit(10i32)));
         let state_info = Arc::new(
             get_state_info(
                 schema.clone(),
@@ -1899,7 +1893,7 @@ mod tests {
             StructField::new("value", DataType::INTEGER, true),
         ])),
         vec![],
-        Arc::new(Expression::column(["value"]).gt(Expression::literal(5i32))),
+        Arc::new(col!("value").gt(lit(5i32))),
         false, // use batch without partition column
     )]
     #[case::partition_predicate(
@@ -1908,7 +1902,7 @@ mod tests {
             StructField::new("date", DataType::DATE, true),
         ])),
         vec!["date".to_string()],
-        Arc::new(Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510)))),
+        Arc::new(col!("date").eq(lit(Scalar::Date(17_510)))),
         true, // use batch with partition column
     )]
     #[case::mixed_stats_and_partition(
@@ -1918,8 +1912,8 @@ mod tests {
         ])),
         vec!["date".to_string()],
         Arc::new(Predicate::and(
-            Expression::column(["value"]).gt(Expression::literal(5i32)),
-            Expression::column(["date"]).eq(Expression::literal(Scalar::Date(17_510))),
+            col!("value").gt(lit(5i32)),
+            col!("date").eq(lit(Scalar::Date(17_510))),
         )),
         true, // use batch with partition column
     )]

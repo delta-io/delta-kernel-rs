@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 use delta_kernel_derive::{internal_api, IntoEngineData, IntoStructData, ToSchema};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
@@ -17,8 +18,8 @@ use crate::schema::{
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{schema, ArrayType};
 use crate::table_features::{
-    FeatureType, TableFeature, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -533,7 +534,10 @@ impl IntoEngineData for Metadata {
 #[derive(
     Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
 )]
-#[serde(rename_all = "camelCase")]
+// Deserialization goes through `ProtocolRaw` so every serde entry point (e.g. CRC files) is
+// validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
+// feature shape that log replay would reject.
+#[serde(rename_all = "camelCase", try_from = "ProtocolRaw")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
@@ -552,6 +556,31 @@ pub(crate) struct Protocol {
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
     writer_features: Option<Vec<TableFeature>>,
+}
+
+/// Raw, unvalidated form of [`Protocol`] that serde reads before validation. Deserialize-only
+/// (never serialized): `Protocol`'s `#[serde(try_from)]` converts it via [`Protocol::try_new`],
+/// so every deserialization is validated.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtocolRaw {
+    min_reader_version: i32,
+    min_writer_version: i32,
+    reader_features: Option<Vec<TableFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
+}
+
+impl TryFrom<ProtocolRaw> for Protocol {
+    type Error = Error;
+
+    fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
+        Protocol::try_new(
+            protocol.min_reader_version,
+            protocol.min_writer_version,
+            protocol.reader_features,
+            protocol.writer_features,
+        )
+    }
 }
 
 /// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
@@ -670,20 +699,48 @@ impl Protocol {
                     )));
                 }
 
-                // Check all writer features that are ReaderWriter must also be in reader features
+                // Every ReaderWriter feature in writerFeatures must also appear in readerFeatures.
                 // Unknown features are treated as potentially Writer-only for forward
                 // compatibility.
-                if let Some(offending) = writer_features.iter().find(|feature| {
-                    matches!(feature.feature_type(), FeatureType::ReaderWriter)
-                        && !reader_features.contains(*feature)
-                }) {
-                    return Err(Error::invalid_protocol(format!(
-                        "Writer features must be Writer-only or also listed in reader features, \
-                         but ReaderWriter feature {offending:?} is listed in writerFeatures and \
-                         missing from readerFeatures \
-                         (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
-                         minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
-                    )));
+                //
+                // Accept the legacy writer-list-only shape for delta-spark compatibility: a
+                // past delta-spark bug produced (3, 7) tables with ColumnMapping in writerFeatures
+                // only and an empty readerFeatures. Such tables still read correctly because the
+                // mode comes from writerFeatures, and rejecting them would break existing
+                // production tables. See #3110 to tighten this once such tables are migrated.
+                //
+                // Validate the whole writer list before warning: a non-legacy orphan rejects the
+                // protocol outright, so we must not emit an acceptance warning for a legacy orphan
+                // seen earlier in the list only to fail on a later one.
+                let mut legacy_orphans = Vec::new();
+                for feature in writer_features.iter() {
+                    let orphaned_reader_writer_feature = feature.feature_type()
+                        == FeatureType::ReaderWriter
+                        && !reader_features.contains(feature);
+                    if !orphaned_reader_writer_feature {
+                        continue;
+                    }
+                    if LEGACY_READER_FEATURES.contains(feature) {
+                        legacy_orphans.push(feature);
+                    } else {
+                        return Err(Error::invalid_protocol(format!(
+                            "Writer features must be Writer-only or also listed in reader features, \
+                             but ReaderWriter feature {feature:?} is listed in writerFeatures and \
+                             missing from readerFeatures \
+                             (readerFeatures={reader_features:?}, \
+                             writerFeatures={writer_features:?}, \
+                             minReaderVersion={min_reader_version}, \
+                             minWriterVersion={min_writer_version})"
+                        )));
+                    }
+                }
+                // Reached only once the whole writer list is known valid.
+                for feature in legacy_orphans {
+                    warn!(
+                        "ReaderWriter feature {feature:?} is listed in writerFeatures but \
+                         missing from readerFeatures at minReaderVersion={min_reader_version}; \
+                         treating it as reader-enabled (malformed protocol)"
+                    );
                 }
                 Ok(())
             }

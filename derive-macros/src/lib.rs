@@ -59,7 +59,7 @@ fn column_name_segments_impl(input: TokenStream) -> Result<TokenStream, Error> {
     // `column_name!` requires at least one argument, so no empty check is needed here.
     let mut emitted = Vec::new();
     for expr in Punctuated::<Expr, Token![,]>::parse_terminated.parse2(input)? {
-        // Fragment-forwarding macros (col!, column_expr!, joined_column_name!, ...) capture with
+        // Fragment-forwarding macros (col!, column_name!, joined_column_name!, ...) capture with
         // `:literal`/`:expr` and re-emit, which wraps the argument in an invisible (none-delimited)
         // group. Peel away those groups to recover an underlying string literal.
         let mut inner = &expr;

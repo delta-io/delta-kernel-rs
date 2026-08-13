@@ -85,7 +85,7 @@ Pass a predicate expression to skip files that cannot contain matching rows:
 # use std::sync::Arc;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::expressions::{column_expr, Predicate, Scalar};
+# use delta_kernel::expressions::{col, lit, Predicate};
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
 # let url = delta_kernel::try_parse_uri("/tmp/table")?;
@@ -93,7 +93,7 @@ Pass a predicate expression to skip files that cannot contain matching rows:
 # let engine = DefaultEngine::builder(store).build();
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let predicate = Arc::new(
-    Predicate::lt(column_expr!("age"), Scalar::from(30))
+    Predicate::lt(col!("age"), lit(30))
 );
 
 let scan = snapshot

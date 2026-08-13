@@ -232,6 +232,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::expressions::col;
     use crate::schema::{ArrayType, MapType, StructField};
 
     fn struct_ty() -> DataType {
@@ -414,7 +415,7 @@ mod tests {
         let d = ColumnDefault {
             raw_sql: "x".into(),
             data_type: &int_ty,
-            parsed_sql: Some(Expression::column(["x"])),
+            parsed_sql: Some(col!("x")),
         };
         let err = d
             .to_scalar()

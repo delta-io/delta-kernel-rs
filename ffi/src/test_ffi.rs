@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use delta_kernel::expressions::{
-    column_expr, column_name, column_pred, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
+    col, column_name, column_pred, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
     Expression as Expr, ExpressionStructPatchBuilder, MapData, OpaqueExpressionOp,
     OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData,
 };
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     let empty_nested_patch = ExpressionStructPatchBuilder::new_nested(column_name!("empty.nested"));
 
     let mut sub_exprs = vec![
-        column_expr!("col"),
+        col!("col"),
         Expr::literal(i8::MAX),
         Expr::literal(i8::MIN),
         Expr::literal(f32::MAX),
@@ -161,8 +161,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             vec![Expr::literal(42), Expr::literal(1.111)],
         ),
         Expr::unknown("mystery"),
-        Expr::map_to_struct(column_expr!("pv")),
-        Expr::coalesce([column_expr!("col"), Expr::literal(0_i32)]),
+        Expr::map_to_struct(col!("pv")),
+        Expr::coalesce([col!("col"), lit(0_i32)]),
         Expr::array([Expr::literal(1_i32), Expr::literal(2_i32)]),
     ];
     sub_exprs.extend(
@@ -212,7 +212,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             Pred::eq(Expr::literal(5), Expr::literal(10)),
             Pred::ne(Expr::literal(20), Expr::literal(10)),
         ]),
-        Pred::is_not_null(column_expr!("col")),
+        Pred::is_not_null(col!("col")),
         Pred::opaque(
             OpaqueTestOp("bar".to_string()),
             vec![Expr::literal(42), Expr::literal(1.111)],
@@ -244,7 +244,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
 #[no_mangle]
 pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<SharedExpression> {
     let sub_exprs = vec![
-        column_expr!("simple_col"),
+        col!("simple_col"),
         Expr::literal(42i32),
         Expr::literal(100i64),
         Expr::literal(2.5f64), // Using 2.5 to avoid clippy::approx_constant warning
@@ -283,7 +283,7 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
             Expr::literal(2_i64),
             Expr::literal(3.0_f64),
         ]),
-        Expr::map_to_struct(column_expr!("partitionValues")),
+        Expr::map_to_struct(col!("partitionValues")),
     ];
     Arc::new(Expr::struct_from(sub_exprs)).into()
 }
@@ -306,8 +306,8 @@ pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedP
         Pred::gt(Expr::literal(20), Expr::literal(10)),
         Pred::ge(Expr::literal(10), Expr::literal(10)),
         Pred::distinct(Expr::literal(1), Expr::literal(2)),
-        Pred::is_null(column_expr!("nullable_col")),
-        Pred::is_not_null(column_expr!("nonnull_col")),
+        Pred::is_null(col!("nullable_col")),
+        Pred::is_not_null(col!("nonnull_col")),
         Pred::not(Pred::FALSE),
         Pred::or_from(vec![
             Pred::eq(Expr::literal(1), Expr::literal(1)),

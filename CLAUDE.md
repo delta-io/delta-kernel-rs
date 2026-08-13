@@ -319,10 +319,10 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
 - Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
-  `Expression::literal(...)` when building expressions inline. `col!` has two forms: a single
-  string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
-  same as `column_expr!`); one or more comma-separated args build a column with each segment taken
-  verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
+  `Expression::literal(...)` when building expressions inline. `col!` uses the same
+  compile-time segment rules as `column_name!` (string literals split on `.`; constants are
+  single simple segments). Use `Expression::column([...])` for runtime or non-simple names.
+  (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
 - Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
   `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
   interpolated fields might collide. For Delta log action schemas, reuse the canonical

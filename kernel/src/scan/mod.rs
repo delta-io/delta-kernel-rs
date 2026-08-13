@@ -118,7 +118,7 @@ pub struct StatsOptions {
     /// the existing JSON is passed through regardless.
     pub(crate) synthesize_json: bool,
 
-    /// Which struct stats columns to emit in `stats_parsed`.
+    /// Which struct stats columns to request in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
 }
 
@@ -131,7 +131,7 @@ pub enum StructStats {
     None,
     /// Emit all indexed stats columns.
     All,
-    /// Emit only the specified stats columns.
+    /// Emit at least the specified stats columns. Predicate-referenced columns may also appear.
     Columns(Vec<ColumnName>),
 }
 
@@ -161,8 +161,8 @@ impl StatsOptions {
         }
     }
 
-    /// Struct stats projected to the specified columns without JSON synthesis. Like
-    /// [`Self::all_struct`] but narrowed to a subset of indexed columns.
+    /// Struct stats for at least the specified columns without JSON synthesis. Predicate-referenced
+    /// columns may also appear because scan paths can retain stats used for data skipping.
     pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
         Self {
             synthesize_json: false,
