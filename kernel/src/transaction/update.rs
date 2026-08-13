@@ -223,6 +223,10 @@ impl Transaction {
     /// of scan file data. It joins the two together internally and will generate appropriate
     /// remove/add actions on commit to update the deletion vectors.
     ///
+    /// Required AddFile fields on matched rows are validated at commit. Staging can therefore
+    /// succeed for metadata that commit later rejects, including an empty path, negative size,
+    /// or incorrect physical partition keys.
+    ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
     ///
     /// # Arguments

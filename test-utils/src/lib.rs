@@ -176,6 +176,7 @@ use delta_kernel::arrow::array::{
     MapBuilder, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::compute::concat;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field, Int64Type, Schema as ArrowSchema,
 };
@@ -524,12 +525,14 @@ pub enum AddFilePartitionKeyModify<'a> {
     },
 }
 
-/// Applies `modifications` in order to a single-row add-file batch.
+/// Applies `modifications` in order to every `partitionValues` row in an add-file batch.
+///
+/// `Drop` removes every entry with the given key. `Insert` appends a new entry.
 ///
 /// # Panics
 ///
-/// Panics when `batch` does not have exactly one row with a string-keyed and string-valued
-/// `partitionValues` map, or when the modified batch cannot be constructed.
+/// Panics when `batch` does not contain a string-keyed and string-valued `partitionValues` map, or
+/// when the modified batch cannot be constructed.
 pub fn modify_add_file_partition_keys(
     batch: RecordBatch,
     modifications: &[AddFilePartitionKeyModify<'_>],
@@ -538,29 +541,11 @@ pub fn modify_add_file_partition_keys(
         return batch;
     }
 
-    assert_eq!(batch.num_rows(), 1, "add-file batch must contain one row");
     let index = batch
         .schema()
         .index_of("partitionValues")
         .expect("partitionValues field in add-file batch");
     let map = batch.column(index).as_map();
-    let entries = map.value(0);
-    let keys = entries.column(0).as_string::<i32>();
-    let values = entries.column(1).as_string::<i32>();
-    let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
-        .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
-        .collect();
-    for modification in modifications {
-        match *modification {
-            AddFilePartitionKeyModify::Drop { key } => {
-                partition_values.retain(|(existing_key, _)| *existing_key != key);
-            }
-            AddFilePartitionKeyModify::Insert { key, value } => {
-                partition_values.push((key, value));
-            }
-        }
-    }
-
     let (entry_field, ordered) = match map.data_type() {
         ArrowDataType::Map(entry_field, ordered) => (entry_field.clone(), *ordered),
         _ => unreachable!("partitionValues column must be a map"),
@@ -569,16 +554,34 @@ pub fn modify_add_file_partition_keys(
     let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
         .with_keys_field(key_field.clone())
         .with_values_field(value_field.clone());
-    for (key, value) in partition_values {
-        builder.keys().append_value(key);
-        match value {
-            Some(v) => builder.values().append_value(v),
-            None => builder.values().append_null(),
+    for row in 0..map.len() {
+        let entries = map.value(row);
+        let keys = entries.column(0).as_string::<i32>();
+        let values = entries.column(1).as_string::<i32>();
+        let mut partition_values: Vec<(&str, Option<&str>)> = (0..keys.len())
+            .map(|i| (keys.value(i), values.is_valid(i).then(|| values.value(i))))
+            .collect();
+        for modification in modifications {
+            match *modification {
+                AddFilePartitionKeyModify::Drop { key } => {
+                    partition_values.retain(|(existing_key, _)| *existing_key != key);
+                }
+                AddFilePartitionKeyModify::Insert { key, value } => {
+                    partition_values.push((key, value));
+                }
+            }
         }
+        for (key, value) in partition_values {
+            builder.keys().append_value(key);
+            match value {
+                Some(value) => builder.values().append_value(value),
+                None => builder.values().append_null(),
+            }
+        }
+        builder
+            .append(true)
+            .expect("failed to append partition-values map row");
     }
-    builder
-        .append(true)
-        .expect("failed to append partition-values map row");
     let (_, offsets, entries, nulls, _) = builder.finish().into_parts();
     let new_map: ArrayRef = Arc::new(
         MapArray::try_new(entry_field, offsets, entries, nulls, ordered)
@@ -589,6 +592,27 @@ pub fn modify_add_file_partition_keys(
     columns[index] = new_map;
     RecordBatch::try_new(batch.schema(), columns)
         .expect("failed to rebuild add-file batch after modifying a partition key")
+}
+
+/// Replaces one row in an Arrow array with a one-row array of the same type.
+///
+/// # Panics
+///
+/// Panics if `replacement` does not contain exactly one row, `row` is out of bounds, or the arrays
+/// cannot be concatenated.
+pub fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row: usize) -> ArrayRef {
+    assert_eq!(
+        replacement.len(),
+        1,
+        "replacement must contain exactly one row"
+    );
+    let slices = [
+        column.slice(0, row),
+        replacement,
+        column.slice(row + 1, column.len() - row - 1),
+    ];
+    let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
+    concat(&arrays).expect("replacement value must match the modified column type")
 }
 
 pub fn create_default_engine(

@@ -6,7 +6,7 @@ use serde::Serialize;
 use tempfile::TempDir;
 use test_utils::{
     copy_directory, delta_path_for_version, load_test_data, modify_add_file_partition_keys,
-    AddFilePartitionKeyModify,
+    replace_array_row, AddFilePartitionKeyModify,
 };
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -14,11 +14,11 @@ use url::Url;
 
 use crate::actions::{get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
 use crate::arrow::array::{
-    new_empty_array, new_null_array, Array, ArrayRef, Int64Array, MapArray, RecordBatch,
-    StringArray, StructArray,
+    new_empty_array, new_null_array, ArrayRef, Int64Array, MapArray, RecordBatch, StringArray,
+    StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use crate::arrow::compute::{concat, concat_batches};
+use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
@@ -221,7 +221,6 @@ pub(crate) fn nullable_add_files(row_count: usize) -> RecordBatch {
         .expect("failed to concatenate rows into a multi-row add-file batch")
 }
 
-/// Returns `batch` with `field` replaced by `column`.
 pub(crate) fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
     let schema = batch.schema();
     let index = schema.index_of(field).expect("field in schema");
@@ -230,20 +229,12 @@ pub(crate) fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef)
     RecordBatch::try_new(schema, columns).expect("failed to rebuild batch after replacing a column")
 }
 
-/// Returns `batch` with `field` set to null at `row`.
 pub(crate) fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
     let schema = batch.schema();
     let index = schema.index_of(field).expect("field in schema");
     let mut columns = batch.columns().to_vec();
-    let column = &columns[index];
     let null = new_null_array(schema.field(index).data_type(), 1);
-    let slices = [
-        column.slice(0, row),
-        null,
-        column.slice(row + 1, batch.num_rows() - row - 1),
-    ];
-    let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
-    columns[index] = concat(&arrays).expect("failed to replace the selected field with null");
+    columns[index] = replace_array_row(&columns[index], null, row);
     RecordBatch::try_new(schema, columns)
         .expect("failed to rebuild batch after replacing a field value with null")
 }

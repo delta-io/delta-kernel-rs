@@ -6,6 +6,9 @@ use std::sync::LazyLock;
 use super::utils::{validate_partition_keys, validate_required_field_exist};
 use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::scan::log_replay::{
+    FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
+};
 use crate::scan::scan_row_schema;
 use crate::schema::{ColumnName, ColumnNamesAndTypes};
 use crate::utils::require;
@@ -15,14 +18,17 @@ const PATH: usize = 0;
 const SIZE: usize = 1;
 const MODIFICATION_TIME: usize = 2;
 const PARTITION_VALUES: usize = 3;
+const MODIFICATION_TIME_NAME: &str = "modificationTime";
 
 static DV_MATCHED_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>> = LazyLock::new(|| {
     let names = vec![
-        ColumnName::new(["path"]),
-        ColumnName::new(["size"]),
-        ColumnName::new(["modificationTime"]),
-        ColumnName::new(["fileConstantValues", "partitionValues"]),
+        ColumnName::new([PATH_NAME]),
+        ColumnName::new([SIZE_NAME]),
+        ColumnName::new([MODIFICATION_TIME_NAME]),
+        ColumnName::new([FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME]),
     ];
+    // Derive types from the canonical scan schema so this projection stays compatible with scan
+    // metadata if those field definitions change.
     let types = names
         .iter()
         .map(|name| {
@@ -41,7 +47,7 @@ struct DvMatchedFileRequiredFields {
 impl Validation for DvMatchedFileRequiredFields {
     fn validate_row<'a>(&mut self, row: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let path: &str = getters[PATH]
-            .get_opt(row, "path")?
+            .get_opt(row, PATH_NAME)?
             .ok_or_else(|| Error::missing_data("AddFile is missing required field 'path'"))?;
         require!(
             !path.is_empty(),
@@ -49,16 +55,16 @@ impl Validation for DvMatchedFileRequiredFields {
         );
 
         let partition_values = validate_required_field_exist(
-            getters[PARTITION_VALUES].get_map(row, "partitionValues")?,
+            getters[PARTITION_VALUES].get_map(row, PARTITION_VALUES_NAME)?,
             path,
-            "partitionValues",
+            PARTITION_VALUES_NAME,
         )?;
         validate_partition_keys(path, partition_values, &self.physical_partition_columns)?;
 
         let size = validate_required_field_exist::<i64>(
-            getters[SIZE].get_opt(row, "size")?,
+            getters[SIZE].get_opt(row, SIZE_NAME)?,
             path,
-            "size",
+            SIZE_NAME,
         )?;
         require!(
             size >= 0,
@@ -67,9 +73,9 @@ impl Validation for DvMatchedFileRequiredFields {
             ))
         );
         validate_required_field_exist::<i64>(
-            getters[MODIFICATION_TIME].get_opt(row, "modificationTime")?,
+            getters[MODIFICATION_TIME].get_opt(row, MODIFICATION_TIME_NAME)?,
             path,
-            "modificationTime",
+            MODIFICATION_TIME_NAME,
         )?;
         Ok(())
     }

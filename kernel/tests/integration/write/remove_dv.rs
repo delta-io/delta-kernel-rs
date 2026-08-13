@@ -10,7 +10,7 @@ use delta_kernel::arrow::array::{
     new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray,
 };
-use delta_kernel::arrow::compute::{concat, concat_batches};
+use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -32,7 +32,7 @@ use tempfile::tempdir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, copy_directory, create_default_engine,
     create_default_engine_mt_executor, insert_data, into_record_batch, load_and_begin_transaction,
-    read_actions_from_commit, setup_test_tables, test_table_setup,
+    read_actions_from_commit, replace_array_row, setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -946,7 +946,6 @@ fn modify_scan_file(
         .filter(|&row_index| selection_vector.get(row_index).copied().unwrap_or(true))
         .nth(modification.row_id)
         .expect("modified selected row must exist in scan-file batch");
-    assert!(row_index < batch.num_rows(), "modified row must exist");
 
     if modification.field_name == "partitionValues" {
         let constants_index = schema
@@ -979,21 +978,6 @@ fn modify_scan_file(
         .expect("modified scan-file schema and columns should form a valid batch");
     FilteredEngineData::try_new(Box::new(ArrowEngineData::new(batch)), selection_vector)
         .expect("selection vector length should match modified scan-file row count")
-}
-
-fn replace_array_row(column: &ArrayRef, replacement: ArrayRef, row_id: usize) -> ArrayRef {
-    assert_eq!(
-        replacement.len(),
-        1,
-        "replacement must contain exactly one row"
-    );
-    let slices = [
-        column.slice(0, row_id),
-        replacement,
-        column.slice(row_id + 1, column.len() - row_id - 1),
-    ];
-    let arrays: Vec<&dyn Array> = slices.iter().map(|array| array.as_ref()).collect();
-    concat(&arrays).expect("replacement value must match the modified column type")
 }
 
 fn string_array(value: &str) -> ArrayRef {
@@ -1034,8 +1018,13 @@ fn string_map_array(values: &[(&str, Option<&str>)]) -> ArrayRef {
     Arc::new(builder.finish())
 }
 
+#[rstest::rstest]
+#[case::unpartitioned(&[])]
+#[case::partitioned(&[("value", Some("partition"))])]
 #[tokio::test]
-async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_update_deletion_vectors_multiple_files(
+    #[case] partition_values: &[(&str, Option<&str>)],
+) -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that update_deletion_vectors can update multiple files
     // in a single call, creating proper Remove and Add actions for each file.
     let _ = tracing_subscriber::fmt::try_init();
@@ -1048,7 +1037,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
     // Setup: Create table with 3 files
     let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
     let (store, engine, table_url, file_paths) =
-        create_dv_table_with_files("test_table", schema, &[], file_names).await?;
+        create_dv_table_with_files("test_table", schema, partition_values, file_names).await?;
 
     // Create DV update transaction
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

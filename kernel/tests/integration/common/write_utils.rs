@@ -417,20 +417,20 @@ pub async fn create_dv_table_with_files(
             )
         })
         .collect();
-    if partition_values.is_empty() {
-        txn.add_files(create_add_files_metadata(add_files_schema, files)?);
+    let metadata = create_add_files_metadata(add_files_schema, files)?;
+    let metadata = if partition_values.is_empty() {
+        metadata
     } else {
         let modifications: Vec<_> = partition_values
             .iter()
             .map(|(key, value)| AddFilePartitionKeyModify::Insert { key, value: *value })
             .collect();
-        for file in files {
-            let metadata = create_add_files_metadata(add_files_schema, vec![file])?;
-            let metadata =
-                modify_add_file_partition_keys(into_record_batch(metadata), &modifications);
-            txn.add_files(Box::new(ArrowEngineData::new(metadata)));
-        }
-    }
+        Box::new(ArrowEngineData::new(modify_add_file_partition_keys(
+            into_record_batch(metadata),
+            &modifications,
+        )))
+    };
+    txn.add_files(metadata);
 
     let _ = txn.commit(engine.as_ref())?;
 
