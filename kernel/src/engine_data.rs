@@ -222,7 +222,7 @@ impl<'a> MapItem<'a> {
 pub trait StructListAccessor {
     /// Visits the element structs of the list at `row_index`, one visited row per element.
     /// Implementations must reject, not skip, a null element struct.
-    fn visit_row(
+    fn visit_elems_of_row(
         &self,
         row_index: usize,
         column_names: &[ColumnName],
@@ -247,7 +247,8 @@ impl<'a> StructList<'a> {
     /// row's. Errors if any element struct in this row is null.
     pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
         let column_names = visitor.selected_column_names_and_types().0;
-        self.list.visit_row(self.row_index, column_names, visitor)
+        self.list
+            .visit_elems_of_row(self.row_index, column_names, visitor)
     }
 }
 
@@ -268,8 +269,7 @@ macro_rules! impl_default_get {
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
 ///
-/// All methods return `Ok(None)` when the row's value is null. `get_struct_list` yields a
-/// [`StructList`], whose element structs a nested [`RowVisitor`] visits in place.
+/// All methods return `Ok(None)` when the row's value is null.
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),

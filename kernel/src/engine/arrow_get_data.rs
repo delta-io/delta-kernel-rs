@@ -168,29 +168,10 @@ fn struct_elements<'a>(
     })
 }
 
-/// Shared implementation of [`StructListAccessor::visit_row`] for the list array flavors. Offsets
-/// are derived from `row_index` here and never surface in the accessor contract.
-fn visit_struct_list_row(
-    list: &impl ListLikeArray,
-    row_index: usize,
-    column_names: &[ColumnName],
-    visitor: &mut dyn RowVisitor,
-) -> DeltaResult<()> {
-    let offsets = list.row_offsets(row_index);
-    let sliced = struct_elements(list, "struct-list")?.slice(offsets.start, offsets.len());
-    // is_nullable means nulls may be present; a null element struct can't round-trip via
-    // RecordBatch.
-    require!(
-        !sliced.is_nullable(),
-        Error::invalid_struct_data("array<struct> elements are nullable; cannot visit")
-    );
-    ArrowEngineData::from(sliced).visit_rows(column_names, visitor)
-}
-
 /// Shared implementation of [`GetData::get_struct_list`] for the list array flavors. Validates the
 /// element type (a type error for every row, even a null one) before short-circuiting a null row.
 fn get_struct_list_item<'a>(
-    list: &'a (impl ListLikeArray + StructListAccessor),
+    list: &'a impl ListLikeArray,
     row_index: usize,
     field_name: &str,
 ) -> DeltaResult<Option<StructList<'a>>> {
@@ -201,25 +182,24 @@ fn get_struct_list_item<'a>(
     Ok(Some(StructList::new(list, row_index)))
 }
 
-impl<O: OffsetSizeTrait> StructListAccessor for GenericListArray<O> {
-    fn visit_row(
+/// Every list-like array can visit its element structs; offsets are derived from `row_index` here
+/// and never surface in the accessor contract.
+impl<T: ListLikeArray> StructListAccessor for T {
+    fn visit_elems_of_row(
         &self,
         row_index: usize,
         column_names: &[ColumnName],
         visitor: &mut dyn RowVisitor,
     ) -> DeltaResult<()> {
-        visit_struct_list_row(self, row_index, column_names, visitor)
-    }
-}
-
-impl<O: OffsetSizeTrait> StructListAccessor for GenericListViewArray<O> {
-    fn visit_row(
-        &self,
-        row_index: usize,
-        column_names: &[ColumnName],
-        visitor: &mut dyn RowVisitor,
-    ) -> DeltaResult<()> {
-        visit_struct_list_row(self, row_index, column_names, visitor)
+        let offsets = self.row_offsets(row_index);
+        let sliced = struct_elements(self, "struct-list")?.slice(offsets.start, offsets.len());
+        // is_nullable means nulls may be present; a null element struct can't round-trip via
+        // RecordBatch.
+        require!(
+            !sliced.is_nullable(),
+            Error::invalid_struct_data("array<struct> elements are nullable; cannot visit")
+        );
+        ArrowEngineData::from(sliced).visit_rows(column_names, visitor)
     }
 }
 
