@@ -124,7 +124,9 @@ fn commit(
     // Write actions to _staged_commits/<version>.<uuid>.json. `actions` is
     // already a Box<dyn Iterator<...>>, so pass it directly (do not re-box).
     let staged_path = commit_metadata.staged_commit_path()?;
-    engine.json_handler().write_json_file(&staged_path, actions, false)?;
+    let written_size = engine
+        .json_handler()
+        .write_json_file(&staged_path, actions, false)?;
     // ...
 ```
 
@@ -149,17 +151,13 @@ shape:
         commit_metadata.max_published_version(),
     )?;
 
-    // Return the staged file metadata on success. HEAD the file via
-    // engine.storage_handler().head() to get the real byte size, and use
-    // the in-commit timestamp as the logical commit time (not the filesystem
-    // mtime, which reflects when the file was written rather than when the
-    // commit took effect).
-    let staged_file = engine.storage_handler().head(&staged_path)?;
+    // Return the staged file metadata on success. Use the in-commit timestamp
+    // as the logical commit time rather than the filesystem mtime.
     Ok(CommitResponse::Committed {
         file_meta: FileMeta::new(
             staged_path,
             commit_metadata.in_commit_timestamp(),
-            staged_file.size,
+            written_size,
         ),
     })
 }
@@ -237,7 +235,9 @@ impl Committer for MyCatalogCommitter {
     ) -> DeltaResult<CommitResponse> {
         // 1. Stage: write actions to _staged_commits/
         let staged_path = commit_metadata.staged_commit_path()?;
-        engine.json_handler().write_json_file(&staged_path, actions, false)?;
+        let written_size = engine
+            .json_handler()
+            .write_json_file(&staged_path, actions, false)?;
 
         // 2. Ratify: register the staged commit with the catalog. ratify_commit
         //    is an imagined example API; your catalog's signature will differ.
@@ -249,15 +249,13 @@ impl Committer for MyCatalogCommitter {
             commit_metadata.max_published_version(),
         )?;
 
-        // 3. Return success. HEAD the staged file to get the real byte size,
-        //    and use the in-commit timestamp as the logical commit time (not
-        //    the filesystem mtime).
-        let staged_file = engine.storage_handler().head(&staged_path)?;
+        // 3. Return success using the in-commit timestamp as the logical
+        //    commit time rather than the filesystem mtime.
         Ok(CommitResponse::Committed {
             file_meta: FileMeta::new(
                 staged_path,
                 commit_metadata.in_commit_timestamp(),
-                staged_file.size,
+                written_size,
             ),
         })
     }

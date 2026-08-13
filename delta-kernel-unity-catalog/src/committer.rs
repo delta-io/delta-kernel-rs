@@ -397,7 +397,6 @@ mod tests {
                 let stored_size = fs::metadata(&commit_path).unwrap().len();
                 assert!(file_meta.size > 0);
                 assert_eq!(file_meta.size, stored_size);
-                assert!(commit_path.exists(), "000.json should exist on disk");
             }
             CommitResponse::Conflict { .. } => {
                 panic!("expected Committed for version 0, got Conflict")
