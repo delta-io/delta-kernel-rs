@@ -150,7 +150,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
         self.transition()
     }
 
-    /// Add a new column at an explicit schema path.
+    /// Add a new column or nested field to the table schema.
     ///
     /// `path` identifies the struct that will contain `field`. An empty path targets the table's
     /// root schema; path segments may traverse nested structs, array elements, map keys, and map
