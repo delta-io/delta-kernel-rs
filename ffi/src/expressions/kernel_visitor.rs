@@ -224,22 +224,44 @@ pub extern "C" fn visit_expression_unknown(
 }
 
 /// # Safety
-/// The string slice must be valid
+/// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
+/// duration of this call. The field parts are copied out before this function returns.
 #[no_mangle]
 pub unsafe extern "C" fn visit_expression_column(
     state: &mut KernelExpressionVisitorState,
-    name: KernelStringSlice,
+    parts: *const KernelStringSlice,
+    parts_len: usize,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_expression_column_impl(state, name).into_extern_result(&allocate_error)
+    visit_expression_column_impl(state, parts, parts_len).into_extern_result(&allocate_error)
 }
-fn visit_expression_column_impl(
+/// # Safety
+/// `parts` must point to `parts_len` valid [`KernelStringSlice`], each valid for the
+/// duration of this call.
+unsafe fn visit_expression_column_impl(
     state: &mut KernelExpressionVisitorState,
-    name: DeltaResult<&str>,
+    parts: *const KernelStringSlice,
+    parts_len: usize,
 ) -> DeltaResult<usize> {
-    // TODO: FIXME: This is incorrect if any field name in the column path contains a period.
-    let name = ColumnName::from_naive_str_split(name?);
+    if parts_len == 0 {
+        return Err(delta_kernel::Error::generic(
+            "column must have at least one field part",
+        ));
+    }
+    // Each part is one column field name, used verbatim; a field name may therefore contain any
+    // character, including a period. Empty parts are rejected: an empty field name is a caller
+    // bug, kept symmetric with the parts_len == 0 guard.
+    let slices = unsafe { std::slice::from_raw_parts(parts, parts_len) };
+    let fields = slices
+        .iter()
+        .map(|slice| unsafe { <&str>::try_from_slice(slice) })
+        .collect::<DeltaResult<Vec<&str>>>()?;
+    if fields.iter().any(|field| field.is_empty()) {
+        return Err(delta_kernel::Error::generic(
+            "column field part must not be empty",
+        ));
+    }
+    let name = ColumnName::new(fields);
     Ok(wrap_expression(state, name))
 }
 
@@ -1083,6 +1105,55 @@ mod tests {
         };
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
         assert_eq!(expr, lit(expected));
+    }
+
+    // ============================================================================
+    // visit_expression_column_impl (structured field parts)
+    // ============================================================================
+
+    /// A field name containing a literal period must survive as a single field part.
+    #[test]
+    fn column_with_dotted_field_round_trips_to_three_parts() {
+        let mut state = KernelExpressionVisitorState::default();
+        let (a, b, d) = ("a", "b.c", "d");
+        let parts = [
+            kernel_string_slice!(a),
+            kernel_string_slice!(b),
+            kernel_string_slice!(d),
+        ];
+        let id = unsafe {
+            visit_expression_column_impl(&mut state, parts.as_ptr(), parts.len()).unwrap()
+        };
+        let expr = unwrap_kernel_expression(&mut state, id).unwrap();
+        assert_eq!(expr, Expression::column(["a", "b.c", "d"]));
+        let Expression::Column(name) = expr else {
+            panic!("expected a column expression, got {expr:?}");
+        };
+        let fields: Vec<&str> = name.path().iter().map(String::as_str).collect();
+        assert_eq!(fields, vec!["a", "b.c", "d"]);
+    }
+
+    /// Invalid part lists are rejected at the boundary. Parts are raw bytes so the
+    /// invalid-UTF-8 case can share the same shape as the empty-string and no-parts cases:
+    /// - `no_parts`: a column must have at least one field part.
+    /// - `empty_part`: an empty field name is a caller bug (symmetric with `parts_len == 0`).
+    /// - `invalid_utf8`: a field name must be valid UTF-8, so `try_from_slice` fails.
+    #[rstest]
+    #[case::no_parts(&[])]
+    #[case::empty_part(&[&b"a"[..], &b""[..], &b"d"[..]])]
+    #[case::invalid_utf8(&[&[0xFF, 0xFE][..]])]
+    fn invalid_column_parts_are_rejected(#[case] raw_parts: &[&[u8]]) {
+        let mut state = KernelExpressionVisitorState::default();
+        let slices: Vec<KernelStringSlice> = raw_parts
+            .iter()
+            .map(|bytes| KernelStringSlice {
+                ptr: bytes.as_ptr().cast(),
+                len: bytes.len(),
+            })
+            .collect();
+        let result =
+            unsafe { visit_expression_column_impl(&mut state, slices.as_ptr(), slices.len()) };
+        assert!(result.is_err());
     }
 
     // ============================================================================

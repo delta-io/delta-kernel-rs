@@ -119,6 +119,12 @@ struct OpaquePredicate {
 struct Unknown {
   char* name;
 };
+// A column is a list of field-name parts. Keeping the parts structured (rather than a single
+// dotted string) lets a field name that itself contains a period survive the FFI round-trip.
+struct Column {
+  char** parts;
+  size_t len;
+};
 struct MapToStructExpr {
   ExpressionItemList child_expr;
 };
@@ -469,8 +475,26 @@ DEFINE_UNARY(visit_expr_not, Not)
  * Column Expression
  ************************************************************/
 void visit_expr_column(void* data, uintptr_t sibling_id_list, KernelStringSlice col_name) {
-  char* column_name = allocate_string(col_name);
-  put_expr_item(data, sibling_id_list, column_name, Column);
+  // The outbound (kernel -> engine) callback delivers the column as a single dotted string, so
+  // the example stores it as a one-part column.
+  struct Column* column = malloc(sizeof(struct Column));
+  column->len = 1;
+  column->parts = malloc(sizeof(char*));
+  column->parts[0] = allocate_string(col_name);
+  put_expr_item(data, sibling_id_list, column, Column);
+}
+
+struct Column* make_column(const char* const* parts, size_t len) {
+  struct Column* column = malloc(sizeof(struct Column));
+  column->len = len;
+  column->parts = malloc(sizeof(char*) * len);
+  for (size_t i = 0; i < len; i++) {
+    size_t part_len = strlen(parts[i]);
+    char* copy = malloc(part_len + 1);
+    memcpy(copy, parts[i], part_len + 1);
+    column->parts[i] = copy;
+  }
+  return column;
 }
 
 /*************************************************************
@@ -699,7 +723,12 @@ void free_expression_item(ExpressionItem ref) {
       break;
     }
     case Column: {
-      free(ref.ref);
+      struct Column* column = ref.ref;
+      for (size_t i = 0; i < column->len; i++) {
+        free(column->parts[i]);
+      }
+      free(column->parts);
+      free(column);
       break;
     }
     case MapToStruct: {

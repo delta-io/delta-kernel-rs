@@ -224,13 +224,17 @@ uintptr_t convert_engine_to_kernel_expression_item(
     case Unary:
       return convert_engine_to_kernel_unary(state, (struct Unary*)item.ref);
     case Column: {
-      char* column_name = (char*)item.ref;
-      KernelStringSlice str_slice = {
-        .ptr = column_name,
-        .len = strlen(column_name)
-      };
+      struct Column* column = (struct Column*)item.ref;
+      // The kernel copies the parts out before visit_expression_column returns, so this
+      // array only needs to outlive the call.
+      KernelStringSlice* parts = malloc(sizeof(KernelStringSlice) * column->len);
+      for (size_t i = 0; i < column->len; i++) {
+        parts[i].ptr = column->parts[i];
+        parts[i].len = strlen(column->parts[i]);
+      }
       ExternResultusize result = visit_expression_column(
-          state, str_slice, allocate_error);
+          state, parts, column->len, allocate_error);
+      free(parts);
       if (result.tag == Errusize) {
         print_error("visit_expression_column failed", (Error*)result.err);
         free_error((Error*)result.err);
