@@ -159,7 +159,9 @@ pub struct EngineExpressionVisitor {
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_is_null: VisitUnaryFn,
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
-    /// The sub-expression will be in a _one_ item list identified by `child_list_id`
+    /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
+    /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
+    /// particular, timestamps carry exactly three fractional digits, truncated.
     pub visit_to_json: VisitUnaryFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by

@@ -284,7 +284,8 @@ mod tests {
                     {"path": "sidecar-1.parquet", "sizeInBytes": 42, "modificationTime": 1700000000000}
                 ],
                 "nonFileActions": [
-                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7}},
+                    {"protocol": {"minReaderVersion": 3, "minWriterVersion": 7,
+                        "readerFeatures": [], "writerFeatures": []}},
                     {"metaData": {"id": "table-id", "format": {"provider": "parquet", "options": {}},
                         "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
                         "partitionColumns": [], "configuration": {}}},

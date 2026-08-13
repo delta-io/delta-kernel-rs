@@ -69,6 +69,8 @@ default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_def
 # the plan executor with `ArrowEvaluationHandler`
 declarative-plans = ["delta_kernel/declarative-plans", "dep:prost", "arrow", "default-engine-base"]
 
+vendored-protoc = ["delta_kernel/vendored-protoc"]
+
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []

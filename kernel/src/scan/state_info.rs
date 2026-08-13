@@ -478,7 +478,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::actions::{Metadata, Protocol, MAX_VALUES, MIN_VALUES};
-    use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
+    use crate::expressions::{col, column_name, lit, Predicate as Pred};
     use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue};
     use crate::table_features::{FeatureType, TableFeature};
     use crate::unit_test_utils::assert_result_error_with_message;
@@ -745,7 +745,7 @@ pub(crate) mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
         let state_info = get_state_info(
             schema.clone(),
@@ -1022,7 +1022,7 @@ pub(crate) mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("value").gt(lit(10i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1057,7 +1057,7 @@ pub(crate) mod tests {
             StructField::nullable("extra", DataType::LONG),
         ]));
 
-        let predicate = Arc::new(column_expr!("extra").gt(Expr::literal(5i64)));
+        let predicate = Arc::new(col!("extra").gt(lit(5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1152,7 +1152,7 @@ pub(crate) mod tests {
             (cm_field("value", 3, "col-value-phys", DataType::LONG)),
         };
 
-        let predicate = Arc::new(column_expr!("date").lt(Expr::literal(100i32)));
+        let predicate = Arc::new(col!("date").lt(lit(100i32)));
 
         let state_info = get_state_info(
             schema,
@@ -1259,7 +1259,7 @@ pub(crate) mod tests {
 
         // Request col_a via stats_columns (logical), and reference col_b via predicate (logical).
         // Both must be translated to physical names in the output stats schema.
-        let predicate = Arc::new(column_expr!("col_b").gt(Expr::literal(5i64)));
+        let predicate = Arc::new(col!("col_b").gt(lit(5i64)));
 
         let state_info = get_state_info_with_stats(
             schema,
@@ -1368,7 +1368,7 @@ pub(crate) mod tests {
     #[test]
     fn predicate_on_past_cap_column_drops_stats_schema() {
         let schema = flat_long_schema(5);
-        let predicate = Arc::new(column_expr!("c4").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("c4").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1395,8 +1395,8 @@ pub(crate) mod tests {
     fn predicate_on_mixed_indexed_and_past_cap_keeps_indexed_only() {
         let schema = flat_long_schema(5);
         let predicate = Arc::new(Pred::and(
-            column_expr!("c0").gt(Expr::literal(10i64)),
-            column_expr!("c4").gt(Expr::literal(10i64)),
+            col!("c0").gt(lit(10i64)),
+            col!("c4").gt(lit(10i64)),
         ));
         let state_info = get_state_info(
             schema,
@@ -1446,7 +1446,7 @@ pub(crate) mod tests {
             ),
         ]));
         // Predicate only on the past-cap leaf -> stats schema goes empty -> None.
-        let predicate = Arc::new(column_expr!("s.c").gt(Expr::literal(10i64)));
+        let predicate = Arc::new(col!("s.c").gt(lit(10i64)));
         let state_info = get_state_info(
             schema,
             vec![],
@@ -1505,8 +1505,8 @@ pub(crate) mod tests {
             ),
         ]));
         let predicate = Arc::new(Pred::and(
-            column_expr!("s.c").gt(Expr::literal(10i64)),
-            column_expr!("s.d").gt(Expr::literal(10i64)),
+            col!("s.c").gt(lit(10i64)),
+            col!("s.d").gt(lit(10i64)),
         ));
         let state_info = get_state_info(
             schema,

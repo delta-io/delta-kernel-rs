@@ -10,22 +10,6 @@ use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use test_utils::test_table_setup;
 
-#[cfg(not(feature = "interval-type-in-dev"))]
-#[test]
-fn test_create_table_interval_blocked_when_feature_off() -> DeltaResult<()> {
-    let (_temp_dir, table_path, engine) = test_table_setup()?;
-    let schema = Arc::new(StructType::try_new(vec![
-        StructField::not_null("id", DataType::INTEGER),
-        StructField::nullable("iv", DataType::INTERVAL_DAY_TIME),
-    ])?);
-
-    let result = create_table(&table_path, schema, "Test/1.0")
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
-
-    test_utils::assert_result_error_with_message(result, "interval-type-in-dev");
-    Ok(())
-}
-
 #[rstest::rstest]
 fn test_create_table_rejects_interval_clustering(
     #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,
@@ -60,8 +44,7 @@ fn test_create_table_rejects_interval_clustering(
     Ok(())
 }
 
-#[cfg(feature = "interval-type-in-dev")]
-mod feature_enabled {
+mod supported {
     use delta_kernel::schema::SchemaRef;
     use delta_kernel::snapshot::Snapshot;
     use delta_kernel::table_features::ColumnMappingMode;

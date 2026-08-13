@@ -62,8 +62,8 @@ cargo +nightly fmt \
 | `delta_kernel_workloads`             | `workloads/`                          | Shared workload spec types + SQL predicate parser                        |
 | `feature_tests`                      | `feature-tests/`                      | Feature flag tests                                                       |
 | `delta-kernel-unity-catalog`         | `delta-kernel-unity-catalog/`         | Unity Catalog integration (UCCommitter, snapshot + create-table helpers) |
-| `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Unity Catalog client traits and shared models                            |
-| `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP implementation of the Unity Catalog client API                 |
+| `unity-catalog-delta-client-api`     | `unity-catalog-delta-client-api/`     | Transport-agnostic UC client traits + wire models                        |
+| `unity-catalog-delta-rest-client`    | `unity-catalog-delta-rest-client/`    | REST/HTTP client for the Unity Catalog Delta Tables API                  |
 
 ### Feature Flags
 
@@ -81,9 +81,6 @@ Some noteworthy ones (see `[features]` in `kernel/Cargo.toml` for the full list)
   (experimental, in development). Gates `KernelSupport::Supported` for the
   `adaptiveMetadata-preview` reader+writer feature (reads/writes to tables listing it are blocked
   with the cargo feature off).
-- `interval-type-in-dev` -- ANSI interval type support (experimental, in development). With the
-  cargo feature off, creating or writing tables with interval columns is blocked; reads are
-  unaffected.
 - `geo-type-in-dev` -- geospatial type support (geometry and geography columns) (experimental,
   in development). Gates `KernelSupport` for the `geospatial` reader+writer feature: with the
   cargo feature off, any table listing it is rejected; with it on, scans and CDF are supported
@@ -322,10 +319,10 @@ Keep this list updated when new protocol features are added to kernel.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
 - Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
-  `Expression::literal(...)` when building expressions inline. `col!` has two forms: a single
-  string literal splits on dots at compile time (`col!("a.b.c")` is a 3-segment nested column,
-  same as `column_expr!`); one or more comma-separated args build a column with each segment taken
-  verbatim (`col!("a.b", "c")` is two segments, `col!(name)` for a runtime string is one segment).
+  `Expression::literal(...)` when building expressions inline. `col!` uses the same
+  compile-time segment rules as `column_name!` (string literals split on `.`; constants are
+  single simple segments). Use `Expression::column([...])` for runtime or non-simple names.
+  (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
 - Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
   `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
   interpolated fields might collide. For Delta log action schemas, reuse the canonical

@@ -9,7 +9,6 @@
 // - No missing partition columns in `txn.dv_matched_files`
 // - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
 //   `txn.dv_matched_files`
-// - AppendOnly table can not have `removeFile` with dataChange = true
 
 mod addfile;
 

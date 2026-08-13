@@ -11,6 +11,7 @@ use delta_kernel::expressions::{
 use delta_kernel::schema::StructType;
 use delta_kernel::{DeltaResult, Error};
 
+use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
 
 /// Converts a kernel [`Expression`](KernelExpression) into the equivalent DataFusion
@@ -25,11 +26,7 @@ pub fn to_df_expr(expr: &KernelExpression, input_schema: &StructType) -> DeltaRe
         KernelExpression::Column(name) => column_to_df_expr(name, input_schema),
         KernelExpression::Binary(binary) => binary_expr_to_df_expr(binary, input_schema),
         KernelExpression::Variadic(variadic) => variadic_to_df_expr(variadic, input_schema),
-
-        // TODO: wire up in the predicate-conversion PR (needs the `Predicate -> Expr` converter).
-        KernelExpression::Predicate(_) => Err(Error::unsupported(
-            "converting an embedded Predicate expression is not yet supported",
-        )),
+        KernelExpression::Predicate(pred) => to_df_predicate_expr(pred, input_schema),
 
         // TODO: wire up once this function takes an output schema (`Struct` needs it for field
         // names; `MapToStruct`/`StructPatch` for field types). Each arm's lowering follows later.
@@ -121,7 +118,7 @@ fn variadic_to_df_expr(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{column_expr, Expression as KernelExpr};
+    use delta_kernel::expressions::{col, lit, Expression as KernelExpr};
     use delta_kernel::schema::{DataType, StructField, StructType};
     use rstest::rstest;
 
@@ -151,31 +148,28 @@ mod tests {
     }
 
     #[rstest]
-    #[case::i32(KernelExpr::literal(7i32), "Int32(7)")]
-    #[case::i64(KernelExpr::literal(42i64), "Int64(42)")]
-    #[case::string(KernelExpr::literal("abc"), "Utf8(\"abc\")")]
-    #[case::boolean(KernelExpr::literal(true), "Boolean(true)")]
+    #[case::i32(lit(7i32), "Int32(7)")]
+    #[case::i64(lit(42i64), "Int64(42)")]
+    #[case::string(lit("abc"), "Utf8(\"abc\")")]
+    #[case::boolean(lit(true), "Boolean(true)")]
     #[case::null(KernelExpr::null_literal(DataType::LONG), "Int64(NULL)")]
     fn literal_lowers_to_scalar(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     #[rstest]
-    #[case::single(KernelExpr::column(["a"]), "a")]
-    #[case::depth_2(KernelExpr::column(["a", "b"]), "get_field(a, Utf8(\"b\"))")]
-    #[case::depth_3(
-        KernelExpr::column(["a", "b", "c"]),
-        "get_field(a, Utf8(\"b\"), Utf8(\"c\"))"
-    )]
+    #[case::single(col!("a"), "a")]
+    #[case::depth_2(col!("a.b"), "get_field(a, Utf8(\"b\"))")]
+    #[case::depth_3(col!("a.b.c"), "get_field(a, Utf8(\"b\"), Utf8(\"c\"))")]
     fn column_lowers_to_nested_field_access(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     #[rstest]
-    #[case::plus(column_expr!("a") + KernelExpr::literal(1i64), "a + Int64(1)")]
-    #[case::minus(column_expr!("a") - KernelExpr::literal(1i64), "a - Int64(1)")]
-    #[case::multiply(column_expr!("a") * KernelExpr::literal(2i64), "a * Int64(2)")]
-    #[case::divide(column_expr!("a") / KernelExpr::literal(2i64), "a / Int64(2)")]
+    #[case::plus(col!("a") + lit(1i64), "a + Int64(1)")]
+    #[case::minus(col!("a") - lit(1i64), "a - Int64(1)")]
+    #[case::multiply(col!("a") * lit(2i64), "a * Int64(2)")]
+    #[case::divide(col!("a") / lit(2i64), "a / Int64(2)")]
     fn arithmetic_binary_lowers_to_binary_expr(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
@@ -183,13 +177,11 @@ mod tests {
     /// Nested arithmetic lowers to the matching operator tree.
     #[rstest]
     #[case::precedence_pins_grouping(
-        (column_expr!("x") + KernelExpr::literal(1i64)) * (column_expr!("b") - KernelExpr::literal(2i64)),
+        (col!("x") + lit(1i64)) * (col!("b") - lit(2i64)),
         "(x + Int64(1)) * (b - Int64(2))"
     )]
     #[case::nested_field_and_all_ops(
-        (KernelExpr::column(["a", "b", "c"]) * KernelExpr::literal(5i64)
-            - (column_expr!("b") + column_expr!("x")))
-            / KernelExpr::literal(20i64),
+        (col!("a.b.c") * lit(5i64) - (col!("b") + col!("x"))) / lit(20i64),
         "(get_field(a, Utf8(\"b\"), Utf8(\"c\")) * Int64(5) - b + x) / Int64(20)"
     )]
     fn nested_arithmetic_lowers_to_operator_tree(
@@ -201,21 +193,21 @@ mod tests {
 
     #[rstest]
     #[case::coalesce(
-        KernelExpr::coalesce([column_expr!("a"), column_expr!("b"), KernelExpr::literal(0i64)]),
+        KernelExpr::coalesce([col!("a"), col!("b"), lit(0i64)]),
         "coalesce(a, b, Int64(0))"
     )]
     #[case::array(
-        KernelExpr::array([KernelExpr::literal(1i64), KernelExpr::literal(2i64)]),
+        KernelExpr::array([lit(1i64), lit(2i64)]),
         "make_array(Int64(1), Int64(2))"
     )]
     #[case::nested_coalesce(
-        KernelExpr::coalesce([KernelExpr::coalesce([column_expr!("a"), column_expr!("b")]), column_expr!("x")]),
+        KernelExpr::coalesce([KernelExpr::coalesce([col!("a"), col!("b")]), col!("x")]),
         "coalesce(coalesce(a, b), x)"
     )]
     #[case::nested_array(
         KernelExpr::array([
-            KernelExpr::array([KernelExpr::literal(1i64), KernelExpr::literal(2i64)]),
-            KernelExpr::array([KernelExpr::literal(3i64), KernelExpr::literal(4i64)]),
+            KernelExpr::array([lit(1i64), lit(2i64)]),
+            KernelExpr::array([lit(3i64), lit(4i64)]),
         ]),
         "make_array(make_array(Int64(1), Int64(2)), make_array(Int64(3), Int64(4)))"
     )]
@@ -223,13 +215,19 @@ mod tests {
         assert_eq!(lower(kernel), expected);
     }
 
+    #[test]
+    fn embedded_predicate_delegates_to_predicate_converter() {
+        let kernel = KernelExpr::Predicate(Box::new(col!("b").is_null()));
+        assert_eq!(lower(kernel), "b IS NULL");
+    }
+
     /// A column reference that does not resolve against the input schema fails at conversion time,
     /// not later during DataFusion analysis. Covers each `field_at` failure mode.
     #[rstest]
     #[case::empty(KernelExpr::Column(KernelColumnName::default()))]
-    #[case::unknown_root(KernelExpr::column(["nope"]))]
-    #[case::unknown_nested(KernelExpr::column(["a", "b", "missing"]))]
-    #[case::descend_into_non_struct(KernelExpr::column(["x", "y"]))]
+    #[case::unknown_root(col!("nope"))]
+    #[case::unknown_nested(col!("a.b.missing"))]
+    #[case::descend_into_non_struct(col!("x.y"))]
     fn unresolved_column_is_an_error(#[case] kernel: KernelExpr) {
         to_df_expr(&kernel, &test_schema()).unwrap_err();
     }

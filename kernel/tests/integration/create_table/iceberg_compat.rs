@@ -93,9 +93,7 @@ fn v3_create_table_rejects_void_column(#[case] void_field: StructField) -> Delta
 }
 
 /// IcebergV3 has no interval type, so icebergCompatV3 omits intervals from
-/// its type allowlist. Enabling V3 alongside an interval column must fail at `.build(...)`. This
-/// holds regardless of the `interval-type-in-dev` gate, since the V3 allowlist is the rejection
-/// point and runs before any kernel-support check.
+/// its type allowlist. Enabling V3 alongside an interval column must fail at `.build(...)`.
 #[rstest]
 fn v3_create_table_rejects_interval_column(
     #[values(DataType::INTERVAL_YEAR_MONTH, DataType::INTERVAL_DAY_TIME)] interval: DataType,

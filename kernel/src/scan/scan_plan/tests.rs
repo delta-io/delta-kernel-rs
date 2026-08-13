@@ -15,7 +15,7 @@ use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{column_expr, column_name, Expression as Expr, Predicate as Pred};
+use crate::expressions::{col, column_name, lit, Predicate as Pred};
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
@@ -210,10 +210,10 @@ fn declarative_metadata_matches_imperative_scan(
     #[case] table: &str,
     #[values(
         None,
-        Some(column_expr!("id").gt(Expr::literal(3i64))),
-        Some(column_expr!("id").eq(Expr::literal(2i64))),
-        Some(column_expr!("id").le(Expr::literal(0i64))),
-        Some(column_expr!("id").is_not_null())
+        Some(col!("id").gt(lit(3i64))),
+        Some(col!("id").eq(lit(2i64))),
+        Some(col!("id").le(lit(0i64))),
+        Some(col!("id").is_not_null())
     )]
     predicate: Option<Pred>,
 ) -> DeltaResult<()> {
@@ -269,7 +269,7 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
     assert!(plan
         .nodes
         .iter()
-        .all(|node| !matches!(&node.op, Operator::Load(_))));
+        .all(|node| !matches!(&node.op, Operator::DynamicScan(_))));
     assert!(plan.nodes.iter().any(|node| {
         let Operator::ScanParquet(scan) = &node.op else {
             return false;
@@ -306,7 +306,7 @@ fn declarative_metadata_matches_imperative_across_stats_options(
     } else {
         stats.clone()
     };
-    let predicate: PredicateRef = column_expr!("id").gt(Expr::literal(0i64)).into();
+    let predicate: PredicateRef = col!("id").gt(lit(0i64)).into();
     let expected_builder = snapshot
         .clone()
         .scan_builder()
@@ -739,9 +739,9 @@ fn assert_metadata_output_options(
 }
 
 #[rstest]
-#[case::gt_three(column_expr!("id").gt(Expr::literal(3i64)), 2)]
-#[case::eq_two(column_expr!("id").eq(Expr::literal(2i64)), 1)]
-#[case::le_zero(column_expr!("id").le(Expr::literal(0i64)), 0)]
+#[case::gt_three(col!("id").gt(lit(3i64)), 2)]
+#[case::eq_two(col!("id").eq(lit(2i64)), 1)]
+#[case::le_zero(col!("id").le(lit(0i64)), 0)]
 fn declarative_metadata_data_skipping(
     #[values(
         "v1-multi-part-struct-stats-only",
@@ -782,9 +782,9 @@ fn declarative_metadata_data_skipping(
 }
 
 #[rstest]
-#[case::part_zero(column_expr!("part").eq(Expr::literal(0i32)), 1)]
-#[case::part_one(column_expr!("part").eq(Expr::literal(1i32)), 2)]
-#[case::missing_part(column_expr!("part").eq(Expr::literal(4i32)), 0)]
+#[case::part_zero(col!("part").eq(lit(0i32)), 1)]
+#[case::part_one(col!("part").eq(lit(1i32)), 2)]
+#[case::missing_part(col!("part").eq(lit(4i32)), 0)]
 fn declarative_metadata_reconstructs_partition_values_for_pruning(
     #[case] predicate: Pred,
     #[case] expected_count: usize,
@@ -824,7 +824,7 @@ fn declarative_metadata_partition_is_null_keeps_null_partition() -> DeltaResult<
     let (engine, snapshot, _tempdir) = load_test_table("data-reader-timestamp_ntz")?;
     let scan = snapshot
         .scan_builder()
-        .with_predicate(Arc::new(column_expr!("tsNtzPartition").is_null()))
+        .with_predicate(Arc::new(col!("tsNtzPartition").is_null()))
         .with_partition_values(PartitionValuesOptions::with_struct())
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
@@ -965,7 +965,7 @@ fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> 
     let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
     let scan = snapshot
         .scan_builder()
-        .with_predicate(Arc::new(column_expr!("int").gt(Expr::literal(0i64))))
+        .with_predicate(Arc::new(col!("int").gt(lit(0i64))))
         .build()?;
     let actual = declarative_metadata(&scan, engine.as_ref())?;
     let formatted = pretty_format_batches(&actual)?.to_string();
@@ -994,9 +994,9 @@ fn declarative_metadata_prunes_across_v1_log_states(
     )]
     log_state: LogState,
     #[values(
-        (column_expr!("value").gt(Expr::literal(2500i32)), 2),
+        (col!("value").gt(lit(2500i32)), 2),
         (
-            column_expr!("part_string").eq(Expr::literal("part_2000")),
+            col!("part_string").eq(lit("part_2000")),
             1
         )
     )]
@@ -1020,7 +1020,7 @@ fn declarative_metadata_partition_prunes_v2_checkpoints(
     assert_declarative_metadata_matches_imperative(
         log_state,
         FeatureSet::new().v2_checkpoint(),
-        column_expr!("part_string").eq(Expr::literal("part_2000")),
+        col!("part_string").eq(lit("part_2000")),
         1,
     )
 }
