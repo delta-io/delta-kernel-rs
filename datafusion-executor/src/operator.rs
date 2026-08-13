@@ -1620,6 +1620,18 @@ mod tests {
     /// NULL
     /// apple
     /// ```
+    ///
+    /// ```sql
+    /// SELECT min(value) AS min_value, max(value) AS max_value FROM input
+    /// ```
+    ///
+    /// ```text
+    /// case         | min_value | max_value
+    /// -------------+-----------+----------
+    /// mixed_values | apple     | cherry
+    /// all_null     | NULL      | NULL
+    /// no_rows      | NULL      | NULL
+    /// ```
     #[rstest]
     #[case::mixed_values(
         vec![
@@ -1690,6 +1702,21 @@ mod tests {
     /// NULL
     /// 5
     /// 1
+    /// ```
+    ///
+    /// ```sql
+    /// SELECT sum(value) AS sum_value,
+    ///        count(value) AS count_value,
+    ///        count(*) AS row_count
+    /// FROM input
+    /// ```
+    ///
+    /// ```text
+    /// case         | sum_value | count_value | row_count
+    /// -------------+-----------+-------------+----------
+    /// mixed_values | 9         | 3           | 4
+    /// all_null     | NULL      | 0           | 2
+    /// no_rows      | NULL      | 0           | 0
     /// ```
     #[rstest]
     #[case::mixed_values(
@@ -1771,6 +1798,21 @@ mod tests {
     /// valid   | no-key        | present  | NULL
     /// invalid | no-sentinel   | NULL     | 1
     /// invalid | no-key        | present  | NULL
+    /// ```
+    ///
+    /// ```sql
+    /// SELECT group,
+    ///        min_non_null_by(value, sentinel, key) AS min_value,
+    ///        max_non_null_by(value, sentinel, key) AS max_value
+    /// FROM input
+    /// GROUP BY group
+    /// ```
+    ///
+    /// ```text
+    /// group   | min_value | max_value
+    /// --------+-----------+----------
+    /// invalid | NULL      | NULL
+    /// valid   | min       | NULL
     /// ```
     #[tokio::test]
     async fn aggregate_non_null_by_filters_on_sentinel_and_key_but_retains_null_value() {
