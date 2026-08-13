@@ -107,7 +107,7 @@ const DATA_SPACE: StatsSpace = StatsSpace {
     field_base: 0,
 };
 
-/// Computes the base field ID for a column's stats struct, given a parent struct field ID.
+/// Computes the base field ID for a leaf column's stats struct from that leaf's own field ID.
 ///
 /// Stats field IDs occupy the range `[9_000, 200_000_000)`:
 /// - Metadata fields in [`SUPPORTED_METADATA_FIELD_IDS`] map into `[9_000, 10_000)`.
@@ -157,12 +157,8 @@ fn get_field_id(field: &StructField) -> Option<i32> {
 ///
 /// `bounds_type` is the type the bounds are recorded at: the column's own type for primitives, or
 /// an unshredded variant type for variant columns.
-fn build_stats_struct(
-    base_field_id: i32,
-    bounds_type: &DataType,
-    nullable: bool,
-    is_variant: bool,
-) -> StructType {
+fn build_stats_struct(base_field_id: i32, bounds_type: &DataType, nullable: bool) -> StructType {
+    let is_variant = matches!(bounds_type, DataType::Variant(_));
     let (has_nan_count, has_size_stats) = match bounds_type {
         DataType::Primitive(ptype) => (
             matches!(ptype, PrimitiveType::Float | PrimitiveType::Double),
@@ -212,10 +208,9 @@ fn build_stats_struct(
             has_size_stats,
         ),
     ];
-    let fields = specs
-        .into_iter()
-        .filter(|&(.., include)| include)
-        .map(|(name, ty, offset, _)| field_with_id(name, ty, true, base_field_id + offset));
+    let fields = specs.into_iter().filter_map(|(name, ty, offset, include)| {
+        include.then(|| field_with_id(name, ty, true, base_field_id + offset))
+    });
 
     StructType::new_unchecked(fields)
 }
@@ -237,16 +232,35 @@ fn leaf_stats_field(
     path: &[String],
     nullable: bool,
 ) -> DeltaResult<Option<StructField>> {
-    // Only leaves carry a field ID that matters for stats (missing => error). The spec limits which
-    // fields may carry stats, so a field ID outside the supported range is expected for some
-    // reserved metadata columns; skip (warn) rather than error in that case.
+    // Only leaves carry a field ID that matters for stats. A field ID that is absent, or present
+    // but not `i32`-representable, is malformed => error. The spec limits which fields may carry
+    // stats, so a field ID outside the supported range is expected for some reserved metadata
+    // columns; skip (warn) rather than error in that case.
     let field_id = get_field_id(field).ok_or_else(|| {
         Error::generic(format!(
-            "Field '{}' is missing field ID! metadata: {:#?}",
+            "Field '{}' has no usable (present, i32-representable) field ID. metadata: {:#?}",
             field.name(),
             field.metadata()
         ))
     })?;
+
+    // Geospatial stats generation is not implemented yet. Error (rather than silently dropping the
+    // column) so this is not forgotten once geospatial support lands -- checked before the range
+    // gate below so an out-of-range geo field ID still errors. Reachable only with the
+    // `geo-type-in-dev` feature enabled.
+    // TODO: emit proper stats for geospatial columns.
+    #[cfg(feature = "geo-type-in-dev")]
+    if matches!(
+        field.data_type(),
+        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_))
+    ) {
+        return Err(Error::unsupported(format!(
+            "AMT stats schema generation is not yet implemented for geospatial column '{}' (type {})",
+            field.name(),
+            field.data_type(),
+        )));
+    }
+
     let Some(base_stats_id) = field_id_to_statistics_base(field_id) else {
         warn!(
             "Skipping stats for field '{}' (field_id={field_id}): outside supported stats range",
@@ -256,33 +270,13 @@ fn leaf_stats_field(
     };
 
     let stats_struct = match field.data_type() {
-        // Geospatial stats generation is not implemented yet. Error (rather than silently dropping
-        // the column) so this is not forgotten once geospatial support lands; the arm is reachable
-        // only with the `geo-type-in-dev` feature enabled.
-        // TODO: emit proper stats for geospatial columns.
-        #[cfg(feature = "geo-type-in-dev")]
-        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
-            return Err(Error::unsupported(format!(
-                "AMT stats schema generation is not yet implemented for geospatial column \
-                 '{}' (type {})",
-                field.name(),
-                field.data_type(),
-            )));
-        }
-        DataType::Primitive(_) => {
-            build_stats_struct(base_stats_id, field.data_type(), nullable, false)
-        }
+        DataType::Primitive(_) => build_stats_struct(base_stats_id, field.data_type(), nullable),
         // A variant's inner fields carry no field IDs; the base stats ID covers the whole variant.
         // Stats are tracked only when it has a `value` field, with the bounds recorded as
         // unshredded variants. `null_value_count` follows the leaf's effective `nullable` -- a NULL
         // variant is a column-level SQL null, independent of the physical encoding.
         DataType::Variant(inner) if inner.field(VARIANT_VALUE_FIELD_NAME).is_some() => {
-            build_stats_struct(
-                base_stats_id,
-                &DataType::unshredded_variant(),
-                nullable,
-                true,
-            )
+            build_stats_struct(base_stats_id, &DataType::unshredded_variant(), nullable)
         }
         // A variant without a `value` field, and array/map columns, carry no leaf stats. (Structs
         // are descended into by the collector and never reach here.)
@@ -301,13 +295,7 @@ fn leaf_stats_field(
 }
 
 /// A [`SchemaTransform`] that collects the flat AMT `content_stats` schema by visiting every leaf
-/// of a table schema.
-///
-/// Each primitive/variant leaf appends one stats struct field (see [`leaf_stats_field`]) to
-/// [`Self::fields`], named by the leaf's full dotted path and keyed at its own base stats field ID.
-/// Struct columns are descended into and get no entry of their own -- their field IDs are never
-/// read (only leaves carry stats). Array/map columns, and variants lacking a `value` field, add
-/// nothing.
+/// of a table schema (see [`stats_schema`] for the layout, [`leaf_stats_field`] for each leaf).
 ///
 /// Uses the `Result<(), Error>` carrier: the rebuilt output is discarded, [`Self::fields`] is the
 /// real result, and an `Err` short-circuits the walk.
@@ -316,9 +304,7 @@ struct StatsSchemaCollector {
     path: Vec<String>,
     /// Accumulated flat stats fields, in schema order.
     fields: Vec<StructField>,
-    /// Whether any struct ancestor on the current path is nullable. A leaf under a nullable struct
-    /// can be physically null (its ancestor is null) even if declared not-null, so it still needs
-    /// a `null_value_count`.
+    /// Whether any struct ancestor on the current path is nullable.
     ancestor_nullable: bool,
 }
 
@@ -359,7 +345,8 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
 /// Struct columns are descended into and produce no stats entry of their own (their field IDs are
 /// never read). `table_struct` must be a physical schema carrying `parquet.field.id` metadata on
 /// each leaf (as produced by [`StructField::make_physical`]); logical schemas that annotate field
-/// IDs only under `delta.columnMapping.id` are not accepted.
+/// IDs only under `delta.columnMapping.id` are not accepted. Leaf field IDs must be unique (as a
+/// physical schema guarantees); duplicates map to the same stats base and are not diagnosed.
 ///
 /// A leaf is omitted when it is an array/map column, a variant lacking a `value` field, or its
 /// field ID is outside the supported stats range (e.g. reserved metadata columns like
@@ -421,11 +408,6 @@ mod tests {
         }
     }
 
-    /// Convenience for top-level leaves, whose flat output key equals `field.name()`.
-    fn field_stats_struct_for(field: &StructField, stats: &StructType) -> StructType {
-        stats_struct_for_name(field.name(), stats)
-    }
-
     /// Asserts every stats sub-field of `stats_struct` carries the expected offset from `base_id`.
     /// `expected_nullable` is the leaf's effective nullability (its own, or inherited from a
     /// nullable ancestor); the `null_value_count` check is gated on it. Variants omit
@@ -478,8 +460,6 @@ mod tests {
         }
     }
 
-    /// `expected_count`: lower/upper/tight/value (4) + null_value_count (if nullable) +
-    /// nan_value_count (float/double) + avg_value_size_in_bytes (string/binary).
     #[rstest]
     #[case(DataType::INTEGER, false, 1, 10_200, 4)] // fixed-length, non-null
     #[case(DataType::STRING, true, 2, 10_400, 6)] // size stats + null count
@@ -506,7 +486,7 @@ mod tests {
         let schema = StructType::new_unchecked([field.clone()]);
 
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        let stats_struct = field_stats_struct_for(&field, &stats);
+        let stats_struct = stats_struct_for_name(field.name(), &stats);
 
         assert_eq!(stats_struct.fields().count(), expected_count);
         // Bounds preserve the column's type.
@@ -688,7 +668,7 @@ mod tests {
         assert!(matches!(stats_field.data_type(), DataType::Struct(_)));
         assert_eq!(get_field_id(stats_field), Some(10_600));
 
-        let v_stats = field_stats_struct_for(&field, &stats);
+        let v_stats = stats_struct_for_name(field.name(), &stats);
         // Bounds are recorded as unshredded variants (metadata + value), not the physical encoding.
         assert_eq!(
             v_stats.field(LOWER_BOUND).unwrap().data_type(),
@@ -736,15 +716,46 @@ mod tests {
         ); // 10_000+200*6
     }
 
-    #[test]
-    fn stats_schema_nullable_variant_gets_null_value_count() {
-        // A nullable variant column must record null_value_count even though the inner `value`
-        // field of an unshredded variant is not_null -- null tracking follows the column.
-        let field = field_with_id("v", DataType::unshredded_variant(), true, 3);
-        let schema = StructType::new_unchecked([field.clone()]);
+    /// `null_value_count` follows the leaf's EFFECTIVE nullability: its own, or inherited from a
+    /// nullable struct ancestor (a leaf under a nullable struct can be physically null). Covers
+    /// plain and variant leaves, at top level and nested under a struct. Note an unshredded
+    /// variant's inner `value` is not_null, so a nullable variant's null tracking follows the
+    /// column, not the encoding.
+    #[rstest]
+    #[case::top_level_nullable_variant(DataType::unshredded_variant(), true, None, true)]
+    #[case::not_null_int_under_nullable_struct(DataType::INTEGER, false, Some(true), true)]
+    #[case::not_null_int_under_not_null_struct(DataType::INTEGER, false, Some(false), false)]
+    #[case::not_null_variant_under_nullable_struct(
+        DataType::unshredded_variant(),
+        false,
+        Some(true),
+        true
+    )]
+    fn null_value_count_follows_effective_nullability(
+        #[case] leaf_type: DataType,
+        #[case] leaf_nullable: bool,
+        #[case] parent_nullable: Option<bool>,
+        #[case] expect_null_count: bool,
+    ) {
+        let leaf = field_with_id("leaf", leaf_type, leaf_nullable, 2);
+        let (schema, leaf_name) = match parent_nullable {
+            None => (StructType::new_unchecked([leaf]), "leaf"),
+            Some(nullable) => (
+                StructType::new_unchecked([field_with_id(
+                    "parent",
+                    StructType::new_unchecked([leaf]).into(),
+                    nullable,
+                    1,
+                )]),
+                "parent.leaf",
+            ),
+        };
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        let v_stats = field_stats_struct_for(&field, &stats);
-        assert!(v_stats.field(NULL_VALUE_COUNT).is_some());
+        let leaf_stats = stats_struct_for_name(leaf_name, &stats);
+        assert_eq!(
+            leaf_stats.field(NULL_VALUE_COUNT).is_some(),
+            expect_null_count
+        );
     }
 
     #[test]
@@ -761,14 +772,17 @@ mod tests {
 
     #[cfg(feature = "geo-type-in-dev")]
     #[rstest]
-    #[case::geometry(DataType::from(GeometryType::try_new("EPSG:4326").expect("valid crs")))]
-    #[case::geography(DataType::from(
+    #[case::geometry_in_range(DataType::from(GeometryType::try_new("EPSG:4326").expect("valid crs")), 1)]
+    #[case::geography_in_range(DataType::from(
         GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).expect("valid crs")
-    ))]
-    fn stats_schema_geospatial_column_errors(#[case] geo_type: DataType) {
-        // Geospatial stats generation is not implemented yet: a geo column errors rather than being
-        // silently dropped, so it is not forgotten once support lands.
-        let schema = StructType::new_unchecked([field_with_id("g", geo_type, true, 1)]);
+    ), 1)]
+    // Out of range: still errors, because the geospatial check precedes the range gate.
+    #[case::geometry_out_of_range(
+        DataType::from(GeometryType::try_new("EPSG:4326").expect("valid crs")),
+        MAX_DATA_FIELD_ID + 1
+    )]
+    fn stats_schema_geospatial_column_errors(#[case] geo_type: DataType, #[case] field_id: i32) {
+        let schema = StructType::new_unchecked([field_with_id("g", geo_type, true, field_id)]);
         let err = stats_schema(&schema).expect_err("geospatial columns are not yet supported");
         assert!(
             err.to_string().contains("geospatial"),
@@ -870,19 +884,19 @@ mod tests {
         // 3 data + 2 supported metadata; _file and _pos are skipped.
         assert_eq!(stats.fields().count(), 5);
         assert_stats_field_ids(
-            &field_stats_struct_for(&id, &stats),
+            &stats_struct_for_name(id.name(), &stats),
             10_000,
             &id,
             id.is_nullable(),
         );
         assert_stats_field_ids(
-            &field_stats_struct_for(&name, &stats),
+            &stats_struct_for_name(name.name(), &stats),
             10_200,
             &name,
             name.is_nullable(),
         );
         assert_stats_field_ids(
-            &field_stats_struct_for(&score, &stats),
+            &stats_struct_for_name(score.name(), &stats),
             10_400,
             &score,
             score.is_nullable(),
@@ -890,13 +904,13 @@ mod tests {
         assert!(stats.field("_file").is_none());
         assert!(stats.field("_pos").is_none());
         assert_stats_field_ids(
-            &field_stats_struct_for(&row_id, &stats),
+            &stats_struct_for_name(row_id.name(), &stats),
             9_200,
             &row_id,
             row_id.is_nullable(),
         );
         assert_stats_field_ids(
-            &field_stats_struct_for(&last_updated_seq_no, &stats),
+            &stats_struct_for_name(last_updated_seq_no.name(), &stats),
             9_000,
             &last_updated_seq_no,
             last_updated_seq_no.is_nullable(),
@@ -904,32 +918,14 @@ mod tests {
     }
 
     #[test]
-    fn stats_schema_not_null_leaf_under_nullable_struct_gets_null_value_count() {
-        // A leaf declared not-null but nested under a nullable struct can still be physically null
-        // (when the enclosing struct is null), so it gets a null_value_count.
-        let inner = StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]);
-        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
-        let b_stats = stats_struct_for_name("a.b", &stats_schema(&schema).unwrap());
-        assert_eq!(b_stats.fields().count(), 5); // 4 base + null_value_count
-        assert!(b_stats.field(NULL_VALUE_COUNT).is_some());
-
-        // Contrast: the same not-null leaf under a NOT-NULL struct keeps no null_value_count.
-        let inner = StructType::new_unchecked([field_with_id("b", DataType::INTEGER, false, 2)]);
-        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), false, 1)]);
-        let b_stats = stats_struct_for_name("a.b", &stats_schema(&schema).unwrap());
-        assert_eq!(b_stats.fields().count(), 4);
-        assert!(b_stats.field(NULL_VALUE_COUNT).is_none());
-    }
-
-    #[test]
-    fn stats_schema_nullable_ancestor_applies_to_variant_leaf() {
-        // The effective-nullability rule applies to variant leaves too: a not-null variant under a
-        // nullable struct records a null_value_count.
-        let variant = field_with_id("v", DataType::unshredded_variant(), false, 2);
-        let inner = StructType::new_unchecked([variant]);
-        let schema = StructType::new_unchecked([field_with_id("a", inner.into(), true, 1)]);
-        let v_stats = stats_struct_for_name("a.v", &stats_schema(&schema).unwrap());
-        assert!(v_stats.field(NULL_VALUE_COUNT).is_some());
+    fn stats_schema_field_id_exceeding_i32_range_errors() {
+        // A field ID present but exceeding i32 range is unusable (not merely "missing") and errors,
+        // rather than being silently mis-keyed.
+        let field = StructField::not_null("c", DataType::INTEGER).with_metadata([(
+            ColumnMetadataKey::ParquetFieldId.as_ref(),
+            MetadataValue::Number(i32::MAX as i64 + 1),
+        )]);
+        assert!(stats_schema(&StructType::new_unchecked([field])).is_err());
     }
 
     #[test]
