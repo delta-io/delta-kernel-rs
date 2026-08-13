@@ -1149,7 +1149,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 /// Arrow lacks the functionality to json-parse a string column into a struct column, so we
 /// implement it here.
 ///
-/// Failure-prone primitive leaves (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) produce
+/// Failure-prone primitive leaves (every timestamp flavor, plus `Date` and `Decimal`) produce
 /// per-cell NULL when the typed decoder rejects a value (extended-year timestamps,
 /// decimals that overflow the declared precision, etc.). Other leaf type mismatches still
 /// surface as batch-level errors.
@@ -1193,9 +1193,9 @@ fn parse_json_inner<'a>(
     num_rows: usize,
     schema: SchemaRef,
 ) -> DeltaResult<RecordBatch> {
-    // arrow-json's typed Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch
-    // on a single bad cell, so rewrite those leaves to `String` first and safe-cast back to
-    // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
+    // arrow-json's typed timestamp/date/decimal decoders fail the entire batch on a single bad
+    // cell, so rewrite those leaves to `String` first and safe-cast back to the target type.
+    // `Cow::Borrowed` means nothing was rewritten; skip the cast pass.
     match StringifyFailureProneLeaves.transform_struct(schema.as_ref()) {
         Cow::Borrowed(_) => {
             let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
@@ -1259,7 +1259,7 @@ fn decode_with_arrow_json<'a>(
     ))
 }
 
-/// Rewrites failure-prone primitives (`Timestamp`, `TimestampNtz`, `Date`, `Decimal`) to
+/// Rewrites failure-prone primitives (every timestamp flavor, plus `Date` and `Decimal`) to
 /// `String` so the typed decoder accepts any well-formed JSON string for those cells.
 ///
 /// `Array`/`Map`/`Variant` are not visited: Delta doesn't track min/max stats for them,
@@ -1273,6 +1273,8 @@ impl<'a> SchemaTransform<'a> for StringifyFailureProneLeaves {
         use PrimitiveType::*;
         match ptype {
             Timestamp | TimestampNtz | Date | Decimal(_) => Cow::Owned(String),
+            #[cfg(feature = "nanosecond-timestamps")]
+            TimestampNanos | TimestampNanosNtz => Cow::Owned(String),
             _ => Cow::Borrowed(ptype),
         }
     }
@@ -1867,7 +1869,7 @@ mod tests {
         }
     }
 
-    /// Per-cell NULL isolation across the four failure-prone leaf types. Each case feeds
+    /// Per-cell NULL isolation across the failure-prone leaf types. Each case feeds
     /// a 3-row single-column batch where row 1 is malformed in a way that defeats
     /// arrow-json's typed decoder; rows 0 and 2 must round-trip to valid typed cells.
     #[rstest]
@@ -1902,6 +1904,29 @@ mod tests {
             r#"{"v": "99999999999.99"}"#,
             r#"{"v": "5.25"}"#,
         ],
+    )]
+    // Year 9999 is inside the microsecond range but overflows nanosecond epoch encoding
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_nanos_out_of_range(
+            DataType::TIMESTAMP_NANOS,
+            &[
+                r#"{"v": "2024-01-01T00:00:00Z"}"#,
+                r#"{"v": "9999-12-31T23:59:59.999Z"}"#,
+                r#"{"v": "2025-06-01T00:00:00Z"}"#,
+            ],
+        )
+    )]
+    #[cfg_attr(
+        feature = "nanosecond-timestamps",
+        case::timestamp_nanos_ntz_out_of_range(
+            DataType::TIMESTAMP_NANOS_NTZ,
+            &[
+                r#"{"v": "2024-01-01T00:00:00"}"#,
+                r#"{"v": "9999-12-31T23:59:59.999"}"#,
+                r#"{"v": "2025-06-01T00:00:00"}"#,
+            ],
+        )
     )]
     fn test_parse_json_safe_cast_per_cell_null(
         #[case] leaf_type: DataType,
