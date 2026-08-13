@@ -721,10 +721,8 @@ mod tests {
         )
     }
 
-    /// The orphaned-but-legacy `columnMapping` shape (writerFeatures only, empty readerFeatures) is
-    /// the one kernel tolerates, so a CRC carrying it deserializes successfully.
     #[test]
-    fn de_crc_accepts_orphaned_column_mapping() {
+    fn deserialize_crc_accepts_orphaned_column_mapping() {
         let json = crc_json_with_protocol(
             r#"{"minReaderVersion": 3, "minWriterVersion": 7,
                 "readerFeatures": [], "writerFeatures": ["columnMapping"]}"#,
@@ -733,11 +731,8 @@ mod tests {
         assert_eq!(crc.protocol.min_reader_version(), 3);
     }
 
-    /// A non-legacy ReaderWriter feature that is writer-only (deletionVectors missing from
-    /// readerFeatures) is an invalid shape. CRC deserialization must reject it the same way JSON
-    /// log replay does, rather than bypassing `Protocol::try_new`.
     #[test]
-    fn de_crc_rejects_non_legacy_writer_only_feature() {
+    fn deserialize_crc_rejects_orphaned_non_legacy_reader_writer_feature() {
         let json = crc_json_with_protocol(
             r#"{"minReaderVersion": 3, "minWriterVersion": 7,
                 "readerFeatures": [], "writerFeatures": ["columnMapping", "deletionVectors"]}"#,
