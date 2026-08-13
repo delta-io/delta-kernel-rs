@@ -1420,6 +1420,7 @@ mod tests {
         StructType::try_new([
             StructField::nullable("group", DataType::STRING),
             StructField::nullable("value", DataType::STRING),
+            StructField::nullable("sentinel", DataType::STRING),
             StructField::nullable("key", DataType::LONG),
         ])
         .unwrap()
@@ -1449,29 +1450,35 @@ mod tests {
     }
 
     #[rstest]
-    #[case::min(KernelAgg::min(column_name!("value")), "min", None)]
-    #[case::max(KernelAgg::max(column_name!("value")), "max", None)]
+    #[case::min(KernelAgg::min(column_name!("value")), "min", df_col("value"), None)]
+    #[case::max(KernelAgg::max(column_name!("value")), "max", df_col("value"), None)]
+    #[case::sum(KernelAgg::sum(column_name!("key")), "sum", df_col("key"), None)]
+    #[case::count(KernelAgg::count(column_name!("value")), "count", df_col("value"), None)]
+    #[case::count_star(KernelAgg::count_star(), "count", lit(1), None)]
     #[case::min_non_null_by(
         KernelAgg::min_non_null_by(
             column_name!("value"),
-            column_name!("value"),
+            column_name!("sentinel"),
             column_name!("key")
         ),
         "first_value",
+        df_col("value"),
         Some(true)
     )]
     #[case::max_non_null_by(
         KernelAgg::max_non_null_by(
             column_name!("value"),
-            column_name!("value"),
+            column_name!("sentinel"),
             column_name!("key")
         ),
         "first_value",
+        df_col("value"),
         Some(false)
     )]
     fn aggregate_lowers_function_with_declared_schema(
         #[case] agg: KernelAgg,
         #[case] expected_function: &str,
+        #[case] expected_arg: DFExpr,
         #[case] expected_ascending: Option<bool>,
         #[values(false, true)] grouped: bool,
     ) {
@@ -1511,7 +1518,7 @@ mod tests {
             panic!("expected aggregate function, got {:?}", alias.expr);
         };
         assert_eq!(function.func.name(), expected_function);
-        assert_eq!(function.params.args, [df_col("value")]);
+        assert_eq!(function.params.args, [expected_arg]);
 
         let Some(ascending) = expected_ascending else {
             assert!(function.params.order_by.is_empty());
@@ -1522,7 +1529,7 @@ mod tests {
             function.params.order_by,
             [df_col("key").sort(ascending, false)]
         );
-        let expected_filter = df_col("value")
+        let expected_filter = df_col("sentinel")
             .is_not_null()
             .and(df_col("key").is_not_null());
         assert_eq!(function.params.filter.as_deref(), Some(&expected_filter));
@@ -1674,47 +1681,146 @@ mod tests {
         assert_eq!(batches[0].column(1).is_null(0), expected_max.is_none());
     }
 
+    /// Mixed-value input; the other cases contain only NULLs or no rows:
+    ///
+    /// ```text
+    /// value
+    /// -----
+    /// 3
+    /// NULL
+    /// 5
+    /// 1
+    /// ```
+    #[rstest]
+    #[case::mixed_values(
+        vec![
+            vec![KernelScalar::Long(3)],
+            vec![KernelScalar::Null(DataType::LONG)],
+            vec![KernelScalar::Long(5)],
+            vec![KernelScalar::Long(1)],
+        ],
+        Some(9),
+        3,
+        4
+    )]
+    #[case::all_null(
+        vec![
+            vec![KernelScalar::Null(DataType::LONG)],
+            vec![KernelScalar::Null(DataType::LONG)],
+        ],
+        None,
+        0,
+        2
+    )]
+    #[case::no_rows(vec![], None, 0, 0)]
+    #[tokio::test]
+    async fn aggregate_executes_sum_count_and_count_star(
+        #[case] rows: Vec<Vec<KernelScalar>>,
+        #[case] expected_sum: Option<i64>,
+        #[case] expected_count: i64,
+        #[case] expected_row_count: i64,
+    ) {
+        let input_schema = Arc::new(
+            StructType::try_new([StructField::nullable("value", DataType::LONG)]).unwrap(),
+        );
+        let parent = Arc::new(lower_values_node(input_schema.as_ref().clone(), rows).unwrap());
+        let aggregate = KernelAggregate::ungrouped(input_schema)
+            .aggregate_as(KernelAgg::sum(column_name!("value")), "sum_value")
+            .aggregate_as(KernelAgg::count(column_name!("value")), "count_value")
+            .aggregate_as(KernelAgg::count_star(), "row_count")
+            .build()
+            .unwrap();
+
+        let lowered = lower_operator(
+            &KernelOperator::Aggregate(aggregate),
+            std::slice::from_ref(&parent),
+        )
+        .unwrap();
+        let batches = execute(lowered).await.unwrap();
+        let expected_row = format!(
+            "| {:<9} | {expected_count:<11} | {expected_row_count:<9} |",
+            expected_sum
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        );
+        assert_batches_eq!(
+            &[
+                "+-----------+-------------+-----------+",
+                "| sum_value | count_value | row_count |",
+                "+-----------+-------------+-----------+",
+                expected_row.as_str(),
+                "+-----------+-------------+-----------+",
+            ],
+            &batches
+        );
+        assert_eq!(batches[0].column(0).is_null(0), expected_sum.is_none());
+        assert!(!batches[0].column(1).is_null(0));
+        assert!(!batches[0].column(2).is_null(0));
+    }
+
     /// Input:
     ///
     /// ```text
-    /// group   | value  | key
-    /// --------+--------+-----
-    /// valid   | NULL   | 0
-    /// valid   | min    | 1
-    /// valid   | max    | 3
-    /// valid   | NULL   | 4
-    /// valid   | no-key | NULL
-    /// invalid | NULL   | 1
-    /// invalid | no-key | NULL
+    /// group   | value         | sentinel | key
+    /// --------+---------------+----------+-----
+    /// valid   | ignored-low   | NULL     | 0
+    /// valid   | min           | present  | 1
+    /// valid   | max           | present  | 3
+    /// valid   | NULL          | present  | 4
+    /// valid   | ignored-high  | NULL     | 5
+    /// valid   | no-key        | present  | NULL
+    /// invalid | no-sentinel   | NULL     | 1
+    /// invalid | no-key        | present  | NULL
     /// ```
     #[tokio::test]
-    async fn aggregate_non_null_by_ignores_rows_unless_value_and_key_are_both_non_null() {
+    async fn aggregate_non_null_by_filters_on_sentinel_and_key_but_retains_null_value() {
         let rows = vec![
             vec![
                 "valid".into(),
+                "ignored-low".into(),
                 KernelScalar::Null(DataType::STRING),
                 KernelScalar::Long(0),
             ],
-            vec!["valid".into(), "min".into(), KernelScalar::Long(1)],
-            vec!["valid".into(), "max".into(), KernelScalar::Long(3)],
+            vec![
+                "valid".into(),
+                "min".into(),
+                "present".into(),
+                KernelScalar::Long(1),
+            ],
+            vec![
+                "valid".into(),
+                "max".into(),
+                "present".into(),
+                KernelScalar::Long(3),
+            ],
             vec![
                 "valid".into(),
                 KernelScalar::Null(DataType::STRING),
+                "present".into(),
                 KernelScalar::Long(4),
             ],
             vec![
                 "valid".into(),
+                "ignored-high".into(),
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Long(5),
+            ],
+            vec![
+                "valid".into(),
                 "no-key".into(),
+                "present".into(),
                 KernelScalar::Null(DataType::LONG),
             ],
             vec![
                 "invalid".into(),
+                "no-sentinel".into(),
                 KernelScalar::Null(DataType::STRING),
                 KernelScalar::Long(1),
             ],
             vec![
                 "invalid".into(),
                 "no-key".into(),
+                "present".into(),
                 KernelScalar::Null(DataType::LONG),
             ],
         ];
@@ -1725,7 +1831,7 @@ mod tests {
                 .aggregate_as(
                     KernelAgg::min_non_null_by(
                         column_name!("value"),
-                        column_name!("value"),
+                        column_name!("sentinel"),
                         column_name!("key"),
                     ),
                     "min_value",
@@ -1733,7 +1839,7 @@ mod tests {
                 .aggregate_as(
                     KernelAgg::max_non_null_by(
                         column_name!("value"),
-                        column_name!("value"),
+                        column_name!("sentinel"),
                         column_name!("key"),
                     ),
                     "max_value",
@@ -1753,7 +1859,7 @@ mod tests {
                 "| group   | min_value | max_value |",
                 "+---------+-----------+-----------+",
                 "| invalid |           |           |",
-                "| valid   | min       | max       |",
+                "| valid   | min       |           |",
                 "+---------+-----------+-----------+",
             ],
             &batches
