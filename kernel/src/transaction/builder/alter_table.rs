@@ -129,8 +129,7 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     /// The field must not be a metadata column.
     ///
     /// With column mapping enabled, existing IDs and physical names are preserved and missing
-    /// annotations are assigned. In `None` mode, introduced annotations are stripped only when
-    /// the pre-ALTER schema had no column-mapping metadata.
+    /// annotations are assigned.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
