@@ -25,9 +25,6 @@ use crate::schema::{
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
 
-/// Variant inner field name whose statistics are tracked (variants only track their `value`).
-const VARIANT_VALUE_FIELD_NAME: &str = "value";
-
 /// Field ID offsets for stats fields within a column's stats struct.
 const STATS_OFFSET_LOWER_BOUND: i32 = 1;
 const STATS_OFFSET_UPPER_BOUND: i32 = 2;
@@ -216,8 +213,8 @@ fn build_stats_struct(base_field_id: i32, bounds_type: &DataType, nullable: bool
 }
 
 /// Builds the flat stats field for a non-struct leaf, or `None` when the leaf carries no stats:
-/// an array/map column, a variant lacking a `value` inner field, or a field ID outside the
-/// supported stats range (skipped with a warning). The returned field is named by the leaf's full
+/// an array/map column, or a field ID outside the supported stats range (skipped with a
+/// warning). The returned field is named by the leaf's full
 /// dotted path (`path`, whose last segment is the leaf itself) and keyed at the leaf's base stats
 /// field ID (see [`build_stats_struct`] for the sub-fields).
 ///
@@ -271,15 +268,15 @@ fn leaf_stats_field(
 
     let stats_struct = match field.data_type() {
         DataType::Primitive(_) => build_stats_struct(base_stats_id, field.data_type(), nullable),
-        // A variant's inner fields carry no field IDs; the base stats ID covers the whole variant.
-        // Stats are tracked only when it has a `value` field, with the bounds recorded as
-        // unshredded variants. `null_value_count` follows the leaf's effective `nullable` -- a NULL
-        // variant is a column-level SQL null, independent of the physical encoding.
-        DataType::Variant(inner) if inner.field(VARIANT_VALUE_FIELD_NAME).is_some() => {
+        // A variant's inner fields carry no field IDs; the base stats ID covers the whole variant,
+        // and its bounds are always recorded as unshredded variants regardless of physical
+        // shredding. `null_value_count` follows the leaf's effective `nullable` -- a NULL variant
+        // is a column-level SQL null, independent of the physical encoding.
+        DataType::Variant(_) => {
             build_stats_struct(base_stats_id, &DataType::unshredded_variant(), nullable)
         }
-        // A variant without a `value` field, and array/map columns, carry no leaf stats. (Structs
-        // are descended into by the collector and never reach here.)
+        // Array/map columns carry no leaf stats. (Structs are descended into by the collector and
+        // never reach here.)
         _ => return Ok(None),
     };
 
@@ -324,6 +321,9 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
             self.ancestor_nullable = saved;
             result
         } else {
+            // Every non-struct type is a leaf handled by `leaf_stats_field` -- including variants
+            // (never descended into: their inner fields carry no field IDs) and array/map columns
+            // (which produce no stats).
             let nullable = field.is_nullable() || self.ancestor_nullable;
             leaf_stats_field(field, &self.path, nullable).map(|stats| self.fields.extend(stats))
         };
@@ -348,8 +348,8 @@ impl<'a> SchemaTransform<'a> for StatsSchemaCollector {
 /// IDs only under `delta.columnMapping.id` are not accepted. Leaf field IDs must be unique (as a
 /// physical schema guarantees); duplicates map to the same stats base and are not diagnosed.
 ///
-/// A leaf is omitted when it is an array/map column, a variant lacking a `value` field, or its
-/// field ID is outside the supported stats range (e.g. reserved metadata columns like
+/// A leaf is omitted when it is an array/map column, or its field ID is outside the supported
+/// stats range (e.g. reserved metadata columns like
 /// `_file`/`_pos`, or data field IDs above the reserved range), which are skipped with a warning.
 /// Returns an error if a leaf is missing its field-id metadata entirely, or is an (as-yet
 /// unimplemented) geospatial column.
@@ -646,8 +646,8 @@ mod tests {
 
     /// Both unshredded and shredded variant inputs produce the same ordinary stats struct: the
     /// bounds are recorded as unshredded variants, `tight_bounds` is excluded, and the size stat is
-    /// present. Only the presence of a `value` inner field matters; extra inner fields (e.g. a
-    /// shredded `typed_value`) are ignored.
+    /// present. The physical inner layout (e.g. a shredded `typed_value`) does not affect the
+    /// generated stats.
     #[rstest]
     #[case::unshredded(DataType::unshredded_variant())]
     #[case::shredded(
@@ -759,15 +759,20 @@ mod tests {
     }
 
     #[test]
-    fn stats_schema_variant_without_value_field_is_omitted() {
-        // A variant whose inner struct has no `value` field has no stats to track -> drop.
+    fn stats_schema_variant_stats_independent_of_physical_layout() {
+        // Stats are emitted for any variant column regardless of its physical inner layout: even a
+        // variant whose inner struct lacks a `value` field still gets unshredded-variant bounds.
         let variant = DataType::Variant(Box::new(StructType::new_unchecked([
             StructField::not_null("metadata", DataType::BINARY),
         ])));
-        let schema = StructType::new_unchecked([field_with_id("v", variant, false, 3)]);
+        let field = field_with_id("v", variant, false, 3);
+        let schema = StructType::new_unchecked([field]);
         let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        assert!(stats.field("v").is_none());
-        assert_eq!(stats.fields().count(), 0);
+        let v_stats = stats_struct_for_name("v", &stats);
+        assert_eq!(
+            v_stats.field(LOWER_BOUND).unwrap().data_type(),
+            &DataType::unshredded_variant()
+        );
     }
 
     #[cfg(feature = "geo-type-in-dev")]
@@ -989,24 +994,5 @@ mod tests {
             get_field_id(stats.field("b.z").unwrap()),
             Some(10_000 + 200 * 20)
         );
-    }
-
-    #[test]
-    fn stats_schema_nested_value_less_variant_dropped_sibling_kept() {
-        // A value-less variant nested inside a struct is dropped, while its surviving sibling is
-        // still emitted at its correct dotted path.
-        let no_value = DataType::Variant(Box::new(StructType::new_unchecked([
-            StructField::not_null("metadata", DataType::BINARY),
-        ])));
-        let inner = StructType::new_unchecked([
-            field_with_id("keep", DataType::LONG, false, 5),
-            field_with_id("v", no_value, false, 6),
-        ]);
-        let schema = StructType::new_unchecked([field_with_id("s", inner.into(), true, 1)]);
-
-        let stats = stats_schema(&schema).expect("stats_schema should succeed");
-        assert_eq!(stats.fields().count(), 1);
-        assert!(stats.field("s.keep").is_some());
-        assert!(stats.field("s.v").is_none());
     }
 }
