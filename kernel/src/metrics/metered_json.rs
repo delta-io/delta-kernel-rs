@@ -120,6 +120,7 @@ mod tests {
         /// Set when the cancellation-aware read variant is invoked, so a test can assert the
         /// metered wrapper forwards to it (rather than the plain read).
         cancellation_read_called: std::sync::atomic::AtomicBool,
+        write_result: Option<JsonWriteResult>,
     }
 
     fn empty_batch() -> Box<dyn EngineData> {
@@ -164,9 +165,8 @@ mod tests {
             _data: DeltaResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
         ) -> DeltaResult<JsonWriteResult> {
-            Err(crate::Error::generic(
-                "StubJsonHandler does not support writes",
-            ))
+            self.write_result
+                .ok_or_else(|| crate::Error::generic("StubJsonHandler does not support writes"))
         }
     }
 
@@ -284,6 +284,24 @@ mod tests {
         };
         assert_eq!(e.num_files, 0);
         assert_eq!(e.bytes_read, 0);
+    }
+
+    #[test]
+    fn write_json_file_forwards_result_without_emitting_metrics() {
+        let (reporter, _guard) = install_capture();
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler {
+            write_result: Some(JsonWriteResult::new(42)),
+            ..Default::default()
+        });
+        let handler = MeteredJsonHandler::new(inner);
+        let path = Url::parse("memory:///_delta_log/0.json").unwrap();
+
+        let result = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap();
+
+        assert_eq!(result, JsonWriteResult::new(42));
+        assert!(reporter.events().is_empty());
     }
 
     #[test]
