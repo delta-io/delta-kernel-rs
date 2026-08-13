@@ -109,6 +109,7 @@
 55. Refine agg definitions and sync engine impl ([#3081])
 56. 3-arg Min/MaxNotNullBy ([#3082])
 57. Define and implement SUM/COUNT aggregates ([#3083])
+58. Initial predicate conversion ([#2971])
 
 ### 🐛 Bug Fixes
 
@@ -130,6 +131,9 @@
 16. Truncate timestamp stats to milliseconds in JSON encoding ([#3073])
 17. Dv resolution when multiple batches are produced ([#3077])
 18. Block dataChange removeFile for appendOnly tables ([#3042])
+19. Remove version from kernel in datafusion executor ([#3108])
+20. Logical comparison for NULL instead of physical comparison ([#3085])
+21. Read tables with orphaned columnMapping reader feature ([#3097])
 
 ### 📚 Documentation
 
@@ -266,6 +270,10 @@
 [#3082]: https://github.com/delta-io/delta-kernel-rs/pull/3082
 [#3074]: https://github.com/delta-io/delta-kernel-rs/pull/3074
 [#3083]: https://github.com/delta-io/delta-kernel-rs/pull/3083
+[#2971]: https://github.com/delta-io/delta-kernel-rs/pull/2971
+[#3108]: https://github.com/delta-io/delta-kernel-rs/pull/3108
+[#3085]: https://github.com/delta-io/delta-kernel-rs/pull/3085
+[#3097]: https://github.com/delta-io/delta-kernel-rs/pull/3097
 
 
 ## [v0.26.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.26.0/) (2026-07-13)
