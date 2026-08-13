@@ -305,6 +305,19 @@ mod tests {
     }
 
     #[test]
+    fn write_json_file_forwards_errors() {
+        let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());
+        let handler = MeteredJsonHandler::new(inner);
+        let path = Url::parse("memory:///_delta_log/0.json").unwrap();
+
+        let error = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not support writes"));
+    }
+
+    #[test]
     #[should_panic(expected = "wraps another MeteredJsonHandler")]
     fn new_panics_on_double_wrap() {
         let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler::default());

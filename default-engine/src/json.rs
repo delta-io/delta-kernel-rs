@@ -135,10 +135,7 @@ async fn write_json_file_impl(
     buffer: Vec<u8>,
     overwrite: bool,
 ) -> DeltaResult<FileSize> {
-    let size = buffer
-        .len()
-        .try_into()
-        .map_err(|_| Error::generic("JSON file size exceeds u64::MAX"))?;
+    let size = buffer.len() as FileSize;
     let put_mode = if overwrite {
         PutMode::Overwrite
     } else {
@@ -891,9 +888,9 @@ mod tests {
         let result =
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        let written_size = result?;
+        let written_size = result.unwrap();
         assert_eq!(written_size, 32);
-        assert_eq!(written_size, store.head(&object_path).await?.size);
+        assert_eq!(written_size, store.head(&object_path).await.unwrap().size);
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -904,9 +901,9 @@ mod tests {
             handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            let written_size = result?;
+            let written_size = result.unwrap();
             assert_eq!(written_size, 28);
-            assert_eq!(written_size, store.head(&object_path).await?.size);
+            assert_eq!(written_size, store.head(&object_path).await.unwrap().size);
             let json = read_json_file(&store, &object_path).await?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
@@ -927,12 +924,20 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let handler =
             DefaultJsonHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-        let path = Url::parse("memory:///test/data/empty.json")?;
+        let path = Url::parse("memory:///test/data/empty.json").unwrap();
         let object_path = Path::from("/test/data/empty.json");
 
-        let written_size = handler.write_json_file(&path, Box::new(std::iter::empty()), false)?;
-        let stored_meta = store.head(&object_path).await?;
-        let stored_bytes = store.get(&object_path).await?.bytes().await?;
+        let written_size = handler
+            .write_json_file(&path, Box::new(std::iter::empty()), false)
+            .unwrap();
+        let stored_meta = store.head(&object_path).await.unwrap();
+        let stored_bytes = store
+            .get(&object_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
 
         assert_eq!(written_size, 0);
         assert_eq!(stored_meta.size, 0);

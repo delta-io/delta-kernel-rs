@@ -76,10 +76,7 @@ impl JsonHandler for SyncJsonHandler {
         overwrite: bool,
     ) -> DeltaResult<FileSize> {
         let buf = to_json_bytes(data)?;
-        let size = buf
-            .len()
-            .try_into()
-            .map_err(|_| Error::generic("JSON file size exceeds u64::MAX"))?;
+        let size = buf.len() as FileSize;
         put_bytes(self.store.as_ref(), path, buf.into(), overwrite)?;
         Ok(size)
     }
@@ -142,9 +139,9 @@ mod tests {
         let result =
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        let written_size = result?;
+        let written_size = result.unwrap();
         assert_eq!(written_size, 32);
-        assert_eq!(written_size, std::fs::metadata(&path)?.len());
+        assert_eq!(written_size, std::fs::metadata(&path).unwrap().len());
         let json = read_json_file(&path)?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -155,9 +152,9 @@ mod tests {
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            let written_size = result?;
+            let written_size = result.unwrap();
             assert_eq!(written_size, 28);
-            assert_eq!(written_size, std::fs::metadata(&path)?.len());
+            assert_eq!(written_size, std::fs::metadata(&path).unwrap().len());
             let json = read_json_file(&path)?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
@@ -175,10 +172,12 @@ mod tests {
         let handler = SyncJsonHandler::new(None);
         let url = Url::from_file_path(&path).unwrap();
 
-        let written_size = handler.write_json_file(&url, Box::new(std::iter::empty()), false)?;
+        let written_size = handler
+            .write_json_file(&url, Box::new(std::iter::empty()), false)
+            .unwrap();
 
         assert_eq!(written_size, 0);
-        assert_eq!(std::fs::metadata(&path)?.len(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         Ok(())
     }
 
