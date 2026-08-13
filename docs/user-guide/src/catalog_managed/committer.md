@@ -133,10 +133,8 @@ fn commit(
 ### Step 2: Ratify through the catalog
 
 Call your catalog's commit API to ratify the staged commit. The exact arguments
-vary by catalog; Unity Catalog's `CommitRequest`, for example, carries the table
-id, commit version, staged filename, in-commit timestamp, and the maximum
-published version. Your catalog's API may look different. Here is the general
-shape:
+vary by catalog. The general shape below passes the table identity, commit version,
+staged path, in-commit timestamp, and maximum published version:
 
 ```rust,ignore
     // Tell the catalog about the staged commit.
