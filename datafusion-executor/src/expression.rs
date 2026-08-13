@@ -329,7 +329,7 @@ fn struct_patch_to_df_expr(
 #[cfg(test)]
 mod tests {
     use delta_kernel::expressions::{
-        column_expr, Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
+        col, lit, Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
     };
     use delta_kernel::schema::{ArrayType, DataType, StructField, StructType};
     use rstest::rstest;
@@ -367,31 +367,28 @@ mod tests {
     }
 
     #[rstest]
-    #[case::i32(KernelExpr::literal(7i32), "Int32(7)")]
-    #[case::i64(KernelExpr::literal(42i64), "Int64(42)")]
-    #[case::string(KernelExpr::literal("abc"), "Utf8(\"abc\")")]
-    #[case::boolean(KernelExpr::literal(true), "Boolean(true)")]
+    #[case::i32(lit(7i32), "Int32(7)")]
+    #[case::i64(lit(42i64), "Int64(42)")]
+    #[case::string(lit("abc"), "Utf8(\"abc\")")]
+    #[case::boolean(lit(true), "Boolean(true)")]
     #[case::null(KernelExpr::null_literal(DataType::LONG), "Int64(NULL)")]
     fn literal_lowers_to_scalar(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     #[rstest]
-    #[case::single(KernelExpr::column(["a"]), "a")]
-    #[case::depth_2(KernelExpr::column(["a", "b"]), "get_field(a, Utf8(\"b\"))")]
-    #[case::depth_3(
-        KernelExpr::column(["a", "b", "c"]),
-        "get_field(a, Utf8(\"b\"), Utf8(\"c\"))"
-    )]
+    #[case::single(col!("a"), "a")]
+    #[case::depth_2(col!("a.b"), "get_field(a, Utf8(\"b\"))")]
+    #[case::depth_3(col!("a.b.c"), "get_field(a, Utf8(\"b\"), Utf8(\"c\"))")]
     fn column_lowers_to_nested_field_access(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
 
     #[rstest]
-    #[case::plus(column_expr!("a") + KernelExpr::literal(1i64), "a + Int64(1)")]
-    #[case::minus(column_expr!("a") - KernelExpr::literal(1i64), "a - Int64(1)")]
-    #[case::multiply(column_expr!("a") * KernelExpr::literal(2i64), "a * Int64(2)")]
-    #[case::divide(column_expr!("a") / KernelExpr::literal(2i64), "a / Int64(2)")]
+    #[case::plus(col!("a") + lit(1i64), "a + Int64(1)")]
+    #[case::minus(col!("a") - lit(1i64), "a - Int64(1)")]
+    #[case::multiply(col!("a") * lit(2i64), "a * Int64(2)")]
+    #[case::divide(col!("a") / lit(2i64), "a / Int64(2)")]
     fn arithmetic_binary_lowers_to_binary_expr(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }
@@ -399,13 +396,11 @@ mod tests {
     /// Nested arithmetic lowers to the matching operator tree.
     #[rstest]
     #[case::precedence_pins_grouping(
-        (column_expr!("x") + KernelExpr::literal(1i64)) * (column_expr!("b") - KernelExpr::literal(2i64)),
+        (col!("x") + lit(1i64)) * (col!("b") - lit(2i64)),
         "(x + Int64(1)) * (b - Int64(2))"
     )]
     #[case::nested_field_and_all_ops(
-        (KernelExpr::column(["a", "b", "c"]) * KernelExpr::literal(5i64)
-            - (column_expr!("b") + column_expr!("x")))
-            / KernelExpr::literal(20i64),
+        (col!("a.b.c") * lit(5i64) - (col!("b") + col!("x"))) / lit(20i64),
         "(get_field(a, Utf8(\"b\"), Utf8(\"c\")) * Int64(5) - b + x) / Int64(20)"
     )]
     fn nested_arithmetic_lowers_to_operator_tree(
@@ -417,21 +412,21 @@ mod tests {
 
     #[rstest]
     #[case::coalesce(
-        KernelExpr::coalesce([column_expr!("a"), column_expr!("b"), KernelExpr::literal(0i64)]),
+        KernelExpr::coalesce([col!("a"), col!("b"), lit(0i64)]),
         "coalesce(a, b, Int64(0))"
     )]
     #[case::array(
-        KernelExpr::array([KernelExpr::literal(1i64), KernelExpr::literal(2i64)]),
+        KernelExpr::array([lit(1i64), lit(2i64)]),
         "make_array(Int64(1), Int64(2))"
     )]
     #[case::nested_coalesce(
-        KernelExpr::coalesce([KernelExpr::coalesce([column_expr!("a"), column_expr!("b")]), column_expr!("x")]),
+        KernelExpr::coalesce([KernelExpr::coalesce([col!("a"), col!("b")]), col!("x")]),
         "coalesce(coalesce(a, b), x)"
     )]
     #[case::nested_array(
         KernelExpr::array([
-            KernelExpr::array([KernelExpr::literal(1i64), KernelExpr::literal(2i64)]),
-            KernelExpr::array([KernelExpr::literal(3i64), KernelExpr::literal(4i64)]),
+            KernelExpr::array([lit(1i64), lit(2i64)]),
+            KernelExpr::array([lit(3i64), lit(4i64)]),
         ]),
         "make_array(make_array(Int64(1), Int64(2)), make_array(Int64(3), Int64(4)))"
     )]
@@ -443,7 +438,7 @@ mod tests {
     /// struct schema to each element, so the struct children get their field names.
     #[test]
     fn array_of_struct_threads_element_schema_to_each_element() {
-        let element = KernelExpr::struct_from([column_expr!("b"), KernelExpr::literal(1i64)]);
+        let element = KernelExpr::struct_from([col!("b"), lit(1i64)]);
         let kernel = KernelExpr::array([element]);
         let target: DataType = ArrayType::new(pq_output_schema(), true).into();
         assert_eq!(
@@ -456,7 +451,7 @@ mod tests {
     /// struct schema reaches the leaf struct element.
     #[test]
     fn nested_array_of_array_peels_element_type_at_each_level() {
-        let inner = KernelExpr::array([KernelExpr::struct_from([column_expr!("b")])]);
+        let inner = KernelExpr::array([KernelExpr::struct_from([col!("b")])]);
         let kernel = KernelExpr::array([inner]);
         let leaf = StructType::try_new([StructField::nullable("p", DataType::LONG)]).unwrap();
         let target: DataType = ArrayType::new(ArrayType::new(leaf, true), true).into();
@@ -471,10 +466,10 @@ mod tests {
     /// element type to peel.
     #[rstest]
     #[case::struct_element_without_target(
-        KernelExpr::array([KernelExpr::struct_from([column_expr!("b")])]),
+        KernelExpr::array([KernelExpr::struct_from([col!("b")])]),
         None
     )]
-    #[case::non_array_target(KernelExpr::array([KernelExpr::literal(1i64)]), Some(DataType::LONG))]
+    #[case::non_array_target(KernelExpr::array([lit(1i64)]), Some(DataType::LONG))]
     fn array_with_unresolvable_element_type_is_an_error(
         #[case] kernel: KernelExpr,
         #[case] output_type: Option<DataType>,
@@ -484,7 +479,7 @@ mod tests {
 
     #[test]
     fn embedded_predicate_delegates_to_predicate_converter() {
-        let kernel = KernelExpr::Predicate(Box::new(column_expr!("b").is_null()));
+        let kernel = KernelExpr::Predicate(Box::new(col!("b").is_null()));
         assert_eq!(lower(kernel), "b IS NULL");
     }
 
@@ -492,9 +487,9 @@ mod tests {
     /// not later during DataFusion analysis. Covers each `field_at` failure mode.
     #[rstest]
     #[case::empty(KernelExpr::Column(KernelColumnName::default()))]
-    #[case::unknown_root(KernelExpr::column(["nope"]))]
-    #[case::unknown_nested(KernelExpr::column(["a", "b", "missing"]))]
-    #[case::descend_into_non_struct(KernelExpr::column(["x", "y"]))]
+    #[case::unknown_root(col!("nope"))]
+    #[case::unknown_nested(col!("a.b.missing"))]
+    #[case::descend_into_non_struct(col!("x.y"))]
     fn unresolved_column_is_an_error(#[case] kernel: KernelExpr) {
         to_df_expr(&kernel, &test_schema(), None).unwrap_err();
     }
@@ -512,7 +507,7 @@ mod tests {
 
     #[test]
     fn struct_lowers_to_named_struct_with_target_names() {
-        let kernel = KernelExpr::struct_from([column_expr!("b"), KernelExpr::literal(1i64)]);
+        let kernel = KernelExpr::struct_from([col!("b"), lit(1i64)]);
         assert_eq!(
             lower_typed(kernel, pq_output_schema().into()),
             "named_struct(Utf8(\"p\"), b, Utf8(\"q\"), Int64(1))"
@@ -521,7 +516,7 @@ mod tests {
 
     #[test]
     fn nested_struct_recurses_with_child_target_names() {
-        let inner = KernelExpr::struct_from([column_expr!("b"), KernelExpr::literal(1i64)]);
+        let inner = KernelExpr::struct_from([col!("b"), lit(1i64)]);
         let kernel = KernelExpr::struct_from([inner]);
         let target =
             StructType::try_new([StructField::nullable("outer", pq_output_schema())]).unwrap();
@@ -534,8 +529,8 @@ mod tests {
     #[test]
     fn struct_with_nullability_wraps_in_case() {
         let kernel = KernelExpr::struct_with_nullability_from(
-            [column_expr!("b"), KernelExpr::literal(1i64)],
-            KernelExpr::Predicate(Box::new(column_expr!("x").is_not_null())),
+            [col!("b"), lit(1i64)],
+            KernelExpr::Predicate(Box::new(col!("x").is_not_null())),
         );
         // Kernel models IS NOT NULL as Not(IsNull), so the guard renders as "NOT x IS NULL".
         let rendered = lower_typed(kernel, pq_output_schema().into());
@@ -548,13 +543,13 @@ mod tests {
 
     #[test]
     fn struct_without_target_is_unsupported() {
-        let kernel = KernelExpr::struct_from([column_expr!("b")]);
+        let kernel = KernelExpr::struct_from([col!("b")]);
         to_df_expr(&kernel, &test_schema(), None).unwrap_err();
     }
 
     #[test]
     fn struct_arity_mismatch_is_an_error() {
-        let kernel = KernelExpr::struct_from([column_expr!("b"), KernelExpr::literal(1i64)]);
+        let kernel = KernelExpr::struct_from([col!("b"), lit(1i64)]);
         let target: DataType = StructType::try_new([StructField::nullable("p", DataType::LONG)])
             .unwrap()
             .into();
@@ -605,7 +600,7 @@ mod tests {
     #[test]
     fn top_level_patch_replace_puts_expr_in_field_slot() {
         let patch = ExpressionStructPatchBuilder::new()
-            .replace("a", KernelExpr::literal(7i64))
+            .replace("a", lit(7i64))
             .build()
             .unwrap();
         assert_eq!(
@@ -630,8 +625,8 @@ mod tests {
     #[test]
     fn top_level_patch_prepend_and_append() {
         let patch = ExpressionStructPatchBuilder::new()
-            .prepend(KernelExpr::literal(0i64))
-            .append(KernelExpr::literal(9i64))
+            .prepend(lit(0i64))
+            .append(lit(9i64))
             .build()
             .unwrap();
         let target = StructType::try_new([
@@ -651,7 +646,7 @@ mod tests {
     #[test]
     fn top_level_patch_insert_after_field() {
         let patch = ExpressionStructPatchBuilder::new()
-            .insert_after("a", KernelExpr::literal(5i64))
+            .insert_after("a", lit(5i64))
             .build()
             .unwrap();
         let target = StructType::try_new([
@@ -671,7 +666,7 @@ mod tests {
         // Input schema: { s: { a: long, b: long } }. Patch replaces s.a with a literal.
         let input = StructType::try_new([StructField::nullable("s", ab_schema())]).unwrap();
         let patch = ExpressionStructPatchBuilder::new_nested(["s"])
-            .replace("a", KernelExpr::literal(7i64))
+            .replace("a", lit(7i64))
             .build()
             .unwrap();
         assert_eq!(
@@ -726,7 +721,7 @@ mod tests {
     #[rstest]
     #[case::only_missing_required(
         ExpressionStructPatchBuilder::new()
-            .replace("nonexistent", KernelExpr::literal(1i64))
+            .replace("nonexistent", lit(1i64))
             .build()
             .unwrap(),
         pq_output_schema()
@@ -734,7 +729,7 @@ mod tests {
     #[case::matched_optional_does_not_mask_missing_required(
         ExpressionStructPatchBuilder::new()
             .drop_if_exists("b")
-            .replace("nonexistent", KernelExpr::literal(1i64))
+            .replace("nonexistent", lit(1i64))
             .build()
             .unwrap(),
         StructType::try_new([StructField::nullable("p", DataType::LONG)]).unwrap()
@@ -770,7 +765,7 @@ mod tests {
     /// the way down (`g` from the patch target, `h` from g's sub-schema, `leaf` from h's).
     #[test]
     fn nested_struct_targets_are_rederived_at_each_level() {
-        let deepest = KernelExpr::struct_from([column_expr!("a")]); // { leaf: a }
+        let deepest = KernelExpr::struct_from([col!("a")]); // { leaf: a }
         let middle = KernelExpr::struct_from([deepest]); // { h: { leaf } }
         let patch = ExpressionStructPatchBuilder::new()
             .append(middle)

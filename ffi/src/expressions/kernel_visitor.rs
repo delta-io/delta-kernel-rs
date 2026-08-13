@@ -785,7 +785,7 @@ fn visit_predicate_opaque_impl(
         return Ok(0);
     }
     tracing::info!("opaque predicate `{name}`: no eval callbacks; kernel will not prune on it");
-    Ok(wrap_predicate(state, Predicate::null_literal()))
+    Ok(wrap_predicate(state, Predicate::NULL))
 }
 
 /// Build an opaque predicate over `FfiOpaquePredicateOp(name, callbacks)` and
@@ -841,7 +841,7 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::{col, lit, Expression, Scalar};
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
@@ -1154,7 +1154,7 @@ mod tests {
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
         // No eval callbacks => NULL boolean literal, which abstains everywhere (even under NOT).
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
         // Children are drained from the visitor state even though they're discarded.
         assert!(state.inflight_ids.is_empty());
     }
@@ -1194,7 +1194,7 @@ mod tests {
         let id = ok_or_panic(result);
         assert_ne!(id, 0);
         let pred = unwrap_kernel_predicate(&mut state, id).unwrap();
-        assert_eq!(pred, Predicate::null_literal());
+        assert_eq!(pred, Predicate::NULL);
     }
 
     /// Drives `visit_predicate_opaque_with_eval` end to end: pass the callbacks struct by value,
@@ -1369,8 +1369,8 @@ mod tests {
 
         // Build the predicate through the FFI symbol, then extract the kernel `Predicate`.
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {
@@ -1498,8 +1498,8 @@ mod tests {
         unsafe extern "C" fn noop_free(_: *mut c_void) {}
 
         let mut state = KernelExpressionVisitorState::default();
-        let col_id = wrap_expression(&mut state, Expression::column(["id"]));
-        let target = wrap_expression(&mut state, Expression::literal(25i64));
+        let col_id = wrap_expression(&mut state, col!("id"));
+        let target = wrap_expression(&mut state, lit(25i64));
         let (_keep, mut it) = make_iter(vec![col_id, target]);
         let name = "IN_RANGE";
         let id = ok_or_panic(unsafe {

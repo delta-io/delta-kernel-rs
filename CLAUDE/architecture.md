@@ -136,7 +136,7 @@ all returned batches -- the engine may split a single file across multiple batch
    SetTransaction, DomainMetadata, Sidecar, CheckpointMetadata)
 - `kernel/src/schema/` -- `StructType`/`StructField`/`DataType`, projections
 - `kernel/src/expressions/` -- expression AST (`Expression`, `Predicate`, `Scalar`),
-  `column_expr!` macro
+  `col!` macro
 - `kernel/src/transforms/` -- generic recursive transforms (`ExpressionTransform`,
   `SchemaTransform`)
 - `kernel/src/checkpoint/` -- classic-named checkpoint writing (V1; V2 with or without sidecars)

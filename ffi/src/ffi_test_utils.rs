@@ -81,6 +81,18 @@ pub(crate) unsafe fn build_snapshot(
     ok_or_panic(snapshot_builder_build(builder))
 }
 
+/// Wrap an already-seeded object store in an engine handle. Caller must free it.
+///
+/// Needed because `get_default_engine` resolves the store from the URL, so a `memory://` path
+/// builds a fresh (empty) `InMemory` rather than the seeded one.
+#[cfg(test)]
+pub(crate) fn engine_handle_for_store(
+    store: Arc<delta_kernel::object_store::DynObjectStore>,
+) -> crate::handle::Handle<SharedExternEngine> {
+    let engine = DefaultEngineBuilder::new(store).build();
+    engine_to_handle(Arc::new(engine), allocate_err)
+}
+
 /// Create an in-memory engine and snapshot from the given commit data. Returns
 /// `(engine_handle, snapshot_handle)` -- the caller must free both when done.
 #[cfg(test)]
