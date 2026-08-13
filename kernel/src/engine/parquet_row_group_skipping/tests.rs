@@ -7,7 +7,7 @@ use super::*;
 use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema as ArrowSchema};
 use crate::expressions::{
-    column_expr, column_name, column_pred, Expression, OpaquePredicateOp, ScalarExpressionEvaluator,
+    col, column_name, column_pred, lit, Expression, OpaquePredicateOp, ScalarExpressionEvaluator,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator as _, DirectDataSkippingPredicateEvaluator,
@@ -648,7 +648,7 @@ fn checkpoint_filter_returns_stats_when_no_nulls_in_stat_columns() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(column_name!("x"), Scalar::from(50i64));
+    let predicate = Predicate::gt(col!("x"), lit(50i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // All stat columns are non-null, so stats should be available.
@@ -683,7 +683,7 @@ fn checkpoint_filter_returns_none_when_stat_column_has_nulls() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(column_name!("x"), Scalar::from(50i64));
+    let predicate = Predicate::gt(col!("x"), lit(50i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // Stat columns have nulls (row 1), so footer aggregates are unreliable.
@@ -713,8 +713,8 @@ fn checkpoint_filter_partition_columns_always_available() {
 
     let partition_columns: HashSet<String> = ["part_col".to_string()].into();
     let predicate = Predicate::and(
-        Predicate::gt(column_name!("x"), Scalar::from(50i64)),
-        Predicate::eq(column_name!("part_col"), Scalar::from("a")),
+        Predicate::gt(col!("x"), lit(50i64)),
+        Predicate::eq(col!("part_col"), lit("a")),
     );
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &partition_columns);
 
@@ -749,7 +749,7 @@ fn checkpoint_filter_apply_keeps_row_group_with_missing_stats() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
+    let predicate = Predicate::gt(col!("x"), lit(500i64));
     // Without null guarding, footer max=100 < 500 would falsely prune this row group.
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
@@ -771,7 +771,7 @@ fn checkpoint_filter_apply_prunes_row_group_with_all_stats_present() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
+    let predicate = Predicate::gt(col!("x"), lit(500i64));
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -896,7 +896,7 @@ fn checkpoint_filter_unknown_column_returns_none() {
     let row_group = metadata.row_group(0);
 
     // Predicate references column "y" which doesn't exist in the checkpoint.
-    let predicate = Predicate::gt(column_name!("y"), Scalar::from(50i64));
+    let predicate = Predicate::gt(col!("y"), lit(50i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     assert_eq!(
@@ -929,8 +929,8 @@ fn checkpoint_filter_mixed_partition_and_data_predicate() {
 
     // x > 500: data stats have nulls, can't prune. Overall AND can't prune.
     let predicate = Predicate::and(
-        Predicate::eq(column_name!("part_col"), Scalar::from("a")),
-        Predicate::gt(column_name!("x"), Scalar::from(500i64)),
+        Predicate::eq(col!("part_col"), lit("a")),
+        Predicate::gt(col!("x"), lit(500i64)),
     );
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
@@ -942,8 +942,8 @@ fn checkpoint_filter_mixed_partition_and_data_predicate() {
     // But x stats are unreliable. AND("c" not in [a,b], x unknown) -- the partition arm
     // is false, so the AND is false -> can prune!
     let predicate = Predicate::and(
-        Predicate::eq(column_name!("part_col"), Scalar::from("c")),
-        Predicate::gt(column_name!("x"), Scalar::from(5i64)),
+        Predicate::eq(col!("part_col"), lit("c")),
+        Predicate::gt(col!("x"), lit(5i64)),
     );
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
@@ -1012,10 +1012,7 @@ fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
 
     // OpaqueLessThanOp(x, 5) -> "x < 5". Data skipping checks min(x) < 5.
     // min(x) = 10, so 10 < 5 is false -> can skip the row group.
-    let predicate = Predicate::opaque(
-        OpaqueLessThanOp,
-        vec![column_expr!("x"), Expression::literal(5i64)],
-    );
+    let predicate = Predicate::opaque(OpaqueLessThanOp, vec![col!("x"), lit(5i64)]);
     assert!(!CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -1023,10 +1020,7 @@ fn checkpoint_filter_opaque_predicate_with_null_guarded_stats() {
     ));
 
     // OpaqueLessThanOp(x, 50) -> "x < 50". min(x) = 10, so 10 < 50 is true -> keep.
-    let predicate = Predicate::opaque(
-        OpaqueLessThanOp,
-        vec![column_expr!("x"), Expression::literal(50i64)],
-    );
+    let predicate = Predicate::opaque(OpaqueLessThanOp, vec![col!("x"), lit(50i64)]);
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -1050,10 +1044,7 @@ fn checkpoint_filter_opaque_predicate_with_missing_stats() {
     // OpaqueLessThanOp(x, 5) -> "x < 5". The stat column has nulls, so the null-guarded
     // provider returns None for min(x). The opaque op gets None and returns None,
     // which means the row group cannot be pruned. This is the safe behavior.
-    let predicate = Predicate::opaque(
-        OpaqueLessThanOp,
-        vec![column_expr!("x"), Expression::literal(5i64)],
-    );
+    let predicate = Predicate::opaque(OpaqueLessThanOp, vec![col!("x"), lit(5i64)]);
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -1160,7 +1151,7 @@ fn checkpoint_filter_multi_row_group_skipping() {
             .unwrap();
     assert_eq!(builder.metadata().num_row_groups(), 2);
 
-    let predicate = Predicate::gt(column_name!("x"), Scalar::from(500i64));
+    let predicate = Predicate::gt(col!("x"), lit(500i64));
     let builder = builder.with_checkpoint_row_group_filter(&predicate, &NO_PARTITIONS, None);
 
     // Only RG1 (x in [400, 600]) survives: max(x) = 600 > 500.
