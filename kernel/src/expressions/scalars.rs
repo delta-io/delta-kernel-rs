@@ -7,6 +7,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use strum::AsRefStr;
 
 use crate::error::add_scalar_path_context;
 use crate::schema::derive_macro_utils::{GetStructField, ToDataType};
@@ -317,7 +318,8 @@ impl StructData {
 ///
 /// NOTE: `PartialEq` uses physical (structural) comparison semantics.
 /// For SQL NULL semantics, use [`Scalar::logical_eq`] or [`Scalar::logical_partial_cmp`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AsRefStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
@@ -410,31 +412,7 @@ impl Scalar {
     /// Error for a failed conversion of this scalar into the Rust type named by `target`.
     #[internal_api]
     pub(crate) fn conversion_error(&self, target: &str) -> Error {
-        Error::scalar_conversion(target, self.kind_name())
-    }
-
-    fn kind_name(&self) -> &'static str {
-        match self {
-            Self::Integer(_) => "integer",
-            Self::Long(_) => "long",
-            Self::Short(_) => "short",
-            Self::Byte(_) => "byte",
-            Self::Float(_) => "float",
-            Self::Double(_) => "double",
-            Self::String(_) => "string",
-            Self::Boolean(_) => "boolean",
-            Self::Timestamp(_) => "timestamp",
-            Self::TimestampNtz(_) => "timestamp_ntz",
-            Self::IntervalYearMonth(_) => "interval_year_month",
-            Self::IntervalDayTime(_) => "interval_day_time",
-            Self::Date(_) => "date",
-            Self::Binary(_) => "binary",
-            Self::Decimal(_) => "decimal",
-            Self::Null(_) => "null",
-            Self::Struct(_) => "struct",
-            Self::Array(_) => "array",
-            Self::Map(_) => "map",
-        }
+        Error::scalar_conversion(target, self.as_ref())
     }
 
     /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
@@ -781,9 +759,15 @@ impl From<StructData> for Scalar {
 
 // ===== Scalar -> rust conversions, inverting the `From<T> for Scalar` impls above =====
 
-/// Inverts a `From<T> for Scalar` conversion. Each impl accepts only the variant its forward
-/// counterpart produces, so variants that merely share a physical representation (`Long` vs.
-/// `Timestamp`, `Integer` vs. `Date`, ...) are rejected instead of silently reinterpreted.
+/// Inverts the corresponding `From<T> for Scalar` conversion. The generated `try_from` matches on
+/// the single `Scalar` variant its forward counterpart produces and returns a conversion error for
+/// every other variant.
+///
+/// Matching is by variant, not by physical representation, so a target type is never produced from
+/// a variant that merely shares its in-memory layout: `i64` accepts `Long` but rejects `Timestamp`,
+/// `TimestampNtz`, and `IntervalDayTime`; `i32` accepts `Integer` but rejects `Date` and
+/// `IntervalYearMonth`. This keeps `Scalar` <-> rust conversions type-preserving, so a value's data
+/// type survives the round trip rather than collapsing onto whichever variant shares its layout.
 macro_rules! impl_try_from_scalar {
     ( $(($variant:ident, $rust_type:ty)),* $(,)? ) => {
         $(
@@ -1660,6 +1644,7 @@ mod tests {
     #[test]
     fn into_scalar_matches_to_data_type() {
         assert_into_scalar_matches_to_data_type(true);
+        assert_into_scalar_matches_to_data_type(1i8);
         assert_into_scalar_matches_to_data_type(1i16);
         assert_into_scalar_matches_to_data_type(1i32);
         assert_into_scalar_matches_to_data_type(1i64);
@@ -1669,7 +1654,9 @@ mod tests {
         assert_into_scalar_matches_to_data_type(Bytes::from_static(b"x"));
         assert_into_scalar_matches_to_data_type(TableFeature::DeletionVectors);
 
+        assert_into_scalar_matches_to_data_type(vec![1i8, 2, 3]);
         assert_into_scalar_matches_to_data_type(vec![1, 2, 3]);
+        assert_into_scalar_matches_to_data_type(vec![Some(1i32), None]);
         assert_into_scalar_matches_to_data_type(HashMap::from([
             ("key1".to_string(), 42i32),
             ("key2".to_string(), 100i32),
@@ -2086,51 +2073,78 @@ mod tests {
         );
     }
 
-    /// `TryFrom<Scalar>` must invert `Into<Scalar>` for every supported rust type.
-    fn assert_round_trip<T>(value: T)
+    /// `TryFrom<Scalar>` must invert `Into<Scalar>` and produce the expected data type.
+    fn assert_round_trip<T>(value: T, expected_type: impl Into<DataType>)
     where
         T: Clone + Debug + PartialEq + Into<Scalar> + TryFrom<Scalar, Error = Error>,
     {
         let scalar: Scalar = value.clone().into();
+        assert_eq!(scalar.data_type(), expected_type.into());
         assert_eq!(T::try_from(scalar).unwrap(), value);
     }
 
     #[test]
     fn scalar_conversions_round_trip() {
-        assert_round_trip(1i8);
-        assert_round_trip(2i16);
-        assert_round_trip(3i32);
-        assert_round_trip(4i64);
-        assert_round_trip(PI);
-        assert_round_trip(6.0f64);
-        assert_round_trip(true);
-        assert_round_trip("seven".to_string());
-        assert_round_trip(Bytes::from_static(b"eight"));
-        assert_round_trip(DecimalData::try_new(9, DecimalType::try_new(2, 1).unwrap()).unwrap());
-        assert_round_trip(vec![10i32, 11]);
-        assert_round_trip(vec![Some(12i32), None]);
-        assert_round_trip(HashMap::from([("k".to_string(), "v".to_string())]));
-        assert_round_trip(HashMap::from([("k".to_string(), None as Option<String>)]));
-        assert_round_trip(Some(13i32));
-        assert_round_trip(None as Option<i32>);
+        assert_round_trip(1i8, DataType::BYTE);
+        assert_round_trip(2i16, DataType::SHORT);
+        assert_round_trip(3i32, DataType::INTEGER);
+        assert_round_trip(4i64, DataType::LONG);
+        assert_round_trip(PI, DataType::FLOAT);
+        assert_round_trip(6.0f64, DataType::DOUBLE);
+        assert_round_trip(true, DataType::BOOLEAN);
+        assert_round_trip("seven".to_string(), DataType::STRING);
+        assert_round_trip(Bytes::from_static(b"eight"), DataType::BINARY);
+        let decimal_type = DecimalType::try_new(2, 1).unwrap();
+        assert_round_trip(DecimalData::try_new(9, decimal_type).unwrap(), decimal_type);
+        assert_round_trip(vec![10i32, 11], ArrayType::new(DataType::INTEGER, false));
+        assert_round_trip(
+            vec![Some(12i32), None],
+            ArrayType::new(DataType::INTEGER, true),
+        );
+        assert_round_trip(
+            HashMap::from([("k".to_string(), "v".to_string())]),
+            MapType::new(DataType::STRING, DataType::STRING, false),
+        );
+        assert_round_trip(
+            HashMap::from([("k".to_string(), None as Option<String>)]),
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        );
+        assert_round_trip(Some(13i32), DataType::INTEGER);
+        assert_round_trip(None::<i32>, DataType::INTEGER);
     }
 
     #[rstest]
-    // Variants that share a physical representation with the target type are still rejected.
-    #[case::long_is_not_integer(Scalar::Long(1), "expected i32, found long")]
-    #[case::timestamp_is_not_long(Scalar::Timestamp(1), "expected i32, found timestamp")]
-    #[case::date_is_not_integer(Scalar::Date(1), "expected i32, found date")]
-    #[case::string_is_not_integer(Scalar::from("1"), "expected i32, found string")]
-    #[case::null_is_not_integer(Scalar::null(DataType::INTEGER), "expected i32, found null")]
-    fn scalar_conversion_rejects_other_variants(#[case] scalar: Scalar, #[case] expected: &str) {
+    #[case::long(Scalar::Long(1), "expected i32, found long")]
+    #[case::date(Scalar::Date(1), "expected i32, found date")]
+    #[case::interval_year_month(
+        Scalar::IntervalYearMonth(1),
+        "expected i32, found interval_year_month"
+    )]
+    #[case::string(Scalar::from("1"), "expected i32, found string")]
+    #[case::null(Scalar::null(DataType::INTEGER), "expected i32, found null")]
+    fn i32_conversion_rejects_other_variants(#[case] scalar: Scalar, #[case] expected: &str) {
         assert_result_error_with_message(i32::try_from(scalar), expected);
     }
 
+    #[rstest]
+    #[case::timestamp(Scalar::Timestamp(1), "expected i64, found timestamp")]
+    #[case::timestamp_ntz(Scalar::TimestampNtz(1), "expected i64, found timestamp_ntz")]
+    #[case::interval_day_time(Scalar::IntervalDayTime(1), "expected i64, found interval_day_time")]
+    #[case::integer(Scalar::Integer(1), "expected i64, found integer")]
+    fn i64_conversion_rejects_other_variants(#[case] scalar: Scalar, #[case] expected: &str) {
+        assert_result_error_with_message(i64::try_from(scalar), expected);
+    }
+
     #[test]
-    fn null_scalar_converts_to_none_regardless_of_type() {
-        // The null's data type is not checked, so a mistyped null is still `None`.
-        let converted = Option::<i32>::try_from(Scalar::null(DataType::STRING)).unwrap();
-        assert_eq!(converted, None);
+    fn null_option_requires_matching_element_data_type() {
+        assert_eq!(
+            Option::<i32>::try_from(Scalar::null(DataType::INTEGER)).unwrap(),
+            None
+        );
+        assert_result_error_with_message(
+            Option::<i32>::try_from(Scalar::null(DataType::STRING)),
+            "expected integer, found string",
+        );
     }
 
     #[test]
@@ -2168,7 +2182,7 @@ mod tests {
 
     #[test]
     fn derived_struct_conversions_round_trip() {
-        assert_round_trip(test_person());
+        assert_round_trip(test_person(), Person::to_schema());
     }
 
     #[rstest]

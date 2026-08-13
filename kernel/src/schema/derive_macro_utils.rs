@@ -55,7 +55,7 @@ impl_to_data_type!(
     (i64, DataType::LONG),
     (i32, DataType::INTEGER),
     (i16, DataType::SHORT),
-    (char, DataType::BYTE),
+    (i8, DataType::BYTE),
     (f32, DataType::FLOAT),
     (f64, DataType::DOUBLE),
     (bool, DataType::BOOLEAN)
@@ -65,6 +65,13 @@ impl_to_data_type!(
 impl<T: ToDataType> ToDataType for Vec<T> {
     fn to_data_type() -> DataType {
         ArrayType::new(T::to_data_type(), false).into()
+    }
+}
+
+// ToDataType impl for arrays that may contain null elements
+impl<T: ToDataType> ToDataType for Vec<Option<T>> {
+    fn to_data_type() -> DataType {
+        ArrayType::new(T::to_data_type(), true).into()
     }
 }
 
