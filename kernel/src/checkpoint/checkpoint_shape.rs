@@ -233,22 +233,6 @@ impl CheckpointShape {
             })
             .then_some(stats_schema)
     }
-
-    /// Return `partition_schema` when the checkpoint has compatible parsed partition values.
-    pub(crate) fn compatible_partition_values_parsed_schema(
-        &self,
-        partition_schema: &SchemaRef,
-    ) -> Option<SchemaRef> {
-        self.leaf_checkpoint_schema
-            .as_ref()
-            .filter(|checkpoint_schema| {
-                LogSegment::schema_has_compatible_partition_values_parsed(
-                    checkpoint_schema,
-                    partition_schema,
-                )
-            })
-            .map(|_| partition_schema.clone())
-    }
 }
 
 /// Read the checkpoint `file`'s `sidecar` column, returning the first referenced sidecar's

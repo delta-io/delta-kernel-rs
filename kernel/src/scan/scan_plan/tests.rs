@@ -139,21 +139,32 @@ fn metadata_row_count(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
 
+fn sorted_pretty_lines(batches: &[RecordBatch]) -> DeltaResult<Vec<String>> {
+    let formatted = pretty_format_batches(batches)?.to_string();
+    let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
+    let len = lines.len();
+    if len > 3 {
+        lines[2..len - 1].sort_unstable();
+    }
+    Ok(lines)
+}
+
+fn assert_sorted_batches_eq(expected: &[&str], actual: &[RecordBatch]) -> DeltaResult<()> {
+    let formatted = pretty_format_batches(actual)?.to_string();
+    let mut actual: Vec<_> = formatted
+        .lines()
+        .filter(|line| line.starts_with("| {") || line.starts_with("| null"))
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(expected, actual, "{formatted}");
+    Ok(())
+}
+
 fn assert_metadata_eq(
     actual: &[RecordBatch],
     expected: &[RecordBatch],
     context: &str,
 ) -> DeltaResult<()> {
-    fn sorted_pretty_lines(batches: &[RecordBatch]) -> DeltaResult<Vec<String>> {
-        let formatted = pretty_format_batches(batches)?.to_string();
-        let mut lines: Vec<_> = formatted.lines().map(str::to_string).collect();
-        let len = lines.len();
-        if len > 3 {
-            lines[2..len - 1].sort_unstable();
-        }
-        Ok(lines)
-    }
-
     if let (Some(actual), Some(expected)) = (actual.first(), expected.first()) {
         assert_eq!(actual.schema(), expected.schema(), "{context}");
     }
@@ -745,14 +756,6 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> DeltaResult<()>
     checkpoint_struct_stats(),
     StatsOptions::all_struct()
 )]
-#[case::v2_checkpoint_without_stats(
-    LogState::with_latest_version(2)
-        .with_checkpoint_at([2])
-        .with_sidecars_if_enabled(None),
-    FeatureSet::new().v2_checkpoint(),
-    no_checkpoint_stats(),
-    StatsOptions::all_struct()
-)]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
@@ -760,6 +763,34 @@ fn declarative_metadata_output_options_across_log_shapes(
     #[case] stats: StatsOptions,
 ) -> DeltaResult<()> {
     assert_metadata_output_options(log_state, features, table_config, stats)
+}
+
+#[rstest]
+#[case::v1(
+    LogState::with_latest_version(2).with_checkpoint_at([2]),
+    FeatureSet::new()
+)]
+#[case::v2(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([2])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+fn declarative_metadata_errors_when_requested_stats_are_absent(
+    #[case] log_state: LogState,
+    #[case] features: FeatureSet,
+    #[values(
+        StatsOptions::json_only(),
+        StatsOptions::all_struct(),
+        StatsOptions::all()
+    )]
+    stats: StatsOptions,
+) {
+    let error = assert_metadata_output_options(log_state, features, no_checkpoint_stats(), stats)
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("checkpoint contains neither compatible add.stats_parsed nor add.stats"));
 }
 
 #[rstest]
@@ -789,6 +820,60 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
 ) {
     assert_metadata_output_options(log_state, features, checkpoint_struct_stats(), stats).unwrap();
+}
+
+#[rstest]
+#[case::v1(
+    LogState::with_latest_version(2).with_checkpoint_at([2]),
+    FeatureSet::new()
+)]
+#[case::v2(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([2])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+fn declarative_metadata_serializes_temporal_struct_stats_as_strings(
+    #[case] log_state: LogState,
+    #[case] features: FeatureSet,
+) -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(log_state)
+        .with_features(features)
+        .with_table_config(checkpoint_struct_stats().data_skipping_stats_columns([
+            "clust_date",
+            "clust_ts",
+            "clust_ts_ntz",
+        ]))
+        .with_data_layout(DataLayoutConfig::ClusteredAllTypes)
+        .build()
+        .expect("build struct-stats table");
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(StatsOptions::json_only())
+        .build()?;
+    let actual = declarative_metadata(&scan, &engine)?;
+    let stats_batches: Vec<_> = actual
+        .iter()
+        .map(|batch| {
+            RecordBatch::try_from_iter([(
+                STATS,
+                batch
+                    .column_by_name(STATS)
+                    .expect("requested JSON stats")
+                    .clone(),
+            )])
+        })
+        .collect::<Result<_, _>>()?;
+    assert_sorted_batches_eq(
+        &[
+            r#"| {"numRecords":10,"nullCount":{"clust_date":4,"clust_ts":4,"clust_ts_ntz":4},"minValues":{"clust_date":"2022-01-09","clust_ts":"2022-01-09T00:00:00.298Z","clust_ts_ntz":"2022-01-09T00:00:00.298"},"maxValues":{"clust_date":"2022-01-16","clust_ts":"2022-01-16T00:00:00.298Z","clust_ts_ntz":"2022-01-16T00:00:00.298"},"tightBounds":true} |"#,
+            r#"| {"numRecords":10,"nullCount":{"clust_date":4,"clust_ts":4,"clust_ts_ntz":4},"minValues":{"clust_date":"2024-10-05","clust_ts":"2024-10-05T00:00:00.298Z","clust_ts_ntz":"2024-10-05T00:00:00.298"},"maxValues":{"clust_date":"2024-10-12","clust_ts":"2024-10-12T00:00:00.298Z","clust_ts_ntz":"2024-10-12T00:00:00.298"},"tightBounds":true} |"#,
+        ],
+        &stats_batches,
+    )
 }
 
 fn assert_metadata_output_options(

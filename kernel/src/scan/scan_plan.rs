@@ -137,8 +137,9 @@ impl Scan {
     /// FROM checkpoint_actions
     /// WHERE add.path IS NOT NULL
     ///
-    /// When the checkpoint lacks a native parsed field, the corresponding `FROM_JSON` or
-    /// `MAP_TO_STRUCT` expression replaces it. A parsed field is omitted when its schema is absent.
+    /// When no compatible native field exists, the arm parses JSON or map input. It serializes
+    /// parsed stats when JSON output is requested from a struct-only checkpoint. Requested parsed
+    /// stats require at least one source representation; unrequested fields are omitted.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_schema.as_ref();
@@ -176,7 +177,7 @@ impl Scan {
             }
         }?;
 
-        actions
+        let actions = actions
             .filter(col!("add.path").is_not_null())?
             .project_patch(|patch| {
                 patch
@@ -190,7 +191,13 @@ impl Scan {
                         FILE_ACTION_KEY_FIELD.clone(),
                         file_action_key_expr(|col| joined_column_expr!("add", col)),
                     )
-            })
+            })?;
+
+        if self.stats.synthesize_json && !shape.has_json_stats() {
+            actions.project_patch(|patch| patch.with_json_add_stats())
+        } else {
+            Ok(actions)
+        }
     }
 
     /// Build the normalized commit JSON arm.
@@ -242,40 +249,52 @@ impl Scan {
 
     fn checkpoint_parquet_read_schema(&self, shape: &CheckpointShape) -> DeltaResult<SchemaRef> {
         let stats_schema = self.state_info.physical_stats_schema.as_ref();
-        let partition_schema = self.state_info.physical_partition_schema.as_ref();
-        let checkpoint_stats_schema = if self.stats.synthesize_json && !shape.has_json_stats() {
-            shape.stats_parsed_schema()
-        } else {
-            stats_schema.and_then(|schema| shape.compatible_stats_parsed_schema(schema))
-        };
-        let checkpoint_partition_schema = partition_schema
-            .and_then(|schema| shape.compatible_partition_values_parsed_schema(schema));
+        let checkpoint_parsed_stats_schema =
+            if self.stats.synthesize_json && !shape.has_json_stats() {
+                // JSON output must preserve all table-configured stats. `stats_schema` may be
+                // narrowed by `StructStats::Columns` or the data-skipping predicate, so use the
+                // full expected schema.
+                let expected_json_stats_schema = self
+                    .snapshot
+                    .table_configuration()
+                    .build_expected_stats_schemas(None, None)?
+                    .physical;
+                shape
+                    .compatible_stats_parsed_schema(&expected_json_stats_schema)
+                    .cloned()
+            } else {
+                stats_schema
+                    .and_then(|schema| shape.compatible_stats_parsed_schema(schema))
+                    .cloned()
+            };
+        if shape.checkpoint_type != CheckpointType::None
+            && (self.stats.synthesize_json || stats_schema.is_some())
+            && !shape.has_json_stats()
+            && checkpoint_parsed_stats_schema.is_none()
+        {
+            return Err(Error::invalid_checkpoint(
+                "stats were requested, but checkpoint contains neither compatible \
+                 add.stats_parsed nor add.stats",
+            ));
+        }
         let read_json_stats = shape.has_json_stats()
             && (self.stats.synthesize_json
-                || (stats_schema.is_some() && checkpoint_stats_schema.is_none()));
-        let read_string_partitions = self.partition_values.string_map
-            || (partition_schema.is_some() && checkpoint_partition_schema.is_none());
-
-        let add_patch = SchemaStructPatchBuilder::new()
-            .fold_with(checkpoint_stats_schema.as_ref(), |patch, schema| {
+                || (stats_schema.is_some() && checkpoint_parsed_stats_schema.is_none()));
+        let add_patch = SchemaStructPatchBuilder::new().fold_with(
+            checkpoint_parsed_stats_schema.as_ref(),
+            |patch, schema| {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
-            })
-            .fold_with(checkpoint_partition_schema.as_ref(), |patch, schema| {
-                patch.append(StructField::nullable(
-                    PARTITION_VALUES_PARSED,
-                    schema.as_ref().clone(),
-                ))
-            });
+            },
+        );
         let add_patch = if read_json_stats {
             add_patch
         } else {
             add_patch.drop(STATS)
         };
-        let add_patch = if read_string_partitions {
-            add_patch
-        } else {
-            add_patch.drop(PARTITION_VALUES)
-        };
+        // Native parsed partitions are not authoritative:
+        // `LogSegment::schema_has_compatible_partition_values_parsed` permits missing fields, and
+        // timestamps may use the checkpoint writer's timezone, making them incorrect for other
+        // readers. We always retain and reparse the complete string map instead.
         Ok(schema_ref! {
             (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
             nullable (VERSION): LONG,
@@ -342,7 +361,6 @@ impl Scan {
             (false, true) => projection.drop(STATS),
         };
 
-        // Raw partition-values output.
         let projection = if self.partition_values.string_map {
             projection
         } else {
@@ -522,12 +540,7 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                     let expr = Expr::parse_json(col!("add.stats"), Arc::clone(schema));
                     self.append_at(add, field, expr)
                 } else {
-                    let expr = Expr::struct_from(
-                        schema
-                            .fields()
-                            .map(|field| Expr::null_literal(field.data_type().clone())),
-                    );
-                    self.append_at(add, field, expr)
+                    self
                 }
             }
             None => self,
@@ -733,25 +746,13 @@ mod tests {
     }
 
     fn shape(checkpoint_type: CheckpointType, parsed_stats: Option<SchemaRef>) -> CheckpointShape {
-        shape_with_schemas(checkpoint_type, parsed_stats, None)
-    }
-
-    fn shape_with_schemas(
-        checkpoint_type: CheckpointType,
-        parsed_stats: Option<SchemaRef>,
-        parsed_partitions: Option<SchemaRef>,
-    ) -> CheckpointShape {
         let leaf_checkpoint_schema = (checkpoint_type != CheckpointType::None).then(|| {
-            let add_patch = SchemaStructPatchBuilder::new()
-                .fold_with(parsed_stats.as_ref(), |patch, schema| {
+            let add_patch = SchemaStructPatchBuilder::new().fold_with(
+                parsed_stats.as_ref(),
+                |patch, schema| {
                     patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
-                })
-                .fold_with(parsed_partitions.as_ref(), |patch, schema| {
-                    patch.append(StructField::nullable(
-                        PARTITION_VALUES_PARSED,
-                        schema.as_ref().clone(),
-                    ))
-                });
+                },
+            );
             schema_ref! {
                 (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA).unwrap())),
                 nullable (VERSION): LONG,
@@ -908,7 +909,6 @@ mod tests {
     fn metadata_plan_manifest_sidecar_dynamic_scan_metadata_columns(
         #[case] parsed_stats: Option<SchemaRef>,
         #[case] expect_parsed_columns: bool,
-        #[values(false, true)] native_parsed_partitions: bool,
     ) -> DeltaResult<()> {
         let stats = StatsOptions::all();
         let partition_values = PartitionValuesOptions::struct_only();
@@ -918,14 +918,8 @@ mod tests {
             .with_stats(stats)
             .with_partition_values(partition_values)
             .build()?;
-        let parsed_partitions = native_parsed_partitions
-            .then(|| scan.state_info.physical_partition_schema.clone().unwrap());
         let plan = scan
-            .build_metadata_scan_plan(&shape_with_schemas(
-                CheckpointType::Manifest,
-                parsed_stats,
-                parsed_partitions,
-            ))?
+            .build_metadata_scan_plan(&shape(CheckpointType::Manifest, parsed_stats))?
             .expect("non-empty");
 
         let dynamic_scan = plan
@@ -942,18 +936,12 @@ mod tests {
                 .is_some(),
             expect_parsed_columns,
         );
-        assert_eq!(
-            add_struct(&dynamic_scan.schema)
-                .field(PARTITION_VALUES_PARSED)
-                .is_some(),
-            native_parsed_partitions,
-        );
-        assert_eq!(
-            add_struct(&dynamic_scan.schema)
-                .field(PARTITION_VALUES)
-                .is_some(),
-            !native_parsed_partitions,
-        );
+        assert!(add_struct(&dynamic_scan.schema)
+            .field(PARTITION_VALUES_PARSED)
+            .is_none());
+        assert!(add_struct(&dynamic_scan.schema)
+            .field(PARTITION_VALUES)
+            .is_some());
         Ok(())
     }
 
