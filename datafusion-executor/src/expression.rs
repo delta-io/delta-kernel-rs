@@ -1,19 +1,32 @@
 //! Conversion from a kernel [`Expression`](KernelExpression) to a DataFusion [`Expr`](DFExpr).
 
-use datafusion::common::{Column as DFColumn, ScalarValue as DFScalarValue};
+use std::sync::Arc;
+
+use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use datafusion::common::utils::take_function_args;
+use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
 use datafusion::functions::core::expr_fn::{
     coalesce, get_field, get_field_path, named_struct, nullif,
 };
 use datafusion::functions_nested::expr_fn::make_array;
-use datafusion::logical_expr::{binary_expr, cast, lit, Case, Expr as DFExpr, Operator};
+use datafusion::logical_expr::{
+    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
+    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
     Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, MapToStructExpression,
-    UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
+    ParseJsonExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
-use delta_kernel::schema::{DataType as KernelDataType, PrimitiveType, StructField, StructType};
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::schema::{
+    DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
+    StructType,
+};
+use delta_kernel::{DeltaResult, EngineData, Error};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -54,11 +67,7 @@ pub fn to_df_expr(
         KernelExpression::MapToStruct(map_to_struct) => {
             map_to_struct_to_df_expr(map_to_struct, input_schema, output_type)
         }
-
-        // TODO: wire up via a custom JSON-parsing UDF (DataFusion core has no stock JSON parser).
-        KernelExpression::ParseJson(_) => Err(Error::unsupported(
-            "converting a ParseJson expression requires a custom JSON-parsing UDF",
-        )),
+        KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
             UnaryExpressionOp::ToJson => Err(Error::unsupported(
@@ -385,8 +394,106 @@ fn map_to_struct_to_df_expr(
     Ok(struct_null_when_not(map.is_not_null(), named_struct(args)))
 }
 
+/// Lowers a `ParseJson` (parse a JSON-string column into a struct) to a call of the
+/// [`ParseJsonUdf`] scalar UDF, which delegates to kernel's own JSON parser. Unlike the
+/// struct-shaped arms, `ParseJson` is self-typed -- it carries its target `output_schema` -- so it
+/// takes no `output_type` and lowers its string operand untyped.
+fn parse_json_to_df_expr(
+    parse: &ParseJsonExpression,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
+    let json = to_df_expr(&parse.json_expr, input_schema, None)?;
+    let udf = ScalarUDF::new_from_impl(ParseJsonUdf::try_new(parse.output_schema.clone())?);
+    Ok(udf.call(vec![json]))
+}
+
+/// A DataFusion scalar UDF that parses a JSON-string column into a struct, delegating to kernel's
+/// [`parse_json`] so the result is value-identical to the kernel evaluator by construction. Since a
+/// [`ParseJsonExpression`] carries its own target schema, the schema is baked into the UDF instance
+/// rather than passed as an argument.
+///
+/// The UDF reproduces the coarse malformed-JSON backstop the evaluator applies around
+/// `parse_json`: on a whole-batch parse error it returns an all-null struct rather than failing.
+/// (The finer per-cell null for failure-prone leaves -- Timestamp/Date/Decimal -- already lives
+/// inside `parse_json`.)
+#[derive(Debug, PartialEq, Eq)]
+struct ParseJsonUdf {
+    output_schema: KernelSchemaRef,
+    return_type: ArrowDataType,
+    signature: Signature,
+}
+
+/// DataFusion requires scalar UDF implementations to support equality and hashing so UDF calls
+/// can participate in expression comparison and optimizations such as common-subexpression
+/// elimination. The output schema captures this UDF's schema-dependent behavior; its signature is
+/// otherwise identical for every instance.
+impl std::hash::Hash for ParseJsonUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for field in self.output_schema.fields() {
+            field.name().hash(state);
+            field.data_type().to_string().hash(state);
+        }
+    }
+}
+
+impl ParseJsonUdf {
+    fn try_new(output_schema: KernelSchemaRef) -> DeltaResult<Self> {
+        let arrow_schema: ArrowSchema = output_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(Error::generic_err)?;
+        Ok(Self {
+            return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
+            // Coerces Utf8 / LargeUtf8 / Utf8View, mirroring kernel's `parse_json_impl`.
+            signature: Signature::string(1, Volatility::Immutable),
+            output_schema,
+        })
+    }
+}
+
+impl ScalarUDFImpl for ParseJsonUdf {
+    fn name(&self) -> &str {
+        "kernel_parse_json"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let num_rows = args.number_rows;
+        let [json] = take_function_args(self.name(), args.args)?;
+        let json = json.into_array(num_rows)?;
+
+        // `parse_json` reads column 0 of an `EngineData`-wrapped batch; wrap the input to match.
+        let batch = RecordBatch::try_from_iter([("json", json)])?;
+        let input: Box<dyn EngineData> = Box::new(ArrowEngineData::from(batch));
+
+        let parsed = match parse_json(input, self.output_schema.clone()) {
+            Ok(data) => {
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    .into();
+                Arc::new(StructArray::from(batch)) as ArrayRef
+            }
+            // Coarse malformed-JSON backstop, matching the evaluator's ParseJson arm.
+            Err(_) => new_null_array(&self.return_type, num_rows),
+        };
+        Ok(ColumnarValue::Array(parsed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::array::{Array, AsArray, StringArray};
+    use datafusion::assert_batches_eq;
+    use datafusion::common::DFSchema;
+    use datafusion::physical_expr::create_physical_expr;
+    use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
         col, lit, Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
     };
@@ -932,5 +1039,326 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(expected_message), "{err}");
+    }
+
+    // === ParseJson Shared Helpers ===
+
+    /// Input schema for JSON tests: `{ j: string }`.
+    fn json_input_schema() -> StructType {
+        StructType::try_new([StructField::nullable("j", DataType::STRING)]).unwrap()
+    }
+
+    fn nested_parse_type() -> StructType {
+        StructType::try_new([
+            StructField::nullable("n", DataType::LONG),
+            StructField::nullable("s", DataType::STRING),
+        ])
+        .unwrap()
+    }
+
+    /// Target parse schema `{ n: long, s: string }`.
+    fn parse_target() -> KernelSchemaRef {
+        Arc::new(nested_parse_type())
+    }
+
+    /// Lowers `parse_json(col("j"), schema)`, builds a physical expr over a one-column string batch
+    /// carrying `rows`, evaluates it, and returns the resulting struct column.
+    fn eval_parse_json(schema: KernelSchemaRef, rows: Vec<Option<&str>>) -> StructArray {
+        let kernel = KernelExpr::parse_json(col!("j"), schema);
+        // Self-typed: no output_type is threaded in, yet lowering still succeeds.
+        let logical = to_df_expr(&kernel, &json_input_schema(), None).unwrap();
+
+        let arrow_schema: ArrowSchema = (&json_input_schema()).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(rows)) as ArrayRef],
+        )
+        .unwrap();
+
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap()
+            .as_struct()
+            .clone()
+    }
+
+    /// [`eval_parse_json`] with the struct flattened to one column per parsed field. Panics on a
+    /// struct with a top-level null, so the malformed-backstop case must use [`eval_parse_json`].
+    fn eval_parse_json_batch(schema: KernelSchemaRef, rows: Vec<Option<&str>>) -> RecordBatch {
+        RecordBatch::from(eval_parse_json(schema, rows))
+    }
+
+    /// Asserts the result fields equal `target`'s arrow projection: the parse is typed to the
+    /// target schema, not merely compatible with it.
+    fn assert_matches_target(batch: &RecordBatch, target: &KernelSchemaRef) {
+        let target: ArrowSchema = target.as_ref().try_into_arrow().unwrap();
+        assert_eq!(batch.schema().fields(), target.fields());
+    }
+
+    // === ParseJson Tests ===
+
+    #[test]
+    fn parse_json_lowers_to_udf_call() {
+        let kernel = KernelExpr::parse_json(col!("j"), parse_target());
+        assert_eq!(
+            to_df_expr(&kernel, &json_input_schema(), None)
+                .unwrap()
+                .to_string(),
+            "kernel_parse_json(j)"
+        );
+    }
+
+    #[test]
+    fn parse_json_parses_fields_into_typed_struct() {
+        let batch = eval_parse_json_batch(
+            parse_target(),
+            vec![Some(r#"{"n": 1, "s": "a"}"#), Some(r#"{"n": 2, "s": "b"}"#)],
+        );
+        assert_matches_target(&batch, &parse_target());
+        assert_batches_eq!(
+            [
+                "+---+---+",
+                "| n | s |",
+                "+---+---+",
+                "| 1 | a |",
+                "| 2 | b |",
+                "+---+---+",
+            ],
+            &[batch]
+        );
+    }
+
+    /// Every primitive `parse_json` can decode, in one struct: the integer/float/boolean families
+    /// decode directly, while the failure-prone leaves (date, both timestamps, decimal) route
+    /// through kernel's stringify-then-safe-cast path. Asserts they all land typed to the target.
+    #[test]
+    fn parse_json_decodes_all_supported_primitive_types() {
+        let target: KernelSchemaRef = Arc::new(
+            StructType::try_new([
+                StructField::nullable("str", DataType::STRING),
+                StructField::nullable("long", DataType::LONG),
+                StructField::nullable("int", DataType::INTEGER),
+                StructField::nullable("short", DataType::SHORT),
+                StructField::nullable("byte", DataType::BYTE),
+                StructField::nullable("float", DataType::FLOAT),
+                StructField::nullable("double", DataType::DOUBLE),
+                StructField::nullable("bool", DataType::BOOLEAN),
+                StructField::nullable("date", DataType::DATE),
+                StructField::nullable("ts", DataType::TIMESTAMP),
+                StructField::nullable("ts_ntz", DataType::TIMESTAMP_NTZ),
+                StructField::nullable("dec", DataType::decimal(10, 2).unwrap()),
+            ])
+            .unwrap(),
+        );
+        let row = r#"{
+            "str": "a", "long": 1, "int": 2, "short": 3, "byte": 4,
+            "float": 1.5, "double": 2.5, "bool": true, "date": "2024-01-02",
+            "ts": "2024-01-02T03:04:05Z", "ts_ntz": "2024-01-02T03:04:05", "dec": "12.34"
+        }"#;
+        let batch = eval_parse_json_batch(target.clone(), vec![Some(row)]);
+        assert_matches_target(&batch, &target);
+        assert_batches_eq!(
+            [
+                "+-----+------+-----+-------+------+-------+--------+------+------------+----------------------+---------------------+-------+",
+                "| str | long | int | short | byte | float | double | bool | date       | ts                   | ts_ntz              | dec   |",
+                "+-----+------+-----+-------+------+-------+--------+------+------------+----------------------+---------------------+-------+",
+                "| a   | 1    | 2   | 3     | 4    | 1.5   | 2.5    | true | 2024-01-02 | 2024-01-02T03:04:05Z | 2024-01-02T03:04:05 | 12.34 |",
+                "+-----+------+-----+-------+------+-------+--------+------+------------+----------------------+---------------------+-------+",
+            ],
+            &[batch]
+        );
+    }
+
+    #[rstest]
+    #[case::array(
+        DataType::from(ArrayType::new(DataType::INTEGER, true)),
+        r#"[1, null, 3]"#,
+        "[1, , 3]"
+    )]
+    #[case::struct_(
+        DataType::from(nested_parse_type()),
+        r#"{"n": 1, "s": "a"}"#,
+        "{n: 1, s: a}"
+    )]
+    #[case::map(
+        DataType::from(MapType::new(DataType::STRING, DataType::LONG, true)),
+        r#"{"x": 1, "y": null}"#,
+        "{x: 1, y: }"
+    )]
+    #[case::array_of_structs(
+        DataType::from(ArrayType::new(nested_parse_type(), true)),
+        r#"[{"n": 1, "s": "a"}, null, {"n": 2, "s": "b"}]"#,
+        "[{n: 1, s: a}, , {n: 2, s: b}]"
+    )]
+    #[case::array_of_maps(
+        DataType::from(ArrayType::new(
+            MapType::new(DataType::STRING, DataType::LONG, true),
+            true,
+        )),
+        r#"[{"x": 1, "y": null}, {"z": 2}]"#,
+        "[{x: 1, y: }, {z: 2}]"
+    )]
+    #[case::array_of_arrays(
+        DataType::from(ArrayType::new(ArrayType::new(DataType::INTEGER, true), true)),
+        r#"[[1, null], [2, 3]]"#,
+        "[[1, ], [2, 3]]"
+    )]
+    #[case::struct_of_structs(
+        DataType::from(
+            StructType::try_new([StructField::nullable("inner", nested_parse_type())]).unwrap()
+        ),
+        r#"{"inner": {"n": 1, "s": "a"}}"#,
+        "{inner: {n: 1, s: a}}"
+    )]
+    #[case::struct_of_arrays(
+        DataType::from(
+            StructType::try_new([StructField::nullable(
+                "items",
+                ArrayType::new(DataType::INTEGER, true),
+            )])
+            .unwrap()
+        ),
+        r#"{"items": [1, null, 3]}"#,
+        "{items: [1, , 3]}"
+    )]
+    #[case::struct_of_maps(
+        DataType::from(
+            StructType::try_new([StructField::nullable(
+                "items",
+                MapType::new(DataType::STRING, DataType::LONG, true),
+            )])
+            .unwrap()
+        ),
+        r#"{"items": {"x": 1, "y": null}}"#,
+        "{items: {x: 1, y: }}"
+    )]
+    #[case::map_of_structs(
+        DataType::from(MapType::new(DataType::STRING, nested_parse_type(), true)),
+        r#"{"x": {"n": 1, "s": "a"}, "y": {"n": 2, "s": "b"}}"#,
+        "{x: {n: 1, s: a}, y: {n: 2, s: b}}"
+    )]
+    #[case::map_of_arrays(
+        DataType::from(MapType::new(
+            DataType::STRING,
+            ArrayType::new(DataType::INTEGER, true),
+            true,
+        )),
+        r#"{"x": [1, null], "y": [2, 3]}"#,
+        "{x: [1, ], y: [2, 3]}"
+    )]
+    #[case::map_of_maps(
+        DataType::from(MapType::new(
+            DataType::STRING,
+            MapType::new(DataType::STRING, DataType::LONG, true),
+            true,
+        )),
+        r#"{"x": {"a": 1}, "y": {"b": 2}}"#,
+        "{x: {a: 1}, y: {b: 2}}"
+    )]
+    fn parse_json_decodes_nested_container_field(
+        #[case] field_type: DataType,
+        #[case] json_value: &str,
+        #[case] expected_value: &str,
+    ) {
+        let target: KernelSchemaRef =
+            Arc::new(StructType::try_new([StructField::nullable("value", field_type)]).unwrap());
+        let row = format!(r#"{{"value": {json_value}}}"#);
+        let batch = eval_parse_json_batch(target.clone(), vec![Some(row.as_str())]);
+        assert_matches_target(&batch, &target);
+
+        let width = expected_value.len().max("value".len());
+        let border = format!("+{}+", "-".repeat(width + 2));
+        let header = format!("| {:width$} |", "value");
+        let value = format!("| {expected_value:width$} |");
+        let expected = [
+            border.as_str(),
+            header.as_str(),
+            border.as_str(),
+            value.as_str(),
+            border.as_str(),
+        ];
+        assert_batches_eq!(expected, &[batch]);
+    }
+
+    /// `Binary` has no JSON decoder in arrow-json, so any row hits kernel's whole-batch parse error
+    /// and the coarse backstop nulls the struct. Documents that a `Binary` leaf is effectively
+    /// unsupported through this path rather than silently mis-decoding.
+    #[test]
+    fn parse_json_binary_leaf_is_unsupported_and_yields_all_null_struct() {
+        let target: KernelSchemaRef =
+            Arc::new(StructType::try_new([StructField::nullable("b", DataType::BINARY)]).unwrap());
+        let out = eval_parse_json(target, vec![Some(r#"{"b": "aGk="}"#)]);
+        assert_eq!(out.len(), 1);
+        assert!(out.column(0).is_null(0));
+    }
+
+    /// A null input string decodes as `{}` (kernel's contract): the row stays present with all its
+    /// fields null, rather than nulling the whole struct row.
+    #[test]
+    fn parse_json_null_input_yields_present_row_with_null_fields() {
+        let batch = eval_parse_json_batch(parse_target(), vec![None]);
+        assert_batches_eq!(
+            [
+                "+---+---+",
+                "| n | s |",
+                "+---+---+",
+                "|   |   |",
+                "+---+---+",
+            ],
+            &[batch]
+        );
+    }
+
+    /// A field absent from the JSON object parses to null.
+    #[test]
+    fn parse_json_missing_field_is_null() {
+        let batch = eval_parse_json_batch(parse_target(), vec![Some(r#"{"s": "only"}"#)]);
+        assert_batches_eq!(
+            [
+                "+---+------+",
+                "| n | s    |",
+                "+---+------+",
+                "|   | only |",
+                "+---+------+",
+            ],
+            &[batch]
+        );
+    }
+
+    /// Genuinely malformed JSON hits the coarse backstop: the whole struct comes back all-null
+    /// (every field of every row null) rather than erroring the batch.
+    #[test]
+    fn parse_json_malformed_yields_all_null_struct() {
+        let out = eval_parse_json(parse_target(), vec![Some("{not json"), Some(r#"{"n": 5}"#)]);
+        assert_eq!(out.len(), 2);
+        assert!((0..2).all(|i| out.column(0).is_null(i) && out.column(1).is_null(i)));
+    }
+
+    /// UDF identity must distinguish target schemas that share an arrow return type, or DataFusion
+    /// would treat the two calls as one common subexpression and parse both with one schema.
+    /// `integer` and `interval year to month` both map to arrow `Int32`.
+    #[rstest]
+    #[case(DataType::INTEGER, DataType::INTERVAL_YEAR_MONTH)]
+    #[case(DataType::LONG, DataType::INTERVAL_DAY_TIME)]
+    fn parse_json_udfs_with_same_return_type_but_different_schemas_are_not_equal(
+        #[case] left: DataType,
+        #[case] right: DataType,
+    ) {
+        let udf = |dt: DataType| {
+            ParseJsonUdf::try_new(Arc::new(
+                StructType::try_new([StructField::nullable("a", dt)]).unwrap(),
+            ))
+            .unwrap()
+        };
+        let (left, right) = (udf(left), udf(right));
+        assert_eq!(
+            left.return_type, right.return_type,
+            "precondition: arrow return types collide"
+        );
+        assert_ne!(left, right);
     }
 }

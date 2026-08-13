@@ -39,13 +39,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use super::ir::nodes::{
     Aggregate, AggregateBuilder, DynamicScan, FileType, Filter, Operator, Project, ScanFile,
     ScanJson, ScanParquet, SemiJoin, UnionAll, Values,
 };
 use super::ir::plan::{Plan, PlanNode};
-use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar};
-use crate::schema::SchemaRef;
+use crate::expressions::{ColumnName, ExpressionRef, PredicateRef, Scalar, StructData};
+use crate::schema::{SchemaRef, ToSchema};
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
@@ -200,11 +202,44 @@ impl PlanBuilder {
                 )));
             }
         }
-        if rows.is_empty() {
-            return Ok(Self::absent(schema));
-        }
-        let op = Values::new(schema, rows);
-        Ok(Self::present(op.schema.clone(), op, vec![]))
+        Ok(Values::new(schema, rows).into())
+    }
+
+    /// Infallible sibling of [`Self::values`] containing rows of `T` converted to scalar data.
+    ///
+    /// Schema is [`ToSchema::to_schema`] for `T`. Each row converts via [`Into<StructData>`] and is
+    /// peeled into top-level field scalars (nested fields remain [`Scalar::Struct`]); see
+    /// [`Values`]'s [`FromIterator`]. Empty `rows` yields the absent relation.
+    ///
+    /// # Example
+    /// ```
+    /// # use delta_kernel::PlanBuilder;
+    /// # use delta_kernel::expressions::Scalar;
+    /// # use delta_kernel::plans::ir::nodes::Operator;
+    /// # use delta_kernel_derive::{IntoStructData, ToSchema};
+    /// #
+    /// #[derive(ToSchema, IntoStructData)]
+    /// struct Row {
+    ///     id: i32,
+    /// }
+    ///
+    /// let plan = PlanBuilder::values_from([Row { id: 1 }, Row { id: 2 }]).build()?;
+    /// let Operator::Values(values) = &plan.nodes[0].op else { panic!("expected Values") };
+    /// assert_eq!(
+    ///     values.rows,
+    ///     vec![vec![Scalar::Integer(1)], vec![Scalar::Integer(2)]],
+    /// );
+    /// assert!(PlanBuilder::values_from(std::iter::empty::<Row>())
+    ///     .build_opt()?
+    ///     .is_none());
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
+    #[internal_api]
+    pub(crate) fn values_from<T>(rows: impl IntoIterator<Item = T>) -> Self
+    where
+        T: Into<StructData> + ToSchema,
+    {
+        Values::from_iter(rows).into()
     }
 
     /// Keep rows where `predicate` holds. Output schema is unchanged. See [`Filter`].
@@ -557,6 +592,17 @@ impl PlanBuilder {
     }
 }
 
+/// A literal relation. Empty rows is the absent relation, which the builder eliminates as dead
+/// code (see the module docs).
+impl From<Values> for PlanBuilder {
+    fn from(values: Values) -> Self {
+        match values.rows.is_empty() {
+            true => Self::absent(values.schema),
+            false => Self::present(values.schema.clone(), values, vec![]),
+        }
+    }
+}
+
 /// Error if any of `cols` fails to resolve against `schema` (nested paths supported).
 fn check_columns_resolve<'a>(
     schema: &SchemaRef,
@@ -606,7 +652,7 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{col, column_name, lit, Expression};
     use crate::plans::ir::nodes::FileType;
-    use crate::schema::{DataType, MetadataColumnSpec, StructField, StructType, ToSchema as _};
+    use crate::schema::{DataType, MetadataColumnSpec, StructField, StructType};
     use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.

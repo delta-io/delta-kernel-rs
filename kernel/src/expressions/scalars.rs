@@ -3,16 +3,26 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{
     parse_interval_type, ArrayType, DataType, DecimalType, IntervalField, IntervalFieldRange,
-    MapType, PrimitiveType, StructField,
+    MapType, PrimitiveType, StructField, StructType,
 };
 use crate::utils::require;
 use crate::{DeltaResult, Error};
+
+/// Pairs [`Into<Scalar>`] with [`ToDataType`] for infallible container conversions.
+///
+/// `Option<T: IntoScalar>` is not itself `IntoScalar`: nullability belongs to the owning
+/// struct/array/map rather than its value type. See [`ToDataType`] for the pairing contract.
+#[internal_api]
+pub(crate) trait IntoScalar: Into<Scalar> + ToDataType {}
+
+impl<T: Into<Scalar> + ToDataType> IntoScalar for T {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecimalData {
@@ -101,6 +111,33 @@ impl ArrayData {
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
+
+    /// Infallible constructor used by `From<Vec<T>>` and `From<Vec<Option<T>>` where we know the
+    /// resulting `Scalar::data_type` is `T:to_data_type`.
+    fn from_elements<T: ToDataType>(
+        elements: impl IntoIterator<Item = impl Into<Scalar>>,
+        contains_null: bool,
+    ) -> Self {
+        Self {
+            tpe: ArrayType::new(T::to_data_type(), contains_null),
+            elements: elements.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Builds [`ArrayData`] from a Rust `Vec` whose element type implements both `Into<Scalar>` and
+/// [`ToSchema`](delta_kernel::schema::ToSchema).
+impl<T: IntoScalar> From<Vec<T>> for ArrayData {
+    fn from(vec: Vec<T>) -> Self {
+        Self::from_elements::<T>(vec, false)
+    }
+}
+
+/// Like [`From<Vec<T>> for ArrayData`], but elements may be null (`contains_null = true`).
+impl<T: IntoScalar> From<Vec<Option<T>>> for ArrayData {
+    fn from(vec: Vec<Option<T>>) -> Self {
+        Self::from_elements::<T>(vec, true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,6 +196,33 @@ impl MapData {
     pub fn map_type(&self) -> &MapType {
         &self.data_type
     }
+
+    /// Infallible constructor used by `From<HashMap<K, V>>` / `From<HashMap<K, Option<V>>>`
+    /// where key/value scalars are known to match `K`/`V`'s [`ToDataType`].
+    fn from_pairs<K: ToDataType, V: ToDataType>(
+        pairs: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
+        value_contains_null: bool,
+    ) -> Self {
+        Self {
+            data_type: MapType::new(K::to_data_type(), V::to_data_type(), value_contains_null),
+            pairs: Vec::from_iter(pairs.into_iter().map(|(k, v)| (k.into(), v.into()))),
+        }
+    }
+}
+
+/// Builds [`MapData`] from a Rust [`HashMap`] whose key/value types implement both `Into<Scalar>`
+/// and [`ToSchema`](delta_kernel::schema::ToSchema).
+impl<K: IntoScalar, V: IntoScalar> From<HashMap<K, V>> for MapData {
+    fn from(map: HashMap<K, V>) -> Self {
+        Self::from_pairs::<K, V>(map, false)
+    }
+}
+
+/// Like [`From<HashMap<K, V>> for MapData`], but values may be null (`value_contains_null = true`).
+impl<K: IntoScalar, V: IntoScalar> From<HashMap<K, Option<V>>> for MapData {
+    fn from(map: HashMap<K, Option<V>>) -> Self {
+        Self::from_pairs::<K, V>(map, true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,12 +272,29 @@ impl StructData {
         Ok(Self { fields, values })
     }
 
+    /// Infallible constructor used by `From<T>` where `schema` and `values` are produced using
+    /// [`ToSchema`](delta_kernel::schema::ToSchema) and `Into<Scalar>`. Does not re-validate types
+    /// or lengths.
+    #[internal_api]
+    pub(crate) fn from_values_unchecked(schema: StructType, values: Vec<Scalar>) -> Self {
+        Self {
+            fields: schema.into_fields().collect(),
+            values,
+        }
+    }
+
     pub fn fields(&self) -> &[StructField] {
         &self.fields
     }
 
     pub fn values(&self) -> &[Scalar] {
         &self.values
+    }
+
+    /// Consume this struct and return its field values in schema order.
+    #[internal_api]
+    pub(crate) fn into_values(self) -> Vec<Scalar> {
+        self.values
     }
 }
 
@@ -608,93 +689,26 @@ impl From<bytes::Bytes> for Scalar {
     }
 }
 
-impl<T> TryFrom<Vec<T>> for Scalar
+impl<T> From<Vec<T>> for Scalar
 where
-    T: Into<Scalar> + ToDataType,
+    Vec<T>: Into<ArrayData>,
 {
-    type Error = Error;
-
-    fn try_from(vec: Vec<T>) -> Result<Self, Self::Error> {
-        let array_type = ArrayType::new(T::to_data_type(), false);
-        let array_data = ArrayData::try_new(array_type, vec)?;
-        Ok(array_data.into())
+    fn from(vec: Vec<T>) -> Self {
+        Self::Array(vec.into())
     }
 }
 
-impl<T> TryFrom<Vec<Option<T>>> for Scalar
+impl<K, V> From<HashMap<K, V>> for Scalar
 where
-    T: Into<Scalar> + ToDataType,
+    HashMap<K, V>: Into<MapData>,
 {
-    type Error = Error;
-
-    fn try_from(vec: Vec<Option<T>>) -> Result<Self, Self::Error> {
-        let array_type = ArrayType::new(T::to_data_type(), true);
-        let array_data = ArrayData::try_new(array_type, vec)?;
-        Ok(array_data.into())
-    }
-}
-
-impl<T> TryFrom<Option<Vec<T>>> for Scalar
-where
-    T: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(opt: Option<Vec<T>>) -> Result<Self, Self::Error> {
-        match opt {
-            Some(vec) => vec.try_into(),
-            None => Ok(Self::Null(ArrayType::new(T::to_data_type(), false).into())),
-        }
-    }
-}
-
-impl<K, V> TryFrom<HashMap<K, V>> for Scalar
-where
-    K: Into<Scalar> + ToDataType,
-    V: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(map: HashMap<K, V>) -> Result<Self, Self::Error> {
-        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), false);
-        let map_data = MapData::try_new(map_type, map)?;
-        Ok(map_data.into())
-    }
-}
-
-impl<K, V> TryFrom<HashMap<K, Option<V>>> for Scalar
-where
-    K: Into<Scalar> + ToDataType,
-    V: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(map: HashMap<K, Option<V>>) -> Result<Self, Self::Error> {
-        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), true);
-        let map_data = MapData::try_new(map_type, map)?;
-        Ok(map_data.into())
-    }
-}
-
-impl<K, V> TryFrom<Option<HashMap<K, V>>> for Scalar
-where
-    K: Into<Scalar> + ToDataType,
-    V: Into<Scalar> + ToDataType,
-{
-    type Error = Error;
-
-    fn try_from(opt: Option<HashMap<K, V>>) -> Result<Self, Self::Error> {
-        match opt {
-            Some(map) => map.try_into(),
-            None => Ok(Self::Null(
-                MapType::new(K::to_data_type(), V::to_data_type(), false).into(),
-            )),
-        }
+    fn from(map: HashMap<K, V>) -> Self {
+        Self::Map(map.into())
     }
 }
 
 // NOTE: We "cheat" and use the macro support trait `ToDataType`
-impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
+impl<T: IntoScalar> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
         match t {
             Some(t) => t.into(),
@@ -715,7 +729,11 @@ impl From<MapData> for Scalar {
     }
 }
 
-// TODO: add more From impls
+impl From<StructData> for Scalar {
+    fn from(struct_data: StructData) -> Self {
+        Self::Struct(struct_data)
+    }
+}
 
 impl PrimitiveType {
     fn data_type(&self) -> DataType {
@@ -1080,10 +1098,12 @@ fn parse_day_time_interval(raw: &str) -> Option<i64> {
 mod tests {
     use std::f32::consts::PI;
 
+    use bytes::Bytes;
     use rstest::rstest;
 
     use super::*;
     use crate::expressions::{col, lit, BinaryPredicateOp};
+    use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::Predicate as Pred;
 
@@ -1440,15 +1460,44 @@ mod tests {
         assert!(!null.logical_eq(&null));
     }
 
+    fn assert_into_scalar_matches_to_data_type<T: IntoScalar>(value: T) {
+        let scalar: Scalar = value.into();
+        assert!(!scalar.is_null());
+        assert_eq!(scalar.data_type(), T::to_data_type());
+    }
+
     #[test]
-    fn test_hashmap_conversion() -> DeltaResult<()> {
+    fn into_scalar_matches_to_data_type() {
+        assert_into_scalar_matches_to_data_type(true);
+        assert_into_scalar_matches_to_data_type(1i16);
+        assert_into_scalar_matches_to_data_type(1i32);
+        assert_into_scalar_matches_to_data_type(1i64);
+        assert_into_scalar_matches_to_data_type(1.0f32);
+        assert_into_scalar_matches_to_data_type(1.0f64);
+        assert_into_scalar_matches_to_data_type("x".to_string());
+        assert_into_scalar_matches_to_data_type(Bytes::from_static(b"x"));
+        assert_into_scalar_matches_to_data_type(TableFeature::DeletionVectors);
+
+        assert_into_scalar_matches_to_data_type(vec![1, 2, 3]);
+        assert_into_scalar_matches_to_data_type(HashMap::from([
+            ("key1".to_string(), 42i32),
+            ("key2".to_string(), 100i32),
+        ]));
+        assert_into_scalar_matches_to_data_type(HashMap::from([
+            ("key1".to_string(), Some(42i32)),
+            ("key2".to_string(), None),
+        ]));
+    }
+
+    #[test]
+    fn test_hashmap_conversion() {
         // Create a simple HashMap with string keys and integer values
         let mut map = HashMap::new();
         map.insert("key1".to_string(), 42i32);
         map.insert("key2".to_string(), 100i32);
 
         // Convert HashMap to Scalar
-        let scalar = Scalar::try_from(map)?;
+        let scalar = Scalar::from(map);
 
         // Verify the scalar is of Map type
         assert!(matches!(scalar, Scalar::Map(_)));
@@ -1470,12 +1519,10 @@ mod tests {
         let entry2 = (Scalar::String("key2".to_string()), Scalar::Integer(100));
         assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
         assert!(pairs.contains(&entry2), "Missing key2 -> 100 pair");
-
-        Ok(())
     }
 
     #[test]
-    fn test_hashmap_conversion_with_nullable_values() -> DeltaResult<()> {
+    fn test_hashmap_conversion_with_nullable_values() {
         // Create a HashMap with string keys and optional integer values
         let mut map = HashMap::new();
         map.insert("key1".to_string(), Some(42i32));
@@ -1483,7 +1530,7 @@ mod tests {
         map.insert("key3".to_string(), Some(100i32));
 
         // Convert HashMap to Scalar
-        let scalar = Scalar::try_from(map)?;
+        let scalar = Scalar::from(map);
 
         // Verify the scalar is of Map type
         assert!(matches!(scalar, Scalar::Map(_)));
@@ -1510,17 +1557,15 @@ mod tests {
         assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
         assert!(pairs.contains(&entry2), "Missing key2 -> null pair");
         assert!(pairs.contains(&entry3), "Missing key3 -> 100 pair");
-
-        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion() -> DeltaResult<()> {
+    fn test_vec_conversion() {
         // Create a simple Vec with integer values
         let vec = vec![42i32, 100i32, 200i32];
 
         // Convert Vec to Scalar
-        let scalar = Scalar::try_from(vec)?;
+        let scalar = Scalar::from(vec);
 
         // Verify the scalar is of Array type
         assert!(matches!(scalar, Scalar::Array(_)));
@@ -1541,17 +1586,15 @@ mod tests {
         assert_eq!(elements[0], Scalar::Integer(42));
         assert_eq!(elements[1], Scalar::Integer(100));
         assert_eq!(elements[2], Scalar::Integer(200));
-
-        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion_with_nullable_values() -> DeltaResult<()> {
+    fn test_vec_conversion_with_nullable_values() {
         // Create a Vec with optional integer values
         let vec = vec![Some(42i32), None, Some(100i32)];
 
         // Convert Vec to Scalar
-        let scalar = Scalar::try_from(vec)?;
+        let scalar = Scalar::from(vec);
 
         // Verify the scalar is of Array type
         assert!(matches!(scalar, Scalar::Array(_)));
@@ -1573,15 +1616,13 @@ mod tests {
         assert_eq!(elements[0], Scalar::Integer(42));
         assert!(elements[1].is_null());
         assert_eq!(elements[2], Scalar::Integer(100));
-
-        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion_different_types() -> DeltaResult<()> {
+    fn test_vec_conversion_different_types() {
         // Test with string Vec
         let string_vec = vec!["hello".to_string(), "world".to_string()];
-        let string_scalar = Scalar::try_from(string_vec)?;
+        let string_scalar = Scalar::from(string_vec);
 
         if let Scalar::Array(array_data) = string_scalar {
             let expected_array_type = ArrayType::new(DataType::STRING, false);
@@ -1592,7 +1633,7 @@ mod tests {
 
         // Test with bool Vec
         let bool_vec = vec![true, false, true];
-        let bool_scalar = Scalar::try_from(bool_vec)?;
+        let bool_scalar = Scalar::from(bool_vec);
 
         if let Scalar::Array(array_data) = bool_scalar {
             let expected_array_type = ArrayType::new(DataType::BOOLEAN, false);
@@ -1600,8 +1641,6 @@ mod tests {
         } else {
             panic!("Expected Array scalar");
         }
-
-        Ok(())
     }
 
     #[test]

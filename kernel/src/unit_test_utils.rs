@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use itertools::Itertools;
 use serde::Serialize;
 use tempfile::TempDir;
-use test_utils::{copy_directory, delta_path_for_version, load_test_data};
+use test_utils::{
+    copy_directory, delta_path_for_version, load_test_data, modify_add_file_partition_keys,
+    replace_array_row, AddFilePartitionKeyModify,
+};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use url::Url;
@@ -15,6 +18,7 @@ use crate::arrow::array::{
     StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_conversion::{parquet_field_id_metadata, TryIntoArrow as _};
@@ -203,6 +207,54 @@ pub(crate) fn create_valid_add_file_batch(all_nullable: bool) -> RecordBatch {
         })
         .collect();
     RecordBatch::try_new(Arc::new(arrow_schema), columns).expect("valid add-file batch")
+}
+
+/// Builds one valid add-file row with a fully nullable schema.
+pub(crate) fn nullable_add_file() -> RecordBatch {
+    create_valid_add_file_batch(true /* all_nullable */)
+}
+
+/// Builds `row_count` valid add-file rows with a fully nullable schema.
+pub(crate) fn nullable_add_files(row_count: usize) -> RecordBatch {
+    let batch = nullable_add_file();
+    concat_batches(&batch.schema(), &vec![batch; row_count])
+        .expect("failed to concatenate rows into a multi-row add-file batch")
+}
+
+pub(crate) fn replace_column(batch: &RecordBatch, field: &str, column: ArrayRef) -> RecordBatch {
+    let schema = batch.schema();
+    let index = schema.index_of(field).expect("field in schema");
+    let mut columns = batch.columns().to_vec();
+    columns[index] = column;
+    RecordBatch::try_new(schema, columns).expect("failed to rebuild batch after replacing a column")
+}
+
+pub(crate) fn set_field_as_null(batch: &RecordBatch, field: &str, row: usize) -> RecordBatch {
+    let schema = batch.schema();
+    let index = schema.index_of(field).expect("field in schema");
+    let mut columns = batch.columns().to_vec();
+    let null = new_null_array(schema.field(index).data_type(), 1);
+    columns[index] = replace_array_row(&columns[index], null, row);
+    RecordBatch::try_new(schema, columns)
+        .expect("failed to rebuild batch after replacing a field value with null")
+}
+
+/// Returns nullable add-file rows with `partitionValues` replaced by `partition_values`.
+pub(crate) fn add_files_with_partition_values(
+    partition_values: &[&[(&str, Option<&str>)]],
+) -> RecordBatch {
+    let batches: Vec<_> = partition_values
+        .iter()
+        .map(|entries| {
+            let modifications: Vec<_> = entries
+                .iter()
+                .map(|(key, value)| AddFilePartitionKeyModify::Insert { key, value: *value })
+                .collect();
+            modify_add_file_partition_keys(nullable_add_file(), &modifications)
+        })
+        .collect();
+    concat_batches(&batches[0].schema(), &batches)
+        .expect("failed to concatenate rows with partition values")
 }
 
 pub(crate) fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {

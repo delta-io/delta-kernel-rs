@@ -4,17 +4,16 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
+use delta_kernel_derive::{internal_api, IntoEngineData, IntoStructData, ToSchema};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{MapData, Scalar, StructData};
 use crate::schema::{
-    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, DataType, MapType, SchemaRef,
-    StructField, StructType, ToSchema as _,
+    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, SchemaRef, StructField,
+    StructType, ToSchema as _,
 };
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::schema::{schema, ArrayType};
@@ -279,7 +278,7 @@ pub(crate) fn as_log_add_schema(add_schema: SchemaRef) -> SchemaRef {
 }
 
 // Serde derives are needed for CRC file deserialization (see `crc::reader`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct Format {
@@ -295,23 +294,6 @@ impl Default for Format {
             provider: String::from("parquet"),
             options: HashMap::new(),
         }
-    }
-}
-
-impl TryFrom<Format> for Scalar {
-    type Error = Error;
-
-    fn try_from(format: Format) -> DeltaResult<Self> {
-        let provider = Scalar::from(format.provider);
-        let options = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            format.options,
-        )
-        .map(Scalar::Map)?;
-        Ok(Scalar::Struct(StructData::try_new(
-            Format::to_schema().into_fields().collect(),
-            vec![provider, options],
-        )?))
     }
 }
 
@@ -538,11 +520,11 @@ impl IntoEngineData for Metadata {
             self.name.into(),
             self.description.into(),
             self.format.provider.into(),
-            self.format.options.try_into()?,
+            self.format.options.into(),
             self.schema_string.into(),
-            self.partition_columns.try_into()?,
+            self.partition_columns.into(),
             self.created_time.into(),
-            self.configuration.try_into()?,
+            self.configuration.into(),
         ];
 
         engine.evaluation_handler().create_one(schema, &values)
@@ -1445,6 +1427,7 @@ mod tests {
     use crate::arrow::json::ReaderBuilder;
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::expressions::Scalar;
     use crate::schema::{schema_ref, ArrayType, DataType, MapType, StructField};
     use crate::unit_test_utils::assert_result_error_with_message;
     use crate::{
@@ -2236,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_try_from_scalar() {
+    fn test_format_from_scalar() {
         let options = HashMap::from([
             ("path".to_string(), "/delta/table".to_string()),
             ("compressionType".to_string(), "snappy".to_string()),
@@ -2245,7 +2228,7 @@ mod tests {
             provider: "parquet".to_string(),
             options,
         };
-        let scalar = Scalar::try_from(format).unwrap();
+        let scalar = Scalar::from(format);
 
         let Scalar::Struct(struct_data) = scalar else {
             panic!("Expected struct scalar");
@@ -2280,7 +2263,7 @@ mod tests {
             provider: "parquet".to_string(),
             options: HashMap::new(),
         };
-        let scalar = Scalar::try_from(format).unwrap();
+        let scalar = Scalar::from(format);
 
         let Scalar::Struct(struct_data) = scalar else {
             panic!("Expected struct");
@@ -2302,7 +2285,7 @@ mod tests {
             provider: "custom".to_string(),
             options,
         };
-        let scalar = Scalar::try_from(format).unwrap();
+        let scalar = Scalar::from(format);
 
         let Scalar::Struct(struct_data) = scalar else {
             panic!("Expected struct");

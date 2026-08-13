@@ -130,7 +130,7 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 ///   `HashMap`). Those mappings will be dropped when converting to an actual rust `HashMap`.
 ///   Currently this can _only_ be set on `HashMap` fields.
 /// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
-///   derives `IntoEngineData`, from the produced engine data).
+///   derives `IntoEngineData` / `IntoStructData`, from the produced engine data / struct scalar).
 #[proc_macro_derive(
     ToSchema,
     attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
@@ -139,7 +139,10 @@ pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStre
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
 
-    let schema_fields = gen_schema_fields(&input.data);
+    let schema_fields = match gen_schema_fields(&input.data, struct_ident.span()) {
+        Ok(tokens) => tokens,
+        Err(e) => return e.to_compile_error().into(),
+    };
     let output = quote! {
         #[automatically_derived]
         impl delta_kernel::schema::ToSchema for #struct_ident {
@@ -350,26 +353,36 @@ fn has_skip_schema(field: &Field) -> bool {
     has_named_attr(&field.attrs, "skip_schema")
 }
 
-fn gen_schema_fields(data: &Data) -> TokenStream {
-    let fields = match data {
-        Data::Struct(DataStruct {
-            fields: Fields::Named(fields),
-            ..
-        }) => &fields.named,
-        _ => {
-            return Error::new(
-                Span::call_site(),
-                "this derive macro only works on structs with named fields",
-            )
-            .to_compile_error()
-        }
+/// Schema-facing fields of a named struct, in declaration order, with `#[skip_schema]` dropped.
+///
+/// Shared by `ToSchema`, `IntoEngineData`, and `IntoStructData` so they cannot disagree on which
+/// fields participate (or in what order).
+fn schema_fields<'a>(
+    data: &'a Data,
+    derive_name: &str,
+    span: Span,
+) -> Result<Vec<&'a Field>, Error> {
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(fields),
+        ..
+    }) = data
+    else {
+        return Err(Error::new(
+            span,
+            format!("{derive_name} can only be derived for structs with named fields"),
+        ));
     };
-
-    let schema_fields = fields
+    Ok(fields
+        .named
         .iter()
         .filter(|f| !has_skip_schema(f))
-        .map(gen_schema_field);
-    quote! { #(#schema_fields),* }
+        .collect())
+}
+
+fn gen_schema_fields(data: &Data, span: Span) -> Result<TokenStream, Error> {
+    let fields = schema_fields(data, "ToSchema", span)?;
+    let fields = fields.iter().map(|f| gen_schema_field(f));
+    Ok(quote! { #(#fields),* })
 }
 
 /// Derive an IntoEngineData trait for a struct that has all fields implement `TryInto<Scalar>`.
@@ -382,28 +395,12 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
 
-    let Data::Struct(DataStruct {
-        fields: Fields::Named(fields),
-        ..
-    }) = &input.data
-    else {
-        return Error::new(
-            struct_name.span(),
-            "IntoEngineData can only be derived for structs with named fields",
-        )
-        .to_compile_error()
-        .into();
+    let fields = match schema_fields(&input.data, "IntoEngineData", struct_name.span()) {
+        Ok(fields) => fields,
+        Err(e) => return e.to_compile_error().into(),
     };
-
-    // Honor `#[skip_schema]` so the produced engine data matches the arity of the schema built by
-    // the `ToSchema` derive (which filters the same fields).
-    let kept: Vec<_> = fields
-        .named
-        .iter()
-        .filter(|f| !has_skip_schema(f))
-        .collect();
-    let field_idents = kept.iter().map(|f| &f.ident);
-    let field_types: Vec<_> = kept.iter().map(|f| &f.ty).collect();
+    let (field_idents, field_types): (Vec<_>, Vec<_>) =
+        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
 
     let expanded = quote! {
         #[automatically_derived]
@@ -424,6 +421,55 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
                 ];
                 let evaluator = engine.evaluation_handler();
                 evaluator.create_one(schema, &values)
+            }
+        }
+    };
+
+    proc_macro::TokenStream::from(expanded)
+}
+
+/// Derive `From` conversions into `StructData` and `Scalar` for a rust struct.
+///
+/// Emits both:
+/// - `From<Self> for StructData` — field values via `.into()`, schema from `ToSchema`
+/// - `From<Self> for Scalar` — `Scalar::Struct(self.into())`
+///
+/// Honors `#[skip_schema]`, producing the same field set as `ToSchema`. Every schema field type
+/// must implement `Into<Scalar>` (and the struct must implement `ToSchema`).
+#[proc_macro_derive(IntoStructData)]
+pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let struct_name = &input.ident;
+
+    let fields = match schema_fields(&input.data, "IntoStructData", struct_name.span()) {
+        Ok(fields) => fields,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let (field_idents, field_types): (Vec<_>, Vec<_>) =
+        fields.into_iter().map(|f| (&f.ident, &f.ty)).unzip();
+
+    let expanded = quote! {
+        #[automatically_derived]
+        impl From<#struct_name> for delta_kernel::expressions::StructData
+        where
+            #struct_name: delta_kernel::schema::ToSchema,
+            #(#field_types: Into<delta_kernel::expressions::Scalar>,)*
+        {
+            fn from(value: #struct_name) -> Self {
+                Self::from_values_unchecked(
+                    <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
+                    vec![ #(value.#field_idents.into()),* ],
+                )
+            }
+        }
+
+        #[automatically_derived]
+        impl From<#struct_name> for delta_kernel::expressions::Scalar
+        where
+            #struct_name: Into<delta_kernel::expressions::StructData>,
+        {
+            fn from(value: #struct_name) -> Self {
+                Self::Struct(value.into())
             }
         }
     };
@@ -520,7 +566,9 @@ mod tests {
     /// input itself failed to parse as a `DeriveInput`.
     fn schema_fields_tokens(input: &str) -> Result<String, String> {
         let input = syn::parse_str::<DeriveInput>(input).map_err(|e| e.to_string())?;
-        Ok(gen_schema_fields(&input.data).to_string())
+        let tokens = gen_schema_fields(&input.data, input.ident.span())
+            .unwrap_or_else(|e| e.to_compile_error());
+        Ok(tokens.to_string())
     }
 
     #[test]
