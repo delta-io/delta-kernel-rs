@@ -1767,16 +1767,18 @@ mod tests {
     /// Input:
     ///
     /// ```text
-    /// group   | value         | sentinel | key
-    /// --------+---------------+----------+-----
-    /// valid   | ignored-low   | NULL     | 0
-    /// valid   | min           | present  | 1
-    /// valid   | max           | present  | 3
-    /// valid   | NULL          | present  | 4
-    /// valid   | ignored-high  | NULL     | 5
-    /// valid   | no-key        | present  | NULL
-    /// invalid | no-sentinel   | NULL     | 1
-    /// invalid | no-key        | present  | NULL
+    /// group      | value        | sentinel | key
+    /// -----------+--------------+----------+-----
+    /// values     | min          | present  | 1
+    /// values     | max          | present  | 3
+    /// null-value | ignored-low  | NULL     | 0
+    /// null-value | min          | present  | 1
+    /// null-value | max          | present  | 3
+    /// null-value | NULL         | present  | 4
+    /// null-value | ignored-high | NULL     | 5
+    /// null-value | no-key       | present  | NULL
+    /// invalid    | no-sentinel  | NULL     | 1
+    /// invalid    | no-key       | present  | NULL
     /// ```
     ///
     /// ```sql
@@ -1788,46 +1790,59 @@ mod tests {
     /// ```
     ///
     /// ```text
-    /// group   | min_value | max_value
-    /// --------+-----------+----------
-    /// invalid | NULL      | NULL
-    /// valid   | min       | NULL
+    /// group      | min_value | max_value
+    /// -----------+-----------+----------
+    /// invalid    | NULL      | NULL
+    /// null-value | min       | NULL
+    /// values     | min       | max
     /// ```
     #[tokio::test]
     async fn aggregate_non_null_by_filters_on_sentinel_and_key_but_retains_null_value() {
         let rows = vec![
             vec![
-                "valid".into(),
-                "ignored-low".into(),
-                KernelScalar::Null(DataType::STRING),
-                KernelScalar::Long(0),
-            ],
-            vec![
-                "valid".into(),
+                "values".into(),
                 "min".into(),
                 "present".into(),
                 KernelScalar::Long(1),
             ],
             vec![
-                "valid".into(),
+                "values".into(),
                 "max".into(),
                 "present".into(),
                 KernelScalar::Long(3),
             ],
             vec![
-                "valid".into(),
+                "null-value".into(),
+                "ignored-low".into(),
+                KernelScalar::Null(DataType::STRING),
+                KernelScalar::Long(0),
+            ],
+            vec![
+                "null-value".into(),
+                "min".into(),
+                "present".into(),
+                KernelScalar::Long(1),
+            ],
+            vec![
+                "null-value".into(),
+                "max".into(),
+                "present".into(),
+                KernelScalar::Long(3),
+            ],
+            vec![
+                "null-value".into(),
                 KernelScalar::Null(DataType::STRING),
                 "present".into(),
                 KernelScalar::Long(4),
             ],
             vec![
-                "valid".into(),
+                "null-value".into(),
                 "ignored-high".into(),
                 KernelScalar::Null(DataType::STRING),
                 KernelScalar::Long(5),
             ],
             vec![
-                "valid".into(),
+                "null-value".into(),
                 "no-key".into(),
                 "present".into(),
                 KernelScalar::Null(DataType::LONG),
@@ -1876,12 +1891,13 @@ mod tests {
         let batches = execute(lowered).await.unwrap();
         assert_batches_sorted_eq!(
             &[
-                "+---------+-----------+-----------+",
-                "| group   | min_value | max_value |",
-                "+---------+-----------+-----------+",
-                "| invalid |           |           |",
-                "| valid   | min       |           |",
-                "+---------+-----------+-----------+",
+                "+------------+-----------+-----------+",
+                "| group      | min_value | max_value |",
+                "+------------+-----------+-----------+",
+                "| invalid    |           |           |",
+                "| null-value | min       |           |",
+                "| values     | min       | max       |",
+                "+------------+-----------+-----------+",
             ],
             &batches
         );
