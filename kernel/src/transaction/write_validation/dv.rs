@@ -6,11 +6,12 @@ use std::sync::LazyLock;
 use super::utils::{validate_partition_keys, validate_required_field_exist};
 use super::{StagedDataValidator, Validation};
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::expressions::column_name;
 use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME, PATH_NAME, SIZE_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ColumnName, ColumnNamesAndTypes};
+use crate::schema::ColumnNamesAndTypes;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -22,10 +23,10 @@ const MODIFICATION_TIME_NAME: &str = "modificationTime";
 
 static DV_MATCHED_FILE_COLUMNS: LazyLock<DeltaResult<ColumnNamesAndTypes>> = LazyLock::new(|| {
     let names = vec![
-        ColumnName::new([PATH_NAME]),
-        ColumnName::new([SIZE_NAME]),
-        ColumnName::new([MODIFICATION_TIME_NAME]),
-        ColumnName::new([FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME]),
+        column_name!(PATH_NAME),
+        column_name!(SIZE_NAME),
+        column_name!(MODIFICATION_TIME_NAME),
+        column_name!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME),
     ];
     // Derive types from the canonical scan schema so this projection stays compatible with scan
     // metadata if those field definitions change.
@@ -115,7 +116,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoArrow;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine_data::FilteredEngineData;
-    use crate::expressions::ColumnName;
+    use crate::expressions::column_name;
     use crate::unit_test_utils::{
         add_files_with_partition_values, assert_result_error_with_message, nullable_add_files,
         replace_column, set_field_as_null,
@@ -172,15 +173,15 @@ mod tests {
             .as_ref()
             .expect("DV validation columns should exist in the scan-row schema");
         let (names, _) = columns.as_ref();
-        assert_eq!(names[PATH], ColumnName::new(["path"]));
-        assert_eq!(names[SIZE], ColumnName::new(["size"]));
+        assert_eq!(names[PATH], column_name!(PATH_NAME));
+        assert_eq!(names[SIZE], column_name!(SIZE_NAME));
         assert_eq!(
             names[MODIFICATION_TIME],
-            ColumnName::new(["modificationTime"])
+            column_name!(MODIFICATION_TIME_NAME)
         );
         assert_eq!(
             names[PARTITION_VALUES],
-            ColumnName::new(["fileConstantValues", "partitionValues"])
+            column_name!(FILE_CONSTANT_VALUES_NAME, PARTITION_VALUES_NAME)
         );
     }
 
