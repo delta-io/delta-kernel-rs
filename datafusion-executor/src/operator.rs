@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::common::{DFSchema, DataFusionError};
-use datafusion::functions_aggregate::expr_fn::{max, min};
+use datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
 use datafusion::functions_aggregate::first_last::first_value_udaf;
 use datafusion::logical_expr::{
     col as df_col, lit as df_lit, Aggregate as DFAggregate, EmptyRelation, Expr as DFExpr,
@@ -116,6 +116,7 @@ fn lower_project(
     Ok(DFLogicalPlan::Projection(projection))
 }
 
+/// Lowers an [`Aggregate`](KernelAggregate) to a DataFusion aggregate over its parent.
 fn lower_aggregate(
     aggregate: &KernelAggregate,
     input: &Arc<DFLogicalPlan>,
@@ -183,24 +184,39 @@ fn lower_aggregate(
 
 fn lower_agg(agg: &KernelAgg, input_schema: &StructType) -> Result<DFExpr, DataFusionError> {
     match agg {
-        KernelAgg::Min { value } => Ok(min(column_to_df_expr(value, input_schema)?)),
-        KernelAgg::Max { value } => Ok(max(column_to_df_expr(value, input_schema)?)),
-        KernelAgg::MinNonNullBy { value, key } => lower_non_null_by(value, key, input_schema, true),
-        KernelAgg::MaxNonNullBy { value, key } => {
-            lower_non_null_by(value, key, input_schema, false)
-        }
+        KernelAgg::Min(value) => Ok(min(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::Max(value) => Ok(max(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::Sum(value) => Ok(sum(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::Count(value) => Ok(count(column_to_df_expr(value, input_schema)?)),
+        KernelAgg::CountStar => Ok(count(df_lit(1))),
+        KernelAgg::MinNonNullBy(operands) => lower_non_null_by(
+            &operands.value,
+            &operands.null_sentinel,
+            &operands.key,
+            input_schema,
+            true,
+        ),
+        KernelAgg::MaxNonNullBy(operands) => lower_non_null_by(
+            &operands.value,
+            &operands.null_sentinel,
+            &operands.key,
+            input_schema,
+            false,
+        ),
     }
 }
 
 fn lower_non_null_by(
     value: &KernelColumnName,
+    null_sentinel: &KernelColumnName,
     key: &KernelColumnName,
     input_schema: &StructType,
     ascending: bool,
 ) -> Result<DFExpr, DataFusionError> {
     let value = column_to_df_expr(value, input_schema)?;
+    let null_sentinel = column_to_df_expr(null_sentinel, input_schema)?;
     let key = column_to_df_expr(key, input_schema)?;
-    let filter = value.clone().is_not_null().and(key.clone().is_not_null());
+    let filter = null_sentinel.is_not_null().and(key.clone().is_not_null());
     let first_value = first_value_udaf().call(vec![value]);
     first_value
         .order_by(vec![key.sort(ascending, false)])
@@ -1415,12 +1431,20 @@ mod tests {
     #[case::min(KernelAgg::min(column_name!("value")), "min", None)]
     #[case::max(KernelAgg::max(column_name!("value")), "max", None)]
     #[case::min_non_null_by(
-        KernelAgg::min_non_null_by(column_name!("value"), column_name!("key")),
+        KernelAgg::min_non_null_by(
+            column_name!("value"),
+            column_name!("value"),
+            column_name!("key")
+        ),
         "first_value",
         Some(true)
     )]
     #[case::max_non_null_by(
-        KernelAgg::max_non_null_by(column_name!("value"), column_name!("key")),
+        KernelAgg::max_non_null_by(
+            column_name!("value"),
+            column_name!("value"),
+            column_name!("key")
+        ),
         "first_value",
         Some(false)
     )]
@@ -1678,11 +1702,19 @@ mod tests {
         let aggregate =
             KernelAggregate::group_by(Arc::clone(&input_schema), [column_name!("group")])
                 .aggregate_as(
-                    KernelAgg::min_non_null_by(column_name!("value"), column_name!("key")),
+                    KernelAgg::min_non_null_by(
+                        column_name!("value"),
+                        column_name!("value"),
+                        column_name!("key"),
+                    ),
                     "min_value",
                 )
                 .aggregate_as(
-                    KernelAgg::max_non_null_by(column_name!("value"), column_name!("key")),
+                    KernelAgg::max_non_null_by(
+                        column_name!("value"),
+                        column_name!("value"),
+                        column_name!("key"),
+                    ),
                     "max_value",
                 )
                 .build()
