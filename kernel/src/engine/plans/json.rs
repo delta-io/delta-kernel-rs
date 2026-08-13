@@ -10,7 +10,7 @@ use crate::plans::{Operation, PlanBuilder, PlanExecutor};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    FilteredEngineData, JsonHandler, JsonWriteResult, PredicateRef,
+    FileSize, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// A [`JsonHandler`] that delegates to a [`PlanExecutor`].
@@ -64,7 +64,7 @@ impl JsonHandler for PlanBasedJsonHandler {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<JsonWriteResult> {
+    ) -> DeltaResult<FileSize> {
         let Some(fallback) = &self.fallback else {
             return Err(Error::unsupported(
                 "PlanBasedJsonHandler does not support write_json_file yet, and no fallback \
@@ -124,10 +124,11 @@ mod tests {
         let filtered = Ok(FilteredEngineData::with_all_rows_selected(
             single_column_data(vec!["a", "b"]),
         ));
-        make_handler()
+        let written_size = make_handler()
             .write_json_file(&url, Box::new(std::iter::once(filtered)), false)
             .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written_size, contents.len() as u64);
         assert_eq!(contents, "{\"x\":\"a\"}\n{\"x\":\"b\"}\n");
     }
 

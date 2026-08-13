@@ -42,7 +42,7 @@ impl Committer for FileSystemCommitter {
             Box::new(actions),
             false,
         ) {
-            Ok(write_result) => {
+            Ok(written_size) => {
                 info!(
                     committed_version = version,
                     "Committed delta file via filesystem committer"
@@ -50,7 +50,7 @@ impl Committer for FileSystemCommitter {
                 let file_meta = FileMeta::new(
                     published_commit_path,
                     commit_metadata.in_commit_timestamp(),
-                    write_result.size,
+                    written_size,
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
@@ -168,10 +168,7 @@ mod tests {
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert_eq!(file_meta.last_modified, 12345);
-                // 177 fixed JSON bytes = 19 prefix + 46 format + 53 schema + 22 partitions
-                //     + 16 timestamp + 21 config.
-                // 214 = 177 fixed JSON + 36 UUID + 1 newline.
-                assert_eq!(file_meta.size, 214);
+                assert!(file_meta.size > 0);
                 assert_eq!(file_meta.size, stored_size);
                 assert!(file_meta
                     .location

@@ -1072,16 +1072,12 @@ impl Committer for TestCatalogCommitter {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
         let path = commit_metadata.published_commit_path()?;
-        let write_result =
+        let written_size =
             engine
                 .json_handler()
                 .write_json_file(&path, Box::new(actions), false)?;
         Ok(CommitResponse::Committed {
-            file_meta: FileMeta::new(
-                path,
-                commit_metadata.in_commit_timestamp(),
-                write_result.size,
-            ),
+            file_meta: FileMeta::new(path, commit_metadata.in_commit_timestamp(), written_size),
         })
     }
 

@@ -150,12 +150,12 @@ impl<C: UpdateTableClient> UCCommitter<C> {
             Box::new(actions),
             false,
         ) {
-            Ok(write_result) => {
+            Ok(written_size) => {
                 info!("wrote version 0 commit file for UC table creation");
                 let file_meta = FileMeta::new(
                     published_commit_path,
                     commit_metadata.in_commit_timestamp(),
-                    write_result.size,
+                    written_size,
                 );
                 Ok(CommitResponse::Committed { file_meta })
             }
@@ -314,9 +314,11 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
 
+    use delta_kernel::arrow::array::{Array, RecordBatch, StringArray};
     use delta_kernel::committer::{CatalogCommit, CommitMetadata};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::object_store::local::LocalFileSystem;
-    use delta_kernel::Version;
+    use delta_kernel::{EngineData, FilteredEngineData, Version};
     use delta_kernel_default_engine::DefaultEngine;
     use unity_catalog_delta_client_api::error::Result;
 
@@ -366,13 +368,21 @@ mod tests {
         let commit_metadata = catalog_managed_commit_metadata(table_root.clone(), 0);
         let committer = test_committer();
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        let action: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "test",
+                Arc::new(StringArray::from(vec!["value"])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let actions = Box::new(std::iter::once(Ok(
+            FilteredEngineData::with_all_rows_selected(action),
+        )));
 
         // Create the _delta_log directory
         fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
 
-        let result = committer
-            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
-            .unwrap();
+        let result = committer.commit(&engine, actions, commit_metadata).unwrap();
         match result {
             CommitResponse::Committed { file_meta } => {
                 assert!(
@@ -383,9 +393,10 @@ mod tests {
                     "expected published path for version 0, got: {}",
                     file_meta.location
                 );
-                assert_eq!(file_meta.size, 0);
-                // Verify the file was written to disk
                 let commit_path = tmp_dir.path().join("_delta_log/00000000000000000000.json");
+                let stored_size = fs::metadata(&commit_path).unwrap().len();
+                assert!(file_meta.size > 0);
+                assert_eq!(file_meta.size, stored_size);
                 assert!(commit_path.exists(), "000.json should exist on disk");
             }
             CommitResponse::Conflict { .. } => {

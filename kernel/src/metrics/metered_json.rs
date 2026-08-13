@@ -10,7 +10,7 @@ use crate::metrics::PrecountedMetricsIterator;
 use crate::schema::SchemaRef;
 use crate::{
     CancellationTokenRef, DeltaResult, DeltaResultIterator, EngineData, FileDataReadResultIterator,
-    FileMeta, FilteredEngineData, JsonHandler, JsonWriteResult, PredicateRef,
+    FileMeta, FileSize, FilteredEngineData, JsonHandler, PredicateRef,
 };
 
 /// Decorator over an engine-provided `Arc<dyn JsonHandler>` that emits a
@@ -96,7 +96,7 @@ impl JsonHandler for MeteredJsonHandler {
         path: &url::Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<JsonWriteResult> {
+    ) -> DeltaResult<FileSize> {
         self.inner.write_json_file(path, data, overwrite)
     }
 }
@@ -120,7 +120,7 @@ mod tests {
         /// Set when the cancellation-aware read variant is invoked, so a test can assert the
         /// metered wrapper forwards to it (rather than the plain read).
         cancellation_read_called: std::sync::atomic::AtomicBool,
-        write_result: Option<JsonWriteResult>,
+        write_size: Option<FileSize>,
     }
 
     fn empty_batch() -> Box<dyn EngineData> {
@@ -164,8 +164,8 @@ mod tests {
             _path: &Url,
             _data: DeltaResultIterator<'_, FilteredEngineData>,
             _overwrite: bool,
-        ) -> DeltaResult<JsonWriteResult> {
-            self.write_result
+        ) -> DeltaResult<FileSize> {
+            self.write_size
                 .ok_or_else(|| crate::Error::generic("StubJsonHandler does not support writes"))
         }
     }
@@ -287,20 +287,20 @@ mod tests {
     }
 
     #[test]
-    fn write_json_file_forwards_result_without_emitting_metrics() {
+    fn write_json_file_forwards_size_without_emitting_metrics() {
         let (reporter, _guard) = install_capture();
         let inner: Arc<dyn JsonHandler> = Arc::new(StubJsonHandler {
-            write_result: Some(JsonWriteResult::new(42)),
+            write_size: Some(42),
             ..Default::default()
         });
         let handler = MeteredJsonHandler::new(inner);
         let path = Url::parse("memory:///_delta_log/0.json").unwrap();
 
-        let result = handler
+        let written_size = handler
             .write_json_file(&path, Box::new(std::iter::empty()), false)
             .unwrap();
 
-        assert_eq!(result, JsonWriteResult::new(42));
+        assert_eq!(written_size, 42);
         assert!(reporter.events().is_empty());
     }
 

@@ -16,7 +16,7 @@ use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
-    JsonHandler, JsonWriteResult, PredicateRef,
+    FileSize, JsonHandler, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler {
@@ -74,14 +74,14 @@ impl JsonHandler for SyncJsonHandler {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<JsonWriteResult> {
+    ) -> DeltaResult<FileSize> {
         let buf = to_json_bytes(data)?;
         let size = buf
             .len()
             .try_into()
             .map_err(|_| Error::generic("JSON file size exceeds u64::MAX"))?;
         put_bytes(self.store.as_ref(), path, buf.into(), overwrite)?;
-        Ok(JsonWriteResult::new(size))
+        Ok(size)
     }
 }
 
@@ -142,12 +142,9 @@ mod tests {
         let result =
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
-        // Verify the first write is successful and reports the expected size.
-        let write_result = result?;
-        // 10 JSON bytes = 8-byte `{"dog":"` prefix + 2-byte `"}` suffix.
-        // 32 = (10 + 4 "remi" + 1 newline) + (10 + 6 "wilson" + 1 newline).
-        assert_eq!(write_result.size, 32);
-        assert_eq!(write_result.size, std::fs::metadata(&path)?.len());
+        let written_size = result?;
+        assert_eq!(written_size, 32);
+        assert_eq!(written_size, std::fs::metadata(&path)?.len());
         let json = read_json_file(&path)?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
@@ -158,12 +155,9 @@ mod tests {
             handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
-            // Verify the second write is successful and reports the expected size.
-            let write_result = result?;
-            // 10 JSON bytes = 8-byte `{"dog":"` prefix + 2-byte `"}` suffix.
-            // 28 = 2 * (10 + 3 value + 1 newline).
-            assert_eq!(write_result.size, 28);
-            assert_eq!(write_result.size, std::fs::metadata(&path)?.len());
+            let written_size = result?;
+            assert_eq!(written_size, 28);
+            assert_eq!(written_size, std::fs::metadata(&path)?.len());
             let json = read_json_file(&path)?;
             assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
         } else {
@@ -171,6 +165,20 @@ mod tests {
             assert!(matches!(result, Err(Error::FileAlreadyExists(_))));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_empty_json_file_reports_zero_size() -> DeltaResult<()> {
+        let test_dir = TempDir::new().unwrap();
+        let path = test_dir.path().join("empty.json");
+        let handler = SyncJsonHandler::new(None);
+        let url = Url::from_file_path(&path).unwrap();
+
+        let written_size = handler.write_json_file(&url, Box::new(std::iter::empty()), false)?;
+
+        assert_eq!(written_size, 0);
+        assert_eq!(std::fs::metadata(&path)?.len(), 0);
         Ok(())
     }
 

@@ -296,29 +296,6 @@ impl FileMeta {
     }
 }
 
-/// Metadata produced by a successful JSON file write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct JsonWriteResult {
-    /// The exact number of bytes written to the JSON file.
-    pub size: FileSize,
-}
-
-impl JsonWriteResult {
-    /// Create a JSON write result with a known serialized file size.
-    ///
-    /// # Parameters
-    ///
-    /// - `size` - Exact number of bytes written to the JSON file.
-    ///
-    /// # Returns
-    ///
-    /// A write result containing `size`.
-    pub fn new(size: FileSize) -> Self {
-        Self { size }
-    }
-}
-
 /// Extension trait that makes it easier to work with traits objects that implement [`Any`],
 /// implemented automatically for any type that satisfies `Any`, `Send`, and `Sync`. In particular,
 /// given some `trait T: Any + Send + Sync`, it allows upcasting `T` to `dyn Any + Send + Sync`,
@@ -777,7 +754,7 @@ pub trait JsonHandler: AsAny {
     ///
     /// # Returns
     ///
-    /// Metadata about the completed write, including the exact serialized file size.
+    /// The exact number of serialized bytes written to the file.
     ///
     /// # Errors
     ///
@@ -788,7 +765,7 @@ pub trait JsonHandler: AsAny {
         path: &Url,
         data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
-    ) -> DeltaResult<JsonWriteResult>;
+    ) -> DeltaResult<FileSize>;
 }
 
 /// Reserved field IDs for metadata columns in Delta tables.
