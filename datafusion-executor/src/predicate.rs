@@ -195,8 +195,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::expressions::{
-        col, lit, ArrayData as KernelArrayData, Expression as KernelExpr,
-        Predicate as KernelPred,
+        col, lit, ArrayData as KernelArrayData, Expression as KernelExpr, Predicate as KernelPred,
     };
     use delta_kernel::schema::{ArrayType, DataType, StructField};
     use rstest::rstest;
