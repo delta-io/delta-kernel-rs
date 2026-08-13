@@ -501,7 +501,7 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::arrow::array::StructArray;
     use crate::arrow::buffer::{BooleanBuffer, NullBuffer};
-    use crate::expressions::StructData;
+    use crate::expressions::{column_name, StructData};
     use crate::schema::{StructField, ToSchema as _};
 
     #[test]
@@ -561,10 +561,10 @@ mod tests {
             file_type: FileType::Parquet,
             base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            last_modified_column: ColumnName::new(["filemod"]),
-            dv_column: ColumnName::new(["dv"]),
+            path_column: column_name!("path"),
+            file_size_column: column_name!("size"),
+            last_modified_column: column_name!("filemod"),
+            dv_column: column_name!("dv"),
         };
 
         dynamic_scan_files(&dynamic_scan, &[input])
@@ -681,10 +681,10 @@ mod tests {
             file_type: FileType::Parquet,
             base_url: Url::parse("memory:///").unwrap(),
             file_constant_columns: vec![],
-            path_column: ColumnName::new(["path"]),
-            file_size_column: ColumnName::new(["size"]),
-            last_modified_column: ColumnName::new(["filemod"]),
-            dv_column: ColumnName::new(["metadata", "dv"]),
+            path_column: column_name!("path"),
+            file_size_column: column_name!("size"),
+            last_modified_column: column_name!("filemod"),
+            dv_column: column_name!("metadata.dv"),
         };
 
         assert_eq!(

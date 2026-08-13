@@ -20,7 +20,7 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 #[cfg(feature = "declarative-plans")]
 use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
@@ -1171,7 +1171,7 @@ impl Scan {
         )?;
 
         let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add"]),
+            prefix: column_name!("add"),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))

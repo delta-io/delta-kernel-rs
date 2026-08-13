@@ -195,7 +195,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::expressions::{
-        column_expr, ArrayData as KernelArrayData, Expression as KernelExpr,
+        col, lit, ArrayData as KernelArrayData, Expression as KernelExpr,
         Predicate as KernelPred,
     };
     use delta_kernel::schema::{ArrayType, DataType, StructField};
@@ -280,29 +280,29 @@ mod tests {
 
     #[rstest]
     // Primitive comparisons lower to a native binary op.
-    #[case::eq(column_expr!("a").eq(KernelExpr::literal(1i64)), "a = Int64(1)")]
-    #[case::lt(column_expr!("a").lt(KernelExpr::literal(1i64)), "a < Int64(1)")]
-    #[case::gt(column_expr!("a").gt(KernelExpr::literal(1i64)), "a > Int64(1)")]
+    #[case::eq(col!("a").eq(lit(1i64)), "a = Int64(1)")]
+    #[case::lt(col!("a").lt(lit(1i64)), "a < Int64(1)")]
+    #[case::gt(col!("a").gt(lit(1i64)), "a > Int64(1)")]
     #[case::distinct(
-        column_expr!("a").distinct(KernelExpr::literal(1i64)),
+        col!("a").distinct(lit(1i64)),
         "a IS DISTINCT FROM Int64(1)"
     )]
     // Kernel has no <=/>=/!= ops: each is `Not` of a comparison, so it renders negated.
-    #[case::ne(column_expr!("a").ne(KernelExpr::literal(1i64)), "NOT a = Int64(1)")]
-    #[case::le(column_expr!("a").le(KernelExpr::literal(1i64)), "NOT a > Int64(1)")]
-    #[case::ge(column_expr!("a").ge(KernelExpr::literal(1i64)), "NOT a < Int64(1)")]
+    #[case::ne(col!("a").ne(lit(1i64)), "NOT a = Int64(1)")]
+    #[case::le(col!("a").le(lit(1i64)), "NOT a > Int64(1)")]
+    #[case::ge(col!("a").ge(lit(1i64)), "NOT a < Int64(1)")]
     // Unary.
-    #[case::is_null(column_expr!("a").is_null(), "a IS NULL")]
-    #[case::is_not_null(column_expr!("a").is_not_null(), "NOT a IS NULL")]
+    #[case::is_null(col!("a").is_null(), "a IS NULL")]
+    #[case::is_not_null(col!("a").is_not_null(), "NOT a IS NULL")]
     // IN / NOT IN. Kernel requires a literal needle. `IS TRUE` turns DataFusion's null into
     // kernel's false, and sits inside the `Not` so a null value gives `NOT false` instead of
     // `NOT NULL`.
     #[case::in_list(
-        KernelPred::binary(KernelBinaryPredicateOp::In, KernelExpr::literal(1i64), long_array([1, 2, 3])),
+        KernelPred::binary(KernelBinaryPredicateOp::In, lit(1i64), long_array([1, 2, 3])),
         "Int64(1) IN ([Int64(1), Int64(2), Int64(3)]) IS TRUE"
     )]
     #[case::not_in(
-        KernelPred::not(KernelPred::binary(KernelBinaryPredicateOp::In, KernelExpr::literal(1i64), long_array([1, 2]))),
+        KernelPred::not(KernelPred::binary(KernelBinaryPredicateOp::In, lit(1i64), long_array([1, 2]))),
         "NOT Int64(1) IN ([Int64(1), Int64(2)]) IS TRUE"
     )]
     #[case::null_needle_in_list(
@@ -318,52 +318,52 @@ mod tests {
     #[case::null_element_in_list(
         KernelPred::binary(
             KernelBinaryPredicateOp::In,
-            KernelExpr::literal(1i64),
+            lit(1i64),
             nullable_long_array([Some(1), None]),
         ),
         "Int64(1) IN ([Int64(1), Int64(NULL)]) IS TRUE"
     )]
     // A literal against a list column lowers to `array_has(list, value)` (haystack first).
     #[case::in_list_column(
-        KernelPred::binary(KernelBinaryPredicateOp::In, KernelExpr::literal(1i64), column_expr!("list")),
+        KernelPred::binary(KernelBinaryPredicateOp::In, lit(1i64), col!("list")),
         "array_has(list, Int64(1)) IS TRUE"
     )]
     // Junctions fold left-associatively.
     #[case::and(
-        KernelPred::and(column_expr!("a").is_null(), column_expr!("b").is_null()),
+        KernelPred::and(col!("a").is_null(), col!("b").is_null()),
         "a IS NULL AND b IS NULL"
     )]
     #[case::or(
-        KernelPred::or(column_expr!("a").is_null(), column_expr!("b").is_null()),
+        KernelPred::or(col!("a").is_null(), col!("b").is_null()),
         "a IS NULL OR b IS NULL"
     )]
     #[case::multi_and(
         KernelPred::and_from([
-            column_expr!("a").is_null(),
-            column_expr!("b").is_null(),
-            column_expr!("c").is_null(),
+            col!("a").is_null(),
+            col!("b").is_null(),
+            col!("c").is_null(),
         ]),
         "a IS NULL AND b IS NULL AND c IS NULL"
     )]
     // A bare boolean expression goes straight to the expression converter.
-    #[case::boolean_expression(KernelPred::from_expr(column_expr!("a")), "a")]
+    #[case::boolean_expression(KernelPred::from_expr(col!("a")), "a")]
     // Nested predicates. DataFusion's Display omits parens around the junction under a `Not`, but
     // the `Expr` tree is still `Not(And(..))`.
     #[case::not_of_junction(
-        KernelPred::not(KernelPred::and(column_expr!("a").is_null(), column_expr!("b").is_null())),
+        KernelPred::not(KernelPred::and(col!("a").is_null(), col!("b").is_null())),
         "NOT a IS NULL AND b IS NULL"
     )]
     #[case::junction_of_junction(
         KernelPred::or(
-            KernelPred::and(column_expr!("a").is_null(), column_expr!("b").is_null()),
-            column_expr!("c").is_null(),
+            KernelPred::and(col!("a").is_null(), col!("b").is_null()),
+            col!("c").is_null(),
         ),
         "a IS NULL AND b IS NULL OR c IS NULL"
     )]
     #[case::and_of_comparisons(
         KernelPred::and(
-            column_expr!("a").eq(KernelExpr::literal(1i64)),
-            column_expr!("b").gt(KernelExpr::literal(2i64)),
+            col!("a").eq(lit(1i64)),
+            col!("b").gt(lit(2i64)),
         ),
         "a = Int64(1) AND b > Int64(2)"
     )]
@@ -377,14 +377,14 @@ mod tests {
     // Kernel's evaluator rejects a column needle, so we do too, whether the elements are a literal
     // array or a list column.
     #[case::column_needle_in_literal_array(
-        KernelPred::binary(KernelBinaryPredicateOp::In, column_expr!("a"), long_array([1, 2]))
+        KernelPred::binary(KernelBinaryPredicateOp::In, col!("a"), long_array([1, 2]))
     )]
     #[case::column_needle_in_list_column(
-        KernelPred::binary(KernelBinaryPredicateOp::In, column_expr!("a"), column_expr!("list"))
+        KernelPred::binary(KernelBinaryPredicateOp::In, col!("a"), col!("list"))
     )]
     // A literal needle against a non-array column (`b` is `long`) cannot be lowered.
     #[case::in_non_array_column(
-        KernelPred::binary(KernelBinaryPredicateOp::In, KernelExpr::literal(1i64), column_expr!("b"))
+        KernelPred::binary(KernelBinaryPredicateOp::In, lit(1i64), col!("b"))
     )]
     fn unsupported_predicate_is_an_error(#[case] pred: KernelPred) {
         to_df_predicate_expr(&pred, &test_schema()).unwrap_err();
@@ -441,7 +441,7 @@ mod tests {
                 Some(n) => KernelExpr::literal(n),
                 None => KernelExpr::null_literal(DataType::LONG),
             },
-            column_expr!("list"),
+            col!("list"),
         );
         // Column `list` carries the elements; `a`/`b`/`c` are unused.
         let batch = list_column_batch(elements);

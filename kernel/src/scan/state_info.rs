@@ -1358,8 +1358,7 @@ pub(crate) mod tests {
             vec![],
         )
         .unwrap();
-        let cols: HashSet<ColumnName> =
-            ["c0", "c1"].iter().map(|s| ColumnName::new([*s])).collect();
+        let cols = HashSet::from_iter([column_name!("c0"), column_name!("c1")]);
         assert_eq!(state_info.physical_stats_columns, cols);
     }
 
@@ -1460,7 +1459,7 @@ pub(crate) mod tests {
         assert!(!state_info.physical_stats_columns.is_empty());
         assert!(!state_info
             .physical_stats_columns
-            .contains(&ColumnName::new(["s", "c"])));
+            .contains(&column_name!("s.c")));
     }
 
     /// `delta.dataSkippingStatsColumns` selects exactly the listed leaves, regardless of
@@ -1571,10 +1570,7 @@ pub(crate) mod tests {
             vec![],
         )
         .unwrap();
-        let expected: HashSet<ColumnName> =
-            [ColumnName::new(["s", "c"]), ColumnName::new(["s", "d"])]
-                .into_iter()
-                .collect();
+        let expected = HashSet::from_iter([column_name!("s.c"), column_name!("s.d")]);
         assert_eq!(state_info.physical_stats_columns, expected);
     }
 

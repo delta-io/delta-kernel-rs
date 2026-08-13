@@ -19,7 +19,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{col, ColumnName};
+use crate::expressions::{col, column_name};
 use crate::last_checkpoint_hint::{LastCheckpointHint, LastCheckpointV2};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
@@ -3572,7 +3572,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         .expect("checkpoint stream must yield one batch")?;
     assert!(!batch.is_log_batch);
     assert_eq!(
-        batch.actions.has_field(&ColumnName::new(["add", "stats"])),
+        batch.actions.has_field(&column_name!("add.stats")),
         expect_json_stats,
         "checkpoint batch JSON stats projection must match the resolved schema"
     );

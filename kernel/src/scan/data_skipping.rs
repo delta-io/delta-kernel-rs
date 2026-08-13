@@ -9,8 +9,9 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    col, column_name, lit, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
-    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
+    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
+    ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
+    Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -515,7 +516,7 @@ fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
 /// The `partitionValues_parsed.<col>` reference holding a partition column's exact value, which
 /// serves as both its min and max stat. `col` is a top-level physical partition name.
 fn partition_value_expr(col: &ColumnName) -> Expr {
-    Expr::from(ColumnName::new([PARTITION_VALUES_PARSED_NAME]).join(col))
+    Expr::from(column_name!(PARTITION_VALUES_PARSED_NAME).join(col))
 }
 
 /// Whether a rewritten stat expression references `partitionValues_parsed`.
@@ -634,7 +635,7 @@ impl<'a> DataSkippingPredicateCreator<'a> {
     /// (op-computed verdicts bypass kernel's null-stats folding). The `is_add` column ensures
     /// non-Add rows always pass the filter.
     fn guard_for_removes(&self, pred: Pred) -> Pred {
-        Pred::or(Pred::not(Pred::from(column_name!("is_add"))), pred)
+        Pred::or(Pred::not(column_pred!("is_add")), pred)
     }
 }
 

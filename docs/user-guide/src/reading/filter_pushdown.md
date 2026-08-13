@@ -299,7 +299,7 @@ To receive statistics for only a subset of columns, pass `StatsOptions::struct_c
 # extern crate delta_kernel_default_engine;
 # use delta_kernel_default_engine::DefaultEngine;
 # use delta_kernel_default_engine::storage::store_from_url;
-# use delta_kernel::expressions::ColumnName;
+# use delta_kernel::expressions::column_name;
 # use delta_kernel::scan::StatsOptions;
 # use delta_kernel::{DeltaResult, Snapshot};
 # fn example() -> DeltaResult<()> {
@@ -310,8 +310,8 @@ To receive statistics for only a subset of columns, pass `StatsOptions::struct_c
 let scan = snapshot
     .scan_builder()
     .with_stats(StatsOptions::struct_columns(vec![
-        ColumnName::new(["age"]),
-        ColumnName::new(["city"]),
+        column_name!("age"),
+        column_name!("city"),
     ]))
     .build()?;
 # Ok(())

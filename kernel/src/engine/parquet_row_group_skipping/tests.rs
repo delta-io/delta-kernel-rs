@@ -479,11 +479,11 @@ fn test_row_group_filter_is_null_prunes_when_nullcount_is_zero() {
 
     assert!(!RowGroupFilter::apply(
         row_group,
-        &Predicate::is_null(column_name!("varlen.utf8"))
+        &Predicate::is_null(col!("varlen.utf8"))
     ));
     assert!(RowGroupFilter::apply(
         row_group,
-        &Predicate::is_null(column_name!("bool"))
+        &Predicate::is_null(col!("bool"))
     ));
 }
 
@@ -793,7 +793,7 @@ fn checkpoint_filter_is_null_with_all_stats_present() {
     let row_group = metadata.row_group(0);
 
     // IS NULL(x): at least one file has nullCount > 0, so keep the row group.
-    let predicate = Predicate::is_null(column_name!("x"));
+    let predicate = Predicate::is_null(col!("x"));
     assert!(CheckpointRowGroupFilter::apply(
         row_group,
         &predicate,
@@ -815,7 +815,7 @@ fn checkpoint_filter_is_null_all_zero_nullcounts() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::is_null(column_name!("x"));
+    let predicate = Predicate::is_null(col!("x"));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // All nullCount entries are present (no nulls in the stat column), so the null guard
@@ -840,7 +840,7 @@ fn checkpoint_filter_is_not_null_never_prunes() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let predicate = Predicate::is_not_null(column_name!("x"));
+    let predicate = Predicate::is_not_null(col!("x"));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 
     // IS NOT NULL checks nullcount != rowcount. Since rowcount is None, the evaluator
@@ -1067,7 +1067,7 @@ fn checkpoint_filter_partition_is_null_prunes_when_all_values_present() {
     let row_group = metadata.row_group(0);
 
     let partition_columns: HashSet<String> = ["part_col".to_string()].into();
-    let predicate = Predicate::is_null(column_name!("part_col"));
+    let predicate = Predicate::is_null(col!("part_col"));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &partition_columns);
 
     assert_eq!(
@@ -1176,7 +1176,7 @@ fn checkpoint_filter_nested_struct_column_stats() {
     let metadata = checkpoint_row_group_metadata(&tmp);
     let row_group = metadata.row_group(0);
 
-    let col = ColumnName::new(["a", "b"]);
+    let col = column_name!("a.b");
     let predicate = Predicate::gt(col.clone(), Scalar::from(500i64));
     let filter = CheckpointRowGroupFilter::new(row_group, &predicate, &NO_PARTITIONS);
 

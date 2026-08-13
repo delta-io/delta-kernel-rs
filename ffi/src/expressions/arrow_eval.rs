@@ -850,8 +850,8 @@ mod tests {
         use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
         use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp as _;
         use delta_kernel::expressions::{
-            col, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-            JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+            col, column_name, joined_column_expr, lit, BinaryExpressionOp, BinaryPredicateOp,
+            ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
         use delta_kernel::schema::DataType;
@@ -868,19 +868,19 @@ mod tests {
         }
 
         fn stats_col(prefix: &str, col: &ColumnName) -> Expression {
-            let mut name = ColumnName::new(["stats_parsed", prefix]);
-            name = name.join(col);
-            Expression::from(name)
+            Expression::from(
+                column_name!("stats_parsed")
+                    .join(&ColumnName::new([prefix]))
+                    .join(col),
+            )
         }
 
         fn partition_col(col: &ColumnName) -> Expression {
-            let mut name = ColumnName::new(["partitionValues_parsed"]);
-            name = name.join(col);
-            Expression::from(name)
+            joined_column_expr!("partitionValues_parsed", col)
         }
 
         fn stats_col_numrecords() -> Expression {
-            Expression::from(ColumnName::new(["stats_parsed", "numRecords"]))
+            col!("stats_parsed.numRecords")
         }
 
         /// Single-file stats batch: `stats_parsed { minValues.col=1, maxValues.col=10,
@@ -1139,14 +1139,8 @@ mod tests {
                 panic!("expected Struct arg, got {:?}", opaque.exprs[0]);
             };
             assert_eq!(fields.len(), 4);
-            assert_eq!(
-                *fields[0],
-                stats_col("minValues", &ColumnName::new(["col"]))
-            );
-            assert_eq!(
-                *fields[1],
-                stats_col("maxValues", &ColumnName::new(["col"]))
-            );
+            assert_eq!(*fields[0], stats_col("minValues", &column_name!("col")));
+            assert_eq!(*fields[1], stats_col("maxValues", &column_name!("col")));
             assert_eq!(
                 *fields[2],
                 Expression::literal(Scalar::Null(DataType::LONG))
@@ -1411,8 +1405,8 @@ mod tests {
             };
             assert_eq!(fields.len(), 4);
             // Exact partition value serves as both bounds.
-            assert_eq!(*fields[0], partition_col(&ColumnName::new(["part_col"])));
-            assert_eq!(*fields[1], partition_col(&ColumnName::new(["part_col"])));
+            assert_eq!(*fields[0], partition_col(&column_name!("part_col")));
+            assert_eq!(*fields[1], partition_col(&column_name!("part_col")));
             // Rowcount is the same `numRecords` ref as for data columns.
             assert_eq!(*fields[3], stats_col_numrecords());
         }

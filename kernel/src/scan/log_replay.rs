@@ -1156,8 +1156,8 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        col, lit, BinaryExpressionOp, ColumnName, Expression, OpaquePredicateOp, Predicate, Scalar,
-        ScalarExpressionEvaluator, UnaryExpressionOp,
+        col, column_name, lit, BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate,
+        Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -1760,7 +1760,7 @@ mod tests {
             is_catalog_managed: false,
             skip_row_transforms: false,
         };
-        let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
+        let predicate = Arc::new(crate::expressions::column_pred!("id"));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
         let invalid_state = SerializableScanState {
             predicate: Some(predicate), // Predicate exists but schema is None
@@ -2060,7 +2060,7 @@ mod tests {
         assert!(
             !without_synthesis
                 .references()
-                .contains(&ColumnName::new(["add", "stats"])),
+                .contains(&column_name!("add.stats")),
             "structured-only checkpoint transform must not reference add.stats"
         );
         let Expression::Struct(fields, _) = without_synthesis.as_ref() else {

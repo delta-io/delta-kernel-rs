@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::column_name;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -22,13 +22,10 @@ fn test_create_table_rejects_interval_clustering(
                 "nested",
                 StructType::new_unchecked([StructField::nullable("iv", interval)]),
             ),
-            ColumnName::new(["nested", "iv"]),
+            column_name!("nested.iv"),
         )
     } else {
-        (
-            StructField::nullable("iv", interval),
-            ColumnName::new(["iv"]),
-        )
+        (StructField::nullable("iv", interval), column_name!("iv"))
     };
     let schema = Arc::new(StructType::try_new(vec![
         StructField::not_null("id", DataType::INTEGER),

@@ -135,11 +135,12 @@ impl<'col> ColumnTrie<'col> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::column_name;
 
     #[test]
     fn test_column_trie() {
         // Build trie with specified column ["a", "b"]
-        let columns = [ColumnName::new(["a", "b"])];
+        let columns = [column_name!("a.b")];
         let trie = ColumnTrie::from_columns(&columns);
 
         // Exact match: path = ["a", "b"] -> include
@@ -157,15 +158,12 @@ mod tests {
 
         // Non-existent nested path: trie has ["a", "b", "c", "d"], path = ["a", "b"]
         // User asked for a.b.c.d but a.b is a leaf -> NOT include
-        let deep_columns = [ColumnName::new(["a", "b", "c", "d"])];
+        let deep_columns = [column_name!("a.b.c.d")];
         let deep_trie = ColumnTrie::from_columns(&deep_columns);
         assert!(!deep_trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
 
         // Multiple specified columns
-        let multi_columns = [
-            ColumnName::new(["a", "b"]),
-            ColumnName::new(["x", "y", "z"]),
-        ];
+        let multi_columns = [column_name!("a.b"), column_name!("x.y.z")];
         let multi_trie = ColumnTrie::from_columns(&multi_columns);
         assert!(multi_trie.contains_prefix_of(&["a".to_string(), "b".to_string()]));
         assert!(multi_trie.contains_prefix_of(&[
@@ -185,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_is_terminal() {
-        let columns = [ColumnName::new(["a", "b"]), ColumnName::new(["x"])];
+        let columns = [column_name!("a.b"), column_name!("x")];
         let trie = ColumnTrie::from_columns(&columns);
 
         // Exact terminal match

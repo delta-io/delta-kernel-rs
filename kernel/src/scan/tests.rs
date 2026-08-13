@@ -1420,7 +1420,7 @@ fn build_checkpoint_meta_predicate(
     let skipping_pred =
         as_checkpoint_skipping_predicate(pred, partition_columns, &HashSet::new(), stats_columns)?;
     let mut prefixer = PrefixColumns {
-        prefix: ColumnName::new(["add"]),
+        prefix: column_name!("add"),
     };
     Some(prefixer.transform_pred(&skipping_pred).into_owned())
 }

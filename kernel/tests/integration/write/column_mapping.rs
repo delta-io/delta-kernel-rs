@@ -11,7 +11,7 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowS
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::expressions::{ColumnName, Scalar};
+use delta_kernel::expressions::{column_name, ColumnName, Scalar};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
@@ -84,13 +84,13 @@ async fn test_column_mapping_write(
         .unwrap_or(ColumnMappingMode::None);
     let row_number_physical = get_any_level_column_physical_name(
         latest_snapshot.schema().as_ref(),
-        &ColumnName::new(["row_number"]),
+        &column_name!("row_number"),
         cm,
     )?
     .into_inner();
     let street_physical = get_any_level_column_physical_name(
         latest_snapshot.schema().as_ref(),
-        &ColumnName::new(["address", "street"]),
+        &column_name!("address.street"),
         cm,
     )?
     .into_inner();
@@ -340,7 +340,7 @@ async fn test_column_mapping_partitioned_write(
         .unwrap_or(ColumnMappingMode::None);
     let physical_name = get_any_level_column_physical_name(
         snapshot.schema().as_ref(),
-        &ColumnName::new(["category"]),
+        &column_name!("category"),
         cm,
     )?
     .into_inner()
@@ -529,7 +529,7 @@ async fn test_read_and_append_tolerates_stale_column_mapping_when_disabled(
     // The `value` column resolves by its logical name, not the stale physical name.
     let physical_name = get_any_level_column_physical_name(
         snapshot.schema().as_ref(),
-        &ColumnName::new(["value"]),
+        &column_name!("value"),
         ColumnMappingMode::None,
     )?
     .into_inner()

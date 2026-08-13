@@ -55,8 +55,8 @@ impl StatsColumnVerifier {
         data_type: &DataType,
     ) -> DeltaResult<()> {
         let column_names = vec![
-            ColumnName::new(["path"]),
-            ColumnName::new(["stats", NUM_RECORDS]),
+            column_name!("path"),
+            column_name!("stats", NUM_RECORDS),
             build_stat_path(column, NULL_COUNT),
             build_stat_path(column, MIN_VALUES),
             build_stat_path(column, MAX_VALUES),
@@ -298,10 +298,7 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
 pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
-    let column_names = vec![
-        ColumnName::new(["path"]),
-        ColumnName::new(["stats", NUM_RECORDS]),
-    ];
+    let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
         let mut visitor = NumRecordsValidator {

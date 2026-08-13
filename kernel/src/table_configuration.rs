@@ -941,7 +941,9 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::schema::{schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{
+        column_name, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
+    };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -2245,15 +2247,12 @@ mod test {
         );
 
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+        assert_eq!(column_names, vec![column_name!("phys_data")]);
 
         // Also verify partition columns are excluded when passed as required columns
-        let required = [
-            ColumnName::new(["phys_part_a"]),
-            ColumnName::new(["phys_part_b"]),
-        ];
+        let required = [column_name!("phys_part_a"), column_name!("phys_part_b")];
         let column_names = config.physical_stats_column_names(Some(&required));
-        assert_eq!(column_names, vec![ColumnName::new(["phys_data"])]);
+        assert_eq!(column_names, vec![column_name!("phys_data")]);
     }
 
     #[test]
@@ -2277,7 +2276,7 @@ mod test {
         let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["data_col"])]);
+        assert_eq!(column_names, vec![column_name!("data_col")]);
     }
 
     #[test]
@@ -2314,10 +2313,7 @@ mod test {
         // Should return physical names, not logical names
         assert_eq!(
             column_names,
-            vec![
-                ColumnName::new(["phys_col_a"]),
-                ColumnName::new(["phys_col_b"]),
-            ],
+            vec![column_name!("phys_col_a"), column_name!("phys_col_b"),],
             "Expected physical column names, not logical names"
         );
     }
@@ -2332,10 +2328,7 @@ mod test {
         let column_names = config.physical_stats_column_names(None);
         assert_eq!(
             column_names,
-            vec![
-                ColumnName::new(["phys_id"]),
-                ColumnName::new(["phys_info", "phys_name"]),
-            ],
+            vec![column_name!("phys_id"), column_name!("phys_info.phys_name"),],
         );
     }
 
@@ -2347,7 +2340,7 @@ mod test {
             [("delta.dataSkippingStatsColumns", "id,nonexistent")],
         );
         let column_names = config.physical_stats_column_names(None);
-        assert_eq!(column_names, vec![ColumnName::new(["phys_id"])],);
+        assert_eq!(column_names, vec![column_name!("phys_id")],);
     }
 
     #[rstest]
@@ -2355,83 +2348,83 @@ mod test {
     #[case::flat_none(
         test_schema_flat(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("name")],
     )]
     #[case::flat_name(
         test_schema_flat_with_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     #[case::flat_id(
         test_schema_flat_with_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_name")],
     )]
     // --- nested schema (includes map/array inside struct as leaf columns) ---
     #[case::nested_none(
         test_schema_nested(),
         "none",
         vec![
-            ColumnName::new(["id"]),
-            ColumnName::new(["info", "name"]),
-            ColumnName::new(["info", "age"]),
-            ColumnName::new(["info", "tags"]),
-            ColumnName::new(["info", "scores"]),
+            column_name!("id"),
+            column_name!("info.name"),
+            column_name!("info.age"),
+            column_name!("info.tags"),
+            column_name!("info.scores"),
         ],
     )]
     #[case::nested_name(
         test_schema_nested_with_column_mapping(),
         "name",
         vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-            ColumnName::new(["phys_info", "phys_tags"]),
-            ColumnName::new(["phys_info", "phys_scores"]),
+            column_name!("phys_id"),
+            column_name!("phys_info.phys_name"),
+            column_name!("phys_info.phys_age"),
+            column_name!("phys_info.phys_tags"),
+            column_name!("phys_info.phys_scores"),
         ],
     )]
     #[case::nested_id(
         test_schema_nested_with_column_mapping(),
         "id",
         vec![
-            ColumnName::new(["phys_id"]),
-            ColumnName::new(["phys_info", "phys_name"]),
-            ColumnName::new(["phys_info", "phys_age"]),
-            ColumnName::new(["phys_info", "phys_tags"]),
-            ColumnName::new(["phys_info", "phys_scores"]),
+            column_name!("phys_id"),
+            column_name!("phys_info.phys_name"),
+            column_name!("phys_info.phys_age"),
+            column_name!("phys_info.phys_tags"),
+            column_name!("phys_info.phys_scores"),
         ],
     )]
     // --- schema with map (included as leaf for nullCount stats) ---
     #[case::map_none(
         test_schema_with_map(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["entries"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("entries"), column_name!("name")],
     )]
     #[case::map_name(
         test_schema_with_map_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     #[case::map_id(
         test_schema_with_map_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_entries"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_entries"), column_name!("phys_name")],
     )]
     // --- schema with array (included as leaf for nullCount stats) ---
     #[case::array_none(
         test_schema_with_array(),
         "none",
-        vec![ColumnName::new(["id"]), ColumnName::new(["items"]), ColumnName::new(["name"])],
+        vec![column_name!("id"), column_name!("items"), column_name!("name")],
     )]
     #[case::array_name(
         test_schema_with_array_and_column_mapping(),
         "name",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     #[case::array_id(
         test_schema_with_array_and_column_mapping(),
         "id",
-        vec![ColumnName::new(["phys_id"]), ColumnName::new(["phys_items"]), ColumnName::new(["phys_name"])],
+        vec![column_name!("phys_id"), column_name!("phys_items"), column_name!("phys_name")],
     )]
     fn test_physical_stats_column_names_all_schemas(
         #[case] schema: SchemaRef,

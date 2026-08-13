@@ -381,10 +381,10 @@ fn sidecar_actions(
         FileType::Parquet,
         log_root.join("_sidecars/")?,
         [VERSION],
-        ColumnName::new([FILE_PATH]),
-        ColumnName::new([FILE_SIZE]),
-        ColumnName::new([FILE_MOD]),
-        ColumnName::new([DV]),
+        column_name!(FILE_PATH),
+        column_name!(FILE_SIZE),
+        column_name!(FILE_MOD),
+        column_name!(DV),
     )?;
 
     sidecar_files.dynamic_scan(dynamic_scan)

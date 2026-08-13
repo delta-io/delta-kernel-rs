@@ -576,7 +576,7 @@ pub trait EngineData: AsAny {
 
     /// Returns `true` if a field at the given (possibly nested) path exists in this data's schema.
     ///
-    /// For a top-level field named `"foo"`, use `ColumnName::new(["foo"])`. For nested fields,
+    /// For a top-level field named `"foo"`, use `column_name!("foo")`. For nested fields,
     /// each non-leaf element of the path must be a struct field at that level.
     fn has_field(&self, name: &ColumnName) -> bool;
 }

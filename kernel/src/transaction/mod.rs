@@ -990,7 +990,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// Returns the list of column names that should have statistics collected.
     ///
     /// This returns leaf column paths as [`ColumnName`] objects. Each `ColumnName`
-    /// stores path components separately (e.g., `ColumnName::new(["nested", "field"])`).
+    /// stores path components separately (e.g., `column_name!("nested.field")`).
     /// See [`ColumnName`'s `Display` implementation][ColumnName#impl-Display-for-ColumnName]
     /// for details on string formatting and escaping.
     ///
@@ -3324,7 +3324,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()), &engine)
             .unwrap()
             .with_operation("WRITE".to_string())
-            .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
+            .with_clustering_columns_for_test(vec![column_name!("value")]);
 
         let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::AllNull]);
 
@@ -3344,7 +3344,7 @@ mod tests {
             .unwrap()
             .with_operation("WRITE".to_string())
             // Enable clustering columns for this test
-            .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
+            .with_clustering_columns_for_test(vec![column_name!("value")]);
 
         // Add files WITHOUT stats
         let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::None]);
@@ -3372,7 +3372,7 @@ mod tests {
             .unwrap()
             .with_operation("WRITE".to_string())
             // Enable clustering columns for this test
-            .with_clustering_columns_for_test(vec![ColumnName::new(["value"])]);
+            .with_clustering_columns_for_test(vec![column_name!("value")]);
 
         // Add files WITH stats
         let add_files = create_test_add_files(vec!["file1.parquet"], vec![TestFileStats::Present]);

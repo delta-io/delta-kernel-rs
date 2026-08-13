@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 
 use super::FileSizeHistogram;
 use crate::engine_data::{FilteredEngineData, GetData, TypedGetData as _};
+use crate::expressions::column_name;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, RowVisitor};
@@ -212,7 +213,7 @@ impl<'sv, 'h> FileStatsVisitor<'sv, 'h> {
 impl RowVisitor for FileStatsVisitor<'_, '_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| (vec![ColumnName::new(["size"])], vec![DataType::LONG]).into());
+            LazyLock::new(|| (vec![column_name!("size")], vec![DataType::LONG]).into());
         NAMES_AND_TYPES.as_ref()
     }
 

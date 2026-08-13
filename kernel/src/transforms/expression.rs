@@ -563,7 +563,7 @@ mod tests {
     use super::*;
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
-        col, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
+        col, column_name, column_pred, lit, Expression, Expression as Expr, OpaqueExpressionOp,
         OpaquePredicateOp, ParseJsonExpression, Predicate as Pred, Scalar,
         ScalarExpressionEvaluator, VariadicExpression,
     };
@@ -634,7 +634,7 @@ mod tests {
 
         fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
             if name.len() == 1 && name[0] == "old_col" {
-                Cow::Owned(ColumnName::new(["new_col"]))
+                Cow::Owned(column_name!("new_col"))
             } else {
                 Cow::Borrowed(name)
             }
@@ -787,7 +787,7 @@ mod tests {
                 name: &'a ColumnName,
             ) -> Option<Cow<'a, ColumnName>> {
                 if name.len() == 1 && name[0] == "transform_me" {
-                    Some(Cow::Owned(ColumnName::new(["transformed"])))
+                    Some(Cow::Owned(column_name!("transformed")))
                 } else {
                     Some(Cow::Borrowed(name))
                 }

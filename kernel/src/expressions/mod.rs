@@ -1442,7 +1442,7 @@ mod tests {
         fn test_column_names_roundtrip() {
             let cases: Vec<ColumnName> = vec![
                 column_name!("simple"),
-                ColumnName::new(["a", "b", "c"]),
+                column_name!("a.b.c"),
                 ColumnName::default(),
             ];
 

@@ -908,7 +908,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::*;
-    use crate::expressions::ColumnName;
+    use crate::expressions::{column_name, ColumnName};
     use crate::schema::{DataType, MetadataValue, StructField, StructType};
     use crate::unit_test_utils::{
         assert_result_error_with_message, column_mapping_physical_name_dedup_fixtures as fixtures,
@@ -2106,7 +2106,7 @@ mod tests {
         // Top-level column
         let result = get_any_level_column_physical_name(
             &schema,
-            &ColumnName::new(["a"]),
+            &column_name!("a"),
             ColumnMappingMode::Name,
         )
         .unwrap();
@@ -2116,7 +2116,7 @@ mod tests {
         // Nested column
         let result = get_any_level_column_physical_name(
             &schema,
-            &ColumnName::new(["a", "y"]),
+            &column_name!("a.y"),
             ColumnMappingMode::Name,
         )
         .unwrap();
@@ -2126,11 +2126,11 @@ mod tests {
         // No mapping mode returns logical names (annotations are ignored)
         let result = get_any_level_column_physical_name(
             &schema,
-            &ColumnName::new(["a", "y"]),
+            &column_name!("a.y"),
             ColumnMappingMode::None,
         )
         .unwrap();
-        assert_eq!(result, ColumnName::new(["a", "y"]));
+        assert_eq!(result, column_name!("a.y"));
         assert_eq!(result.path().len(), 2);
     }
 
@@ -2141,7 +2141,7 @@ mod tests {
         // Non-existent top-level column
         let result = get_any_level_column_physical_name(
             &schema,
-            &ColumnName::new(["nonexistent"]),
+            &column_name!("nonexistent"),
             ColumnMappingMode::None,
         );
         assert!(result.is_err());
@@ -2149,7 +2149,7 @@ mod tests {
         // Nested path on a non-struct field
         let result = get_any_level_column_physical_name(
             &schema,
-            &ColumnName::new(["a", "b"]),
+            &column_name!("a.b"),
             ColumnMappingMode::None,
         );
         assert!(result.is_err());
@@ -2196,7 +2196,7 @@ mod tests {
 
         let err = get_any_level_column_physical_name(
             &schema,
-            &ColumnName::new(["a", "y"]),
+            &column_name!("a.y"),
             ColumnMappingMode::Name,
         )
         .unwrap_err()
@@ -2252,14 +2252,14 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("name", DataType::STRING, true),
         ]);
-        let physical_col = ColumnName::new(["id"]);
+        let physical_col = column_name!("id");
         let (logical, data_type) = physical_to_logical_column_name_and_type(
             &schema,
             &physical_col,
             ColumnMappingMode::None,
         )
         .unwrap();
-        assert_eq!(logical, ColumnName::new(["id"]));
+        assert_eq!(logical, column_name!("id"));
         assert_eq!(data_type, DataType::INTEGER);
     }
 
@@ -2278,7 +2278,7 @@ mod tests {
             ColumnMappingMode::Name,
         )
         .unwrap();
-        assert_eq!(logical, ColumnName::new(["user_id"]));
+        assert_eq!(logical, column_name!("user_id"));
         assert_eq!(data_type, DataType::INTEGER);
     }
 
@@ -2286,7 +2286,7 @@ mod tests {
     fn physical_to_logical_not_found() {
         let schema =
             StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
-        let physical_col = ColumnName::new(["nonexistent"]);
+        let physical_col = column_name!("nonexistent");
         let result = physical_to_logical_column_name_and_type(
             &schema,
             &physical_col,
@@ -2319,7 +2319,7 @@ mod tests {
             ColumnMappingMode::Name,
         )
         .unwrap();
-        assert_eq!(logical, ColumnName::new(["address", "city"]));
+        assert_eq!(logical, column_name!("address.city"));
         assert_eq!(data_type, DataType::STRING);
     }
 
@@ -2327,7 +2327,7 @@ mod tests {
     fn physical_to_logical_non_struct_intermediate_errors() {
         let schema =
             StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)]);
-        let physical_col = ColumnName::new(["id", "nested"]);
+        let physical_col = column_name!("id.nested");
         let result = physical_to_logical_column_name_and_type(
             &schema,
             &physical_col,

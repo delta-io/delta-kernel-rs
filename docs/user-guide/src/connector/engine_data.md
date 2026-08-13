@@ -43,7 +43,7 @@ The five required methods to implement are `visit_rows`, `len`, `append_columns`
 implementation that delegates to `len`.
 
 `has_field` returns `true` if a field at the given (possibly nested) path exists in the
-data's schema. For a top-level field named `"foo"`, pass `ColumnName::new(["foo"])`. For
+data's schema. For a top-level field named `"foo"`, pass `column_name!("foo")`. For
 nested fields, each non-leaf element of the path must be a struct field at that level.
 
 ## visit_rows and the visitor pattern

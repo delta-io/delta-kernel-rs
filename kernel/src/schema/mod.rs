@@ -4752,28 +4752,28 @@ mod tests {
         ]);
 
         // Mismatched casing -> normalized to schema
-        let cols = vec![ColumnName::new(["eventdate"])];
+        let cols = vec![column_name!("eventdate")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["EventDate"]
         );
 
         // Nested path -> each field name normalized
-        let cols = vec![ColumnName::new(["address", "city"])];
+        let cols = vec![column_name!("address.city")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["Address", "City"]
         );
 
         // Already matching -> unchanged
-        let cols = vec![ColumnName::new(["id"])];
+        let cols = vec![column_name!("id")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["id"]
         );
 
         // Unrecognized -> keeps original
-        let cols = vec![ColumnName::new(["nonexistent"])];
+        let cols = vec![column_name!("nonexistent")];
         assert_eq!(
             normalize_column_names_to_schema_casing(&schema, &cols)[0].path(),
             ["nonexistent"]

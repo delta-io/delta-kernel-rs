@@ -301,12 +301,12 @@ impl Values {
 /// ```text
 /// Project {
 ///     expr: Expression::struct_from([
-///         col("id"),
-///         Expression::array([col("first"), col("last")]),
+///         col!("id"),
+///         Expression::array([col!("first"), col!("last")]),
 ///         Expression::struct_from([
-///             col("add.path"),
-///             col("add.size"),
-///             col("add.stats_parsed.numRecords"),
+///             col!("add.path"),
+///             col!("add.size"),
+///             col!("add.stats_parsed.numRecords"),
 ///         ]),
 ///     ]),
 ///     schema: {
