@@ -430,8 +430,8 @@ fn between_to_pred(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::column_name;
     use delta_kernel::expressions::Scalar::*;
+    use delta_kernel::expressions::{col, column_name};
     use delta_kernel::schema::{MapType, Schema, StructField, StructType};
     use rstest::rstest;
 
@@ -554,9 +554,12 @@ mod tests {
 
     // -- Compound identifiers (nested columns) --
     #[rstest]
-    #[case("data.value > 150", KPred::gt(KExpr::column(["data", "value"]), Long(150)))]
-    #[case("null_v_struct.v > 1", KPred::gt(KExpr::column(["null_v_struct", "v"]), Long(1)))]
-    #[case("struct_col.inner_int = 2", KPred::eq(KExpr::column(["struct_col", "inner_int"]), Integer(2)))]
+    #[case("data.value > 150", KPred::gt(col!("data.value"), Long(150)))]
+    #[case("null_v_struct.v > 1", KPred::gt(col!("null_v_struct.v"), Long(1)))]
+    #[case(
+        "struct_col.inner_int = 2",
+        KPred::eq(col!("struct_col.inner_int"), Integer(2))
+    )]
     fn nested_columns(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
         assert_eq!(parse_predicate(sql, &schema).unwrap(), expected);
@@ -575,7 +578,7 @@ mod tests {
     #[rstest]
     #[case("a IS NULL", KPred::is_null(column_name!("a")))]
     #[case("a IS NOT NULL", KPred::is_not_null(column_name!("a")))]
-    #[case("null_v_struct.v IS NULL", KPred::is_null(KExpr::column(["null_v_struct", "v"])))]
+    #[case("null_v_struct.v IS NULL", KPred::is_null(col!("null_v_struct.v")))]
     fn is_null(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
         assert_eq!(parse_predicate(sql, &schema).unwrap(), expected);
@@ -936,8 +939,14 @@ mod tests {
 
     // Nested struct column tests
     #[rstest]
-    #[case("struct_col.inner_int > 25", KPred::gt(KExpr::column(["struct_col", "inner_int"]), Integer(25)))]
-    #[case("struct_col.inner_str = 'alice'", KPred::eq(KExpr::column(["struct_col", "inner_str"]), String("alice".to_string())))]
+    #[case(
+        "struct_col.inner_int > 25",
+        KPred::gt(col!("struct_col.inner_int"), Integer(25))
+    )]
+    #[case(
+        "struct_col.inner_str = 'alice'",
+        KPred::eq(col!("struct_col.inner_str"), String("alice".to_string()))
+    )]
     fn nested_struct_columns(#[case] sql: &str, #[case] expected: KPred) {
         let schema = test_schema();
         assert_eq!(parse_predicate(sql, &schema).unwrap(), expected);

@@ -59,7 +59,7 @@ fn column_name_segments_impl(input: TokenStream) -> Result<TokenStream, Error> {
     // `column_name!` requires at least one argument, so no empty check is needed here.
     let mut emitted = Vec::new();
     for expr in Punctuated::<Expr, Token![,]>::parse_terminated.parse2(input)? {
-        // Fragment-forwarding macros (col!, column_expr!, joined_column_name!, ...) capture with
+        // Fragment-forwarding macros (col!, column_name!, joined_column_name!, ...) capture with
         // `:literal`/`:expr` and re-emit, which wraps the argument in an invisible (none-delimited)
         // group. Peel away those groups to recover an underlying string literal.
         let mut inner = &expr;
@@ -131,7 +131,7 @@ fn validate_single_segment(segment: &str, span: Span) -> Result<(), Error> {
 ///   Currently this can _only_ be set on `HashMap` fields.
 /// - `#[skip_schema]`: Excludes this field from the generated schema (and, on a struct that also
 ///   derives `IntoEngineData` / `IntoStructData`, from the produced engine data / struct scalar).
-///   `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
+///   NOTE: `TryFromStructData` rejects skipped fields because it cannot reconstruct them.
 #[proc_macro_derive(
     ToSchema,
     attributes(allow_null_container_values, field_id, nested_field_id, skip_schema)
@@ -478,7 +478,7 @@ pub fn into_struct_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
             #(#field_types: Into<delta_kernel::expressions::Scalar>,)*
         {
             fn from(value: #struct_name) -> Self {
-                Self::from_values(
+                Self::from_values_unchecked(
                     <#struct_name as delta_kernel::schema::ToSchema>::to_schema(),
                     vec![ #(value.#field_idents.into()),* ],
                 )

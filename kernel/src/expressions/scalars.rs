@@ -290,7 +290,7 @@ impl StructData {
     /// [`ToSchema`](delta_kernel::schema::ToSchema) and `Into<Scalar>`. Does not re-validate types
     /// or lengths.
     #[internal_api]
-    pub(crate) fn from_values(schema: StructType, values: Vec<Scalar>) -> Self {
+    pub(crate) fn from_values_unchecked(schema: StructType, values: Vec<Scalar>) -> Self {
         Self {
             fields: schema.into_fields().collect(),
             values,
@@ -1292,11 +1292,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::expressions::{column_expr, BinaryPredicateOp};
+    use crate::expressions::{col, lit, BinaryPredicateOp};
     use crate::schema::ToSchema as _;
     use crate::table_features::TableFeature;
     use crate::unit_test_utils::assert_result_error_with_message;
-    use crate::{Expression as Expr, Predicate as Pred};
+    use crate::Predicate as Pred;
 
     #[rstest]
     #[case::truncates(Scalar::Integer(7), Scalar::Integer(2), Some(Scalar::Integer(3)))]
@@ -1501,18 +1501,13 @@ mod tests {
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
         });
 
-        let column = column_expr!("item");
-        let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
-        let array_not_op = Pred::not(Pred::binary(
-            BinaryPredicateOp::In,
-            Expr::literal(10),
-            array,
-        ));
-        let column_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(PI), column.clone());
+        let array_op = Pred::binary(BinaryPredicateOp::In, lit(10), array.clone());
+        let array_not_op = Pred::not(Pred::binary(BinaryPredicateOp::In, lit(10), array));
+        let column_op = Pred::binary(BinaryPredicateOp::In, lit(PI), col!("item"));
         let column_not_op = Pred::not(Pred::binary(
             BinaryPredicateOp::In,
-            Expr::literal("Cool"),
-            column,
+            lit("Cool"),
+            col!("item"),
         ));
         assert_eq!(&format!("{array_op}"), "10 IN (1, 2, 3)");
         assert_eq!(&format!("{array_not_op}"), "NOT(10 IN (1, 2, 3))");
@@ -2179,7 +2174,7 @@ mod tests {
     #[rstest]
     #[case::not_a_struct(Scalar::Long(1), "expected Person, found long")]
     #[case::wrong_field_type(
-        Scalar::Struct(StructData::from_values(
+        Scalar::Struct(StructData::from_values_unchecked(
             Person::to_schema(),
             vec![
                 Scalar::from("not an integer"),
@@ -2199,7 +2194,7 @@ mod tests {
     #[test]
     fn derived_struct_conversion_requires_exact_field_count() {
         let values = vec![Scalar::from(1)];
-        let struct_data = StructData::from_values(Person::to_schema(), values);
+        let struct_data = StructData::from_values_unchecked(Person::to_schema(), values);
         assert_result_error_with_message(
             Person::try_from(struct_data),
             "expected 3 struct values, found 1 struct values",
@@ -2221,11 +2216,11 @@ mod tests {
 
     #[test]
     fn derived_struct_conversion_builds_nested_error_path_while_unwinding() {
-        let address = StructData::from_values(
+        let address = StructData::from_values_unchecked(
             Address::to_schema(),
             vec![Scalar::from(7), Scalar::null(DataType::INTEGER)],
         );
-        let person = StructData::from_values(
+        let person = StructData::from_values_unchecked(
             Person::to_schema(),
             vec![
                 Scalar::from(1),
@@ -2241,7 +2236,7 @@ mod tests {
 
     #[test]
     fn container_conversion_adds_index_to_nested_error_path() {
-        let address = StructData::from_values(
+        let address = StructData::from_values_unchecked(
             Address::to_schema(),
             vec![Scalar::from(7), Scalar::null(DataType::INTEGER)],
         );
@@ -2259,7 +2254,7 @@ mod tests {
     #[test]
     fn derived_struct_conversion_checks_null_field_data_type() {
         // `Option::try_from` rejects a typed null whose data type does not match `T`.
-        let address = StructData::from_values(
+        let address = StructData::from_values_unchecked(
             StructType::new_unchecked([
                 StructField::not_null("city", DataType::STRING),
                 StructField::nullable("zip", DataType::STRING),

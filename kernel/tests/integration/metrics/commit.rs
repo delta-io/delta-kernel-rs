@@ -311,7 +311,7 @@ async fn commit_dv_update_reports_updated_file_count_not_batch_count(
     ])?);
     let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
     let (_store, engine, table_url, file_paths) =
-        create_dv_table_with_files("dv_metrics_table", schema, file_names).await?;
+        create_dv_table_with_files("dv_metrics_table", schema, &[], file_names).await?;
 
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
@@ -354,7 +354,7 @@ async fn commit_dv_update_accumulates_file_count_across_calls(
     ])?);
     let file_names = &["file0.parquet", "file1.parquet"];
     let (_store, engine, table_url, file_paths) =
-        create_dv_table_with_files("dv_metrics_multi_call_table", schema, file_names).await?;
+        create_dv_table_with_files("dv_metrics_multi_call_table", schema, &[], file_names).await?;
 
     let reporter = Arc::new(LastCommitSuccess::default());
     let _guard = install_thread_local_metrics_reporter(reporter.clone());
