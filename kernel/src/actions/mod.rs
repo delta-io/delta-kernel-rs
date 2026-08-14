@@ -1272,6 +1272,7 @@ impl IntoEngineData for CheckpointAction {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        self.validate()?;
         let checkpoint_metadata = CheckpointMetadata {
             version: self.version,
             tags: None,
@@ -1395,6 +1396,20 @@ impl CheckpointAction {
         let mut visitor = visitors::CheckpointVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.checkpoint)
+    }
+
+    /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
+    /// checkpoint version. Called on both the parse and serialize paths so a `CheckpointAction`
+    /// can never be written in a shape the reader would reject.
+    fn validate(&self) -> DeltaResult<()> {
+        require!(
+            self.content_root.version <= self.version,
+            Error::generic(format!(
+                "checkpoint contentRoot.version {} exceeds checkpointMetadata.version {}",
+                self.content_root.version, self.version
+            ))
+        );
+        Ok(())
     }
 
     /// Path to the root manifest file (delegates to the nested [`ContentRoot`]).
@@ -2979,6 +2994,97 @@ mod tests {
                 { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
             ] })
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> DeltaResult<()> {
+        // `action_batch` carries many action kinds but no `checkpoint` array, so parsing yields
+        // `Ok(None)` rather than an error.
+        let data = crate::unit_test_utils::action_batch();
+        assert!(CheckpointAction::try_new_from_data(data.as_ref())?.is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> DeltaResult<()> {
+        // Exercise the write loops and the reader's accumulation for count > 1 (two txns, two
+        // domainMetadata, two same-type sidecars) and count 0 (empty domainMetadata sidecars).
+        let sidecar = |path: &str| Sidecar {
+            path: path.to_string(),
+            size_in_bytes: 1,
+            modification_time: 2,
+            tags: None,
+        };
+        let action = CheckpointAction {
+            version: 10,
+            content_root: ContentRoot {
+                path: "s3://bucket/manifest".to_string(),
+                size_in_bytes: 8,
+                version: 8,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: vec![
+                SetTransaction {
+                    app_id: "a1".to_string(),
+                    version: 1,
+                    last_updated: None,
+                },
+                SetTransaction {
+                    app_id: "a2".to_string(),
+                    version: 2,
+                    last_updated: None,
+                },
+            ],
+            domain_metadata: vec![
+                DomainMetadata {
+                    domain: "d1".to_string(),
+                    configuration: "c1".to_string(),
+                    removed: false,
+                },
+                DomainMetadata {
+                    domain: "d2".to_string(),
+                    configuration: "c2".to_string(),
+                    removed: true,
+                },
+            ],
+            txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
+            domain_metadata_sidecars: vec![],
+        };
+        let engine = ExprEngine::new();
+        let data = action
+            .clone()
+            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_round_trip_protocol_with_features() -> DeltaResult<()> {
+        // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
+        // read-time feature-consistency check) must survive `into_engine_data` -> parse.
+        let action = CheckpointAction {
+            protocol: Protocol::new_unchecked(
+                3,
+                7,
+                Some(vec![TableFeature::AdaptiveMetadataPreview]),
+                Some(vec![TableFeature::AdaptiveMetadataPreview]),
+            ),
+            ..sample_checkpoint_action()
+        };
+        let engine = ExprEngine::new();
+        let data = action
+            .clone()
+            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
         Ok(())
     }
 }

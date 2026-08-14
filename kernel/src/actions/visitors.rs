@@ -792,6 +792,21 @@ static ELEMENT_RANGES: LazyLock<ElementRanges> = LazyLock::new(|| {
             _ => {}
         }
     }
+    // Every checkpoint element field is a struct with >= 1 leaf, so every range must have been
+    // populated by the match above. A 0..0 range means a name in the match drifted from
+    // CHECKPOINT_ACTION_ELEMENT_SCHEMA and would silently alias field 0's getter.
+    debug_assert!(
+        !r.checkpoint_metadata.is_empty()
+            && !r.content_root.is_empty()
+            && !r.protocol.is_empty()
+            && !r.metadata.is_empty()
+            && !r.domain_metadata.is_empty()
+            && !r.txn.is_empty()
+            && r.sidecar_type > 0
+            && !r.sidecar.is_empty(),
+        "ELEMENT_RANGES: a checkpoint element field name did not match a known variant \
+         (schema/constant drift)"
+    );
     r
 });
 
@@ -816,32 +831,25 @@ struct CheckpointElementVisitor {
 #[cfg(feature = "adaptive-metadata-in-dev")]
 impl CheckpointElementVisitor {
     /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
-    /// was absent or if `contentRoot.version` exceeds `checkpointMetadata.version`.
+    /// was absent or if [`CheckpointAction::validate`] rejects the assembled action.
     fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
         let missing = |field: &str| {
             Error::generic(format!(
                 "checkpoint action is missing required `{field}` element"
             ))
         };
-        let version = self.version.ok_or_else(|| missing("checkpointMetadata"))?;
-        let content_root = self.content_root.ok_or_else(|| missing("contentRoot"))?;
-        // Per the adaptiveMetadata RFC, contentRoot.version must be <= checkpointMetadata.version.
-        if content_root.version > version {
-            return Err(Error::generic(format!(
-                "checkpoint contentRoot.version {} exceeds checkpointMetadata.version {}",
-                content_root.version, version
-            )));
-        }
-        Ok(CheckpointAction {
-            version,
-            content_root,
+        let action = CheckpointAction {
+            version: self.version.ok_or_else(|| missing("checkpointMetadata"))?,
+            content_root: self.content_root.ok_or_else(|| missing("contentRoot"))?,
             protocol: self.protocol.ok_or_else(|| missing("protocol"))?,
             metadata: self.metadata.ok_or_else(|| missing("metaData"))?,
             transactions: self.transactions,
             domain_metadata: self.domain_metadata,
             txn_sidecars: self.txn_sidecars,
             domain_metadata_sidecars: self.domain_metadata_sidecars,
-        })
+        };
+        action.validate()?;
+        Ok(action)
     }
 }
 
@@ -1077,6 +1085,14 @@ mod tests {
         assert_eq!(checkpoint.version, 42);
         assert_eq!(checkpoint.content_root.path, "s3://bucket/manifest");
         assert_eq!(checkpoint.protocol.min_reader_version, 3);
+        assert_eq!(
+            checkpoint.protocol.reader_features(),
+            Some([TableFeature::AdaptiveMetadataPreview].as_slice())
+        );
+        assert_eq!(
+            checkpoint.protocol.writer_features(),
+            Some([TableFeature::AdaptiveMetadataPreview].as_slice())
+        );
         assert_eq!(checkpoint.metadata.id, "testId");
         assert_eq!(
             checkpoint.transactions,
@@ -1217,6 +1233,24 @@ mod tests {
         assert!(checkpoint.domain_metadata.is_empty());
         assert!(checkpoint.txn_sidecars.is_empty());
         assert!(checkpoint.domain_metadata_sidecars.is_empty());
+        Ok(())
+    }
+
+    /// `contentRoot.version == checkpointMetadata.version` is the boundary of the `<=` invariant
+    /// and must parse successfully (the error rstest covers only `<` and `>`).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_checkpoint_action_content_root_version_equal_is_ok() -> DeltaResult<()> {
+        let data = checkpoint_commit(&[
+            checkpoint_elements::CHECKPOINT_METADATA,
+            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":42}}"#,
+            checkpoint_elements::PROTOCOL,
+            checkpoint_elements::METADATA,
+        ]);
+        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should be present");
+        assert_eq!(checkpoint.version, 42);
+        assert_eq!(checkpoint.content_root.version, 42);
         Ok(())
     }
 
