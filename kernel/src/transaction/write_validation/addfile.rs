@@ -97,6 +97,7 @@ mod tests {
         nullable_add_files, replace_column, set_field_as_null,
     };
     use crate::EngineData;
+
     fn add_file_validator(physical_partition_columns: &[&str]) -> StagedDataValidator {
         StagedDataValidator::staged_add_file(
             physical_partition_columns.iter().map(|s| s.to_string()),
