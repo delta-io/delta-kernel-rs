@@ -13,9 +13,9 @@ use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-// `Scalar` backs the derived `IntoStructData` conversions used by checkpoint serialization
-// (feature-gated) and is exercised directly by unit tests.
-#[cfg(any(feature = "adaptive-metadata-in-dev", test))]
+// `Scalar` backs the derived `IntoStructData` conversions used by checkpoint serialization.
+// The `tests` module imports it separately for its own use.
+#[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::Scalar;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::expressions::{ArrayData, StructData};
