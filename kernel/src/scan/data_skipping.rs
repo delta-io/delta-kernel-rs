@@ -10,8 +10,8 @@ use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
     col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
-    Scalar,
+    ExpressionRef, JunctionPredicateOp, MapToStructOptions, OpaquePredicateOpRef,
+    Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -276,7 +276,10 @@ impl DataSkippingFilter {
             col!("add.stats"),
             physical_stats_schema.clone(),
         ));
-        let partition_expr = Arc::new(Expr::map_to_struct(col!("add.partitionValues")));
+        let partition_expr = Arc::new(Expr::map_to_struct(
+            col!("add.partitionValues"),
+            MapToStructOptions::default(),
+        ));
         let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
         Self::new(
             engine,
