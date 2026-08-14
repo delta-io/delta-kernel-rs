@@ -29,6 +29,7 @@ use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
 use crate::delta_kernel_derive::internal_api;
 use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow, LIST_ARRAY_ROOT};
+use crate::engine::arrow_data::as_string_accessor;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -396,6 +397,14 @@ pub fn evaluate_expression(
         }
         (MapToStruct(_), dt) => Err(Error::Generic(format!(
             "MapToStruct expression requires a DataType::Struct result type, but got {dt:?}"
+        ))),
+        (ElementAt(e), None | Some(&DataType::STRING)) => {
+            let map_arr = evaluate_expression(&e.map_expr, batch, None)?;
+            let key_arr = evaluate_expression(&e.key_expr, batch, Some(&DataType::STRING))?;
+            evaluate_element_at(&map_arr, &key_arr)
+        }
+        (ElementAt(_), Some(data_type)) => Err(Error::generic(format!(
+            "ElementAt expression requires a STRING result type, but got {data_type:?}"
         ))),
         (Cast(c), result_type) => {
             let input = evaluate_expression(&c.expr, batch, None)?;
@@ -1103,6 +1112,43 @@ fn evaluate_map_to_struct(
     )?)
 }
 
+fn evaluate_element_at(map_arr: &ArrayRef, key_arr: &ArrayRef) -> DeltaResult<ArrayRef> {
+    let map_array = map_arr
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| Error::generic("ElementAt requires a MapArray as input"))?;
+    let map_keys = as_string_accessor(map_array.keys().as_ref())
+        .ok_or_else(|| Error::generic("ElementAt requires maps with string keys"))?;
+    let map_values = as_string_accessor(map_array.values().as_ref())
+        .ok_or_else(|| Error::generic("ElementAt requires maps with string values"))?;
+    let key_array = as_string_accessor(key_arr.as_ref())
+        .ok_or_else(|| Error::generic("ElementAt requires string keys"))?;
+    if map_array.len() != key_array.len() {
+        return Err(Error::generic(format!(
+            "ElementAt map has {} rows, but key has {} rows",
+            map_array.len(),
+            key_array.len()
+        )));
+    }
+
+    let offsets = map_array.value_offsets();
+    let values = (0..map_array.len()).map(|row| {
+        if map_array.is_null(row) || !key_array.is_valid(row) {
+            return None;
+        }
+        let key = key_array.value(row);
+        let entry_start = offsets[row] as usize;
+        let entry_end = offsets[row + 1] as usize;
+        let entry_idx = (entry_start..entry_end)
+            .rev()
+            .find(|entry_idx| map_keys.value(*entry_idx) == key)?;
+        map_values
+            .is_valid(entry_idx)
+            .then(|| map_values.value(entry_idx))
+    });
+    Ok(Arc::new(StringArray::from_iter(values)))
+}
+
 fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
     if let Some(expected) = expected {
         ensure_data_types(expected, array.data_type(), ValidationMode::TypesAndNames)?;
@@ -1118,9 +1164,9 @@ mod tests {
 
     use super::*;
     use crate::arrow::array::{
-        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StructArray,
-        TimestampMicrosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int32Builder, Int64Array,
+        LargeStringArray, ListArray, MapBuilder, StringArray, StringBuilder, StringViewArray,
+        StructArray, TimestampMicrosecondArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
@@ -2687,6 +2733,225 @@ mod tests {
             true,
         )]);
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(map_array)]).unwrap()
+    }
+
+    fn element_at_batch(map: ArrayRef, key: ArrayRef) -> RecordBatch {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("map", map.data_type().clone(), true),
+            ArrowField::new("key", key.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![map, key]).unwrap()
+    }
+
+    #[test]
+    fn test_element_at_returns_matching_value() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("region")])),
+        );
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values, &StringArray::from(vec![Some("us")]));
+    }
+
+    #[rstest]
+    fn test_element_at_accepts_all_arrow_string_representations(
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8, ArrowDataType::Utf8View)]
+        string_type: ArrowDataType,
+    ) {
+        let make_array = |value: &str| -> ArrayRef {
+            match &string_type {
+                ArrowDataType::Utf8 => Arc::new(StringArray::from(vec![Some(value)])),
+                ArrowDataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![Some(value)])),
+                ArrowDataType::Utf8View => Arc::new(StringViewArray::from(vec![Some(value)])),
+                other => panic!("unexpected string type: {other:?}"),
+            }
+        };
+        let fields: Fields = vec![
+            Arc::new(ArrowField::new("key", string_type.clone(), false)),
+            Arc::new(ArrowField::new("value", string_type.clone(), true)),
+        ]
+        .into();
+        let entries = StructArray::try_new(
+            fields.clone(),
+            vec![make_array("region"), make_array("us")],
+            None,
+        )
+        .unwrap();
+        let map = MapArray::try_new(
+            Arc::new(ArrowField::new(
+                "entries",
+                ArrowDataType::Struct(fields),
+                false,
+            )),
+            OffsetBuffer::new(vec![0i32, 1].into()),
+            entries,
+            None,
+            false,
+        )
+        .unwrap();
+        let batch = element_at_batch(Arc::new(map), make_array("region"));
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values, &StringArray::from(vec![Some("us")]));
+    }
+
+    #[test]
+    fn test_element_at_returns_null_for_missing_key_null_map_null_key_and_null_value() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("other");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+        builder.keys().append_value("region");
+        builder.values().append_value("us");
+        builder.append(true).unwrap();
+        builder.keys().append_value("region");
+        builder.values().append_null();
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![
+                Some("region"),
+                Some("region"),
+                None,
+                Some("region"),
+            ])),
+        );
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values.null_count(), 4);
+    }
+
+    #[test]
+    fn test_element_at_uses_rightmost_duplicate_key() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("region");
+        builder.values().append_value("first");
+        builder.keys().append_value("region");
+        builder.values().append_value("last");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("region")])),
+        );
+
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let values = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values.value(0), "last");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_map_input() {
+        let batch = element_at_batch(
+            Arc::new(StringArray::from(vec![Some("not a map")])),
+            Arc::new(StringArray::from(vec![Some("key")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert_result_error_with_message(result, "requires a MapArray");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_map_keys() {
+        let mut builder = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        builder.keys().append_value(1);
+        builder.values().append_value("one");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("1")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert_result_error_with_message(result, "maps with string keys");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_map_values() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        builder.keys().append_value("one");
+        builder.values().append_value(1);
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("one")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert_result_error_with_message(result, "maps with string values");
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_key_expression() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("one");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(Int32Array::from(vec![Some(1)])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::STRING),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_element_at_rejects_non_string_result_type() {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("one");
+        builder.values().append_value("value");
+        builder.append(true).unwrap();
+        let batch = element_at_batch(
+            Arc::new(builder.finish()),
+            Arc::new(StringArray::from(vec![Some("one")])),
+        );
+        let result = evaluate_expression(
+            &Expr::element_at(col!("map"), col!("key")),
+            &batch,
+            Some(&DataType::INTEGER),
+        );
+        assert_result_error_with_message(result, "requires a STRING result type");
     }
 
     #[test]

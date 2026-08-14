@@ -359,6 +359,19 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
+/// Looks up one value in a `Map<String, String>` for each input row.
+///
+/// Missing keys, null maps, and null keys evaluate to NULL. Duplicate keys are resolved by taking
+/// the rightmost entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ElementAtExpression {
+    /// The expression that evaluates to a `Map<String, String>` column.
+    pub map_expr: Box<Expression>,
+
+    /// The expression that evaluates to a STRING key column.
+    pub key_expr: Box<Expression>,
+}
+
 /// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
 /// value that cannot be represented in the target type evaluates to NULL rather than erroring.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -517,6 +530,8 @@ pub enum Expression {
     /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
     /// [`MapToStructExpression`] for how values are parsed.
     MapToStruct(MapToStructExpression),
+    /// Looks up a STRING value in a `Map<String, String>`.
+    ElementAt(ElementAtExpression),
     /// Cast a child expression to a target type. See [`CastExpression`].
     Cast(CastExpression),
 }
@@ -668,6 +683,15 @@ impl MapToStructOptions {
 
     fn is_default(&self) -> bool {
         self.timestamp_timezone.is_none()
+    }
+}
+
+impl ElementAtExpression {
+    pub(crate) fn new(map_expr: impl Into<Expression>, key_expr: impl Into<Expression>) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
+            key_expr: Box::new(key_expr.into()),
+        }
     }
 }
 
@@ -897,6 +921,11 @@ impl Expression {
     /// contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr, options))
+    }
+
+    /// Looks up a STRING value in a `Map<String, String>` for each input row.
+    pub fn element_at(map_expr: impl Into<Expression>, key_expr: impl Into<Expression>) -> Self {
+        Self::ElementAt(ElementAtExpression::new(map_expr, key_expr))
     }
 
     /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
@@ -1197,6 +1226,7 @@ impl Display for Expression {
                 ),
                 None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
             },
+            ElementAt(e) => write!(f, "ELEMENT_AT({}, {})", e.map_expr, e.key_expr),
             Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
         }
     }
@@ -1654,6 +1684,12 @@ mod tests {
             for expr in &cases {
                 assert_roundtrip(expr);
             }
+        }
+
+        #[test]
+        fn test_element_at_expression_roundtrip() {
+            let expr = Expression::element_at(col!("partitionValues"), col!("partitionKey"));
+            assert_roundtrip(&expr);
         }
 
         // ==================== Predicate Tests ====================

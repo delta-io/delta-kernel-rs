@@ -693,6 +693,9 @@ fn visit_expression_impl(
             visit_expression_impl(visitor, map_expr, child_list_id);
             call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
         }
+        // The FFI expression visitor has no ElementAt callback. Surface an explicit unknown node
+        // so engines cannot silently interpret it as another expression.
+        Expression::ElementAt(_) => visit_unknown(visitor, sibling_list_id, "element_at"),
         // TODO(#2975): Add a dedicated visitor callback for cast expressions.
         Expression::Cast(cast) => visit_unknown(
             visitor,
@@ -981,6 +984,27 @@ mod tests {
             vec![LiteralEvent::Unknown {
                 sibling_list_id: 0,
                 name: "map_to_struct_with_timestamp_timezone".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn element_at_visits_unknown() {
+        let expression = Expression::element_at(
+            Expression::column(["partitionValues"]),
+            Expression::literal("key"),
+        );
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: "element_at".to_string(),
             }]
         );
     }

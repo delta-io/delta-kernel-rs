@@ -161,6 +161,11 @@ message MapToStructExpression {
   MapToStructOptions options = 2;
 }
 
+message ElementAtExpression {
+  Expression map_expr = 1;
+  Expression key_expr = 2;
+}
+
 // `nullability_predicate` is optional: when set and it evaluates to false/null, the whole
 // struct is null.
 message StructExpression {
@@ -246,5 +251,6 @@ message Expression {
     ParseJsonExpression parse_json = 11;
     MapToStructExpression map_to_struct = 12;
     string unknown = 13;
+    ElementAtExpression element_at = 14;
   }
 }

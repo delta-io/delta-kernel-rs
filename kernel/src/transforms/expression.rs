@@ -2,10 +2,10 @@ use std::borrow::{Cow, ToOwned};
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, CastExpression, ColumnName, Expression, ExpressionRef,
-    ExpressionStructPatch, JunctionPredicate, MapToStructExpression, OpaqueExpression,
-    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression, UnaryPredicate,
-    VariadicExpression,
+    BinaryExpression, BinaryPredicate, CastExpression, ColumnName, ElementAtExpression, Expression,
+    ExpressionRef, ExpressionStructPatch, JunctionPredicate, MapToStructExpression,
+    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression,
+    UnaryPredicate, VariadicExpression,
 };
 use crate::transforms::{
     map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
@@ -139,6 +139,14 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_map_to_struct(expr)
     }
 
+    /// Called for each element-at expression encountered during the traversal.
+    fn transform_expr_element_at(
+        &mut self,
+        expr: &'a ElementAtExpression,
+    ) -> Self::Output<ElementAtExpression> {
+        self.recurse_into_expr_element_at(expr)
+    }
+
     /// Called for each cast expression encountered during the traversal. The provided
     /// implementation just forwards to [`Self::recurse_into_expr_cast`].
     fn transform_expr_cast(&mut self, expr: &'a CastExpression) -> Self::Output<CastExpression> {
@@ -268,6 +276,10 @@ pub trait ExpressionTransform<'a> {
                 let child = self.transform_expr_map_to_struct(m);
                 map_owned_or_else(expr, child, Expression::MapToStruct)
             }
+            Expression::ElementAt(e) => {
+                let child = self.transform_expr_element_at(e);
+                map_owned_or_else(expr, child, Expression::ElementAt)
+            }
             Expression::Cast(c) => {
                 let child = self.transform_expr_cast(c);
                 map_owned_or_else(expr, child, Expression::Cast)
@@ -349,6 +361,17 @@ pub trait ExpressionTransform<'a> {
             options: expr.options.clone(),
         };
         map_owned_or_else(expr, nested, rebuild)
+    }
+
+    /// Recursively transforms both children of an element-at expression.
+    fn recurse_into_expr_element_at(
+        &mut self,
+        expr: &'a ElementAtExpression,
+    ) -> Self::Output<ElementAtExpression> {
+        let map_expr = self.transform_expr(&expr.map_expr);
+        let key_expr = self.transform_expr(&expr.key_expr);
+        let rebuild = |(map_expr, key_expr)| ElementAtExpression::new(map_expr, key_expr);
+        map_owned_pair_or_else(expr, map_expr, key_expr, rebuild)
     }
 
     /// Recursively transforms the child expression of a cast expression (unary).
@@ -556,6 +579,10 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 
     fn transform_expr_map_to_struct(&mut self, expr: &'a MapToStructExpression) -> DeltaResult<()> {
         self.depth_limited(Self::recurse_into_expr_map_to_struct, expr)
+    }
+
+    fn transform_expr_element_at(&mut self, expr: &'a ElementAtExpression) -> DeltaResult<()> {
+        self.depth_limited(Self::recurse_into_expr_element_at, expr)
     }
 }
 
@@ -1119,6 +1146,44 @@ mod tests {
         assert_eq!(
             ExpressionDepthChecker::check_expr_with_call_count(&expr, 0),
             (1, 2)
+        );
+    }
+
+    #[test]
+    fn test_element_at_references_and_transforms_both_children() {
+        let expr = Expr::element_at(col!("old_col"), col!("partitionKey"));
+        let references = expr.references();
+        assert_eq!(references.len(), 2);
+        assert!(references.contains(&ColumnName::new(["old_col"])));
+        assert!(references.contains(&ColumnName::new(["partitionKey"])));
+
+        let transformed = ColumnReplacer.transform_expr(&expr).into_owned();
+        assert_eq!(
+            transformed,
+            Expr::element_at(col!("new_col"), col!("partitionKey"))
+        );
+
+        struct ColumnRemover;
+        impl<'a> ExpressionTransform<'a> for ColumnRemover {
+            transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
+            fn transform_expr_column(
+                &mut self,
+                name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                (name[0] != "partitionKey").then_some(Cow::Borrowed(name))
+            }
+        }
+        assert!(ColumnRemover.transform_expr(&expr).is_none());
+    }
+
+    #[test]
+    fn test_depth_checker_counts_element_at_expressions() {
+        let expr = Expr::element_at(col!("partitionValues"), col!("partitionKey"));
+
+        assert_eq!(
+            ExpressionDepthChecker::check_expr_with_call_count(&expr, 0),
+            (0, 1)
         );
     }
 

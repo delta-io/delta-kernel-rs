@@ -19,7 +19,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::evaluate_expression as kernel_expression;
 use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
-    BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
+    BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName, ElementAtExpression,
     Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, MapToStructExpression,
     MapToStructOptions, ParseJsonExpression, UnaryExpressionOp, VariadicExpression,
     VariadicExpressionOp,
@@ -69,6 +69,7 @@ pub fn to_df_expr(
         KernelExpression::MapToStruct(map_to_struct) => {
             map_to_struct_to_df_expr(map_to_struct, input_schema, output_type)
         }
+        KernelExpression::ElementAt(element_at) => element_at_to_df_expr(element_at, input_schema),
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
@@ -88,6 +89,72 @@ pub fn to_df_expr(
         KernelExpression::Unknown(name) => Err(Error::unsupported(format!(
             "cannot convert Unknown expression {name:?}"
         ))),
+    }
+}
+
+/// Lowers an `ElementAt` map lookup to a UDF backed by kernel's Arrow evaluator.
+///
+/// # Errors
+/// Returns an error when either child expression cannot be converted.
+fn element_at_to_df_expr(
+    element_at: &ElementAtExpression,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
+    let map = to_df_expr(&element_at.map_expr, input_schema, None)?;
+    let key = to_df_expr(
+        &element_at.key_expr,
+        input_schema,
+        Some(&KernelDataType::STRING),
+    )?;
+    Ok(ScalarUDF::new_from_impl(ElementAtUdf::new()).call(vec![map, key]))
+}
+
+/// A DataFusion scalar UDF that delegates `ElementAt` evaluation to kernel, preserving dynamic-key
+/// and rightmost-duplicate semantics across executors.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ElementAtUdf {
+    signature: Signature,
+}
+
+impl ElementAtUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ElementAtUdf {
+    fn name(&self) -> &str {
+        "kernel_element_at"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(ArrowDataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let num_rows = args.number_rows;
+        let [map, key] = take_function_args(self.name(), args.args)?;
+        let batch = RecordBatch::try_from_iter([
+            ("map", map.into_array(num_rows)?),
+            ("key", key.into_array(num_rows)?),
+        ])?;
+        let expression = KernelExpression::element_at(
+            KernelExpression::column(["map"]),
+            KernelExpression::column(["key"]),
+        );
+        let result = kernel_expression::evaluate_expression(
+            &expression,
+            &batch,
+            Some(&KernelDataType::STRING),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ColumnarValue::Array(result))
     }
 }
 
@@ -1051,6 +1118,69 @@ mod tests {
         to_df_expr(&kernel, &pv_map_schema(), Some(&target))
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn element_at_lowers_to_kernel_udf() {
+        let kernel = KernelExpr::element_at(col!("pv"), lit("region"));
+        let rendered = to_df_expr(&kernel, &pv_map_schema(), Some(&DataType::STRING))
+            .unwrap()
+            .to_string();
+        assert_eq!(rendered, "kernel_element_at(pv, Utf8(\"region\"))");
+    }
+
+    #[test]
+    fn element_at_executes_dynamic_keys_and_rightmost_duplicates() {
+        let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        maps.keys().append_value("region");
+        maps.values().append_value("first");
+        maps.keys().append_value("region");
+        maps.values().append_value("last");
+        maps.append(true).unwrap();
+        maps.keys().append_value("a");
+        maps.values().append_value("A");
+        maps.keys().append_value("b");
+        maps.values().append_value("B");
+        maps.append(true).unwrap();
+        maps.append(false).unwrap();
+        maps.keys().append_value("a");
+        maps.values().append_value("A");
+        maps.append(true).unwrap();
+
+        let map = Arc::new(maps.finish()) as ArrayRef;
+        let key = Arc::new(StringArray::from(vec![
+            Some("region"),
+            Some("b"),
+            Some("a"),
+            None,
+        ])) as ArrayRef;
+        let logical = to_df_expr(
+            &KernelExpr::element_at(col!("pv"), col!("key")),
+            &StructType::try_new([
+                StructField::nullable("pv", MapType::new(DataType::STRING, DataType::STRING, true)),
+                StructField::nullable("key", DataType::STRING),
+            ])
+            .unwrap(),
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let input_schema = ArrowSchema::new(vec![
+            ArrowField::new("pv", map.data_type().clone(), true),
+            ArrowField::new("key", ArrowDataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(input_schema.clone()), vec![map, key]).unwrap();
+        let df_schema = DFSchema::try_from(input_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let result = result.as_string::<i32>();
+        assert_eq!(
+            result,
+            &StringArray::from(vec![Some("last"), Some("B"), None, None])
+        );
     }
 
     /// Each target field extracts its value with `cast(get_field(pv, name), T)`, and the whole

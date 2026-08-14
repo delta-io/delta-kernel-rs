@@ -2154,6 +2154,7 @@ mod tests {
             }
             Expression::ParseJson(p) => count_to_json(&p.json_expr),
             Expression::MapToStruct(m) => count_to_json(&m.map_expr),
+            Expression::ElementAt(e) => count_to_json(&e.map_expr) + count_to_json(&e.key_expr),
             Expression::Cast(c) => count_to_json(&c.expr),
             Expression::Predicate(_)
             | Expression::Literal(_)

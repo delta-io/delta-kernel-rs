@@ -12,11 +12,11 @@ use super::{
 };
 use crate::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, DecimalData, Expression, ExpressionFieldPatch, ExpressionStructPatch,
-    JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression, MapToStructOptions,
-    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
-    VariadicExpressionOp,
+    ColumnName, DecimalData, ElementAtExpression, Expression, ExpressionFieldPatch,
+    ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, MapData, MapToStructExpression,
+    MapToStructOptions, OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar,
+    StructData, UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
+    VariadicExpression, VariadicExpressionOp,
 };
 use crate::plans::ir::nodes::{
     Agg, Aggregate, DynamicScan, FileType, Filter, Operator, Project, ScanFile, ScanJson,
@@ -325,6 +325,7 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::MapToStruct(map_to_struct) => {
                 Kind::MapToStruct(Box::new(map_to_struct.into()))
             }
+            Expression::ElementAt(element_at) => Kind::ElementAt(Box::new(element_at.into())),
             // No proto cast node yet; serialize as an opaque unknown.
             Expression::Cast(cast) => Kind::Unknown(format!("cast_to_{}", cast.target)),
         };
@@ -416,6 +417,15 @@ impl From<&MapToStructOptions> for proto_expr::MapToStructOptions {
     fn from(options: &MapToStructOptions) -> Self {
         Self {
             timestamp_timezone: options.timestamp_timezone().map(ToOwned::to_owned),
+        }
+    }
+}
+
+impl From<&ElementAtExpression> for proto_expr::ElementAtExpression {
+    fn from(element_at: &ElementAtExpression) -> Self {
+        Self {
+            map_expr: Some(Box::new(element_at.map_expr.as_ref().into())),
+            key_expr: Some(Box::new(element_at.key_expr.as_ref().into())),
         }
     }
 }
@@ -1583,6 +1593,7 @@ mod tests {
         Expression::map_to_struct(col!("m"), MapToStructOptions::default()),
         "map_to_struct"
     )]
+    #[case(Expression::element_at(col!("m"), lit("key")), "element_at")]
     #[case(Expression::unknown("x"), "unknown")]
     fn from_expression(#[case] expr: Expression, #[case] expected: &str) {
         use proto_expr::expression::Kind;
@@ -1600,6 +1611,7 @@ mod tests {
             Kind::ParseJson(_) => "parse_json",
             Kind::MapToStruct(_) => "map_to_struct",
             Kind::Unknown(_) => "unknown",
+            Kind::ElementAt(_) => "element_at",
         };
         assert_eq!(kind, expected);
     }
@@ -1686,6 +1698,17 @@ mod tests {
             proto_expr::VariadicExpressionOp::Coalesce as i32
         );
         assert_eq!(variadic.exprs.len(), 3);
+    }
+
+    #[test]
+    fn from_element_at_expression() {
+        let proto_expr::expression::Kind::ElementAt(element_at) =
+            expr_kind_of(Expression::element_at(col!("map"), col!("key")))
+        else {
+            panic!("expected an element-at expression");
+        };
+        assert!(element_at.map_expr.is_some());
+        assert!(element_at.key_expr.is_some());
     }
 
     #[test]

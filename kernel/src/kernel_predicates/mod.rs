@@ -202,6 +202,7 @@ pub trait KernelPredicateEvaluator {
             | Expr::Variadic(_)
             | Expr::ParseJson(_)
             | Expr::MapToStruct(_)
+            | Expr::ElementAt(_)
             | Expr::Cast(_)
             | Expr::Unknown(_) => None,
         }
@@ -233,6 +234,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Opaque(_)
                 | Expr::ParseJson { .. }
                 | Expr::MapToStruct(_)
+                | Expr::ElementAt(_)
                 | Expr::Cast(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
@@ -682,8 +684,9 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 })
                 .ok(),
             Expr::Cast(c) => cast_scalar(self.eval_expr(&c.expr)?, &c.target),
-            // ParseJson and MapToStruct produce structured output, not scalar values
-            Expr::ParseJson(_) | Expr::MapToStruct(_) => None,
+            // ParseJson and MapToStruct produce structured output, and ElementAt is unsupported by
+            // this scalar evaluator.
+            Expr::ParseJson(_) | Expr::MapToStruct(_) | Expr::ElementAt(_) => None,
             Expr::Unknown(_) => None,
         }
     }
