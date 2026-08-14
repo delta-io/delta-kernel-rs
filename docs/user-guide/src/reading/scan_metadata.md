@@ -249,9 +249,9 @@ If the scan has no predicate, this returns `None`.
 ## Typed partition values
 
 Kernel reads each file's partition values from the Delta log and exposes them on its
-`ScanFile` as a raw string map. Kernel's `transform_to_logical` could materialize them as
-typed columns. If your connector assembles output rows itself instead of using that transform,
-it parses the string map per file.
+`ScanFile` as a raw string map. `transform_to_logical` materializes them as typed columns. A
+connector that assembles output rows itself instead of using that transform would otherwise need
+to parse the string map per file.
 
 To have Kernel hand you the typed values directly, opt in with `with_partition_values`:
 
@@ -270,7 +270,10 @@ To have Kernel hand you the typed values directly, opt in with `with_partition_v
 # let snapshot = Snapshot::builder_for(url).build(&engine)?;
 let scan = snapshot
     .scan_builder()
-    .with_partition_values(PartitionValuesOptions::with_struct())
+    .with_partition_values(
+        PartitionValuesOptions::with_struct()
+            .with_timestamp_timezone("America/Los_Angeles"),
+    )
     .build()?;
 # Ok(())
 # }
@@ -281,9 +284,18 @@ nullable field per partition column (by physical name). You read it as a typed c
 of parsing the string map per file. The raw string map is still present, so this option only
 adds the typed column.
 
+By default, offset-less `TIMESTAMP` partition strings are interpreted in UTC. Use
+`with_timestamp_timezone` with an IANA timezone or fixed offset when the reader uses another
+timezone. An explicit offset in a partition value takes precedence. This setting affects typed
+`scan_metadata` output, internal partition pruning, and the partition-column row transforms used
+by `Scan::execute`. Incremental scans expose the raw partition-value map. For daylight-saving
+transitions, ambiguous local times use the earlier instant, and nonexistent local times use the
+offset from before the transition.
+
 > [!TIP]
 > When the checkpoint already stores typed partition values, Kernel reads that column directly
-> and skips parsing entirely.
+> unless a reader timezone requires zoned `TIMESTAMP` values to be reinterpreted. In that case,
+> Kernel reparses the raw partition map.
 
 ## Cancelling a scan
 

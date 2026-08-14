@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::expressions::{
-    col, column_name, column_pred, lit, ArrayData, Expression as Expr, OpaqueExpressionOp,
-    OpaquePredicateOp, Predicate as Pred, ScalarExpressionEvaluator, StructData,
+    col, column_name, column_pred, lit, ArrayData, CastOptions, Expression as Expr,
+    OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, ScalarExpressionEvaluator,
+    StructData,
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
@@ -630,11 +631,37 @@ fn test_default_evaluator_resolves_column_then_casts_and_compares() {
             BinaryPredicateOp::LessThan,
             &col,
             &DataType::INTEGER,
+            &CastOptions::default(),
             &Scalar::Integer(20),
             false,
         ),
         Some(true)
     );
+}
+
+#[test]
+fn default_evaluator_does_not_fold_cast_options_it_cannot_honor() {
+    let col = column_name!("x");
+    let options = CastOptions::default().with_timestamp_timezone("America/Los_Angeles");
+    let evaluator = DefaultKernelPredicateEvaluator::from(HashMap::from([(
+        col.clone(),
+        Scalar::String("2024-01-15 12:30:45".to_string()),
+    )]));
+    assert_eq!(
+        evaluator.eval_pred_cast(
+            BinaryPredicateOp::LessThan,
+            &col,
+            &DataType::TIMESTAMP,
+            &options,
+            &Scalar::Timestamp(1_705_350_645_000_000),
+            false,
+        ),
+        None
+    );
+
+    let expression = Expr::cast(lit("2024-01-15 12:30:45"), DataType::TIMESTAMP, options);
+
+    assert_eq!(evaluator.eval_expr(&expression), None);
 }
 
 // NOTE: We're testing routing here -- the actual comparisons are already validated by
@@ -701,7 +728,7 @@ fn test_eval_binary_commutes_literal_and_cast_column(
     #[values(false, true)] inverted: bool,
 ) {
     let val = lit(10);
-    let cast_col = Expr::cast(col!("x"), DataType::INTEGER);
+    let cast_col = Expr::cast(col!("x"), DataType::INTEGER, CastOptions::default());
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::String("1".to_string()));
 
     assert_eq!(

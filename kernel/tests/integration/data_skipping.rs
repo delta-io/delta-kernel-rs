@@ -20,7 +20,7 @@ use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{
-    col, lit, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
+    col, lit, CastOptions, Expression as Expr, Predicate as Pred, PredicateRef, Scalar,
 };
 use delta_kernel::metrics::{MetricEvent, ScanType};
 use delta_kernel::object_store::local::LocalFileSystem;
@@ -1006,6 +1006,51 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
     let predicate = Arc::new(Pred::eq(
         col!("ts"),
         lit(Scalar::Timestamp(fourteen_thirty_utc_us)),
+    ));
+    assert_eq!(
+        surviving_files(&table_path, engine, predicate, use_parallel)?,
+        1
+    );
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_pruning_preserves_partition_cast_timezone(
+    #[values(false, true)] use_parallel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("ts", DataType::STRING),
+        StructField::nullable("v", DataType::LONG),
+    ])?);
+    create_table(&table_path, schema, "Test/1.0")
+        .with_data_layout(DataLayout::partitioned(["ts"]))
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?
+        .unwrap_committed();
+
+    let store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_url = Url::from_directory_path(&table_path)
+        .map_err(|_| "table_path should be a valid file URL")?;
+    add_commit(
+        table_url.as_str(),
+        store.as_ref(),
+        1,
+        commit_with_ts_partitioned_adds(1, &[("file.parquet", "2024-01-15 12:30:45")]),
+    )
+    .await?;
+    Snapshot::builder_for(table_url)
+        .build(engine.as_ref())?
+        .checkpoint(engine.as_ref(), None)?;
+
+    let predicate = Arc::new(Pred::gt(
+        Expr::cast(
+            col!("ts"),
+            DataType::TIMESTAMP,
+            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        ),
+        Scalar::Timestamp(1_705_334_400_000_000),
     ));
     assert_eq!(
         surviving_files(&table_path, engine, predicate, use_parallel)?,

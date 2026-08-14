@@ -1,10 +1,13 @@
+use std::path::Path;
 use std::sync::Arc;
 
+use ::test_utils::add_commit;
 use ::test_utils::table_builder::{
     checkpoint_json_stats, checkpoint_struct_stats, no_checkpoint_stats, DataLayoutConfig,
     FeatureSet, LogState, TableConfig, TestTableBuilder,
 };
 use rstest::rstest;
+use url::Url;
 
 use super::*;
 use crate::arrow::array::{Array, ArrayRef, BooleanArray, StringArray, StructArray};
@@ -15,7 +18,9 @@ use crate::arrow::util::pretty::pretty_format_batches;
 use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{col, column_name, lit, Predicate as Pred};
+use crate::expressions::{col, column_name, lit, Predicate as Pred, Scalar};
+use crate::object_store::local::LocalFileSystem;
+use crate::object_store::DynObjectStore;
 use crate::plans::ir::nodes::Operator;
 use crate::plans::Operation as PlanOperation;
 use crate::scan::{PartitionValuesOptions, Scan, StatsOptions, StructStats};
@@ -251,6 +256,152 @@ fn declarative_metadata_matches_imperative_scan(
     } else {
         assert_metadata_eq(&actual, &expected, &format!("table {table}"))
     }
+}
+
+#[rstest]
+#[case::json_commit(LogState::with_latest_version(1), FeatureSet::new())]
+#[case::v1_checkpoint(
+    LogState::with_latest_version(1).with_checkpoint_at([1]),
+    FeatureSet::new()
+)]
+#[case::v2_sidecar(
+    LogState::with_latest_version(1)
+        .with_checkpoint_at([1])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+#[case::column_mapping(
+    LogState::with_latest_version(1).with_checkpoint_at([1]),
+    FeatureSet::new().column_mapping("id")
+)]
+fn declarative_metadata_matches_imperative_with_reader_timezone(
+    #[case] log_state: LogState,
+    #[case] features: FeatureSet,
+) -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(log_state)
+        .with_features(features)
+        .with_table_config(TableConfig::new().write_stats_as_struct(true))
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .expect("build reader-timezone parity table");
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let partition_values =
+        || PartitionValuesOptions::with_struct().with_timestamp_timezone("America/Los_Angeles");
+    let predicate: PredicateRef = Pred::gt(col!("part_ts"), Scalar::Timestamp(0)).into();
+
+    let expected = imperative_metadata(
+        snapshot
+            .clone()
+            .scan_builder()
+            .with_partition_values(partition_values())
+            .with_predicate(predicate.clone())
+            .build()?,
+        &engine,
+    )?;
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(partition_values())
+        .with_predicate(predicate)
+        .build()?;
+    let actual = declarative_metadata(&scan, &engine)?;
+
+    assert_metadata_eq(&actual, &expected, "reader-timezone metadata parity")
+}
+
+fn write_timezone_partition_table(table_path: &Path) -> Url {
+    std::fs::create_dir_all(table_path).unwrap();
+    let url = Url::from_directory_path(table_path).unwrap();
+    let table_root = url.to_string();
+    let store: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+    let schema_string = serde_json::json!({
+        "type": "struct",
+        "fields": [
+            {"name": "p_ts", "type": "timestamp", "nullable": true, "metadata": {}},
+            {"name": "value", "type": "integer", "nullable": true, "metadata": {}},
+        ],
+    })
+    .to_string();
+    let protocol = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    let metadata = serde_json::json!({
+        "metaData": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema_string,
+            "partitionColumns": ["p_ts"],
+            "configuration": {"delta.checkpoint.writeStatsAsStruct": "true"},
+            "createdTime": 1700000000000_i64,
+        },
+    })
+    .to_string();
+    futures::executor::block_on(add_commit(
+        &table_root,
+        store.as_ref(),
+        0,
+        format!("{protocol}\n{metadata}"),
+    ))
+    .unwrap();
+    let add = serde_json::json!({
+        "add": {
+            "path": "part.parquet",
+            "partitionValues": {"p_ts": "2024-01-15 12:30:45"},
+            "size": 100,
+            "modificationTime": 1700000000000_i64,
+            "dataChange": true,
+            "stats": "{\"numRecords\":1}",
+        },
+    });
+    futures::executor::block_on(add_commit(&table_root, store.as_ref(), 1, add.to_string()))
+        .unwrap();
+    url
+}
+
+#[rstest]
+fn reader_timezone_controls_partition_pruning_across_metadata_paths(
+    #[values(false, true)] native_checkpoint: bool,
+) -> DeltaResult<()> {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let url = write_timezone_partition_table(temp_dir.path());
+    let engine = SyncEngine::new();
+    if native_checkpoint {
+        Snapshot::builder_for(url.clone())
+            .build(&engine)?
+            .checkpoint(&engine, None)?;
+    }
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let partition_values =
+        || PartitionValuesOptions::with_struct().with_timestamp_timezone("America/Los_Angeles");
+    let predicate: PredicateRef =
+        Pred::gt(col!("p_ts"), Scalar::Timestamp(1_705_334_400_000_000)).into();
+
+    let expected = imperative_metadata(
+        snapshot
+            .clone()
+            .scan_builder()
+            .with_partition_values(partition_values())
+            .with_predicate(predicate.clone())
+            .build()?,
+        &engine,
+    )?;
+    assert_eq!(
+        metadata_row_count(&expected),
+        1,
+        "imperative pruning must use the configured reader timezone"
+    );
+    let scan = snapshot
+        .scan_builder()
+        .with_partition_values(partition_values())
+        .with_predicate(predicate)
+        .build()?;
+    let actual = declarative_metadata(&scan, &engine)?;
+    assert_eq!(
+        metadata_row_count(&actual),
+        1,
+        "declarative pruning must use the configured reader timezone"
+    );
+
+    assert_metadata_eq(&actual, &expected, "reader-timezone metadata parity")
 }
 
 #[rstest]
