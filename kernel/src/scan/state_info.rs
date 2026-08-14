@@ -474,14 +474,13 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
-    use url::Url;
 
     use super::*;
-    use crate::actions::{Metadata, Protocol, MAX_VALUES, MIN_VALUES};
+    use crate::actions::{MAX_VALUES, MIN_VALUES};
     use crate::expressions::{col, column_name, lit, Predicate as Pred};
-    use crate::schema::{schema_ref, ColumnMetadataKey, MetadataValue};
-    use crate::table_features::{FeatureType, TableFeature};
-    use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::schema::{schema, schema_ref, ColumnMetadataKey, MetadataValue};
+    use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{assert_result_error_with_message, TableConfigBuilder};
 
     // get a state info with no predicate or extra metadata
     pub(crate) fn get_simple_state_info(
@@ -544,36 +543,17 @@ pub(crate) mod tests {
         stats: StatsOptions,
         partition_values: PartitionValuesOptions,
     ) -> DeltaResult<StateInfo> {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema.clone(),
-            partition_columns,
-            10,
-            metadata_configuration,
-        )?;
-        let protocol = if features.is_empty() {
-            Protocol::try_new_legacy(2, 5)?
-        } else {
-            // This helper only handles known features. Unknown features would need
-            // explicit placement on reader vs writer lists.
-            assert!(
-                features
-                    .iter()
-                    .all(|f| f.feature_type() != FeatureType::Unknown),
-                "Test helper does not support unknown features"
-            );
-            let reader_features = features
-                .iter()
-                .filter(|f| f.feature_type() == FeatureType::ReaderWriter);
-            Protocol::try_new_modern(reader_features, features)?
+        let builder = TableConfigBuilder::new()
+            .with_schema(schema.clone())
+            .with_partition_columns(partition_columns)
+            .with_props(metadata_configuration)
+            .with_table_root("s3://my-table")
+            .with_version(1);
+        let builder = match features.is_empty() {
+            true => builder.with_protocol_versions(2, 5),
+            false => builder.with_features(features),
         };
-        let table_configuration = TableConfiguration::try_new(
-            metadata,
-            protocol,
-            Url::parse("s3://my-table").unwrap(),
-            1,
-        )?;
+        let table_configuration = builder.try_build()?;
 
         let mut schema = schema;
         for (name, spec) in metadata_cols.into_iter() {
@@ -956,26 +936,16 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_column_matches_partition_column() {
-        let table_schema = schema_ref! {
-            nullable "id": STRING,
-            nullable "part_col": STRING,
-        };
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            table_schema,
-            vec!["part_col".to_string()],
-            10,
-            HashMap::new(),
-        )
-        .unwrap();
-        let table_configuration = TableConfiguration::try_new(
-            metadata,
-            Protocol::try_new_legacy(2, 5).unwrap(),
-            Url::parse("s3://my-table").unwrap(),
-            1,
-        )
-        .unwrap();
+        let table_configuration = TableConfigBuilder::new()
+            .with_schema(schema! {
+                nullable "id": STRING,
+                nullable "part_col": STRING,
+            })
+            .with_partition_columns(["part_col"])
+            .with_protocol_versions(2, 5)
+            .with_table_root("s3://my-table")
+            .with_version(1)
+            .build();
 
         let read_schema = schema_ref! { nullable "id": STRING };
         let read_schema = Arc::new(
