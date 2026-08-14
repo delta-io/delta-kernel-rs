@@ -16,7 +16,7 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_changes::test_utils::{
     row_tracking_metadata, row_tracking_table_config, test_deletion_vector,
@@ -29,10 +29,10 @@ use crate::unit_test_utils::{assert_result_error_with_message, Action, LocalMock
 use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
 fn get_schema() -> SchemaRef {
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]))
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    }
 }
 
 fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
@@ -296,10 +296,10 @@ async fn column_mapping_should_succeed() {
         ]))
     }
 
-    let cm_schema = Arc::new(StructType::new_unchecked([
-        cm_field("id", DataType::INTEGER, 1),
-        cm_field("value", DataType::STRING, 2),
-    ]));
+    let cm_schema = schema_ref! {
+        (cm_field("id", DataType::INTEGER, 1)),
+        (cm_field("value", DataType::STRING, 2)),
+    };
 
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
@@ -593,51 +593,51 @@ async fn incompatible_schemas_fail() {
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long`, `value: string` and `year: int` (nullable).
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-        StructField::nullable("year", DataType::INTEGER),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+        nullable "year": INTEGER,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long` and `value: string`.
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // NOTE: Once type widening is supported, this should not return an error.
     //
     // The CDF schema has fields: `id: long` and `value: string`.
     // This commit has schema with fields: `id: int` and `value: string`.
-    let cdf_schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let commit_schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let cdf_schema = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+    };
+    let commit_schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(cdf_schema, commit_schema).await;
 
     // Note: Once schema evolution is supported, this should not return an error.
     //
     // The CDF schema has fields: nullable `id`  and nullable `value`.
     // This commit has schema with fields: non-nullable `id` and nullable `value`.
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::not_null("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        not_null "id": LONG,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields:`id: string` and `value: string`.
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::STRING),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": STRING,
+        nullable "value": STRING,
+    };
     assert_incompatible_schema(schema, get_schema()).await;
 
     // Note: Once schema evolution is supported, this should not return an error.
@@ -703,15 +703,15 @@ async fn demonstration_schema_evolution_failures() {
     // Scenario 1: Adding a nullable column (safe evolution)
     // Initial: {id: int, value: string}
     // Evolved: {id: int, value: string, new_col: int?}
-    let initial = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let evolved = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-        StructField::nullable("new_col", DataType::INTEGER),
-    ]));
+    let initial = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
+    let evolved = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+        nullable "new_col": INTEGER,
+    };
     let res = test_schema_evolution(initial, evolved).await;
     assert!(
         matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
@@ -721,14 +721,14 @@ async fn demonstration_schema_evolution_failures() {
     // Scenario 2: Type widening (int -> long) - supported by type widening feature
     // Initial: {id: int, value: string}
     // Evolved: {id: long, value: string}
-    let initial = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let evolved = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::LONG),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let initial = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
+    let evolved = schema_ref! {
+        nullable "id": LONG,
+        nullable "value": STRING,
+    };
     let res = test_schema_evolution(initial, evolved).await;
     assert!(
         matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
@@ -738,14 +738,14 @@ async fn demonstration_schema_evolution_failures() {
     // Scenario 3: Changing nullability from non-null to nullable (safe evolution)
     // Initial: {id: int!, value: string}
     // Evolved: {id: int?, value: string}
-    let initial = Arc::new(StructType::new_unchecked([
-        StructField::not_null("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
-    let evolved = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("value", DataType::STRING),
-    ]));
+    let initial = schema_ref! {
+        not_null "id": INTEGER,
+        nullable "value": STRING,
+    };
+    let evolved = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "value": STRING,
+    };
     let res = test_schema_evolution(initial, evolved).await;
     assert!(
         matches!(res, Err(Error::ChangeDataFeedIncompatibleSchema(_, _))),
@@ -1051,10 +1051,10 @@ async fn data_skipping_filter_prunes_partition_values_but_keeps_removes() {
         .await;
 
     // Partitioned schema: `part` is the partition column, `id` a data column.
-    let logical_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("part", DataType::STRING),
-    ]));
+    let logical_schema: SchemaRef = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "part": STRING,
+    };
     let metadata = Metadata::try_new(
         None,
         None,

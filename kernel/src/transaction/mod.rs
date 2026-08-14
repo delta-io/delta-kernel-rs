@@ -40,8 +40,8 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::void_utils::{add_void_stripping, validate_schema_for_write};
 use crate::schema::{
-    lazy_schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder, StructField,
-    StructType,
+    lazy_schema_ref, schema_ref, ArrayType, ColumnDefault, SchemaRef, SchemaStructPatchBuilder,
+    StructField, StructType,
 };
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::struct_patch::ProjectionStructPatchBuilder;
@@ -1398,8 +1398,7 @@ impl<S> Transaction<S> {
                 let commit_versions_array =
                     ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
-                let row_tracking_schema =
-                    with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![])))?;
+                let row_tracking_schema = with_row_tracking_cols(&schema_ref! {})?;
                 add_files_batch.append_columns(
                     row_tracking_schema,
                     vec![base_row_ids_array, commit_versions_array],
@@ -3258,16 +3257,13 @@ mod tests {
             StructField::nullable(MIN_VALUES, value_struct_type.clone()),
             StructField::nullable(MAX_VALUES, value_struct_type),
         ];
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null(
-                "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable("stats", stats_type.clone()),
-        ]));
+        let schema = schema_ref! {
+            not_null "path": STRING,
+            not_null "partitionValues": { STRING => nullable STRING },
+            not_null "size": LONG,
+            not_null "modificationTime": LONG,
+            nullable "stats": (stats_type.clone()),
+        };
 
         let empty_map = Scalar::Map(
             MapData::try_new(
@@ -3455,9 +3451,7 @@ mod tests {
         let engine = crate::engine::sync::SyncEngine::new_with_store(storage);
 
         // Create a non-catalog-managed table using a catalog committer
-        let schema = Arc::new(crate::schema::StructType::new_unchecked(vec![
-            crate::schema::StructField::new("id", crate::schema::DataType::INTEGER, true),
-        ]));
+        let schema = schema_ref! { nullable "id": INTEGER };
         let committer = Box::new(MockCatalogCommitter);
         let err = create_table("memory:///", schema, "test-engine")
             .build(&engine, committer)

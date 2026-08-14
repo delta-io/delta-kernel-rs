@@ -233,16 +233,15 @@ mod tests {
 
     use super::*;
     use crate::expressions::{col, BinaryExpressionOp};
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, PrimitiveType, StructField, StructType};
     use crate::unit_test_utils::assert_result_error_with_message;
 
     // Tests for parse_partition_value function
     #[test]
     fn test_parse_partition_value_invalid_index() {
-        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "col1",
-            DataType::STRING,
-        )]));
+        let schema = schema_ref! {
+            nullable "col1": STRING,
+        };
         let partition_values = HashMap::new();
 
         let result = parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None);
@@ -252,11 +251,11 @@ mod tests {
     // Tests for parse_partition_values function
     #[test]
     fn test_parse_partition_values_mixed_transforms() {
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("age", DataType::LONG),
-            StructField::nullable("_change_type", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "age": LONG,
+            nullable "_change_type": STRING,
+        };
         let transform_spec = vec![
             FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 1,
@@ -302,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_parse_partition_values_empty_spec() {
-        let schema = Arc::new(StructType::new_unchecked(vec![]));
+        let schema = schema_ref! {};
         let transform_spec = vec![];
         let partition_values = HashMap::new();
 

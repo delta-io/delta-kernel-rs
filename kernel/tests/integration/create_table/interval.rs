@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::expressions::column_name;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
@@ -55,22 +55,20 @@ mod supported {
 
     /// Top-level schema carrying the given interval `DataType`.
     fn top_level_interval_schema(interval: DataType) -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("iv", interval, true),
-        ]))
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "iv": (interval),
+        }
     }
 
     /// Schema with the given interval `DataType` nested inside a struct.
     fn nested_interval_schema(interval: DataType) -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                StructType::new_unchecked([StructField::new("inner_iv", interval, true)]),
-                true,
-            ),
-        ]))
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "nested": {
+                nullable "inner_iv": (interval),
+            },
+        }
     }
 
     /// Creating a table with interval columns preserves its schema across column mapping modes.

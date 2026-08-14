@@ -39,8 +39,8 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
-    StructType, ToSchema as _,
+    lazy_schema_ref, schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
+    StructField, StructType, ToSchema as _,
 };
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
@@ -82,10 +82,9 @@ pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = La
         .cloned()
         .collect();
     let add_no_stats = StructType::new_unchecked(fields_no_stats);
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME,
-        add_no_stats,
-    )]))
+    schema_ref! {
+        nullable ADD_NAME: (add_no_stats),
+    }
 });
 
 #[allow(unused)]
@@ -606,28 +605,20 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     }
 }
 
-static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    StructType::new_unchecked(vec![StructField::nullable(
-        "add",
-        StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("partitionValues", partition_values),
-            StructField::not_null("size", DataType::LONG),
-            StructField::nullable("modificationTime", DataType::LONG),
-            StructField::nullable("stats", DataType::STRING),
-            StructField::nullable(
-                "tags",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-            StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-            StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-            StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
-        ]),
-    )])
-    .into()
-});
+static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable "add": {
+        not_null "path": STRING,
+        not_null "partitionValues": { STRING => nullable STRING },
+        not_null "size": LONG,
+        nullable "modificationTime": LONG,
+        nullable "stats": STRING,
+        nullable "tags": { STRING => nullable STRING },
+        nullable "deletionVector": (DeletionVectorDescriptor::to_schema()),
+        nullable BASE_ROW_ID_NAME: LONG,
+        nullable DEFAULT_ROW_COMMIT_VERSION_NAME: LONG,
+        nullable CLUSTERING_PROVIDER_NAME: STRING,
+    },
+};
 
 pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA

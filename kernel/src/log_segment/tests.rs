@@ -3205,10 +3205,9 @@ async fn test_get_file_actions_schema_v2_identity_filter(
     let cp_size = get_file_size(&store, &format!("_delta_log/{selected}")).await;
 
     // A distinct hint schema so we can tell whether the hint or the footer was used.
-    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "metadata",
-        StructType::new_unchecked([]),
-    )]));
+    let hint_schema: SchemaRef = schema_ref! {
+        nullable "metadata": {},
+    };
     let hint_name = if identity_matches { selected } else { other };
 
     let commit_v2_path = log_root.join("00000000000000000002.json")?.to_string();
@@ -4118,19 +4117,15 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
     // Use a read schema that includes the add field
-    let read_schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::nullable(
-        "add",
-        StructType::new_unchecked([
-            StructField::nullable("path", DataType::STRING),
-            StructField::nullable(
-                "partitionValues",
-                crate::schema::MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::nullable("size", DataType::LONG),
-            StructField::nullable("modificationTime", DataType::LONG),
-            StructField::nullable("dataChange", DataType::BOOLEAN),
-        ]),
-    )]));
+    let read_schema: SchemaRef = schema_ref! {
+        nullable "add": {
+            nullable "path": STRING,
+            nullable "partitionValues": { STRING => nullable STRING },
+            nullable "size": LONG,
+            nullable "modificationTime": LONG,
+            nullable "dataChange": BOOLEAN,
+        },
+    };
 
     let log_segment = LogSegment::try_new(
         LogSegmentFiles {

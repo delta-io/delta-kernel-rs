@@ -118,7 +118,7 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::{Schema, SchemaRef, StructField, StructType, ToSchema};
+    use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
     use crate::transaction::Transaction;
     use crate::unit_test_utils::load_test_table;
     use crate::utils::FoldWithOption as _;
@@ -443,7 +443,7 @@ mod tests {
     fn test_build_commit_info_empty_engine_schema() -> DeltaResult<()> {
         // A 0-row, 0-column RecordBatch with an empty kernel schema.
         let empty_batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
-        let empty_schema = Arc::new(StructType::new_unchecked(Vec::<StructField>::new()));
+        let empty_schema = schema_ref! {};
         let (engine, txn) = make_txn(Some((
             Box::new(ArrowEngineData::new(empty_batch)),
             empty_schema,

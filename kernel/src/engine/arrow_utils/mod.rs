@@ -1755,10 +1755,10 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(large_strings) as ArrowArrayRef]).unwrap();
         let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
 
-        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ]));
+        let output_schema: crate::schema::SchemaRef = schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        };
         let result = parse_json(engine_data, output_schema).unwrap();
         let result = ArrowEngineData::try_from_engine_data(result).unwrap();
         let batch: RecordBatch = result.into();
@@ -1780,10 +1780,10 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(view_strings) as ArrowArrayRef]).unwrap();
         let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
 
-        let output_schema: crate::schema::SchemaRef = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("a", DataType::INTEGER),
-            StructField::nullable("b", DataType::STRING),
-        ]));
+        let output_schema: crate::schema::SchemaRef = schema_ref! {
+            nullable "a": INTEGER,
+            nullable "b": STRING,
+        };
         let result = parse_json(engine_data, output_schema).unwrap();
         let result = ArrowEngineData::try_from_engine_data(result).unwrap();
         let batch: RecordBatch = result.into();
@@ -2150,10 +2150,11 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Struct of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "struct_v",
-            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]),
-        )]));
+        let requested_schema = schema_ref! {
+            nullable "struct_v": {
+                nullable "v": unshredded_variant(),
+            },
+        };
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "struct_v",
             ArrowDataType::Struct(vec![unshredded_variant_parquet_schema()].into()),
@@ -2171,10 +2172,9 @@ mod tests {
         assert!(matches!(result_shredded,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
         // Array of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "array_v",
-            ArrayType::new(DataType::unshredded_variant(), true),
-        )]));
+        let requested_schema = schema_ref! {
+            nullable "array_v": [ nullable unshredded_variant() ],
+        };
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "array_v",
             ArrowDataType::List(Arc::new(unshredded_variant_parquet_schema())),
@@ -2193,10 +2193,9 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Map of Variant
-        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "map_v",
-            MapType::new(DataType::STRING, DataType::unshredded_variant(), true),
-        )]));
+        let requested_schema = schema_ref! {
+            nullable "map_v": { STRING => nullable unshredded_variant() },
+        };
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
             "map_v",
             "struc_v",
@@ -2269,11 +2268,13 @@ mod tests {
     #[test]
     fn mask_with_map() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
-                logical_name(0),
-                MapType::new(DataType::INTEGER, DataType::STRING, false),
-            )
-            .with_metadata(column_mapping_metadata(0, mode))])
+            let requested_schema = schema! {
+                (StructField::not_null(
+                    logical_name(0),
+                    MapType::new(DataType::INTEGER, DataType::STRING, false),
+                )
+                .with_metadata(column_mapping_metadata(0, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2566,11 +2567,11 @@ mod tests {
 
     #[test]
     fn simple_row_index_field() {
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::create_metadata_column("my_row_index", MetadataColumnSpec::RowIndex),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "i": INTEGER,
+            (StructField::create_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)),
+            nullable "i2": INTEGER,
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("i2", ArrowDataType::Int32, true),
@@ -2595,11 +2596,11 @@ mod tests {
 
     #[test]
     fn simple_file_path_field() {
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "i": INTEGER,
+            (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+            nullable "i2": INTEGER,
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("i2", ArrowDataType::Int32, true),
@@ -2880,13 +2881,12 @@ mod tests {
         // Regression: when a struct with no matching children appears BEFORE a selected
         // leaf in parquet order, the Missing entry must be deferred so the leaf's
         // Identity entry gets the correct parquet_position in reorder_struct_array.
-        let requested_schema: SchemaRef = Arc::new(StructType::new_unchecked([
-            StructField::nullable("a", DataType::LONG),
-            StructField::nullable(
-                "stats",
-                StructType::new_unchecked([StructField::nullable("age", DataType::LONG)]),
-            ),
-        ]));
+        let requested_schema: SchemaRef = schema_ref! {
+            nullable "a": LONG,
+            nullable "stats": {
+                nullable "age": LONG,
+            },
+        };
         // Parquet has stats BEFORE a
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(
@@ -2965,11 +2965,13 @@ mod tests {
     #[test]
     fn list_skip_earlier_element() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new_unchecked([StructField::not_null(
-                logical_name(1),
-                ArrayType::new(DataType::INTEGER, false),
-            )
-            .with_metadata(column_mapping_metadata(1, mode))])
+            let requested_schema = schema! {
+                (StructField::not_null(
+                    logical_name(1),
+                    ArrayType::new(DataType::INTEGER, false),
+                )
+                .with_metadata(column_mapping_metadata(1, mode))),
+            }
             .make_physical(mode)
             .unwrap()
             .into();
@@ -3610,7 +3612,7 @@ mod tests {
 
     #[test]
     fn empty_requested_schema() {
-        let requested_schema = Arc::new(StructType::new_unchecked([]));
+        let requested_schema = schema_ref! {};
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("s", ArrowDataType::Utf8, true),
@@ -4003,10 +4005,10 @@ mod tests {
                 StructType::new_unchecked([StructField::nullable("z", DataType::LONG)]),
             )
         };
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("a", DataType::LONG),
-            info_field,
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "a": LONG,
+            (info_field),
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int64, true),
             ArrowField::new(
@@ -4097,10 +4099,10 @@ mod tests {
     fn empty_struct_is_matched() {
         // Delta protocol allows empty structs. An empty struct has no children, so no
         // leaf columns are selected, but the struct itself should still be matched.
-        let requested_schema = Arc::new(StructType::new_unchecked([
-            StructField::not_null("a", DataType::LONG),
-            StructField::not_null("empty", StructType::new_unchecked([])),
-        ]));
+        let requested_schema = schema_ref! {
+            not_null "a": LONG,
+            not_null "empty": {},
+        };
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int64, true),
             ArrowField::new("empty", ArrowDataType::Struct(ArrowFields::empty()), false),
@@ -4195,17 +4197,12 @@ mod tests {
         let batch = RecordBatch::try_new(src_schema, vec![outer_col]).unwrap();
 
         // Kernel target: all nullable where Arrow allows it.
-        let target_schema: SchemaRef =
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "outer",
-                StructType::new_unchecked([
-                    StructField::nullable("lst", ArrayType::new(DataType::INTEGER, true)),
-                    StructField::nullable(
-                        "mp",
-                        MapType::new(DataType::STRING, DataType::INTEGER, true),
-                    ),
-                ]),
-            )]));
+        let target_schema: SchemaRef = schema_ref! {
+            nullable "outer": {
+                nullable "lst": [ nullable INTEGER ],
+                nullable "mp": { STRING => nullable INTEGER },
+            },
+        };
 
         let ordering = [ReorderIndex::identity(0)];
         let result =

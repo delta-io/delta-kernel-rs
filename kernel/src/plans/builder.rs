@@ -652,7 +652,7 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::expressions::{col, column_name, lit, Expression};
     use crate::plans::ir::nodes::FileType;
-    use crate::schema::{DataType, MetadataColumnSpec, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, MetadataColumnSpec, StructField, StructType};
     use crate::FileMeta;
 
     /// A single-file scan (present), no file-constant columns -- the trivial scan fixture.
@@ -669,17 +669,15 @@ mod tests {
     }
 
     fn id_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "id",
-            DataType::STRING,
-        )]))
+        schema_ref! {
+            nullable "id": STRING,
+        }
     }
 
     fn x_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "x",
-            DataType::LONG,
-        )]))
+        schema_ref! {
+            nullable "x": LONG,
+        }
     }
 
     /// A one-row (all-null) `Values` source over `schema` -- the common present-source fixture.
@@ -723,10 +721,10 @@ mod tests {
 
     /// `{ id, part }`, with `part` used as a file-constant column.
     fn part_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("part", DataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": STRING,
+            nullable "part": STRING,
+        }
     }
 
     /// A single-file scan with one file constant `"p1"` for the `part` column.
@@ -1013,16 +1011,13 @@ mod tests {
 
     /// `{ outer: { a, b }, c }` -- a nested schema for exercising `project_patch`.
     fn nested_ab_c() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable(
-                "outer",
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::LONG),
-                    StructField::nullable("b", DataType::STRING),
-                ]),
-            ),
-            StructField::nullable("c", DataType::LONG),
-        ]))
+        schema_ref! {
+            nullable "outer": {
+                nullable "a": LONG,
+                nullable "b": STRING,
+            },
+            nullable "c": LONG,
+        }
     }
 
     /// `project_patch` lowers field edits and the output schema together: a nested replace, a
@@ -1040,16 +1035,13 @@ mod tests {
             .drop("c")
         })?;
 
-        let expected: SchemaRef = Arc::new(StructType::new_unchecked([
-            StructField::nullable(
-                "outer",
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::LONG),
-                    StructField::nullable("b2", DataType::LONG),
-                ]),
-            ),
-            StructField::nullable("d", DataType::LONG),
-        ]));
+        let expected: SchemaRef = schema_ref! {
+            nullable "outer": {
+                nullable "a": LONG,
+                nullable "b2": LONG,
+            },
+            nullable "d": LONG,
+        };
         assert_eq!(patched.schema(), &expected);
         assert_plan(patched, &[(&[], "values"), (&[0], "project")]);
         Ok(())
@@ -1122,20 +1114,20 @@ mod tests {
     }
 
     fn dynamic_scan_input_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
-            StructField::nullable("version", DataType::LONG),
-        ]))
+        schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+            nullable "version": LONG,
+        }
     }
 
     fn dynamic_scan_output_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("version", DataType::LONG),
-        ]))
+        schema_ref! {
+            nullable "id": STRING,
+            nullable "version": LONG,
+        }
     }
 
     #[test]

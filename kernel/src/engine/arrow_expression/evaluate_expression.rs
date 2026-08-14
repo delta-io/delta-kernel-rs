@@ -2328,10 +2328,9 @@ mod tests {
         #[case] input: Vec<Option<&str>>,
         #[case] expected_null_count: usize,
     ) {
-        let output_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
-            "a",
-            DataType::LONG,
-        )]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+        };
         let schema = ArrowSchema::new(vec![ArrowField::new("s", ArrowDataType::Utf8, true)]);
         let batch = RecordBatch::try_new(
             Arc::new(schema),
@@ -2350,10 +2349,10 @@ mod tests {
         let batch = create_json_batch();
 
         // Define the output schema for parsing
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2427,10 +2426,10 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2563,10 +2562,10 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();
@@ -2604,10 +2603,10 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_strings)]).unwrap();
 
         // Schema only asks for "a" and "b"
-        let output_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]));
+        let output_schema = schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        };
 
         let expr = Expr::parse_json(col!("json_col"), output_schema);
         let result = evaluate_expression(&expr, &batch, None).unwrap();

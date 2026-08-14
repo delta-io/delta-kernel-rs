@@ -614,10 +614,10 @@ mod tests {
     }
 
     fn partitioned_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("x", DataType::LONG),
-            StructField::nullable("p", DataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "x": LONG,
+            nullable "p": STRING,
+        }
     }
 
     fn log_root() -> Url {

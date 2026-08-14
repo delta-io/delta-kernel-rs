@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
+use super::{schema_ref, DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType};
 use crate::expressions::ExpressionStructPatchBuilder;
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::{DeltaResult, Error};
@@ -55,7 +55,7 @@ pub(crate) fn strip_void_from_schema(schema: SchemaRef) -> SchemaRef {
     match StripVoidFields.transform_struct(&schema) {
         Some(Cow::Owned(stripped)) => Arc::new(stripped),
         Some(Cow::Borrowed(_)) => schema,
-        None => Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+        None => schema_ref! {},
     }
 }
 
@@ -663,10 +663,10 @@ mod tests {
         true
     )))]
     fn test_strip_drops_container_with_void(#[case] field_type: DataType) {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("c", field_type),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "c": (field_type),
+        };
         let stripped = strip_void_from_schema(schema);
         assert!(stripped.field("id").is_some());
         assert!(stripped.field("c").is_none());
@@ -685,7 +685,9 @@ mod tests {
             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref().into(),
             MetadataValue::String("phys_s".into()),
         );
-        let schema = Arc::new(StructType::new_unchecked([s_field]));
+        let schema = schema_ref! {
+            (s_field),
+        };
         let stripped = strip_void_from_schema(schema);
         assert_eq!(
             stripped

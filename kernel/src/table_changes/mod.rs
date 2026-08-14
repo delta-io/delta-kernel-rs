@@ -555,7 +555,7 @@ mod tests {
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructField, StructType};
     use crate::table_changes::test_utils::{
         row_tracking_properties, row_tracking_protocol, row_tracking_setup_actions,
         test_deletion_vector, TEST_MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
@@ -574,10 +574,10 @@ mod tests {
     use crate::{Engine, Error};
 
     fn listing_test_schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]))
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+        }
     }
 
     #[test]
@@ -713,15 +713,15 @@ mod tests {
         // the per-commit one.
         let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
-        let start_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-            StructField::nullable("extra", DataType::INTEGER),
-        ]));
-        let end_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("value", DataType::STRING),
-        ]));
+        let start_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+            nullable "extra": INTEGER,
+        };
+        let end_schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "value": STRING,
+        };
         let rt_config = row_tracking_properties();
 
         // v0: start schema + row tracking. v1: a data commit (no metadata) using the start schema.

@@ -31,7 +31,7 @@ use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
@@ -450,15 +450,10 @@ fn struct_deletion_vector_schema() -> &'static ArrayType {
 /// Schema for the intermediate column holding new DV descriptors.
 /// This temporary column is dropped during transformation to final add actions.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable(
-            NEW_DELETION_VECTOR_NAME,
-            DeletionVectorDescriptor::to_schema(),
-        ),
-        StructField::nullable(NEW_STATS_NAME, DataType::STRING),
-    ]))
-});
+static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
+    nullable NEW_STATS_NAME: STRING,
+};
 
 /// Returns the schema for the intermediate column holding new DV descriptors.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]

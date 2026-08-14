@@ -136,18 +136,18 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::schema_ref;
     use crate::table_features::ColumnMappingMode;
 
     fn create_test_logical_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("age", DataType::LONG),
-            StructField::nullable("name", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-            StructField::nullable("_commit_version", DataType::LONG),
-            StructField::nullable("_commit_timestamp", DataType::TIMESTAMP),
-        ]))
+        schema_ref! {
+            nullable "id": STRING,
+            nullable "age": LONG,
+            nullable "name": STRING,
+            nullable "_change_type": STRING,
+            nullable "_commit_version": LONG,
+            nullable "_commit_timestamp": TIMESTAMP,
+        }
     }
 
     fn create_test_physical_schema() -> StructType {
@@ -395,10 +395,10 @@ mod tests {
         };
 
         // Create a simple schema without CDF metadata columns
-        let logical_schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("name", DataType::STRING),
-        ]));
+        let logical_schema = schema_ref! {
+            nullable "id": STRING,
+            nullable "name": STRING,
+        };
 
         let physical_schema = StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::{
     ColumnMappingMode, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
@@ -113,11 +113,11 @@ fn test_create_table_no_timestamp_ntz_no_feature() -> DeltaResult<()> {
 fn test_create_table_timestamp_ntz_and_variant() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
 
-    let schema = Arc::new(StructType::new_unchecked(vec![
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-        StructField::new("v", DataType::unshredded_variant(), true),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "ts": TIMESTAMP_NTZ,
+        nullable "v": unshredded_variant(),
+    };
 
     let _ = create_table(&table_path, schema, "Test/1.0")
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?

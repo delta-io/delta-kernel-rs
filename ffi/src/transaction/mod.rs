@@ -1786,10 +1786,10 @@ mod tests {
             OptionalValue::None
         }
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("number", DataType::INTEGER),
-            StructField::nullable("string", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "number": INTEGER,
+            nullable "string": STRING,
+        };
 
         // Create a catalog-managed table so UCCommitter (a catalog committer) is allowed.
         let (store, _test_engine, table_location) =

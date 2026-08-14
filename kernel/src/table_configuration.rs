@@ -934,16 +934,13 @@ impl TableConfiguration {
 mod test {
 
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use rstest::rstest;
     use url::Url;
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::schema::{
-        column_name, schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType,
-    };
+    use crate::schema::{column_name, schema_ref, ColumnName, DataType, SchemaRef, StructField};
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -1050,10 +1047,10 @@ mod test {
 
     #[test]
     fn table_configuration_rejects_duplicate_partition_columns() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("part", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "value": INTEGER,
+            nullable "part": STRING,
+        };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -1496,10 +1493,9 @@ mod test {
 
     #[test]
     fn test_timestamp_ntz_legacy_alias_unblocks_read_and_write() {
-        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "ts",
-            DataType::TIMESTAMP_NTZ,
-        )]));
+        let schema = schema_ref! {
+            nullable "ts": TIMESTAMP_NTZ,
+        };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         // Build the protocol from the legacy string alias to exercise the real read path.
@@ -1957,7 +1953,10 @@ mod test {
         )
         .unwrap();
 
-        Arc::new(StructType::new_unchecked([field_a, field_b]))
+        schema_ref! {
+            (field_a),
+            (field_b),
+        }
     }
 
     fn create_table_config_with_column_mapping(
@@ -2005,10 +2004,10 @@ mod test {
 
     #[test]
     fn test_build_expected_stats_schemas_no_column_mapping() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("col_a", DataType::LONG),
-            StructField::nullable("col_b", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "col_a": LONG,
+            nullable "col_b": STRING,
+        };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new_legacy(1, 2).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -2161,7 +2160,11 @@ mod test {
             }"#,
         )
         .unwrap();
-        Arc::new(StructType::new_unchecked([data_col, part_a, part_b]))
+        schema_ref! {
+            (data_col),
+            (part_a),
+            (part_b),
+        }
     }
 
     #[test]
@@ -2257,11 +2260,11 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_excludes_partition_columns_no_column_mapping() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("data_col", DataType::LONG),
-            StructField::nullable("part_a", DataType::STRING),
-            StructField::nullable("part_b", DataType::INTEGER),
-        ]));
+        let schema = schema_ref! {
+            nullable "data_col": LONG,
+            nullable "part_a": STRING,
+            nullable "part_b": INTEGER,
+        };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -2281,10 +2284,10 @@ mod test {
 
     #[test]
     fn test_physical_stats_column_names_all_partition_columns_returns_empty() {
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("part_a", DataType::STRING),
-            StructField::nullable("part_b", DataType::INTEGER),
-        ]));
+        let schema = schema_ref! {
+            nullable "part_a": STRING,
+            nullable "part_b": INTEGER,
+        };
         let metadata = Metadata::try_new(
             None,
             None,
@@ -2469,10 +2472,10 @@ mod test {
         // names equal logical names.
         // IcebergCompatV3 requires column mapping. This test bypasses that requirement for
         // convenience.
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("value", DataType::INTEGER),
-            StructField::nullable("pcol", DataType::STRING),
-        ]));
+        let schema = schema_ref! {
+            nullable "value": INTEGER,
+            nullable "pcol": STRING,
+        };
         let props: HashMap<String, String> = extra_props
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2506,17 +2509,14 @@ mod test {
         // Pins the invariant that `physical_write_schema()` strips void columns from the
         // returned schema (top level and nested), so callers receive a Parquet-writable
         // schema without needing to apply `strip_void_from_schema` themselves.
-        let schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("v", DataType::VOID),
-            StructField::nullable(
-                "s",
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("nested_void", DataType::VOID),
-                ]),
-            ),
-        ]));
+        let schema = schema_ref! {
+            nullable "id": INTEGER,
+            nullable "v": VOID,
+            nullable "s": {
+                nullable "a": INTEGER,
+                nullable "nested_void": VOID,
+            },
+        };
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,

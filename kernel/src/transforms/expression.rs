@@ -571,7 +571,7 @@ mod tests {
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{schema_ref, DataType, StructType};
 
     #[derive(Debug, PartialEq)]
     struct OpaqueTestOp(String);
@@ -836,10 +836,10 @@ mod tests {
     }
 
     fn test_output_schema() -> Arc<StructType> {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::STRING, true),
-        ]))
+        schema_ref! {
+            nullable "a": LONG,
+            nullable "b": STRING,
+        }
     }
 
     #[test]

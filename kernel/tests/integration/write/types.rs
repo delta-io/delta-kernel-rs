@@ -15,7 +15,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
-use delta_kernel::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table as kernel_create_table;
 use delta_kernel::{Error as KernelError, Snapshot};
 use itertools::Itertools;
@@ -649,112 +649,69 @@ async fn try_write_with_void_schema(schema: SchemaRef) -> KernelError {
 
 #[rstest]
 #[case::void_array_element(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "arr",
-            ArrayType::new(DataType::VOID, true),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "arr": [ nullable VOID ],
+    },
     "array element type"
 )]
 #[case::void_map_value(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "m",
-            MapType::new(DataType::STRING, DataType::VOID, true),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "m": { STRING => nullable VOID },
+    },
     "map value type"
 )]
 #[case::void_map_key(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "m",
-            MapType::new(DataType::VOID, DataType::STRING, true),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "m": { VOID => nullable STRING },
+    },
     "map key type"
 )]
 #[case::void_in_struct_in_array(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "arr",
-            ArrayType::new(
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::VOID),
-                ]),
-                true,
-            ),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "arr": [ nullable {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        } ],
+    },
     "Void type is not allowed inside"
 )]
 #[case::void_in_struct_in_map_value(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "m",
-            MapType::new(
-                DataType::STRING,
-                StructType::new_unchecked([
-                    StructField::nullable("a", DataType::INTEGER),
-                    StructField::nullable("b", DataType::VOID),
-                ]),
-                true,
-            ),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "m": { STRING => nullable {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        } },
+    },
     "Void type is not allowed inside"
 )]
 #[case::all_void_table(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", DataType::VOID),
-        StructField::nullable("b", DataType::VOID),
-    ])),
+    schema_ref! { nullable "a": VOID, nullable "b": VOID },
     "at least one non-void column"
 )]
 #[case::all_void_struct(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("x", DataType::VOID),
-                StructField::nullable("y", DataType::VOID),
-            ]),
-        ),
-    ])),
+    schema_ref! {
+        nullable "id": INTEGER,
+        nullable "s": { nullable "x": VOID, nullable "y": VOID },
+    },
     "contains no non-void fields"
 )]
 // A zero-field top-level schema is an empty schema, rejected by the empty-schema
 // write gate (it has no columns at all, void or otherwise) rather than by void validation.
 #[case::empty_struct_top_level(
-    Arc::new(StructType::new_unchecked(Vec::<StructField>::new())),
+    schema_ref! {},
     "empty schema"
 )]
 #[case::nested_empty_struct(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked(Vec::<StructField>::new()),
-        ),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "s": {} },
     "contains no non-void fields"
 )]
 #[case::empty_struct_in_array(
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "arr",
-            ArrayType::new(StructType::new_unchecked(Vec::<StructField>::new()), true),
-        ),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable {} ] },
     "struct nested in Array or Map must contain at least one non-void field"
 )]
 #[tokio::test]
@@ -780,30 +737,21 @@ async fn write_rejects_invalid_void_placement(
     "void_fail_fast_unpartitioned_array",
     vec![],
     HashMap::new(),
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable VOID ] },
     "array element type",
 )]
 #[case::partitioned_void_array(
     "void_fail_fast_partitioned_array",
     vec!["id"],
     HashMap::from([("id".to_string(), Scalar::Integer(1))]),
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
-    ])),
+    schema_ref! { nullable "id": INTEGER, nullable "arr": [ nullable VOID ] },
     "array element type",
 )]
 #[case::unpartitioned_all_void(
     "void_fail_fast_unpartitioned_all_void",
     vec![],
     HashMap::new(),
-    Arc::new(StructType::new_unchecked([
-        StructField::nullable("a", DataType::VOID),
-        StructField::nullable("b", DataType::VOID),
-    ])),
+    schema_ref! { nullable "a": VOID, nullable "b": VOID },
     "at least one non-void column",
 )]
 #[tokio::test]
@@ -850,11 +798,11 @@ async fn write_context_creation_fails_fast_on_invalid_void_schema(
 #[tokio::test]
 async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dyn std::error::Error>>
 {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("v", DataType::VOID),
-        StructField::nullable("name", DataType::STRING),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "v": VOID,
+        nullable "name": STRING,
+    };
     let (store, engine, table_location) = engine_store_setup("void_physical_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
@@ -886,10 +834,10 @@ async fn write_context_excludes_void_from_physical_schema() -> Result<(), Box<dy
 #[tokio::test]
 async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dyn std::error::Error>>
 {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable("arr", ArrayType::new(DataType::VOID, true)),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "arr": [ nullable VOID ],
+    };
     let (store, engine, table_location) = engine_store_setup("void_metadata_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
@@ -913,16 +861,13 @@ async fn metadata_only_commit_with_void_in_array_succeeds() -> Result<(), Box<dy
 #[tokio::test]
 async fn write_context_excludes_nested_void_from_physical_schema(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-            ]),
-        ),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "s": {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        },
+    };
     let (store, engine, table_location) = engine_store_setup("void_nested_physical_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);
@@ -967,16 +912,13 @@ async fn write_context_excludes_nested_void_from_physical_schema(
 // matching the physical schema which has void stripped recursively.
 #[tokio::test]
 async fn write_transform_drops_nested_void_fields() -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Arc::new(StructType::new_unchecked([
-        StructField::nullable("id", DataType::INTEGER),
-        StructField::nullable(
-            "s",
-            StructType::new_unchecked([
-                StructField::nullable("a", DataType::INTEGER),
-                StructField::nullable("b", DataType::VOID),
-            ]),
-        ),
-    ]));
+    let schema = schema_ref! {
+        nullable "id": INTEGER,
+        nullable "s": {
+            nullable "a": INTEGER,
+            nullable "b": VOID,
+        },
+    };
     let (store, engine, table_location) = engine_store_setup("void_nested_transform_test", None);
     let table_url = create_table(store, table_location, schema, &[], false, vec![], vec![]).await?;
     let engine = Arc::new(engine);

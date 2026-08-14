@@ -1186,10 +1186,10 @@ mod tests {
         use crate::clustering::CLUSTERING_DOMAIN_NAME;
         use crate::expressions::column_name;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1214,11 +1214,11 @@ mod tests {
     fn test_clustering_support_multiple_columns() {
         use crate::expressions::column_name;
 
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("date", DataType::STRING, true),
-            StructField::new("region", DataType::STRING, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "date": STRING,
+            nullable "region": STRING,
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1271,10 +1271,10 @@ mod tests {
             StructField::new("city", DataType::STRING, true),
             StructField::new("zip", DataType::STRING, true),
         ]);
-        let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("address", address_struct, true),
-        ]));
+        let schema = schema_ref! {
+            not_null "id": INTEGER,
+            nullable "address": (address_struct),
+        };
 
         let mut reader_features = vec![];
         let mut writer_features = vec![];
@@ -1334,11 +1334,11 @@ mod tests {
         &[TableFeature::TimestampWithoutTimezone],
     )]
     #[case::both_variant_and_ntz(
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", DataType::unshredded_variant(), true),
-            StructField::new("ts", DataType::TIMESTAMP_NTZ, true),
-        ])),
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "v": unshredded_variant(),
+            nullable "ts": TIMESTAMP_NTZ,
+        },
         &[TableFeature::VariantType, TableFeature::TimestampWithoutTimezone],
     )]
     #[case::no_special_types(
@@ -1495,11 +1495,11 @@ mod tests {
     }
 
     fn multi_column_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked(vec![
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("date", DataType::DATE, true),
-        ]))
+        schema_ref! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+            nullable "date": DATE,
+        }
     }
 
     struct DataLayoutExpectation {

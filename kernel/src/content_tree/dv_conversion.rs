@@ -1,12 +1,10 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::content_tree::DeletionVectorInfo;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{ArrayData, Scalar};
-use crate::schema::{
-    column_name, ArrayType, ColumnName, DataType, SchemaRef, StructField, StructType,
-};
+use crate::schema::{column_name, lazy_schema_ref, ArrayType, ColumnName, DataType, SchemaRef};
 use crate::{DeltaResult, EngineData, Error};
 
 /// Extracts deletion vector content from a DeletionVectorDescriptor.
@@ -61,14 +59,12 @@ const DV_SIZE_IN_BYTES: &str = "_dv_size_in_bytes";
 const DV_CARDINALITY: &str = "_dv_cardinality";
 
 /// Schema of [`DV_LOCATION`] etc., for [`EngineData::append_columns`].
-static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable(DV_LOCATION, DataType::STRING),
-        StructField::nullable(DV_OFFSET, DataType::LONG),
-        StructField::nullable(DV_SIZE_IN_BYTES, DataType::LONG),
-        StructField::nullable(DV_CARDINALITY, DataType::LONG),
-    ]))
-});
+static DV_DECODED_FLAT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable DV_LOCATION: STRING,
+    nullable DV_OFFSET: LONG,
+    nullable DV_SIZE_IN_BYTES: LONG,
+    nullable DV_CARDINALITY: LONG,
+};
 
 /// Types of the DV descriptor leaves [`DecodedDvVisitor`] decodes, in getter order. Shared across
 /// all source layouts: only the *names* (the projection path to the DV struct) vary per layout, so
@@ -233,7 +229,7 @@ mod tests {
     use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::engine::sync::SyncEngine;
     use crate::expressions::StructData;
-    use crate::schema::{ColumnNamesAndTypes, ToSchema};
+    use crate::schema::{schema_ref, ColumnNamesAndTypes, StructField, StructType, ToSchema};
     use crate::Engine;
 
     /// Decoded DV columns read back from an augmented batch, one entry per row.
@@ -344,15 +340,16 @@ mod tests {
     impl DvColumnShape {
         /// Schema projecting `dv_schema` at this shape's location.
         fn schema(self, dv_schema: StructType) -> SchemaRef {
-            let dv_field = StructField::nullable("deletionVector", dv_schema);
-            let root = match self {
-                DvColumnShape::ScanRow => StructType::new_unchecked([dv_field]),
-                DvColumnShape::LogBatch => StructType::new_unchecked([StructField::nullable(
-                    "add",
-                    StructType::new_unchecked([dv_field]),
-                )]),
-            };
-            Arc::new(root)
+            match self {
+                DvColumnShape::ScanRow => schema_ref! {
+                    nullable "deletionVector": (dv_schema),
+                },
+                DvColumnShape::LogBatch => schema_ref! {
+                    nullable "add": {
+                        nullable "deletionVector": (dv_schema),
+                    },
+                },
+            }
         }
 
         /// Wraps a DV struct scalar (or a null placeholder) at this shape's root field, matching

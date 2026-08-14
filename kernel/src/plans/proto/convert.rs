@@ -998,8 +998,8 @@ mod tests {
     };
     use crate::plans::{IoOperation, Operation};
     use crate::schema::{
-        ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType, SchemaRef,
-        StructField, StructType, ToSchema as _,
+        schema_ref, ArrayType, DataType, DecimalType, MapType, MetadataValue, PrimitiveType,
+        SchemaRef, StructField, StructType, ToSchema as _,
     };
     #[cfg(feature = "geo-type-in-dev")]
     use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
@@ -1417,20 +1417,20 @@ mod tests {
     }
 
     fn sample_dynamic_scan_input_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("filemod", DataType::LONG),
-            StructField::nullable("dv", DeletionVectorDescriptor::to_schema()),
-            StructField::nullable("c", DataType::INTEGER),
-        ]))
+        schema_ref! {
+            not_null "path": STRING,
+            not_null "size": LONG,
+            not_null "filemod": LONG,
+            nullable "dv": (DeletionVectorDescriptor::to_schema()),
+            nullable "c": INTEGER,
+        }
     }
 
     fn sample_dynamic_scan_output_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("c", DataType::INTEGER),
-        ]))
+        schema_ref! {
+            nullable "id": INTEGER,
+            nullable "c": INTEGER,
+        }
     }
 
     #[rstest]
