@@ -1438,6 +1438,24 @@ impl CheckpointAction {
     pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
         self.content_root.to_filemeta(table_root)
     }
+
+    /// Fill missing Protocol and/or Metadata from this checkpoint action's embedded copies.
+    ///
+    /// A manifest commit's `checkpoint` action embeds the table `protocol` and `metaData` at the
+    /// checkpoint version (see the type-level docs), making the commit self-contained with respect
+    /// to P+M. When log replay has not already found a top-level `protocol`/`metaData` action, this
+    /// supplies them from the checkpoint action. A value that is already `Some` is left untouched,
+    /// so a newer top-level action (e.g. a metadata-only log commit written after the manifest
+    /// commit) always wins over the embedded copy.
+    #[internal_api]
+    pub(crate) fn fill_missing_pm(
+        &self,
+        protocol: &mut Option<Protocol>,
+        metadata: &mut Option<Metadata>,
+    ) {
+        protocol.get_or_insert_with(|| self.protocol.clone());
+        metadata.get_or_insert_with(|| self.metadata.clone());
+    }
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
@@ -2957,6 +2975,43 @@ mod tests {
         let engine = ExprEngine::new();
         let result = action.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine);
         assert_result_error_with_message(result, "exceeds checkpointMetadata.version");
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_fill_missing_pm_fills_only_missing_side() {
+        let action = sample_checkpoint_action();
+        // A protocol/metadata distinct from the checkpoint action's embedded copies, standing in
+        // for a top-level action found during replay.
+        let other_protocol = Protocol::new_unchecked(3, 7, None, None);
+        assert_ne!(other_protocol, action.protocol);
+        let mut other_metadata = Metadata::default();
+        other_metadata.id = "distinct-metadata-id".to_string();
+        assert_ne!(other_metadata, action.metadata);
+
+        // Both missing: both filled from the checkpoint action.
+        let (mut p, mut m) = (None, None);
+        action.fill_missing_pm(&mut p, &mut m);
+        assert_eq!(p, Some(action.protocol.clone()));
+        assert_eq!(m, Some(action.metadata.clone()));
+
+        // Protocol present: left untouched; metadata filled.
+        let (mut p, mut m) = (Some(other_protocol.clone()), None);
+        action.fill_missing_pm(&mut p, &mut m);
+        assert_eq!(p, Some(other_protocol.clone()));
+        assert_eq!(m, Some(action.metadata.clone()));
+
+        // Metadata present: left untouched; protocol filled.
+        let (mut p, mut m) = (None, Some(other_metadata.clone()));
+        action.fill_missing_pm(&mut p, &mut m);
+        assert_eq!(p, Some(action.protocol.clone()));
+        assert_eq!(m, Some(other_metadata.clone()));
+
+        // Both present: no-op.
+        let (mut p, mut m) = (Some(other_protocol.clone()), Some(other_metadata.clone()));
+        action.fill_missing_pm(&mut p, &mut m);
+        assert_eq!(p, Some(other_protocol));
+        assert_eq!(m, Some(other_metadata));
     }
 
     #[cfg(feature = "adaptive-metadata-in-dev")]
