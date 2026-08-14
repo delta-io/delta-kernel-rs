@@ -750,7 +750,7 @@ pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
-pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = lazy_schema_ref! {
+pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     // Note that fields projected out of a nullable struct must be nullable
     nullable PATH_NAME: STRING,
     nullable SIZE_NAME: LONG,

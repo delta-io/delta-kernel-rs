@@ -12,7 +12,7 @@ use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::log_segment::DomainMetadataMap;
 use crate::schema::{
-    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema,
+    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
 };
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -643,7 +643,7 @@ impl InCommitTimestampVisitor {
     #[allow(unused)]
     /// Get the schema that the visitor expects the data to have.
     pub(crate) fn schema() -> Arc<Schema> {
-        static SCHEMA: LazyLock<Arc<Schema>> = lazy_schema_ref! {
+        static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
             nullable COMMIT_INFO_NAME: {
                 nullable "inCommitTimestamp": LONG,
             },
