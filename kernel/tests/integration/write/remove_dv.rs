@@ -7,10 +7,10 @@ use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionV
 use delta_kernel::actions::{NUM_RECORDS, TIGHT_BOUNDS};
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{
-    new_null_array, Array, ArrayRef, AsArray, BooleanArray, Int32Array, Int64Array, RecordBatch,
-    StringArray, StructArray,
+    new_null_array, Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray,
 };
-use delta_kernel::arrow::compute::{concat, concat_batches, filter_record_batch};
+use delta_kernel::arrow::compute::{concat, concat_batches};
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -34,8 +34,8 @@ use tempfile::tempdir;
 use test_utils::{
     assert_result_error_with_message, begin_transaction, copy_directory, create_add_files_metadata,
     create_default_engine, create_default_engine_mt_executor, insert_data, into_record_batch,
-    load_and_begin_transaction, read_actions_from_commit, replace_array_row, setup_test_tables,
-    test_table_setup,
+    load_and_begin_transaction, read_actions_from_commit, replace_array_row, setup_test_table_p37,
+    setup_test_tables, test_table_setup,
 };
 use url::Url;
 
@@ -214,8 +214,15 @@ fn selected_scan_file_batch(
 #[derive(Clone, Copy)]
 struct StagedRemoveFileModification {
     field: &'static str,
-    string_value: Option<&'static str>,
+    value: StagedRemoveFileFieldValue,
     modified_row_index: usize,
+}
+
+#[derive(Clone, Copy)]
+enum StagedRemoveFileFieldValue {
+    Null,
+    String(&'static str),
+    Int64(i64),
 }
 
 impl StagedRemoveFileModification {
@@ -226,7 +233,18 @@ impl StagedRemoveFileModification {
     ) -> Self {
         Self {
             field,
-            string_value,
+            value: match string_value {
+                Some(value) => StagedRemoveFileFieldValue::String(value),
+                None => StagedRemoveFileFieldValue::Null,
+            },
+            modified_row_index,
+        }
+    }
+
+    const fn modify_size(size: i64, modified_row_index: usize) -> Self {
+        Self {
+            field: "size",
+            value: StagedRemoveFileFieldValue::Int64(size),
             modified_row_index,
         }
     }
@@ -247,6 +265,26 @@ impl StagedRemoveFileModification {
     StagedRemoveFileModification::modify_value("path", None, 2 /* modified_row_index */),
     &[true, true, false],
     None,
+)]
+#[case::short_selection_vector_missing_path(
+    StagedRemoveFileModification::modify_value("path", None, 2 /* modified_row_index */),
+    &[false, false],
+    Some("missing required field 'path'"),
+)]
+#[case::missing_size(
+    StagedRemoveFileModification::modify_value("size", None, 1 /* modified_row_index */),
+    &[true, true, true],
+    Some("missing required field 'size'"),
+)]
+#[case::unselected_missing_size(
+    StagedRemoveFileModification::modify_value("size", None, 2 /* modified_row_index */),
+    &[true, true, false],
+    None,
+)]
+#[case::negative_size(
+    StagedRemoveFileModification::modify_size(-1, 1 /* modified_row_index */),
+    &[true, true, true],
+    Some("size must be non-negative"),
 )]
 #[case::missing_modification_time(
     StagedRemoveFileModification::modify_value(
@@ -289,11 +327,7 @@ async fn commit_validates_staged_remove_fields(
     // === Create table ===
     let schema = get_simple_int_schema();
     let (table_url, engine, _store, _table_name) =
-        setup_test_tables(schema.clone(), &[], None, "remove_required_field_table")
-            .await?
-            .into_iter()
-            .next()
-            .expect("at least one test table");
+        setup_test_table_p37(schema, &[], None, "remove_required_field_table").await?;
     let engine = Arc::new(engine);
 
     // === Insert files ===
@@ -312,16 +346,9 @@ async fn commit_validates_staged_remove_fields(
 
     // === Modify staged remove metadata ===
     let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
-    let scan = snapshot.clone().scan_builder().build()?;
     let mut batches = Vec::new();
-    for scan_metadata in scan.scan_metadata(engine.as_ref())? {
-        let (data, mut scan_selection_vector) = scan_metadata?.scan_files.into_parts();
-        let batch = into_record_batch(data);
-        scan_selection_vector.resize(batch.num_rows(), true);
-        batches.push(filter_record_batch(
-            &batch,
-            &BooleanArray::from(scan_selection_vector),
-        )?);
+    for scan_files in get_scan_files(snapshot.clone(), engine.as_ref())? {
+        batches.push(into_record_batch(scan_files.apply_selection_vector()?));
     }
     let schema = batches
         .first()
@@ -337,9 +364,9 @@ async fn commit_validates_staged_remove_fields(
         .expect("path is a string column");
     let mut expected_surviving_paths = paths
         .iter()
-        .zip(selection_vector)
-        .filter(|(_, selected)| !**selected)
-        .map(|(path, _)| path.expect("path is present").to_owned())
+        .enumerate()
+        .filter(|(row, _)| !selection_vector.get(*row).copied().unwrap_or(true))
+        .map(|(_, path)| path.expect("path is present").to_owned())
         .collect::<Vec<_>>();
     expected_surviving_paths.sort();
     let corrupted = modify_staged_remove_file(&batch, modification)?;
@@ -542,23 +569,15 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Verifies `extendedFileMetadata` is true exactly when `size` and `partitionValues` are present;
-/// `tags` does not affect it.
+/// Verifies `extendedFileMetadata` when the required `size` is present.
 #[rstest::rstest]
 #[case::all_present(&[], true)]
-#[case::missing_size(&[ExtendedMetadataField::Size], false)]
 #[case::missing_partition_values(&[ExtendedMetadataField::PartitionValues], false)]
 #[case::missing_tags(&[ExtendedMetadataField::Tags], true)]
 #[case::only_size(&[
     ExtendedMetadataField::PartitionValues,
     ExtendedMetadataField::Tags,
 ], false)]
-#[case::only_partition_values(&[ExtendedMetadataField::Size, ExtendedMetadataField::Tags], false)]
-#[case::only_tags(&[
-    ExtendedMetadataField::Size,
-    ExtendedMetadataField::PartitionValues,
-], false)]
-#[case::none_present(&ExtendedMetadataField::ALL, false)]
 #[tokio::test]
 async fn test_remove_scanned_file_sets_extended_metadata(
     #[case] missing_fields: &[ExtendedMetadataField],
@@ -590,13 +609,7 @@ async fn test_remove_scanned_file_sets_extended_metadata(
         )?);
     }
     let commit_result = txn.commit(engine.as_ref());
-    if missing_fields.contains(&ExtendedMetadataField::Size) {
-        // TODO(#2717): The commit is materialized before post-commit validation returns this error,
-        // so the committed Remove action remains available for validation below.
-        assert_result_error_with_message(commit_result, "Data missing for field size");
-    } else {
-        commit_result?.unwrap_committed();
-    }
+    commit_result?.unwrap_committed();
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
 
     let remove_actions = read_actions_from_commit(&table_url, 2, "remove")?;
@@ -2032,9 +2045,14 @@ fn modify_staged_remove_file(
 ) -> Result<RecordBatch, ArrowError> {
     let field_index = batch.schema().index_of(modification.field)?;
     let mut columns = batch.columns().to_vec();
-    let modified_value = match modification.string_value {
-        Some(value) => Arc::new(StringArray::from(vec![value])) as ArrayRef,
-        None => new_null_array(batch.schema().field(field_index).data_type(), 1),
+    let modified_value = match modification.value {
+        StagedRemoveFileFieldValue::Null => {
+            new_null_array(batch.schema().field(field_index).data_type(), 1)
+        }
+        StagedRemoveFileFieldValue::String(value) => {
+            Arc::new(StringArray::from(vec![value])) as ArrayRef
+        }
+        StagedRemoveFileFieldValue::Int64(value) => Arc::new(Int64Array::from(vec![value])) as ArrayRef,
     };
     let column = batch.column(field_index);
     let slices = [

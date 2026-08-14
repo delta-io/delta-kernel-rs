@@ -425,7 +425,6 @@ pub trait FilteredRowVisitor {
     {
         // column_names is 'static so this borrow ends immediately, before bridge borrows self
         let column_names = self.selected_column_names_and_types().0;
-        // TODO(#3028): Define callback cardinality; this bridge assumes one visit per EngineData.
         let mut bridge = FilteredVisitorBridge {
             visitor: self,
             selection_vector: data.selection_vector(),
@@ -521,6 +520,9 @@ pub trait EngineData: AsAny {
     /// Visits a subset of leaf columns in each row of this data, passing a `GetData` item for each
     /// requested column to the visitor's `visit` method (along with the number of rows of data to
     /// be visited).
+    ///
+    /// Implementations must invoke [`RowVisitor::visit`] exactly once. `row_count` must equal
+    /// [`EngineData::len`], and every getter must support the same `0..row_count` row range.
     fn visit_rows(
         &self,
         column_names: &[ColumnName],
