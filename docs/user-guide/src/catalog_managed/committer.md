@@ -149,8 +149,9 @@ staged path, in-commit timestamp, and maximum published version:
         commit_metadata.max_published_version(),
     )?;
 
-    // Return the staged file metadata on success. Use the in-commit timestamp
-    // as the logical commit time rather than the filesystem mtime.
+    // Use the in-commit timestamp as the logical commit time (not the filesystem
+    // mtime, which reflects when the file was written rather than when the
+    // commit took effect).
     Ok(CommitResponse::Committed {
         file_meta: FileMeta::new(
             staged_path,
