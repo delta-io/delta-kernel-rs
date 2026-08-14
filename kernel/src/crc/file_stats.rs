@@ -70,6 +70,7 @@ pub(crate) struct FileStatsDelta {
 
 const INCREMENTAL_SAFE_OPS: &[&str] = &[
     "WRITE",
+    "STREAMING UPDATE",
     "MERGE",
     "UPDATE",
     "DELETE",
