@@ -134,6 +134,7 @@ impl<S> Transaction<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::actions::CommitInfo;
@@ -335,6 +336,31 @@ mod tests {
             ci.num_columns(),
             2 + CommitInfo::to_schema().fields().count() - 1
         );
+        Ok(())
+    }
+
+    /// Non-empty `operationParameters` and `operationMetrics` maps are written through the merge
+    /// branch with their entries.
+    #[test]
+    fn test_build_commit_info_merges_non_empty_maps() -> DeltaResult<()> {
+        let (data, schema) = make_engine_commit_info(
+            vec![ArrowField::new("customApp", ArrowDataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["myApp"])) as ArrayRef],
+        );
+        let (engine, txn) = make_txn(Some((data, schema)))?;
+
+        let mut commit_info = make_kernel_commit_info();
+        commit_info.operation_parameters =
+            Some(HashMap::from([("mode".to_string(), "Append".to_string())]));
+        commit_info.operation_metrics =
+            Some(HashMap::from([("numFiles".to_string(), "2".to_string())]));
+
+        let result = ArrowEngineData::try_from_engine_data(
+            txn.build_commit_info_action(engine.as_ref(), commit_info)?,
+        )?;
+        let ci = commit_info_struct(&result);
+        assert_eq!(get_map(ci, "operationParameters").len(), 1);
+        assert_eq!(get_map(ci, "operationMetrics").len(), 1);
         Ok(())
     }
 }
