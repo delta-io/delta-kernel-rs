@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::num::NonZero;
+use std::sync::Arc;
 
 use rand::Rng;
 use url::Url;
@@ -35,7 +36,7 @@ use crate::{DeltaResult, Error};
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct BoundWriteContext {
-    pub(super) write_state: WriteState,
+    pub(super) write_state: Arc<WriteState>,
     /// Transforms logical data to physical data for writing. The logical data must not contain
     /// any partition columns. The expression injects the partition columns when needed.
     pub(super) logical_to_physical: ExpressionRef,
@@ -284,7 +285,7 @@ mod tests {
         random_prefix_length: usize,
     ) -> BoundWriteContext {
         let schema = schema_ref! { nullable "value": INTEGER };
-        let write_state = WriteState {
+        let write_state = Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: schema.clone(),
             logical_schema: schema.clone(),
@@ -296,7 +297,7 @@ mod tests {
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
-        };
+        });
         BoundWriteContext {
             write_state,
             logical_to_physical: Arc::new(lit(true)),

@@ -1075,23 +1075,24 @@ impl<S: SupportsDataFiles> Transaction<S> {
 
     /// Creates the table-wide state needed to write data files.
     ///
-    /// The returned state can create [`BoundWriteContext`] instances in this process,
-    /// or it can be encoded and transported to distributed writers. All table-wide write
-    /// validation runs before the state is returned so a writer does not begin producing files
-    /// for a table that kernel cannot write to safely.
+    /// The returned shared state can create [`BoundWriteContext`] instances in this process,
+    /// or it can be encoded and transported to distributed writers. Each context retains a
+    /// reference to the same immutable state. All table-wide write validation runs before the
+    /// state is returned so a writer does not begin producing files for a table that kernel cannot
+    /// write to safely.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
     /// column defaults that the connector has not acknowledged.
-    pub fn write_state(&self) -> DeltaResult<WriteState> {
+    pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_context()?;
         self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction.
-        Ok(WriteState::new(
+        Ok(Arc::new(WriteState::new(
             &self.effective_table_config,
             self.stats_columns(),
-        ))
+        )))
     }
 
     /// Creates a write context for writing data to a specific partition.

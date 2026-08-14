@@ -24,7 +24,7 @@ const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 /// [`Transaction::write_state`](super::Transaction::write_state). Distributed writers can encode
 /// it, transport it to another process, decode it, and bind partition values there without
 /// transporting the transaction itself.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WriteState {
     pub(super) table_root: Url,
     /// Complete logical table schema, including partition columns.
@@ -95,7 +95,7 @@ impl WriteState {
     /// Returns an error if the table is not partitioned or if the partition keys or values are
     /// invalid.
     pub fn partitioned_write_context(
-        &self,
+        self: &Arc<Self>,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<BoundWriteContext> {
         require!(
@@ -131,7 +131,7 @@ impl WriteState {
         let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
 
         Ok(BoundWriteContext {
-            write_state: self.clone(),
+            write_state: Arc::clone(self),
             logical_to_physical,
             physical_partition_values: serialized,
         })
@@ -140,14 +140,14 @@ impl WriteState {
     /// Creates a write context for writing data to an unpartitioned table.
     ///
     /// Returns an error if the table has partition columns.
-    pub fn unpartitioned_write_context(&self) -> DeltaResult<BoundWriteContext> {
+    pub fn unpartitioned_write_context(self: &Arc<Self>) -> DeltaResult<BoundWriteContext> {
         require!(
             self.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
         let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
         Ok(BoundWriteContext {
-            write_state: self.clone(),
+            write_state: Arc::clone(self),
             logical_to_physical,
             physical_partition_values: HashMap::new(),
         })
@@ -166,14 +166,14 @@ impl WriteState {
         })?)
     }
 
-    /// Decodes a write state from JSON bytes produced by [`encode`](Self::encode).
+    /// Decodes shared write state from JSON bytes produced by [`encode`](Self::encode).
     ///
     /// The bytes must use the current write-state format version. Cross-version decoding is not
     /// supported.
     ///
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
-    pub fn decode(bytes: &[u8]) -> DeltaResult<Self> {
+    pub fn decode(bytes: &[u8]) -> DeltaResult<Arc<Self>> {
         let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
@@ -182,7 +182,7 @@ impl WriteState {
                 wire.version, WRITE_STATE_FORMAT_VERSION
             ))
         );
-        Ok(wire.write_state)
+        Ok(Arc::new(wire.write_state))
     }
 
     fn generate_logical_to_physical(
@@ -237,7 +237,7 @@ mod tests {
         materialize_partition_columns: bool,
         randomize_file_prefixes: bool,
         random_prefix_length: usize,
-    ) -> WriteState {
+    ) -> Arc<WriteState> {
         let year = StructField::not_null("year", DataType::INTEGER).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
@@ -258,7 +258,7 @@ mod tests {
                 MetadataValue::String("phys_value".into()),
             ),
         ]);
-        WriteState {
+        Arc::new(WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: Arc::new(StructType::new_unchecked([year, value])),
             logical_schema: schema_ref! { nullable "value": INTEGER },
@@ -269,7 +269,7 @@ mod tests {
             materialize_partition_columns,
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length).unwrap(),
-        }
+        })
     }
 
     #[rstest]
@@ -300,6 +300,8 @@ mod tests {
         let original_context = original.partitioned_write_context(values()).unwrap();
         let decoded_context = decoded.partitioned_write_context(values()).unwrap();
 
+        assert!(Arc::ptr_eq(&original, &original_context.write_state));
+        assert!(Arc::ptr_eq(&decoded, &decoded_context.write_state));
         assert_eq!(
             decoded_context.table_root_dir(),
             original_context.table_root_dir()
