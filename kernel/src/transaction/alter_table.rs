@@ -76,6 +76,7 @@ impl AlterTableTransaction {
             dv_matched_files: vec![],
             num_dv_updates: 0,
             physical_clustering_columns: None,
+            write_state: Default::default(),
             _state: PhantomData,
         })
     }

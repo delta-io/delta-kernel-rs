@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
@@ -68,6 +68,7 @@ pub(crate) mod data_layout;
 
 pub(crate) mod alter_table;
 pub use alter_table::AlterTableTransaction;
+mod bound_write_context;
 mod commit_info;
 mod domain_metadata;
 pub(crate) mod schema_evolution;
@@ -76,11 +77,12 @@ pub mod stats_verifier;
 #[cfg(not(feature = "internal-api"))]
 mod stats_verifier;
 mod update;
-mod write_context;
+mod write_state;
 mod write_validation;
 
+pub use bound_write_context::BoundWriteContext;
 use stats_verifier::StatsColumnVerifier;
-pub use write_context::{BoundWriteContext, WriteState};
+pub use write_state::WriteState;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -254,6 +256,9 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
+    // Initialized on the first write-state handout after write validation succeeds. All
+    // partition-bound contexts share this table-wide allocation.
+    write_state: OnceLock<Arc<WriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -323,6 +328,12 @@ where
 // Shared methods available on ALL transaction types
 // =============================================================================
 impl<S> Transaction<S> {
+    #[cfg(test)]
+    fn replace_effective_table_config(&mut self, table_config: TableConfiguration) {
+        self.effective_table_config = table_config;
+        self.write_state = OnceLock::new();
+    }
+
     /// Consume the transaction and commit it to the table. The result is a result of
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
@@ -1071,28 +1082,23 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// The returned state can create [`BoundWriteContext`] instances in this process,
     /// or it can be encoded and transported to distributed writers. All table-wide write
     /// validation runs before the state is returned so a writer does not begin producing files
-    /// for a table that kernel cannot write safely.
+    /// for a table that kernel cannot write to safely.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
     /// column defaults that the connector has not acknowledged.
-    pub fn write_state(&self) -> DeltaResult<WriteState> {
+    pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_context()?;
         self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
-        let table_config = &self.effective_table_config;
-        let props = table_config.table_properties();
-        Ok(WriteState {
-            table_root: table_config.table_root().clone(),
-            full_logical_schema: table_config.logical_schema(),
-            logical_schema: table_config.logical_schema_without_partition_columns(),
-            physical_schema: table_config.physical_write_schema(),
-            column_mapping_mode: table_config.column_mapping_mode(),
-            stats_columns: self.stats_columns(),
-            logical_partition_columns: table_config.logical_partition_columns().to_vec(),
-            materialize_partition_columns: table_config.should_materialize_partition_columns(),
-            randomize_file_prefixes: props.should_randomize_file_prefixes(),
-            random_prefix_length: props.random_prefix_length(),
-        })
+        Ok(self
+            .write_state
+            .get_or_init(|| {
+                Arc::new(WriteState::new(
+                    &self.effective_table_config,
+                    self.stats_columns(),
+                ))
+            })
+            .clone())
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -2095,11 +2101,12 @@ mod tests {
             .metadata()
             .clone()
             .with_schema(evolved_schema.clone())?;
-        txn.effective_table_config = TableConfiguration::try_new_with_schema(
+        let evolved_table_config = TableConfiguration::try_new_with_schema(
             &txn.effective_table_config,
             evolved_metadata,
             evolved_schema,
         )?;
+        txn.replace_effective_table_config(evolved_table_config);
 
         let updated_write_context = txn.unpartitioned_write_context()?;
         assert!(updated_write_context
@@ -2112,6 +2119,22 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_reuses_shared_write_state() -> Result<(), Box<dyn std::error::Error>> {
+        let (engine, snapshot) = setup_non_dv_table();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
+            .with_engine_info("default engine");
+
+        let first = txn.write_state()?;
+        let second = txn.write_state()?;
+        let context = txn.unpartitioned_write_context()?;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first, &context.shared));
         Ok(())
     }
 
@@ -2141,7 +2164,8 @@ mod tests {
             let mut txn = snapshot
                 .transaction(Box::new(FileSystemCommitter::new()), &engine)
                 .unwrap();
-            txn.effective_table_config = try_table_config(&txn, schema, writer_features).unwrap();
+            let table_config = try_table_config(&txn, schema, writer_features).unwrap();
+            txn.replace_effective_table_config(table_config);
             txn
         }
 
@@ -2706,12 +2730,13 @@ mod tests {
             .metadata()
             .clone()
             .with_configuration_entry(APPEND_ONLY, enabled.to_string());
-        txn.effective_table_config = TableConfiguration::try_new_from(
+        let table_config = TableConfiguration::try_new_from(
             &txn.effective_table_config,
             Some(metadata),
             None,
             txn.effective_table_config.version(),
         )?;
+        txn.replace_effective_table_config(table_config);
         Ok(())
     }
 
