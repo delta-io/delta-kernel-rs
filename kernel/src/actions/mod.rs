@@ -1221,21 +1221,12 @@ pub(crate) struct CheckpointAction {
 fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scalar> {
     let sidecar: StructData = sidecar.into();
     let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
-        .chain(sidecar.fields().iter().cloned());
+        .chain(sidecar.fields().iter().cloned())
+        .collect();
     let values = std::iter::once(Scalar::from(type_str))
         .chain(sidecar.values().iter().cloned())
         .collect();
-    // `from_values_unchecked`, not `try_new`: `Sidecar::tags` carries
-    // `#[allow_null_container_values]` so its schema field declares value-nullable maps, while
-    // the derived `.into()` value is a non-nullable map -- a leaf-level mismatch `try_new`
-    // would reject. This is inert because the enclosing `checkpoint_action_union_element` still
-    // validates the composite against `CONTENT_SIDECAR_FIELD`, and materialization derives map
-    // nullability from the schema, not the scalar. Tracked by delta-io/delta-kernel-rs#3136,
-    // which will let this use `try_new`.
-    Ok(Scalar::Struct(StructData::from_values_unchecked(
-        StructType::try_new(fields)?,
-        values,
-    )))
+    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
 }
 
 /// Wrap a single element `value` into a full union struct matching the checkpoint array's element

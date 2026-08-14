@@ -122,28 +122,23 @@ impl LogSegment {
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
-    ///
-    /// `crc_protocol` is the Protocol from the CRC that seeded this replay, if any. It is used only
-    /// to decide whether to run the adaptiveMetadata checkpoint pass (see below).
     #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
         crc_protocol: Option<&Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        // Providing a plan executor opts the engine into declarative P&M replay.
         #[cfg(feature = "declarative-plans")]
-        let actions_batches = match engine.plan_executor() {
+        let batches = match engine.plan_executor() {
             Some(executor) => self.read_pm_batches_via_plan(executor.as_ref())?,
             None => Box::new(self.read_pm_batches(engine)?) as _,
         };
-
         #[cfg(not(feature = "declarative-plans"))]
-        let actions_batches = self.read_pm_batches(engine)?;
+        let batches = self.read_pm_batches(engine)?;
 
         let mut metadata_opt = None;
         let mut protocol_opt = None;
-        for actions_batch in actions_batches {
+        for actions_batch in batches {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
@@ -156,56 +151,46 @@ impl LogSegment {
             }
         }
 
-        // An adaptiveMetadata manifest commit stores its Protocol and Metadata inside a
-        // `checkpoint` action rather than as top-level actions, so re-resolve P&M with that
-        // action included. The pass is a second scan, so run it only when the table might
-        // be adaptive: when a protocol we already have (from this replay or the CRC)
-        // enables the feature, or when P&M is incomplete and there is no CRC to supply it
-        // (the checkpoint action is then the only possible source).
+        // Second pass: phase 1 reads P&M only from `protocol`/`metaData` actions. With
+        // `declarative-plans` it runs an engine plan that can't unnest the `checkpoint` action, and
+        // folding the action into one scan would drop the plan for non-adaptive tables too, so we
+        // re-resolve here. TODO: add an unnest op to the plan IR (+ proto) so a single pass for
+        // resolving P&M can be performed with AMT.
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        {
-            let known_adaptive = protocol_opt
-                .as_ref()
-                .or(crc_protocol)
-                .is_some_and(protocol_enables_adaptive);
-            let incomplete_without_crc =
-                (metadata_opt.is_none() || protocol_opt.is_none()) && crc_protocol.is_none();
-            if known_adaptive || incomplete_without_crc {
-                if let Some((metadata, protocol)) =
-                    self.read_pm_including_checkpoint_action(engine)?
-                {
-                    return Ok((Some(metadata), Some(protocol)));
-                }
-            }
-        }
+        let (metadata_opt, protocol_opt) =
+            self.reconcile_pm_with_checkpoint(engine, metadata_opt, protocol_opt, crc_protocol)?;
 
         Ok((metadata_opt, protocol_opt))
     }
 
-    /// Resolve Protocol and Metadata from the newest `checkpoint` action, overridable by top-level
-    /// actions in later commits.
-    ///
-    /// An adaptiveMetadata manifest commit stores its Protocol and Metadata inside a `checkpoint`
-    /// action (see [`CheckpointAction`]) rather than as top-level actions. Replaying newest-first,
-    /// top-level actions from later commits are seen first and win; the newest `checkpoint` action
-    /// supplies whatever they did not set.
-    ///
-    /// Returns `None` when the top-level actions already resolve both, or when the log has no
-    /// `checkpoint` action at all -- in both cases the caller's top-level result stands. Errors
-    /// with [`Error::invalid_protocol`] if a `checkpoint` action is present but the protocol
-    /// does not enable the `adaptiveMetadata` reader feature.
+    /// Re-resolve P&M including any `checkpoint` action; newest wins, so a later top-level commit
+    /// overrides it. Returns `top_level_*` unchanged when there is no `checkpoint` action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn read_pm_including_checkpoint_action(
+    fn reconcile_pm_with_checkpoint(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<Option<(Metadata, Protocol)>> {
+        top_level_metadata: Option<Metadata>,
+        top_level_protocol: Option<Protocol>,
+        crc_protocol: Option<&Protocol>,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        // Skip the extra scan when the table can't be adaptive: not flagged adaptive and P&M is
+        // either complete or covered by a CRC.
+        let known_adaptive = top_level_protocol
+            .as_ref()
+            .or(crc_protocol)
+            .is_some_and(protocol_enables_adaptive);
+        let incomplete_without_crc = (top_level_metadata.is_none() || top_level_protocol.is_none())
+            && crc_protocol.is_none();
+        if !(known_adaptive || incomplete_without_crc) {
+            return Ok((top_level_metadata, top_level_protocol));
+        }
+
         let schema =
             get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
         let mut metadata_opt = None;
         let mut protocol_opt = None;
         for actions_batch in self.read_actions(engine, schema)? {
             let actions = actions_batch?.actions;
-            // Keep the first (newest) protocol and metadata seen.
             if metadata_opt.is_none() {
                 metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
             }
@@ -213,9 +198,7 @@ impl LogSegment {
                 protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
 
-            // A checkpoint action is complete state at its version. On reaching it (newest-first),
-            // everything newer is already captured above and everything older is subsumed, so fill
-            // any remaining gaps from it and we are done.
+            // A `checkpoint` action is complete state at its version: fill any gap and stop.
             if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
                 let metadata = metadata_opt.unwrap_or_else(|| checkpoint.metadata().clone());
                 let protocol = protocol_opt.unwrap_or_else(|| checkpoint.protocol().clone());
@@ -226,18 +209,15 @@ impl LogSegment {
                          adaptiveMetadata reader feature"
                     )
                 );
-                return Ok(Some((metadata, protocol)));
+                return Ok((Some(metadata), Some(protocol)));
             }
 
-            // Both resolved from top-level commits newer than any checkpoint, so no checkpoint can
-            // override them; the caller's top-level result already matches.
             if metadata_opt.is_some() && protocol_opt.is_some() {
-                return Ok(None);
+                break;
             }
         }
 
-        // No checkpoint action: not an adaptiveMetadata table, so the caller keeps its result.
-        Ok(None)
+        Ok((top_level_metadata, top_level_protocol))
     }
 
     #[cfg(feature = "declarative-plans")]
