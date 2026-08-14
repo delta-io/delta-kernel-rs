@@ -90,7 +90,7 @@ impl LogSegment {
                 crc.version
             );
             let pruned = self.segment_after_version(crc.version);
-            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine)?;
+            let (metadata_opt, protocol_opt) = pruned.replay_for_pm(engine, Some(&crc.protocol))?;
 
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 info!("Found P&M from pruned log replay");
@@ -113,7 +113,7 @@ impl LogSegment {
         }
 
         // Case 3: Full P&M log replay.
-        let (metadata_opt, protocol_opt) = self.replay_for_pm(engine)?;
+        let (metadata_opt, protocol_opt) = self.replay_for_pm(engine, None)?;
         Ok((
             metadata_opt,
             protocol_opt,
@@ -122,9 +122,14 @@ impl LogSegment {
     }
 
     /// Replays the log segment for Protocol and Metadata, stopping early once both are found.
+    ///
+    /// `crc_protocol` is the Protocol from the CRC that seeded this replay, if any. It is used only
+    /// to decide whether to run the adaptiveMetadata checkpoint pass (see below).
+    #[cfg_attr(not(feature = "adaptive-metadata-in-dev"), allow(unused_variables))]
     fn replay_for_pm(
         &self,
         engine: &dyn Engine,
+        crc_protocol: Option<&Protocol>,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         // Providing a plan executor opts the engine into declarative P&M replay.
         #[cfg(feature = "declarative-plans")]
@@ -151,73 +156,93 @@ impl LogSegment {
             }
         }
 
-        // A manifest commit on an adaptiveMetadata table stores Protocol and Metadata inside its
-        // self-contained `checkpoint` action rather than as top-level actions, so the scan above
-        // (which only inspects the top-level `protocol`/`metaData` columns, and likewise the
-        // declarative-plan path) can come up empty. Fall back to a checkpoint-aware replay.
+        // An adaptiveMetadata manifest commit stores its Protocol and Metadata inside a
+        // `checkpoint` action rather than as top-level actions, so re-resolve P&M with that
+        // action included. The pass is a second scan, so run it only when the table might
+        // be adaptive: when a protocol we already have (from this replay or the CRC)
+        // enables the feature, or when P&M is incomplete and there is no CRC to supply it
+        // (the checkpoint action is then the only possible source).
         #[cfg(feature = "adaptive-metadata-in-dev")]
-        if metadata_opt.is_none() || protocol_opt.is_none() {
-            self.fill_pm_from_checkpoint_action(engine, &mut metadata_opt, &mut protocol_opt)?;
+        {
+            let known_adaptive = protocol_opt
+                .as_ref()
+                .or(crc_protocol)
+                .is_some_and(protocol_enables_adaptive);
+            let incomplete_without_crc =
+                (metadata_opt.is_none() || protocol_opt.is_none()) && crc_protocol.is_none();
+            if known_adaptive || incomplete_without_crc {
+                if let Some((metadata, protocol)) =
+                    self.resolve_pm_anchored_on_checkpoint(engine)?
+                {
+                    return Ok((Some(metadata), Some(protocol)));
+                }
+            }
         }
 
         Ok((metadata_opt, protocol_opt))
     }
 
-    /// Fallback P&M resolution for adaptiveMetadata manifest-commit tables.
+    /// Resolve Protocol and Metadata from the newest `checkpoint` action, overridable by top-level
+    /// actions in later commits.
     ///
-    /// A manifest commit embeds Protocol and Metadata inside its self-contained `checkpoint`
-    /// action (see [`CheckpointAction`]), so the ordinary top-level scan in
-    /// [`Self::replay_for_pm`] finds nothing. This does a second projected replay that also reads
-    /// the `checkpoint` column and fills any still-missing P&M from the embedded copies. Values
-    /// already resolved from top-level actions are left untouched, so a newer top-level action
-    /// still wins over an embedded copy.
+    /// An adaptiveMetadata manifest commit stores its Protocol and Metadata inside a `checkpoint`
+    /// action (see [`CheckpointAction`]). Replaying newest-first with first-of-each-wins, top-level
+    /// actions from later commits win over the checkpoint's embedded values, and the newest
+    /// `checkpoint` action supplies whatever they did not set.
     ///
-    /// Errors with [`Error::invalid_protocol`] if a `checkpoint` action is present but the resolved
-    /// protocol does not enable the `adaptiveMetadata` reader feature.
+    /// Returns `None` when the log has no `checkpoint` action, leaving the caller's top-level
+    /// resolution in force. Errors with [`Error::invalid_protocol`] if a `checkpoint` action is
+    /// present but the protocol does not enable the `adaptiveMetadata` reader feature.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn fill_pm_from_checkpoint_action(
+    fn resolve_pm_anchored_on_checkpoint(
         &self,
         engine: &dyn Engine,
-        metadata_opt: &mut Option<Metadata>,
-        protocol_opt: &mut Option<Protocol>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let schema =
             get_commit_schema().project(&[PROTOCOL_NAME, METADATA_NAME, CHECKPOINT_ACTION_NAME])?;
-        let mut checkpoint_action_seen = false;
+        let mut metadata_opt = None;
+        let mut protocol_opt = None;
+        let mut saw_checkpoint = false;
         for actions_batch in self.read_actions(engine, schema)? {
             let actions = actions_batch?.actions;
+            // Keep the first (newest) protocol and metadata seen.
             if metadata_opt.is_none() {
-                *metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
             }
             if protocol_opt.is_none() {
-                *protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
-            if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
-                checkpoint_action_seen = true;
-                checkpoint.fill_missing_pm(protocol_opt, metadata_opt);
+            if !saw_checkpoint {
+                if let Some(checkpoint) = CheckpointAction::try_new_from_data(actions.as_ref())? {
+                    // The first checkpoint reached is the newest; use it for any P&M not yet set.
+                    saw_checkpoint = true;
+                    metadata_opt.get_or_insert_with(|| checkpoint.metadata().clone());
+                    protocol_opt.get_or_insert_with(|| checkpoint.protocol().clone());
+                }
             }
-            if metadata_opt.is_some() && protocol_opt.is_some() {
+            if saw_checkpoint && metadata_opt.is_some() && protocol_opt.is_some() {
                 break;
             }
         }
 
-        // A checkpoint action is only valid on a table that declares the adaptiveMetadata reader
-        // feature; reject one found under a protocol that does not.
-        if checkpoint_action_seen {
-            if let Some(protocol) = protocol_opt.as_ref() {
-                let feature_enabled = protocol.reader_features().is_some_and(|features| {
-                    features.contains(&TableFeature::AdaptiveMetadataPreview)
-                });
-                require!(
-                    feature_enabled,
-                    Error::invalid_protocol(
-                        "found a checkpoint action but the protocol does not enable the \
-                         adaptiveMetadata reader feature"
-                    )
-                );
-            }
+        // No checkpoint action means the table is not adaptive; let the caller keep its result.
+        if !saw_checkpoint {
+            return Ok(None);
         }
-        Ok(())
+        // A checkpoint action always embeds both Protocol and Metadata.
+        let (Some(metadata), Some(protocol)) = (metadata_opt, protocol_opt) else {
+            return Ok(None);
+        };
+
+        // A checkpoint action is only valid when the protocol enables the adaptiveMetadata feature.
+        require!(
+            protocol_enables_adaptive(&protocol),
+            Error::invalid_protocol(
+                "found a checkpoint action but the protocol does not enable the \
+                 adaptiveMetadata reader feature"
+            )
+        );
+        Ok(Some((metadata, protocol)))
     }
 
     #[cfg(feature = "declarative-plans")]
@@ -282,6 +307,14 @@ impl LogSegment {
     }
 }
 
+/// Whether `protocol` enables the `adaptiveMetadata` reader feature.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn protocol_enables_adaptive(protocol: &Protocol) -> bool {
+    protocol
+        .reader_features()
+        .is_some_and(|features| features.contains(&TableFeature::AdaptiveMetadataPreview))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -309,14 +342,15 @@ mod tests {
     const SCHEMA_STRING: &str =
         r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}"#;
 
-    // Build a manifest-commit `checkpoint` action commit line embedding Protocol + Metadata, with
-    // the given reader/writer features and schema. The commit has NO top-level protocol/metaData,
-    // so P&M can only be resolved from the checkpoint action.
+    // Build a manifest-commit `checkpoint` action commit line embedding Protocol + Metadata at the
+    // given `checkpointMetadata.version`, with the given reader/writer features and schema. The
+    // commit has NO top-level protocol/metaData, so P&M can only be resolved from the checkpoint
+    // action.
     #[cfg(feature = "adaptive-metadata-in-dev")]
-    fn checkpoint_commit(features: &[&str], schema_string: &str) -> String {
+    fn checkpoint_commit(version: i64, features: &[&str], schema_string: &str) -> String {
         serde_json::json!({ "checkpoint": [
-            { "checkpointMetadata": { "version": 0 } },
-            { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": 0 } },
+            { "checkpointMetadata": { "version": version } },
+            { "contentRoot": { "path": "metadata/root.parquet", "sizeInBytes": 1, "version": version } },
             { "protocol": {
                 "minReaderVersion": 3, "minWriterVersion": 7,
                 "readerFeatures": features, "writerFeatures": features,
@@ -332,6 +366,24 @@ mod tests {
         .to_string()
     }
 
+    // Build a top-level `metaData` commit line with the given schema (no protocol).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn metadata_commit(schema_string: &str) -> String {
+        serde_json::json!({ "metaData": {
+            "id": "test-table",
+            "format": { "provider": "parquet", "options": {} },
+            "schemaString": schema_string,
+            "partitionColumns": [],
+            "configuration": {},
+        } })
+        .to_string()
+    }
+
+    // A two-column schema, used to distinguish "newer" metadata from the single-column
+    // `SCHEMA_STRING` in override tests.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    const TWO_COLUMN_SCHEMA_STRING: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
+
     // Loading a table whose only commit is a manifest-commit `checkpoint` action must resolve
     // Protocol and Metadata from inside that action (they are not present as top-level actions).
     #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -344,7 +396,7 @@ mod tests {
             table_root.as_str(),
             store.as_ref(),
             0,
-            checkpoint_commit(&["adaptiveMetadata-preview"], SCHEMA_STRING),
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
         )
         .await
         .unwrap();
@@ -370,7 +422,7 @@ mod tests {
             table_root.as_str(),
             store.as_ref(),
             0,
-            checkpoint_commit(&[], SCHEMA_STRING),
+            checkpoint_commit(0, &[], SCHEMA_STRING),
         )
         .await
         .unwrap();
@@ -397,27 +449,56 @@ mod tests {
             table_root.as_str(),
             store.as_ref(),
             0,
-            checkpoint_commit(&["adaptiveMetadata-preview"], SCHEMA_STRING),
+            checkpoint_commit(0, &["adaptiveMetadata-preview"], SCHEMA_STRING),
         )
         .await
         .unwrap();
         // A metadata-only log commit at v1 with a two-column schema.
-        let new_schema = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"name","type":"string","nullable":true,"metadata":{}}]}"#;
-        let metadata_commit = serde_json::json!({ "metaData": {
-            "id": "test-table",
-            "format": { "provider": "parquet", "options": {} },
-            "schemaString": new_schema,
-            "partitionColumns": [],
-            "configuration": {},
-        } })
-        .to_string();
-        add_commit(table_root.as_str(), store.as_ref(), 1, metadata_commit)
-            .await
-            .unwrap();
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            metadata_commit(TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
 
         let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
         assert_eq!(snapshot.version(), 1);
         // Newer metadata (two columns) wins over the checkpoint action's single-column metadata.
+        assert!(snapshot.schema().field("name").is_some());
+    }
+
+    // When a newer checkpoint action carries metadata that differs from an older top-level
+    // metaData, the checkpoint's metadata must win.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[tokio::test]
+    async fn test_newer_checkpoint_action_metadata_overrides_older_top_level_metadata() {
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store.clone());
+        let table_root = url::Url::parse("memory:///").unwrap();
+        // v0: a top-level metaData with a single-column schema (the older, subsumed metadata).
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            0,
+            metadata_commit(SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+        // v1: a manifest-commit checkpoint action embedding a two-column schema.
+        add_commit(
+            table_root.as_str(),
+            store.as_ref(),
+            1,
+            checkpoint_commit(1, &["adaptiveMetadata-preview"], TWO_COLUMN_SCHEMA_STRING),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert_eq!(snapshot.version(), 1);
+        // The checkpoint action's metadata (two columns) wins over the older top-level metaData.
         assert!(snapshot.schema().field("name").is_some());
     }
 
