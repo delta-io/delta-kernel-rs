@@ -64,9 +64,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{ColumnName, Expression, ExpressionRef};
+use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::utils::{CollectInto, FoldWithOption as _};
+use crate::utils::CollectInto;
 use crate::{DeltaResult, Error};
 
 // === Raw expression patch ===
@@ -923,8 +923,10 @@ impl<'a> ProjectionStructPatchBuilder<'a> {
 
 /// Joins an optional input prefix with a field name into a (possibly nested) input column path.
 fn join_prefix(prefix: Option<&ColumnName>, name: &str) -> ColumnName {
-    let leaf = ColumnName::new([name]);
-    leaf.fold_with(prefix, |leaf, prefix| prefix.join(&leaf))
+    match prefix {
+        Some(prefix) => column_name!(..(prefix), (name)),
+        None => column_name!((name)),
+    }
 }
 
 #[cfg(test)]

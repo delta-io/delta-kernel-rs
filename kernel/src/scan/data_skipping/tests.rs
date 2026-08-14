@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rstest::rstest;
 
 use super::*;
-use crate::expressions::{col, column_expr_ref, column_name, lit};
+use crate::expressions::{col, column_name, lit};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, UnimplementedColumnResolver,
 };
@@ -1175,10 +1175,10 @@ fn test_interval_partition_columns_are_not_pruning_columns(
     )]));
     let (_, _, partition_columns) = DataSkippingFilter::build_unified_schema_and_expr(
         None,
-        column_expr_ref!("stats_parsed"),
+        col!("stats_parsed"),
         Some(&partition_schema),
-        column_expr_ref!("partitionValues_parsed"),
-        Arc::new(Expr::literal(true)),
+        col!("partitionValues_parsed"),
+        Pred::TRUE,
     )
     .unwrap();
 

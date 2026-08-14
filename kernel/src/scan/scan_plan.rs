@@ -17,7 +17,7 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, ColumnName, Expression as Expr, ExpressionRef, Predicate,
+    col, column_name, ColumnName, Expression as Expr, ExpressionRef, Predicate,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -176,7 +176,7 @@ impl Scan {
                     )
                     .append(
                         FILE_ACTION_KEY_FIELD.clone(),
-                        file_action_key_expr(|col| joined_column_expr!("add", col)),
+                        file_action_key_expr(|col| col!("add", ..(col))),
                     )
             })
     }
@@ -219,10 +219,7 @@ impl Scan {
                     .append(
                         FILE_ACTION_KEY_FIELD.clone(),
                         file_action_key_expr(|col| {
-                            Expr::coalesce([
-                                joined_column_expr!("add", col),
-                                joined_column_expr!("remove", col),
-                            ])
+                            Expr::coalesce([col!("add", ..(&col)), col!("remove", ..(&col))])
                         }),
                     )
             })
@@ -512,7 +509,7 @@ fn project_nested_struct_to_schema(
 ) -> Expr {
     let root = root.collect_into();
     let fields = schema.fields().map(|field| {
-        let column = root.join(&ColumnName::new([field.name()]));
+        let column = column_name!(..(&root), (field.name()));
         match field.data_type() {
             DataType::Struct(schema) => project_nested_struct_to_schema(column, schema),
             _ => Expr::from(column),

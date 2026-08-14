@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
-use crate::expressions::joined_column_name;
+use crate::expressions::column_name;
 
 /// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
@@ -457,7 +457,7 @@ fn collect_fields_from_datatype(
             // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
 
             // For arrays, we use "element" as the path segment and recurse into element type
-            let element_path = joined_column_name!(parent_path, "element");
+            let element_path = column_name!(..(parent_path), "element");
             collect_fields_from_datatype(array_type.element_type(), &element_path, out)?;
         }
         DataType::Map(map_type) => {
@@ -467,10 +467,10 @@ fn collect_fields_from_datatype(
             // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
 
             // For maps, we use "key" and "value" as path segments and recurse into both types
-            let key_path = joined_column_name!(parent_path, "key");
+            let key_path = column_name!(..(parent_path), "key");
             collect_fields_from_datatype(map_type.key_type(), &key_path, out)?;
 
-            let value_path = joined_column_name!(parent_path, "value");
+            let value_path = column_name!(..(parent_path), "value");
             collect_fields_from_datatype(map_type.value_type(), &value_path, out)?;
         }
         _ => {
@@ -488,7 +488,7 @@ fn collect_all_fields_with_paths(
     out: &mut Vec<FieldWithPath>,
 ) -> Result<(), SchemaDiffError> {
     for field in schema.fields() {
-        let field_path = parent_path.join(&ColumnName::new([field.name()]));
+        let field_path = column_name!(..(parent_path), (field.name()));
 
         // Only struct fields can have field IDs in column mapping
         let field_id = get_field_id_for_path(field, &field_path)?;

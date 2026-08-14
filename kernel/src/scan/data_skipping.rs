@@ -9,9 +9,8 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
-    col, column_name, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr,
-    ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
-    Scalar,
+    col, column_pred, lit, BinaryPredicateOp, ColumnName, Expression as Expr, ExpressionRef,
+    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -125,10 +124,10 @@ impl DataSkippingFilter {
     ///   matching `partition_schema`. Typically a `MapToStruct` expression that converts the
     ///   `partitionValues` string map into a typed struct. Only used when `partition_schema` is
     ///   `Some`.
-    /// - `is_add_expr`: Boolean expression that is true for Add rows and false for Remove and other
-    ///   non-file rows (e.g. `path IS NOT NULL` against a transformed batch, or `add.path IS NOT
-    ///   NULL` against a raw action batch). Used to guard partition predicates and opaque-predicate
-    ///   rewrites so non-Add rows are never filtered out.
+    /// - `is_add`: Predicate that is true for Add rows and false for Remove and other non-file rows
+    ///   (e.g. `path IS NOT NULL` against a transformed batch, or `add.path IS NOT NULL` against a
+    ///   raw action batch). Used to guard partition predicates and opaque-predicate rewrites so
+    ///   non-Add rows are never filtered out.
     /// - `input_schema`: Schema of the batch that will be passed to [`apply()`](Self::apply)
     /// - `stats_columns`: Physical leaf paths whose stats are in `stats_schema`. References to
     ///   other data columns fold to NULL (keeping the file). Must line up with `stats_schema` --
@@ -140,10 +139,10 @@ impl DataSkippingFilter {
         engine: &dyn Engine,
         predicate: Option<PredicateRef>,
         stats_schema: Option<&SchemaRef>,
-        stats_expr: ExpressionRef,
+        stats_expr: impl Into<ExpressionRef>,
         partition_schema: Option<&SchemaRef>,
-        partition_expr: ExpressionRef,
-        is_add_expr: ExpressionRef,
+        partition_expr: impl Into<ExpressionRef>,
+        is_add: impl Into<Pred>,
         input_schema: SchemaRef,
         stats_columns: &HashSet<ColumnName>,
         metrics: Option<Arc<ScanMetrics>>,
@@ -168,7 +167,7 @@ impl DataSkippingFilter {
                 stats_expr,
                 partition_schema,
                 partition_expr,
-                is_add_expr,
+                is_add,
             )?;
 
         let stats_evaluator = engine
@@ -238,7 +237,7 @@ impl DataSkippingFilter {
     /// (references no stats columns, or fails evaluator construction).
     ///
     /// Pruning applies only to Add rows: Remove and cdc rows (null `add.path`) are never pruned,
-    /// guarded by the `add.path IS NOT NULL` `is_add` expression wired in below. Callers on the
+    /// guarded by the `add.path IS NOT NULL` `is_add` predicate wired in below. Callers on the
     /// change-data-feed path rely on this so tombstones survive a non-matching predicate.
     ///
     /// # Parameters
@@ -272,20 +271,14 @@ impl DataSkippingFilter {
         // Parse JSON stats from the raw action batch's `add.stats` column, parse partition values
         // from the raw `add.partitionValues` string map, and identify Add rows by
         // `add.path IS NOT NULL` (raw batches keep the nested layout).
-        let stats_expr = Arc::new(Expr::parse_json(
-            col!("add.stats"),
-            physical_stats_schema.clone(),
-        ));
-        let partition_expr = Arc::new(Expr::map_to_struct(col!("add.partitionValues")));
-        let is_add_expr = Arc::new(Pred::is_not_null(col!("add.path")).into());
         Self::new(
             engine,
             Some(physical_predicate),
             Some(&physical_stats_schema),
-            stats_expr,
+            Expr::parse_json(col!("add.stats"), physical_stats_schema.clone()),
             partition_schema.as_ref(),
-            partition_expr,
-            is_add_expr,
+            Expr::map_to_struct(col!("add.partitionValues")),
+            col!("add.path").is_not_null(),
             input_schema,
             &physical_stats_columns,
             None,
@@ -305,11 +298,14 @@ impl DataSkippingFilter {
     /// `partitionValues_parsed` when present.
     fn build_unified_schema_and_expr(
         physical_stats_schema: Option<&SchemaRef>,
-        stats_expr: ExpressionRef,
+        stats_expr: impl Into<ExpressionRef>,
         physical_partition_schema: Option<&SchemaRef>,
-        partition_expr: ExpressionRef,
-        is_add_expr: ExpressionRef,
+        partition_expr: impl Into<ExpressionRef>,
+        is_add: impl Into<Pred>,
     ) -> Option<(SchemaRef, ExpressionRef, HashSet<ColumnName>)> {
+        let stats_expr = stats_expr.into();
+        let partition_expr = partition_expr.into();
+        let is_add = Arc::new(Expr::from(is_add.into()));
         let partition_columns: HashSet<ColumnName> = physical_partition_schema
             .map(|s| {
                 s.fields()
@@ -336,36 +332,28 @@ impl DataSkippingFilter {
             |ps: &SchemaRef| StructField::nullable("partitionValues_parsed", ps.as_ref().clone());
         let is_add_field = StructField::not_null("is_add", DataType::BOOLEAN);
 
-        // Always include an `is_add` boolean (extracted by the caller-provided `is_add_expr`,
-        // true for Add rows and false for Remove/non-file rows) so that predicates can guard
-        // against filtering Remove rows: partition predicates and opaque-predicate rewrites are
-        // wrapped with `OR(NOT is_add, ...)` (see `guard_for_removes`).
+        // Always include an `is_add` boolean (extracted by the caller-provided `is_add`
+        // predicate, true for Add rows and false for Remove/non-file rows) so that predicates can
+        // guard against filtering Remove rows: partition predicates and opaque-predicate rewrites
+        // are wrapped with `OR(NOT is_add, ...)` (see `guard_for_removes`).
         let unified_schema = match (physical_stats_schema, physical_partition_schema) {
-            (Some(stats), Some(ps)) => Arc::new(StructType::new_unchecked([
-                stats_field(stats),
-                partition_field(ps),
-                is_add_field,
-            ])),
-            (Some(stats), None) => Arc::new(StructType::new_unchecked([
-                stats_field(stats),
-                is_add_field,
-            ])),
-            (None, Some(ps)) => Arc::new(StructType::new_unchecked([
-                partition_field(ps),
-                is_add_field,
-            ])),
+            (Some(s), Some(ps)) => vec![stats_field(s), partition_field(ps), is_add_field],
+            (Some(stats), None) => vec![stats_field(stats), is_add_field],
+            (None, Some(ps)) => vec![partition_field(ps), is_add_field],
             (None, None) => return None,
         };
+        let unified_schema = Arc::new(StructType::new_unchecked(unified_schema));
 
         let unified_expr = match (
             physical_stats_schema.is_some(),
             physical_partition_schema.is_some(),
         ) {
-            (true, true) => Arc::new(Expr::struct_from([stats_expr, partition_expr, is_add_expr])),
-            (true, false) => Arc::new(Expr::struct_from([stats_expr, is_add_expr])),
-            (false, true) => Arc::new(Expr::struct_from([partition_expr, is_add_expr])),
+            (true, true) => vec![stats_expr, partition_expr, is_add],
+            (true, false) => vec![stats_expr, is_add],
+            (false, true) => vec![partition_expr, is_add],
             (false, false) => return None,
         };
+        let unified_expr = Arc::new(Expr::struct_from(unified_expr));
 
         Some((unified_schema, unified_expr, partition_columns))
     }
@@ -516,7 +504,7 @@ fn adjust_scalar_for_max_stat_truncation(val: &Scalar) -> Scalar {
 /// The `partitionValues_parsed.<col>` reference holding a partition column's exact value, which
 /// serves as both its min and max stat. `col` is a top-level physical partition name.
 fn partition_value_expr(col: &ColumnName) -> Expr {
-    Expr::from(column_name!(PARTITION_VALUES_PARSED_NAME).join(col))
+    col!(PARTITION_VALUES_PARSED_NAME, ..(col))
 }
 
 /// Whether a rewritten stat expression references `partitionValues_parsed`.
@@ -564,7 +552,7 @@ impl DataSkippingColumns<'_> {
             Some(partition_value_expr(col))
         } else {
             (self.is_stats_column(col) && has_min_max_stats(data_type))
-                .then(|| Expr::from(column_name!("stats_parsed", MIN_VALUES).join(col)))
+                .then(|| col!("stats_parsed", MIN_VALUES, ..(col)))
         }
     }
 
@@ -575,7 +563,7 @@ impl DataSkippingColumns<'_> {
             Some(partition_value_expr(col))
         } else {
             (self.is_stats_column(col) && has_min_max_stats(data_type))
-                .then(|| Expr::from(column_name!("stats_parsed", MAX_VALUES).join(col)))
+                .then(|| col!("stats_parsed", MAX_VALUES, ..(col)))
         }
     }
 
@@ -597,7 +585,7 @@ impl DataSkippingColumns<'_> {
             None
         } else {
             self.is_stats_column(col)
-                .then(|| Expr::from(column_name!("stats_parsed", NULL_COUNT).join(col)))
+                .then(|| col!("stats_parsed", NULL_COUNT, ..(col)))
         }
     }
 

@@ -12,8 +12,7 @@ use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
-    PredicateRef, UnaryExpressionOp,
+    col, column_name, ColumnName, Expression, ExpressionRef, PredicateRef, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -291,12 +290,12 @@ impl ScanLogReplayProcessor {
                 engine,
                 physical_predicate.as_ref().map(|(p, _)| p.clone()),
                 stats_schema_for_transform.as_ref(),
-                column_expr_ref!("stats_parsed"),
+                col!("stats_parsed"),
                 partition_schema_for_transform.as_ref(),
-                column_expr_ref!("partitionValues_parsed"),
+                col!("partitionValues_parsed"),
                 // The transform flattens `add.*` to top-level columns, so `path` is non-null
                 // exactly for Add rows.
-                Arc::new(Predicate::is_not_null(col!("path")).into()),
+                col!("path").is_not_null(),
                 output_schema.clone(),
                 &state_info.physical_stats_columns,
                 Some(metrics.clone()),
@@ -830,33 +829,33 @@ fn get_add_transform_expr(
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
-        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+        Expression::Literal(Scalar::Null(DataType::STRING))
     } else if has_stats_parsed && synthesize_json {
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
-        Arc::new(Expression::coalesce([
+        Expression::coalesce([
             col!("add.stats"),
             Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
-        ]))
+        ])
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
-        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+        Expression::Literal(Scalar::Null(DataType::STRING))
     } else {
-        column_expr_ref!("add.stats")
+        col!("add.stats")
     };
     let mut fields = vec![
-        column_expr_ref!("add.path"),
-        column_expr_ref!("add.size"),
-        column_expr_ref!("add.modificationTime"),
+        col!("add.path"),
+        col!("add.size"),
+        col!("add.modificationTime"),
         stats_expr,
-        column_expr_ref!("add.deletionVector"),
-        Arc::new(Expression::struct_from([
-            column_expr_ref!("add.partitionValues"),
-            column_expr_ref!("add.baseRowId"),
-            column_expr_ref!("add.defaultRowCommitVersion"),
-            column_expr_ref!("add.tags"),
-            column_expr_ref!("add.clusteringProvider"),
-        ])),
+        col!("add.deletionVector"),
+        Expression::struct_from([
+            col!("add.partitionValues"),
+            col!("add.baseRowId"),
+            col!("add.defaultRowCommitVersion"),
+            col!("add.tags"),
+            col!("add.clusteringProvider"),
+        ]),
     ];
 
     // Add stats_parsed when stats output is requested (using physical column names)
@@ -868,7 +867,7 @@ fn get_add_transform_expr(
             // No stats_parsed available (JSON log files) - parse JSON
             Expression::parse_json(col!("add.stats"), stats_schema)
         };
-        fields.push(Arc::new(stats_parsed_expr));
+        fields.push(stats_parsed_expr);
     }
 
     // Add partitionValues_parsed when partition columns are needed for data skipping or for the
@@ -881,7 +880,7 @@ fn get_add_transform_expr(
             // No native column (JSON commit): reconstruct from the string map.
             Expression::map_to_struct(col!("add.partitionValues"))
         };
-        fields.push(Arc::new(pv_parsed_expr));
+        fields.push(pv_parsed_expr);
     }
 
     Arc::new(Expression::struct_from(fields))
@@ -892,20 +891,18 @@ fn get_add_transform_expr(
 #[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
-        Arc::new(Expression::struct_from([Arc::new(
-            Expression::struct_from([
-                column_expr_ref!("path"),
-                column_expr_ref!("fileConstantValues.partitionValues"),
-                column_expr_ref!("size"),
-                column_expr_ref!("modificationTime"),
-                column_expr_ref!("stats"),
-                column_expr_ref!("fileConstantValues.tags"),
-                column_expr_ref!("deletionVector"),
-                column_expr_ref!("fileConstantValues.baseRowId"),
-                column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
-                column_expr_ref!("fileConstantValues.clusteringProvider"),
-            ]),
-        )]))
+        Arc::new(Expression::struct_from([Expression::struct_from([
+            col!("path"),
+            col!("fileConstantValues.partitionValues"),
+            col!("size"),
+            col!("modificationTime"),
+            col!("stats"),
+            col!("fileConstantValues.tags"),
+            col!("deletionVector"),
+            col!("fileConstantValues.baseRowId"),
+            col!("fileConstantValues.defaultRowCommitVersion"),
+            col!("fileConstantValues.clusteringProvider"),
+        ])]))
     });
     EXPR.clone()
 }

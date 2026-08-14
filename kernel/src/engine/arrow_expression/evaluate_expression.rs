@@ -1128,9 +1128,8 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        col, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-        Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
-        Predicate as Pred, StructData,
+        col, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+        ExpressionStructPatchBuilder, JunctionPredicateOp, MapData, Predicate as Pred, StructData,
     };
     use crate::schema::{
         schema, schema_ref, ArrayType, DataType, MapType, StructField, StructType,
@@ -1572,7 +1571,7 @@ mod tests {
         let test_cases = vec![
             (
                 "too many schema fields",
-                Expr::struct_from([column_expr_ref!("a"), column_expr_ref!("b")]),
+                Expr::struct_from([col!("a"), col!("b")]),
                 StructType::new_unchecked(vec![
                     StructField::not_null("a", DataType::INTEGER),
                     StructField::not_null("b", DataType::INTEGER),
@@ -1581,11 +1580,7 @@ mod tests {
             ),
             (
                 "too few schema fields",
-                Expr::struct_from([
-                    column_expr_ref!("a"),
-                    column_expr_ref!("b"),
-                    column_expr_ref!("c"),
-                ]),
+                Expr::struct_from([col!("a"), col!("b"), col!("c")]),
                 StructType::new_unchecked(vec![
                     StructField::not_null("a", DataType::INTEGER),
                     StructField::not_null("b", DataType::INTEGER),
@@ -1866,11 +1861,11 @@ mod tests {
         let batch = create_test_batch();
 
         // Valid: column matches expected type
-        let result = evaluate_expression(&column_expr_ref!("a"), &batch, Some(&DataType::INTEGER));
+        let result = evaluate_expression(&col!("a"), &batch, Some(&DataType::INTEGER));
         assert!(result.is_ok());
 
         // Error: column type mismatch
-        let result = evaluate_expression(&column_expr_ref!("a"), &batch, Some(&DataType::STRING));
+        let result = evaluate_expression(&col!("a"), &batch, Some(&DataType::STRING));
         assert_result_error_with_message(result, "Incorrect datatype");
     }
 
@@ -3115,10 +3110,7 @@ mod tests {
     ) {
         let batch = create_batch_with_bool_col(a_vals, pred_vals);
         let schema = DataType::from(schema! { nullable "a": INTEGER });
-        let expr = Expr::struct_with_nullability_from(
-            [column_expr_ref!("a")],
-            column_expr_ref!("is_valid"),
-        );
+        let expr = Expr::struct_with_nullability_from([col!("a")], col!("is_valid"));
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
         for (i, valid) in expected_valid.iter().enumerate() {
@@ -3136,8 +3128,8 @@ mod tests {
         let schema = DataType::from(schema! {
             nullable "nested": { nullable "a": INTEGER },
         });
-        let inner_expr = Expr::struct_from([column_expr_ref!("a")]);
-        let expr = Expr::struct_with_nullability_from([inner_expr], column_expr_ref!("is_valid"));
+        let inner_expr = Expr::struct_from([col!("a")]);
+        let expr = Expr::struct_with_nullability_from([inner_expr], col!("is_valid"));
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
         assert!(struct_result.is_valid(0));
@@ -3154,7 +3146,7 @@ mod tests {
 
     #[test]
     fn test_struct_with_nullability_predicate_multiple_fields() {
-        // Multiple expressions: [column_expr_ref!("a"), column_expr_ref!("b")] with predicate.
+        // Multiple expressions: [col!("a"), col!("b")] with predicate.
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int32, true),
             ArrowField::new("b", ArrowDataType::Int32, true),
@@ -3177,10 +3169,7 @@ mod tests {
             StructField::new("a", DataType::INTEGER, true),
             StructField::new("b", DataType::INTEGER, true),
         ]));
-        let expr = Expr::struct_with_nullability_from(
-            [column_expr_ref!("a"), column_expr_ref!("b")],
-            column_expr_ref!("is_valid"),
-        );
+        let expr = Expr::struct_with_nullability_from([col!("a"), col!("b")], col!("is_valid"));
         let result = evaluate_expression(&expr, &batch, Some(&schema)).unwrap();
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
         assert!(struct_result.is_valid(0), "row 0 should be valid");
@@ -3198,8 +3187,7 @@ mod tests {
             vec![Some(true), Some(false), Some(true)],
         );
         let schema = DataType::from(schema! { nullable "a": INTEGER });
-        let expr =
-            Expr::struct_with_nullability_from([column_expr_ref!("a")], column_expr_ref!("a"));
+        let expr = Expr::struct_with_nullability_from([col!("a")], col!("a"));
         let result = evaluate_expression(&expr, &batch, Some(&schema));
         assert_result_error_with_message(result, "Incorrect datatype");
     }
@@ -3208,7 +3196,7 @@ mod tests {
     fn test_struct_no_result_type_errors() {
         // struct_from with result_type = None should return an error
         let batch = create_test_batch();
-        let expr = Expr::struct_from([column_expr_ref!("a")]);
+        let expr = Expr::struct_from([col!("a")]);
         let result = evaluate_expression(&expr, &batch, None);
         assert!(result.is_err());
     }
@@ -3337,10 +3325,7 @@ mod tests {
         )]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(add_struct)]).unwrap();
 
-        let expr = Expr::struct_from([
-            column_expr_ref!("add.path"),
-            column_expr_ref!("add.stats_parsed"),
-        ]);
+        let expr = Expr::struct_from([col!("add.path"), col!("add.stats_parsed")]);
 
         // Output schema uses logical names (differs from physical names in the batch)
         let output_type = DataType::try_struct_type([

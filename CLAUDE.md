@@ -318,11 +318,10 @@ Keep this list updated when new protocol features are added to kernel.
     `DataType::Array(Box::new(ArrayType::new(...)))`.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
-- Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
-  `Expression::literal(...)` when building expressions inline. `col!` uses the same
-  compile-time segment rules as `column_name!` (string literals split on `.`; constants are
-  single simple segments). Use `Expression::column([...])` for runtime or non-simple names.
-  (`column_expr!` is a doc-hidden compatibility alias of `col!`.)
+- Prefer `lit` over `Expression::literal`.
+- Prefer `column_name!` / `col!` / `column_pred!` over `ColumnName::new` / `Expression::column` /
+  `Predicate::column`. See the documentation. Note that `column_expr!` is a doc-hidden compatibility
+  alias of `col!`; do not use it.
 - Prefer the `schema!` / `schema_ref!` macros for inline declarative schema literals,
   `lazy_schema_ref!` for `LazyLock<SchemaRef>` statics, and `try_schema!` when names of
   interpolated fields might collide. For Delta log action schemas, reuse the canonical

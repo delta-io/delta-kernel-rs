@@ -8,11 +8,8 @@ use itertools::Itertools;
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 #[doc(hidden)]
-pub use self::column_names::{__require_valid_simple_column_segment, column_expr};
-pub use self::column_names::{
-    col, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
-    ColumnName,
-};
+pub use self::column_names::{__require_valid_simple_column_segment, column_expr, column_expr_ref};
+pub use self::column_names::{col, column_name, column_pred, ColumnName};
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -691,7 +688,10 @@ impl Expression {
         references.0
     }
 
-    /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
+    /// Creates a column expression from path segments.
+    ///
+    /// NOTE: This is a low-level constructor; the [`col!`] macro provides a convenient and more
+    /// flexible shorthand for most use cases.
     pub fn column(field_names: impl CollectInto<ColumnName>) -> Expression {
         ColumnName::new(field_names).into()
     }
@@ -886,7 +886,10 @@ impl Predicate {
         references.0
     }
 
-    /// Creates a new boolean column reference. See also [`Expression::column`].
+    /// Creates a boolean column reference.
+    ///
+    /// NOTE: This is a low-level constructor; the [`column_pred!`] macro provides a convenient and
+    /// more flexible shorthand for most use cases.
     pub fn column(field_names: impl CollectInto<ColumnName>) -> Self {
         Self::from_expr(ColumnName::new(field_names))
     }

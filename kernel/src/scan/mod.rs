@@ -587,7 +587,7 @@ impl<'a> ExpressionTransform<'a> for PrefixColumns {
     transform_output_type!(|'a, T| Cow<'a, T>);
 
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
-        Cow::Owned(self.prefix.join(name))
+        Cow::Owned(column_name!(..(&self.prefix), ..(name)))
     }
 }
 

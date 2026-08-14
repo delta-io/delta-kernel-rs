@@ -850,8 +850,8 @@ mod tests {
         use delta_kernel::arrow::datatypes::DataType as ArrowDataType;
         use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicateOp as _;
         use delta_kernel::expressions::{
-            col, column_name, joined_column_expr, lit, BinaryExpressionOp, BinaryPredicateOp,
-            ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+            col, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+            JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
         };
         use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
         use delta_kernel::schema::DataType;
@@ -868,15 +868,11 @@ mod tests {
         }
 
         fn stats_col(prefix: &str, col: &ColumnName) -> Expression {
-            Expression::from(
-                column_name!("stats_parsed")
-                    .join(&ColumnName::new([prefix]))
-                    .join(col),
-            )
+            col!("stats_parsed", (prefix), ..(col))
         }
 
         fn partition_col(col: &ColumnName) -> Expression {
-            joined_column_expr!("partitionValues_parsed", col)
+            col!("partitionValues_parsed", ..(col))
         }
 
         fn stats_col_numrecords() -> Expression {
