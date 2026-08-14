@@ -699,6 +699,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::safe("WRITE", true)]
+    #[case::streaming_update("STREAMING UPDATE", true)]
     #[case::unsafe_op("ANALYZE STATS", false)]
     fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
         let mut acc = CrcReplayAccumulator::new(None);

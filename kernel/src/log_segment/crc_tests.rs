@@ -1045,31 +1045,6 @@ async fn test_adds_and_removes_accumulate() {
     assert_eq!(stats.table_size_bytes(), 700); // c (300) + d (400)
 }
 
-#[tokio::test]
-async fn test_streaming_update_advances_on_disk_file_stats() {
-    let built = CrcReadTest::new()
-        .commit(0, create_table_actions())
-        .crc_with_files(0, protocol_a(), metadata_a(), None, &[100])
-        .commit(
-            1,
-            [
-                commit_info("STREAMING UPDATE", None),
-                remove("a", Some(100)),
-                add("b", 200),
-            ],
-        )
-        .build()
-        .await;
-    let base = built.read_crc_at(0).unwrap();
-
-    let crc = built.incrementally_build_crc(&base).unwrap();
-
-    assert!(crc.file_stats_state().is_complete());
-    let stats = crc.file_stats().unwrap();
-    assert_eq!(stats.num_files(), 1);
-    assert_eq!(stats.table_size_bytes(), 200);
-}
-
 // === Indeterminate trips ===
 
 // Three distinct ways a single commit can lose incremental safety.
