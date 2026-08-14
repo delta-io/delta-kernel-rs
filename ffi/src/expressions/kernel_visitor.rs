@@ -5,8 +5,8 @@ use std::sync::Arc;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
-    Scalar, UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp,
+    MapToStructOptions, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
@@ -671,7 +671,10 @@ pub extern "C" fn visit_expression_map_to_struct(
     child_expr: usize,
 ) -> usize {
     unwrap_kernel_expression(state, child_expr).map_or(0, |expr| {
-        wrap_expression(state, Expression::map_to_struct(expr))
+        wrap_expression(
+            state,
+            Expression::map_to_struct(expr, MapToStructOptions::default()),
+        )
     })
 }
 

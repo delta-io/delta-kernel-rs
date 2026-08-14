@@ -20,9 +20,11 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred,
+    col, column_name, column_pred, lit, CastOptions, Expression as Expr, Predicate as Pred,
 };
 use crate::object_store::memory::InMemory;
+use crate::object_store::path::Path;
+use crate::object_store::ObjectStoreExt as _;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::scan::data_skipping::{all_referenced_columns, as_checkpoint_skipping_predicate};
@@ -38,6 +40,19 @@ use crate::{
 
 fn field_names(s: &StructArray) -> Vec<String> {
     s.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+#[test]
+fn partition_values_options_carry_optional_timestamp_timezone() {
+    let default = PartitionValuesOptions::with_struct();
+    assert!(default.parsed_struct);
+    assert_eq!(default.timestamp_timezone, None);
+
+    let zoned = default.with_timestamp_timezone("America/Los_Angeles");
+    assert_eq!(
+        zoned.timestamp_timezone.as_deref(),
+        Some("America/Los_Angeles")
+    );
 }
 
 #[test]
@@ -771,6 +786,7 @@ fn test_get_partition_value() {
         let value = crate::scan::transform_spec::parse_partition_value_raw(
             Some(&raw.to_string()),
             &DataType::Primitive(data_type.clone()),
+            crate::timestamp_timezone::TimestampTimezone::default(),
         )
         .unwrap();
         assert_eq!(value, *expected);
@@ -1103,11 +1119,19 @@ fn test_build_actions_meta_predicate_static_skip_all() {
 ), None)]
 #[case::date_cast_range(Pred::and(
     Pred::ge(
-        Expr::cast(col!("modified"), DataType::DATE),
+        Expr::cast(
+            col!("modified"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_641),
     ),
     Pred::lt(
-        Expr::cast(col!("modified"), DataType::DATE),
+        Expr::cast(
+            col!("modified"),
+            DataType::DATE,
+            CastOptions::default(),
+        ),
         Scalar::Date(20_644),
     ),
 ), Some("CAST(Column(add.partitionValues_parsed.modified) AS date)"))]
@@ -1145,6 +1169,73 @@ fn test_build_actions_meta_predicate_partition_only(
     );
 }
 
+#[test]
+fn checkpoint_reader_timezone_omits_only_zoned_timestamp_partition_from_meta_predicate() {
+    let store = Arc::new(InMemory::new());
+    let commit = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}
+{"metaData":{"id":"test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"part_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"part_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}},{\"name\":\"part_int\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["part_ts","part_ts_ntz","part_int"],"configuration":{},"createdTime":0}}"#;
+    futures::executor::block_on(store.put(
+        &Path::from("_delta_log/00000000000000000000.json"),
+        commit.into(),
+    ))
+    .unwrap();
+    let engine = SyncEngine::new_with_store(store);
+    let snapshot = Snapshot::builder_for("memory:///").build(&engine).unwrap();
+    let predicate = Arc::new(Pred::and(
+        Pred::gt(col!("part_ts"), Scalar::Timestamp(0)),
+        Pred::and(
+            Pred::gt(col!("part_ts_ntz"), Scalar::TimestampNtz(0)),
+            Pred::gt(col!("part_int"), lit(0)),
+        ),
+    ));
+
+    let zoned_scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(predicate.clone())
+        .with_partition_values(
+            PartitionValuesOptions::with_struct().with_timestamp_timezone("America/Los_Angeles"),
+        )
+        .build()
+        .unwrap();
+    let zoned_refs: HashSet<_> = zoned_scan
+        .build_actions_meta_predicate()
+        .expect("safe partition leaves should retain a checkpoint predicate")
+        .references()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        zoned_refs,
+        HashSet::from([
+            "add.partitionValues_parsed.part_int".to_string(),
+            "add.partitionValues_parsed.part_ts_ntz".to_string(),
+        ])
+    );
+
+    let utc_scan = snapshot
+        .scan_builder()
+        .with_predicate(predicate)
+        .with_partition_values(PartitionValuesOptions::with_struct())
+        .build()
+        .unwrap();
+    let utc_refs: HashSet<_> = utc_scan
+        .build_actions_meta_predicate()
+        .expect("all UTC partition leaves should retain a checkpoint predicate")
+        .references()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        utc_refs,
+        HashSet::from([
+            "add.partitionValues_parsed.part_int".to_string(),
+            "add.partitionValues_parsed.part_ts".to_string(),
+            "add.partitionValues_parsed.part_ts_ntz".to_string(),
+        ])
+    );
+}
+
 // Under column mapping, `partitionValues_parsed` is keyed by the physical partition name, so the
 // checkpoint meta-predicate must reference that physical name (not the logical one) in both name
 // and id mapping modes.
@@ -1165,7 +1256,7 @@ fn test_build_actions_meta_predicate_partition_column_mapping(
 
     let predicate = if casted {
         Pred::eq(
-            Expr::cast(col!("category"), DataType::DATE),
+            Expr::cast(col!("category"), DataType::DATE, CastOptions::default()),
             Scalar::Date(20_641),
         )
     } else {
@@ -1585,7 +1676,7 @@ fn standard_multi_rg() -> Bytes {
 #[case::partition_all_pruned(Pred::eq(col!("part"), lit("z")), vec![])]
 #[case::partition_cast_kept(
     Pred::eq(
-        Expr::cast(col!("part"), DataType::DATE),
+        Expr::cast(col!("part"), DataType::DATE, CastOptions::default()),
         Scalar::Date(18_628),
     ),
     vec![1, 2, 3, 4]
@@ -1593,7 +1684,7 @@ fn standard_multi_rg() -> Bytes {
 #[case::partition_cast_and_stats(
     Pred::and(
         Pred::eq(
-            Expr::cast(col!("part"), DataType::DATE),
+            Expr::cast(col!("part"), DataType::DATE, CastOptions::default()),
             Scalar::Date(18_628),
         ),
         Pred::gt(col!("x"), lit(150i64)),

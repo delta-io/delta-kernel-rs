@@ -2,7 +2,8 @@
 use std::cmp::Ordering;
 
 use crate::expressions::{
-    BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+    BinaryPredicateOp, CastOptions, ColumnName, Expression, JunctionPredicateOp,
+    OpaquePredicateOpRef, Scalar,
 };
 use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
@@ -95,6 +96,7 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         _op: BinaryPredicateOp,
         _col: &ColumnName,
         _target: &DataType,
+        _options: &CastOptions,
         _val: &Scalar,
         _inverted: bool,
     ) -> Option<bool> {

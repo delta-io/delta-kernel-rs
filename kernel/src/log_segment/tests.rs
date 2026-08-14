@@ -4290,12 +4290,11 @@ fn test_partition_values_parsed_missing_field() {
             DataType::DATE,
         )]);
     // Partition schema expects both date and region, but checkpoint only has date.
-    // Missing fields are OK — they just won't contribute to row group skipping.
     let partition_schema = StructType::new_unchecked([
         StructField::nullable("date", DataType::DATE),
         StructField::nullable("region", DataType::STRING),
     ]);
-    assert!(LogSegment::schema_has_compatible_partition_values_parsed(
+    assert!(!LogSegment::schema_has_compatible_partition_values_parsed(
         &checkpoint_schema,
         &partition_schema,
     ));

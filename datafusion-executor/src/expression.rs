@@ -1,25 +1,32 @@
 //! Conversion from a kernel [`Expression`](KernelExpression) to a DataFusion [`Expr`](DFExpr).
 
+use std::hash::Hash;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, StructArray};
+use datafusion::arrow::compute::can_cast_types;
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
-use datafusion::common::{Column as DFColumn, DataFusionError, ScalarValue as DFScalarValue};
+use datafusion::common::{
+    Column as DFColumn, DFSchema, DataFusionError, ScalarValue as DFScalarValue,
+};
 use datafusion::functions::core::expr_fn::{
     coalesce, get_field, get_field_path, named_struct, nullif,
 };
 use datafusion::functions_nested::expr_fn::make_array;
+use datafusion::logical_expr::expr_fn::try_cast;
 use datafusion::logical_expr::{
-    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, Operator, ScalarFunctionArgs,
-    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    binary_expr, cast, lit, Case, ColumnarValue, Expr as DFExpr, ExprSchemable, Operator,
+    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_expression::evaluate_expression as kernel_expression;
 use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
-    BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
-    Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, MapToStructExpression,
+    BinaryExpression, BinaryExpressionOp, CastExpression, CastOptions,
+    ColumnName as KernelColumnName, ElementAtExpression, Expression as KernelExpression,
+    ExpressionRef, ExpressionStructPatch, MapToStructExpression, MapToStructOptions,
     ParseJsonExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{
@@ -67,6 +74,7 @@ pub fn to_df_expr(
         KernelExpression::MapToStruct(map_to_struct) => {
             map_to_struct_to_df_expr(map_to_struct, input_schema, output_type)
         }
+        KernelExpression::ElementAt(element_at) => element_at_to_df_expr(element_at, input_schema),
         KernelExpression::ParseJson(parse) => parse_json_to_df_expr(parse, input_schema),
 
         KernelExpression::Unary(u) => match u.op {
@@ -75,10 +83,7 @@ pub fn to_df_expr(
             )),
         },
 
-        // TODO(#3007): implement once kernel's Cast semantics are clarified.
-        KernelExpression::Cast(_) => Err(Error::unsupported(
-            "converting a Cast expression is not yet supported",
-        )),
+        KernelExpression::Cast(cast_expr) => cast_to_df_expr(cast_expr, input_schema),
 
         KernelExpression::Opaque(_) => Err(Error::unsupported(
             "cannot convert an engine-defined Opaque expression",
@@ -86,6 +91,163 @@ pub fn to_df_expr(
         KernelExpression::Unknown(name) => Err(Error::unsupported(format!(
             "cannot convert Unknown expression {name:?}"
         ))),
+    }
+}
+
+/// Lowers an `ElementAt` map lookup to a UDF backed by kernel's Arrow evaluator.
+///
+/// # Errors
+/// Returns an error when either child expression cannot be converted.
+fn element_at_to_df_expr(
+    element_at: &ElementAtExpression,
+    input_schema: &StructType,
+) -> DeltaResult<DFExpr> {
+    let map = to_df_expr(&element_at.map_expr, input_schema, None)?;
+    let key = to_df_expr(
+        &element_at.key_expr,
+        input_schema,
+        Some(&KernelDataType::STRING),
+    )?;
+    Ok(ScalarUDF::new_from_impl(ElementAtUdf::new()).call(vec![map, key]))
+}
+
+fn evaluate_kernel_udf<const N: usize>(
+    num_rows: usize,
+    args: [(&'static str, ColumnarValue); N],
+    expression: KernelExpression,
+    result_type: &KernelDataType,
+) -> Result<ColumnarValue, DataFusionError> {
+    let columns = args
+        .into_iter()
+        .map(|(name, value)| Ok((name, value.into_array(num_rows)?)))
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+    let batch = RecordBatch::try_from_iter(columns)?;
+    let result = kernel_expression::evaluate_expression(&expression, &batch, Some(result_type))
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    Ok(ColumnarValue::Array(result))
+}
+
+/// A DataFusion scalar UDF that delegates `ElementAt` evaluation to kernel, preserving dynamic-key
+/// and rightmost-duplicate semantics across executors.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ElementAtUdf {
+    signature: Signature,
+}
+
+impl ElementAtUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ElementAtUdf {
+    fn name(&self) -> &str {
+        "kernel_element_at"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(ArrowDataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let num_rows = args.number_rows;
+        let [map, key] = take_function_args(self.name(), args.args)?;
+        let expression = KernelExpression::element_at(
+            KernelExpression::column(["map"]),
+            KernelExpression::column(["key"]),
+        );
+        evaluate_kernel_udf(
+            num_rows,
+            [("map", map), ("key", key)],
+            expression,
+            &KernelDataType::STRING,
+        )
+    }
+}
+
+/// Lowers a `Cast` to DataFusion while retaining its optional timestamp timezone.
+///
+/// # Errors
+/// Returns an error when the child expression or either schema cannot be converted.
+fn cast_to_df_expr(cast_expr: &CastExpression, input_schema: &StructType) -> DeltaResult<DFExpr> {
+    let value = to_df_expr(&cast_expr.expr, input_schema, None)?;
+    let target = (&cast_expr.target).try_into_arrow()?;
+    let arrow_input_schema: ArrowSchema = input_schema.try_into_arrow()?;
+    let df_input_schema = DFSchema::try_from(arrow_input_schema).map_err(Error::generic_err)?;
+    let source = value
+        .get_type(&df_input_schema)
+        .map_err(Error::generic_err)?;
+    let source_is_string = matches!(
+        source,
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
+    );
+    if cast_expr.requires_kernel_evaluation(source_is_string) {
+        let udf = KernelCastUdf::try_new(cast_expr.target.clone(), cast_expr.options.clone())?;
+        return Ok(ScalarUDF::new_from_impl(udf).call(vec![value]));
+    }
+    if can_cast_types(&source, &target) {
+        return Ok(try_cast(value, target));
+    }
+    let udf = KernelCastUdf::try_new(cast_expr.target.clone(), cast_expr.options.clone())?;
+    Ok(ScalarUDF::new_from_impl(udf).call(vec![value]))
+}
+
+/// A DataFusion scalar UDF that delegates casts requiring kernel semantics to its Arrow evaluator.
+#[derive(Debug, PartialEq, Eq)]
+struct KernelCastUdf {
+    target: KernelDataType,
+    options: CastOptions,
+    return_type: ArrowDataType,
+    signature: Signature,
+}
+
+impl Hash for KernelCastUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.return_type.hash(state);
+        self.options.hash(state);
+    }
+}
+
+impl KernelCastUdf {
+    fn try_new(target: KernelDataType, options: CastOptions) -> DeltaResult<Self> {
+        let return_type = (&target).try_into_arrow()?;
+        Ok(Self {
+            target,
+            options,
+            return_type,
+            signature: Signature::any(1, Volatility::Immutable),
+        })
+    }
+}
+
+impl ScalarUDFImpl for KernelCastUdf {
+    fn name(&self) -> &str {
+        "kernel_cast"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let num_rows = args.number_rows;
+        let [value] = take_function_args(self.name(), args.args)?;
+        let expression = KernelExpression::cast(
+            KernelExpression::column(["value"]),
+            self.target.clone(),
+            self.options.clone(),
+        );
+        evaluate_kernel_udf(num_rows, [("value", value)], expression, &self.target)
     }
 }
 
@@ -366,6 +528,11 @@ fn map_to_struct_to_df_expr(
 ) -> DeltaResult<DFExpr> {
     let target = require_struct_output(output_type, "MapToStruct")?;
     let map = to_df_expr(&map_to_struct.map_expr, input_schema, None)?;
+    if map_to_struct.options.timestamp_timezone().is_some() {
+        let udf =
+            KernelMapToStructUdf::try_new(Arc::new(target.clone()), map_to_struct.options.clone())?;
+        return Ok(ScalarUDF::new_from_impl(udf).call(vec![map]));
+    }
 
     let mut args = Vec::with_capacity(target.num_fields() * 2);
     for field in target.fields() {
@@ -392,6 +559,66 @@ fn map_to_struct_to_df_expr(
     }
 
     Ok(struct_null_when_not(map.is_not_null(), named_struct(args)))
+}
+
+/// A DataFusion scalar UDF that delegates timezone-aware partition parsing to kernel's Arrow
+/// evaluator.
+#[derive(Debug, PartialEq, Eq)]
+struct KernelMapToStructUdf {
+    output_schema: KernelSchemaRef,
+    options: MapToStructOptions,
+    return_type: ArrowDataType,
+    signature: Signature,
+}
+
+impl std::hash::Hash for KernelMapToStructUdf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for field in self.output_schema.fields() {
+            field.name().hash(state);
+            field.data_type().to_string().hash(state);
+        }
+        self.options.hash(state);
+    }
+}
+
+impl KernelMapToStructUdf {
+    fn try_new(output_schema: KernelSchemaRef, options: MapToStructOptions) -> DeltaResult<Self> {
+        let arrow_schema: ArrowSchema = output_schema
+            .as_ref()
+            .try_into_arrow()
+            .map_err(Error::generic_err)?;
+        Ok(Self {
+            return_type: ArrowDataType::Struct(arrow_schema.fields().clone()),
+            output_schema,
+            options,
+            signature: Signature::any(1, Volatility::Immutable),
+        })
+    }
+}
+
+impl ScalarUDFImpl for KernelMapToStructUdf {
+    fn name(&self) -> &str {
+        "kernel_map_to_struct_with_timestamp_timezone"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[ArrowDataType]) -> Result<ArrowDataType, DataFusionError> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        let num_rows = args.number_rows;
+        let [map] = take_function_args(self.name(), args.args)?;
+        let expression = KernelExpression::map_to_struct(
+            KernelExpression::column(["map"]),
+            self.options.clone(),
+        );
+        let output_type = KernelDataType::from(self.output_schema.as_ref().clone());
+        evaluate_kernel_udf(num_rows, [("map", map)], expression, &output_type)
+    }
 }
 
 /// Lowers a `ParseJson` (parse a JSON-string column into a struct) to a call of the
@@ -489,13 +716,18 @@ impl ScalarUDFImpl for ParseJsonUdf {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{Array, AsArray, StringArray};
+    use datafusion::arrow::array::{
+        Array, AsArray, Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder,
+        TimestampMicrosecondArray,
+    };
+    use datafusion::arrow::datatypes::Field as ArrowField;
     use datafusion::assert_batches_eq;
     use datafusion::common::DFSchema;
     use datafusion::physical_expr::create_physical_expr;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use delta_kernel::expressions::{
-        col, lit, Expression as KernelExpr, ExpressionStructPatch, ExpressionStructPatchBuilder,
+        col, lit, CastOptions, Expression as KernelExpr, ExpressionStructPatch,
+        ExpressionStructPatchBuilder, MapToStructOptions,
     };
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
@@ -548,6 +780,111 @@ mod tests {
     #[case::depth_3(col!("a.b.c"), "get_field(a, Utf8(\"b\"), Utf8(\"c\"))")]
     fn column_lowers_to_nested_field_access(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
+    }
+
+    #[test]
+    fn cast_lowers_to_try_cast() {
+        let kernel = KernelExpr::cast(col!("x"), DataType::INTEGER, CastOptions::default());
+        assert_eq!(lower(kernel), "TRY_CAST(x AS Int32)");
+    }
+
+    #[test]
+    fn cast_executes_with_safe_null_semantics() {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(vec![
+                Some("42"),
+                Some("bad"),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let logical = to_df_expr(
+            &KernelExpr::cast(col!("s"), DataType::INTEGER, CastOptions::default()),
+            &input_schema,
+            Some(&DataType::INTEGER),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+
+        let result = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let values = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values, &Int32Array::from(vec![Some(42), None, None]));
+    }
+
+    #[test]
+    fn unsupported_cast_executes_as_typed_null() {
+        let input_schema =
+            StructType::try_new([StructField::nullable("x", DataType::LONG)]).unwrap();
+        let target: DataType =
+            StructType::try_new([StructField::nullable("value", DataType::LONG)])
+                .unwrap()
+                .into();
+        let logical = to_df_expr(
+            &KernelExpr::cast(col!("x"), target.clone(), CastOptions::default()),
+            &input_schema,
+            Some(&target),
+        )
+        .unwrap();
+
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let expected_type: ArrowDataType = (&target).try_into_arrow().unwrap();
+        assert_eq!(result.data_type(), &expected_type);
+        assert_eq!(result.null_count(), batch.num_rows());
+    }
+
+    #[test]
+    fn unsupported_cast_evaluates_child_errors() {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let target: DataType =
+            StructType::try_new([StructField::nullable("value", DataType::LONG)])
+                .unwrap()
+                .into();
+        let child = KernelExpr::cast(
+            col!("s"),
+            DataType::TIMESTAMP,
+            CastOptions::default().with_timestamp_timezone("Not/AZone"),
+        );
+        let logical = to_df_expr(
+            &KernelExpr::cast(child, target.clone(), CastOptions::default()),
+            &input_schema,
+            Some(&target),
+        )
+        .unwrap();
+
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(vec![Some(
+                "2024-06-15 09:30:00",
+            )]))],
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let error = physical.evaluate(&batch).unwrap_err();
+        assert!(error.to_string().contains("Invalid timestamp timezone"));
     }
 
     #[rstest]
@@ -971,11 +1308,74 @@ mod tests {
     /// Lowers a `MapToStruct` over `pv` targeting `output_schema` and renders it as a `Display`
     /// string.
     fn lower_map_to_struct(output_schema: StructType) -> String {
-        let kernel = KernelExpr::map_to_struct(col!("pv"));
+        let kernel = KernelExpr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let target: DataType = output_schema.into();
         to_df_expr(&kernel, &pv_map_schema(), Some(&target))
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn element_at_lowers_to_kernel_udf() {
+        let kernel = KernelExpr::element_at(col!("pv"), lit("region"));
+        let rendered = to_df_expr(&kernel, &pv_map_schema(), Some(&DataType::STRING))
+            .unwrap()
+            .to_string();
+        assert_eq!(rendered, "kernel_element_at(pv, Utf8(\"region\"))");
+    }
+
+    #[test]
+    fn element_at_executes_dynamic_keys_and_rightmost_duplicates() {
+        let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        maps.keys().append_value("region");
+        maps.values().append_value("first");
+        maps.keys().append_value("region");
+        maps.values().append_value("last");
+        maps.append(true).unwrap();
+        maps.keys().append_value("a");
+        maps.values().append_value("A");
+        maps.keys().append_value("b");
+        maps.values().append_value("B");
+        maps.append(true).unwrap();
+        maps.append(false).unwrap();
+        maps.keys().append_value("a");
+        maps.values().append_value("A");
+        maps.append(true).unwrap();
+
+        let map = Arc::new(maps.finish()) as ArrayRef;
+        let key = Arc::new(StringArray::from(vec![
+            Some("region"),
+            Some("b"),
+            Some("a"),
+            None,
+        ])) as ArrayRef;
+        let logical = to_df_expr(
+            &KernelExpr::element_at(col!("pv"), col!("key")),
+            &StructType::try_new([
+                StructField::nullable("pv", MapType::new(DataType::STRING, DataType::STRING, true)),
+                StructField::nullable("key", DataType::STRING),
+            ])
+            .unwrap(),
+            Some(&DataType::STRING),
+        )
+        .unwrap();
+        let input_schema = ArrowSchema::new(vec![
+            ArrowField::new("pv", map.data_type().clone(), true),
+            ArrowField::new("key", ArrowDataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(input_schema.clone()), vec![map, key]).unwrap();
+        let df_schema = DFSchema::try_from(input_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = physical
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let result = result.as_string::<i32>();
+        assert_eq!(
+            result,
+            &StringArray::from(vec![Some("last"), Some("B"), None, None])
+        );
     }
 
     /// Each target field extracts its value with `cast(get_field(pv, name), T)`, and the whole
@@ -1034,11 +1434,192 @@ mod tests {
         #[case] output_type: Option<DataType>,
         #[case] expected_message: &str,
     ) {
-        let kernel = KernelExpr::map_to_struct(col!("pv"));
+        let kernel = KernelExpr::map_to_struct(col!("pv"), MapToStructOptions::default());
         let err = to_df_expr(&kernel, &pv_map_schema(), output_type.as_ref())
             .unwrap_err()
             .to_string();
         assert!(err.contains(expected_message), "{err}");
+    }
+
+    #[test]
+    fn map_to_struct_with_timezone_lowers_to_kernel_udf() {
+        let target =
+            StructType::try_new([StructField::nullable("ts", DataType::TIMESTAMP)]).unwrap();
+        let map = KernelExpr::map_to_struct(
+            col!("pv"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        assert_eq!(
+            to_df_expr(&map, &pv_map_schema(), Some(&DataType::from(target)))
+                .unwrap()
+                .to_string(),
+            "kernel_map_to_struct_with_timestamp_timezone(pv)"
+        );
+    }
+
+    #[test]
+    fn map_to_struct_with_timezone_executes_in_reader_timezone() {
+        let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        maps.keys().append_value("ts");
+        maps.values().append_value("2024-06-15 09:30:00");
+        maps.append(true).unwrap();
+        let map = Arc::new(maps.finish()) as ArrayRef;
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new("pv", map.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), vec![map]).unwrap();
+        let target =
+            StructType::try_new([StructField::nullable("ts", DataType::TIMESTAMP)]).unwrap();
+        let logical = to_df_expr(
+            &KernelExpr::map_to_struct(
+                col!("pv"),
+                MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            ),
+            &pv_map_schema(),
+            Some(&DataType::from(target)),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(1).unwrap();
+        let timestamps = result
+            .as_struct()
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), 1_718_469_000_000_000);
+    }
+
+    #[test]
+    fn cast_with_timezone_lowers_to_kernel_udf() {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let cast = KernelExpr::cast(
+            col!("s"),
+            DataType::TIMESTAMP,
+            CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        assert_eq!(
+            to_df_expr(&cast, &input_schema, Some(&DataType::TIMESTAMP))
+                .unwrap()
+                .to_string(),
+            "kernel_cast(s)"
+        );
+    }
+
+    #[test]
+    fn cast_with_timezone_executes_in_reader_timezone() {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(vec![Some(
+                "2024-06-15 09:30:00",
+            )]))],
+        )
+        .unwrap();
+        let logical = to_df_expr(
+            &KernelExpr::cast(
+                col!("s"),
+                DataType::TIMESTAMP,
+                CastOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+            ),
+            &input_schema,
+            Some(&DataType::TIMESTAMP),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(1).unwrap();
+        let timestamps = result
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), 1_718_469_000_000_000);
+    }
+
+    #[rstest]
+    #[case::timestamp(
+        "not a timestamp",
+        DataType::TIMESTAMP,
+        CastOptions::default()
+            .with_timestamp_timezone("America/Los_Angeles")
+            .with_invalid_input_error()
+    )]
+    #[case::integer(
+        "not an integer",
+        DataType::INTEGER,
+        CastOptions::default().with_invalid_input_error()
+    )]
+    fn cast_with_invalid_input_error_propagates_parse_failure(
+        #[case] raw: &str,
+        #[case] target: DataType,
+        #[case] options: CastOptions,
+    ) {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(vec![Some(raw)]))],
+        )
+        .unwrap();
+        let logical = to_df_expr(
+            &KernelExpr::cast(col!("s"), target.clone(), options),
+            &input_schema,
+            Some(&target),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new()).unwrap();
+
+        let error = physical.evaluate(&batch).unwrap_err();
+        assert!(error.to_string().contains(raw), "{error}");
+    }
+
+    #[test]
+    fn strict_timestamp_empty_string_requires_explicit_null_semantics() {
+        let input_schema =
+            StructType::try_new([StructField::nullable("s", DataType::STRING)]).unwrap();
+        let arrow_schema: ArrowSchema = (&input_schema).try_into_arrow().unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(StringArray::from(vec![Some(""), None]))],
+        )
+        .unwrap();
+        let strict_options = CastOptions::default()
+            .with_timestamp_timezone("America/Los_Angeles")
+            .with_invalid_input_error();
+
+        let strict = to_df_expr(
+            &KernelExpr::cast(col!("s"), DataType::TIMESTAMP, strict_options.clone()),
+            &input_schema,
+            Some(&DataType::TIMESTAMP),
+        )
+        .unwrap();
+        let df_schema = DFSchema::try_from(arrow_schema.clone()).unwrap();
+        let strict = create_physical_expr(&strict, &df_schema, &ExecutionProps::new()).unwrap();
+        assert!(strict.evaluate(&batch).is_err());
+
+        let partition = to_df_expr(
+            &KernelExpr::cast(
+                col!("s"),
+                DataType::TIMESTAMP,
+                strict_options.with_empty_string_as_null(),
+            ),
+            &input_schema,
+            Some(&DataType::TIMESTAMP),
+        )
+        .unwrap();
+        let partition =
+            create_physical_expr(&partition, &df_schema, &ExecutionProps::new()).unwrap();
+        let result = partition
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(result.null_count(), batch.num_rows());
     }
 
     // === ParseJson Shared Helpers ===

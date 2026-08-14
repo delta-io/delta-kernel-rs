@@ -1427,11 +1427,10 @@ impl LogSegment {
     ///
     /// Validates that:
     /// 1. The `add.partitionValues_parsed` field exists in the checkpoint schema
-    /// 2. The types for partition columns present in both schemas are compatible
+    /// 2. Every requested partition column exists in the checkpoint struct
+    /// 3. The requested partition-column types are compatible
     ///
-    /// Missing partition columns in the checkpoint are OK (they simply won't contribute
-    /// to row group skipping). Returns `false` if `partitionValues_parsed` doesn't exist
-    /// or has incompatible types for any shared column.
+    /// Returns `false` if `partitionValues_parsed` is absent, incomplete, or incompatible.
     pub(crate) fn schema_has_compatible_partition_values_parsed(
         checkpoint_schema: &StructType,
         partition_schema: &StructType,
@@ -1450,6 +1449,17 @@ impl LogSegment {
             );
             return false;
         };
+
+        if let Some(missing) = partition_schema
+            .fields()
+            .find(|field| partition_struct.field(field.name()).is_none())
+        {
+            debug!(
+                "partitionValues_parsed not compatible: checkpoint struct is missing '{}'",
+                missing.name()
+            );
+            return false;
+        }
 
         // Flat struct: reuse the recursive type checker (trivial case with no nesting)
         if !Self::structs_have_compatible_types(

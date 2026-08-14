@@ -14,6 +14,7 @@ pub use self::column_names::{
     ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+use crate::delta_kernel_derive::internal_api;
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
@@ -359,14 +360,113 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
-/// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
-/// value that cannot be represented in the target type evaluates to NULL rather than erroring.
+/// Looks up one value in a `Map<String, String>` for each input row.
+///
+/// Missing keys, null maps, and null keys evaluate to NULL. Duplicate keys are resolved by taking
+/// the rightmost entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ElementAtExpression {
+    /// The expression that evaluates to a `Map<String, String>` column.
+    pub map_expr: Box<Expression>,
+
+    /// The expression that evaluates to a STRING key column.
+    pub key_expr: Box<Expression>,
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+struct TimestampInterpretation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp_timezone: Option<String>,
+}
+
+impl TimestampInterpretation {
+    fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp_timezone = Some(timestamp_timezone.into());
+        self
+    }
+
+    fn timestamp_timezone(&self) -> Option<&str> {
+        self.timestamp_timezone.as_deref()
+    }
+
+    fn is_default(&self) -> bool {
+        self.timestamp_timezone.is_none()
+    }
+}
+
+/// Options controlling how a [`CastExpression`] evaluates values.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct CastOptions {
+    #[serde(flatten)]
+    timestamp: TimestampInterpretation,
+    /// Whether invalid input should fail evaluation instead of producing null.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    invalid_input_error: bool,
+    /// Whether empty string input should evaluate to null.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    empty_string_as_null: bool,
+}
+
+impl CastOptions {
+    /// Interpret offset-less strings cast to `TIMESTAMP` in `timestamp_timezone`.
+    ///
+    /// The timezone may be an IANA name or a fixed offset such as `+12:45:30`. Explicit offsets in
+    /// input strings take precedence. Ambiguous local times use the earlier instant, while
+    /// nonexistent local times use the pre-transition offset. Invalid timezones are reported
+    /// during evaluation.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp = self.timestamp.with_timestamp_timezone(timestamp_timezone);
+        self
+    }
+
+    /// Returns the timezone used to interpret offset-less strings cast to `TIMESTAMP`.
+    pub fn timestamp_timezone(&self) -> Option<&str> {
+        self.timestamp.timestamp_timezone()
+    }
+
+    /// Report invalid input as an evaluation error instead of producing null.
+    ///
+    /// Intended for parsing contexts, such as Delta partition values, whose malformed values must
+    /// remain observable.
+    pub fn with_invalid_input_error(mut self) -> Self {
+        self.invalid_input_error = true;
+        self
+    }
+
+    /// Returns whether invalid input is reported as an evaluation error.
+    pub fn invalid_input_is_error(&self) -> bool {
+        self.invalid_input_error
+    }
+
+    /// Treat empty string input as null, including when invalid input otherwise produces an error.
+    pub fn with_empty_string_as_null(mut self) -> Self {
+        self.empty_string_as_null = true;
+        self
+    }
+
+    /// Returns whether empty string input evaluates to null.
+    pub fn empty_string_is_null(&self) -> bool {
+        self.empty_string_as_null
+    }
+
+    fn is_default(&self) -> bool {
+        self.timestamp.is_default() && !self.invalid_input_error && !self.empty_string_as_null
+    }
+}
+
+/// An expression that casts a child expression to a target type, following SQL `CAST` semantics by
+/// default: a value that cannot be represented in the target type evaluates to NULL. Callers may
+/// opt into errors for parsing contexts through [`CastOptions::with_invalid_input_error`].
+/// Offset-less strings cast to `TIMESTAMP` use the configured timezone, or UTC by default.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CastExpression {
     /// The expression whose value is cast.
     pub expr: Box<Expression>,
     /// The type the value is cast to.
     pub target: DataType,
+    /// Options controlling cast evaluation.
+    #[serde(default, skip_serializing_if = "CastOptions::is_default")]
+    pub options: CastOptions,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -517,6 +617,8 @@ pub enum Expression {
     /// Extract keys from a `Map<String, String>` and parse values into a typed struct. See
     /// [`MapToStructExpression`] for how values are parsed.
     MapToStruct(MapToStructExpression),
+    /// Looks up a STRING value in a `Map<String, String>`.
+    ElementAt(ElementAtExpression),
     /// Cast a child expression to a target type. See [`CastExpression`].
     Cast(CastExpression),
 }
@@ -641,38 +743,93 @@ impl ParseJsonExpression {
     }
 }
 
+/// Options controlling how a [`MapToStructExpression`] parses map values.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct MapToStructOptions {
+    #[serde(flatten)]
+    timestamp: TimestampInterpretation,
+}
+
+impl MapToStructOptions {
+    /// Interpret offset-less `TIMESTAMP` values in `timestamp_timezone`.
+    ///
+    /// The timezone may be an IANA name or a fixed offset such as `+12:45:30`. Explicit offsets in
+    /// values take precedence. Ambiguous local times use the earlier instant, while nonexistent
+    /// local times use the pre-transition offset. Invalid timezones are reported during
+    /// evaluation.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp = self.timestamp.with_timestamp_timezone(timestamp_timezone);
+        self
+    }
+
+    /// Returns the timezone used to interpret offset-less `TIMESTAMP` values.
+    pub fn timestamp_timezone(&self) -> Option<&str> {
+        self.timestamp.timestamp_timezone()
+    }
+
+    fn is_default(&self) -> bool {
+        self.timestamp.is_default()
+    }
+}
+
+impl ElementAtExpression {
+    pub(crate) fn new(map_expr: impl Into<Expression>, key_expr: impl Into<Expression>) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
+            key_expr: Box::new(key_expr.into()),
+        }
+    }
+}
+
 /// Transforms a `Map<String, String>` column into a struct whose schema is provided by the
 /// evaluator's output type (via `result_type`). Each row in the map column becomes one row in
 /// the output struct column: a `key` -> `value` mapping in the map means the struct field named
-/// `key` receives `value`, parsed into the field's target type via [`PrimitiveType::parse_scalar`].
-/// An empty-string value is the exception (aligning with Spark): it casts to itself for string, to
-/// empty bytes for binary, and to null for every other type. This empty-string rule is specific to
-/// this operator; [`ParseJsonExpression`] does not share it.
+/// `key` receives `value`, parsed into the field's target type. Offset-less `TIMESTAMP` values use
+/// the timezone in [`MapToStructOptions`], or UTC when no timezone is configured. An empty-string
+/// value is the exception (aligning with Spark): it casts to itself for string, to empty bytes for
+/// binary, and to null for every other type. This empty-string rule is specific to this operator;
+/// [`ParseJsonExpression`] does not share it.
 ///
 /// - Missing keys produce null values
 /// - A value that cannot be parsed as its target field type returns [`Error::ParseError`]
 /// - Duplicate map keys are resolved by taking the rightmost entry
-///
-/// [`PrimitiveType::parse_scalar`]: crate::schema::PrimitiveType::parse_scalar
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MapToStructExpression {
     /// The expression that evaluates to a `Map<String, String>` column.
     pub map_expr: Box<Expression>,
+    /// Options controlling value parsing.
+    #[serde(default, skip_serializing_if = "MapToStructOptions::is_default")]
+    pub options: MapToStructOptions,
 }
 
 impl MapToStructExpression {
-    pub(crate) fn new(map_expr: impl Into<Expression>) -> Self {
+    pub(crate) fn new(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
         Self {
             map_expr: Box::new(map_expr.into()),
+            options,
         }
     }
 }
 
 impl CastExpression {
-    pub(crate) fn new(expr: impl Into<Expression>, target: DataType) -> Self {
+    /// Returns whether this cast requires Kernel evaluation for the given source type.
+    ///
+    /// `source_is_string` must be true when the input is any supported string representation.
+    /// Kernel evaluation is required when an option changes native engine cast semantics.
+    #[internal_api]
+    pub(crate) fn requires_kernel_evaluation(&self, source_is_string: bool) -> bool {
+        self.options.invalid_input_is_error()
+            || (source_is_string && self.options.empty_string_is_null())
+            || (source_is_string
+                && self.target == DataType::TIMESTAMP
+                && self.options.timestamp_timezone().is_some())
+    }
+
+    pub(crate) fn new(expr: impl Into<Expression>, target: DataType, options: CastOptions) -> Self {
         Self {
             expr: Box::new(expr.into()),
             target,
+            options,
         }
     }
 }
@@ -856,18 +1013,27 @@ impl Expression {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
 
-    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct. The output
-    /// struct schema is determined by the evaluator's `result_type`. An empty-string value is the
-    /// exception (aligning with Spark): it casts to itself for string, to empty bytes for binary,
-    /// and to null for every other type. See [`MapToStructExpression`] for the full contract.
-    pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
-        Self::MapToStruct(MapToStructExpression::new(map_expr))
+    /// Extracts keys from a `Map<String, String>` and parses values into a typed struct according
+    /// to `options`. The output struct schema is determined by the evaluator's `result_type`.
+    /// [`MapToStructOptions::default`] interprets offset-less timestamps in UTC. An empty-string
+    /// value is the exception (aligning with Spark): it casts to itself for string, to empty bytes
+    /// for binary, and to null for every other type. See [`MapToStructExpression`] for the full
+    /// contract.
+    pub fn map_to_struct(map_expr: impl Into<Expression>, options: MapToStructOptions) -> Self {
+        Self::MapToStruct(MapToStructExpression::new(map_expr, options))
     }
 
-    /// Creates a new cast of `expr` to `target`, following SQL `CAST` semantics (unrepresentable
-    /// values become NULL). See [`CastExpression`].
-    pub fn cast(expr: impl Into<Expression>, target: DataType) -> Self {
-        Self::Cast(CastExpression::new(expr, target))
+    /// Looks up a STRING value in a `Map<String, String>` for each input row.
+    pub fn element_at(map_expr: impl Into<Expression>, key_expr: impl Into<Expression>) -> Self {
+        Self::ElementAt(ElementAtExpression::new(map_expr, key_expr))
+    }
+
+    /// Casts `expr` to `target` according to `options`, following SQL `CAST` semantics.
+    /// Unrepresentable values become NULL by default; [`CastOptions::with_invalid_input_error`]
+    /// instead reports them as errors. [`CastOptions::default`] interprets offset-less timestamps
+    /// in UTC. See [`CastExpression`].
+    pub fn cast(expr: impl Into<Expression>, target: DataType, options: CastOptions) -> Self {
+        Self::Cast(CastExpression::new(expr, target, options))
     }
 }
 
@@ -1154,8 +1320,28 @@ impl Display for Expression {
                     p.output_schema.fields().len()
                 )
             }
-            MapToStruct(m) => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
-            Cast(c) => write!(f, "CAST({} AS {})", c.expr, c.target),
+            MapToStruct(m) => match m.options.timestamp_timezone() {
+                Some(timezone) => write!(
+                    f,
+                    "MAP_TO_STRUCT({}, timestamp_timezone=\"{}\")",
+                    m.map_expr, timezone
+                ),
+                None => write!(f, "MAP_TO_STRUCT({})", m.map_expr),
+            },
+            ElementAt(e) => write!(f, "ELEMENT_AT({}, {})", e.map_expr, e.key_expr),
+            Cast(c) => {
+                write!(f, "CAST({} AS {}", c.expr, c.target)?;
+                if let Some(timezone) = c.options.timestamp_timezone() {
+                    write!(f, " USING \"{timezone}\"")?;
+                }
+                if c.options.invalid_input_is_error() {
+                    write!(f, " ERROR ON INVALID")?;
+                }
+                if c.options.empty_string_is_null() {
+                    write!(f, " EMPTY STRING AS NULL")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -1265,7 +1451,10 @@ mod tests {
     use serde::de::DeserializeOwned;
     use serde::Serialize;
 
-    use super::{col, column_pred, lit, DataType, Expression as Expr, Predicate as Pred};
+    use super::{
+        col, column_pred, lit, CastOptions, DataType, Expression as Expr, MapToStructOptions,
+        Predicate as Pred,
+    };
 
     /// Helper function to verify roundtrip serialization/deserialization
     fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
@@ -1291,7 +1480,7 @@ mod tests {
                 "ARRAY(Column(x), Column(y), 0)",
             ),
             (
-                Expr::cast(col!("x"), DataType::DATE),
+                Expr::cast(col!("x"), DataType::DATE, CastOptions::default()),
                 "CAST(Column(x) AS date)",
             ),
         ];
@@ -1300,6 +1489,61 @@ mod tests {
             let result = format!("{expr}");
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn test_map_to_struct_options_state_and_format() {
+        let default = Expr::map_to_struct(col!("m"), MapToStructOptions::default());
+        let Expr::MapToStruct(default_state) = &default else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(default_state.options.timestamp_timezone(), None);
+        assert_eq!(format!("{default}"), "MAP_TO_STRUCT(Column(m))");
+
+        let configured = Expr::map_to_struct(
+            col!("m"),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        let Expr::MapToStruct(configured_state) = &configured else {
+            panic!("expected map-to-struct expression");
+        };
+        assert_eq!(
+            configured_state.options.timestamp_timezone(),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            format!("{configured}"),
+            "MAP_TO_STRUCT(Column(m), timestamp_timezone=\"America/Los_Angeles\")"
+        );
+    }
+
+    #[test]
+    fn test_cast_options_state_and_format() {
+        let cast_default = Expr::cast(col!("s"), DataType::TIMESTAMP, CastOptions::default());
+        let Expr::Cast(cast_default_state) = &cast_default else {
+            panic!("expected cast expression");
+        };
+        assert_eq!(cast_default_state.options.timestamp_timezone(), None);
+        assert_eq!(format!("{cast_default}"), "CAST(Column(s) AS timestamp)");
+
+        let cast = Expr::cast(
+            col!("s"),
+            DataType::TIMESTAMP,
+            CastOptions::default()
+                .with_timestamp_timezone("+12:45:30")
+                .with_invalid_input_error()
+                .with_empty_string_as_null(),
+        );
+        let Expr::Cast(cast_state) = &cast else {
+            panic!("expected cast expression");
+        };
+        assert_eq!(cast_state.options.timestamp_timezone(), Some("+12:45:30"));
+        assert!(cast_state.options.invalid_input_is_error());
+        assert!(cast_state.options.empty_string_is_null());
+        assert_eq!(
+            format!("{cast}"),
+            "CAST(Column(s) AS timestamp USING \"+12:45:30\" ERROR ON INVALID EMPTY STRING AS NULL)"
+        );
     }
 
     #[test]
@@ -1341,8 +1585,9 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            col, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-            ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
+            col, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, CastOptions, ColumnName,
+            Expression, ExpressionStructPatchBuilder, MapToStructOptions, Predicate, Scalar,
+            UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1481,11 +1726,28 @@ mod tests {
         }
 
         #[rstest::rstest]
-        #[case::column(Expression::cast(col!("part"), DataType::DATE))]
-        #[case::literal(Expression::cast(lit("2025-01-01"), DataType::DATE))]
+        #[case::column(Expression::cast(
+            col!("part"),
+            DataType::DATE,
+            CastOptions::default(),
+        ))]
+        #[case::literal(Expression::cast(
+            lit("2025-01-01"),
+            DataType::DATE,
+            CastOptions::default(),
+        ))]
         #[case::nested(Expression::cast(
-            Expression::cast(col!("part"), DataType::STRING),
+            Expression::cast(col!("part"), DataType::STRING, CastOptions::default()),
             DataType::INTEGER,
+            CastOptions::default(),
+        ))]
+        #[case::timestamp_timezone(Expression::cast(
+            col!("part"),
+            DataType::TIMESTAMP,
+            CastOptions::default()
+                .with_timestamp_timezone("America/Los_Angeles")
+                .with_invalid_input_error()
+                .with_empty_string_as_null(),
         ))]
         fn test_cast_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
@@ -1573,13 +1835,23 @@ mod tests {
         #[test]
         fn test_map_to_struct_expression_roundtrip() {
             let cases: Vec<Expression> = vec![
-                Expression::map_to_struct(col!("pv")),
-                Expression::map_to_struct(lit("ignored")),
+                Expression::map_to_struct(col!("pv"), MapToStructOptions::default()),
+                Expression::map_to_struct(lit("ignored"), MapToStructOptions::default()),
+                Expression::map_to_struct(
+                    col!("pv"),
+                    MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+                ),
             ];
 
             for expr in &cases {
                 assert_roundtrip(expr);
             }
+        }
+
+        #[test]
+        fn test_element_at_expression_roundtrip() {
+            let expr = Expression::element_at(col!("partitionValues"), col!("partitionKey"));
+            assert_roundtrip(&expr);
         }
 
         // ==================== Predicate Tests ====================
