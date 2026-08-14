@@ -137,9 +137,9 @@ impl Scan {
     /// FROM checkpoint_actions
     /// WHERE add.path IS NOT NULL
     ///
-    /// When no compatible native field exists, the arm parses JSON or map input. It serializes
-    /// parsed stats when JSON output is requested from a struct-only checkpoint. Requested parsed
-    /// stats require at least one source representation; unrequested fields are omitted.
+    /// When no compatible native field exists, the arm parses JSON or map input. Missing stats
+    /// remain null. It serializes parsed stats when JSON output is requested from a struct-only
+    /// checkpoint; unrequested fields are omitted.
     fn checkpoint_arm(&self, shape: &CheckpointShape) -> DeltaResult<PlanBuilder> {
         let log_segment = self.snapshot.log_segment();
         let physical_stats = self.state_info.physical_stats_schema.as_ref();
@@ -248,6 +248,18 @@ impl Scan {
     }
 
     fn checkpoint_parquet_read_schema(&self, shape: &CheckpointShape) -> DeltaResult<SchemaRef> {
+        let add_patch = SchemaStructPatchBuilder::new();
+
+        // This determines which parsed stats columns to read from the checkpoint. This happens in
+        // one of the following cases:
+        //     1) The user requested JSON stats, but the checkpoint only has parsed stats. This
+        //        reads the full stats schema so JSON can be synthesized.
+        //     2) The user requested structured stats using `StructStats::All` or
+        //        `StructStats::Columns`.
+        //     3) The user provided a predicate that can be evaluated using parsed stats.
+        //
+        // Cases 2 and 3 are handled by `physical_stats_schema`, which contains the union of columns
+        // needed for structured output and predicate evaluation.
         let stats_schema = self.state_info.physical_stats_schema.as_ref();
         let checkpoint_parsed_stats_schema =
             if self.stats.synthesize_json && !shape.has_json_stats() {
@@ -267,25 +279,16 @@ impl Scan {
                     .and_then(|schema| shape.compatible_stats_parsed_schema(schema))
                     .cloned()
             };
-        if shape.checkpoint_type != CheckpointType::None
-            && (self.stats.synthesize_json || stats_schema.is_some())
-            && !shape.has_json_stats()
-            && checkpoint_parsed_stats_schema.is_none()
-        {
-            return Err(Error::invalid_checkpoint(
-                "stats were requested, but checkpoint contains neither compatible \
-                 add.stats_parsed nor add.stats",
-            ));
-        }
-        let read_json_stats = shape.has_json_stats()
-            && (self.stats.synthesize_json
-                || (stats_schema.is_some() && checkpoint_parsed_stats_schema.is_none()));
-        let add_patch = SchemaStructPatchBuilder::new().fold_with(
-            checkpoint_parsed_stats_schema.as_ref(),
-            |patch, schema| {
+        let add_patch =
+            add_patch.fold_with(checkpoint_parsed_stats_schema.as_ref(), |patch, schema| {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
-            },
-        );
+            });
+
+        // JSON stats are read when requested using `StructStats::Json` or needed to derive parsed stats because
+        // the checkpoint has no compatible parsed representation.
+        let needs_json_stats = self.stats.synthesize_json
+            || (stats_schema.is_some() && checkpoint_parsed_stats_schema.is_none());
+        let read_json_stats = shape.has_json_stats() && needs_json_stats;
         let add_patch = if read_json_stats {
             add_patch
         } else {
@@ -294,7 +297,7 @@ impl Scan {
         // Native parsed partitions are not authoritative:
         // `LogSegment::schema_has_compatible_partition_values_parsed` permits missing fields, and
         // timestamps may use the checkpoint writer's timezone, making them incorrect for other
-        // readers. We always retain and reparse the complete string map instead.
+        // readers. We retain and reparse the complete string map downstream.
         Ok(schema_ref! {
             (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
             nullable (VERSION): LONG,
@@ -324,7 +327,7 @@ impl Scan {
     /// ```text
     /// add: struct<
     ///   path: string,
-    ///   partitionValues: map<string, string>,
+    ///   partitionValues: map<string, string>,     // when string partitions are requested
     ///   size: long,
     ///   modificationTime: long,
     ///   dataChange: boolean,
@@ -512,10 +515,8 @@ fn file_action_key_expr(key_col_expr: impl Fn(ColumnName) -> Expr) -> Expr {
 }
 
 trait ProjectionStructPatchBuilderExt<'a> {
-    /// Parses add stats, preferring a compatible parsed field.
-    ///
-    /// When `physical_stats` is present, the input must contain either
-    /// `add.stats_parsed` or the fallback `add.stats` JSON field.
+    /// Parses add stats, preferring a compatible parsed field. When neither representation exists,
+    /// emits a typed null struct so metadata pruning conservatively retains the file.
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self;
 
     /// Parses add partition values, preferring a compatible parsed field.
@@ -540,7 +541,11 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
                     let expr = Expr::parse_json(col!("add.stats"), Arc::clone(schema));
                     self.append_at(add, field, expr)
                 } else {
-                    self
+                    self.append_at(
+                        add,
+                        field,
+                        Expr::null_literal(schema.as_ref().clone().into()),
+                    )
                 }
             }
             None => self,
@@ -572,7 +577,14 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
             return self;
         }
 
-        let expr = Expr::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed"));
+        let has_stats_parsed = self
+            .input_schema()
+            .contains_col([ADD_NAME, STATS_PARSED_NAME]);
+        let expr = if has_stats_parsed {
+            Expr::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed"))
+        } else {
+            Expr::null_literal(DataType::STRING)
+        };
         self.insert_after_at(
             [ADD_NAME],
             DATA_CHANGE,

@@ -199,8 +199,8 @@ impl StatsOptions {
 /// When the typed struct is requested, scan metadata output gains a top-level
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// omitted. Values are parsed from the complete `partitionValues` string map; native checkpoint
+/// `partitionValues_parsed` values may be incomplete or use the checkpoint writer's timezone.
 #[derive(Clone, Debug)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the raw `partitionValues` string map.

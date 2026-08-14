@@ -776,21 +776,51 @@ fn declarative_metadata_output_options_across_log_shapes(
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint()
 )]
-fn declarative_metadata_errors_when_requested_stats_are_absent(
+fn declarative_metadata_handles_absent_stats(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[values(
         StatsOptions::json_only(),
         StatsOptions::all_struct(),
-        StatsOptions::all()
+        StatsOptions::all(),
+        StatsOptions::struct_columns(vec![])
     )]
     stats: StatsOptions,
-) {
-    let error = assert_metadata_output_options(log_state, features, no_checkpoint_stats(), stats)
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("checkpoint contains neither compatible add.stats_parsed nor add.stats"));
+) -> DeltaResult<()> {
+    let table = TestTableBuilder::new()
+        .with_log_state(log_state)
+        .with_features(features)
+        .with_table_config(no_checkpoint_stats())
+        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .build()
+        .expect("build no-stats table");
+    let engine = SyncEngine::new_with_store(table.store().clone());
+    let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
+    let scan = snapshot
+        .scan_builder()
+        .with_stats(stats.clone())
+        .with_predicate(Arc::new(column_expr!("value").gt(Expr::literal(i32::MAX))))
+        .build()?;
+    let actual = declarative_metadata(&scan, &engine)?;
+    assert!(metadata_row_count(&actual) > 0);
+
+    for batch in &actual {
+        if stats.synthesize_json {
+            let json = batch.column_by_name(STATS).expect("requested JSON stats");
+            assert_eq!(json.null_count(), batch.num_rows());
+        } else {
+            assert!(batch.column_by_name(STATS).is_none());
+        }
+        if matches!(stats.struct_stats, StructStats::All) {
+            let parsed = batch
+                .column_by_name(STATS_PARSED)
+                .expect("requested parsed stats");
+            assert_eq!(parsed.null_count(), batch.num_rows());
+        } else {
+            assert!(batch.column_by_name(STATS_PARSED).is_none());
+        }
+    }
+    Ok(())
 }
 
 #[rstest]
