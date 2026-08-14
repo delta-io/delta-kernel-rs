@@ -298,8 +298,8 @@ impl Scan {
                 ))
             });
 
-        // JSON stats are read when requested or needed to derive parsed stats because the
-        // checkpoint has no compatible parsed representation.
+        // JSON stats are read when requested for output or needed to derive parsed stats because
+        // the checkpoint has no compatible parsed representation.
         let needs_json_stats = self.stats.synthesize_json
             || (stats_schema.is_some() && checkpoint_parsed_stats_schema.is_none());
         let read_json_stats = shape.has_json_stats() && needs_json_stats;
