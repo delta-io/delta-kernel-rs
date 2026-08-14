@@ -3,7 +3,7 @@
 
 use std::ops::Deref as _;
 
-use crate::expressions::{Expression, Scalar};
+use crate::expressions::{null_lit, Expression, Scalar};
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::DeltaResult;
@@ -126,7 +126,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
                     "NULL value for non-nullable struct field with non-NULL siblings".to_string(),
                 ));
             }
-            Expression::null_literal(struct_type.clone().into())
+            null_lit(struct_type.clone())
         } else {
             Expression::struct_from(field_exprs)
         };
@@ -156,7 +156,7 @@ mod tests {
     use Expression as Expr;
 
     use super::*;
-    use crate::expressions::{ArrayData, MapData};
+    use crate::expressions::{lit, ArrayData, MapData};
     use crate::schema::{schema_ref, SchemaRef, StructField, StructType};
     use crate::DataType as DeltaDataTypes;
 
@@ -178,11 +178,11 @@ mod tests {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
 
         let schema = schema_ref! { not_null "col_1": INTEGER };
-        let expected = Expr::null_literal(schema.clone().into());
+        let expected = null_lit(schema.clone());
         assert_single_row_transform(values, schema, Ok(expected));
 
         let schema = schema_ref! { nullable "col_1": INTEGER };
-        let expected = Expr::struct_from(vec![Expr::null_literal(DeltaDataTypes::INTEGER)]);
+        let expected = Expr::struct_from(vec![null_lit(DeltaDataTypes::INTEGER)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
 
@@ -231,8 +231,8 @@ mod tests {
             },
         };
         let expected = Expr::struct_from(vec![
-            Expr::struct_from(vec![Expr::literal(1), Expr::literal(2)]),
-            Expr::struct_from(vec![Expr::literal(3), Expr::literal(4)]),
+            Expr::struct_from(vec![lit(1), lit(2)]),
+            Expr::struct_from(vec![lit(3), lit(4)]),
         ]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -251,10 +251,7 @@ mod tests {
             StructField::nullable("map", map_type),
             StructField::nullable("array", array_type),
         ]));
-        let expected = Expr::struct_from(vec![
-            Expr::literal(Scalar::Map(map_data)),
-            Expr::literal(Scalar::Array(array_data)),
-        ]);
+        let expected = Expr::struct_from(vec![lit(map_data), lit(array_data)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
 
@@ -295,15 +292,13 @@ mod tests {
 
         let expected_result = match expected {
             Expected::Noop => {
-                let nested_struct = Expr::struct_from(vec![
-                    Expr::literal(values[0].clone()),
-                    Expr::literal(values[1].clone()),
-                ]);
+                let nested_struct =
+                    Expr::struct_from(vec![lit(values[0].clone()), lit(values[1].clone())]);
                 Ok(Expr::struct_from([nested_struct]))
             }
-            Expected::Null => Ok(Expr::null_literal(schema.clone().into())),
+            Expected::Null => Ok(null_lit(schema.clone())),
             Expected::NullStruct => {
-                let nested_null = Expr::null_literal(field_x.data_type().clone());
+                let nested_null = null_lit(field_x.data_type().clone());
                 Ok(Expr::struct_from([nested_null]))
             }
             Expected::Error => Err(()),

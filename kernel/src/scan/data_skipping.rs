@@ -715,7 +715,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator<'_> {
         } else {
             let safe_to_skip = match inverted {
                 true => self.get_rowcount_stat()?, // all-null
-                false => Expr::literal(0i64),      // no-null
+                false => lit(0i64),                // no-null
             };
             Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
         }
@@ -895,7 +895,7 @@ impl DataSkippingPredicateEvaluator for CheckpointDataSkippingPredicateCreator<'
             return None; // IS NOT NULL: column vs column, can't prune (#1873)
         }
         let nullcount = self.get_nullcount_stat(col)?;
-        let comparison = Pred::ne(nullcount.clone(), Expr::literal(0i64));
+        let comparison = Pred::ne(nullcount.clone(), lit(0i64));
         Some(Pred::or(Pred::is_null(nullcount), comparison))
     }
 

@@ -277,7 +277,7 @@ mod tests {
             StructField::not_null("b", KernelDataType::STRING),
         ])
         .unwrap();
-        let value = to_df_scalar(&KernelScalar::Null(struct_type.into())).unwrap();
+        let value = to_df_scalar(&KernelScalar::null(struct_type)).unwrap();
         assert!(matches!(value, DFScalarValue::Struct(_)), "got {value:?}");
         assert!(value.is_null(), "expected a null struct, got {value:?}");
     }

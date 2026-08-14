@@ -44,8 +44,8 @@ use std::borrow::Cow;
 // - K-prefix: Kernel types (KExpr, KPred, KBinOp, KPredOp)
 // - P-prefix: Parser/sqlparser types (PExpr, PBinOp, PUnaryOp, PVal)
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpressionOp as KBinOp, BinaryPredicateOp as KPredOp, ColumnName,
-    Expression as KExpr, Predicate as KPred, Scalar,
+    lit, null_lit, ArrayData, BinaryExpressionOp as KBinOp, BinaryPredicateOp as KPredOp,
+    ColumnName, Expression as KExpr, Predicate as KPred, Scalar,
 };
 use delta_kernel::schema::{ArrayType, DataType, PrimitiveType, Schema};
 use itertools::Itertools as _;
@@ -129,7 +129,7 @@ fn synthesize_expr(schema: &Schema, expr: &PExpr) -> Option<(KExpr, DataType)> {
             Some((expr, ty))
         }
         PExpr::Value(v) => match &v.value {
-            PVal::Boolean(b) => Some((Scalar::Boolean(*b).into(), DataType::BOOLEAN)),
+            PVal::Boolean(b) => Some((lit(*b), DataType::BOOLEAN)),
             _ => None, // Numeric, string, null need type context
         },
         // Typed literals need type context from the other side of comparison
@@ -189,7 +189,7 @@ fn check_expr(
                     format!("Typed literal cannot be used for type: {expected_ty:?}").into(),
                 );
             };
-            Ok(prim.parse_scalar(s).map_err(|e| e.to_string())?.into())
+            Ok(lit(prim.parse_scalar(s).map_err(|e| e.to_string())?))
         }
         PExpr::Nested(inner) => check_expr(schema, expected_ty, inner),
         _ => {
@@ -225,20 +225,20 @@ fn check_literal(
         ) => {
             let raw = format!("{}{n}", if is_negative { "-" } else { "" });
             let scalar = prim.parse_scalar(&raw).map_err(|e| e.to_string())?;
-            Ok(scalar.into())
+            Ok(lit(scalar))
         }
 
         // String literals - use parse_scalar (handles String, Date, Timestamp, etc.)
         (DataType::Primitive(prim), PVal::SingleQuotedString(s) | PVal::DoubleQuotedString(s)) => {
             let scalar = prim.parse_scalar(s).map_err(|e| e.to_string())?;
-            Ok(scalar.into())
+            Ok(lit(scalar))
         }
 
         // Boolean literals
-        (DataType::Primitive(Boolean), PVal::Boolean(b)) => Ok(Scalar::Boolean(*b).into()),
+        (DataType::Primitive(Boolean), PVal::Boolean(b)) => Ok(lit(*b)),
 
         // NULL can be any type
-        (ty, PVal::Null) => Ok(Scalar::Null(ty.clone()).into()),
+        (ty, PVal::Null) => Ok(null_lit(ty.clone())),
 
         // Type mismatches
         (expected, actual) => Err(format!(
@@ -402,11 +402,7 @@ fn in_list_to_pred(
     // Check if any scalar is null to determine array nullability
     let contains_null = scalars.iter().any(|s| s.is_null());
     let array_data = ArrayData::try_new(ArrayType::new(col_ty, contains_null), scalars)?;
-    let pred = KPred::binary(
-        KPredOp::In,
-        col_expr,
-        KExpr::literal(Scalar::Array(array_data)),
-    );
+    let pred = KPred::binary(KPredOp::In, col_expr, lit(array_data));
     Ok(if negated { KPred::not(pred) } else { pred })
 }
 
@@ -514,7 +510,7 @@ mod tests {
             .map(|s| s.data_type())
             .unwrap_or(DataType::LONG);
         let array = ArrayData::try_new(ArrayType::new(element_type, false), scalars).unwrap();
-        KPred::binary(KPredOp::In, col, KExpr::literal(Array(array)))
+        KPred::binary(KPredOp::In, col, lit(Array(array)))
     }
 
     // -- Comparisons --
@@ -850,11 +846,7 @@ mod tests {
             vec![Long(1), Long(2), Null(DataType::LONG)],
         )
         .unwrap();
-        let expected = KPred::binary(
-            KPredOp::In,
-            col!("a"),
-            KExpr::literal(Scalar::Array(expected_array)),
-        );
+        let expected = KPred::binary(KPredOp::In, col!("a"), lit(expected_array));
         assert_eq!(pred, expected);
     }
 

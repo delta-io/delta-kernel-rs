@@ -5,8 +5,8 @@ use std::sync::Arc;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_expression::opaque::ArrowOpaquePredicate;
 use delta_kernel::expressions::{
-    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, Predicate,
-    Scalar, UnaryPredicateOp,
+    lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
+    JunctionPredicateOp, Predicate, Scalar, UnaryPredicateOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
 use delta_kernel::DeltaResult;
@@ -275,7 +275,7 @@ fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
     value: DeltaResult<String>,
 ) -> DeltaResult<usize> {
-    Ok(wrap_expression(state, Expression::literal(value?)))
+    Ok(wrap_expression(state, lit(value?)))
 }
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
@@ -284,7 +284,7 @@ pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -292,7 +292,7 @@ pub extern "C" fn visit_expression_literal_long(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -300,7 +300,7 @@ pub extern "C" fn visit_expression_literal_short(
     state: &mut KernelExpressionVisitorState,
     value: i16,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -308,7 +308,7 @@ pub extern "C" fn visit_expression_literal_byte(
     state: &mut KernelExpressionVisitorState,
     value: i8,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -316,7 +316,7 @@ pub extern "C" fn visit_expression_literal_float(
     state: &mut KernelExpressionVisitorState,
     value: f32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -324,7 +324,7 @@ pub extern "C" fn visit_expression_literal_double(
     state: &mut KernelExpressionVisitorState,
     value: f64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 #[no_mangle]
@@ -332,7 +332,7 @@ pub extern "C" fn visit_expression_literal_bool(
     state: &mut KernelExpressionVisitorState,
     value: bool,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, lit(value))
 }
 
 /// visit a date literal expression 'value' (i32 representing days since unix epoch)
@@ -341,7 +341,7 @@ pub extern "C" fn visit_expression_literal_date(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::Date(value)))
+    wrap_expression(state, lit(Scalar::Date(value)))
 }
 
 /// visit a timestamp literal expression 'value' (i64 representing microseconds since unix epoch)
@@ -350,7 +350,7 @@ pub extern "C" fn visit_expression_literal_timestamp(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
+    wrap_expression(state, lit(Scalar::Timestamp(value)))
 }
 
 /// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix
@@ -360,7 +360,7 @@ pub extern "C" fn visit_expression_literal_timestamp_ntz(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::TimestampNtz(value)))
+    wrap_expression(state, lit(Scalar::TimestampNtz(value)))
 }
 
 /// Visit an interval year-month literal (signed month count).
@@ -369,7 +369,7 @@ pub extern "C" fn visit_expression_literal_interval_year_month(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::IntervalYearMonth(value)))
+    wrap_expression(state, lit(Scalar::IntervalYearMonth(value)))
 }
 
 /// Visit an interval day-time literal (signed microsecond count).
@@ -378,7 +378,7 @@ pub extern "C" fn visit_expression_literal_interval_day_time(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(Scalar::IntervalDayTime(value)))
+    wrap_expression(state, lit(Scalar::IntervalDayTime(value)))
 }
 
 /// visit a binary literal expression
@@ -392,7 +392,7 @@ pub unsafe extern "C" fn visit_expression_literal_binary(
     len: usize,
 ) -> usize {
     let bytes = std::slice::from_raw_parts(value, len);
-    wrap_expression(state, Expression::literal(Scalar::Binary(bytes.to_vec())))
+    wrap_expression(state, lit(bytes))
 }
 
 /// visit a decimal literal expression
@@ -424,7 +424,7 @@ fn visit_expression_literal_decimal_impl(
     // Reconstruct the i128 from two u64 parts
     let value = ((value_hi as i128) << 64) | (value_lo as i128);
     let decimal = Scalar::decimal(value, precision, scale)?;
-    Ok(wrap_expression(state, Expression::literal(decimal)))
+    Ok(wrap_expression(state, lit(decimal)))
 }
 
 /// Type tag for null literal construction via FFI. Identifies the data type of a typed null.
@@ -617,10 +617,7 @@ fn visit_expression_literal_null_impl(
 ) -> DeltaResult<usize> {
     let tag = NullTypeTag::try_from(type_tag)?;
     let data_type = tag.to_data_type(precision, scale)?;
-    Ok(wrap_expression(
-        state,
-        Expression::literal(Scalar::Null(data_type)),
-    ))
+    Ok(wrap_expression(state, null_lit(data_type)))
 }
 
 #[no_mangle]
@@ -841,7 +838,7 @@ fn visit_predicate_opaque_with_eval_impl(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use delta_kernel::expressions::{col, lit, Expression, Scalar};
+    use delta_kernel::expressions::{col, lit, Scalar};
     use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
     use rstest::rstest;
 
@@ -1049,7 +1046,7 @@ mod tests {
         let id =
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        assert_eq!(expr, Expression::literal(Scalar::Null(data_type)),);
+        assert_eq!(expr, null_lit(data_type),);
     }
 
     #[test]
@@ -1061,7 +1058,7 @@ mod tests {
         let id =
             visit_expression_literal_null_impl(&mut state, tag as u8, precision, scale).unwrap();
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        assert_eq!(expr, Expression::literal(Scalar::Null(dt)));
+        assert_eq!(expr, null_lit(dt));
     }
 
     #[rstest]
@@ -1085,7 +1082,7 @@ mod tests {
             _ => unreachable!(),
         };
         let expr = unwrap_kernel_expression(&mut state, id).unwrap();
-        assert_eq!(expr, Expression::literal(expected));
+        assert_eq!(expr, lit(expected));
     }
 
     // ============================================================================
@@ -1140,8 +1137,8 @@ mod tests {
     }
 
     fn make_two_literal_ids(state: &mut KernelExpressionVisitorState) -> (usize, usize) {
-        let a = wrap_expression(state, Expression::literal(1i32));
-        let b = wrap_expression(state, Expression::literal(2i32));
+        let a = wrap_expression(state, lit(1i32));
+        let b = wrap_expression(state, lit(2i32));
         (a, b)
     }
 

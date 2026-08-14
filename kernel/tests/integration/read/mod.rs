@@ -15,8 +15,8 @@ use delta_kernel::arrow::datatypes::{
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::expressions::{
-    col, column_pred, lit, Expression as Expr, ExpressionRef, Predicate as Pred, PredicateRef,
-    Scalar,
+    col, column_pred, lit, null_lit, Expression as Expr, ExpressionRef, Predicate as Pred,
+    PredicateRef, Scalar,
 };
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::object_store::memory::InMemory;
@@ -1378,7 +1378,7 @@ fn not_and_or_predicates(
     table_for_numbers(vec![1, 2, 4, 5, 6])
 )]
 #[case::distinct_null(
-    col!("number").distinct(Expr::null_literal(DataType::LONG)),
+    col!("number").distinct(null_lit(DataType::LONG)),
     table_for_numbers(vec![1, 2, 3, 4, 5, 6])
 )]
 #[case::not_distinct_value(
@@ -1386,7 +1386,7 @@ fn not_and_or_predicates(
     table_for_numbers(vec![3])
 )]
 #[case::not_distinct_null(
-    Pred::not(col!("number").distinct(Expr::null_literal(DataType::LONG))),
+    Pred::not(col!("number").distinct(null_lit(DataType::LONG))),
     table_for_numbers(vec![])
 )]
 #[case::gt_empty_struct(

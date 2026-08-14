@@ -6,7 +6,7 @@ use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::{ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::filter_by_predicate;
 use crate::expressions::{
-    col, lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
+    col, null_lit, Expression, ExpressionStructPatchBuilder, Predicate, Scalar, StructData,
 };
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{
@@ -203,11 +203,8 @@ impl SidecarSplitter {
             checkpoint_data_schema.clone(),
             Arc::new(Expression::struct_patch(
                 ExpressionStructPatchBuilder::new()
-                    .replace(ADD_NAME, lit(Scalar::Null(add_field.data_type.clone())))
-                    .replace(
-                        REMOVE_NAME,
-                        lit(Scalar::Null(remove_field.data_type.clone())),
-                    ),
+                    .replace(ADD_NAME, null_lit(add_field.data_type.clone()))
+                    .replace(REMOVE_NAME, null_lit(remove_field.data_type.clone())),
             )?),
             checkpoint_data_schema.clone().into(),
         )?;

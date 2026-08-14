@@ -18,7 +18,9 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
-use delta_kernel::expressions::{col, lit, ExpressionStructPatchBuilder, MapData, Scalar};
+use delta_kernel::expressions::{
+    col, lit, null_lit, ExpressionStructPatchBuilder, MapData, Scalar,
+};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStoreExt as _;
 use delta_kernel::scan::{scan_row_schema, StatsOptions};
@@ -1429,7 +1431,7 @@ fn with_missing_extended_metadata_fields(
     let (data, selection_vector) = scan_files.into_parts();
     let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let tags = if missing_fields.contains(&ExtendedMetadataField::Tags) {
-        Scalar::Null(DataType::from(map_type.clone()))
+        Scalar::null(map_type.clone())
     } else {
         Scalar::Map(MapData::try_new(map_type.clone(), [("key", "value")])?)
     };
@@ -1437,11 +1439,11 @@ fn with_missing_extended_metadata_fields(
         ExpressionStructPatchBuilder::new().replace_at(["fileConstantValues"], "tags", lit(tags));
     for field in missing_fields {
         patch = match field {
-            ExtendedMetadataField::Size => patch.replace("size", lit(Scalar::Null(DataType::LONG))),
+            ExtendedMetadataField::Size => patch.replace("size", null_lit(DataType::LONG)),
             ExtendedMetadataField::PartitionValues => patch.replace_at(
                 ["fileConstantValues"],
                 field.name(),
-                lit(Scalar::Null(DataType::from(map_type.clone()))),
+                null_lit(map_type.clone()),
             ),
             ExtendedMetadataField::Tags => patch,
         };

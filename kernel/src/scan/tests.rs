@@ -20,7 +20,7 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
 use crate::expressions::{
-    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred,
+    col, column_name, column_pred, lit, Expression as Expr, Predicate as Pred, Scalar,
 };
 use crate::object_store::memory::InMemory;
 use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -50,9 +50,9 @@ fn test_static_skipping() {
         (true, Pred::and(column_pred!("a"), Pred::FALSE)),
         (false, Pred::or(column_pred!("a"), Pred::TRUE)),
         (false, Pred::or(column_pred!("a"), Pred::FALSE)),
-        (false, Pred::lt(col!("a"), Expr::literal(10))),
-        (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
-        (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
+        (false, Pred::lt(col!("a"), lit(10))),
+        (false, Pred::lt(lit(10), lit(100))),
+        (true, Pred::gt(lit(10), lit(100))),
         (false, Pred::and(Pred::NULL, column_pred!("a"))), // NULL is unknown, not false
     ];
     for (should_skip, predicate) in test_cases {

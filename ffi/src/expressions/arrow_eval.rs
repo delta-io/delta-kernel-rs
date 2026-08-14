@@ -20,7 +20,7 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::evaluate_expres
 use delta_kernel::engine::arrow_expression::opaque::{
     ArrowOpaquePredicate as _, ArrowOpaquePredicateOp,
 };
-use delta_kernel::expressions::{Expression, ExpressionRef, Scalar, ScalarExpressionEvaluator};
+use delta_kernel::expressions::{null_lit, Expression, ExpressionRef, ScalarExpressionEvaluator};
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator,
@@ -177,7 +177,7 @@ fn rewrite_stat_arg(
     arg: &Expression,
     type_hint: Option<&DataType>,
 ) -> Option<Expression> {
-    let null_long = || Expression::literal(Scalar::Null(DataType::LONG));
+    let null_long = || null_lit(DataType::LONG);
     match arg {
         Expression::Column(col) => {
             // The two column kinds go through the same call: a partition column resolves to its
@@ -1010,7 +1010,7 @@ mod tests {
                     Ordering::Greater => BinaryPredicateOp::GreaterThan,
                     Ordering::Equal => BinaryPredicateOp::Equal,
                 };
-                let pred = Predicate::binary(base_op, col, Expression::literal(val.clone()));
+                let pred = Predicate::binary(base_op, col, lit(val.clone()));
                 Some(if inverted { Predicate::not(pred) } else { pred })
             }
         }
@@ -1141,12 +1141,9 @@ mod tests {
             assert_eq!(fields.len(), 4);
             assert_eq!(*fields[0], stats_col("minValues", &column_name!("col")));
             assert_eq!(*fields[1], stats_col("maxValues", &column_name!("col")));
-            assert_eq!(
-                *fields[2],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
+            assert_eq!(*fields[2], null_lit(DataType::LONG));
             assert_eq!(*fields[3], stats_col_numrecords());
-            assert_eq!(opaque.exprs[1], Expression::literal("foo"));
+            assert_eq!(opaque.exprs[1], lit("foo"));
         }
 
         /// A data column with no sibling literal gives no type hint, so min/max stats can't be
@@ -1161,13 +1158,13 @@ mod tests {
         #[test]
         fn passes_literals_through_unchanged() {
             let op = op_with_callbacks("OP");
-            let args = [Expression::literal("foo")];
+            let args = [lit("foo")];
             let pred = rewrite(&op, &args, &rewriter(), false).expect("rewrite should succeed");
             let Predicate::Opaque(opaque) = pred else {
                 panic!("expected Opaque");
             };
             assert_eq!(opaque.exprs.len(), 1, "arity preserved");
-            assert_eq!(opaque.exprs[0], Expression::literal("foo"));
+            assert_eq!(opaque.exprs[0], lit("foo"));
         }
 
         #[test]
@@ -1216,18 +1213,9 @@ mod tests {
             let Expression::Struct(fields, _) = &opaque.exprs[0] else {
                 panic!("expected Struct arg");
             };
-            assert_eq!(
-                *fields[0],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
-            assert_eq!(
-                *fields[1],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
-            assert_eq!(
-                *fields[2],
-                Expression::literal(Scalar::Null(DataType::LONG))
-            );
+            assert_eq!(*fields[0], null_lit(DataType::LONG));
+            assert_eq!(*fields[1], null_lit(DataType::LONG));
+            assert_eq!(*fields[2], null_lit(DataType::LONG));
             assert_eq!(*fields[3], stats_col_numrecords());
         }
 

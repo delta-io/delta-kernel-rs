@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_get_transform_expr_static_transforms() {
-        let expr = Arc::new(Expression::literal(42));
+        let expr = Arc::new(lit(42));
         let transform_spec = vec![
             FieldTransformSpec::StaticInsert {
                 insert_after: Some("col1".to_string()),

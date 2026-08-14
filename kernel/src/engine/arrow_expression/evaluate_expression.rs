@@ -1128,7 +1128,7 @@ mod tests {
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     };
     use crate::expressions::{
-        col, column_expr_ref, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
+        col, column_expr_ref, lit, null_lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
         Expression as Expr, ExpressionStructPatchBuilder, JunctionPredicateOp, MapData,
         Predicate as Pred, StructData,
     };
@@ -1853,11 +1853,11 @@ mod tests {
         let batch = create_test_batch();
 
         // Valid: literal matches expected type
-        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::INTEGER));
+        let result = evaluate_expression(&lit(42), &batch, Some(&DataType::INTEGER));
         assert!(result.is_ok());
 
         // Error: literal type mismatch
-        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::STRING));
+        let result = evaluate_expression(&lit(42), &batch, Some(&DataType::STRING));
         assert_result_error_with_message(result, "Incorrect datatype");
     }
 
@@ -1969,7 +1969,7 @@ mod tests {
         let (literal_source, column_source, batch) = in_element_sources(elements);
         let needle = match needle {
             Some(n) => lit(n),
-            None => Expr::null_literal(DataType::INTEGER),
+            None => null_lit(DataType::INTEGER),
         };
         for elements in [literal_source, column_source] {
             let pred = Pred::binary(BinaryPredicateOp::In, needle.clone(), elements);
@@ -3476,7 +3476,7 @@ mod tests {
     // the Arrow Debug formatter for `DataType` since that may change.
     #[case::input_type_mismatch(
         create_test_batch(),
-        Expr::array([Expr::literal(1_i32), Expr::literal(2_i32), Expr::literal("text")]),
+        Expr::array([lit(1_i32), lit(2_i32), lit("text")]),
         None,
         "input 2",
     )]

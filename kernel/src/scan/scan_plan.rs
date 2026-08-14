@@ -17,7 +17,8 @@ use crate::actions::{
 };
 use crate::checkpoint::{CheckpointShape, CheckpointType};
 use crate::expressions::{
-    col, column_name, joined_column_expr, ColumnName, Expression as Expr, ExpressionRef, Predicate,
+    col, column_name, joined_column_expr, lit, null_lit, ColumnName, Expression as Expr,
+    ExpressionRef, Predicate,
 };
 use crate::plans::ir::nodes::{DynamicScan, FileType, ScanFile};
 use crate::plans::ir::plan::Plan;
@@ -369,7 +370,7 @@ fn sidecar_actions(
                 col!(SIDECAR_NAME, FILE_PATH),
                 col!(SIDECAR_NAME, SIDECAR_SIZE),
                 col!(SIDECAR_NAME, SIDECAR_FILE_MOD),
-                Expr::null_literal(DeletionVectorDescriptor::to_schema().into()),
+                null_lit(DeletionVectorDescriptor::to_schema()),
                 col!(VERSION),
             ]),
             SIDECAR_FILE_META_SCHEMA.clone(),
@@ -562,7 +563,7 @@ fn stats_skipping_predicate(state: &StateInfo) -> Option<Predicate> {
         &state.physical_stats_columns,
     )?;
     // A null skipping verdict means the available metadata cannot prove the file is skippable.
-    let skipping = Predicate::distinct(skipping, Expr::literal(false));
+    let skipping = Predicate::distinct(skipping, lit(false));
     let mut prefixer = MetadataSkippingColumnPrefixer;
     Some(prefixer.transform_pred(&skipping).into_owned())
 }
@@ -580,7 +581,6 @@ mod tests {
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::lit;
     use crate::log_segment::LogSegment;
     use crate::log_segment_files::LogSegmentFiles;
     use crate::object_store::memory::InMemory;
@@ -893,7 +893,7 @@ mod tests {
         let segment = log_segment(log_root(), &[], None);
         let scan = mock_snapshot(segment)?
             .scan_builder()
-            .with_predicate(Arc::new(Predicate::literal(false)))
+            .with_predicate(Arc::new(Predicate::FALSE))
             .build()?;
         assert_eq!(
             scan.state_info.physical_predicate,

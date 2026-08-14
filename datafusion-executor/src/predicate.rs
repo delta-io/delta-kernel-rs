@@ -5,8 +5,7 @@ use datafusion::functions_nested::expr_fn::array_has;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, disjunction};
 use datafusion::logical_expr::{binary_expr, lit, Expr as DFExpr, Operator};
-use delta_kernel::expressions::{
-    ArrayData as KernelArrayData, BinaryPredicate as KernelBinaryPredicate,
+use delta_kernel::expressions::{null_lit, ArrayData as KernelArrayData, BinaryPredicate as KernelBinaryPredicate,
     BinaryPredicateOp as KernelBinaryPredicateOp, ColumnName as KernelColumnName,
     Expression as KernelExpression, JunctionPredicate as KernelJunctionPredicate,
     JunctionPredicateOp as KernelJunctionPredicateOp, Predicate as KernelPredicate,
@@ -258,7 +257,7 @@ mod tests {
         let elements: Vec<KernelScalar> = values.into_iter().map(KernelScalar::Long).collect();
         let array =
             KernelArrayData::try_new(ArrayType::new(DataType::LONG, false), elements).unwrap();
-        KernelExpr::literal(KernelScalar::Array(array))
+        lit(KernelScalar::Array(array))
     }
 
     /// A literal `Scalar::Array` of longs where `None` becomes a null element.
@@ -272,7 +271,7 @@ mod tests {
             .collect();
         let array =
             KernelArrayData::try_new(ArrayType::new(DataType::LONG, true), elements).unwrap();
-        KernelExpr::literal(KernelScalar::Array(array))
+        lit(KernelScalar::Array(array))
     }
 
     // === Tests ===
@@ -307,7 +306,7 @@ mod tests {
     #[case::null_needle_in_list(
         KernelPred::binary(
             KernelBinaryPredicateOp::In,
-            KernelExpr::null_literal(DataType::LONG),
+            null_lit(DataType::LONG),
             long_array([1, 2]),
         ),
         "Int64(NULL) IN ([Int64(1), Int64(2)]) IS TRUE"
@@ -408,8 +407,8 @@ mod tests {
         let in_pred = KernelPred::binary(
             KernelBinaryPredicateOp::In,
             match needle {
-                Some(n) => KernelExpr::literal(n),
-                None => KernelExpr::null_literal(DataType::LONG),
+                Some(n) => lit(n),
+                None => null_lit(DataType::LONG),
             },
             nullable_long_array(elements.to_vec()),
         );
@@ -437,8 +436,8 @@ mod tests {
         let in_pred = KernelPred::binary(
             KernelBinaryPredicateOp::In,
             match needle {
-                Some(n) => KernelExpr::literal(n),
-                None => KernelExpr::null_literal(DataType::LONG),
+                Some(n) => lit(n),
+                None => null_lit(DataType::LONG),
             },
             col!("list"),
         );

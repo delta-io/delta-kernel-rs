@@ -571,7 +571,7 @@ impl DvUpdateEntry {
     /// The (null DV, null stats) entry for rows that are not getting a DV update.
     fn null() -> Self {
         static NULL_DV: LazyLock<Scalar> =
-            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+            LazyLock::new(|| Scalar::null(DeletionVectorDescriptor::to_schema()));
         static NULL_STATS: LazyLock<Scalar> = LazyLock::new(|| Scalar::Null(DataType::STRING));
         Self {
             deletion_vector: NULL_DV.clone(),

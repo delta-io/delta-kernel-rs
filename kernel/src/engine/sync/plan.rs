@@ -517,7 +517,7 @@ mod tests {
     }
 
     fn null_dv() -> Scalar {
-        Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema()))
+        Scalar::null(DeletionVectorDescriptor::to_schema())
     }
 
     fn present_dv() -> Scalar {

@@ -12,7 +12,7 @@ use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
+    col, column_expr_ref, column_name, null_lit, ColumnName, Expression, ExpressionRef, Predicate,
     PredicateRef, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
@@ -22,7 +22,6 @@ use crate::log_replay::{
 };
 use crate::log_segment::CheckpointReadInfo;
 use crate::scan::transform_spec::{get_transform_expr, parse_partition_values, TransformSpec};
-use crate::scan::Scalar;
 use crate::schema::{
     schema_ref, ColumnNamesAndTypes, DataType, MapType, SchemaRef, SchemaStructPatchBuilder,
     StructField, StructType, ToSchema as _,
@@ -830,7 +829,7 @@ fn get_add_transform_expr(
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
     let stats_expr = if skip_stats {
-        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+        Arc::new(null_lit(DataType::STRING))
     } else if has_stats_parsed && synthesize_json {
         // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
         // serializing stats_parsed so ScanFile.stats is populated either way.
@@ -840,7 +839,7 @@ fn get_add_transform_expr(
         ]))
     } else if has_stats_parsed {
         // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
-        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+        Arc::new(null_lit(DataType::STRING))
     } else {
         column_expr_ref!("add.stats")
     };
@@ -1156,8 +1155,8 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{
-        col, column_name, lit, BinaryExpressionOp, Expression, OpaquePredicateOp, Predicate,
-        Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
+        col, column_name, lit, null_lit, BinaryExpressionOp, Expression, OpaquePredicateOp,
+        Predicate, Scalar, ScalarExpressionEvaluator, UnaryExpressionOp,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -2068,7 +2067,7 @@ mod tests {
         };
         assert_eq!(
             fields[3].as_ref(),
-            &Expression::Literal(Scalar::Null(DataType::STRING)),
+            &null_lit(DataType::STRING),
             "structured-only checkpoint stats output must be a typed NULL"
         );
     }

@@ -47,6 +47,24 @@ pub fn lit(value: impl Into<Scalar>) -> Expression {
     Expression::literal(value)
 }
 
+/// Build a typed NULL [`Expression::Literal`].
+///
+/// Prefer this over `lit(Scalar::Null(...))`. Accepts anything convertible into a [`DataType`]
+/// (including container types like [`StructType`](crate::schema::StructType)), so callers can
+/// skip an explicit `DataType::from(...)` wrapper.
+///
+/// ```
+/// # use delta_kernel::expressions::{lit, null_lit, Scalar};
+/// # use delta_kernel::schema::DataType;
+/// assert_eq!(
+///     lit(Scalar::Null(DataType::LONG)),
+///     null_lit(DataType::LONG),
+/// );
+/// ```
+pub fn null_lit(data_type: impl Into<DataType>) -> Expression {
+    Expression::Literal(Scalar::null(data_type))
+}
+
 /// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are
 /// expressions, lowered into an [`ExpressionStructPatch`] that can be embedded in an
 /// [`Expression`].
@@ -701,11 +719,6 @@ impl Expression {
         Self::Literal(value.into())
     }
 
-    /// Creates a NULL literal expression
-    pub const fn null_literal(data_type: DataType) -> Self {
-        Self::Literal(Scalar::Null(data_type))
-    }
-
     /// Wraps a predicate as a boolean-valued expression
     pub fn from_pred(value: Predicate) -> Self {
         match value {
@@ -872,12 +885,13 @@ impl Expression {
 }
 
 impl Predicate {
-    /// Literal boolean true
+    /// Literal boolean true.
     pub const TRUE: Self = Self::literal(true);
-    /// Literal boolean false
+    /// Literal boolean false.
     pub const FALSE: Self = Self::literal(false);
-    /// NULL boolean literal
-    pub const NULL: Self = Self::null_literal();
+    /// NULL boolean literal.
+    pub const NULL: Self =
+        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)));
 
     /// Returns a set of columns referenced by this predicate.
     pub fn references(&self) -> HashSet<&ColumnName> {
@@ -891,14 +905,11 @@ impl Predicate {
         Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Create a new literal boolean value. See also [`Self::TRUE`] and [`Self::FALSE`].
+    /// Create a boolean literal predicate from a runtime `bool`.
+    ///
+    /// Prefer [`Self::TRUE`] / [`Self::FALSE`] when the value is statically known.
     pub const fn literal(value: bool) -> Self {
         Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
-    }
-
-    /// Creates a NULL literal boolean value. Prefer [`Self::NULL`].
-    pub const fn null_literal() -> Self {
-        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
     }
 
     /// Converts a boolean-valued expression into a predicate
@@ -1011,8 +1022,8 @@ impl Predicate {
         let mut preds: Vec<_> = preds.into_iter().collect();
         match preds.len() {
             0 => match op {
-                JunctionPredicateOp::And => Self::literal(true),
-                JunctionPredicateOp::Or => Self::literal(false),
+                JunctionPredicateOp::And => Self::TRUE,
+                JunctionPredicateOp::Or => Self::FALSE,
             },
             // A junction of one predicate is just that predicate.
             1 => preds.remove(0),
@@ -1341,8 +1352,8 @@ mod tests {
         use super::assert_roundtrip;
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
         use crate::expressions::{
-            col, column_name, lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression,
-            ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
+            col, column_name, lit, null_lit, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+            Expression, ExpressionStructPatchBuilder, Predicate, Scalar, UnaryExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
         use crate::unit_test_utils::assert_result_error_with_message;
@@ -1354,22 +1365,22 @@ mod tests {
             // Test all primitive scalar types that have proper PartialEq
             let cases: Vec<Expression> = vec![
                 // Numeric types
-                Expression::literal(42i32),         // Integer
-                Expression::literal(9999999999i64), // Long
-                Expression::literal(123i16),        // Short
-                Expression::literal(42i8),          // Byte
-                Expression::literal(1.12345677_32), // Float
-                Expression::literal(1.12345667_64), // Double
+                lit(42i32),         // Integer
+                lit(9999999999i64), // Long
+                lit(123i16),        // Short
+                lit(42i8),          // Byte
+                lit(1.12345677_32), // Float
+                lit(1.12345667_64), // Double
                 // String and Boolean
-                Expression::literal("hello world"),
-                Expression::literal(true),
-                Expression::literal(false),
+                lit("hello world"),
+                lit(true),
+                lit(false),
                 // Temporal types
                 Expression::Literal(Scalar::Timestamp(1234567890000000)),
                 Expression::Literal(Scalar::TimestampNtz(1234567890000000)),
                 Expression::Literal(Scalar::Date(19000)),
                 // Binary
-                Expression::Literal(Scalar::Binary(vec![1, 2, 3, 4, 5])),
+                lit(vec![1u8, 2, 3, 4, 5]),
                 // Decimal
                 Expression::Literal(Scalar::Decimal(
                     DecimalData::try_new(12345i128, DecimalType::try_new(10, 2).unwrap()).unwrap(),
@@ -1386,9 +1397,9 @@ mod tests {
             // Test complex scalar types that need JSON comparison (partial_cmp returns None)
             let cases: Vec<Expression> = vec![
                 // Null with different types
-                Expression::null_literal(DataType::INTEGER),
-                Expression::null_literal(DataType::STRING),
-                Expression::null_literal(DataType::BOOLEAN),
+                null_lit(DataType::INTEGER),
+                null_lit(DataType::STRING),
+                null_lit(DataType::BOOLEAN),
                 // Array
                 Expression::Literal(Scalar::Array(
                     ArrayData::try_new(
@@ -1731,7 +1742,7 @@ mod tests {
                 }
             }
 
-            let expr = Expression::opaque(TestOpaqueExprOp, [Expression::literal(1)]);
+            let expr = Expression::opaque(TestOpaqueExprOp, [lit(1)]);
             let result = serde_json::to_string(&expr);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Expression");
         }
@@ -1779,7 +1790,7 @@ mod tests {
                 }
             }
 
-            let pred = Predicate::opaque(TestOpaquePredOp, [Expression::literal(1)]);
+            let pred = Predicate::opaque(TestOpaquePredOp, [lit(1)]);
             let result = serde_json::to_string(&pred);
             assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
         }

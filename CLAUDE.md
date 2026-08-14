@@ -318,6 +318,10 @@ Keep this list updated when new protocol features are added to kernel.
     `DataType::Array(Box::new(ArrayType::new(...)))`.
 - Prefer the `DeltaResultIterator<'a, T>` / `DeltaResultIteratorStatic<T>` aliases over
   hand-rolled `Box<dyn Iterator<Item = DeltaResult<T>> + Send (+ 'a)>`.
+- Prefer the `lit` / `null_lit` constructors over `Expression::literal(...)` / `lit(Scalar::Null(...))`
+  when building expressions inline. They take `impl Into<Scalar>` and `impl Into<DataType>`,
+  respectively. Prefer `Predicate::TRUE` / `FALSE` / `NULL` for predicates whose value is statically
+  known, reserving `Predicate::literal(b)` for runtime `bool` values.
 - Prefer the `col!` macro and `lit(value)` constructor over `Expression::column(...)` /
   `Expression::literal(...)` when building expressions inline. `col!` uses the same
   compile-time segment rules as `column_name!` (string literals split on `.`; constants are

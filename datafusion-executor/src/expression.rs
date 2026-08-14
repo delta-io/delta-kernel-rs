@@ -17,8 +17,7 @@ use datafusion::logical_expr::{
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::parse_json;
-use delta_kernel::expressions::{
-    BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
+use delta_kernel::expressions::{null_lit, BinaryExpression, BinaryExpressionOp, ColumnName as KernelColumnName,
     Expression as KernelExpression, ExpressionRef, ExpressionStructPatch, MapToStructExpression,
     ParseJsonExpression, UnaryExpressionOp, VariadicExpression, VariadicExpressionOp,
 };
@@ -537,7 +536,7 @@ mod tests {
     #[case::i64(lit(42i64), "Int64(42)")]
     #[case::string(lit("abc"), "Utf8(\"abc\")")]
     #[case::boolean(lit(true), "Boolean(true)")]
-    #[case::null(KernelExpr::null_literal(DataType::LONG), "Int64(NULL)")]
+    #[case::null(null_lit(DataType::LONG), "Int64(NULL)")]
     fn literal_lowers_to_scalar(#[case] kernel: KernelExpr, #[case] expected: &str) {
         assert_eq!(lower(kernel), expected);
     }

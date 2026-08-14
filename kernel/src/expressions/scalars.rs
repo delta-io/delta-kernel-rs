@@ -705,6 +705,12 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+impl From<Vec<u8>> for Scalar {
+    fn from(b: Vec<u8>) -> Self {
+        Self::Binary(b)
+    }
+}
+
 impl From<bytes::Bytes> for Scalar {
     fn from(b: bytes::Bytes) -> Self {
         Self::Binary(b.into())
@@ -1839,6 +1845,13 @@ mod tests {
         } else {
             panic!("Expected Binary scalar");
         }
+
+        // Owned Vec moves into Binary without reallocation via slice.
+        let owned = vec![9u8, 8, 7];
+        let from_vec: Scalar = owned.into();
+        assert_eq!(from_vec, Scalar::Binary(vec![9, 8, 7]));
+        let from_slice: Scalar = [9u8, 8, 7].as_slice().into();
+        assert_eq!(from_slice, Scalar::Binary(vec![9, 8, 7]));
 
         // Test with empty bytes
         let empty_bytes = bytes::Bytes::new();

@@ -754,7 +754,7 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::{lit, Expression, Scalar};
     use rstest::rstest;
 
     use super::*;
@@ -887,35 +887,35 @@ mod tests {
 
     #[rstest]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(26)),
+        lit(Scalar::IntervalYearMonth(26)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(987_654)),
+        lit(Scalar::IntervalDayTime(987_654)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(-13)),
+        lit(Scalar::IntervalYearMonth(-13)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: -13 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(i32::MIN)),
+        lit(Scalar::IntervalYearMonth(i32::MIN)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MIN }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalYearMonth(i32::MAX)),
+        lit(Scalar::IntervalYearMonth(i32::MAX)),
         LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MAX }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(-86_400_000_000)),
+        lit(Scalar::IntervalDayTime(-86_400_000_000)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: -86_400_000_000 }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(i64::MIN)),
+        lit(Scalar::IntervalDayTime(i64::MIN)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MIN }
     )]
     #[case(
-        Expression::literal(Scalar::IntervalDayTime(i64::MAX)),
+        lit(Scalar::IntervalDayTime(i64::MAX)),
         LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
     )]
     fn visit_expression_uses_interval_literal_callbacks(
