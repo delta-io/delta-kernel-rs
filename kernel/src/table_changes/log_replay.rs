@@ -22,7 +22,7 @@ use crate::schema::{schema_ref, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::CdfMode;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::{format_features, Operation, TableFeature};
+use crate::table_features::{format_features, TableFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
@@ -280,7 +280,7 @@ impl LogReplayScanner {
 
             if has_protocol_update {
                 table_configuration
-                    .ensure_operation_supported(Operation::Cdf)
+                    .ensure_operation_supported(mode.read_operation())
                     .map_err(|e| mode.protocol_support_error(e, commit_file.version))?;
             }
         }

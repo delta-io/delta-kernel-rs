@@ -16,6 +16,7 @@ use crate::cancellation::{CancellableIterator, CancellationTokenRef};
 use crate::committer::CatalogCommit;
 use crate::expressions::ColumnName;
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::log_path::LogPath;
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 #[internal_api]
@@ -410,12 +411,17 @@ impl LogSegment {
     /// and all commits between versions `start_version` (inclusive) and `end_version`
     /// (inclusive). If no `end_version` is specified it will be the most recent version by
     /// default.
+    ///
+    /// `log_tail` must contain a contiguous ascending sequence of commit paths. It takes
+    /// precedence over numbered commits at overlapping versions, and entries outside the selected
+    /// range are ignored.
     #[internal_api]
     pub(crate) fn for_table_changes(
         storage: &dyn StorageHandler,
         log_root: Url,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
+        log_tail: Vec<LogPath>,
     ) -> DeltaResult<Self> {
         let end_version = end_version.into();
         if let Some(end_version) = end_version {
@@ -427,12 +433,10 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        // TODO(#2796): table-changes does not supply a log_tail yet. CDF over a catalog-managed
-        // table will need the catalog's commits passed here to see unbackfilled staged commits.
         let listed_files = LogSegmentFiles::list_commits(
             storage,
             &log_root,
-            vec![], // log-tail
+            log_tail.into_iter().map(Into::into).collect(),
             Some(start_version),
             end_version,
         )?;

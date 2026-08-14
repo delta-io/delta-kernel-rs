@@ -549,6 +549,7 @@ mod tests {
             table_root.join("_delta_log/").unwrap(),
             0,
             None,
+            vec![],
         )
         .unwrap();
         let table_schema = Arc::new(StructType::new_unchecked([
@@ -647,9 +648,14 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let log_root = table_root.join("_delta_log/").unwrap();
-        let log_segment =
-            LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
-                .unwrap();
+        let log_segment = LogSegment::for_table_changes(
+            engine.storage_handler().as_ref(),
+            log_root,
+            0,
+            None,
+            vec![],
+        )
+        .unwrap();
         let table_schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
