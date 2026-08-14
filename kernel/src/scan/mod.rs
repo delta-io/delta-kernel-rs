@@ -1084,8 +1084,11 @@ impl Scan {
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and retains the
-        // leaf schema when output or pruning requires checkpoint-specific columns.
+        // checkpoint leaf schema when output or pruning requires checkpoint-specific columns.
         let plan_executor = engine.require_plan_executor()?;
         let shape = if self.stats.synthesize_json
             || self.state_info.physical_stats_schema.is_some()

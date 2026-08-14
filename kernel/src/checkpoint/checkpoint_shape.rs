@@ -1,6 +1,10 @@
-//! Resolves a checkpoint shape. This falls into the following cases: no checkpoint,
-//! leaf (file actions inline, including multi-part), or manifest (which references sidecar files).
-//! When requested, also retains the schema of the files containing leaf actions.
+//! Resolves a checkpoint shape:
+//! - A single-part checkpoint has one checkpoint leaf storing file actions (`add` and `remove`).
+//! - A multipart checkpoint has one checkpoint leaf per checkpoint part.
+//! - A manifest checkpoint has sidecars as its checkpoint leaves.
+//!
+//! A checkpoint leaf directly stores file actions. When requested, this module also retains the
+//! checkpoint leaf schema.
 //! Driven through a [`PlanExecutor`].
 
 // No in-crate caller yet; following PRs will use this.
@@ -29,17 +33,17 @@ pub(crate) enum CheckpointType {
     Manifest,
 }
 
-/// A snapshot's resolved checkpoint type and leaf-action schema.
+/// A snapshot's resolved checkpoint type and checkpoint leaf schema.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CheckpointShape {
     /// What kind of checkpoint this is.
     pub(crate) checkpoint_type: CheckpointType,
-    /// Schema of the files containing leaf actions, when requested.
+    /// Schema of the checkpoint leaves, when requested.
     pub(crate) leaf_checkpoint_schema: Option<SchemaRef>,
 }
 
 impl CheckpointShape {
-    /// Resolves `snapshot`'s checkpoint topology without retaining the leaf-action schema.
+    /// Resolves `snapshot`'s checkpoint topology without retaining the checkpoint leaf schema.
     ///
     /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
     /// read.
@@ -50,7 +54,7 @@ impl CheckpointShape {
         Self::try_new_impl(exec, snapshot, false)
     }
 
-    /// Resolves `snapshot`'s checkpoint topology and retains the leaf-action schema.
+    /// Resolves `snapshot`'s checkpoint topology and retains the checkpoint leaf schema.
     ///
     /// Returns an error if checkpoint metadata is invalid or required checkpoint data cannot be
     /// read.
@@ -142,7 +146,7 @@ impl CheckpointShape {
             }
             Some([]) => {
                 // A parquet leaf's actions live in its own schema; read it only when requested.
-                // JSON leaves use the canonical JSON action schema.
+                // JSON checkpoint leaves use the canonical JSON action schema.
                 let leaf_schema = match file_type {
                     FileType::Parquet if needs_leaf_schema => {
                         Some(match segment.checkpoint_hint_schema() {
@@ -152,7 +156,8 @@ impl CheckpointShape {
                     }
                     _ => None,
                 };
-                // JSON leaves have no footer, so we assume it has the widest checkpoint schema.
+                // JSON checkpoint leaves have no footer, so use the canonical checkpoint leaf
+                // schema.
                 let leaf_schema = leaf_schema.or_else(|| {
                     (needs_leaf_schema && file_type == FileType::Json)
                         .then(|| LEAF_CHECKPOINT_ACTIONS_SCHEMA.clone())
@@ -369,7 +374,7 @@ mod tests {
         assert_eq!(
             shape.leaf_checkpoint_schema.is_some(),
             needs_leaf_schema && expected_checkpoint != CheckpointType::None,
-            "{table}: retained leaf schema"
+            "{table}: checkpoint leaf schema"
         );
         if let Some(schema) = &shape.leaf_checkpoint_schema {
             assert!(schema.contains("add"), "{table}: retained add action");

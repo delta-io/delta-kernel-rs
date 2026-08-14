@@ -1068,21 +1068,32 @@ fn assert_declarative_metadata_matches_imperative(
     assert_metadata_eq(&actual, &expected, table.description())
 }
 
-#[test]
-fn test_declarative_metadata_scan_plan_no_executor_returns_unsupported() -> DeltaResult<()> {
+#[rstest]
+#[case::requires_executor(None, true)]
+#[case::static_skip_all(Some(Pred::FALSE), false)]
+fn declarative_metadata_scan_plan_requires_executor_unless_statically_skipped(
+    #[case] predicate: Option<Pred>,
+    #[case] requires_executor: bool,
+) -> DeltaResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(LogState::with_latest_version(4).with_checkpoint_at([2]))
         .build()
         .expect("build checkpoint-plus-commits table");
     let sync_engine = Arc::new(SyncEngine::new_with_store(table.store().clone()));
     let snapshot = Snapshot::builder_for(table.table_root()).build(sync_engine.as_ref())?;
-    let scan = snapshot.scan_builder().build()?;
+    let builder = snapshot.scan_builder();
+    let builder = match predicate {
+        Some(predicate) => builder.with_predicate(Arc::new(predicate)),
+        None => builder,
+    };
+    let scan = builder.build()?;
 
     let no_plan_engine = DelegatingEngine::new(sync_engine).without_plan_executor();
-    let err = scan
-        .declarative_metadata_scan_plan(&no_plan_engine)
-        .unwrap_err();
-
-    assert!(matches!(err, crate::Error::Unsupported(_)));
+    let result = scan.declarative_metadata_scan_plan(&no_plan_engine);
+    if requires_executor {
+        assert!(matches!(result, Err(crate::Error::Unsupported(_))));
+    } else {
+        assert!(result?.is_none());
+    }
     Ok(())
 }
