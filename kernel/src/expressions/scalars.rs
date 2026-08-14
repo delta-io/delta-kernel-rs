@@ -402,6 +402,24 @@ impl Scalar {
         Self::Null(data_type.into())
     }
 
+    /// Mark a map scalar's value type as nullable (`value_contains_null = true`), for a field
+    /// declared with `#[allow_null_container_values]`. This aligns the value's map type with the
+    /// schema `ToSchema` produces, so the two agree. Non-map scalars are returned unchanged.
+    #[internal_api]
+    pub(crate) fn with_nullable_container_values(self) -> Self {
+        match self {
+            Self::Map(mut data) => {
+                data.data_type.value_contains_null = true;
+                Self::Map(data)
+            }
+            Self::Null(DataType::Map(mut map_type)) => {
+                map_type.value_contains_null = true;
+                Self::Null(DataType::Map(map_type))
+            }
+            other => other,
+        }
+    }
+
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
