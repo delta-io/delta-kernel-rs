@@ -200,11 +200,14 @@ impl StatsOptions {
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
 /// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
+/// when present, otherwise from parsing the string map. If a requested reader timezone changes
+/// zoned timestamp interpretation, Kernel reparses the complete string map.
 #[derive(Clone, Debug, Default)]
 pub struct PartitionValuesOptions {
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
+    /// Reader timezone used to interpret offset-less zoned timestamp partition strings.
+    pub(crate) timestamp_timezone: Option<String>,
 }
 
 impl PartitionValuesOptions {
@@ -218,7 +221,22 @@ impl PartitionValuesOptions {
     pub fn with_struct() -> Self {
         Self {
             parsed_struct: true,
+            timestamp_timezone: None,
         }
+    }
+
+    /// Interpret offset-less zoned `TIMESTAMP` partition strings in `timestamp_timezone`.
+    ///
+    /// The timezone may be an IANA name or a fixed offset. Explicit offsets in partition values
+    /// take precedence. Ambiguous local times use the earlier instant, and nonexistent local times
+    /// use the pre-transition offset. This option applies to typed scan metadata, internal
+    /// partition pruning, and partition-column row transforms used by [`Scan::execute`] for full
+    /// snapshot scans. Incremental scans continue to expose the raw partition-value map. Without
+    /// this option, Kernel interprets offset-less timestamps as UTC. Invalid timezones are reported
+    /// when scan metadata is evaluated.
+    pub fn with_timestamp_timezone(mut self, timestamp_timezone: impl Into<String>) -> Self {
+        self.timestamp_timezone = Some(timestamp_timezone.into());
+        self
     }
 }
 
@@ -798,6 +816,7 @@ impl Scan {
     fn partition_values_options(&self) -> log_replay::ScanPartitionValuesOptions {
         log_replay::ScanPartitionValuesOptions {
             parsed_struct: self.partition_values.parsed_struct,
+            timestamp_timezone: self.partition_values.timestamp_timezone.clone(),
         }
     }
 
@@ -1085,12 +1104,13 @@ impl Scan {
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
-        // whether the checkpoint carries a compatible parsed-stats column.
+        // whether the checkpoint carries compatible parsed stats and partition columns.
         let plan_executor = engine.require_plan_executor()?;
         let shape = CheckpointShape::try_new(
             plan_executor.as_ref(),
             &self.snapshot,
             self.state_info.physical_stats_schema.as_ref(),
+            self.state_info.physical_partition_schema.as_ref(),
         )?;
         self.build_metadata_scan_plan(&shape)
     }
@@ -1156,6 +1176,12 @@ impl Scan {
         let mut floating_partition_columns = HashSet::new();
         if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
             for field in schema.fields() {
+                if log_replay::partition_value_requires_timezone_reparse(
+                    field.data_type(),
+                    self.partition_values.timestamp_timezone.as_deref(),
+                ) {
+                    continue;
+                }
                 let column = ColumnName::new([field.name()]);
                 if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
                     floating_partition_columns.insert(column.clone());

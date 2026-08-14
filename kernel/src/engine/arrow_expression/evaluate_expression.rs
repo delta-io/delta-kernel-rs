@@ -3,11 +3,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{FixedOffset, MappedLocalTime, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc};
 use itertools::Itertools;
 use tracing::warn;
 
-use crate::arrow::array::timezone::Tz;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, make_array, new_null_array, Array, ArrayBuilder, ArrayData, ArrayRef,
@@ -15,7 +13,7 @@ use crate::arrow::array::{
     RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
-use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
+use crate::arrow::compute::kernels::cast_utils::Parser;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -44,6 +42,7 @@ use crate::expressions::{
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+use crate::timestamp_timezone::TimestampTimezone;
 
 #[internal_api]
 pub(crate) trait ProvidesColumnByName {
@@ -411,99 +410,6 @@ pub fn evaluate_expression(
             validate_array_type(output, result_type)
         }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TimestampTimezone {
-    Arrow(Tz),
-    Fixed(FixedOffset),
-}
-
-impl TimestampTimezone {
-    fn parse(value: &str) -> DeltaResult<Self> {
-        if value.starts_with('+') || value.starts_with('-') {
-            return parse_fixed_offset(value)
-                .map(Self::Fixed)
-                .ok_or_else(|| Error::generic(format!("Invalid timestamp timezone: {value}")));
-        }
-        value
-            .parse::<Tz>()
-            .map(Self::Arrow)
-            .map_err(|_| Error::generic(format!("Invalid timestamp timezone: {value}")))
-    }
-
-    fn parse_timestamp(self, raw: &str) -> Result<i64, ArrowError> {
-        match self {
-            Self::Arrow(timezone) => parse_timestamp_with_timezone(timezone, raw),
-            Self::Fixed(timezone) => parse_timestamp_with_timezone(timezone, raw),
-        }
-    }
-}
-
-fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
-    let (sign, value) = match value.as_bytes().first()? {
-        b'+' => (1, &value[1..]),
-        b'-' => (-1, &value[1..]),
-        _ => return None,
-    };
-    let mut parts = value.split(':');
-    let parse_component = |part: &str| {
-        (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            .then(|| part.parse::<i32>().ok())
-            .flatten()
-    };
-    let hours = parse_component(parts.next()?)?;
-    let minutes = parts.next().map_or(Some(0), parse_component)?;
-    let seconds = parts.next().map_or(Some(0), parse_component)?;
-    if parts.next().is_some()
-        || value.is_empty()
-        || hours > 18
-        || minutes > 59
-        || seconds > 59
-        || (hours == 18 && (minutes != 0 || seconds != 0))
-    {
-        return None;
-    }
-    FixedOffset::east_opt(sign * (hours * 3_600 + minutes * 60 + seconds))
-}
-
-fn parse_timestamp_with_timezone<T: TimeZone + Copy>(
-    timezone: T,
-    raw: &str,
-) -> Result<i64, ArrowError> {
-    if let Ok(timestamp) = string_to_datetime(&timezone, raw) {
-        return Ok(timestamp.timestamp_micros());
-    }
-    let local_datetime = string_to_datetime(&Utc, raw)?.naive_utc();
-    resolve_local_timestamp(local_datetime, timezone).ok_or_else(|| {
-        ArrowError::ParseError(format!("Error resolving local timestamp from '{raw}'"))
-    })
-}
-
-fn resolve_local_timestamp<T: TimeZone + Copy>(
-    local_datetime: NaiveDateTime,
-    timezone: T,
-) -> Option<i64> {
-    match timezone.from_local_datetime(&local_datetime) {
-        MappedLocalTime::Single(timestamp) => Some(timestamp.timestamp_micros()),
-        MappedLocalTime::Ambiguous(earlier, _) => Some(earlier.timestamp_micros()),
-        MappedLocalTime::None => {
-            // A forward transition can skip more than one hour, so walk backward until reaching
-            // the pre-transition side of the gap.
-            let offset = (1..=48).find_map(|hours| {
-                let before_transition =
-                    local_datetime.checked_sub_signed(TimeDelta::hours(hours))?;
-                match timezone.from_local_datetime(&before_transition) {
-                    MappedLocalTime::Single(timestamp) => Some(timestamp.offset().fix()),
-                    MappedLocalTime::Ambiguous(earlier, _) => Some(earlier.offset().fix()),
-                    MappedLocalTime::None => None,
-                }
-            })?;
-            local_datetime
-                .checked_sub_signed(TimeDelta::seconds(i64::from(offset.local_minus_utc())))
-                .map(|utc_datetime| utc_datetime.and_utc().timestamp_micros())
-        }
     }
 }
 
@@ -1059,16 +965,10 @@ fn parse_partition_scalar(
             return Ok(Some(Scalar::Date(days)));
         }
         PrimitiveType::Timestamp => {
-            let micros = timestamp_timezone.parse_timestamp(raw).map_err(|_| {
+            let micros = timestamp_timezone.parse_timestamp(raw).ok_or_else(|| {
                 Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone()))
             })?;
             return Ok(Some(Scalar::Timestamp(micros)));
-        }
-        PrimitiveType::TimestampNtz => {
-            let micros = string_to_datetime(&Utc, raw)
-                .map_err(|_| Error::ParseError(raw.to_string(), DataType::Primitive(prim.clone())))?
-                .timestamp_micros();
-            return Ok(Some(Scalar::TimestampNtz(micros)));
         }
         _ => {}
     }
@@ -3025,35 +2925,6 @@ mod tests {
             evaluate_map_timestamp_timezone(raw, DataType::TIMESTAMP, timestamp_timezone).unwrap(),
             Some(expected_timestamp_micros(expected))
         );
-    }
-
-    #[rstest]
-    #[case::zero("+0", 0)]
-    #[case::hours("+5", 18_000)]
-    #[case::hours_minutes("-05:30", -19_800)]
-    #[case::hours_minutes_seconds("+12:45:30", 45_930)]
-    #[case::positive_limit("+18:00:00", 64_800)]
-    #[case::negative_limit("-18", -64_800)]
-    fn test_parse_fixed_offset_accepts_supported_forms(
-        #[case] timezone: &str,
-        #[case] expected_seconds: i32,
-    ) {
-        assert_eq!(
-            parse_fixed_offset(timezone).map(|offset| offset.local_minus_utc()),
-            Some(expected_seconds)
-        );
-    }
-
-    #[rstest]
-    #[case::empty("")]
-    #[case::bare_positive_sign("+")]
-    #[case::over_max_second("+18:00:01")]
-    #[case::over_max_hour("+19")]
-    #[case::minutes_out_of_range("+00:60")]
-    #[case::seconds_out_of_range("+00:00:60")]
-    #[case::extra_component("+05:30:00:00")]
-    fn test_parse_fixed_offset_rejects_invalid_forms(#[case] timezone: &str) {
-        assert_eq!(parse_fixed_offset(timezone), None);
     }
 
     #[test]

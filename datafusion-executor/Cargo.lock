@@ -1387,6 +1387,7 @@ dependencies = [
  "arrow",
  "bytes",
  "chrono",
+ "chrono-tz",
  "crc",
  "delta_kernel_derive",
  "indexmap",
