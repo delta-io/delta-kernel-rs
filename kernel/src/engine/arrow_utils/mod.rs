@@ -2268,13 +2268,11 @@ mod tests {
     #[test]
     fn mask_with_map() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = schema! {
-                (StructField::not_null(
-                    logical_name(0),
-                    MapType::new(DataType::INTEGER, DataType::STRING, false),
-                )
-                .with_metadata(column_mapping_metadata(0, mode))),
-            }
+            let requested_schema = StructType::new_unchecked([StructField::not_null(
+                logical_name(0),
+                MapType::new(DataType::INTEGER, DataType::STRING, false),
+            )
+            .with_metadata(column_mapping_metadata(0, mode))])
             .make_physical(mode)
             .unwrap()
             .into();
@@ -2965,13 +2963,11 @@ mod tests {
     #[test]
     fn list_skip_earlier_element() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = schema! {
-                (StructField::not_null(
-                    logical_name(1),
-                    ArrayType::new(DataType::INTEGER, false),
-                )
-                .with_metadata(column_mapping_metadata(1, mode))),
-            }
+            let requested_schema = StructType::new_unchecked([StructField::not_null(
+                logical_name(1),
+                ArrayType::new(DataType::INTEGER, false),
+            )
+            .with_metadata(column_mapping_metadata(1, mode))])
             .make_physical(mode)
             .unwrap()
             .into();
