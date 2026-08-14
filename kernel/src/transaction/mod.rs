@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use delta_kernel_derive::internal_api;
@@ -256,9 +256,6 @@ pub struct Transaction<S = ExistingTable> {
     // enabled. Used for determining which columns require statistics collection. Expected to be
     // physical column names.
     physical_clustering_columns: Option<Vec<ColumnName>>,
-    // Initialized on the first write-state handout after write validation succeeds. All
-    // partition-bound contexts share this table-wide allocation.
-    write_state: OnceLock<Arc<WriteState>>,
     // PhantomData marker for transaction state (ExistingTable or CreateTable).
     // Zero-sized; only affects the type system.
     _state: PhantomData<S>,
@@ -331,7 +328,6 @@ impl<S> Transaction<S> {
     #[cfg(test)]
     fn replace_effective_table_config(&mut self, table_config: TableConfiguration) {
         self.effective_table_config = table_config;
-        self.write_state = OnceLock::new();
     }
 
     /// Consume the transaction and commit it to the table. The result is a result of
@@ -1086,19 +1082,16 @@ impl<S: SupportsDataFiles> Transaction<S> {
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
     /// column defaults that the connector has not acknowledged.
-    pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
+    pub fn write_state(&self) -> DeltaResult<WriteState> {
         self.ensure_schema_non_empty_for_write_context()?;
         self.ensure_column_defaults_acknowledged()?;
         self.validate_for_data_write()?;
-        Ok(self
-            .write_state
-            .get_or_init(|| {
-                Arc::new(WriteState::new(
-                    &self.effective_table_config,
-                    self.stats_columns(),
-                ))
-            })
-            .clone())
+        // The effective table configuration can change while building a transaction, so this
+        // state must be derived on demand rather than cached on the transaction.
+        Ok(WriteState::new(
+            &self.effective_table_config,
+            self.stats_columns(),
+        ))
     }
 
     /// Creates a write context for writing data to a specific partition.
@@ -2119,22 +2112,6 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
-        Ok(())
-    }
-
-    #[test]
-    fn transaction_reuses_shared_write_state() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snapshot) = setup_non_dv_table();
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()), &engine)?
-            .with_engine_info("default engine");
-
-        let first = txn.write_state()?;
-        let second = txn.write_state()?;
-        let context = txn.unpartitioned_write_context()?;
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(Arc::ptr_eq(&first, &context.shared));
         Ok(())
     }
 

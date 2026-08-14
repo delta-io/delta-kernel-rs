@@ -24,7 +24,7 @@ const WRITE_STATE_FORMAT_VERSION: u32 = 1;
 /// [`Transaction::write_state`](super::Transaction::write_state). Distributed writers can encode
 /// it, transport it to another process, decode it, and bind partition values there without
 /// transporting the transaction itself.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WriteState {
     pub(super) table_root: Url,
     /// Complete logical table schema, including partition columns.
@@ -95,7 +95,7 @@ impl WriteState {
     /// Returns an error if the table is not partitioned or if the partition keys or values are
     /// invalid.
     pub fn partitioned_write_context(
-        self: &Arc<Self>,
+        &self,
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<BoundWriteContext> {
         require!(
@@ -131,7 +131,7 @@ impl WriteState {
         let logical_to_physical = Arc::new(self.generate_logical_to_physical(Some(&normalized))?);
 
         Ok(BoundWriteContext {
-            shared: self.clone(),
+            write_state: self.clone(),
             logical_to_physical,
             physical_partition_values: serialized,
         })
@@ -140,14 +140,14 @@ impl WriteState {
     /// Creates a write context for writing data to an unpartitioned table.
     ///
     /// Returns an error if the table has partition columns.
-    pub fn unpartitioned_write_context(self: &Arc<Self>) -> DeltaResult<BoundWriteContext> {
+    pub fn unpartitioned_write_context(&self) -> DeltaResult<BoundWriteContext> {
         require!(
             self.logical_partition_columns.is_empty(),
             Error::generic("table is partitioned; use partitioned_write_context() instead")
         );
         let logical_to_physical = Arc::new(self.generate_logical_to_physical(None)?);
         Ok(BoundWriteContext {
-            shared: self.clone(),
+            write_state: self.clone(),
             logical_to_physical,
             physical_partition_values: HashMap::new(),
         })
@@ -173,7 +173,7 @@ impl WriteState {
     ///
     /// Returns an error if the bytes contain an unsupported format version or do not contain a
     /// valid serialized write state.
-    pub fn decode(bytes: &[u8]) -> DeltaResult<Arc<Self>> {
+    pub fn decode(bytes: &[u8]) -> DeltaResult<Self> {
         let wire: DecodedWriteStateWire = serde_json::from_slice(bytes)?;
         require!(
             wire.version == WRITE_STATE_FORMAT_VERSION,
@@ -182,7 +182,7 @@ impl WriteState {
                 wire.version, WRITE_STATE_FORMAT_VERSION
             ))
         );
-        Ok(Arc::new(wire.write_state))
+        Ok(wire.write_state)
     }
 
     fn generate_logical_to_physical(
@@ -237,7 +237,7 @@ mod tests {
         materialize_partition_columns: bool,
         randomize_file_prefixes: bool,
         random_prefix_length: usize,
-    ) -> Arc<WriteState> {
+    ) -> WriteState {
         let year = StructField::not_null("year", DataType::INTEGER).with_metadata([
             (
                 ColumnMetadataKey::ColumnMappingId.as_ref(),
@@ -258,7 +258,7 @@ mod tests {
                 MetadataValue::String("phys_value".into()),
             ),
         ]);
-        Arc::new(WriteState {
+        WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: Arc::new(StructType::new_unchecked([year, value])),
             logical_schema: schema_ref! { nullable "value": INTEGER },
@@ -269,7 +269,7 @@ mod tests {
             materialize_partition_columns,
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length).unwrap(),
-        })
+        }
     }
 
     #[rstest]
@@ -371,17 +371,5 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported write state format version 2; expected 1"));
-    }
-
-    #[test]
-    fn write_state_contexts_share_table_wide_state() {
-        let state = partitioned_write_state(ColumnMappingMode::None, false, false, 2);
-        let values = || HashMap::from([("year".to_string(), Scalar::Integer(2024))]);
-
-        let first = state.partitioned_write_context(values()).unwrap();
-        let second = state.partitioned_write_context(values()).unwrap();
-
-        assert!(Arc::ptr_eq(&state, &first.shared));
-        assert!(Arc::ptr_eq(&first.shared, &second.shared));
     }
 }

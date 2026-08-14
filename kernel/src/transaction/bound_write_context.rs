@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::num::NonZero;
-use std::sync::Arc;
 
 use rand::Rng;
 use url::Url;
@@ -19,9 +18,8 @@ use crate::{DeltaResult, Error};
 ///
 /// Note: clustered tables are unpartitioned and use `unpartitioned_write_context`.
 ///
-/// Contains both table-wide state (shared cheaply via `Arc`) and per-partition state
-/// (serialized partition values with physical column names as keys). How you use a
-/// `BoundWriteContext` depends on your engine:
+/// Contains both table-wide state and per-partition state (serialized partition values with
+/// physical column names as keys). How you use a `BoundWriteContext` depends on your engine:
 ///
 /// - **`DefaultEngine` consumers**: pass this to `DefaultEngine::write_parquet`, which handles
 ///   everything (transform, write, partition metadata).
@@ -37,20 +35,20 @@ use crate::{DeltaResult, Error};
 /// [`physical_partition_values`]: BoundWriteContext::physical_partition_values
 #[derive(Debug)]
 pub struct BoundWriteContext {
-    pub(super) shared: Arc<WriteState>,
+    pub(super) write_state: WriteState,
     /// Transforms logical data to physical data for writing. The logical data must not contain
     /// any partition columns. The expression injects the partition columns when needed.
     pub(super) logical_to_physical: ExpressionRef,
     /// Physical column name -> serialized value (`None` = null partition value).
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
-    /// `shared.logical_partition_columns`, not from this map.
+    /// `write_state.logical_partition_columns`, not from this map.
     pub(super) physical_partition_values: HashMap<String, Option<String>>,
 }
 
 impl BoundWriteContext {
     /// Returns the table root URL.
     pub fn table_root_dir(&self) -> &Url {
-        &self.shared.table_root
+        &self.write_state.table_root
     }
 
     /// Returns the recommended directory URL for writing Parquet data files. Connectors
@@ -112,19 +110,19 @@ impl BoundWriteContext {
     // TODO(#2436): revisit this API shape. Returning a `Url` forces callers to URI-decode
     // before filesystem writes and keep it encoded for `add.path`, which is unintuitive.
     pub fn write_dir(&self) -> Url {
-        let mut url = self.shared.table_root.clone();
+        let mut url = self.write_state.table_root.clone();
         // A random prefix is used when column mapping is on (to avoid leaking physical
         // UUID column names into paths) or when `delta.randomizeFilePrefixes` is set (to
         // avoid S3 hotspots). When a random prefix is used, the Hive-style partition path
         // is suppressed; partition values are recorded in `add.partitionValues` instead.
-        let should_prefix = self.shared.column_mapping_mode != ColumnMappingMode::None
-            || self.shared.randomize_file_prefixes;
+        let should_prefix = self.write_state.column_mapping_mode != ColumnMappingMode::None
+            || self.write_state.randomize_file_prefixes;
         if should_prefix {
             // The alphanumeric charset is RFC 3986 unreserved, so the prefix is URI-safe
             // as-is and needs no further encoding.
-            let prefix = random_alphanumeric_prefix(self.shared.random_prefix_length);
+            let prefix = random_alphanumeric_prefix(self.write_state.random_prefix_length);
             url.set_path(&format!("{}{}/", url.path(), prefix));
-        } else if !self.shared.logical_partition_columns.is_empty() {
+        } else if !self.write_state.logical_partition_columns.is_empty() {
             // CM=None, no randomization: emit a Hive-style partition path. URI-encode on
             // top of Hive-escaping because the fn-level contract (see doc above) requires
             // callers to URI-decode once before using the URL as a filesystem path. That
@@ -139,13 +137,13 @@ impl BoundWriteContext {
 
     /// Returns the schema which connectors' logical data should conform to.
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.shared.logical_schema
+        &self.write_state.logical_schema
     }
 
     /// Returns the physical schema (partition columns removed if applicable, column mapping
     /// applied). Partition columns are kept when `materializePartitionColumns` is enabled.
     pub fn physical_schema(&self) -> &SchemaRef {
-        &self.shared.physical_schema
+        &self.write_state.physical_schema
     }
 
     /// Returns the expression that transforms logical data to physical data for writing.
@@ -155,14 +153,14 @@ impl BoundWriteContext {
 
     /// The [`ColumnMappingMode`] for this table.
     pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.shared.column_mapping_mode
+        self.write_state.column_mapping_mode
     }
 
     /// Returns the column names that should have statistics collected during writes.
     ///
     /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
     pub fn stats_columns(&self) -> &[ColumnName] {
-        &self.shared.stats_columns
+        &self.write_state.stats_columns
     }
 
     /// Returns the serialized partition values for this write context. Keys are physical
@@ -177,11 +175,11 @@ impl BoundWriteContext {
     /// Only called when column mapping is OFF.
     fn hive_partition_path_suffix(&self) -> String {
         debug_assert!(
-            self.shared.column_mapping_mode == ColumnMappingMode::None,
+            self.write_state.column_mapping_mode == ColumnMappingMode::None,
             "Hive-style paths should only be used when column mapping is OFF"
         );
         let columns: Vec<(&str, Option<&str>)> = self
-            .shared
+            .write_state
             .logical_partition_columns
             .iter()
             .map(|logical_name| {
@@ -213,19 +211,19 @@ impl BoundWriteContext {
     /// Returns an error if the file is not under the table root.
     pub fn resolve_file_path(&self, file_location: &Url) -> DeltaResult<String> {
         let relative = self
-            .shared
+            .write_state
             .table_root
             .make_relative(file_location)
             .ok_or_else(|| {
                 Error::internal_error(format!(
                     "file '{}' is not under table root '{}'",
-                    file_location, self.shared.table_root
+                    file_location, self.write_state.table_root
                 ))
             })?;
         if relative.starts_with("..") {
             return Err(Error::internal_error(format!(
                 "file '{}' is not under table root '{}'",
-                file_location, self.shared.table_root
+                file_location, self.write_state.table_root
             )));
         }
         Ok(relative)
@@ -252,7 +250,7 @@ impl BoundWriteContext {
     // (delta.randomizeFilePrefixes / delta.randomPrefixLength) instead of requiring the
     // caller to pass it. Connectors that need custom paths can use table_root_dir() directly.
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
-        DeletionVectorPath::new(self.shared.table_root.clone(), random_prefix)
+        DeletionVectorPath::new(self.write_state.table_root.clone(), random_prefix)
     }
 }
 
@@ -286,7 +284,7 @@ mod tests {
         random_prefix_length: usize,
     ) -> BoundWriteContext {
         let schema = schema_ref! { nullable "value": INTEGER };
-        let shared = Arc::new(WriteState {
+        let write_state = WriteState {
             table_root: Url::parse("s3://bucket/table/").unwrap(),
             full_logical_schema: schema.clone(),
             logical_schema: schema.clone(),
@@ -298,9 +296,9 @@ mod tests {
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
-        });
+        };
         BoundWriteContext {
-            shared,
+            write_state,
             logical_to_physical: Arc::new(lit(true)),
             physical_partition_values: partition_values,
         }
