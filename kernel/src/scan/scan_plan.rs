@@ -29,7 +29,7 @@ use crate::schema::{
 };
 use crate::struct_patch::ProjectionStructPatchBuilder;
 use crate::transforms::{transform_output_type, ExpressionTransform};
-use crate::utils::{CollectInto, FoldWithOption as _};
+use crate::utils::{require, CollectInto, FoldWithOption as _};
 use crate::{DeltaResult, Error, PlanBuilder};
 
 // === Internal column names ===
@@ -284,7 +284,7 @@ impl Scan {
                 patch.append(StructField::nullable(STATS_PARSED, schema.as_ref().clone()))
             });
 
-        // JSON stats are read when requested using `StructStats::Json` or needed to derive parsed stats because
+        // JSON stats are read when requested for output or needed to derive parsed stats because
         // the checkpoint has no compatible parsed representation.
         let needs_json_stats = self.stats.synthesize_json
             || (stats_schema.is_some() && checkpoint_parsed_stats_schema.is_none());
@@ -298,10 +298,17 @@ impl Scan {
         // `LogSegment::schema_has_compatible_partition_values_parsed` permits missing fields, and
         // timestamps may use the checkpoint writer's timezone, making them incorrect for other
         // readers. We retain and reparse the complete string map downstream.
-        Ok(schema_ref! {
+        let read_schema = schema_ref! {
             (StructField::nullable(ADD_NAME, add_patch.build(&ADD_SCHEMA)?)),
             nullable (VERSION): LONG,
-        })
+        };
+        // TODO: Read native parsed partitions once compatibility validates complete fields and
+        // timestamp semantics.
+        require!(
+            !read_schema.contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]),
+            Error::internal_error("checkpoint reads must not use native parsed partition values")
+        );
+        Ok(read_schema)
     }
 
     fn normalized_add_field(&self) -> DeltaResult<StructField> {
@@ -519,7 +526,7 @@ trait ProjectionStructPatchBuilderExt<'a> {
     /// emits a typed null struct so metadata pruning conservatively retains the file.
     fn with_parsed_add_stats(self, physical_stats: Option<&SchemaRef>) -> Self;
 
-    /// Parses add partition values, preferring a compatible parsed field.
+    /// Parses add partition values from the authoritative raw string map.
     fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self;
 
     fn with_json_add_stats(self) -> Self;
@@ -553,20 +560,12 @@ impl<'a> ProjectionStructPatchBuilderExt<'a> for ProjectionStructPatchBuilder<'a
     }
 
     fn with_parsed_add_partition_values(self, physical_partitions: Option<&SchemaRef>) -> Self {
-        let has_partition_values_parsed = self
-            .input_schema()
-            .contains_col([ADD_NAME, PARTITION_VALUES_PARSED_NAME]);
-        let add = [ADD_NAME];
         match physical_partitions {
-            Some(schema) => {
-                let field = StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone());
-                let expr = Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES));
-                if has_partition_values_parsed {
-                    self
-                } else {
-                    self.append_at(add, field, expr)
-                }
-            }
+            Some(schema) => self.append_at(
+                [ADD_NAME],
+                StructField::nullable(PARTITION_VALUES_PARSED, schema.as_ref().clone()),
+                Expr::map_to_struct(col!(ADD_NAME, PARTITION_VALUES)),
+            ),
             None => self,
         }
     }
