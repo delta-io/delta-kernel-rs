@@ -27,6 +27,7 @@ use crate::{DeltaResult, Engine, PredicateRef, Snapshot};
 fn normalized_metadata_batch(
     field: impl Fn(&str) -> ArrayRef,
     json_stats: Option<ArrayRef>,
+    partition_values: Option<ArrayRef>,
     stats_parsed: Option<ArrayRef>,
     partitions_parsed: Option<ArrayRef>,
 ) -> DeltaResult<RecordBatch> {
@@ -38,8 +39,10 @@ fn normalized_metadata_batch(
     if let Some(stats) = json_stats {
         columns.push(("stats", stats));
     }
+    if let Some(partition_values) = partition_values {
+        columns.push(("partitionValues", partition_values));
+    }
     columns.extend([
-        ("partitionValues", field("partitionValues")),
         ("deletionVector", field("deletionVector")),
         ("baseRowId", field("baseRowId")),
         ("defaultRowCommitVersion", field("defaultRowCommitVersion")),
@@ -92,6 +95,10 @@ fn imperative_metadata(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<Recor
                 .column_by_name(STATS)
                 .or_else(|| constants.column_by_name(STATS))
                 .cloned(),
+            batch
+                .column_by_name(PARTITION_VALUES)
+                .or_else(|| constants.column_by_name(PARTITION_VALUES))
+                .cloned(),
             batch.column_by_name("stats_parsed").cloned(),
             batch.column_by_name("partitionValues_parsed").cloned(),
         )?);
@@ -128,6 +135,7 @@ fn declarative_metadata(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<Rec
                     .clone()
             },
             add.column_by_name(STATS).cloned(),
+            add.column_by_name(PARTITION_VALUES).cloned(),
             add.column_by_name(STATS_PARSED).cloned(),
             add.column_by_name(PARTITION_VALUES_PARSED).cloned(),
         )?);
@@ -298,6 +306,73 @@ fn declarative_metadata_scans_sidecars_from_checkpoint_hint(
             .any(|file| file.meta.location.path().contains("/_sidecars/"))
     }));
     Ok(())
+}
+
+#[rstest]
+#[should_panic(expected = "checkpoint JSON stats must be retained for missing parsed columns")]
+#[case::requested(
+    StatsOptions::struct_columns(vec![column_name!("age")]),
+    None,
+)]
+#[should_panic(expected = "checkpoint JSON stats must be retained for missing parsed columns")]
+#[case::predicate(
+    StatsOptions::none(),
+    Some(column_expr!("age").gt(Expr::literal(0i64))),
+)]
+#[should_panic(expected = "checkpoint JSON stats must be retained for missing parsed columns")]
+#[case::requested_and_predicate(
+    StatsOptions::struct_columns(vec![column_name!("name")]),
+    Some(column_expr!("age").gt(Expr::literal(0i64))),
+)]
+fn declarative_metadata_reads_json_for_columns_missing_from_parsed_stats(
+    #[case] stats: StatsOptions,
+    #[case] predicate: Option<Pred>,
+) {
+    (|| -> DeltaResult<()> {
+        // This table's parsed stats contain id, name, age, salary, and ts_col. The synthetic
+        // checkpoint shape below retains only numRecords to model incomplete native stats.
+        let (_engine, snapshot, _tempdir) = load_test_table("parsed-stats")?;
+        let builder = snapshot.scan_builder().with_stats(stats);
+        let builder = match predicate {
+            Some(predicate) => builder.with_predicate(Arc::new(predicate)),
+            None => builder,
+        };
+        let scan = builder.build()?;
+
+        // Compatibility accepts missing fields. It should expose which parsed columns are absent
+        // so the scan can retain JSON as a fallback for only those columns.
+        let partial_stats = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "numRecords",
+            DataType::LONG,
+        )]));
+        let add = SchemaStructPatchBuilder::new()
+            .append(StructField::nullable(STATS_PARSED, partial_stats))
+            .build(&ADD_SCHEMA)?;
+        let shape = CheckpointShape {
+            checkpoint_type: CheckpointType::Leaf,
+            leaf_checkpoint_schema: Some(schema_ref! {
+                (StructField::nullable(ADD_NAME, add)),
+                nullable (VERSION): LONG,
+            }),
+        };
+        let plan = scan
+            .build_metadata_scan_plan(&shape)?
+            .expect("metadata plan");
+        let checkpoint = plan
+            .nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                Operator::ScanParquet(scan) => Some(scan),
+                _ => None,
+            })
+            .expect("checkpoint parquet scan");
+        assert!(
+            checkpoint.schema.contains_col([ADD_NAME, STATS]),
+            "checkpoint JSON stats must be retained for missing parsed columns"
+        );
+        Ok(())
+    })()
+    .unwrap()
 }
 
 #[rstest]
@@ -756,13 +831,48 @@ fn declarative_metadata_projects_nested_column_mapped_stats() -> DeltaResult<()>
     checkpoint_struct_stats(),
     StatsOptions::all_struct()
 )]
+#[case::v1_checkpoint_json_columns(
+    LogState::with_latest_version(2).with_checkpoint_at([2]),
+    FeatureSet::new(),
+    checkpoint_json_stats(),
+    StatsOptions::struct_columns(vec![column_name!("value")])
+)]
+#[case::v1_mixed_json_columns(
+    LogState::with_latest_version(2).with_checkpoint_at([1]),
+    FeatureSet::new(),
+    checkpoint_json_stats(),
+    StatsOptions::struct_columns(vec![column_name!("value")])
+)]
+#[case::v2_checkpoint_json_columns(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([2])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint(),
+    checkpoint_json_stats(),
+    StatsOptions::struct_columns(vec![column_name!("value")])
+)]
+#[case::v2_mixed_json_columns(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([1])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint(),
+    checkpoint_json_stats(),
+    StatsOptions::struct_columns(vec![column_name!("value")])
+)]
 fn declarative_metadata_output_options_across_log_shapes(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[case] table_config: TableConfig,
     #[case] stats: StatsOptions,
 ) -> DeltaResult<()> {
-    assert_metadata_output_options(log_state, features, table_config, stats)
+    assert_metadata_output_options(
+        log_state,
+        features,
+        table_config,
+        DataLayoutConfig::PartitionedAllTypes,
+        stats,
+        None,
+    )
 }
 
 #[rstest]
@@ -773,6 +883,16 @@ fn declarative_metadata_output_options_across_log_shapes(
 #[case::v2(
     LogState::with_latest_version(2)
         .with_checkpoint_at([2])
+        .with_sidecars_if_enabled(None),
+    FeatureSet::new().v2_checkpoint()
+)]
+#[case::v1_with_commit(
+    LogState::with_latest_version(2).with_checkpoint_at([1]),
+    FeatureSet::new()
+)]
+#[case::v2_with_commit(
+    LogState::with_latest_version(2)
+        .with_checkpoint_at([1])
         .with_sidecars_if_enabled(None),
     FeatureSet::new().v2_checkpoint()
 )]
@@ -848,8 +968,17 @@ fn declarative_metadata_synthesizes_json_for_struct_only_checkpoints(
     #[case] log_state: LogState,
     #[case] features: FeatureSet,
     #[values(StatsOptions::json_only(), StatsOptions::all())] stats: StatsOptions,
-) {
-    assert_metadata_output_options(log_state, features, checkpoint_struct_stats(), stats).unwrap();
+    #[values(false, true)] with_predicate: bool,
+) -> DeltaResult<()> {
+    let predicate = with_predicate.then(|| column_expr!("clust_int").gt(Expr::literal(0i32)));
+    assert_metadata_output_options(
+        log_state,
+        features,
+        checkpoint_struct_stats(),
+        DataLayoutConfig::ClusteredAllTypes,
+        stats,
+        predicate,
+    )
 }
 
 #[rstest]
@@ -910,32 +1039,45 @@ fn assert_metadata_output_options(
     log_state: LogState,
     features: FeatureSet,
     table_config: TableConfig,
+    data_layout: DataLayoutConfig,
     stats: StatsOptions,
+    predicate: Option<Pred>,
 ) -> DeltaResult<()> {
     let json_requested = stats.synthesize_json;
+    let parsed_stats_requested = match &stats.struct_stats {
+        StructStats::None => false,
+        StructStats::Columns(columns) => !columns.is_empty(),
+        StructStats::All => true,
+    };
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
         .with_features(features)
         .with_table_config(table_config)
-        .with_data_layout(DataLayoutConfig::PartitionedAllTypes)
+        .with_data_layout(data_layout)
         .build()
         .expect("build output-options table");
     let engine = SyncEngine::new_with_store(table.store().clone());
     let snapshot = Snapshot::builder_for(table.table_root()).build(&engine)?;
-    let expected = imperative_metadata(
-        snapshot
-            .clone()
-            .scan_builder()
-            .with_stats(stats.clone())
-            .with_partition_values(PartitionValuesOptions::with_struct())
-            .build()?,
-        &engine,
-    )?;
-    let scan = snapshot
+    let predicate = predicate.map(Arc::new);
+    let expected_builder = snapshot
+        .clone()
+        .scan_builder()
+        .with_stats(stats.clone())
+        .with_partition_values(PartitionValuesOptions::with_struct());
+    let expected_builder = match &predicate {
+        Some(predicate) => expected_builder.with_predicate(predicate.clone()),
+        None => expected_builder,
+    };
+    let expected = imperative_metadata(expected_builder.build()?, &engine)?;
+    let scan_builder = snapshot
         .scan_builder()
         .with_stats(stats)
-        .with_partition_values(PartitionValuesOptions::with_struct())
-        .build()?;
+        .with_partition_values(PartitionValuesOptions::with_struct());
+    let scan_builder = match predicate {
+        Some(predicate) => scan_builder.with_predicate(predicate),
+        None => scan_builder,
+    };
+    let scan = scan_builder.build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
     if json_requested {
@@ -974,24 +1116,37 @@ fn assert_metadata_output_options(
                 .column_by_name(STATS)
                 .is_some_and(|stats| stats.null_count() > 0)
         });
-    if imperative_is_missing_json_stats {
-        // The imperative path cannot synthesize JSON for struct-only checkpoints.
+    let imperative_has_incomplete_json_stats = json_requested
+        && expected.iter().any(|batch| {
+            batch
+                .column_by_name(STATS)
+                .and_then(|stats| stats.as_any().downcast_ref::<StringArray>())
+                .into_iter()
+                .flat_map(|stats| stats.iter().flatten())
+                .any(|stats| {
+                    serde_json::from_str::<serde_json::Value>(stats)
+                        .is_ok_and(|stats| stats.pointer("/minValues/value").is_none())
+                })
+        });
+    // The imperative path exposes source and predicate stats even when they were not requested.
+    let ignored_imperative_stats = match (json_requested, parsed_stats_requested) {
+        (true, true) => &[][..],
+        (true, false) => &[STATS_PARSED][..],
+        (false, true) => &[STATS][..],
+        (false, false) => &[STATS, STATS_PARSED][..],
+    };
+    let expected = without_columns(&expected, ignored_imperative_stats)?;
+    if imperative_is_missing_json_stats || imperative_has_incomplete_json_stats {
+        // The imperative path cannot synthesize complete JSON for struct-only checkpoints.
         assert_metadata_eq(
             &without_columns(&actual, &[STATS])?,
             &without_columns(&expected, &[STATS])?,
             "metadata output options across log shapes",
         )?;
-    } else if json_requested {
+    } else {
         assert_metadata_eq(
             &actual,
             &expected,
-            "metadata output options across log shapes",
-        )?;
-    } else {
-        // The imperative path exposes source JSON even when it was not requested.
-        assert_metadata_eq(
-            &actual,
-            &without_columns(&expected, &[STATS])?,
             "metadata output options across log shapes",
         )?;
     }
@@ -1246,6 +1401,8 @@ fn declarative_metadata_pruning_keeps_remove_for_checkpoint_reconciliation() -> 
 }
 
 #[rstest]
+#[case::with_struct(PartitionValuesOptions::with_struct())]
+#[case::struct_only(PartitionValuesOptions::struct_only())]
 fn declarative_metadata_prunes_across_v1_log_states(
     #[values(
         LogState::with_latest_version(4),
@@ -1261,18 +1418,23 @@ fn declarative_metadata_prunes_across_v1_log_states(
         )
     )]
     pruning: (Pred, usize),
+    #[case] partition_values: PartitionValuesOptions,
 ) -> DeltaResult<()> {
     assert_declarative_metadata_matches_imperative(
         log_state,
         FeatureSet::new(),
         pruning.0,
         pruning.1,
+        partition_values,
     )
 }
 
 #[rstest]
+#[case::with_struct(PartitionValuesOptions::with_struct())]
+#[case::struct_only(PartitionValuesOptions::struct_only())]
 fn declarative_metadata_partition_prunes_v2_checkpoints(
     #[values(2, 4)] checkpoint_version: u64,
+    #[case] partition_values: PartitionValuesOptions,
 ) -> DeltaResult<()> {
     let log_state = LogState::with_latest_version(4)
         .with_checkpoint_at([checkpoint_version])
@@ -1282,6 +1444,7 @@ fn declarative_metadata_partition_prunes_v2_checkpoints(
         FeatureSet::new().v2_checkpoint(),
         col!("part_string").eq(lit("part_2000")),
         1,
+        partition_values,
     )
 }
 
@@ -1290,6 +1453,7 @@ fn assert_declarative_metadata_matches_imperative(
     features: FeatureSet,
     predicate: Pred,
     expected_count: usize,
+    partition_values: PartitionValuesOptions,
 ) -> DeltaResult<()> {
     let table = TestTableBuilder::new()
         .with_log_state(log_state)
@@ -1307,7 +1471,7 @@ fn assert_declarative_metadata_matches_imperative(
             .scan_builder()
             .with_predicate(predicate.clone())
             .with_stats(StatsOptions::all())
-            .with_partition_values(PartitionValuesOptions::with_struct())
+            .with_partition_values(partition_values.clone())
             .build()?,
         &engine,
     )?;
@@ -1321,10 +1485,30 @@ fn assert_declarative_metadata_matches_imperative(
         .scan_builder()
         .with_predicate(predicate)
         .with_stats(StatsOptions::all())
-        .with_partition_values(PartitionValuesOptions::with_struct())
+        .with_partition_values(partition_values.clone())
         .build()?;
     let actual = declarative_metadata(&scan, &engine)?;
 
+    for batch in &actual {
+        assert_eq!(
+            batch.column_by_name(PARTITION_VALUES).is_some(),
+            partition_values.string_map
+        );
+        assert_eq!(
+            batch.column_by_name(PARTITION_VALUES_PARSED).is_some(),
+            partition_values.parsed_struct
+        );
+    }
+
+    let expected = if partition_values.string_map {
+        expected
+    } else {
+        // The imperative path still exposes the source map for `struct_only()`.
+        assert!(expected
+            .iter()
+            .all(|batch| batch.column_by_name(PARTITION_VALUES).is_some()));
+        without_columns(&expected, &[PARTITION_VALUES])?
+    };
     assert_metadata_eq(&actual, &expected, table.description())
 }
 
