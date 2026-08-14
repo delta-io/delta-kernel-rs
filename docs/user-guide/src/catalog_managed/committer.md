@@ -133,8 +133,10 @@ fn commit(
 ### Step 2: Ratify through the catalog
 
 Call your catalog's commit API to ratify the staged commit. The exact arguments
-vary by catalog. The general shape below passes the table identity, commit version,
-staged path, in-commit timestamp, and maximum published version:
+vary by catalog; Unity Catalog's `CommitRequest`, for example, carries the table
+id, commit version, staged filename, in-commit timestamp, and the maximum
+published version. Your catalog's API may look different. Here is the general
+shape:
 
 ```rust,ignore
     // Tell the catalog about the staged commit.
@@ -149,7 +151,8 @@ staged path, in-commit timestamp, and maximum published version:
         commit_metadata.max_published_version(),
     )?;
 
-    // Use the in-commit timestamp as the logical commit time (not the filesystem
+    // Return the staged file metadata on success and use
+    // the in-commit timestamp as the logical commit time (not the filesystem
     // mtime, which reflects when the file was written rather than when the
     // commit took effect).
     Ok(CommitResponse::Committed {
@@ -248,8 +251,8 @@ impl Committer for MyCatalogCommitter {
             commit_metadata.max_published_version(),
         )?;
 
-        // 3. Return success using the in-commit timestamp as the logical
-        //    commit time rather than the filesystem mtime.
+        // 3. Return success and use the in-commit timestamp as the logical commit time (not
+        //    the filesystem mtime).
         Ok(CommitResponse::Committed {
             file_meta: FileMeta::new(
                 staged_path,
