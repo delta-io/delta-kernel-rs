@@ -176,22 +176,21 @@ fn test_physical_predicate() {
             Pred::and(column_pred!("mapped.n"), Pred::TRUE),
             Some(PhysicalPredicate::Some(
                 Pred::and(column_pred!("phys_mapped.phys_n"), Pred::TRUE).into(),
-                StructType::new_unchecked(vec![StructField::nullable(
-                    "phys_mapped",
-                    StructType::new_unchecked(vec![StructField::nullable(
-                        "phys_n",
-                        DataType::LONG,
+                schema_ref! {
+                    (StructField::nullable(
+                        "phys_mapped",
+                        schema! {
+                            (StructField::nullable("phys_n", DataType::LONG).with_metadata([(
+                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                                "phys_n",
+                            )])),
+                        },
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                        "phys_n",
-                    )])]),
-                )
-                .with_metadata([(
-                    ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                    "phys_mapped",
-                )])])
-                .into(),
+                        "phys_mapped",
+                    )])),
+                },
             )),
         ),
         (
