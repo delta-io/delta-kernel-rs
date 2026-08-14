@@ -375,7 +375,7 @@ async fn assert_materialized_column_default_round_trips(
         let defaults = txn.top_level_column_defaults()?;
         defaults["c"]
             .to_scalar()?
-            .expect("a primitive literal default must materialize")
+            .expect("a kernel-supported primitive default must materialize")
     };
     let values = scalar.to_array(1)?;
     insert_data(snapshot, &engine, vec![values.clone()])
@@ -403,6 +403,7 @@ async fn assert_materialized_column_default_round_trips(
 #[case::binary(DataType::BINARY, "X'deadbeef'")]
 #[case::date(DataType::DATE, "DATE '2024-01-01'")]
 #[case::timestamp(DataType::TIMESTAMP, "TIMESTAMP '2024-01-01T12:00:00Z'")]
+#[case::current_timestamp(DataType::TIMESTAMP, "CURRENT_TIMESTAMP")]
 #[case::timestamp_ntz(DataType::TIMESTAMP_NTZ, "TIMESTAMP_NTZ '2024-01-01 12:00:00'")]
 #[case::decimal(DataType::decimal(10, 2).unwrap(), "1.23")]
 #[tokio::test]
@@ -425,7 +426,7 @@ async fn test_transaction_top_level_column_defaults_excludes_nested_defaults(
         MetadataValue::String("7".to_string()),
     )]);
 
-    // `a`: no default, `b`: kernel-parsable default, `c`: non-kernel-parsable default,
+    // `a`: no default, `b`: kernel-parsable literal, `c`: kernel-evaluated non-literal default,
     // `s.inner`: nested default that the top-level API must not return.
     let base = StructType::try_new(vec![
         StructField::nullable("a", DataType::INTEGER),
@@ -467,57 +468,70 @@ async fn test_transaction_top_level_column_defaults_excludes_nested_defaults(
 
     let c = &defaults["c"];
     assert_eq!(c.raw_sql(), "current_timestamp()");
-    assert_eq!(
-        c.to_scalar()?,
-        None,
-        "a non-kernel-parsable default is not parsed by the kernel",
+    assert!(
+        matches!(c.to_scalar()?, Some(Scalar::Timestamp(_))),
+        "CURRENT_TIMESTAMP must materialize to a timestamp scalar",
     );
 
     Ok(())
 }
 
-/// On an `icebergCompatV3` table, a default kernel cannot verify as a literal produces a
-/// warning rather than an error, so the snapshot loads and a DML transaction constructs.
+#[derive(Clone, Copy, Debug)]
+enum V3ValidationOutcome {
+    Warning(&'static str),
+    Unsupported(&'static str),
+}
+
 #[rstest]
-#[case::non_literal(
-    "non_literal",
-    DataType::TIMESTAMP,
-    "current_timestamp()",
-    "could not verify"
-)]
-#[case::unparsable_non_primitive(
-    "non_primitive",
+#[case::unparseable(
+    "test_v3_tolerates_unparseable_default",
     DataType::from(ArrayType::new(DataType::INTEGER, true)),
     "ARRAY(1)",
-    "could not verify"
+    V3ValidationOutcome::Warning("could not verify")
+)]
+#[case::recognized_non_literal(
+    "test_v3_rejects_recognized_non_literal_default",
+    DataType::TIMESTAMP,
+    "current_timestamp()",
+    V3ValidationOutcome::Unsupported("requires column defaults to be literals")
 )]
 #[tokio::test]
-async fn test_load_and_write_tolerate_v3_unverifiable_default(
-    #[case] label: &str,
+async fn test_v3_column_default_validation_e2e(
+    #[case] table_name: &str,
     #[case] field_type: DataType,
     #[case] default_sql: &str,
-    #[case] warning_text: &str,
+    #[case] expected: V3ValidationOutcome,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let base = StructType::try_new(vec![StructField::nullable("c", field_type)])?;
     let schema = schema_with_column_defaults(&base, HashMap::from([("c", default_sql)]))?;
 
     let (engine, table_url) = setup_unpartitioned_table(
-        &format!("test_v3_tolerates_{label}"),
+        table_name,
         schema,
         vec!["allowColumnDefaults", "icebergCompatV3"],
     )
     .await?;
 
-    // Read: the snapshot loads despite the unverifiable default.
     let snapshot = Snapshot::builder_for(table_url).build(&engine)?;
-
     let logging = LoggingTest::new();
-    snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
-    assert!(
-        logging.logs().contains(warning_text),
-        "logs: {}",
-        logging.logs()
-    );
+
+    match expected {
+        V3ValidationOutcome::Warning(needle) => {
+            snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+            let logs = logging.logs();
+            assert!(logs.contains(needle), "logs: {logs}");
+        }
+        V3ValidationOutcome::Unsupported(needle) => {
+            let error = snapshot
+                .transaction(Box::new(FileSystemCommitter::new()), &engine)
+                .expect_err("icebergCompatV3 must reject a recognized non-literal default");
+            assert!(matches!(&error, delta_kernel::Error::Unsupported(_)));
+            let message = error.to_string();
+            assert!(message.contains("icebergCompatV3"), "got: {message}");
+            assert!(message.contains(default_sql), "got: {message}");
+            assert!(message.contains(needle), "got: {message}");
+        }
+    }
 
     Ok(())
 }

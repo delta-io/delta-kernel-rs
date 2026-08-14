@@ -192,7 +192,7 @@ pub enum JunctionPredicateOp {
 /// `Scalar::Null` if the output was NULL).
 pub type ScalarExpressionEvaluator<'a> = dyn Fn(&Expression) -> Option<Scalar> + 'a;
 
-/// An opaque expression operation (ie defined and implemented by the engine).
+/// An opaque expression operation whose semantics are supplied by its implementor.
 pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// Succinctly identifies this op
     fn name(&self) -> &str;

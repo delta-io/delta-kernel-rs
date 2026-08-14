@@ -3,8 +3,8 @@
 //! # Invariants
 //!
 //! The rules Kernel applies to column defaults, and where each comes from. This applies to
-//! [`ColumnDefault::new`], [`validate_column_defaults_metadata`], and the IcebergCompatV3 warnings
-//! in [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
+//! [`ColumnDefault::new`], [`validate_column_defaults_metadata`], and IcebergCompatV3 validation in
+//! [`crate::table_features`]. Rules that follow the protocol are stated plainly; only kernel
 //! divergences are called out as such.
 //!
 //! - `CURRENT_DEFAULT` metadata must be a string.
@@ -14,10 +14,10 @@
 //! - Defaults may appear on nested struct fields, not just top-level columns, so validation
 //!   descends into nested fields. Kernel only *writes* top-level defaults (a kernel limitation),
 //!   but *loads* a snapshot of a table authored elsewhere that carries nested defaults.
-//! - Parsing is best-effort: unparseable SQL (e.g. `current_timestamp()`) is not an error; the
-//!   connector falls back to the raw SQL.
-//! - On an IcebergCompatV3 table, kernel warns when its parser cannot verify that a default is a
-//!   literal.
+//! - Parsing is best-effort: unparseable SQL (e.g. an unsupported function call) is not an error;
+//!   the connector falls back to the raw SQL.
+//! - On an IcebergCompatV3 table, kernel rejects defaults it recognizes as non-literal and warns
+//!   when its parser cannot determine whether a default is a literal.
 
 use crate::expressions::{parse_sql, Expression, Scalar};
 use crate::schema::{DataType, StructField, StructType};
@@ -29,9 +29,9 @@ use crate::{DeltaResult, Error};
 ///
 /// Holds the raw SQL and the column's declared type. On construction the kernel parses the SQL
 /// with its built-in parser and caches the result. [`to_scalar`](Self::to_scalar) returns the
-/// parsed [`Scalar`], or `None` when the kernel could not parse the SQL (e.g.
-/// `current_timestamp()`), in which case a connector can evaluate [`raw_sql`](Self::raw_sql)
-/// itself.
+/// parsed [`Scalar`], or `None` when the kernel could not parse the SQL, in which case a connector
+/// can evaluate [`raw_sql`](Self::raw_sql) itself. Kernel-supported non-literal defaults such as
+/// `CURRENT_TIMESTAMP` are evaluated each time [`to_scalar`](Self::to_scalar) is called.
 ///
 /// The declared type is borrowed from the logical schema, which outlives the carrier.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +41,14 @@ pub struct ColumnDefault<'a> {
     /// The default parsed as a kernel [`Expression`], or `None` if the kernel's
     /// built-in SQL parser could not parse it.
     parsed_sql: Option<Expression>,
+}
+
+/// Kernel's classification of a parsed column-default expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseStatus {
+    Literal,
+    NonLiteral,
+    Unparsed,
 }
 
 impl<'a> ColumnDefault<'a> {
@@ -83,29 +91,43 @@ impl<'a> ColumnDefault<'a> {
 
     /// The default as a [`Scalar`], or `None` when the kernel could not parse the SQL.
     ///
-    /// On `None` the connector can evaluate [`raw_sql`](Self::raw_sql) with its own SQL engine.
+    /// Kernel-supported non-literal defaults such as `CURRENT_TIMESTAMP` are evaluated when this
+    /// method is called. On `None` the connector can evaluate [`raw_sql`](Self::raw_sql) with its
+    /// own SQL engine.
     ///
     /// # Errors
     ///
-    /// Returns an error if the parsed default is not a literal. The parser only emits literals, so
-    /// this is defensive.
+    /// Returns an error if a parsed expression is neither a literal nor a kernel-supported
+    /// non-literal default, or if evaluation of a supported non-literal default fails.
     pub fn to_scalar(&self) -> DeltaResult<Option<Scalar>> {
         match &self.parsed_sql {
             None => Ok(None),
             Some(Expression::Literal(scalar)) => Ok(Some(scalar.clone())),
+            Some(Expression::Opaque(opaque)) => opaque
+                .op
+                .eval_expr_scalar(
+                    &|expr| match expr {
+                        Expression::Literal(scalar) => Some(scalar.clone()),
+                        _ => None,
+                    },
+                    &opaque.exprs,
+                )
+                .map(Some),
             Some(other) => Err(Error::generic(format!(
                 "kernel cannot evaluate non-literal column default expression: {other:?}"
             ))),
         }
     }
 
-    /// Returns `true` iff the default parsed to a literal expression.
+    /// Classifies the default according to kernel's SQL parser coverage.
     ///
-    /// Returns `false` for SQL the kernel could not parse (e.g. arithmetic or function calls). Note
-    /// that NULL parses to a literal, so this is `true` for a NULL default regardless of the
-    /// column type.
-    pub(crate) fn is_kernel_parsable_literal(&self) -> bool {
-        matches!(self.parsed_sql, Some(Expression::Literal(_)))
+    /// NULL is classified as [`ParseStatus::Literal`] regardless of the column type.
+    pub(crate) fn parse_status(&self) -> ParseStatus {
+        match &self.parsed_sql {
+            Some(Expression::Literal(_)) => ParseStatus::Literal,
+            Some(_) => ParseStatus::NonLiteral,
+            None => ParseStatus::Unparsed,
+        }
     }
 }
 
@@ -263,6 +285,8 @@ mod tests {
         ParsedNull,
         /// `to_scalar` yields `None`.
         Unparsable,
+        /// `to_scalar` yields the current UTC timestamp.
+        CurrentTimestamp,
         /// `new` fails with an error containing this substring.
         NewErr(&'static str),
     }
@@ -289,7 +313,12 @@ mod tests {
     )]
     #[case::null_struct("NULL", struct_ty(), Expect::ParsedNull)]
     #[case::null_variant("NULL", DataType::unshredded_variant(), Expect::ParsedNull)]
-    #[case::function_call("current_timestamp()", DataType::TIMESTAMP, Expect::Unparsable)]
+    #[case::current_timestamp(
+        "  CuRrEnT_TiMeStAmP()  ",
+        DataType::TIMESTAMP,
+        Expect::CurrentTimestamp
+    )]
+    #[case::unsupported_function("NOW()", DataType::TIMESTAMP, Expect::Unparsable)]
     #[case::type_mismatch("'not an int'", DataType::INTEGER, Expect::Unparsable)]
     #[case::arithmetic("1 + 1", DataType::INTEGER, Expect::Unparsable)]
     #[case::non_primitive_array(
@@ -325,6 +354,21 @@ mod tests {
                 assert_eq!(d.to_scalar().unwrap(), None);
                 // A parse failure must not drop the raw SQL; connectors fall back to it.
                 assert_eq!(d.raw_sql(), raw_sql);
+            }
+            (Ok(d), Expect::CurrentTimestamp) => {
+                assert_eq!(d.raw_sql(), raw_sql);
+                for _ in 0..2 {
+                    let before = Utc::now().timestamp_micros();
+                    let scalar = d.to_scalar().unwrap();
+                    let after = Utc::now().timestamp_micros();
+                    let Some(Scalar::Timestamp(actual)) = scalar else {
+                        panic!("expected a timestamp scalar, got {scalar:?}");
+                    };
+                    assert!(
+                        (before..=after).contains(&actual),
+                        "timestamp {actual} was not sampled between {before} and {after}"
+                    );
+                }
             }
             (Err(e), Expect::NewErr(needle)) => {
                 assert!(e.to_string().contains(needle), "got: {e}");
@@ -409,8 +453,7 @@ mod tests {
 
     #[test]
     fn to_scalar_errors_on_non_literal_parsed_expression() {
-        // The parser only emits literals, so construct a non-literal directly to reach the
-        // defensive error arm.
+        // Construct an unsupported parsed expression directly to reach the defensive error arm.
         let int_ty = DataType::INTEGER;
         let d = ColumnDefault {
             raw_sql: "x".into(),
@@ -422,5 +465,18 @@ mod tests {
             .expect_err("non-literal parsed expression must error")
             .to_string();
         assert!(err.contains("non-literal"), "got: {err}");
+    }
+
+    #[rstest]
+    #[case::literal("42", DataType::INTEGER, ParseStatus::Literal)]
+    #[case::non_literal("CURRENT_TIMESTAMP", DataType::TIMESTAMP, ParseStatus::NonLiteral)]
+    #[case::unparsed("NOW()", DataType::TIMESTAMP, ParseStatus::Unparsed)]
+    fn classifies_parsed_defaults(
+        #[case] raw_sql: &str,
+        #[case] data_type: DataType,
+        #[case] expected: ParseStatus,
+    ) {
+        let default = ColumnDefault::new(raw_sql.to_string(), &data_type).unwrap();
+        assert_eq!(default.parse_status(), expected);
     }
 }

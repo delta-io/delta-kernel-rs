@@ -8,12 +8,11 @@
 //! grammar rather than defining a kernel-specific dialect, so the forms it accepts match what
 //! Spark reads and writes.
 //!
-//! This is an intentionally light start: a small internal parser covering only the literal forms
-//! Delta metadata contains today. If the supported SQL surface grows, options include moving
-//! parsing behind the [`Engine`](crate::Engine) trait or adopting an existing SQL parser library.
+//! This internal parser supports literals and the zero-argument `CURRENT_TIMESTAMP` function.
 
-use crate::expressions::{Expression, Scalar};
+use crate::expressions::{Expression, OpaqueExpressionOp, Scalar, ScalarExpressionEvaluator};
 use crate::schema::{DataType, PrimitiveType};
+use crate::utils::current_time_micros;
 use crate::{DeltaResult, Error};
 
 #[cfg(feature = "check-constraints-in-dev")]
@@ -25,8 +24,9 @@ mod token;
 /// (e.g. the type of the column whose default is being parsed).
 ///
 /// Leading and trailing whitespace are ignored. `NULL` (case-insensitive) is accepted for any
-/// data type. All other input is parsed as a typed literal, which is supported only for primitive
-/// types.
+/// data type. `CURRENT_TIMESTAMP` and `CURRENT_TIMESTAMP()` (case-insensitive) are accepted for
+/// [`DataType::TIMESTAMP`]. All other input is parsed as a typed literal, which is supported only
+/// for primitive types.
 ///
 /// # Examples
 ///
@@ -48,9 +48,49 @@ pub(crate) fn parse_sql(sql: &str, data_type: &DataType) -> DeltaResult<Expressi
     if trimmed.eq_ignore_ascii_case("null") {
         return Ok(Expression::literal(Scalar::Null(data_type.clone())));
     }
-    // TODO(#2630): support SQL function calls (e.g. `current_date()`) when column defaults
-    // need them.
+    if is_current_timestamp(trimmed) {
+        if data_type != &DataType::TIMESTAMP {
+            return Err(Error::generic(format!(
+                "CURRENT_TIMESTAMP requires TIMESTAMP, got {data_type:?}"
+            )));
+        }
+        return Ok(Expression::opaque(CurrentTimestampOp, []));
+    }
     parse_literal(trimmed, data_type, sql)
+}
+
+/// Whether `sql` is one of the supported zero-argument `CURRENT_TIMESTAMP` spellings.
+fn is_current_timestamp(sql: &str) -> bool {
+    sql.eq_ignore_ascii_case("CURRENT_TIMESTAMP") || sql.eq_ignore_ascii_case("CURRENT_TIMESTAMP()")
+}
+
+#[derive(Debug, PartialEq)]
+struct CurrentTimestampOp;
+
+impl OpaqueExpressionOp for CurrentTimestampOp {
+    fn name(&self) -> &str {
+        "current_timestamp"
+    }
+
+    fn eval_expr_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        exprs: &[Expression],
+    ) -> DeltaResult<Scalar> {
+        evaluate_current_timestamp(exprs, current_time_micros)
+    }
+}
+
+fn evaluate_current_timestamp(
+    exprs: &[Expression],
+    current_time: impl FnOnce() -> DeltaResult<i64>,
+) -> DeltaResult<Scalar> {
+    if !exprs.is_empty() {
+        return Err(Error::generic(
+            "CURRENT_TIMESTAMP does not accept arguments",
+        ));
+    }
+    Ok(Scalar::Timestamp(current_time()?))
 }
 
 /// Dispatch a SQL literal to the per-type parser for its primitive `data_type`, then wrap the
@@ -342,6 +382,8 @@ fn decode_binary_literal(input: &str) -> DeltaResult<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
     use rstest::rstest;
 
@@ -371,6 +413,65 @@ mod tests {
         DataType::Primitive(PrimitiveType::Decimal(
             DecimalType::try_new(precision, scale).unwrap(),
         ))
+    }
+
+    #[rstest]
+    #[case("CURRENT_TIMESTAMP")]
+    #[case("CURRENT_TIMESTAMP()")]
+    #[case("current_timestamp")]
+    #[case("CuRrEnT_TiMeStAmP()")]
+    #[case("  CURRENT_TIMESTAMP  ")]
+    #[case("\ncurrent_timestamp()\t")]
+    fn parses_current_timestamp_as_opaque_expression(#[case] sql: &str) {
+        let Expression::Opaque(opaque) = parse_sql(sql, &DataType::TIMESTAMP).unwrap() else {
+            panic!("expected an opaque expression for {sql:?}");
+        };
+
+        assert_eq!(opaque.op.name(), "current_timestamp");
+        assert!(opaque.exprs.is_empty());
+    }
+
+    #[test]
+    fn current_timestamp_reads_clock_only_when_evaluated() {
+        let reads = Cell::new(0);
+        let Expression::Opaque(opaque) =
+            parse_sql("CURRENT_TIMESTAMP", &DataType::TIMESTAMP).unwrap()
+        else {
+            panic!("expected an opaque expression");
+        };
+
+        assert_eq!(reads.get(), 0);
+        let scalar = evaluate_current_timestamp(&opaque.exprs, || {
+            reads.set(reads.get() + 1);
+            Ok(123_456)
+        })
+        .unwrap();
+
+        assert_eq!(scalar, Scalar::Timestamp(123_456));
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[rstest]
+    #[case("CURRENT_TIMESTAMP ()", DataType::TIMESTAMP)]
+    #[case("CURRENT_TIMESTAMP( )", DataType::TIMESTAMP)]
+    #[case("CURRENT_TIMESTAMP(1)", DataType::TIMESTAMP)]
+    #[case("CURRENT_TIMESTAMPS", DataType::TIMESTAMP)]
+    #[case("NOW()", DataType::TIMESTAMP)]
+    #[case("CURRENT_TIMESTAMP", DataType::TIMESTAMP_NTZ)]
+    #[case("CURRENT_TIMESTAMP()", DataType::STRING)]
+    fn rejects_unsupported_current_timestamp_forms_and_types(
+        #[case] sql: &str,
+        #[case] data_type: DataType,
+    ) {
+        assert!(parse_sql(sql, &data_type).is_err());
+    }
+
+    #[test]
+    fn current_timestamp_opaque_op_rejects_children() {
+        let err = CurrentTimestampOp
+            .eval_expr_scalar(&|_| None, &[Expression::literal(1)])
+            .unwrap_err();
+        assert!(err.to_string().contains("does not accept arguments"));
     }
 
     #[rstest]
@@ -554,7 +655,6 @@ mod tests {
     #[case("CAST('2024-01-01' AS DATE)", DataType::DATE)]
     #[case("CAST(NULL AS INT)", DataType::INTEGER)]
     #[case("current_date()", DataType::DATE)]
-    #[case("current_timestamp()", DataType::TIMESTAMP)]
     #[case("now()", DataType::TIMESTAMP)]
     #[case("1 + 1", DataType::INTEGER)]
     #[case("concat('a', 'b')", DataType::STRING)]
