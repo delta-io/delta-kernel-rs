@@ -94,6 +94,10 @@ pub(crate) fn table_changes_action_iter_with_mode(
         })
         .map(Arc::new);
 
+    let read_partition_columns = start_table_configuration
+        .metadata()
+        .partition_columns()
+        .to_vec();
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
@@ -103,6 +107,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
                 &mut current_configuration,
                 commit_file,
                 &table_schema,
+                &read_partition_columns,
                 mode,
             )?;
             scanner.into_scan_batches(engine.clone(), filter.clone())
@@ -131,6 +136,7 @@ pub(crate) fn table_changes_action_iter_with_mode(
 ///     - Ensure that schema updates satisfy the mode's compatibility policy. Change Data Feed mode
 ///       requires equality; row-tracking mode allows additive nullable columns and relaxed
 ///       nullability, but rejects datatype changes.
+///     - Ensure that partition columns remain unchanged in both modes.
 ///     - Read the in-commit timestamp from `CommitInfo` when that feature is enabled.
 ///
 /// Note: We check the protocol, mode-specific table feature, and schema compatibility in phase 1
@@ -181,6 +187,7 @@ impl LogReplayScanner {
         table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
+        read_partition_columns: &[String],
         mode: CdfMode,
     ) -> DeltaResult<Self> {
         let visitor_schema = PreparePhaseVisitor::schema();
@@ -241,6 +248,11 @@ impl LogReplayScanner {
                         commit_file.version
                     )
                 );
+                mode.validate_partition_columns(
+                    metadata.partition_columns(),
+                    read_partition_columns,
+                    commit_file.version,
+                )?;
             }
 
             // Update table configuration with any new Protocol or Metadata from this commit
