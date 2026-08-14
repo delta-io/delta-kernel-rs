@@ -186,15 +186,15 @@ jobs:
       - name: build and lint with clippy
         run: cargo clippy --locked --benches --tests --all-features -- -D warnings
       - name: lint without default features - packages which depend on kernel with features enabled
-        run: cargo clippy --locked --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+        run: cargo clippy-no-default-kernel-dependents
       - name: check without default features - kernel
         env:
           RUSTFLAGS: --cap-lints=warn
-        run: cargo check --locked --no-default-features --package delta_kernel
+        run: cargo check-no-default-kernel
       - name: check without default features - default engine
-        run: cargo check --locked --no-default-features --package delta_kernel_default_engine --features arrow
+        run: cargo check-no-default-engine
       - name: lint without default features - packages which don't depend on kernel with features enabled
-        run: cargo clippy --locked --no-default-features --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
+        run: cargo clippy-no-default-kernel-leaves
       - name: check kernel declarative-plans feature-only build
         run: cargo check --locked -p delta_kernel --no-default-features --features declarative-plans,vendored-protoc
       - name: lint kernel declarative-plans feature-only build
