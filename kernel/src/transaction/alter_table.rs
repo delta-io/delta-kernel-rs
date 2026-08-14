@@ -49,6 +49,9 @@ impl AlterTableTransaction {
             operation = "ALTER TABLE",
         );
 
+        // ALTER TABLE's operation is kernel-owned: override any caller-supplied value.
+        let mut commit_info_options = commit_info_options;
+        commit_info_options.operation = Some("ALTER TABLE".to_string());
         Ok(Transaction {
             span,
             operation_id: MetricId::new(),
@@ -58,7 +61,6 @@ impl AlterTableTransaction {
             should_emit_protocol: false,
             should_emit_metadata: true,
             committer,
-            operation: Some("ALTER TABLE".to_string()),
             commit_info_options,
             add_files_metadata: vec![],
             remove_files_metadata: vec![],

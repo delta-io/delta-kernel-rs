@@ -88,18 +88,22 @@ pub use write_context::WriteContext;
 /// Client-supplied fields for a transaction's `CommitInfo` action, and the structured entry point
 /// for populating it.
 ///
-/// The typed setters cover the common provenance fields.
+/// The typed setters cover the common fields.
 /// [`with_additional_commit_info`](Self::with_additional_commit_info) adds arbitrary extra fields
 /// (including nested or non-string values) as [`EngineData`].
 ///
-/// Fields that drive kernel behavior are not here. Kernel interprets `operation` (CRC
-/// incremental-safety) and blind-append status, so they are [`Transaction`] settings
-/// (`with_operation`, `with_blind_append`). Kernel-owned fields (timestamp, kernel version,
-/// transaction id) are set at commit time.
+/// Kernel reads `operation` at commit time to classify CRC incremental-safety, and sets the
+/// kernel-owned fields (timestamp, kernel version, transaction id) itself. Blind-append status is
+/// a separate [`Transaction`] setting (`with_blind_append`) because it is a write-behavior mode,
+/// not just commit metadata.
 ///
 /// Not `Clone`/`PartialEq`: `additional_commit_info` holds opaque [`EngineData`].
 #[derive(Default)]
 pub struct CommitInfoClientOptions {
+    /// Operation recorded in the commit (e.g. "WRITE", "CREATE TABLE"). Kernel also reads it to
+    /// classify CRC incremental-safety. Set via `Transaction::with_operation`; fixed by kernel for
+    /// create-table and alter-table.
+    pub(crate) operation: Option<String>,
     /// Always written; an unset value serializes as an empty map (`{}`).
     pub(crate) operation_parameters: Option<HashMap<String, String>>,
     /// Written only when set; an unset value is omitted from the commit.
@@ -114,6 +118,7 @@ pub struct CommitInfoClientOptions {
 impl std::fmt::Debug for CommitInfoClientOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CommitInfoClientOptions")
+            .field("operation", &self.operation)
             .field("operation_parameters", &self.operation_parameters)
             .field("operation_metrics", &self.operation_metrics)
             .field("engine_info", &self.engine_info)
@@ -179,6 +184,27 @@ impl CommitInfoClientOptions {
     ) -> Self {
         self.additional_commit_info = Some((additional_commit_info, commit_info_schema));
         self
+    }
+
+    /// Merge `other` into these options: each field set in `other` overrides ours; a field left
+    /// unset in `other` keeps its current value. `operation` has no public setter here, so it is
+    /// never overridden by a merge (it comes from `Transaction::with_operation` or kernel).
+    pub(crate) fn merge(&mut self, other: CommitInfoClientOptions) {
+        if other.operation.is_some() {
+            self.operation = other.operation;
+        }
+        if other.operation_parameters.is_some() {
+            self.operation_parameters = other.operation_parameters;
+        }
+        if other.operation_metrics.is_some() {
+            self.operation_metrics = other.operation_metrics;
+        }
+        if other.engine_info.is_some() {
+            self.engine_info = other.engine_info;
+        }
+        if other.additional_commit_info.is_some() {
+            self.additional_commit_info = other.additional_commit_info;
+        }
     }
 }
 
@@ -316,10 +342,6 @@ pub struct Transaction<S = ExistingTable> {
     // Whether to emit a Metadata action. True for CREATE TABLE and ALTER TABLE, false otherwise.
     should_emit_metadata: bool,
     committer: Box<dyn Committer>,
-    // Operation recorded in the commitInfo action (e.g. "WRITE", "CREATE TABLE"). Kernel
-    // interprets it for CRC incremental-safety, so it is a transaction field, not a
-    // commit-info option.
-    operation: Option<String>,
     commit_info_options: CommitInfoClientOptions,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     remove_files_metadata: Vec<FilteredEngineData>,
@@ -548,7 +570,7 @@ impl<S> Transaction<S> {
         let mut kernel_commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
-            self.operation.clone(),
+            self.commit_info_options.operation.clone(),
             self.commit_info_options.engine_info.clone(),
             self.is_blind_append,
         );
@@ -688,7 +710,7 @@ impl<S> Transaction<S> {
         span.record("remove_files_bytes", file_stats.gross_remove_bytes);
         span.record("is_blind_append", self.is_blind_append);
         span.record("data_change", self.data_change);
-        if let Some(operation) = self.operation.as_deref() {
+        if let Some(operation) = self.commit_info_options.operation.as_deref() {
             span.record("operation", operation);
         }
         span.record("prepare_duration_ns", prepare_duration.as_nanos() as u64);
@@ -727,12 +749,22 @@ impl<S> Transaction<S> {
         self
     }
 
+    /// Set the client-supplied commit-info options for this transaction.
+    ///
+    /// Merges into the current options: each field set in `options` overrides its current value;
+    /// fields left unset keep their current value (so a prior `with_engine_info` or the operation
+    /// are not cleared). A later convenience setter (e.g.
+    /// [`with_engine_info`](Self::with_engine_info)) overrides its field again.
+    pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
+        self.commit_info_options.merge(options);
+        self
+    }
+
     /// Add arbitrary caller-supplied fields to this transaction's `commitInfo` action.
     ///
     /// Convenience shortcut for [`CommitInfoClientOptions::with_additional_commit_info`]; see it
     /// for the merge and kernel-override rules. Sets the same payload on this transaction's
-    /// options, so a later [`with_commit_info_options`](Self::with_commit_info_options) replaces
-    /// it.
+    /// options.
     pub fn with_additional_commit_info(
         mut self,
         additional_commit_info: Box<dyn EngineData>,
@@ -967,7 +999,8 @@ impl<S> Transaction<S> {
     /// A create-table transaction has no read snapshot (no pre-existing table).
     fn is_create_table(&self) -> bool {
         debug_assert!(
-            self.operation.as_deref() != Some("CREATE TABLE") || self.read_snapshot_opt.is_none(),
+            self.commit_info_options.operation.as_deref() != Some("CREATE TABLE")
+                || self.read_snapshot_opt.is_none(),
             "CREATE TABLE operation should not have a read snapshot"
         );
         self.read_snapshot_opt.is_none()
@@ -1604,6 +1637,7 @@ impl<S> Transaction<S> {
         // `kernel/src/crc/file_stats.rs`). So at this point every size is known to be
         // present, and only operation classification can flip `is_incremental_safe`.
         let is_incremental_safe = self
+            .commit_info_options
             .operation
             .as_deref()
             .is_some_and(is_incremental_safe_operation);
@@ -3255,24 +3289,26 @@ mod tests {
         );
     }
 
-    /// `operation` is a first-class transaction setting, so it survives a later
-    /// `with_commit_info_options` (which replaces only the payload). `engine_info` lives in the
-    /// payload, so the same replace clears it unless a convenience setter follows.
+    /// `with_commit_info_options` merges: fields unset in the new options keep their current value,
+    /// so a prior `operation` and `engine_info` both survive an empty-options call.
     #[test]
-    fn test_operation_survives_options_replace_but_engine_info_does_not() -> DeltaResult<()> {
+    fn test_options_merge_keeps_prior_operation_and_engine_info() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
 
-        // Replace the options after setting both: operation survives, engine_info is cleared.
+        // Merge empty options: operation and engine_info both survive.
         let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_operation("WRITE".to_string())
             .with_engine_info("from-setter")
             .with_commit_info_options(CommitInfoClientOptions::new());
-        assert_eq!(txn.operation.as_deref(), Some("WRITE"));
-        assert_eq!(txn.commit_info_options.engine_info, None);
+        assert_eq!(txn.commit_info_options.operation.as_deref(), Some("WRITE"));
+        assert_eq!(
+            txn.commit_info_options.engine_info.as_deref(),
+            Some("from-setter")
+        );
 
-        // A convenience setter after the options override wins for engine_info.
+        // A field set in the new options overrides the prior value; a later setter wins again.
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
             .with_commit_info_options(

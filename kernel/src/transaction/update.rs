@@ -93,7 +93,6 @@ impl Transaction {
             should_emit_protocol: false,
             should_emit_metadata: false,
             committer,
-            operation: None,
             commit_info_options: CommitInfoClientOptions::new(),
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
@@ -116,17 +115,6 @@ impl Transaction {
     // Public API
     // -------------------------------------------------------------------------
 
-    /// Replace this transaction's commit-info options wholesale.
-    ///
-    /// Convenience setters (e.g. [`with_engine_info`]) called after this method override their
-    /// corresponding option.
-    ///
-    /// [`with_engine_info`]: Transaction::with_engine_info
-    pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
-        self.commit_info_options = options;
-        self
-    }
-
     /// Mark this transaction as a blind append.
     ///
     /// Blind append transactions should only add new files and avoid write operations that
@@ -139,7 +127,7 @@ impl Transaction {
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
+        self.commit_info_options.operation = Some(operation);
         self
     }
 

@@ -839,11 +839,10 @@ impl CreateTableTransactionBuilder {
 
     /// Set the commit-info options for the create-table commit.
     ///
-    /// The operation is always `CREATE TABLE` and is not part of these options. When the options
-    /// omit engine info, the [`create_table`](super::super::create_table::create_table) value is
-    /// kept.
+    /// Merges into the current options (fields set in `options` override; unset fields are kept).
+    /// The operation is always `CREATE TABLE`, regardless of these options.
     pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
-        self.commit_info_options = options;
+        self.commit_info_options.merge(options);
         self
     }
 

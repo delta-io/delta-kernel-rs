@@ -109,9 +109,9 @@ impl<S> AlterTableTransactionBuilder<S> {
     }
 
     /// Set the commit-info options for the alter-table commit. The operation is always
-    /// `ALTER TABLE` and is not part of these options.
+    /// `ALTER TABLE`, regardless of these options.
     pub fn with_commit_info_options(mut self, options: CommitInfoClientOptions) -> Self {
-        self.commit_info_options = options;
+        self.commit_info_options.merge(options);
         self
     }
 }
