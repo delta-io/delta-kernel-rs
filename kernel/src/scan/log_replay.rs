@@ -12,8 +12,8 @@ use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
-    col, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, Predicate,
-    PredicateRef, UnaryExpressionOp,
+    col, column_expr_ref, column_name, ColumnName, Expression, ExpressionRef, MapToStructOptions,
+    Predicate, PredicateRef, UnaryExpressionOp,
 };
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator, FileActionInfo};
 use crate::log_replay::{
@@ -879,7 +879,7 @@ fn get_add_transform_expr(
             col!("add.partitionValues_parsed")
         } else {
             // No native column (JSON commit): reconstruct from the string map.
-            Expression::map_to_struct(col!("add.partitionValues"))
+            Expression::map_to_struct(col!("add.partitionValues"), MapToStructOptions::default())
         };
         fields.push(Arc::new(pv_parsed_expr));
     }

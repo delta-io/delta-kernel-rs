@@ -679,7 +679,16 @@ fn visit_expression_impl(
                 schema_handle
             );
         }
-        Expression::MapToStruct(MapToStructExpression { map_expr }) => {
+        Expression::MapToStruct(map_to_struct)
+            if map_to_struct.options.timestamp_timezone().is_some() =>
+        {
+            visit_unknown(
+                visitor,
+                sibling_list_id,
+                "map_to_struct_with_timestamp_timezone",
+            )
+        }
+        Expression::MapToStruct(MapToStructExpression { map_expr, .. }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, map_expr, child_list_id);
             call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
@@ -754,15 +763,26 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::expressions::{Expression, Scalar};
+    use delta_kernel::expressions::{Expression, MapToStructOptions, Scalar};
     use rstest::rstest;
 
     use super::*;
+    use crate::TryFromStringSlice;
 
     #[derive(Debug, PartialEq, Eq)]
     enum LiteralEvent {
-        IntervalYearMonth { sibling_list_id: usize, value: i32 },
-        IntervalDayTime { sibling_list_id: usize, value: i64 },
+        IntervalYearMonth {
+            sibling_list_id: usize,
+            value: i32,
+        },
+        IntervalDayTime {
+            sibling_list_id: usize,
+            value: i64,
+        },
+        Unknown {
+            sibling_list_id: usize,
+            name: String,
+        },
     }
 
     #[derive(Default)]
@@ -799,6 +819,19 @@ mod tests {
         builder.events.push(LiteralEvent::IntervalDayTime {
             sibling_list_id,
             value,
+        });
+    }
+
+    extern "C" fn visit_unknown_name(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let name = unsafe { String::try_from_slice(&name) }.unwrap();
+        builder.events.push(LiteralEvent::Unknown {
+            sibling_list_id,
+            name,
         });
     }
 
@@ -881,7 +914,7 @@ mod tests {
             visit_field_patch: ignore_field_patch,
             visit_opaque_expr: ignore_opaque_expr,
             visit_opaque_pred: ignore_opaque_pred,
-            visit_unknown: ignore_column,
+            visit_unknown: visit_unknown_name,
         }
     }
 
@@ -929,5 +962,26 @@ mod tests {
 
         assert_eq!(top_level_id, 0);
         assert_eq!(builder.events, vec![expected]);
+    }
+
+    #[test]
+    fn timezone_aware_map_to_struct_visits_unknown() {
+        let expression = Expression::map_to_struct(
+            Expression::column(["partitionValues"]),
+            MapToStructOptions::default().with_timestamp_timezone("America/Los_Angeles"),
+        );
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(
+            builder.events,
+            vec![LiteralEvent::Unknown {
+                sibling_list_id: 0,
+                name: "map_to_struct_with_timestamp_timezone".to_string(),
+            }]
+        );
     }
 }
