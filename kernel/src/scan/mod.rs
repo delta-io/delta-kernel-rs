@@ -193,18 +193,29 @@ impl StatsOptions {
 }
 
 /// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
-/// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
-/// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
+/// declare whether scan metadata output includes the raw `partitionValues` string map, the typed
+/// `partitionValues_parsed` struct, or both.
 ///
 /// When the typed struct is requested, scan metadata output gains a top-level
 /// `partitionValues_parsed` struct column with one typed nullable field per partition column
 /// (physical names, table partition-column order). On non-partitioned tables the column is
-/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
-/// when present, otherwise from parsing the string map.
-#[derive(Clone, Debug, Default)]
+/// omitted. Values are parsed from the complete `partitionValues` string map; native checkpoint
+/// `partitionValues_parsed` values may be incomplete or use the checkpoint writer's timezone.
+#[derive(Clone, Debug)]
 pub struct PartitionValuesOptions {
+    /// Whether to emit the raw `partitionValues` string map.
+    pub(crate) string_map: bool,
     /// Whether to emit the typed `partitionValues_parsed` struct column.
     pub(crate) parsed_struct: bool,
+}
+
+impl Default for PartitionValuesOptions {
+    fn default() -> Self {
+        Self {
+            string_map: true,
+            parsed_struct: false,
+        }
+    }
 }
 
 impl PartitionValuesOptions {
@@ -217,6 +228,15 @@ impl PartitionValuesOptions {
     /// consume `partitionValues_parsed` directly instead of parsing the string map per row.
     pub fn with_struct() -> Self {
         Self {
+            string_map: true,
+            parsed_struct: true,
+        }
+    }
+
+    /// Emit only the typed `partitionValues_parsed` struct.
+    pub fn struct_only() -> Self {
+        Self {
+            string_map: false,
             parsed_struct: true,
         }
     }
@@ -1084,14 +1104,20 @@ impl Scan {
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
-        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
-        // whether the checkpoint carries a compatible parsed-stats column.
+        if self.state_info.physical_predicate == PhysicalPredicate::StaticSkipAll {
+            return Ok(None);
+        }
+        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and retains the
+        // checkpoint leaf schema when output or pruning requires checkpoint-specific columns.
         let plan_executor = engine.require_plan_executor()?;
-        let shape = CheckpointShape::try_new(
-            plan_executor.as_ref(),
-            &self.snapshot,
-            self.state_info.physical_stats_schema.as_ref(),
-        )?;
+        let shape = if self.stats.synthesize_json
+            || self.state_info.physical_stats_schema.is_some()
+            || self.partition_values.parsed_struct
+        {
+            CheckpointShape::try_new_with_leaf_schema(plan_executor.as_ref(), &self.snapshot)?
+        } else {
+            CheckpointShape::try_new(plan_executor.as_ref(), &self.snapshot)?
+        };
         self.build_metadata_scan_plan(&shape)
     }
 
