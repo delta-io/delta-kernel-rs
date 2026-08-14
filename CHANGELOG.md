@@ -1,8 +1,9 @@
 # Changelog
 
-## [v0.27.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.27.0/) (2026-08-12)
 
-[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.26.0...v0.27.0)
+## [v0.27.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.27.1/) (2026-08-14)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.26.0...v0.27.1)
 
 
 ### 🏗️ Breaking changes
@@ -49,6 +50,14 @@
      protocol/metadata loads), and `crc_versions_behind` goes from a bool to a count. None are
      `#[non_exhaustive]`, so code that constructs or exhaustively matches them needs updating.
      `LogSegmentLoad` and `ProtocolMetadataLoad` now fire on incremental loads too, not just fresh.
+11. Derive `Scalar` from POD structs; infallible `Vec`/`HashMap` conversions ([#3095])
+   - Converting a `Vec` or `HashMap` into `Scalar::Array` / `Scalar::Map` is now infallible (it used to
+     return a `Result`), so drop the `?`/`unwrap` at those call sites. Also adds a proc macro that
+     derives `From<MyStruct> for Scalar`.
+12. Derive macro for populating a struct from a `Scalar` ([#3101])
+   - `StructData::into_values` is replaced by `StructData::into_parts`, which also returns field info, so
+     update callers to `into_parts`. Adds a derive macro for `TryFrom<Scalar>`, round-tripping a struct
+     through `Scalar`.
 
 ### 🚀 Features / new APIs
 
@@ -110,6 +119,10 @@
 56. 3-arg Min/MaxNotNullBy ([#3082])
 57. Define and implement SUM/COUNT aggregates ([#3083])
 58. Initial predicate conversion ([#2971])
+59. Typed Struct and StructPatch expression conversion ([#2972])
+60. Convert MapToStruct expressions to DataFusion ([#2996])
+61. Lower ParseJson to a kernel-delegating scalar UDF ([#3056])
+62. Validate required fields for dv update ([#3026])
 
 ### 🐛 Bug Fixes
 
@@ -134,6 +147,8 @@
 19. Remove version from kernel in datafusion executor ([#3108])
 20. Logical comparison for NULL instead of physical comparison ([#3085])
 21. Read tables with orphaned columnMapping reader feature ([#3097])
+22. Spurious delta acceptance failure due to network connection issues ([#3109])
+23. Fix default-feature build (import CollectInto from crate::utils) ([#3123])
 
 ### 📚 Documentation
 
@@ -158,12 +173,17 @@
 6. Extract unit test utils from `kernel/src/utils.rs` ([#3018])
 7. Move plan construction to `Scan` ([#3039])
 
+### 🧪 Testing
+
+1. Strengthen scan metadata struct columns coverage ([#3053])
+
 ### ⚙️ Chores/CI
 
 1. Split no-declarative-plans tests into a parallel job ([#3038])
 2. Scaffold datafusion-executor crate ([#2928])
 3. Version the UC crates independently at 0.1.0 ([#3062])
 4. Use col! instead of column_expr! ([#3074])
+5. Use col and col_name macros everywhere they make sense ([#3121])
 
 
 [#2860]: https://github.com/delta-io/delta-kernel-rs/pull/2860
@@ -274,6 +294,16 @@
 [#3108]: https://github.com/delta-io/delta-kernel-rs/pull/3108
 [#3085]: https://github.com/delta-io/delta-kernel-rs/pull/3085
 [#3097]: https://github.com/delta-io/delta-kernel-rs/pull/3097
+[#3095]: https://github.com/delta-io/delta-kernel-rs/pull/3095
+[#3101]: https://github.com/delta-io/delta-kernel-rs/pull/3101
+[#2972]: https://github.com/delta-io/delta-kernel-rs/pull/2972
+[#2996]: https://github.com/delta-io/delta-kernel-rs/pull/2996
+[#3056]: https://github.com/delta-io/delta-kernel-rs/pull/3056
+[#3026]: https://github.com/delta-io/delta-kernel-rs/pull/3026
+[#3109]: https://github.com/delta-io/delta-kernel-rs/pull/3109
+[#3053]: https://github.com/delta-io/delta-kernel-rs/pull/3053
+[#3121]: https://github.com/delta-io/delta-kernel-rs/pull/3121
+[#3123]: https://github.com/delta-io/delta-kernel-rs/pull/3123
 
 
 ## [v0.26.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.26.0/) (2026-07-13)
