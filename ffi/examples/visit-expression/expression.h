@@ -492,19 +492,6 @@ void visit_expr_column(void* data,
   put_expr_item(data, sibling_id_list, column, Column);
 }
 
-struct Column* make_column(const char* const* parts, size_t len) {
-  struct Column* column = malloc(sizeof(struct Column));
-  column->len = len;
-  column->parts = malloc(sizeof(struct ColumnPart) * len);
-  for (size_t i = 0; i < len; i++) {
-    size_t part_len = strlen(parts[i]);
-    char* copy = malloc(part_len + 1);
-    memcpy(copy, parts[i], part_len + 1);
-    column->parts[i] = (struct ColumnPart){ .ptr = copy, .len = part_len };
-  }
-  return column;
-}
-
 /*************************************************************
  * EngineExpressionVisitor Implementation
  ************************************************************/
